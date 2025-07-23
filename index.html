@@ -7,9 +7,24 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
-        body { font-family: 'Inter', sans-serif; }
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
         .calendar-day { min-height: 120px; }
+        /* Custom scrollbar for modal content */
+        .modal-content::-webkit-scrollbar {
+            width: 8px;
+        }
+        .modal-content::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
+        }
+        .modal-content::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 10px;
+        }
+        .modal-content::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
     </style>
 </head>
 <body class="bg-gray-100">
@@ -40,37 +55,34 @@
 
     <!-- Firebase SDK -->
     <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, setDoc, deleteDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        // Use latest Firebase SDKs
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, setDoc, deleteDoc, serverTimestamp, query, where, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // --- YOUR LIVE FIREBASE CONFIGURATION ---
-        const firebaseConfig = {
-           apiKey: "AIzaSyCJYn2wp6Vrlz-DVMwyZwsHrXSJJrXL3f0",
-           authDomain: "nasa-27896.firebaseapp.com",
-           projectId: "nasa-27896",
-           storageBucket: "nasa-27896.appspot.com",
-           messagingSenderId: "407765833759",
-           appId: "1:407765833759:web:cef776a5e24a6fa92e5d2a",
-           measurementId: "G-JXT99BHXMQ"
-        };
+        // --- Firebase Configuration ---
+        // Use the globally provided Firebase config and App ID
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "YOUR_API_KEY", authDomain: "...", projectId: "...", ...{}};
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
         // Initialize Firebase
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
+        const auth = getAuth(app);
 
-        // --- DATA STORE (Now fetched from Firebase) ---
+        // --- GLOBAL STATE & CONSTANTS ---
         let state = {
+            authReady: false,
+            userId: null,
             activeTab: 'dashboard',
             patientSearchTerm: '',
-            schedulingView: 'creator',
-            calendarDate: new Date(),
             studies: [],
             patients: [],
             sites: [],
             surveys: [],
             schedules: [],
         };
-        
+
         // --- DOM ELEMENTS ---
         const mainContent = document.getElementById('main-content');
         const navMenu = document.getElementById('nav-menu');
@@ -83,14 +95,15 @@
         };
 
         const render = () => {
+            if (!state.authReady) return; // Don't render until Firebase auth is ready
             renderNav();
             renderContent();
-            lucide.createIcons();
+            lucide.createIcons(); // Re-render icons after DOM changes
         };
 
         const renderNav = () => {
-             const navItems = [
-                { id: 'dashboard', label: 'Dashboard', icon: 'activity' },
+            const navItems = [
+                { id: 'dashboard', label: 'Dashboard', icon: 'layout-dashboard' },
                 { id: 'studies', label: 'Studies', icon: 'file-text' },
                 { id: 'patients', label: 'Patients', icon: 'users' },
                 { id: 'sites', label: 'Sites', icon: 'building' },
@@ -98,7 +111,12 @@
                 { id: 'scheduling', label: 'Scheduling', icon: 'calendar' },
                 { id: 'reporting', label: 'Reporting', icon: 'trending-up' },
             ];
-            navMenu.innerHTML = navItems.map(item => `<button data-tab="${item.id}" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors ${state.activeTab === item.id ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-200'}"><i data-lucide="${item.icon}" class="w-5 h-5"></i><span class="ml-3">${item.label}</span></button>`).join('');
+            navMenu.innerHTML = navItems.map(item => `
+                <button data-tab="${item.id}" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors ${state.activeTab === item.id ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-200'}">
+                    <i data-lucide="${item.icon}" class="w-5 h-5"></i>
+                    <span class="ml-3">${item.label}</span>
+                </button>
+            `).join('');
         };
 
         const renderContent = () => {
@@ -112,13 +130,23 @@
                 reporting: getReportingHTML,
             };
             mainContent.innerHTML = contentMap[state.activeTab]();
-            if (state.activeTab === 'surveys' && !document.getElementById('questions-container')?.children.length) addQuestionToSurveyForm();
-            if (state.activeTab === 'scheduling' && state.schedulingView === 'calendar') renderCalendar();
+            // Add initial question if survey creator is open and has no questions
+            if (state.activeTab === 'surveys' && !document.getElementById('questions-container')?.children.length) {
+                addQuestionToSurveyForm();
+            }
         };
 
         // --- MODAL HANDLING ---
         const openModal = (content) => {
-            modalContainer.innerHTML = `<div class="bg-white p-8 rounded-lg shadow-2xl w-full max-w-2xl relative max-h-full overflow-y-auto"><button data-action="close-modal" class="absolute top-4 right-4 text-gray-500 hover:text-gray-800"><i data-lucide="x"></i></button>${content}</div>`;
+            modalContainer.innerHTML = `
+                <div class="bg-white p-8 rounded-lg shadow-2xl w-full max-w-2xl relative max-h-[90vh]">
+                    <div class="modal-content overflow-y-auto max-h-[calc(90vh-100px)] pr-4">
+                        ${content}
+                    </div>
+                     <button data-action="close-modal" class="absolute top-4 right-4 text-gray-500 hover:text-gray-800">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>`;
             modalContainer.classList.remove('hidden');
             lucide.createIcons();
         };
@@ -129,6 +157,7 @@
         };
 
         // --- HTML GETTERS FOR EACH PAGE ---
+
         const getDashboardHTML = () => {
             const totalEnrolled = state.studies.reduce((sum, study) => sum + (study.enrolled || 0), 0);
             const recruitingStudies = state.studies.filter(s => s.status === 'Recruiting').length;
@@ -140,15 +169,15 @@
                     <div class="bg-white p-6 rounded-lg shadow-md flex items-center"><div class="p-3 rounded-full mr-4 bg-green-500"><i data-lucide="file-text" class="text-white"></i></div><div><p class="text-sm text-gray-500">Active Recruiting Studies</p><p class="text-2xl font-bold">${recruitingStudies}</p></div></div>
                     <div class="bg-white p-6 rounded-lg shadow-md flex items-center"><div class="p-3 rounded-full mr-4 bg-indigo-500"><i data-lucide="users" class="text-white"></i></div><div><p class="text-sm text-gray-500">Potential Candidates</p><p class="text-2xl font-bold">${totalPatients}</p></div></div>
                 </div>
-                <div class="bg-white p-6 rounded-lg shadow-md"><h3 class="text-xl font-semibold text-gray-700 mb-4">Recruitment Funnel</h3><div id="chart-container" class="flex items-center justify-center h-full text-gray-500">Charting library removed for stability.</div></div>`;
+                <div class="bg-white p-6 rounded-lg shadow-md"><h3 class="text-xl font-semibold text-gray-700 mb-4">Recruitment Funnel</h3><div id="chart-container" class="flex items-center justify-center h-64 text-gray-500">Charting library placeholder.</div></div>`;
         };
-        
+
         const getStudiesHTML = () => `
             <h2 class="text-3xl font-bold text-gray-800 mb-6">Clinical Studies</h2>
             <div class="bg-white rounded-lg shadow-md overflow-hidden">
                 <table class="min-w-full divide-y divide-gray-200">
                     <thead class="bg-gray-50"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Study Title</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Enrollment</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th></tr></thead>
-                    <tbody class="bg-white divide-y divide-gray-200">${state.studies.map(study => `<tr><td class="px-6 py-4">${study.title}</td><td class="px-6 py-4">${study.status}</td><td class="px-6 py-4">${study.enrolled} / ${study.target}</td><td class="px-6 py-4"><button data-action="edit-study" data-id="${study.id}" class="text-blue-600 hover:underline">Edit</button></td></tr>`).join('')}</tbody>
+                    <tbody class="bg-white divide-y divide-gray-200">${state.studies.map(study => `<tr><td class="px-6 py-4">${study.title}</td><td class="px-6 py-4">${study.status}</td><td class="px-6 py-4">${study.enrolled || 0} / ${study.target}</td><td class="px-6 py-4"><button data-action="edit-study" data-id="${study.id}" class="text-blue-600 hover:underline">Edit</button></td></tr>`).join('')}</tbody>
                 </table>
             </div>`;
 
@@ -167,7 +196,7 @@
                     </table>
                 </div>`;
         };
-        
+
         const getSitesHTML = () => `
             <h2 class="text-3xl font-bold text-gray-800 mb-6">Clinical Sites</h2>
             <div class="bg-white p-6 rounded-lg shadow-md mb-8">
@@ -191,8 +220,8 @@
             <div class="bg-white p-6 rounded-lg shadow-md mb-8">
                 <h3 class="text-xl font-semibold text-gray-700 mb-4">Create New Survey</h3>
                 <form id="survey-creator-form" class="space-y-6">
-                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                         <div><label class="block text-sm font-medium text-gray-700">Survey Title</label><input type="text" name="title" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2" placeholder="e.g., Patient Intake Survey" required /></div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div><label class="block text-sm font-medium text-gray-700">Survey Title</label><input type="text" name="title" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2" placeholder="e.g., Patient Intake Survey" required /></div>
                         <div><label class="block text-sm font-medium text-gray-700">Assign to Study</label><select name="studyId" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 bg-white" required><option value="" disabled selected>Select a study</option>${state.studies.map(study => `<option value="${study.id}">${study.title}</option>`).join('')}</select></div>
                     </div>
                     <div id="questions-container" class="space-y-4"></div>
@@ -204,59 +233,152 @@
                 <h3 class="text-xl font-semibold text-gray-700 p-6">Existing Surveys</h3>
                 <table class="min-w-full divide-y divide-gray-200">
                     <thead class="bg-gray-50"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Title</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Study</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th></tr></thead>
-                    <tbody>${state.surveys.map(s => `<tr><td class="px-6 py-4">${s.title}</td><td class="px-6 py-4">${state.studies.find(study => study.id == s.studyId)?.title}</td><td class="px-6 py-4"><button data-action="view-survey" data-id="${s.id}" class="text-blue-600 hover:underline">View Survey</button></td></tr>`).join('')}${state.surveys.length === 0 ? `<tr><td colspan="3" class="text-center text-gray-500 py-8">No surveys created yet.</td></tr>` : ''}</tbody>
+                    <tbody>${state.surveys.map(s => `<tr><td class="px-6 py-4">${s.title}</td><td class="px-6 py-4">${state.studies.find(study => study.id == s.studyId)?.title || 'N/A'}</td><td class="px-6 py-4"><button data-action="view-survey" data-id="${s.id}" class="text-blue-600 hover:underline">View Survey</button></td></tr>`).join('')}${state.surveys.length === 0 ? `<tr><td colspan="3" class="text-center text-gray-500 py-8">No surveys created yet.</td></tr>` : ''}</tbody>
                 </table>
             </div>`;
-        
+
         const getReportingHTML = () => `
             <h2 class="text-3xl font-bold text-gray-800 mb-6">Reporting</h2>
             <div class="bg-white p-6 rounded-lg shadow-md mb-8">
                 <h3 class="text-xl font-semibold text-gray-700 mb-4">Generate Report</h3>
-                <form id="report-filter-form" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <form id="report-filter-form" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 items-end">
                     <select name="studyId" class="p-2 border rounded"><option value="all">All Studies</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
                     <select name="siteId" class="p-2 border rounded"><option value="all">All Sites</option>${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select>
-                    <input type="text" name="status" placeholder="Filter by Status (e.g., Enrolled)" class="p-2 border rounded"/>
                     <input type="date" name="startDate" class="p-2 border rounded"/>
                     <input type="date" name="endDate" class="p-2 border rounded"/>
-                    <button type="submit" class="bg-blue-600 text-white rounded-md md:col-span-2 lg:col-span-1">Generate</button>
+                    <button type="submit" class="bg-blue-600 text-white rounded-md h-10 col-span-full lg:col-span-1">Generate</button>
                 </form>
             </div>
             <div class="bg-white rounded-lg shadow-md overflow-hidden">
                 <h3 class="text-xl font-semibold text-gray-700 p-6">Report Results</h3>
                 <div class="overflow-x-auto">
                     <table class="min-w-full divide-y divide-gray-200">
-                        <thead class="bg-gray-50"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Patient Name</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Study</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Site</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Appointment Date</th></tr></thead>
-                        <tbody id="report-results-body"><tr><td colspan="5" class="text-center text-gray-500 py-8">Generate a report to see results.</td></tr></tbody>
+                        <thead class="bg-gray-50"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Patient Name</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Study</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Site</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Appointment Date</th></tr></thead>
+                        <tbody id="report-results-body"><tr><td colspan="4" class="text-center text-gray-500 py-8">Generate a report to see results.</td></tr></tbody>
                     </table>
                 </div>
             </div>`;
-        
+
         const getSchedulingHTML = () => `
             <h2 class="text-3xl font-bold text-gray-800 mb-6">Scheduling</h2>
             <div class="bg-white p-6 rounded-lg shadow-md mb-8">
                 <h3 class="text-xl font-semibold text-gray-700 mb-4">Create Appointment Schedule</h3>
                 <form id="schedule-creator-form" class="space-y-4">
-                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div><label class="block text-sm font-medium text-gray-700">Site</label><select name="siteId" required class="mt-1 block w-full p-2 border rounded border-gray-300"><option value="">Select a Site</option>${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
-                        <div><label class="block text-sm font-medium text-gray-700">Study</label><select name="studyId" required class="mt-1 block w-full p-2 border rounded border-gray-300"><option value="">Select a Study</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div><label class="block text-sm font-medium text-gray-700">Site</label><select name="siteId" required class="mt-1 block w-full p-2 border rounded border-gray-300 bg-white"><option value="">Select a Site</option>${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
+                        <div><label class="block text-sm font-medium text-gray-700">Study</label><select name="studyId" required class="mt-1 block w-full p-2 border rounded border-gray-300 bg-white"><option value="">Select a Study</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
                         <div><label class="block text-sm font-medium text-gray-700">Start Date</label><input type="date" name="startDate" required class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
                         <div><label class="block text-sm font-medium text-gray-700">End Date</label><input type="date" name="endDate" required class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
                     </div>
-                    <div><label class="font-medium">Days of the Week</label><div class="flex gap-2 mt-1">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day, i) => `<button type="button" data-day="${i}" class="day-btn p-2 rounded border w-12 bg-gray-200">${day}</button>`).join('')}</div></div>
+                    <div><label class="font-medium">Days of the Week</label><div class="flex flex-wrap gap-2 mt-1">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day, i) => `<button type="button" data-day="${i}" class="day-btn p-2 rounded border w-12 bg-gray-200">${day}</button>`).join('')}</div></div>
                     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                         <div><label class="block text-sm font-medium text-gray-700">Start Time</label><input type="time" name="startTime" value="09:00" required class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
-                         <div><label class="block text-sm font-medium text-gray-700">End Time</label><input type="time" name="endTime" value="17:00" required class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
-                         <div><label class="block text-sm font-medium text-gray-700">Duration (mins)</label><input type="number" name="duration" value="60" required placeholder="e.g., 60" class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
-                         <div><label class="block text-sm font-medium text-gray-700">Capacity</label><input type="number" name="capacity" value="1" required placeholder="e.g., 1" class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
+                        <div><label class="block text-sm font-medium text-gray-700">Start Time</label><input type="time" name="startTime" value="09:00" required class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
+                        <div><label class="block text-sm font-medium text-gray-700">End Time</label><input type="time" name="endTime" value="17:00" required class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
+                        <div><label class="block text-sm font-medium text-gray-700">Duration (mins)</label><input type="number" name="duration" value="60" required placeholder="e.g., 60" class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
+                        <div><label class="block text-sm font-medium text-gray-700">Capacity</label><input type="number" name="capacity" value="1" required placeholder="e.g., 1" class="mt-1 block w-full p-2 border rounded border-gray-300"/></div>
                     </div>
                     <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md">Generate Schedule</button>
                 </form>
             </div>
             <div class="bg-white p-6 rounded-lg shadow-md">
                 <h3 class="text-xl font-semibold text-gray-700 mb-4">Generated Schedules</h3>
-                <div id="schedules-list" class="space-y-4">${state.schedules.length === 0 ? '<p class="text-center text-gray-500 py-8">No schedules created yet.</p>' : state.schedules.map(s => `<div class="p-4 border rounded-lg"><h4 class="font-bold">${state.studies.find(study => study.id == s.studyId)?.title} at ${state.sites.find(site => site.id == s.siteId)?.name}</h4><p>${s.slots.length} total slots available.</p></div>`).join('')}</div>
+                <div id="schedules-list" class="space-y-4">${state.schedules.length === 0 ? '<p class="text-center text-gray-500 py-8">No schedules created yet.</p>' : state.schedules.map(s => `<div class="p-4 border rounded-lg"><h4 class="font-bold">${state.studies.find(study => study.id == s.studyId)?.title || 'N/A'} at ${state.sites.find(site => site.id == s.siteId)?.name || 'N/A'}</h4><p>${s.slots.length} total slots available.</p></div>`).join('')}</div>
             </div>`;
+
+        // --- MODAL HTML GETTERS ---
+        const getPatientProfileHTML = (patient) => {
+            if (!patient) return `<h2>Patient not found</h2>`;
+            const study = state.studies.find(s => s.id === patient.studyId);
+            const site = state.sites.find(s => s.id === patient.siteId);
+            return `
+                <h2 class="text-2xl font-bold mb-4">${patient.name}</h2>
+                <div class="space-y-2">
+                    <p><strong>Age:</strong> ${patient.age || 'N/A'}</p>
+                    <p><strong>Condition:</strong> ${patient.condition || 'N/A'}</p>
+                    <p><strong>Status:</strong> ${patient.status || 'N/A'}</p>
+                    <p><strong>Assigned Study:</strong> ${study?.title || 'N/A'}</p>
+                    <p><strong>Assigned Site:</strong> ${site?.name || 'N/A'}</p>
+                    <p><strong>Appointment:</strong> ${patient.appointment ? new Date(patient.appointment.time).toLocaleString() : 'Not Scheduled'}</p>
+                </div>
+            `;
+        };
+
+        const getBookingModalHTML = (patient) => {
+             if (!patient) return `<h2>Patient not found</h2>`;
+             const availableSchedules = state.schedules.filter(s => s.siteId === patient.siteId && s.studyId === patient.studyId);
+             if (availableSchedules.length === 0) {
+                 return `
+                    <h2 class="text-2xl font-bold mb-4">Schedule for ${patient.name}</h2>
+                    <p class="text-red-500">No available schedules match the patient's assigned site and study.</p>
+                 `;
+             }
+             let slotsHTML = '';
+             availableSchedules.forEach(schedule => {
+                 const availableSlots = schedule.slots.filter(slot => slot.booked < slot.capacity);
+                 if (availableSlots.length > 0) {
+                     slotsHTML += `<h4 class="font-semibold mt-4 mb-2">Available Slots:</h4>`;
+                     slotsHTML += availableSlots.map(slot => `
+                        <button data-action="book-appointment" data-patient-id="${patient.id}" data-schedule-id="${schedule.id}" data-slot-id="${slot.id}" class="w-full text-left p-2 border rounded hover:bg-gray-100 mb-2">
+                            ${new Date(slot.startTime).toLocaleString()}
+                        </button>
+                     `).join('');
+                 }
+             });
+
+             if (slotsHTML === '') {
+                 slotsHTML = `<p class="text-yellow-600 mt-4">All slots for this patient's study and site are fully booked.</p>`;
+             }
+
+             return `
+                <h2 class="text-2xl font-bold mb-4">Schedule for ${patient.name}</h2>
+                <p><strong>Study:</strong> ${state.studies.find(s => s.id === patient.studyId)?.title}</p>
+                <p><strong>Site:</strong> ${state.sites.find(s => s.id === patient.siteId)?.name}</p>
+                ${slotsHTML}
+             `;
+        };
+
+        const getQuickAddPatientHTML = () => {
+             return `
+                <h2 class="text-2xl font-bold mb-4">Quick Add Patient</h2>
+                <form id="quick-add-patient-form" class="space-y-4">
+                    <div><label class="block text-sm font-medium">Full Name</label><input type="text" name="name" required class="mt-1 w-full p-2 border rounded"></div>
+                    <div><label class="block text-sm font-medium">Age</label><input type="number" name="age" class="mt-1 w-full p-2 border rounded"></div>
+                    <div><label class="block text-sm font-medium">Condition</label><input type="text" name="condition" class="mt-1 w-full p-2 border rounded"></div>
+                    <div><label class="block text-sm font-medium">Status</label><input type="text" name="status" value="Candidate" class="mt-1 w-full p-2 border rounded"></div>
+                    <div><label class="block text-sm font-medium">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border rounded bg-white"><option value="">None</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
+                    <div><label class="block text-sm font-medium">Assign to Site</label><select name="siteId" class="mt-1 w-full p-2 border rounded bg-white"><option value="">None</option>${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
+                    <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700">Add Patient</button>
+                </form>
+             `;
+        };
         
+        const getViewSurveyModalHTML = (survey) => {
+            if (!survey) return `<h2>Survey not found</h2>`;
+            const study = state.studies.find(s => s.id === survey.studyId);
+            let questionsHTML = survey.questions.map((q, index) => {
+                let optionsHTML = q.options.map(opt => `
+                    <li class="ml-4 list-disc">
+                        ${opt.text} &rarr; (Next: ${opt.next})
+                    </li>
+                `).join('');
+                return `
+                    <div class="mt-4 p-2 border-t">
+                        <p class="font-semibold">Q${index + 1}: ${q.text}</p>
+                        <ul class="mt-1">
+                            ${optionsHTML}
+                        </ul>
+                    </div>
+                `;
+            }).join('');
+
+            return `
+                <h2 class="text-2xl font-bold mb-2">${survey.title}</h2>
+                <p class="text-sm text-gray-600 mb-4">For Study: ${study?.title || 'N/A'}</p>
+                <div>${questionsHTML}</div>
+            `;
+        };
+
+
         // --- EVENT HANDLERS ---
         document.addEventListener('click', async (e) => {
             const navButton = e.target.closest('.nav-item');
@@ -270,105 +392,170 @@
                 dayButton.classList.toggle('text-white');
                 dayButton.classList.toggle('bg-gray-200');
             }
-            
+
             const actionButton = e.target.closest('button[data-action]');
             if (actionButton) {
                 const { action, id } = actionButton.dataset;
-                if (action === 'view-patient') {
-                    const patient = state.patients.find(p => p.id === id);
-                    openModal(getPatientProfileHTML(patient));
-                } else if (action === 'schedule-patient') {
-                    const patient = state.patients.find(p => p.id === id);
-                    openModal(getBookingModalHTML(patient));
-                } else if (action === 'book-appointment') {
-                    const { patientId, scheduleId, slotId } = actionButton.dataset;
-                    const schedule = state.schedules.find(s => s.id === scheduleId);
-                    const slot = schedule.slots.find(s => s.id === slotId);
-                    slot.booked += 1;
-                    
-                    await updateDoc(doc(db, "schedules", scheduleId), { slots: schedule.slots });
-                    await updateDoc(doc(db, "patients", patientId), { appointment: { scheduleId, slotId, time: slot.startTime } });
-                    closeModal();
-                } else if (action === 'quick-add-patient-modal') {
-                    openModal(getQuickAddPatientHTML());
-                } else if (action === 'add-question') {
-                    addQuestionToSurveyForm();
-                } else if (action === 'add-option') {
-                    addOptionToQuestion(actionButton.dataset.qId);
-                } else if (action === 'remove-question') {
-                    document.getElementById(actionButton.dataset.qId).remove();
-                } else if (action === 'remove-option') {
-                    actionButton.parentElement.remove();
-                } else if (action === 'view-survey') {
-                    // view survey modal
-                } else if (action === 'close-modal') {
-                    closeModal();
-                }
-            }
-        });
-        
-        document.addEventListener('submit', async (e) => {
-             e.preventDefault();
-            if (e.target.id === 'schedule-creator-form') {
-                const formData = new FormData(e.target);
-                const data = Object.fromEntries(formData.entries());
-                const days = {};
-                e.target.querySelectorAll('.day-btn.bg-blue-500').forEach(btn => { days[btn.dataset.day] = true; });
-                
-                let slots = [];
-                let currentDate = new Date(data.startDate + 'T00:00:00');
-                const finalDate = new Date(data.endDate + 'T00:00:00');
-
-                while (currentDate <= finalDate) {
-                    const dayOfWeek = currentDate.getDay();
-                    if (days[dayOfWeek]) {
-                        const [startHour, startMinute] = data.startTime.split(':').map(Number);
-                        const [endHour, endMinute] = data.endTime.split(':').map(Number);
-                        let slotTime = new Date(currentDate);
-                        slotTime.setHours(startHour, startMinute, 0, 0);
-                        const endSlotTime = new Date(currentDate);
-                        endSlotTime.setHours(endHour, endMinute, 0, 0);
-
-                        while (slotTime < endSlotTime) {
-                            slots.push({ id: `slot-${Date.now()}-${Math.random()}`, startTime: slotTime.toISOString(), booked: 0, capacity: parseInt(data.capacity) });
-                            slotTime.setMinutes(slotTime.getMinutes() + parseInt(data.duration));
-                        }
+                switch (action) {
+                    case 'close-modal': closeModal(); break;
+                    case 'view-patient': {
+                        const patient = state.patients.find(p => p.id === id);
+                        openModal(getPatientProfileHTML(patient));
+                        break;
                     }
-                    currentDate.setDate(currentDate.getDate() + 1);
+                    case 'schedule-patient': {
+                        const patient = state.patients.find(p => p.id === id);
+                        openModal(getBookingModalHTML(patient));
+                        break;
+                    }
+                    case 'book-appointment': {
+                        const { patientId, scheduleId, slotId } = actionButton.dataset;
+                        const schedule = state.schedules.find(s => s.id === scheduleId);
+                        const slot = schedule.slots.find(s => s.id === slotId);
+                        slot.booked += 1;
+                        
+                        // Use the full collection path
+                        const scheduleRef = doc(db, `artifacts/${appId}/public/data/schedules`, scheduleId);
+                        const patientRef = doc(db, `artifacts/${appId}/public/data/patients`, patientId);
+
+                        await updateDoc(scheduleRef, { slots: schedule.slots });
+                        await updateDoc(patientRef, { appointment: { scheduleId, slotId, time: slot.startTime } });
+                        closeModal();
+                        break;
+                    }
+                    case 'quick-add-patient-modal': openModal(getQuickAddPatientHTML()); break;
+                    case 'add-question': addQuestionToSurveyForm(); break;
+                    case 'add-option': addOptionToQuestion(actionButton.dataset.qId); break;
+                    case 'remove-question': document.getElementById(actionButton.dataset.qId).remove(); break;
+                    case 'remove-option': actionButton.parentElement.remove(); break;
+                    case 'view-survey': {
+                        const survey = state.surveys.find(s => s.id === id);
+                        openModal(getViewSurveyModalHTML(survey));
+                        break;
+                    }
+                    case 'edit-study': {
+                        // This is a placeholder. A full implementation would require a new modal form.
+                        alert("Edit study functionality not yet implemented.");
+                        break;
+                    }
                 }
-                
-                const newSchedule = { siteId: parseInt(data.siteId), studyId: parseInt(data.studyId), slots: slots };
-                await addDoc(collection(db, "schedules"), newSchedule);
-                e.target.reset();
-            } else if (e.target.id === 'add-site-form') {
-                const formData = new FormData(e.target);
-                const newSite = {
-                    name: formData.get('siteName'),
-                    location: formData.get('siteLocation'),
-                };
-                await addDoc(collection(db, "sites"), newSite);
-                e.target.reset();
-            } else if (e.target.id === 'quick-add-patient-form') {
-                const formData = new FormData(e.target);
-                const newPatient = {
-                    name: formData.get('name'),
-                    age: parseInt(formData.get('age')),
-                    condition: formData.get('condition'),
-                    status: formData.get('status'),
-                    studyId: parseInt(formData.get('studyId')),
-                    siteId: parseInt(formData.get('siteId')),
-                    appointment: null,
-                };
-                await addDoc(collection(db, "patients"), newPatient);
-                closeModal();
+            }
+        });
+        
+        document.addEventListener('input', (e) => {
+            if (e.target.id === 'patient-search') {
+                state.patientSearchTerm = e.target.value; // Update state directly to avoid re-render lag
+                render(); // Re-render the patient list
             }
         });
 
-        // --- CHARTING ---
-        const renderDashboardChart = () => {
-            // Charting library has been removed for stability.
-        };
-        
+        document.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const formData = new FormData(form);
+            const data = Object.fromEntries(formData.entries());
+            
+            // Use the full collection path for all writes
+            const getCollectionRef = (name) => collection(db, `artifacts/${appId}/public/data/${name}`);
+
+            switch (form.id) {
+                case 'schedule-creator-form': {
+                    const days = {};
+                    form.querySelectorAll('.day-btn.bg-blue-500').forEach(btn => { days[btn.dataset.day] = true; });
+                    
+                    let slots = [];
+                    let currentDate = new Date(data.startDate + 'T00:00:00');
+                    const finalDate = new Date(data.endDate + 'T00:00:00');
+
+                    while (currentDate <= finalDate) {
+                        if (days[currentDate.getDay()]) {
+                            const [startHour, startMinute] = data.startTime.split(':').map(Number);
+                            const [endHour, endMinute] = data.endTime.split(':').map(Number);
+                            let slotTime = new Date(currentDate);
+                            slotTime.setHours(startHour, startMinute, 0, 0);
+                            const endSlotTime = new Date(currentDate);
+                            endSlotTime.setHours(endHour, endMinute, 0, 0);
+
+                            while (slotTime < endSlotTime) {
+                                slots.push({ id: `slot-${Date.now()}-${Math.random()}`, startTime: slotTime.toISOString(), booked: 0, capacity: parseInt(data.capacity) });
+                                slotTime.setMinutes(slotTime.getMinutes() + parseInt(data.duration));
+                            }
+                        }
+                        currentDate.setDate(currentDate.getDate() + 1);
+                    }
+                    
+                    const newSchedule = { siteId: data.siteId, studyId: data.studyId, slots: slots };
+                    await addDoc(getCollectionRef("schedules"), newSchedule);
+                    form.reset();
+                    break;
+                }
+                case 'add-site-form': {
+                    const newSite = { name: data.siteName, location: data.siteLocation };
+                    await addDoc(getCollectionRef("sites"), newSite);
+                    form.reset();
+                    break;
+                }
+                case 'quick-add-patient-form': {
+                    const newPatient = {
+                        name: data.name,
+                        age: data.age ? parseInt(data.age) : null,
+                        condition: data.condition,
+                        status: data.status,
+                        studyId: data.studyId || null,
+                        siteId: data.siteId || null,
+                        appointment: null,
+                    };
+                    await addDoc(getCollectionRef("patients"), newPatient);
+                    closeModal();
+                    break;
+                }
+                case 'survey-creator-form': {
+                    const questions = [];
+                    const questionElements = form.querySelectorAll('#questions-container > div');
+                    questionElements.forEach((qEl, index) => {
+                        const qId = qEl.id;
+                        const text = form.querySelector(`input[name="${qId}-text"]`).value;
+                        const options = [];
+                        qEl.querySelectorAll(`div[data-options-for="${qId}"] > div`).forEach(optEl => {
+                            options.push({
+                                text: optEl.querySelector(`input[name="${qId}-option-text"]`).value,
+                                next: optEl.querySelector(`input[name="${qId}-option-next"]`).value,
+                            });
+                        });
+                        questions.push({ id: index + 1, text, options });
+                    });
+                    const newSurvey = { title: data.title, studyId: data.studyId, questions };
+                    await addDoc(getCollectionRef("surveys"), newSurvey);
+                    form.reset();
+                    // After reset, re-add the first question block
+                    addQuestionToSurveyForm(); 
+                    break;
+                }
+                case 'report-filter-form': {
+                    let filteredPatients = [...state.patients];
+                    if (data.studyId !== 'all') filteredPatients = filteredPatients.filter(p => p.studyId === data.studyId);
+                    if (data.siteId !== 'all') filteredPatients = filteredPatients.filter(p => p.siteId === data.siteId);
+                    if (data.startDate) filteredPatients = filteredPatients.filter(p => p.appointment && new Date(p.appointment.time) >= new Date(data.startDate));
+                    if (data.endDate) filteredPatients = filteredPatients.filter(p => p.appointment && new Date(p.appointment.time) <= new Date(data.endDate));
+                    
+                    const resultsBody = document.getElementById('report-results-body');
+                    if(filteredPatients.length > 0) {
+                        resultsBody.innerHTML = filteredPatients.map(p => `
+                            <tr>
+                                <td class="px-6 py-4">${p.name}</td>
+                                <td class="px-6 py-4">${state.studies.find(s => s.id === p.studyId)?.title || 'N/A'}</td>
+                                <td class="px-6 py-4">${state.sites.find(s => s.id === p.siteId)?.name || 'N/A'}</td>
+                                <td class="px-6 py-4">${p.appointment ? new Date(p.appointment.time).toLocaleString() : 'N/A'}</td>
+                            </tr>
+                        `).join('');
+                    } else {
+                        resultsBody.innerHTML = `<tr><td colspan="4" class="text-center text-gray-500 py-8">No patients match the selected criteria.</td></tr>`;
+                    }
+                    break;
+                }
+            }
+        });
+
         // --- SURVEY LOGIC ---
         const addQuestionToSurveyForm = () => {
             const container = document.getElementById('questions-container');
@@ -380,12 +567,10 @@
                     <label class="font-medium">Question ${container.children.length + 1}</label>
                     <input type="text" name="${qId}-text" class="w-full p-2 border rounded" placeholder="Question Text" required/>
                     <div class="mt-2 space-y-2 pl-4" data-options-for="${qId}">
-                         <label class="text-sm font-medium text-gray-600">Options</label>
-                         <!-- Options will be injected here -->
+                        <label class="text-sm font-medium text-gray-600">Options</label>
                     </div>
                     <button type="button" data-action="add-option" data-q-id="${qId}" class="text-sm text-blue-600 hover:underline mt-2">+ Add Option</button>
-                </div>
-            `;
+                </div>`;
             container.insertAdjacentHTML('beforeend', questionHTML);
             addOptionToQuestion(qId); // Add one option by default
             lucide.createIcons();
@@ -397,40 +582,27 @@
             const optionHTML = `
                 <div class="flex items-center gap-2">
                     <input type="text" name="${qId}-option-text" class="flex-grow p-2 border rounded" placeholder="Option Text" required/>
-                    <input type="text" name="${qId}-option-next" class="w-48 p-2 border rounded" placeholder="Next Q# (e.g., 2) or 'submit'" required/>
+                    <input type="text" name="${qId}-option-next" class="w-48 p-2 border rounded" placeholder="Next Q# or 'submit'" required/>
                     <button type="button" data-action="remove-option" class="p-1 text-red-500 hover:bg-red-100 rounded-full"><i data-lucide="x" class="w-3.5 h-3.5"></i></button>
-                </div>
-            `;
+                </div>`;
             optionsContainer.insertAdjacentHTML('beforeend', optionHTML);
             lucide.createIcons();
         };
-        
+
         // --- FIREBASE DATA INTERACTIONS ---
-        const setupRealtimeListeners = () => {
-            onSnapshot(collection(db, "studies"), (snapshot) => {
-                state.studies = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                render();
-            });
-            onSnapshot(collection(db, "patients"), (snapshot) => {
-                state.patients = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                render();
-            });
-            onSnapshot(collection(db, "sites"), (snapshot) => {
-                state.sites = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                render();
-            });
-            onSnapshot(collection(db, "schedules"), (snapshot) => {
-                state.schedules = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                render();
-            });
-             onSnapshot(collection(db, "surveys"), (snapshot) => {
-                state.surveys = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                render();
+        const setupRealtimeListeners = (userId) => {
+            const collections = ["studies", "patients", "sites", "schedules", "surveys"];
+            collections.forEach(colName => {
+                const collectionRef = collection(db, `artifacts/${appId}/public/data/${colName}`);
+                onSnapshot(collectionRef, (snapshot) => {
+                    state[colName] = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    render();
+                });
             });
         };
 
         // --- INITIALIZATION ---
-        const init = () => {
+        const init = async () => {
             document.getElementById('logo-container').innerHTML = `
                 <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
                     <g>
@@ -439,9 +611,33 @@
                         <circle cx="50" cy="50" r="22" fill="#1F2937" />
                         <circle cx="59" cy="41" r="7" fill="white" />
                     </g>
-                </svg>
-            `;
-            setupRealtimeListeners();
+                </svg>`;
+            
+            // Handle Authentication
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    console.log("User is signed in:", user.uid);
+                    state.userId = user.uid;
+                    state.authReady = true;
+                    setupRealtimeListeners(user.uid);
+                } else {
+                    console.log("User is signed out.");
+                    state.authReady = false;
+                    // Handle signed out state if necessary
+                }
+            });
+
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Authentication failed:", error);
+                // Show an error message to the user on the page
+                mainContent.innerHTML = `<div class="text-red-500 p-4 bg-red-100 rounded-md">Error: Could not authenticate with the server. Please refresh the page.</div>`;
+            }
         };
 
         window.onload = init;
