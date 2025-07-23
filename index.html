@@ -71,7 +71,7 @@
         // Use latest Firebase SDKs
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, setDoc, deleteDoc, serverTimestamp, query, where, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, setDoc, deleteDoc, serverTimestamp, query, where, getDocs, arrayUnion } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- Firebase Configuration ---
         const firebaseConfig = {
@@ -95,13 +95,15 @@
             userId: null,
             activeTab: 'dashboard',
             patientSearchTerm: '',
-            schedulingView: 'creator', // 'creator' or 'calendar'
+            schedulingView: 'calendar', // 'creator' or 'calendar' - Default to calendar
             calendarDate: new Date(),
             studies: [],
             patients: [],
             sites: [],
             surveys: [],
             schedules: [],
+            // For survey taking
+            currentSurveyState: null, 
         };
 
         // --- DOM ELEMENTS ---
@@ -163,9 +165,10 @@
         };
 
         // --- MODAL HANDLING ---
-        const openModal = (content) => {
+        const openModal = (content, fullWidth = false) => {
+            const maxWidthClass = fullWidth ? 'max-w-4xl' : 'max-w-2xl';
             modalContainer.innerHTML = `
-                <div class="bg-white p-8 rounded-lg shadow-2xl w-full max-w-2xl relative max-h-[90vh]">
+                <div class="bg-white p-8 rounded-lg shadow-2xl w-full ${maxWidthClass} relative max-h-[90vh]">
                     <div class="modal-content overflow-y-auto max-h-[calc(90vh-100px)] pr-4">
                         ${content}
                     </div>
@@ -180,6 +183,7 @@
         const closeModal = () => {
             modalContainer.classList.add('hidden');
             modalContainer.innerHTML = '';
+            state.currentSurveyState = null; // Clear survey state on modal close
         };
 
         // --- HTML GETTERS FOR EACH PAGE ---
@@ -223,7 +227,7 @@
                 <div class="bg-white rounded-lg shadow-md overflow-hidden">
                     <table class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Site</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Study</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Appointment</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th></tr></thead>
-                        <tbody class="bg-white divide-y divide-gray-200">${filteredPatients.map(p => `<tr><td class="px-6 py-4"><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 hover:underline font-medium">${p.name}</button></td><td class="px-6 py-4">${state.sites.find(s => s.id === p.siteId)?.name || 'N/A'}</td><td class="px-6 py-4">${state.studies.find(s => s.id === p.studyId)?.title || 'N/A'}</td><td class="px-6 py-4">${p.appointment ? new Date(p.appointment.time).toLocaleString() : 'Not Scheduled'}</td><td class="px-6 py-4 flex items-center gap-4"><button data-action="schedule-patient" data-id="${p.id}" ${p.appointment ? 'disabled' : ''} class="text-blue-600 hover:underline disabled:text-gray-400 disabled:no-underline">Schedule</button><button data-action="edit-patient" data-id="${p.id}" class="text-gray-500 hover:text-blue-600"><i data-lucide="edit" class="w-4 h-4"></i></button></td></tr>`).join('')}</tbody>
+                        <tbody class="bg-white divide-y divide-gray-200">${filteredPatients.map(p => `<tr><td class="px-6 py-4"><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 hover:underline font-medium">${p.name}</button></td><td class="px-6 py-4">${state.sites.find(s => s.id === p.siteId)?.name || 'N/A'}</td><td class="px-6 py-4">${state.studies.find(s => s.id === p.studyId)?.title || 'N/A'}</td><td class="px-6 py-4">${p.appointment ? new Date(p.appointment.time).toLocaleString() : 'Not Scheduled'}</td><td class="px-6 py-4 flex items-center gap-4"><button data-action="survey-patient" data-id="${p.id}" class="text-green-600 hover:underline">Survey</button><button data-action="schedule-patient" data-id="${p.id}" ${p.appointment ? 'disabled' : ''} class="text-blue-600 hover:underline disabled:text-gray-400 disabled:no-underline">Schedule</button><button data-action="edit-patient" data-id="${p.id}" class="text-gray-500 hover:text-blue-600"><i data-lucide="edit" class="w-4 h-4"></i></button></td></tr>`).join('')}</tbody>
                     </table>
                 </div>`;
         };
@@ -326,7 +330,7 @@
                         <button data-action="set-scheduling-view" data-view="calendar" class="${state.schedulingView === 'calendar' ? 'bg-blue-600 text-white' : 'bg-gray-200'} px-4 py-2 rounded-md text-sm font-medium">Calendar View</button>
                     </div>
                 </div>
-                ${state.schedulingView === 'creator' ? creatorView : calendarView}
+                ${state.schedulingView === 'calendar' ? calendarView : creatorView}
             `;
         };
         
@@ -335,15 +339,38 @@
             if (!patient) return `<h2>Patient not found</h2>`;
             const study = state.studies.find(s => s.id === patient.studyId);
             const site = state.sites.find(s => s.id === patient.siteId);
+            
+            let surveyResultsHTML = '<p class="text-gray-500">No survey results found.</p>';
+            if (patient.surveyResults && patient.surveyResults.length > 0) {
+                surveyResultsHTML = patient.surveyResults.map(result => `
+                    <div class="mt-4 p-3 border rounded-lg">
+                        <h4 class="font-semibold">${result.surveyTitle}</h4>
+                        <p class="text-sm text-gray-500 mb-2">Completed on: ${new Date(result.completedAt).toLocaleString()}</p>
+                        <ul class="list-disc pl-5 text-sm">
+                            ${result.answers.map(ans => `<li><strong>${ans.question}</strong>: ${ans.answer}</li>`).join('')}
+                        </ul>
+                    </div>
+                `).join('');
+            }
+
             return `
                 <h2 class="text-2xl font-bold mb-4">${patient.name}</h2>
-                <div class="space-y-2">
-                    <p><strong>Age:</strong> ${patient.age || 'N/A'}</p>
-                    <p><strong>Condition:</strong> ${patient.condition || 'N/A'}</p>
-                    <p><strong>Status:</strong> ${patient.status || 'N/A'}</p>
-                    <p><strong>Assigned Study:</strong> ${study?.title || 'N/A'}</p>
-                    <p><strong>Assigned Site:</strong> ${site?.name || 'N/A'}</p>
-                    <p><strong>Appointment:</strong> ${patient.appointment ? new Date(patient.appointment.time).toLocaleString() : 'Not Scheduled'}</p>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div>
+                        <h3 class="font-semibold text-lg mb-2 border-b pb-1">Patient Details</h3>
+                        <div class="space-y-2">
+                            <p><strong>Age:</strong> ${patient.age || 'N/A'}</p>
+                            <p><strong>Condition:</strong> ${patient.condition || 'N/A'}</p>
+                            <p><strong>Status:</strong> ${patient.status || 'N/A'}</p>
+                            <p><strong>Assigned Study:</strong> ${study?.title || 'N/A'}</p>
+                            <p><strong>Assigned Site:</strong> ${site?.name || 'N/A'}</p>
+                            <p><strong>Appointment:</strong> ${patient.appointment ? new Date(patient.appointment.time).toLocaleString() : 'Not Scheduled'}</p>
+                        </div>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-lg mb-2 border-b pb-1">Survey History</h3>
+                        ${surveyResultsHTML}
+                    </div>
                 </div>
             `;
         };
@@ -498,6 +525,41 @@
                 <div>${questionsHTML}</div>
             `;
         };
+        
+        const getSelectSurveyModalHTML = (patient) => {
+            const availableSurveys = state.surveys.filter(s => s.studyId === patient.studyId);
+            if (availableSurveys.length === 0) {
+                return `<h2 class="text-2xl font-bold mb-4">Survey ${patient.name}</h2><p>No surveys available for the patient's assigned study.</p>`;
+            }
+            return `
+                <h2 class="text-2xl font-bold mb-4">Select Survey for ${patient.name}</h2>
+                <div class="space-y-2">
+                    ${availableSurveys.map(s => `<button data-action="start-survey" data-patient-id="${patient.id}" data-survey-id="${s.id}" class="w-full text-left p-3 border rounded-md hover:bg-gray-100">${s.title}</button>`).join('')}
+                </div>
+            `;
+        };
+
+        const getTakeSurveyModalHTML = () => {
+            const { survey, patient, currentQuestionIndex, answers } = state.currentSurveyState;
+            const question = survey.questions[currentQuestionIndex];
+            
+            return `
+                <h2 class="text-2xl font-bold mb-2">${survey.title}</h2>
+                <p class="text-sm text-gray-600 mb-6">Question ${currentQuestionIndex + 1} of ${survey.questions.length}</p>
+                <form id="take-survey-form">
+                    <p class="text-lg font-semibold mb-4">${question.text}</p>
+                    <div class="space-y-3">
+                        ${question.options.map((opt, index) => `
+                            <div>
+                                <input type="radio" id="option-${index}" name="answer" value="${opt.text}" data-next="${opt.next}" required class="mr-2">
+                                <label for="option-${index}">${opt.text}</label>
+                            </div>
+                        `).join('')}
+                    </div>
+                    <button type="submit" class="mt-8 w-full bg-blue-600 text-white py-2 rounded-md">Next</button>
+                </form>
+            `;
+        };
 
 
         // --- EVENT HANDLERS ---
@@ -522,18 +584,29 @@
 
             const actionButton = e.target.closest('button[data-action]');
             if (actionButton) {
-                const { action, id, view } = actionButton.dataset;
+                const { action, id, view, patientId, surveyId } = actionButton.dataset;
                 switch (action) {
                     case 'close-modal': closeModal(); break;
                     case 'create-study-modal': openModal(getCreateStudyModalHTML()); break;
                     case 'set-scheduling-view': setState({ schedulingView: view }); break;
                     case 'prev-month': state.calendarDate.setMonth(state.calendarDate.getMonth() - 1); render(); break;
                     case 'next-month': state.calendarDate.setMonth(state.calendarDate.getMonth() + 1); render(); break;
-                    case 'view-patient': openModal(getPatientProfileHTML(state.patients.find(p => p.id === id))); break;
+                    case 'view-patient': openModal(getPatientProfileHTML(state.patients.find(p => p.id === id)), true); break;
                     case 'edit-patient': openModal(getEditPatientModalHTML(state.patients.find(p => p.id === id))); break;
                     case 'edit-study': openModal(getEditStudyModalHTML(state.studies.find(s => s.id === id))); break;
                     case 'edit-site': openModal(getEditSiteModalHTML(state.sites.find(s => s.id === id))); break;
                     case 'schedule-patient': openModal(getBookingModalHTML(state.patients.find(p => p.id === id))); break;
+                    case 'survey-patient': openModal(getSelectSurveyModalHTML(state.patients.find(p => p.id === id))); break;
+                    case 'start-survey': {
+                        state.currentSurveyState = {
+                            patient: state.patients.find(p => p.id === patientId),
+                            survey: state.surveys.find(s => s.id === surveyId),
+                            currentQuestionIndex: 0,
+                            answers: []
+                        };
+                        openModal(getTakeSurveyModalHTML());
+                        break;
+                    }
                     case 'book-appointment': {
                         const { patientId, scheduleId, slotId } = actionButton.dataset;
                         const schedule = state.schedules.find(s => s.id === scheduleId);
@@ -573,6 +646,36 @@
             const getCollectionRef = (name) => collection(db, name);
 
             switch (form.id) {
+                case 'take-survey-form': {
+                    const { survey, patient, currentQuestionIndex, answers } = state.currentSurveyState;
+                    const question = survey.questions[currentQuestionIndex];
+                    const selectedOption = form.querySelector('input[name="answer"]:checked');
+                    const answer = selectedOption.value;
+                    const nextQuestionTarget = selectedOption.dataset.next;
+
+                    answers.push({ question: question.text, answer });
+
+                    if (nextQuestionTarget.toLowerCase() === 'submit' || answers.length === survey.questions.length) {
+                        // Survey finished, save results
+                        const surveyResult = {
+                            surveyId: survey.id,
+                            surveyTitle: survey.title,
+                            completedAt: new Date().toISOString(),
+                            answers: answers
+                        };
+                        const patientRef = doc(db, "patients", patient.id);
+                        await updateDoc(patientRef, {
+                            surveyResults: arrayUnion(surveyResult)
+                        });
+                        closeModal();
+                    } else {
+                        // Go to next question
+                        const nextIndex = parseInt(nextQuestionTarget) - 1;
+                        state.currentSurveyState.currentQuestionIndex = nextIndex;
+                        openModal(getTakeSurveyModalHTML());
+                    }
+                    break;
+                }
                 case 'update-capacity-form': {
                     const { scheduleId, slotId } = form.dataset;
                     const newCapacity = parseInt(data.capacity);
