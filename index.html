@@ -102,7 +102,10 @@
         };
 
         const render = () => {
-            if (!state.authReady) return; // Don't render until Firebase auth is ready
+            if (!state.authReady) {
+                 mainContent.innerHTML = `<div class="flex items-center justify-center h-full"><div class="text-gray-500">Authenticating...</div></div>`;
+                return;
+            }
             renderNav();
             renderContent();
             lucide.createIcons(); // Re-render icons after DOM changes
@@ -180,7 +183,12 @@
         };
 
         const getStudiesHTML = () => `
-            <h2 class="text-3xl font-bold text-gray-800 mb-6">Clinical Studies</h2>
+            <div class="flex justify-between items-center mb-6">
+                 <h2 class="text-3xl font-bold text-gray-800">Clinical Studies</h2>
+                 <button data-action="create-study-modal" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 flex items-center">
+                    <i data-lucide="plus" class="w-5 h-5 mr-2"></i> Create New Study
+                 </button>
+            </div>
             <div class="bg-white rounded-lg shadow-md overflow-hidden">
                 <table class="min-w-full divide-y divide-gray-200">
                     <thead class="bg-gray-50"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Study Title</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Enrollment</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th></tr></thead>
@@ -359,6 +367,32 @@
              `;
         };
         
+        const getCreateStudyModalHTML = () => {
+            return `
+                <h2 class="text-2xl font-bold mb-4">Create New Clinical Study</h2>
+                <form id="create-study-form" class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium">Study Title</label>
+                        <input type="text" name="title" required class="mt-1 w-full p-2 border rounded" placeholder="e.g., Phase 3 Aspirin Trial">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium">Status</label>
+                        <select name="status" class="mt-1 w-full p-2 border rounded bg-white">
+                            <option>Recruiting</option>
+                            <option>Enrolling</option>
+                            <option>Active</option>
+                            <option>Closed</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium">Enrollment Target</label>
+                        <input type="number" name="target" required class="mt-1 w-full p-2 border rounded" placeholder="e.g., 100">
+                    </div>
+                    <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700">Create Study</button>
+                </form>
+            `;
+        };
+
         const getViewSurveyModalHTML = (survey) => {
             if (!survey) return `<h2>Survey not found</h2>`;
             const study = state.studies.find(s => s.id === survey.studyId);
@@ -405,6 +439,7 @@
                 const { action, id } = actionButton.dataset;
                 switch (action) {
                     case 'close-modal': closeModal(); break;
+                    case 'create-study-modal': openModal(getCreateStudyModalHTML()); break;
                     case 'view-patient': {
                         const patient = state.patients.find(p => p.id === id);
                         openModal(getPatientProfileHTML(patient));
@@ -464,6 +499,17 @@
             const getCollectionRef = (name) => collection(db, name);
 
             switch (form.id) {
+                case 'create-study-form': {
+                    const newStudy = {
+                        title: data.title,
+                        status: data.status,
+                        target: parseInt(data.target),
+                        enrolled: 0 // Start with 0 enrolled
+                    };
+                    await addDoc(getCollectionRef("studies"), newStudy);
+                    closeModal();
+                    break;
+                }
                 case 'schedule-creator-form': {
                     const days = {};
                     form.querySelectorAll('.day-btn.bg-blue-500').forEach(btn => { days[btn.dataset.day] = true; });
@@ -602,6 +648,9 @@
                 onSnapshot(collectionRef, (snapshot) => {
                     state[colName] = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     render();
+                }, (error) => {
+                    console.error(`Error listening to ${colName}:`, error);
+                    // You might want to display a more specific error to the user here
                 });
             });
         };
@@ -618,27 +667,46 @@
                     </g>
                 </svg>`;
             
-            // Handle Authentication
+            // Handle Authentication state changes
             onAuthStateChanged(auth, (user) => {
                 if (user) {
                     console.log("User is signed in:", user.uid);
-                    state.userId = user.uid;
-                    state.authReady = true;
-                    setupRealtimeListeners(user.uid);
+                    if (!state.authReady) { // Prevent re-triggering listeners on token refresh
+                        state.userId = user.uid;
+                        state.authReady = true;
+                        setupRealtimeListeners(user.uid);
+                    }
                 } else {
                     console.log("User is signed out.");
                     state.authReady = false;
-                    // Handle signed out state if necessary
+                    state.userId = null;
+                    setState({ patients: [], sites: [], studies: [], schedules: [], surveys: [] });
                 }
             });
 
             try {
-                // For external sites, we rely on anonymous sign-in since there's no initial token.///
-                await signInAnonymously(auth);
+                // This logic handles both the Canvas environment (with a token) and standalone deployment (anonymously)
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    console.log("Canvas environment detected. Signing in with custom token.");
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    console.log("Standalone environment detected. Signing in anonymously.");
+                    await signInAnonymously(auth);
+                }
             } catch (error) {
                 console.error("Authentication failed:", error);
-                // Show an error message to the user on the page
-                mainContent.innerHTML = `<div class="text-red-500 p-4 bg-red-100 rounded-md">Error: Could not authenticate with the server. Please refresh the page.</div>`;
+                let errorMessage = "Error: Could not authenticate with the server. Please refresh the page.";
+                if (error.code === 'auth/operation-not-allowed') {
+                    errorMessage = `
+                        <div class='text-center'>
+                            <h3 class='font-bold text-lg'>Authentication Error</h3>
+                            <p class='mt-2'>Anonymous sign-in is not enabled for this project.</p>
+                            <p class='mt-4 text-sm text-gray-600'>
+                                <strong>Action Required:</strong> Go to your Firebase project's Authentication settings, select the "Sign-in method" tab, and enable the "Anonymous" provider.
+                            </p>
+                        </div>`;
+                }
+                mainContent.innerHTML = `<div class="p-4 bg-red-100 rounded-md text-red-700">${errorMessage}</div>`;
             }
         };
 
@@ -647,4 +715,3 @@
     </script>
 </body>
 </html>
-
