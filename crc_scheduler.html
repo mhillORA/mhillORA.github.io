@@ -69,6 +69,20 @@
         .crc-calendar-day:hover .add-event-btn {
             opacity: 1;
         }
+        @media print {
+            body * {
+                visibility: hidden;
+            }
+            #print-area, #print-area * {
+                visibility: visible;
+            }
+            #print-area {
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 100%;
+            }
+        }
     </style>
      <script>
         // Apply theme as early as possible to prevent Flash of Unstyled Content (FOUC)
@@ -96,9 +110,12 @@
         </div>
     </div>
     <div class="p-4 sm:p-8">
-        <div class="flex justify-between items-center mb-6">
+        <div class="flex flex-wrap justify-between items-center mb-6 gap-4">
             <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">CRC Field Rep Scheduler</h2>
             <div class="flex items-center space-x-4">
+                 <button id="generate-report-btn" class="bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 transition-colors flex items-center">
+                    <i data-lucide="bar-chart-3" class="w-4 h-4 mr-2"></i>Generate Report
+                </button>
                  <button id="theme-toggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
                     <i data-lucide="sun" class="w-5 h-5 hidden dark:block"></i>
                     <i data-lucide="moon" class="w-5 h-5 block dark:hidden"></i>
@@ -182,7 +199,7 @@
             // Firebase Imports
             const { initializeApp } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js");
             const { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js");
-            const { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, setDoc, getDocs } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js");
+            const { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, setDoc, getDocs, writeBatch, query, where } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js");
 
             // User-provided Firebase Configuration
             const firebaseConfig = {
@@ -221,6 +238,7 @@
                 crc_events: [],
                 selectedCrcFilter: 'all',
                 selectedSiteFilter: 'all',
+                selectedRegionFilter: 'all',
                 initialLoadComplete: false,
             };
 
@@ -229,7 +247,6 @@
             // --- CORE FUNCTIONS ---
             const setState = (newState) => {
                 state = { ...state, ...newState };
-                // The main render function is now only called after the initial load is complete.
                 if (state.authReady && state.initialLoadComplete) {
                     window.requestAnimationFrame(() => {
                         render();
@@ -283,27 +300,37 @@
 
                 const crcOptions = state.crcs.map(crc => `<option value="${crc.id}">${crc.name}</option>`).join('');
                 const siteOptions = state.crc_sites.map(site => `<option value="${site.id}">${site.name}</option>`).join('');
+                const regions = [...new Set(state.crcs.map(crc => crc.region).filter(Boolean))];
+                const regionOptions = regions.map(region => `<option value="${region}">${region}</option>`).join('');
 
                 container.innerHTML = `
-                    <div class="flex flex-col sm:flex-row gap-4 p-4 bg-gray-50 dark:bg-gray-900/50 rounded-lg border dark:border-gray-700">
-                        <div class="flex-1">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 p-4 bg-gray-50 dark:bg-gray-900/50 rounded-lg border dark:border-gray-700">
+                        <div>
                             <label for="crc-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Filter by CRC</label>
                             <select id="crc-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                 <option value="all">All CRCs</option>
                                 ${crcOptions}
                             </select>
                         </div>
-                        <div class="flex-1">
+                        <div>
                             <label for="site-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Filter by Site</label>
                             <select id="site-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                 <option value="all">All Sites</option>
                                 ${siteOptions}
                             </select>
                         </div>
+                         <div>
+                            <label for="region-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Filter by Region</label>
+                            <select id="region-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="all">All Regions</option>
+                                ${regionOptions}
+                            </select>
+                        </div>
                     </div>
                 `;
                 document.getElementById('crc-filter').value = state.selectedCrcFilter;
                 document.getElementById('site-filter').value = state.selectedSiteFilter;
+                document.getElementById('region-filter').value = state.selectedRegionFilter;
             };
 
             const getCRCCalendarHTML = () => {
@@ -318,6 +345,11 @@
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
                 }
+                 if (state.selectedRegionFilter !== 'all') {
+                    const crcsInRegion = state.crcs.filter(c => c.region === state.selectedRegionFilter).map(c => c.id);
+                    filteredEvents = filteredEvents.filter(e => crcsInRegion.includes(e.crcId));
+                }
+
 
                 const monthName = now.toLocaleString('default', { month: 'long' });
                 const firstDayOfMonth = new Date(year, month, 1).getDay();
@@ -351,11 +383,18 @@
                     const eventTags = todaysEvents.map(event => {
                         const crc = state.crcs.find(c => c.id === event.crcId);
                         const eventColors = {
-                            'Site Assignment': 'bg-blue-500', 'Travel': 'bg-green-500', 'Paid Time Off': 'bg-purple-500',
+                            'Site Assignment': 'bg-blue-500', 
+                            'Travel Day': 'bg-orange-500', 
+                            'Paid Time Off': 'bg-purple-500',
+                            'Unavailable': 'bg-gray-500',
+                            'Open Shift': 'bg-red-500',
                         };
+                        let title = crc ? `${crc.name.split(' ')[0]}: ${event.type}` : `Open: ${event.type}`;
+                        if(event.role) title += ` (${event.role})`;
+
                         return `
-                            <div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag ${eventColors[event.type] || 'bg-gray-500'}">
-                                ${crc ? crc.name.split(' ')[0] : 'Unknown'}: ${event.type}
+                            <div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag ${eventColors[event.type] || 'bg-gray-500'}" title="${event.notes || title}">
+                                ${title}
                             </div>
                         `;
                     }).join('');
@@ -426,7 +465,7 @@
                 const utilizationHTML = state.crcs.map(crc => {
                     const eventsThisMonth = state.crc_events.filter(e => {
                         const eventDate = new Date(e.date);
-                        return e.crcId === crc.id && eventDate.getFullYear() === year && eventDate.getMonth() === month && e.type !== 'Paid Time Off';
+                        return e.crcId === crc.id && eventDate.getFullYear() === year && eventDate.getMonth() === month && e.type !== 'Paid Time Off' && e.type !== 'Unavailable';
                     }).length;
 
                     const utilizationPercent = workingDays > 0 ? Math.round((eventsThisMonth / workingDays) * 100) : 0;
@@ -470,32 +509,58 @@
                 const siteOptions = state.crc_sites.map(site => `<option value="${site.id}" ${isEditing && event.siteId === site.id ? 'selected' : ''}>${site.name}</option>`).join('');
 
                 return `
-                    <h2 class="text-2xl font-bold dark:text-white mb-4">${isEditing ? 'Edit' : 'Add'} CRC Event</h2>
-                    <form id="crc-event-form" data-event-id="${isEditing ? event.id : ''}" class="space-y-4">
-                        <input type="hidden" name="date" value="${date}">
-                        <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">CRC</label>
-                            <select name="crcId" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${crcOptions}</select>
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">${isEditing ? 'Edit' : 'Add'} CRC Event</h2>
+                    <form id="crc-event-form" data-event-id="${isEditing ? event.id : ''}" data-group-id="${event?.groupId || ''}" class="space-y-4">
+                        
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Start Date</label>
+                                <input type="date" name="startDate" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${event?.date || date}">
+                            </div>
+                             <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">End Date (Optional)</label>
+                                <input type="date" name="endDate" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${event?.date || date}">
+                            </div>
                         </div>
+
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Event Type</label>
                             <select id="crc-event-type" name="eventType" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                 <option ${isEditing && event.type === 'Site Assignment' ? 'selected' : ''}>Site Assignment</option>
-                                <option ${isEditing && event.type === 'Travel' ? 'selected' : ''}>Travel</option>
+                                <option ${isEditing && event.type === 'Travel Day' ? 'selected' : ''}>Travel Day</option>
                                 <option ${isEditing && event.type === 'Paid Time Off' ? 'selected' : ''}>Paid Time Off</option>
+                                <option ${isEditing && event.type === 'Unavailable' ? 'selected' : ''}>Unavailable</option>
+                                <option ${isEditing && event.type === 'Open Shift' ? 'selected' : ''}>Open Shift</option>
                             </select>
                         </div>
-                        <div id="crc-site-group" class="${!isEditing || (event.type !== 'Site Assignment' && event.type !== 'Travel') ? 'hidden' : ''}">
+
+                        <div id="crc-group">
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">CRC</label>
+                            <select name="crcId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${crcOptions}</select>
+                        </div>
+
+                        <div id="site-group" class="hidden">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Site</label>
                             <select name="siteId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${siteOptions}</select>
                         </div>
+                        
+                        <div id="role-group" class="hidden">
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Role</label>
+                            <select name="role" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="">Default</option>
+                                <option ${isEditing && event.role === 'Lead' ? 'selected' : ''}>Lead</option>
+                                <option ${isEditing && event.role === 'Support' ? 'selected' : ''}>Support</option>
+                                <option ${isEditing && event.role === 'Trainee' ? 'selected' : ''}>Trainee</option>
+                            </select>
+                        </div>
+
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Notes</label>
                             <textarea name="notes" rows="3" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${isEditing ? event.notes || '' : ''}</textarea>
                         </div>
                         <div class="flex justify-between items-center pt-4">
-                            ${isEditing ? `<button type="button" data-action="delete-crc-event" data-event-id="${event.id}" class="text-red-600 hover:underline">Delete Event</button>` : '<div></div>'}
-                            <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">${isEditing ? 'Save Changes' : 'Add Event'}</button>
+                            ${isEditing ? `<button type="button" data-action="delete-crc-event" data-event-id="${event.id}" data-group-id="${event.groupId || ''}" class="text-red-600 hover:underline">Delete Event</button>` : '<div></div>'}
+                            <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">${isEditing ? 'Save Changes' : 'Add Event(s)'}</button>
                         </div>
                     </form>
                 `;
@@ -573,23 +638,55 @@
                 const actionButton = e.target.closest('[data-action]');
                 if (!actionButton) return;
                 
-                const { action, id, date, eventId } = actionButton.dataset;
+                const { action, id, date, eventId, groupId } = actionButton.dataset;
                 const getCollectionRef = (name) => collection(db, `artifacts/${appId}/public/data/${name}`);
 
                 switch(action) {
                     case 'close-modal': closeModal(); break;
                     case 'prev-crc-month': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() - 1)) }); break;
                     case 'next-crc-month': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() + 1)) }); break;
-                    case 'open-crc-event-modal': openModal(getCRCEventModalHTML(date)); break;
+                    case 'open-crc-event-modal': 
+                        openModal(getCRCEventModalHTML(date));
+                        setTimeout(() => handleEventTypeChange(document.getElementById('crc-event-type')), 100);
+                        break;
                     case 'view-crc-event': {
                         const event = state.crc_events.find(e => e.id === eventId);
-                        if (event) openModal(getCRCEventModalHTML(event.date, event));
+                        if (event) {
+                            openModal(getCRCEventModalHTML(event.date, event));
+                            setTimeout(() => handleEventTypeChange(document.getElementById('crc-event-type')), 100);
+                        }
                         break;
                     }
                     case 'delete-crc': await deleteDoc(doc(getCollectionRef("crcs"), id)); break;
                     case 'delete-crc-site': await deleteDoc(doc(getCollectionRef("crc_sites"), id)); break;
                     case 'delete-crc-event': {
+                        if (groupId) {
+                            openModal(`
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Delete Event Series</h3>
+                                <p class="dark:text-gray-300 mb-6">This event is part of a series. Do you want to delete only this single event or the entire series?</p>
+                                <div class="flex justify-end gap-4">
+                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                    <button data-action="delete-single-event" data-event-id="${eventId}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Just This One</button>
+                                    <button data-action="delete-event-series" data-group-id="${groupId}" class="py-2 px-4 rounded-md bg-red-800 text-white hover:bg-red-900">Delete Entire Series</button>
+                                </div>
+                            `);
+                        } else {
+                            await deleteDoc(doc(getCollectionRef("crc_events"), eventId));
+                            closeModal();
+                        }
+                        break;
+                    }
+                     case 'delete-single-event': {
                         await deleteDoc(doc(getCollectionRef("crc_events"), eventId));
+                        closeModal();
+                        break;
+                    }
+                    case 'delete-event-series': {
+                        const q = query(getCollectionRef("crc_events"), where("groupId", "==", groupId));
+                        const querySnapshot = await getDocs(q);
+                        const batch = writeBatch(db);
+                        querySnapshot.forEach((doc) => batch.delete(doc.ref));
+                        await batch.commit();
                         closeModal();
                         break;
                     }
@@ -626,17 +723,37 @@
                     }
                     case 'crc-event-form': {
                         const eventId = form.dataset.eventId;
-                        const eventData = {
-                            crcId: data.crcId,
-                            date: data.date,
-                            type: data.eventType,
-                            siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel') ? data.siteId : null,
-                            notes: data.notes,
-                        };
-                        if (eventId) {
+                        const groupId = form.dataset.groupId || crypto.randomUUID();
+                        
+                        const startDate = new Date(data.startDate + 'T00:00:00');
+                        const endDate = new Date(data.endDate + 'T00:00:00');
+
+                        if (isEditing) { // Simple update for single day edit
+                             const eventData = {
+                                crcId: data.eventType === 'Open Shift' ? null : data.crcId,
+                                type: data.eventType,
+                                siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day') ? data.siteId : null,
+                                role: data.eventType === 'Site Assignment' ? data.role : null,
+                                notes: data.notes,
+                                date: data.startDate, // Keep original date on edit
+                            };
                             await updateDoc(doc(getCollectionRef("crc_events"), eventId), eventData);
-                        } else {
-                            await addDoc(getCollectionRef("crc_events"), eventData);
+                        } else { // Create new event(s)
+                            const batch = writeBatch(db);
+                            for (let d = startDate; d <= endDate; d.setDate(d.getDate() + 1)) {
+                                const dateStr = d.toISOString().split('T')[0];
+                                const newEventRef = doc(collection(getCollectionRef("crc_events")));
+                                batch.set(newEventRef, {
+                                    groupId,
+                                    crcId: data.eventType === 'Open Shift' ? null : data.crcId,
+                                    type: data.eventType,
+                                    siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day') ? data.siteId : null,
+                                    role: data.eventType === 'Site Assignment' ? data.role : null,
+                                    notes: data.notes,
+                                    date: dateStr,
+                                });
+                            }
+                            await batch.commit();
                         }
                         closeModal();
                         break;
@@ -668,16 +785,33 @@
                     }
                 }
             });
+
+            const handleEventTypeChange = (target) => {
+                const crcGroup = document.getElementById('crc-group');
+                const siteGroup = document.getElementById('site-group');
+                const roleGroup = document.getElementById('role-group');
+                
+                const show = (el) => el.classList.remove('hidden');
+                const hide = (el) => el.classList.add('hidden');
+
+                switch(target.value) {
+                    case 'Site Assignment':
+                        show(crcGroup); show(siteGroup); show(roleGroup); break;
+                    case 'Travel Day':
+                        show(crcGroup); show(siteGroup); hide(roleGroup); break;
+                    case 'Paid Time Off':
+                    case 'Unavailable':
+                        show(crcGroup); hide(siteGroup); hide(roleGroup); break;
+                    case 'Open Shift':
+                        hide(crcGroup); show(siteGroup); show(roleGroup); break;
+                    default:
+                        show(crcGroup); hide(siteGroup); hide(roleGroup);
+                }
+            };
             
              document.addEventListener('change', (e) => {
                 if (e.target.id === 'crc-event-type') {
-                    const siteGroup = document.getElementById('crc-site-group');
-                    if (e.target.value === 'Site Assignment' || e.target.value === 'Travel') {
-                        siteGroup.classList.remove('hidden');
-                    } else {
-                        siteGroup.classList.add('hidden');
-                        siteGroup.querySelector('select').value = '';
-                    }
+                    handleEventTypeChange(e.target);
                 }
                 if (e.target.id === 'crc-filter') {
                     setState({ selectedCrcFilter: e.target.value });
@@ -685,7 +819,81 @@
                 if (e.target.id === 'site-filter') {
                     setState({ selectedSiteFilter: e.target.value });
                 }
+                 if (e.target.id === 'region-filter') {
+                    setState({ selectedRegionFilter: e.target.value });
+                }
             });
+            
+             document.getElementById('generate-report-btn').addEventListener('click', () => {
+                const now = state.crcCalendarDate;
+                const monthName = now.toLocaleString('default', { month: 'long', year: 'numeric' });
+                
+                let reportData = {};
+
+                state.crcs.forEach(crc => {
+                    reportData[crc.id] = {
+                        name: crc.name,
+                        assignments: 0,
+                        travelDays: 0,
+                        pto: 0,
+                        unavailable: 0
+                    };
+                });
+
+                let openShifts = 0;
+
+                state.crc_events.filter(e => {
+                    const eventDate = new Date(e.date);
+                    return eventDate.getMonth() === now.getMonth() && eventDate.getFullYear() === now.getFullYear();
+                }).forEach(event => {
+                    if (event.type === 'Open Shift') {
+                        openShifts++;
+                    } else if (reportData[event.crcId]) {
+                        if (event.type === 'Site Assignment') reportData[event.crcId].assignments++;
+                        if (event.type === 'Travel Day') reportData[event.crcId].travelDays++;
+                        if (event.type === 'Paid Time Off') reportData[event.crcId].pto++;
+                        if (event.type === 'Unavailable') reportData[event.crcId].unavailable++;
+                    }
+                });
+
+                const tableRows = Object.values(reportData).map(crc => `
+                    <tr class="border-b dark:border-gray-700">
+                        <td class="py-2 px-4 font-medium">${crc.name}</td>
+                        <td class="py-2 px-4 text-center">${crc.assignments}</td>
+                        <td class="py-2 px-4 text-center">${crc.travelDays}</td>
+                        <td class="py-2 px-4 text-center">${crc.pto}</td>
+                        <td class="py-2 px-4 text-center">${crc.unavailable}</td>
+                    </tr>
+                `).join('');
+
+                const reportHTML = `
+                    <div id="print-area">
+                        <h2 class="text-2xl font-bold dark:text-white mb-2">Monthly Report: ${monthName}</h2>
+                        <p class="text-sm text-gray-500 dark:text-gray-400 mb-6">This report summarizes all activities for the selected month.</p>
+                        
+                        <table class="w-full text-left text-sm">
+                            <thead class="bg-gray-100 dark:bg-gray-700">
+                                <tr>
+                                    <th class="py-2 px-4">CRC</th>
+                                    <th class="py-2 px-4 text-center">Site Assignments</th>
+                                    <th class="py-2 px-4 text-center">Travel Days</th>
+                                    <th class="py-2 px-4 text-center">PTO Days</th>
+                                    <th class="py-2 px-4 text-center">Unavailable Days</th>
+                                </tr>
+                            </thead>
+                            <tbody>${tableRows}</tbody>
+                        </table>
+                        <div class="mt-6">
+                            <h3 class="font-semibold dark:text-white">Total Open Shifts this month: ${openShifts}</h3>
+                        </div>
+                    </div>
+                    <div class="flex justify-end mt-8">
+                        <button onclick="window.print()" class="bg-blue-600 text-white py-2 px-4 rounded-md">Print Report</button>
+                    </div>
+                `;
+                openModal(reportHTML, true);
+            });
+
 
             // --- INITIALIZATION ---
             const setupRealtimeListeners = () => {
@@ -732,7 +940,6 @@
                         initialLoadComplete: true
                     });
                     
-                    // Now that initial data is loaded, set up listeners for real-time updates
                     setupRealtimeListeners();
 
                 } catch (error) {
@@ -763,12 +970,11 @@
                 onAuthStateChanged(auth, (user) => {
                     if (user) {
                         if (!state.authReady) {
-                            state.authReady = true; // Set authReady immediately
+                            state.authReady = true;
                             state.userId = user.uid;
                             performInitialLoad();
                         }
                     } else {
-                        // If user is not signed in, stop loading and show message.
                         loadingMessage.textContent = 'Not Signed In';
                         loadingError.textContent = 'Please sign in to use the scheduler.';
                     }
