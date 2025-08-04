@@ -84,12 +84,15 @@
 </head>
 <body class="bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
     <div id="loading-overlay" class="fixed inset-0 bg-gray-100 dark:bg-gray-900 z-[100] flex items-center justify-center">
-        <div class="flex items-center space-x-2">
-            <svg class="animate-spin h-8 w-8 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-            </svg>
-            <span class="text-xl font-medium text-gray-700 dark:text-gray-300">Loading Scheduler...</span>
+        <div class="text-center">
+            <div class="flex items-center justify-center space-x-2">
+                <svg class="animate-spin h-8 w-8 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span id="loading-message" class="text-xl font-medium text-gray-700 dark:text-gray-300">Loading Scheduler...</span>
+            </div>
+            <p id="loading-error" class="mt-4 text-red-500"></p>
         </div>
     </div>
     <div class="p-4 sm:p-8">
@@ -184,6 +187,8 @@
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'crc-scheduler-app';
         let firebaseConfig = {};
         const loadingOverlay = document.getElementById('loading-overlay');
+        const loadingMessage = document.getElementById('loading-message');
+        const loadingError = document.getElementById('loading-error');
 
         try {
             firebaseConfig = JSON.parse(firebaseConfigStr);
@@ -192,7 +197,8 @@
             }
         } catch (e) {
             console.error("Invalid Firebase configuration:", e);
-            loadingOverlay.innerHTML = `<div class="p-8 text-red-500 text-center"><strong>Error:</strong> Invalid or missing Firebase configuration. Please ensure the app is set up correctly.<br><small>${e.message}</small></div>`;
+            loadingMessage.textContent = 'Configuration Error';
+            loadingError.innerHTML = `<strong>Error:</strong> Invalid or missing Firebase configuration. Please ensure the app is set up correctly.<br><small>${e.message}</small>`;
             return; // Stop execution if config is bad
         }
 
@@ -220,11 +226,9 @@
         const setState = (newState) => {
             state = { ...state, ...newState };
             window.requestAnimationFrame(() => {
-                if (!state.authReady) return; // Don't render if not authenticated
+                if (!state.authReady || !state.initialLoadComplete) return;
                 render();
-                if (state.initialLoadComplete && loadingOverlay) {
-                    loadingOverlay.style.display = 'none';
-                }
+                loadingOverlay.style.display = 'none';
             });
         };
 
@@ -680,33 +684,56 @@
         // --- INITIALIZATION ---
         const setupRealtimeListeners = () => {
             const collectionsToWatch = ["crcs", "crc_sites", "crc_events"];
-            let loadedCollections = 0;
-
             collectionsToWatch.forEach(colName => {
                 const collectionRef = collection(db, `artifacts/${appId}/public/data/${colName}`);
                 onSnapshot(collectionRef, (snapshot) => {
                     const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                     if (data.length > 0 && data[0].name) {
+                    if (data.length > 0 && data[0].name) {
                         data.sort((a, b) => a.name.localeCompare(b.name));
                     }
-                    
-                    const update = { [colName]: data };
-
-                    if (!state.initialLoadComplete) {
-                        state = {...state, ...update}; // Manually update state before initial render
-                        loadedCollections++;
-                        if (loadedCollections === collectionsToWatch.length) {
-                             setState({ initialLoadComplete: true });
-                        }
-                    } else {
-                        setState(update);
-                    }
-
+                    setState({ [colName]: data });
                 }, (error) => {
-                    console.error(`Error fetching ${colName}:`, error);
-                    loadingOverlay.innerHTML = `<div class="p-8 text-red-500 text-center"><strong>Error:</strong> Could not fetch data from the database. Please check Firestore security rules and network connection.</div>`;
+                    console.error(`Realtime listener error for ${colName}:`, error);
                 });
             });
+        };
+        
+        const performInitialLoad = async () => {
+            const collectionsToFetch = {
+                crcs: collection(db, `artifacts/${appId}/public/data/crcs`),
+                crc_sites: collection(db, `artifacts/${appId}/public/data/crc_sites`),
+                crc_events: collection(db, `artifacts/${appId}/public/data/crc_events`),
+            };
+
+            try {
+                const [crcsSnapshot, sitesSnapshot, eventsSnapshot] = await Promise.all([
+                    getDocs(collectionsToFetch.crcs),
+                    getDocs(collectionsToFetch.crc_sites),
+                    getDocs(collectionsToFetch.crc_events),
+                ]);
+
+                const crcs = crcsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                const crc_sites = sitesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                const crc_events = eventsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                
+                crcs.sort((a, b) => a.name.localeCompare(b.name));
+                crc_sites.sort((a, b) => a.name.localeCompare(b.name));
+
+                setState({
+                    crcs,
+                    crc_sites,
+                    crc_events,
+                    initialLoadComplete: true
+                });
+                
+                // Now that initial data is loaded, set up listeners for real-time updates
+                setupRealtimeListeners();
+
+            } catch (error) {
+                console.error("Error during initial data load:", error);
+                loadingMessage.textContent = 'Data Load Error';
+                loadingError.innerHTML = `<strong>Error:</strong> Could not fetch initial data from the database. This might be due to Firestore security rules or a network issue. Please check the console for details.`;
+            }
         };
 
         const setupThemeToggle = () => {
@@ -719,7 +746,7 @@
                     document.documentElement.classList.add('dark');
                     localStorage.setItem('theme', 'dark');
                 }
-                lucide.createIcons(); // Re-render icons if they change
+                lucide.createIcons();
             });
         };
 
@@ -730,17 +757,18 @@
             onAuthStateChanged(auth, (user) => {
                 if (user) {
                     if (!state.authReady) {
-                        state.authReady = true;
-                        state.userId = user.uid;
-                        setupRealtimeListeners();
+                        setState({ authReady: true, userId: user.uid });
+                        performInitialLoad();
                     }
                 } else {
-                    setState({ authReady: false, userId: null, crcs: [], crc_sites: [], crc_events: [] });
-                    loadingOverlay.innerHTML = `<div class="p-8 text-yellow-500 text-center">Not signed in.</div>`;
+                    setState({ authReady: false, userId: null, initialLoadComplete: true, crcs: [], crc_sites: [], crc_events: [] });
+                    loadingMessage.textContent = 'Not Signed In';
+                    loadingError.textContent = 'Please sign in to use the scheduler.';
                 }
             });
 
             try {
+                loadingMessage.textContent = 'Authenticating...';
                 const token = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
                 if (token) {
                     await signInWithCustomToken(auth, token);
@@ -749,7 +777,8 @@
                 }
             } catch (error) {
                 console.error("Authentication failed:", error);
-                loadingOverlay.innerHTML = `<div class="p-8 text-red-500 text-center"><strong>Error:</strong> Could not authenticate with the database.<br><small>${error.message}</small></div>`;
+                loadingMessage.textContent = 'Authentication Error';
+                loadingError.innerHTML = `<strong>Error:</strong> Could not authenticate with the database.<br><small>${error.message}</small>`;
             }
         };
 
