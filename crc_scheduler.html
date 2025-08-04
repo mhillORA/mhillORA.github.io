@@ -73,19 +73,38 @@
      <script>
         // Apply theme as early as possible to prevent Flash of Unstyled Content (FOUC)
         (function() {
-            // For this example, we'll default to the light theme.
-            document.documentElement.classList.remove('dark');
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                document.documentElement.classList.add('dark');
+            } else {
+                document.documentElement.classList.remove('dark');
+            }
         })();
     </script>
 </head>
 <body class="bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+    <div id="loading-overlay" class="fixed inset-0 bg-gray-100 dark:bg-gray-900 z-[100] flex items-center justify-center">
+        <div class="flex items-center space-x-2">
+            <svg class="animate-spin h-8 w-8 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <span class="text-xl font-medium text-gray-700 dark:text-gray-300">Loading Scheduler...</span>
+        </div>
+    </div>
     <div class="p-4 sm:p-8">
         <div class="flex justify-between items-center mb-6">
             <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">CRC Field Rep Scheduler</h2>
-            <a href="#" class="text-blue-600 dark:text-blue-400 hover:underline flex items-center" onclick="alert('Navigate back to Main Dashboard'); return false;">
-                <i data-lucide="arrow-left" class="w-4 h-4 mr-2"></i>
-                Back to Main Dashboard
-            </a>
+            <div class="flex items-center space-x-4">
+                 <button id="theme-toggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
+                    <i data-lucide="sun" class="w-5 h-5 hidden dark:block"></i>
+                    <i data-lucide="moon" class="w-5 h-5 block dark:hidden"></i>
+                </button>
+                <a href="#" class="text-blue-600 dark:text-blue-400 hover:underline flex items-center" onclick="alert('Navigate back to Main Dashboard'); return false;">
+                    <i data-lucide="arrow-left" class="w-4 h-4 mr-2"></i>
+                    Back to Main Dashboard
+                </a>
+            </div>
         </div>
         <div class="flex flex-col lg:flex-row gap-8">
             <!-- Sidebar for Controls -->
@@ -161,8 +180,19 @@
         import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, setDoc, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // IMPORTANT: Replace with your actual Firebase configuration
-        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'crc-scheduler-app';
+        let firebaseConfig = {};
+        try {
+            firebaseConfig = JSON.parse(firebaseConfigStr);
+            if (!firebaseConfig.apiKey) {
+                throw new Error("Firebase config is missing API key.");
+            }
+        } catch (e) {
+            console.error("Invalid Firebase configuration:", e);
+            document.getElementById('loading-overlay').innerHTML = `<div class="p-8 text-red-500 text-center">Error: Invalid or missing Firebase configuration. Please check your setup.</div>`;
+            return; // Stop execution if config is bad
+        }
 
         // Initialize Firebase
         const app = initializeApp(firebaseConfig);
@@ -179,14 +209,21 @@
             crc_events: [],
             selectedCrcFilter: 'all',
             selectedSiteFilter: 'all',
+            initialLoadComplete: false,
         };
 
         const modalContainer = document.getElementById('modal-container');
+        const loadingOverlay = document.getElementById('loading-overlay');
 
         // --- CORE FUNCTIONS ---
         const setState = (newState) => {
             state = { ...state, ...newState };
-            render();
+            window.requestAnimationFrame(() => {
+                render();
+                if (state.initialLoadComplete && loadingOverlay) {
+                    loadingOverlay.style.display = 'none';
+                }
+            });
         };
 
         const render = () => {
@@ -254,7 +291,6 @@
                     </div>
                 </div>
             `;
-            // Persist dropdown selection after re-render
             document.getElementById('crc-filter').value = state.selectedCrcFilter;
             document.getElementById('site-filter').value = state.selectedSiteFilter;
         };
@@ -264,7 +300,6 @@
             const year = now.getFullYear();
             const month = now.getMonth();
 
-            // Filter events based on supervisor selections
             let filteredEvents = state.crc_events;
             if (state.selectedCrcFilter !== 'all') {
                 filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
@@ -644,6 +679,8 @@
         // --- INITIALIZATION ---
         const setupRealtimeListeners = () => {
             const collectionsToWatch = ["crcs", "crc_sites", "crc_events"];
+            let loadedCollections = 0;
+
             collectionsToWatch.forEach(colName => {
                 const collectionRef = collection(db, `artifacts/${appId}/public/data/${colName}`);
                 onSnapshot(collectionRef, (snapshot) => {
@@ -651,24 +688,53 @@
                      if (data.length > 0 && data[0].name) {
                         data.sort((a, b) => a.name.localeCompare(b.name));
                     }
-                    setState({ [colName]: data });
+                    
+                    // This is a bit of a trick to update state without causing multiple re-renders
+                    state[colName] = data;
+                    
+                    if (!state.initialLoadComplete) {
+                        loadedCollections++;
+                        if (loadedCollections === collectionsToWatch.length) {
+                             setState({ initialLoadComplete: true });
+                        }
+                    } else {
+                        // If initial load is done, just trigger a re-render
+                        setState({});
+                    }
+
+                }, (error) => {
+                    console.error(`Error fetching ${colName}:`, error);
+                    loadingOverlay.innerHTML = `<div class="p-8 text-red-500 text-center">Error: Could not fetch data from the database. Please check Firestore security rules and network connection.</div>`;
                 });
+            });
+        };
+
+        const setupThemeToggle = () => {
+            const themeToggle = document.getElementById('theme-toggle');
+            themeToggle.addEventListener('click', () => {
+                if (document.documentElement.classList.contains('dark')) {
+                    document.documentElement.classList.remove('dark');
+                    localStorage.setItem('theme', 'light');
+                } else {
+                    document.documentElement.classList.add('dark');
+                    localStorage.setItem('theme', 'dark');
+                }
+                lucide.createIcons(); // Re-render icons if they change
             });
         };
 
         const init = async () => {
             lucide.createIcons();
+            setupThemeToggle();
+            
             onAuthStateChanged(auth, (user) => {
                 if (user) {
                     if (!state.authReady) {
-                        state.userId = user.uid;
-                        state.authReady = true;
+                        setState({ userId: user.uid, authReady: true });
                         setupRealtimeListeners();
                     }
                 } else {
-                    state.authReady = false;
-                    state.userId = null;
-                    setState({ crcs: [], crc_sites: [], crc_events: [] });
+                    setState({ authReady: false, userId: null, crcs: [], crc_sites: [], crc_events: [] });
                 }
             });
 
@@ -681,7 +747,7 @@
                 }
             } catch (error) {
                 console.error("Authentication failed:", error);
-                document.body.innerHTML = `<div class="p-8 text-red-500">Error: Could not connect to the database. Authentication failed. Please check your Firebase setup. Details: ${error.message}</div>`;
+                loadingOverlay.innerHTML = `<div class="p-8 text-red-500">Error: Could not connect to the database. Authentication failed. Details: ${error.message}</div>`;
             }
         };
 
