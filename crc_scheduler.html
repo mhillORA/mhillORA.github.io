@@ -261,6 +261,9 @@
                 initialLoadComplete: false,
             };
 
+            // --- Temporary storage for event data during confirmation modals ---
+            let tempEventData = {};
+
             const modalContainer = document.getElementById('modal-container');
 
             // --- CORE FUNCTIONS ---
@@ -306,7 +309,6 @@
                 modalContainer.classList.remove('hidden');
                 lucide.createIcons();
 
-                // Add event listener for the print button if it exists in the modal
                 const printButton = modalContainer.querySelector('[data-action="print-report"]');
                 if (printButton) {
                     printButton.addEventListener('click', () => window.print());
@@ -678,7 +680,6 @@
                 const mapFrame = document.getElementById('mapFrame');
                 if (!mapFrame || !window.google) return;
 
-                // Do not attempt to load map if the key is a placeholder
                 const apiKey = "YOUR_API_KEY"; 
                 if (apiKey === "YOUR_API_KEY") {
                     mapFrame.src = "";
@@ -890,6 +891,55 @@
                         if (crc) openModal(getCRCProfileModalHTML(crc), true);
                         break;
                     }
+                    case 'update-single-event': {
+                        const eventData = {
+                            type: tempEventData.eventType,
+                            crcId: tempEventData.eventType === 'Open Shift' ? null : tempEventData.crcId,
+                            siteId: (tempEventData.eventType === 'Site Assignment' || tempEventData.eventType === 'Travel Day' || tempEventData.eventType === 'Open Shift') ? tempEventData.siteId : null,
+                            role: tempEventData.eventType === 'Site Assignment' ? (tempEventData.role || null) : null,
+                            notes: tempEventData.notes || '',
+                            date: tempEventData.startDate,
+                            groupId: null // Becomes a standalone event
+                        };
+                        await updateDoc(doc(getCollectionRef("crc_events"), eventId), eventData);
+                        closeModal();
+                        break;
+                    }
+                    case 'update-event-series': {
+                        const q = query(getCollectionRef("crc_events"), where("groupId", "==", groupId));
+                        const querySnapshot = await getDocs(q);
+                        const deleteBatch = writeBatch(db);
+                        querySnapshot.forEach((doc) => deleteBatch.delete(doc.ref));
+                        await deleteBatch.commit();
+
+                        const createBatch = writeBatch(db);
+                        const startDate = new Date(tempEventData.startDate + 'T00:00:00');
+                        const endDate = tempEventData.endDate ? new Date(tempEventData.endDate + 'T00:00:00') : new Date(startDate);
+                        let currentDate = new Date(startDate);
+                        const crcEventsRef = getCollectionRef("crc_events");
+
+                        const eventData = {
+                            type: tempEventData.eventType,
+                            crcId: tempEventData.eventType === 'Open Shift' ? null : tempEventData.crcId,
+                            siteId: (tempEventData.eventType === 'Site Assignment' || tempEventData.eventType === 'Travel Day' || tempEventData.eventType === 'Open Shift') ? tempEventData.siteId : null,
+                            role: tempEventData.eventType === 'Site Assignment' ? (tempEventData.role || null) : null,
+                            notes: tempEventData.notes || '',
+                        };
+
+                        while (currentDate <= endDate) {
+                            const dateStr = currentDate.toISOString().split('T')[0];
+                            const newEventRef = doc(crcEventsRef);
+                            createBatch.set(newEventRef, {
+                                ...eventData,
+                                groupId,
+                                date: dateStr,
+                            });
+                            currentDate.setDate(currentDate.getDate() + 1);
+                        }
+                        await createBatch.commit();
+                        closeModal();
+                        break;
+                    }
                 }
             });
 
@@ -918,11 +968,10 @@
                     }
                     case 'crc-event-form': {
                         const eventId = form.dataset.eventId;
-                        const groupId = form.dataset.groupId || crypto.randomUUID();
+                        const isEditing = !!eventId;
                         const errorMessageDiv = document.getElementById('form-error-message');
                         if(errorMessageDiv) errorMessageDiv.textContent = '';
-
-                        // --- Improved Validation ---
+                        
                         const eventType = data.eventType;
                         if ((eventType === 'Site Assignment' || eventType === 'Travel Day' || eventType === 'Paid Time Off' || eventType === 'Unavailable') && !data.crcId) {
                             if(errorMessageDiv) errorMessageDiv.textContent = 'A CRC must be selected for this event type.';
@@ -944,26 +993,50 @@
                             if(errorMessageDiv) errorMessageDiv.textContent = 'End date cannot be before start date.';
                             return;
                         }
-                        
-                        const isEditing = !!eventId;
-
-                        const eventData = {
-                            type: data.eventType,
-                            crcId: data.eventType === 'Open Shift' ? null : data.crcId,
-                            siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day' || data.eventType === 'Open Shift') ? data.siteId : null,
-                            role: data.eventType === 'Site Assignment' ? (data.role || null) : null,
-                            notes: data.notes || '',
-                        };
 
                         if (isEditing) {
-                            await updateDoc(doc(getCollectionRef("crc_events"), eventId), { ...eventData, date: data.startDate });
+                            const originalEvent = state.crc_events.find(e => e.id === eventId);
+                            const groupId = originalEvent?.groupId;
+
+                            tempEventData = { ...data };
+
+                            if (groupId) {
+                                openModal(`
+                                    <h3 class="text-xl font-bold dark:text-white mb-4">Edit Event Series</h3>
+                                    <p class="dark:text-gray-300 mb-6">This event is part of a series. Do you want to update only this single event (making it independent) or the entire series?</p>
+                                    <div class="flex justify-end gap-4">
+                                        <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                        <button data-action="update-single-event" data-event-id="${eventId}" class="py-2 px-4 rounded-md bg-blue-600 text-white hover:bg-blue-700">Update Just This One</button>
+                                        <button data-action="update-event-series" data-group-id="${groupId}" class="py-2 px-4 rounded-md bg-blue-800 text-white hover:bg-blue-900">Update Entire Series</button>
+                                    </div>
+                                `);
+                            } else {
+                                const eventData = {
+                                    type: data.eventType,
+                                    crcId: data.eventType === 'Open Shift' ? null : data.crcId,
+                                    siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day' || data.eventType === 'Open Shift') ? data.siteId : null,
+                                    role: data.eventType === 'Site Assignment' ? (data.role || null) : null,
+                                    notes: data.notes || '',
+                                    date: data.startDate,
+                                };
+                                await updateDoc(doc(getCollectionRef("crc_events"), eventId), eventData);
+                                closeModal();
+                            }
                         } else {
+                            const groupId = crypto.randomUUID();
                             const batch = writeBatch(db);
                             let currentDate = new Date(startDate);
-                            const crcEventsRef = getCollectionRef("crc_events"); // Get collection reference once
+                            const crcEventsRef = getCollectionRef("crc_events");
+                            const eventData = {
+                                type: data.eventType,
+                                crcId: data.eventType === 'Open Shift' ? null : data.crcId,
+                                siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day' || data.eventType === 'Open Shift') ? data.siteId : null,
+                                role: data.eventType === 'Site Assignment' ? (data.role || null) : null,
+                                notes: data.notes || '',
+                            };
                             while (currentDate <= endDate) {
                                 const dateStr = currentDate.toISOString().split('T')[0];
-                                const newEventRef = doc(crcEventsRef); // Create new doc ref in the collection
+                                const newEventRef = doc(crcEventsRef);
                                 batch.set(newEventRef, {
                                     ...eventData,
                                     groupId,
@@ -972,8 +1045,8 @@
                                 currentDate.setDate(currentDate.getDate() + 1);
                             }
                             await batch.commit();
+                            closeModal();
                         }
-                        closeModal();
                         break;
                     }
                     case 'edit-crc-form': {
