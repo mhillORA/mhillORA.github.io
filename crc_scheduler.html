@@ -727,6 +727,7 @@
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Notes</label>
                             <textarea name="notes" rows="3" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${isEditing ? event.notes || '' : ''}</textarea>
                         </div>
+                        <div id="form-error-message" class="text-red-500 text-sm h-4"></div>
                         <div class="flex justify-between items-center pt-4">
                             ${isEditing ? `<button type="button" data-action="delete-crc-event" data-event-id="${event.id}" data-group-id="${event.groupId || ''}" class="text-red-600 hover:underline">Delete Event</button>` : '<div></div>'}
                             <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">${isEditing ? 'Save Changes' : 'Add Event(s)'}</button>
@@ -896,34 +897,44 @@
                     case 'crc-event-form': {
                         const eventId = form.dataset.eventId;
                         const groupId = form.dataset.groupId || crypto.randomUUID();
-                        
+                        const errorMessageDiv = document.getElementById('form-error-message');
+                        if(errorMessageDiv) errorMessageDiv.textContent = '';
+
+                        // FIX: Validate dates and handle empty end date
+                        if (!data.startDate) {
+                            if(errorMessageDiv) errorMessageDiv.textContent = 'Start date is required.';
+                            return;
+                        }
                         const startDate = new Date(data.startDate + 'T00:00:00');
-                        const endDate = new Date(data.endDate + 'T00:00:00');
+                        const endDate = data.endDate ? new Date(data.endDate + 'T00:00:00') : new Date(startDate);
+
+                        if (endDate < startDate) {
+                            if(errorMessageDiv) errorMessageDiv.textContent = 'End date cannot be before start date.';
+                            return;
+                        }
+                        
                         const isEditing = !!eventId;
 
-                        if (isEditing) { // Simple update for single day edit
-                             const eventData = {
-                                crcId: data.eventType === 'Open Shift' ? null : data.crcId,
-                                type: data.eventType,
-                                siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day') ? data.siteId : null,
-                                role: data.eventType === 'Site Assignment' ? data.role : null,
-                                notes: data.notes,
-                                date: data.startDate, // Keep original date on edit
-                            };
-                            await updateDoc(doc(getCollectionRef("crc_events"), eventId), eventData);
-                        } else { // Create new event(s)
+                        // FIX: Make data handling more robust by checking for undefined values
+                        const eventData = {
+                            type: data.eventType,
+                            crcId: data.eventType === 'Open Shift' ? null : (data.crcId || null),
+                            siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day') ? (data.siteId || null) : null,
+                            role: data.eventType === 'Site Assignment' ? (data.role || null) : null,
+                            notes: data.notes || '',
+                        };
+
+                        if (isEditing) {
+                            await updateDoc(doc(getCollectionRef("crc_events"), eventId), { ...eventData, date: data.startDate });
+                        } else {
                             const batch = writeBatch(db);
                             let currentDate = new Date(startDate);
                             while (currentDate <= endDate) {
                                 const dateStr = currentDate.toISOString().split('T')[0];
                                 const newEventRef = doc(collection(getCollectionRef("crc_events")));
                                 batch.set(newEventRef, {
+                                    ...eventData,
                                     groupId,
-                                    crcId: data.eventType === 'Open Shift' ? null : data.crcId,
-                                    type: data.eventType,
-                                    siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day') ? data.siteId : null,
-                                    role: data.eventType === 'Site Assignment' ? data.role : null,
-                                    notes: data.notes,
                                     date: dateStr,
                                 });
                                 currentDate.setDate(currentDate.getDate() + 1);
@@ -1088,48 +1099,25 @@
             };
             
             const performInitialLoad = async () => {
-                const sitesCollectionRef = collection(db, `artifacts/${appId}/public/data/crc_sites`);
-                const sitesSnapshot = await getDocs(sitesCollectionRef);
-                
-                if (sitesSnapshot.empty) {
-                    loadingMessage.textContent = 'Populating initial NASA sites...';
-                    const nasaSites = [
-                        { name: "Ames Research Center", address: "Moffett Field, CA" },
-                        { name: "Armstrong Flight Research Center", address: "Edwards, CA" },
-                        { name: "Glenn Research Center", address: "Cleveland, OH" },
-                        { name: "Goddard Space Flight Center", address: "Greenbelt, MD" },
-                        { name: "Jet Propulsion Laboratory", address: "Pasadena, CA" },
-                        { name: "Johnson Space Center", address: "Houston, TX" },
-                        { name: "Kennedy Space Center", address: "Merritt Island, FL" },
-                        { name: "Langley Research Center", address: "Hampton, VA" },
-                        { name: "Marshall Space Flight Center", address: "Huntsville, AL" },
-                        { name: "Stennis Space Center", address: "Hancock County, MS" },
-                        { name: "Wallops Flight Facility", address: "Wallops Island, VA" },
-                        { name: "White Sands Test Facility", address: "Las Cruces, NM" }
-                    ];
-                    const batch = writeBatch(db);
-                    nasaSites.forEach(site => {
-                        const newSiteRef = doc(sitesCollectionRef);
-                        batch.set(newSiteRef, site);
-                    });
-                    await batch.commit();
-                }
+                // FIX: Removed the logic that populates initial sites.
+                // The app now assumes that the 'crc_sites' collection already contains the necessary data.
+                loadingMessage.textContent = 'Loading data from database...';
 
                 const collectionsToFetch = {
                     crcs: collection(db, `artifacts/${appId}/public/data/crcs`),
-                    crc_sites: sitesCollectionRef, // Use the same ref
+                    crc_sites: collection(db, `artifacts/${appId}/public/data/crc_sites`),
                     crc_events: collection(db, `artifacts/${appId}/public/data/crc_events`),
                 };
 
                 try {
-                    const [crcsSnapshot, finalSitesSnapshot, eventsSnapshot] = await Promise.all([
+                    const [crcsSnapshot, sitesSnapshot, eventsSnapshot] = await Promise.all([
                         getDocs(collectionsToFetch.crcs),
                         getDocs(collectionsToFetch.crc_sites),
                         getDocs(collectionsToFetch.crc_events),
                     ]);
 
                     const crcs = crcsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    const crc_sites = finalSitesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    const crc_sites = sitesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     const crc_events = eventsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     
                     if (crcs.length > 0 && crcs[0].name) crcs.sort((a, b) => a.name.localeCompare(b.name));
