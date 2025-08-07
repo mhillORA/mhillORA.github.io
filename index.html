@@ -137,7 +137,7 @@
         // Use latest Firebase SDKs
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, setDoc, deleteDoc, serverTimestamp, query, where, getDocs, arrayUnion, increment, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, setDoc, deleteDoc, serverTimestamp, query, where, getDocs, arrayUnion, arrayRemove, increment, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- Firebase Configuration ---
         const firebaseConfig = {
@@ -669,6 +669,8 @@
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site</label><select name="siteId" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"><option value="">Select a Site</option>${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
                             <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Study</label><select name="studyId" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"><option value="">Select a Study</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
+                            <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Schedule Name/Type</label><input type="text" name="scheduleType" required placeholder="e.g., Visit 1" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"/></div>
+                            <div></div>
                             <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Start Date</label><input type="date" name="startDate" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"/></div>
                             <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">End Date</label><input type="date" name="endDate" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"/></div>
                         </div>
@@ -688,7 +690,7 @@
                         const totalCapacity = s.slots.reduce((sum, slot) => sum + slot.capacity, 0);
                         const totalBooked = s.slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
                         const availableSlots = totalCapacity - totalBooked;
-                        return `<div class="p-4 border dark:border-gray-700 rounded-lg dark:text-gray-300"><h4 class="font-bold">${state.studies.find(study => study.id == s.studyId)?.title || 'N/A'} at ${state.sites.find(site => site.id == s.siteId)?.name || 'N/A'}</h4><p>${availableSlots} of ${totalCapacity} total slots available.</p></div>`
+                        return `<div class="p-4 border dark:border-gray-700 rounded-lg dark:text-gray-300"><h4 class="font-bold">${s.scheduleType || 'Schedule'} - ${state.studies.find(study => study.id == s.studyId)?.title || 'N/A'} at ${state.sites.find(site => site.id == s.siteId)?.name || 'N/A'}</h4><p>${availableSlots} of ${totalCapacity} total slots available.</p></div>`
                     }).join('')}</div>
                 </div>
             `;
@@ -768,7 +770,7 @@
             let appointmentHTML = '<p><strong>Appointment:</strong> Not Scheduled</p>';
             if (patient.appointment) {
                 appointmentHTML = `
-                    <p><strong>Appointment:</strong> ${new Date(patient.appointment.time).toLocaleString()}</p>
+                    <p><strong>Appointment:</strong> ${new Date(patient.appointment.time).toLocaleString()} (${patient.appointment.scheduleType || 'General'})</p>
                     <div class="flex gap-2 mt-2">
                         <button data-action="change-appointment" data-patient-id="${patient.id}" class="text-sm bg-yellow-500 text-white px-3 py-1 rounded hover:bg-yellow-600">Change</button>
                         <button data-action="cancel-appointment" data-patient-id="${patient.id}" class="text-sm bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600">Cancel</button>
@@ -833,80 +835,86 @@
         };
 
         const getBookingModalHTML = (patient) => {
-             if (!patient) return `<h2>Patient not found</h2>`;
-             const availableSchedules = state.schedules.filter(s => s.siteId === patient.siteId && s.studyId === patient.studyId);
-             if (availableSchedules.length === 0) {
-                 return `
-                     <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${patient.firstName} ${patient.lastName}</h2>
-                     <p class="text-red-500">No available schedules match the patient's assigned site and study.</p>
-                 `;
-             }
-             
-             // This function will now be responsible for rendering the calendar inside the modal
-             const renderBookingCalendar = (date, patient) => {
-                 const month = date.getMonth();
-                 const year = date.getFullYear();
-                 const firstDay = new Date(year, month, 1);
-                 const lastDay = new Date(year, month + 1, 0);
-                 const daysInMonth = lastDay.getDate();
-                 const startDayOfWeek = firstDay.getDay();
-                 const monthName = date.toLocaleString('default', { month: 'long' });
+            if (!patient) return `<h2>Patient not found</h2>`;
+            const completedVisits = patient.completedVisits || [];
+            const availableSchedules = state.schedules.filter(s => 
+                s.siteId === patient.siteId && 
+                s.studyId === patient.studyId &&
+                !completedVisits.includes(s.scheduleType)
+            );
 
-                 const availableSlotsByDay = {};
-                 availableSchedules.forEach(schedule => {
-                     schedule.slots.forEach(slot => {
-                         if (slot.booked < slot.capacity) {
-                             const slotDate = new Date(slot.startTime).toISOString().split('T')[0];
-                             if (!availableSlotsByDay[slotDate]) {
-                                 availableSlotsByDay[slotDate] = [];
-                             }
-                             availableSlotsByDay[slotDate].push({scheduleId: schedule.id, ...slot});
-                         }
-                     });
-                 });
+            if (availableSchedules.length === 0) {
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${patient.firstName} ${patient.lastName}</h2>
+                    <p class="text-red-500">No available schedules match the patient's assigned site, study, and visit history.</p>
+                `;
+            }
+            
+            // This function will now be responsible for rendering the calendar inside the modal
+            const renderBookingCalendar = (date, patient) => {
+                const month = date.getMonth();
+                const year = date.getFullYear();
+                const firstDay = new Date(year, month, 1);
+                const lastDay = new Date(year, month + 1, 0);
+                const daysInMonth = lastDay.getDate();
+                const startDayOfWeek = firstDay.getDay();
+                const monthName = date.toLocaleString('default', { month: 'long' });
 
-                 let calendarHTML = `
-                     <div class="flex justify-between items-center mb-4 dark:text-white">
-                         <button data-action="prev-booking-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left"></i></button>
-                         <h3 class="text-xl font-semibold">${monthName} ${year}</h3>
-                         <button data-action="next-booking-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right"></i></button>
-                     </div>
-                     <div class="grid grid-cols-7 gap-1 text-center text-sm">
-                         ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => `<div class="font-semibold text-gray-500 dark:text-gray-400">${day}</div>`).join('')}
-                 `;
+                const availableSlotsByDay = {};
+                availableSchedules.forEach(schedule => {
+                    schedule.slots.forEach(slot => {
+                        if (slot.booked < slot.capacity) {
+                            const slotDate = new Date(slot.startTime).toISOString().split('T')[0];
+                            if (!availableSlotsByDay[slotDate]) {
+                                availableSlotsByDay[slotDate] = [];
+                            }
+                            availableSlotsByDay[slotDate].push({scheduleId: schedule.id, ...slot});
+                        }
+                    });
+                });
 
-                 for (let i = 0; i < startDayOfWeek; i++) { calendarHTML += `<div></div>`; }
+                let calendarHTML = `
+                    <div class="flex justify-between items-center mb-4 dark:text-white">
+                        <button data-action="prev-booking-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left"></i></button>
+                        <h3 class="text-xl font-semibold">${monthName} ${year}</h3>
+                        <button data-action="next-booking-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right"></i></button>
+                    </div>
+                    <div class="grid grid-cols-7 gap-1 text-center text-sm">
+                        ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => `<div class="font-semibold text-gray-500 dark:text-gray-400">${day}</div>`).join('')}
+                `;
 
-                 for (let day = 1; day <= daysInMonth; day++) {
-                     const currentDate = new Date(year, month, day);
-                     const dateString = currentDate.toISOString().split('T')[0];
-                     const hasSlots = availableSlotsByDay[dateString];
-                     const isToday = new Date().toDateString() === currentDate.toDateString();
+                for (let i = 0; i < startDayOfWeek; i++) { calendarHTML += `<div></div>`; }
 
-                     calendarHTML += `
-                         <button 
-                             data-action="select-booking-day" 
-                             data-date="${dateString}" 
-                             class="p-2 rounded-full ${hasSlots ? 'bg-blue-500 text-white hover:bg-blue-600 cursor-pointer' : 'text-gray-400 dark:text-gray-500 cursor-not-allowed'} ${isToday ? 'ring-2 ring-blue-500' : ''}"
-                             ${!hasSlots ? 'disabled' : ''}
-                         >
-                             ${day}
-                         </button>
-                     `;
-                 }
-                 calendarHTML += `</div>`;
-                 return calendarHTML;
-             };
+                for (let day = 1; day <= daysInMonth; day++) {
+                    const currentDate = new Date(year, month, day);
+                    const dateString = currentDate.toISOString().split('T')[0];
+                    const hasSlots = availableSlotsByDay[dateString];
+                    const isToday = new Date().toDateString() === currentDate.toDateString();
 
-             return `
-                 <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${patient.firstName} ${patient.lastName}</h2>
-                 <p class="dark:text-gray-300"><strong>Study:</strong> ${state.studies.find(s => s.id === patient.studyId)?.title}</p>
-                 <p class="dark:text-gray-300 mb-4"><strong>Site:</strong> ${state.sites.find(s => s.id === patient.siteId)?.name}</p>
-                 <div id="booking-calendar-container" data-patient-id="${patient.id}">
-                     ${renderBookingCalendar(state.bookingCalendarDate, patient)}
-                 </div>
-                 <div id="booking-slots-container" class="mt-4 max-h-48 overflow-y-auto"></div>
-             `;
+                    calendarHTML += `
+                        <button 
+                            data-action="select-booking-day" 
+                            data-date="${dateString}" 
+                            class="p-2 rounded-full ${hasSlots ? 'bg-blue-500 text-white hover:bg-blue-600 cursor-pointer' : 'text-gray-400 dark:text-gray-500 cursor-not-allowed'} ${isToday ? 'ring-2 ring-blue-500' : ''}"
+                            ${!hasSlots ? 'disabled' : ''}
+                        >
+                            ${day}
+                        </button>
+                    `;
+                }
+                calendarHTML += `</div>`;
+                return calendarHTML;
+            };
+
+            return `
+                <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${patient.firstName} ${patient.lastName}</h2>
+                <p class="dark:text-gray-300"><strong>Study:</strong> ${state.studies.find(s => s.id === patient.studyId)?.title}</p>
+                <p class="dark:text-gray-300 mb-4"><strong>Site:</strong> ${state.sites.find(s => s.id === patient.siteId)?.name}</p>
+                <div id="booking-calendar-container" data-patient-id="${patient.id}">
+                    ${renderBookingCalendar(state.bookingCalendarDate, patient)}
+                </div>
+                <div id="booking-slots-container" class="mt-4 max-h-48 overflow-y-auto"></div>
+            `;
         };
 
         const getQuickAddPatientHTML = () => {
@@ -929,7 +937,7 @@
                          if (key === 'studyId') {
                              return `<div><label class="block text-sm font-medium dark:text-gray-300">Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>`;
                          }
-                         if (key === 'oranetSite' || key === 'appointment' || key === 'surveyResults' || key === 'contactLogs' || key === 'studyHistory') return '';
+                         if (key === 'oranetSite' || key === 'appointment' || key === 'surveyResults' || key === 'contactLogs' || key === 'studyHistory' || key === 'completedVisits') return '';
                          return `<div><label class="block text-sm font-medium dark:text-gray-300">${label}</label><input type="${key === 'dob' ? 'date' : 'text'}" name="${key}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>`;
                      }).join('')}
                      </div>
@@ -997,7 +1005,7 @@
                          if (key === 'siteId') {
                              return `<div><label class="block text-sm font-medium dark:text-gray-300">Site</label><select name="siteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.sites.map(s => `<option value="${s.id}" ${value === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}</select></div>`;
                          }
-                         if (key === 'oranetSite' || key === 'appointment' || key === 'surveyResults' || key === 'contactLogs' || key === 'studyHistory') return '';
+                         if (key === 'oranetSite' || key === 'appointment' || key === 'surveyResults' || key === 'contactLogs' || key === 'studyHistory' || key === 'completedVisits') return '';
                          return `<div><label class="block text-sm font-medium dark:text-gray-300">${label}</label><input type="${key === 'dob' ? 'date' : 'text'}" name="${key}" value="${value}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>`;
                      }).join('')}
                      </div>
@@ -1014,6 +1022,7 @@
                 <h2 class="text-2xl font-bold dark:text-white mb-2">Appointment Details</h2>
                 <p class="text-gray-600 dark:text-gray-400 mb-4">${new Date(slot.startTime).toLocaleString()}</p>
                 <p class="dark:text-gray-300"><strong>Study:</strong> ${study?.title || 'N/A'}</p>
+                <p class="dark:text-gray-300"><strong>Visit Type:</strong> ${schedule.scheduleType || 'General'}</p>
                 
                 <form id="update-capacity-form" data-schedule-id="${schedule.id}" data-slot-id="${slot.id}" class="my-4 flex items-end gap-2">
                     <div>
@@ -1218,7 +1227,7 @@
             const patient = state.patients.find(p => p.id === patientId);
             if (!patient || !patient.appointment) return;
 
-            const { scheduleId, slotId } = patient.appointment;
+            const { scheduleId, slotId, scheduleType } = patient.appointment;
             const schedule = state.schedules.find(s => s.id === scheduleId);
             if (!schedule) return;
 
@@ -1233,7 +1242,11 @@
             await updateDoc(studyRef, { enrolled: increment(-1) });
 
             const patientRef = doc(db, "patients", patientId);
-            await updateDoc(patientRef, { appointment: null });
+            const updatedCompletedVisits = (patient.completedVisits || []).filter(v => v !== scheduleType);
+            await updateDoc(patientRef, { 
+                appointment: null,
+                completedVisits: updatedCompletedVisits
+            });
         };
 
         const deletePatient = async (patientId) => {
@@ -1266,7 +1279,7 @@
         const patientTemplate = () => ({
             firstName: '', lastName: '', globalId: '', phoneNumber: '', email: '', dob: '', address: '', city: '', state: '', zipCode: '',
             age: null, condition: '', status: 'Candidate', registryStatus: 'Active', source: '', therapeuticArea: '',
-            studyId: null, siteId: null, appointment: null, surveyResults: [], contactLogs: [], studyHistory: []
+            studyId: null, siteId: null, appointment: null, surveyResults: [], contactLogs: [], studyHistory: [], completedVisits: []
         });
 
 
@@ -1388,7 +1401,15 @@
                         await updateDoc(scheduleRef, { slots: schedule.slots });
 
                         const patientRef = doc(db, "patients", patientId);
-                        await updateDoc(patientRef, { appointment: { scheduleId, slotId, time: slot.startTime } });
+                        await updateDoc(patientRef, { 
+                            appointment: { 
+                                scheduleId, 
+                                slotId, 
+                                time: slot.startTime,
+                                scheduleType: schedule.scheduleType 
+                            },
+                            completedVisits: arrayUnion(schedule.scheduleType)
+                        });
 
                         const studyRef = doc(db, "studies", patient.studyId);
                         await updateDoc(studyRef, { enrolled: increment(1) });
@@ -1452,19 +1473,24 @@
                     }
                     case 'select-booking-day': {
                           const patient = state.patients.find(p => p.id === document.getElementById('booking-calendar-container').dataset.patientId);
-                          const availableSchedules = state.schedules.filter(s => s.siteId === patient.siteId && s.studyId === patient.studyId);
+                          const completedVisits = patient.completedVisits || [];
+                          const availableSchedules = state.schedules.filter(s => 
+                                s.siteId === patient.siteId && 
+                                s.studyId === patient.studyId &&
+                                !completedVisits.includes(s.scheduleType)
+                          );
                           const slotsForDay = [];
                           availableSchedules.forEach(schedule => {
                               schedule.slots.forEach(slot => {
                                   if (slot.booked < slot.capacity && new Date(slot.startTime).toISOString().split('T')[0] === date) {
-                                      slotsForDay.push({scheduleId: schedule.id, ...slot});
+                                      slotsForDay.push({scheduleId: schedule.id, scheduleType: schedule.scheduleType, ...slot});
                                   }
                               });
                           });
                           const slotsContainer = document.getElementById('booking-slots-container');
                           slotsContainer.innerHTML = slotsForDay.length > 0 ? slotsForDay.map(slot => `
                               <button data-action="book-appointment" data-patient-id="${patient.id}" data-schedule-id="${slot.scheduleId}" data-slot-id="${slot.id}" class="w-full text-left p-2 border dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 dark:text-white mb-2">
-                                  ${new Date(slot.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                  ${new Date(slot.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - ${slot.scheduleType || 'General'}
                               </button>
                           `).join('') : '<p class="text-gray-500 dark:text-gray-400">No available slots for this day.</p>';
                           break;
@@ -1789,7 +1815,12 @@
                         currentDate.setDate(currentDate.getDate() + 1);
                     }
                     
-                    const newSchedule = { siteId: data.siteId, studyId: data.studyId, slots: slots };
+                    const newSchedule = { 
+                        siteId: data.siteId, 
+                        studyId: data.studyId, 
+                        scheduleType: data.scheduleType,
+                        slots: slots 
+                    };
                     await addDoc(getCollectionRef("schedules"), newSchedule);
                     form.reset();
                     break;
@@ -2035,7 +2066,7 @@
                             const isFull = slot.booked >= slot.capacity;
                             appointmentsHTML += `
                                 <div data-schedule-id="${schedule.id}" data-slot-id="${slot.id}" class="appointment-slot p-1.5 mb-1 rounded-md text-xs cursor-pointer ${isFull ? 'bg-red-200 dark:bg-red-800 text-red-900 dark:text-red-100' : 'bg-blue-100 dark:bg-blue-800 hover:bg-blue-200 dark:hover:bg-blue-700 text-blue-900 dark:text-blue-100'}">
-                                    <p class="font-semibold truncate dark:text-white">${study?.title || 'No Title'}</p>
+                                    <p class="font-semibold truncate dark:text-white">${schedule.scheduleType || 'General'}: ${study?.title || 'No Title'}</p>
                                     <p class="dark:text-gray-300">${slotDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} (${slot.booked}/${slot.capacity})</p>
                                 </div>
                             `;
@@ -2088,7 +2119,7 @@
                     dayHTML += `
                         <div class="p-4 border dark:border-gray-700 rounded-lg">
                             <p class="font-bold dark:text-white">${new Date(slot.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</p>
-                            <p class="text-sm text-gray-600 dark:text-gray-400">${study?.title || 'N/A'}</p>
+                            <p class="text-sm text-gray-600 dark:text-gray-400">${schedule.scheduleType || 'General'}: ${study?.title || 'N/A'}</p>
                             <div class="mt-2 text-sm">
                                 ${patientsInSlot.length > 0 ? patientsInSlot.map(p => `<p class="dark:text-gray-300">${p.firstName} ${p.lastName}</p>`).join('') : '<p class="text-gray-500 dark:text-gray-500">Open Slot</p>'}
                             </div>
@@ -2130,6 +2161,7 @@
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Date & Time</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Patient</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Visit Type</th>
                         </tr></thead>
                         <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                         ${bookedAppointments.map(({patient, schedule, slot}) => `
@@ -2137,6 +2169,7 @@
                                 <td class="px-6 py-4">${new Date(slot.startTime).toLocaleString()}</td>
                                 <td class="px-6 py-4"><button data-action="view-patient" data-id="${patient.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${patient.firstName} ${patient.lastName}</button></td>
                                 <td class="px-6 py-4">${state.studies.find(s => s.id === schedule.studyId)?.title || 'N/A'}</td>
+                                <td class="px-6 py-4">${schedule.scheduleType || 'General'}</td>
                             </tr>
                         `).join('')}
                         </tbody>
