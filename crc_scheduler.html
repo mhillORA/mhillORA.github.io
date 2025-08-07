@@ -137,20 +137,26 @@
         <div class="flex flex-wrap justify-between items-center mb-6 gap-4">
             <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">CRC Scheduler</h2>
             <div class="flex items-center space-x-4">
+                 <button data-action="auto-create-shift" class="bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 transition-colors flex items-center">
+                    <i data-lucide="wand-2" class="w-4 h-4 mr-2"></i>Create Shift
+                </button>
                  <button data-action="import-csv-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
-                    <i data-lucide="upload" class="w-4 h-4 mr-2"></i>Import Shifts
+                    <i data-lucide="upload" class="w-4 h-4 mr-2"></i>Import
                 </button>
                 <input type="file" id="csv-upload-input" class="hidden" accept=".csv">
                 <button data-action="export-csv-btn" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center">
-                    <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export Month
+                    <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export
                 </button>
                 <button id="theme-toggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
                     <i data-lucide="sun" class="w-5 h-5 hidden dark:block"></i>
                     <i data-lucide="moon" class="w-5 h-5 block dark:hidden"></i>
                 </button>
+                 <button data-action="open-settings" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
+                    <i data-lucide="settings" class="w-5 h-5"></i>
+                </button>
                 <a href="index.html" id="back-to-dashboard" class="text-blue-600 dark:text-blue-400 hover:underline flex items-center">
                     <i data-lucide="arrow-left" class="w-4 h-4 mr-2"></i>
-                    Back to Main Dashboard
+                    Dashboard
                 </a>
             </div>
         </div>
@@ -173,7 +179,7 @@
             // Firebase Imports
             const { initializeApp } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js");
             const { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js");
-            const { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, setDoc, getDocs, writeBatch, query, where } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js");
+            const { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, setDoc, getDoc, getDocs, writeBatch, query, where } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js");
 
             // User-provided Firebase Configuration
             const firebaseConfig = {
@@ -207,13 +213,21 @@
                 authReady: false,
                 userId: null,
                 crcCalendarDate: new Date(),
-                calendarView: 'month', // 'month', 'week', or 'availability'
+                calendarView: 'month', // 'month', 'week', or 'master'
                 activeTab: 'scheduler', // 'scheduler', 'reporting'
                 sidebarTab: 'crcs',
                 crcs: [],
                 crc_sites: [],
                 studies: [],
                 crc_events: [],
+                crcStats: {}, // New: To hold calculated stats for each CRC
+                settings: { // New: Default hour settings
+                    'Site Assignment': 8,
+                    'Travel Day': 8,
+                    'Paid Time Off': 8,
+                    'Unavailable': 8,
+                    'Open Shift': 8,
+                },
                 selectedCrcFilter: 'all',
                 selectedSiteFilter: 'all',
                 selectedRegionFilter: 'all',
@@ -228,7 +242,15 @@
 
             /// --- CORE FUNCTIONS ---
             const setState = (newState) => {
+                const oldDate = state.crcCalendarDate.getTime();
                 state = { ...state, ...newState };
+                const newDate = state.crcCalendarDate.getTime();
+
+                // Recalculate stats if data changes or if the month/year changes
+                if (newState.crc_events || newState.crcs || oldDate !== newDate) {
+                    state.crcStats = calculateAllCrcStats();
+                }
+
                 if (state.authReady && state.initialLoadComplete) {
                     window.requestAnimationFrame(() => {
                         render();
@@ -288,7 +310,7 @@
 
                 setTimeout(() => {
                     notification.classList.add('translate-y-20', 'opacity-0');
-                    setTimeout(() => notification.remove(), 300);
+                    setTimeout(() => notification.remove(), 4000);
                 }, 4000);
             };
 
@@ -336,20 +358,11 @@
             };
 
             // --- CSV HANDLING ---
-            /**
-             * A simple CSV parser. Does not handle complex cases like commas within quoted fields.
-             * For robust parsing, a dedicated library would be better.
-             * @param {string} text - The CSV content as a string.
-             * @returns {{headers: string[], data: Object[]}}
-             */
             const parseCSV = (text) => {
                 const lines = text.replace(/\r/g, '').split('\n').filter(Boolean);
                 if (lines.length < 2) return { headers: [], data: [] };
-                
-                // Trim headers and handle potential byte order mark (BOM)
                 const headers = lines[0].split(',').map(h => h.trim().replace(/^\uFEFF/, ''));
                 const data = [];
-
                 for (let i = 1; i < lines.length; i++) {
                     const values = lines[i].split(',');
                     const rowObject = {};
@@ -400,7 +413,7 @@
 
                     for (const [index, row] of data.entries()) {
                         const rowNum = index + 2;
-                        const { Date: date, EventType, CRCName, SiteName, StudyName, Role, Notes } = row;
+                        const { Date: date, EventType, CRCName, SiteName, StudyName, Role, Notes, Hours } = row;
 
                         if (!date || !EventType) {
                             errors.push(`Row ${rowNum}: Missing required value for Date or EventType.`);
@@ -416,6 +429,7 @@
                             type: EventType.trim(),
                             notes: (Notes || '').trim(),
                             role: (Role || null),
+                            hours: Hours ? parseFloat(Hours) : (state.settings[EventType.trim()] || 8),
                             groupId: crypto.randomUUID(),
                             crcId: null, siteId: null, studyId: null,
                         };
@@ -506,7 +520,7 @@
                     return;
                 }
 
-                const headers = ['Date', 'EventType', 'CRCName', 'SiteName', 'StudyName', 'Role', 'Notes'];
+                const headers = ['Date', 'EventType', 'CRCName', 'SiteName', 'StudyName', 'Role', 'Hours', 'Notes'];
                 const rows = eventsThisMonth.map(event => {
                     const crc = state.crcs.find(c => c.id === event.crcId);
                     const site = state.crc_sites.find(s => s.id === event.siteId);
@@ -518,6 +532,7 @@
                         site ? site.name : '',
                         study ? study.name : '',
                         event.role || '',
+                        event.hours || '',
                         event.notes || ''
                     ].map(val => `"${(val || '').replace(/"/g, '""')}"`).join(',');
                 });
@@ -650,12 +665,10 @@
                 const container = document.getElementById('crc-calendar-container');
                 if (!container) return;
 
-                if (state.selectedCrcFilter !== 'all') {
-                    container.innerHTML = getIndividualScheduleHTML();
-                } else if (state.calendarView === 'week') {
+                if (state.calendarView === 'week') {
                     container.innerHTML = getWeeklyCalendarHTML();
-                } else if (state.calendarView === 'availability') {
-                    container.innerHTML = getAvailabilityViewHTML();
+                } else if (state.calendarView === 'master') {
+                    container.innerHTML = getMasterScheduleHTML();
                 } else {
                     container.innerHTML = getMonthlyCalendarHTML();
                 }
@@ -667,10 +680,10 @@
                 const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
                 const weekName = `Week of ${startOfWeek.toLocaleDateString('en-US', {month: 'long', day: 'numeric'})}`;
                 
-                const title = (state.calendarView === 'week' || (state.selectedCrcFilter !== 'all' && state.calendarView !== 'month')) ? weekName : monthName;
+                const title = state.calendarView === 'week' ? weekName : monthName;
                 
-                const prevAction = (state.calendarView === 'week' || (state.selectedCrcFilter !== 'all' && state.calendarView !== 'month')) ? 'prev-crc-week' : 'prev-crc-month';
-                const nextAction = (state.calendarView === 'week' || (state.selectedCrcFilter !== 'all' && state.calendarView !== 'month')) ? 'next-crc-week' : 'next-crc-month';
+                const prevAction = state.calendarView === 'week' ? 'prev-crc-week' : 'prev-crc-month';
+                const nextAction = state.calendarView === 'week' ? 'next-crc-week' : 'next-crc-month';
 
                 return `
                     <div class="flex flex-wrap justify-between items-center mb-4 gap-2">
@@ -679,7 +692,7 @@
                             <div class="flex items-center rounded-md border dark:border-gray-600">
                                 <button data-action="set-view" data-view="month" class="px-3 py-1 text-sm ${state.calendarView === 'month' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Month</button>
                                 <button data-action="set-view" data-view="week" class="px-3 py-1 text-sm ${state.calendarView === 'week' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Week</button>
-                                <button data-action="set-view" data-view="availability" class="px-3 py-1 text-sm ${state.calendarView === 'availability' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Availability</button>
+                                <button data-action="set-view" data-view="master" class="px-3 py-1 text-sm ${state.calendarView === 'master' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Master Schedule</button>
                             </div>
                             <button data-action="${prevAction}" class="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left" class="w-5 h-5"></i></button>
                             <button data-action="${nextAction}" class="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right" class="w-5 h-5"></i></button>
@@ -694,6 +707,9 @@
                 const month = now.getMonth();
 
                 let filteredEvents = state.crc_events;
+                if (state.selectedCrcFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                }
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
                 }
@@ -753,6 +769,9 @@
                 const startOfWeek = new Date(year, month, day - now.getDay());
 
                 let filteredEvents = state.crc_events;
+                 if (state.selectedCrcFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                }
                  if (state.selectedSiteFilter !== 'all') {
                      filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
                 }
@@ -802,116 +821,71 @@
                 return getCalendarHeaderHTML() + dayGrid;
             };
             
-            const getAvailabilityViewHTML = () => {
+            const getMasterScheduleHTML = () => {
                 const now = state.crcCalendarDate;
                 const year = now.getFullYear();
                 const month = now.getMonth();
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
 
-                let grid = `<div class="overflow-x-auto custom-scrollbar"><div class="availability-grid bg-gray-200 dark:bg-gray-700 border dark:border-gray-700 rounded-lg">`;
-                // Header Row
-                grid += `<div class="p-2 font-semibold bg-white dark:bg-gray-800 sticky left-0 z-10">CRC</div>`;
-                for (let day = 1; day <= daysInMonth; day++) {
-                    grid += `<div class="p-2 text-center font-semibold bg-white dark:bg-gray-800">${day}</div>`;
-                }
-
-                // CRC Rows
-                state.crcs.forEach(crc => {
-                    grid += `<div class="p-2 font-medium bg-white dark:bg-gray-800 sticky left-0 z-10">${crc.name}</div>`;
-                    for (let day = 1; day <= daysInMonth; day++) {
-                        const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                        const event = state.crc_events.find(e => e.crcId === crc.id && e.date === dateStr);
-                        let cellClass = 'bg-green-200 dark:bg-green-800/50'; // Available
-                        let title = 'Available';
-                        if (event) {
-                            const colorMap = {
-                                'Site Assignment': 'bg-blue-500', 
-                                'Travel Day': 'bg-orange-500', 
-                                'Paid Time Off': 'bg-purple-500', 
-                                'Unavailable': 'bg-gray-500',
-                            };
-                            cellClass = colorMap[event.type] || 'bg-gray-400';
-                            title = event.type;
-                        }
-                        grid += `<div class="availability-cell ${cellClass}" title="${title}"></div>`;
-                    }
+                let filteredEvents = state.crc_events.filter(e => {
+                    const eventDate = new Date(e.date + 'T00:00:00');
+                    return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
-                
-                // Open Shifts Row
-                grid += `<div class="p-2 font-medium bg-white dark:bg-gray-800 sticky left-0 z-10">Open Shifts</div>`;
-                for (let day = 1; day <= daysInMonth; day++) {
-                     const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                     const openShift = state.crc_events.find(e => e.type === 'Open Shift' && e.date === dateStr);
-                     const cellClass = openShift ? 'bg-red-500' : 'bg-gray-100 dark:bg-gray-700/50';
-                     const title = openShift ? 'Open Shift' : 'No open shifts';
-                     grid += `<div class="availability-cell ${cellClass}" title="${title}"></div>`;
+
+                if (state.selectedCrcFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                }
+                if (state.selectedSiteFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
+                }
+                 if (state.selectedRegionFilter !== 'all') {
+                    const crcsInRegion = state.crcs.filter(c => c.region === state.selectedRegionFilter).map(c => c.id);
+                    filteredEvents = filteredEvents.filter(e => crcsInRegion.includes(e.crcId));
                 }
 
-                grid += `</div></div>`;
-                return getCalendarHeaderHTML() + grid;
-            };
+                const eventsBySite = filteredEvents.reduce((acc, event) => {
+                    const siteId = event.siteId || 'unassigned';
+                    if (!acc[siteId]) acc[siteId] = [];
+                    acc[siteId].push(event);
+                    return acc;
+                }, {});
 
-            const getIndividualScheduleHTML = () => {
-                const crcId = state.selectedCrcFilter;
-                const crc = state.crcs.find(c => c.id === crcId);
-                if (!crc) return '<p>Select a CRC to view their schedule.</p>';
+                let siteSections = state.crc_sites
+                    .sort((a,b) => a.name.localeCompare(b.name))
+                    .map(site => {
+                        const siteEvents = (eventsBySite[site.id] || []).sort((a,b) => new Date(a.date) - new Date(b.date));
+                        if (siteEvents.length === 0) return '';
 
-                const now = state.crcCalendarDate;
-                const year = now.getFullYear();
-                const month = now.getMonth();
-                const viewMode = state.calendarView === 'week' ? 'week' : 'month';
-                
-                let title;
-                let events;
-
-                if (viewMode === 'week') {
-                    const startOfWeek = new Date(year, month, now.getDate() - now.getDay());
-                    const endOfWeek = new Date(startOfWeek);
-                    endOfWeek.setDate(startOfWeek.getDate() + 6);
-                    title = `Week of ${startOfWeek.toLocaleDateString('en-US', {month: 'long', day: 'numeric'})}`;
-                    events = state.crc_events
-                        .filter(e => {
-                            const eventDate = new Date(e.date + 'T00:00:00');
-                            return e.crcId === crcId && eventDate >= startOfWeek && eventDate <= endOfWeek;
-                        })
-                        .sort((a,b) => new Date(a.date) - new Date(b.date));
-                } else { // month view
-                    title = now.toLocaleString('default', { month: 'long', year: 'numeric' });
-                    events = state.crc_events
-                        .filter(e => e.crcId === crcId && new Date(e.date).getMonth() === month && new Date(e.date).getFullYear() === year)
-                        .sort((a,b) => new Date(a.date) - new Date(b.date));
-                }
-
-                let eventListHTML = events.map(event => {
-                    const site = state.crc_sites.find(s => s.id === event.siteId);
-                    return `
-                        <div class="p-4 border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50 flex justify-between items-center">
-                            <div>
-                                <p class="font-bold">${new Date(event.date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</p>
-                                <p>${event.type} ${site ? `at ${site.name}` : ''} ${event.role ? `(${event.role})` : ''}</p>
-                                ${event.notes ? `<p class="text-sm text-gray-500 dark:text-gray-400">${event.notes}</p>` : ''}
+                        return `
+                            <div class="mb-8">
+                                <h4 class="text-lg font-bold mb-3 pb-2 border-b dark:border-gray-600">${site.name}</h4>
+                                <div class="space-y-3">
+                                    ${siteEvents.map(event => {
+                                        const crc = state.crcs.find(c => c.id === event.crcId);
+                                        const study = state.studies.find(s => s.id === event.studyId);
+                                        return `
+                                            <div class="p-3 rounded-md bg-gray-50 dark:bg-gray-900/50 border dark:border-gray-700">
+                                                <p class="font-semibold">${new Date(event.date + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}: ${event.type}</p>
+                                                <p class="text-sm text-gray-600 dark:text-gray-300">
+                                                    <strong>CRC:</strong> ${crc ? crc.name : 'N/A'} | 
+                                                    <strong>Study:</strong> ${study ? study.name : 'N/A'} | 
+                                                    <strong>Role:</strong> ${event.role || 'Default'} |
+                                                    <strong>Hours:</strong> ${event.hours || 'N/A'}
+                                                </p>
+                                                ${event.notes ? `<p class="text-xs mt-1 text-gray-500 dark:text-gray-400">Notes: ${event.notes}</p>` : ''}
+                                            </div>
+                                        `;
+                                    }).join('')}
+                                </div>
                             </div>
-                            <button data-action="view-crc-event" data-event-id="${event.id}" class="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700">
-                                <i data-lucide="edit" class="w-4 h-4"></i>
-                            </button>
-                        </div>
-                    `;
+                        `;
                 }).join('');
 
-                if (events.length === 0) {
-                    eventListHTML = `<p class="p-4 text-center text-gray-500 dark:text-gray-400">No events scheduled for ${crc.name} in this period.</p>`;
+                if (!siteSections) {
+                    siteSections = '<p class="text-center text-gray-500 dark:text-gray-400 py-8">No site assignments found for the current filters and month.</p>';
                 }
 
-                return `
-                    <div class="flex justify-between items-center mb-4">
-                        <h3 class="text-xl font-semibold text-gray-800 dark:text-gray-200">Schedule for ${crc.name} - ${title}</h3>
-                         <div class="flex items-center space-x-2">
-                            <button data-action="${viewMode === 'week' ? 'prev-crc-week' : 'prev-crc-month'}" class="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left" class="w-5 h-5"></i></button>
-                            <button data-action="${viewMode === 'week' ? 'next-crc-week' : 'next-crc-month'}" class="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right" class="w-5 h-5"></i></button>
-                        </div>
-                    </div>
-                    <div class="border dark:border-gray-700 rounded-lg">${eventListHTML}</div>
-                `;
+                return getCalendarHeaderHTML() + `<div class="mt-4 custom-scrollbar pr-2" style="max-height: 70vh; overflow-y: auto;">${siteSections}</div>`;
             };
 
             // --- UI & UTILIZATION RENDERING ---
@@ -1009,31 +983,14 @@
                 const container = document.getElementById('crcUtilization');
                 if (!container) return;
 
-                const now = state.crcCalendarDate;
-                const year = now.getFullYear();
-                const month = now.getMonth();
-                const daysInMonth = new Date(year, month + 1, 0).getDate();
-
-                let workingDays = 0;
-                for (let day = 1; day <= daysInMonth; day++) {
-                    const dayOfWeek = new Date(year, month, day).getDay();
-                    if (dayOfWeek > 0 && dayOfWeek < 6) { // Monday to Friday
-                        workingDays++;
-                    }
-                }
-
                 if (state.crcs.length === 0) {
                     container.innerHTML = '<p class="text-gray-500 dark:text-gray-400">No CRCs to analyze.</p>';
                     return;
                 }
 
                 const utilizationHTML = state.crcs.map(crc => {
-                    const eventsThisMonth = state.crc_events.filter(e => {
-                        const eventDate = new Date(e.date);
-                        return e.crcId === crc.id && eventDate.getFullYear() === year && eventDate.getMonth() === month && e.type !== 'Paid Time Off' && e.type !== 'Unavailable';
-                    }).length;
-
-                    const utilizationPercent = workingDays > 0 ? Math.round((eventsThisMonth / workingDays) * 100) : 0;
+                    const stats = state.crcStats[crc.id] || { utilizationPercent: 0 };
+                    const utilizationPercent = stats.utilizationPercent;
                     
                     let barColor = 'bg-green-500';
                     if (utilizationPercent > 85) barColor = 'bg-yellow-500';
@@ -1130,6 +1087,11 @@
                 const siteGroup = form.querySelector('#site-group');
                 const studyGroup = form.querySelector('#study-group');
                 const roleGroup = form.querySelector('#role-group');
+                const hoursInput = form.querySelector('input[name="hours"]');
+
+                if(hoursInput) {
+                    hoursInput.value = state.settings[eventType] || 8;
+                }
 
                 crcGroup.classList.add('hidden');
                 siteGroup.classList.add('hidden');
@@ -1156,6 +1118,8 @@
             // --- MODAL HTML GENERATORS ---
             const getCRCEventModalHTML = (date, event = null, seriesStartDate = null, seriesEndDate = null) => {
                 const isEditing = event !== null;
+                const eventType = isEditing ? event.type : 'Site Assignment';
+                const hours = isEditing ? event.hours : (state.settings[eventType] || 8);
                 const crcOptions = state.crcs.map(crc => `<option value="${crc.id}" ${isEditing && event.crcId === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
                 const siteOptions = state.crc_sites.map(site => `<option value="${site.id}" ${isEditing && event.siteId === site.id ? 'selected' : ''}>${site.name}</option>`).join('');
                 const studyOptions = state.studies.map(study => `<option value="${study.id}" ${isEditing && event.studyId === study.id ? 'selected' : ''}>${study.name}</option>`).join('');
@@ -1175,15 +1139,21 @@
                             </div>
                         </div>
 
-                        <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Event Type</label>
-                            <select id="crc-event-type" name="eventType" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                <option ${isEditing && event.type === 'Site Assignment' ? 'selected' : ''}>Site Assignment</option>
-                                <option ${isEditing && event.type === 'Travel Day' ? 'selected' : ''}>Travel Day</option>
-                                <option ${isEditing && event.type === 'Paid Time Off' ? 'selected' : ''}>Paid Time Off</option>
-                                <option ${isEditing && event.type === 'Unavailable' ? 'selected' : ''}>Unavailable</option>
-                                <option ${isEditing && event.type === 'Open Shift' ? 'selected' : ''}>Open Shift</option>
-                            </select>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Event Type</label>
+                                <select id="crc-event-type" name="eventType" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                    <option ${eventType === 'Site Assignment' ? 'selected' : ''}>Site Assignment</option>
+                                    <option ${eventType === 'Travel Day' ? 'selected' : ''}>Travel Day</option>
+                                    <option ${eventType === 'Paid Time Off' ? 'selected' : ''}>Paid Time Off</option>
+                                    <option ${eventType === 'Unavailable' ? 'selected' : ''}>Unavailable</option>
+                                    <option ${eventType === 'Open Shift' ? 'selected' : ''}>Open Shift</option>
+                                </select>
+                            </div>
+                             <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Hours</label>
+                                <input type="number" name="hours" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${hours}" step="0.5">
+                            </div>
                         </div>
 
                         <div id="crc-group">
@@ -1237,7 +1207,7 @@
                         <div class="p-3 border-b dark:border-gray-700 flex items-center gap-4">
                             <div class="w-4 h-4 rounded-full ${eventColors[event.type] || 'bg-gray-500'}"></div>
                             <div class="flex-grow">
-                                <p class="font-semibold">${event.type}</p>
+                                <p class="font-semibold">${event.type} (${event.hours || 'N/A'} hrs)</p>
                                 <p class="text-sm text-gray-600 dark:text-gray-300">
                                     ${crc ? crc.name : ''} ${site ? `at ${site.name}` : ''} ${event.role ? `(${event.role})` : ''}
                                 </p>
@@ -1366,6 +1336,7 @@
                                 <li><strong>SiteName</strong>: The name of the Site. Must match an existing Site.</li>
                                 <li><strong>StudyName</strong>: The name of the Study. Must match an existing Study.</li>
                                 <li><strong>Role</strong>: The role for the assignment (e.g., 'Lead', 'Support').</li>
+                                <li><strong>Hours</strong>: Number of hours for the shift (defaults to 8).</li>
                                 <li><strong>Notes</strong>: Any additional notes for the shift.</li>
                             </ul>
                         </div>
@@ -1480,6 +1451,7 @@
                             siteId: (tempEventData.eventType === 'Site Assignment' || tempEventData.eventType === 'Travel Day' || tempEventData.eventType === 'Open Shift') ? tempEventData.siteId : null,
                             studyId: tempEventData.eventType === 'Site Assignment' ? tempEventData.studyId : null,
                             role: tempEventData.eventType === 'Site Assignment' ? (tempEventData.role || null) : null,
+                            hours: parseFloat(tempEventData.hours) || state.settings[tempEventData.eventType] || 8,
                             notes: tempEventData.notes || '',
                             date: tempEventData.startDate,
                             groupId: null // Becomes a standalone event
@@ -1507,6 +1479,7 @@
                             siteId: (tempEventData.eventType === 'Site Assignment' || tempEventData.eventType === 'Travel Day' || tempEventData.eventType === 'Open Shift') ? tempEventData.siteId : null,
                             studyId: tempEventData.eventType === 'Site Assignment' ? tempEventData.studyId : null,
                             role: tempEventData.eventType === 'Site Assignment' ? (tempEventData.role || null) : null,
+                            hours: parseFloat(tempEventData.hours) || state.settings[tempEventData.eventType] || 8,
                             notes: tempEventData.notes || '',
                         };
 
@@ -1562,6 +1535,7 @@
                                             <th class="py-2 px-4">Event Type (Shift)</th>
                                             <th class="py-2 px-4">Site</th>
                                             <th class="py-2 px-4">Study</th>
+                                            <th class="py-2 px-4">Hours</th>
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -1577,6 +1551,7 @@
                                                     <td class="py-2 px-4">${event.type}</td>
                                                     <td class="py-2 px-4">${site.name || 'N/A'}</td>
                                                     <td class="py-2 px-4">${study.name || 'N/A'}</td>
+                                                    <td class="py-2 px-4">${event.hours || 'N/A'}</td>
                                                 </tr>
                                             `;
                                         }).join('')}
@@ -1692,6 +1667,7 @@
                                     siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day' || data.eventType === 'Open Shift') ? data.siteId : null,
                                     studyId: data.eventType === 'Site Assignment' ? data.studyId : null,
                                     role: data.eventType === 'Site Assignment' ? (data.role || null) : null,
+                                    hours: parseFloat(data.hours) || state.settings[data.eventType] || 8,
                                     notes: data.notes || '',
                                     date: data.startDate,
                                 };
@@ -1709,6 +1685,7 @@
                                 siteId: (data.eventType === 'Site Assignment' || data.eventType === 'Travel Day' || data.eventType === 'Open Shift') ? data.siteId : null,
                                 studyId: data.eventType === 'Site Assignment' ? data.studyId : null,
                                 role: data.eventType === 'Site Assignment' ? (data.role || null) : null,
+                                hours: parseFloat(data.hours) || state.settings[data.eventType] || 8,
                                 notes: data.notes || '',
                             };
                             while (currentDate <= endDate) {
