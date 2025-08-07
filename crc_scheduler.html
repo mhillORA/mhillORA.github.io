@@ -137,8 +137,12 @@
         <div class="flex flex-wrap justify-between items-center mb-6 gap-4">
             <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">CRC Scheduler</h2>
             <div class="flex items-center space-x-4">
-                 <button id="export-csv-btn" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center">
-                    <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export Month to CSV
+                 <button id="import-csv-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
+                    <i data-lucide="upload" class="w-4 h-4 mr-2"></i>Import Shifts
+                </button>
+                <input type="file" id="csv-upload-input" class="hidden" accept=".csv">
+                <button id="export-csv-btn" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center">
+                    <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export Month
                 </button>
                 <button id="theme-toggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
                     <i data-lucide="sun" class="w-5 h-5 hidden dark:block"></i>
@@ -265,7 +269,29 @@
                 }
             };
 
-            // --- MODAL HANDLING ---
+            // --- NOTIFICATION & MODAL HANDLING ---
+            const showNotification = (message, type = 'info') => {
+                const colors = {
+                    info: 'bg-blue-500',
+                    success: 'bg-green-500',
+                    error: 'bg-red-500',
+                };
+                const notification = document.createElement('div');
+                notification.className = `fixed bottom-5 right-5 ${colors[type]} text-white py-3 px-5 rounded-lg shadow-lg transform translate-y-20 opacity-0 transition-all duration-300 z-[101]`;
+                notification.textContent = message;
+
+                document.body.appendChild(notification);
+
+                setTimeout(() => {
+                    notification.classList.remove('translate-y-20', 'opacity-0');
+                }, 10);
+
+                setTimeout(() => {
+                    notification.classList.add('translate-y-20', 'opacity-0');
+                    setTimeout(() => notification.remove(), 300);
+                }, 4000);
+            };
+
             const openModal = (content, fullWidth = false) => {
                 const maxWidthClass = fullWidth ? 'max-w-4xl' : 'max-w-lg';
                 modalContainer.innerHTML = `
@@ -307,6 +333,204 @@
             const closeModal = () => {
                 modalContainer.classList.add('hidden');
                 modalContainer.innerHTML = '';
+            };
+
+            // --- CSV HANDLING ---
+            /**
+             * A simple CSV parser. Does not handle complex cases like commas within quoted fields.
+             * For robust parsing, a dedicated library would be better.
+             * @param {string} text - The CSV content as a string.
+             * @returns {{headers: string[], data: Object[]}}
+             */
+            const parseCSV = (text) => {
+                const lines = text.replace(/\r/g, '').split('\n').filter(Boolean);
+                if (lines.length < 2) return { headers: [], data: [] };
+                
+                // Trim headers and handle potential byte order mark (BOM)
+                const headers = lines[0].split(',').map(h => h.trim().replace(/^\uFEFF/, ''));
+                const data = [];
+
+                for (let i = 1; i < lines.length; i++) {
+                    const values = lines[i].split(',');
+                    const rowObject = {};
+                    headers.forEach((header, index) => {
+                        rowObject[header] = (values[index] || '').trim();
+                    });
+                    data.push(rowObject);
+                }
+                return { headers, data };
+            };
+
+            const handleCsvUpload = async (file) => {
+                if (!file) return;
+
+                openModal(`
+                    <div class="text-center p-4">
+                        <h3 class="text-xl font-semibold mb-4 dark:text-white">Processing CSV...</h3>
+                        <div class="flex items-center justify-center space-x-2">
+                            <svg class="animate-spin h-8 w-8 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            <p class="dark:text-gray-300">Reading file and preparing shifts. Please wait.</p>
+                        </div>
+                    </div>
+                `);
+
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                    const text = e.target.result;
+                    const { headers, data } = parseCSV(text);
+
+                    const requiredHeaders = ['Date', 'EventType'];
+                    const missingHeaders = requiredHeaders.filter(h => !headers.includes(h));
+                    if (missingHeaders.length > 0) {
+                        openModal(`<h3 class="text-xl font-bold dark:text-white">Import Error</h3><p class="dark:text-gray-300">CSV file is missing required headers. It must contain: ${missingHeaders.join(', ')}</p>`);
+                        return;
+                    }
+
+                    const batch = writeBatch(db);
+                    const crcEventsRef = collection(db, `artifacts/${appId}/public/data/crc_events`);
+                    const errors = [];
+                    let successCount = 0;
+
+                    const crcMap = new Map(state.crcs.map(c => [c.name.toLowerCase(), c.id]));
+                    const siteMap = new Map(state.crc_sites.map(s => [s.name.toLowerCase(), s.id]));
+                    const studyMap = new Map(state.studies.map(s => [s.name.toLowerCase(), s.id]));
+
+                    for (const [index, row] of data.entries()) {
+                        const rowNum = index + 2;
+                        const { Date: date, EventType, CRCName, SiteName, StudyName, Role, Notes } = row;
+
+                        if (!date || !EventType) {
+                            errors.push(`Row ${rowNum}: Missing required value for Date or EventType.`);
+                            continue;
+                        }
+                        if (isNaN(new Date(date).getTime())) {
+                            errors.push(`Row ${rowNum}: Invalid date format for "${date}". Please use YYYY-MM-DD.`);
+                            continue;
+                        }
+
+                        const eventData = {
+                            date: date.trim(),
+                            type: EventType.trim(),
+                            notes: (Notes || '').trim(),
+                            role: (Role || null),
+                            groupId: crypto.randomUUID(),
+                            crcId: null, siteId: null, studyId: null,
+                        };
+                        
+                        let hasError = false;
+
+                        if (EventType !== 'Open Shift' && !CRCName) {
+                            errors.push(`Row ${rowNum}: CRCName is required for EventType "${EventType}".`);
+                            hasError = true;
+                        }
+
+                        if (CRCName) {
+                            const crcId = crcMap.get(CRCName.toLowerCase());
+                            if (crcId) eventData.crcId = crcId;
+                            else {
+                                errors.push(`Row ${rowNum}: CRC "${CRCName}" not found.`);
+                                hasError = true;
+                            }
+                        }
+                        if (SiteName) {
+                            const siteId = siteMap.get(SiteName.toLowerCase());
+                            if (siteId) eventData.siteId = siteId;
+                            else {
+                                errors.push(`Row ${rowNum}: Site "${SiteName}" not found.`);
+                                hasError = true;
+                            }
+                        }
+                        if (StudyName) {
+                            const studyId = studyMap.get(StudyName.toLowerCase());
+                            if (studyId) eventData.studyId = studyId;
+                            else {
+                                errors.push(`Row ${rowNum}: Study "${StudyName}" not found.`);
+                                hasError = true;
+                            }
+                        }
+
+                        if (!hasError) {
+                            const newEventRef = doc(crcEventsRef);
+                            batch.set(newEventRef, eventData);
+                            successCount++;
+                        }
+                    }
+
+                    if (errors.length > 0) {
+                        const errorList = errors.map(err => `<li>${err}</li>`).join('');
+                        openModal(`
+                            <h3 class="text-xl font-bold text-red-500">Import Complete with Errors</h3>
+                            <p class="my-2 dark:text-gray-300">Successfully prepared <strong>${successCount}</strong> shifts to be created.</p>
+                            <p class="my-2 dark:text-gray-300">The following ${errors.length} rows could not be imported:</p>
+                            <ul class="list-disc list-inside bg-red-100 dark:bg-red-900/50 p-4 rounded-md text-sm max-h-60 overflow-y-auto custom-scrollbar">
+                                ${errorList}
+                            </ul>
+                            <div class="mt-6 text-right">
+                                <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Close</button>
+                            </div>
+                        `, true);
+                    }
+                    
+                    if (successCount > 0) {
+                        await batch.commit();
+                        if (errors.length === 0) {
+                             closeModal();
+                             showNotification(`${successCount} shifts imported successfully!`, 'success');
+                        }
+                    } else if (errors.length === 0) {
+                        closeModal();
+                        showNotification('No new shifts found in the CSV file.', 'info');
+                    }
+                };
+                reader.onerror = () => {
+                    openModal('<h3 class="text-xl font-bold dark:text-white">Import Error</h3><p class="dark:text-gray-300">Could not read the selected file.</p>');
+                };
+                reader.readAsText(file);
+            };
+            
+            const exportCurrentMonthToCSV = () => {
+                const now = state.crcCalendarDate;
+                const year = now.getFullYear();
+                const month = now.getMonth();
+
+                const eventsThisMonth = state.crc_events.filter(e => {
+                    const eventDate = new Date(e.date + "T00:00:00");
+                    return eventDate.getFullYear() === year && eventDate.getMonth() === month;
+                });
+
+                if (eventsThisMonth.length === 0) {
+                    showNotification('No events in the current month to export.', 'info');
+                    return;
+                }
+
+                const headers = ['Date', 'EventType', 'CRCName', 'SiteName', 'StudyName', 'Role', 'Notes'];
+                const rows = eventsThisMonth.map(event => {
+                    const crc = state.crcs.find(c => c.id === event.crcId);
+                    const site = state.crc_sites.find(s => s.id === event.siteId);
+                    const study = state.studies.find(s => s.id === event.studyId);
+                    return [
+                        event.date,
+                        event.type,
+                        crc ? crc.name : '',
+                        site ? site.name : '',
+                        study ? study.name : '',
+                        event.role || '',
+                        event.notes || ''
+                    ].map(val => `"${(val || '').replace(/"/g, '""')}"`).join(',');
+                });
+
+                const csvContent = "data:text/csv;charset=utf-8," + [headers.join(','), ...rows].join('\n');
+                const encodedUri = encodeURI(csvContent);
+                const link = document.createElement("a");
+                link.setAttribute("href", encodedUri);
+                const monthName = now.toLocaleString('default', { month: 'long' });
+                link.setAttribute("download", `crc_schedule_${year}_${monthName}.csv`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
             };
 
             // --- HTML GETTERS ---
@@ -899,7 +1123,6 @@
                 }
             };
 
-            // This is the missing function
             const handleEventTypeChange = (selectElement) => {
                 const eventType = selectElement.value;
                 const form = selectElement.closest('form');
@@ -908,13 +1131,11 @@
                 const studyGroup = form.querySelector('#study-group');
                 const roleGroup = form.querySelector('#role-group');
 
-                // Hide all relevant groups initially
                 crcGroup.classList.add('hidden');
                 siteGroup.classList.add('hidden');
                 studyGroup.classList.add('hidden');
                 roleGroup.classList.add('hidden');
 
-                // Show/hide based on event type
                 if (eventType === 'Site Assignment') {
                     crcGroup.classList.remove('hidden');
                     siteGroup.classList.remove('hidden');
@@ -929,7 +1150,6 @@
                     siteGroup.classList.remove('hidden');
                 }
                 
-                // Update CRC availability dropdown
                 updateCrcDropdownAvailability();
             };
 
@@ -1132,7 +1352,6 @@
                 const actionButton = e.target.closest('[data-action]');
                 if (!actionButton) return;
                 
-                // Prevent day view from opening when clicking on an event tag or the add button
                 if (actionButton.dataset.action !== 'view-day-events' && e.target.closest('.crc-event-tag, .add-event-btn')) {
                     e.stopPropagation();
                 }
@@ -1149,6 +1368,7 @@
                     case 'set-view': setState({ calendarView: view }); break;
                     case 'set-sidebar-tab': setState({ sidebarTab: tabId }); break;
                     case 'set-main-tab': setState({ activeTab: tabId }); break;
+                    case 'export-csv-btn': exportCurrentMonthToCSV(); break;
                     case 'open-crc-event-modal': 
                         openModal(getCRCEventModalHTML(date));
                         setTimeout(() => handleEventTypeChange(document.getElementById('crc-event-type')), 100);
@@ -1595,6 +1815,16 @@
                     e.preventDefault();
                     window.location.href = 'index.html';
                 });
+                
+                const importBtn = document.getElementById('import-csv-btn');
+                const csvInput = document.getElementById('csv-upload-input');
+                importBtn.addEventListener('click', () => csvInput.click());
+                csvInput.addEventListener('change', (e) => {
+                    handleCsvUpload(e.target.files[0]);
+                    // Reset the input so the same file can be uploaded again if needed
+                    e.target.value = ''; 
+                });
+
 
                 onAuthStateChanged(auth, (user) => {
                     if (user) {
@@ -1631,4 +1861,3 @@
     </script>
 </body>
 </html>
-```
