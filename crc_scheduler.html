@@ -105,16 +105,23 @@
             padding: 4px;
             border-radius: 4px;
         }
-        /* Styles for Global View (formerly Master Schedule) */
-        .global-view-grid {
-            display: grid;
-            grid-template-columns: 200px repeat(31, minmax(150px, 1fr));
-            gap: 1px;
-        }
-        .global-view-header, .global-view-cell {
+        /* Styles for Global View */
+        .global-view-header {
             padding: 8px;
             text-align: center;
             font-size: 0.8rem;
+        }
+        .global-view-study-header {
+            text-align: left;
+            font-weight: bold;
+            font-size: 1rem;
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            background-color: #e5e7eb; /* gray-200 */
+        }
+        .dark .global-view-study-header {
+            background-color: #374151; /* gray-700 */
         }
         .global-view-site-header {
             text-align: left;
@@ -125,7 +132,7 @@
         }
         .global-view-day-header {
             position: sticky;
-            top: 0;
+            top: 2.5rem; /* Height of study header */
             z-index: 20;
         }
         .global-view-cell {
@@ -250,7 +257,6 @@
             const loadingMessage = document.getElementById('loading-message');
             const loadingError = document.getElementById('loading-error');
             
-            // Removed the faulty API key check that was causing the error.
             if (!firebaseConfig.apiKey) {
                 loadingMessage.textContent = 'Configuration Error';
                 loadingError.innerHTML = `<strong>Action Required:</strong> Please provide your Firebase configuration object in the script.`;
@@ -322,31 +328,28 @@
                     const productiveEventTypes = ['Site Assignment', 'Travel Day'];
                     const nonWorkEventTypes = ['Paid Time Off', 'Unavailable'];
 
-                    const productiveHours = eventsThisMonth
-                        .filter(e => productiveEventTypes.includes(e.type))
-                        .reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                    // Use a Set to count unique days for productive and non-work events
+                    const productiveDays = new Set(
+                        eventsThisMonth
+                            .filter(e => productiveEventTypes.includes(e.type))
+                            .map(e => e.date)
+                    ).size;
                     
-                    const nonWorkDays = eventsThisMonth
-                        .filter(e => nonWorkEventTypes.includes(e.type))
-                        .reduce((sum, e) => sum + (parseFloat(e.hours) || 0) / 8, 0);
+                    const nonWorkDays = new Set(
+                        eventsThisMonth
+                            .filter(e => nonWorkEventTypes.includes(e.type))
+                            .map(e => e.date)
+                    ).size;
 
                     const crcAvailableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
-                    const crcTotalAvailableHours = crcAvailableWorkDays * 8;
-
-                    const totalHours = eventsThisMonth.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
-                    const siteDays = eventsThisMonth.filter(e => e.type === 'Site Assignment').length;
-                    const travelDays = eventsThisMonth.filter(e => e.type === 'Travel Day').length;
-                    const ptoDays = eventsThisMonth.filter(e => e.type === 'Paid Time Off').length;
-                    const unavailableDays = eventsThisMonth.filter(e => e.type === 'Unavailable').length;
                     
-                    const utilizationPercent = crcTotalAvailableHours > 0 ? Math.round((productiveHours / crcTotalAvailableHours) * 100) : 0;
+                    const utilizationPercent = crcAvailableWorkDays > 0 ? Math.round((productiveDays / crcAvailableWorkDays) * 100) : 0;
 
                     stats[crc.id] = {
-                        totalHours,
-                        siteDays,
-                        travelDays,
-                        ptoDays,
-                        unavailableDays,
+                        productiveDays,
+                        travelDays: eventsThisMonth.filter(e => e.type === 'Travel Day').length,
+                        ptoDays: eventsThisMonth.filter(e => e.type === 'Paid Time Off').length,
+                        unavailableDays: eventsThisMonth.filter(e => e.type === 'Unavailable').length,
                         utilizationPercent
                     };
                 });
@@ -459,6 +462,7 @@
                     const endDateInput = form.querySelector('input[name="endDate"]');
                     const crcSelect = form.querySelector('select[name="crcId"]');
                     const periodSelect = form.querySelector('select[name="period"]');
+                    const studySelect = form.querySelector('select[name="studyIds"]');
                     
                     updateCrcDropdownAvailability(); 
                     if (form.dataset.eventId && crcSelect.value) {
@@ -469,6 +473,7 @@
                     if(endDateInput) endDateInput.addEventListener('change', updateCrcDropdownAvailability);
                     if(crcSelect) crcSelect.addEventListener('change', (e) => updateCrcHoursDisplay(e.target.value, startDateInput.value));
                     if(periodSelect) periodSelect.addEventListener('change', updateCrcDropdownAvailability);
+                    if(studySelect) studySelect.addEventListener('change', updateSiteDropdownForStudies);
                 }
                 
                 if (modalContainer.querySelector('#unavailability-calendar-container')) {
@@ -1059,7 +1064,7 @@
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
 
-                // Apply filters
+                // Apply top-level filters
                 if (state.selectedCrcFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
                 }
@@ -1071,55 +1076,74 @@
                     filteredEvents = filteredEvents.filter(e => crcsInRegion.includes(e.crcId));
                 }
 
-                const eventsBySiteAndDay = filteredEvents.reduce((acc, event) => {
-                    const siteId = event.siteId || 'unassigned';
-                    const day = new Date(event.date + 'T00:00:00').getDate();
-                    const key = `${siteId}-${day}`;
-                    if (!acc[key]) acc[key] = [];
-                    acc[key].push(event);
+                // Group events by study, then by site
+                const eventsByStudy = filteredEvents.reduce((acc, event) => {
+                    (event.studyIds || ['unassigned']).forEach(studyId => {
+                        if (!acc[studyId]) acc[studyId] = [];
+                        acc[studyId].push(event);
+                    });
                     return acc;
                 }, {});
 
                 let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;">
-                                        <table class="min-w-full text-xs">
-                                            <thead>
-                                                <tr class="sticky top-0 z-20 bg-gray-100 dark:bg-gray-800">
-                                                    <th class="global-view-header global-view-site-header sticky left-0 z-30 bg-gray-100 dark:bg-gray-800">Site</th>`;
+                                        <table class="min-w-full text-xs">`;
+                
+                // Day headers row
+                tableHtml += `<thead><tr class="bg-gray-100 dark:bg-gray-800">
+                                <th class="global-view-header global-view-site-header sticky left-0 z-30 bg-gray-100 dark:bg-gray-800">Study / Site</th>`;
                 for (let day = 1; day <= daysInMonth; day++) {
                     tableHtml += `<th class="global-view-header global-view-day-header">${day}</th>`;
                 }
                 tableHtml += `</tr></thead><tbody>`;
 
-                const sitesToDisplay = state.selectedSiteFilter === 'all' ? state.crc_sites : state.crc_sites.filter(s => s.id === state.selectedSiteFilter);
+                // Iterate through studies
+                state.studies.forEach(study => {
+                    const studyEvents = eventsByStudy[study.id];
+                    if (!studyEvents || studyEvents.length === 0) return;
 
-                sitesToDisplay.sort((a, b) => a.name.localeCompare(b.name)).forEach(site => {
+                    // Study header row
                     tableHtml += `<tr class="border-t dark:border-gray-700">
-                                    <td class="global-view-header global-view-site-header sticky left-0 bg-white dark:bg-gray-900">${site.name}</td>`;
-                    for (let day = 1; day <= daysInMonth; day++) {
-                        const key = `${site.id}-${day}`;
-                        const dayEvents = eventsBySiteAndDay[key] || [];
-                        const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                                    <td colspan="${daysInMonth + 1}" class="global-view-study-header p-2">${study.name}</td>
+                                  </tr>`;
+
+                    const eventsBySite = studyEvents.reduce((acc, event) => {
+                        const siteId = event.siteId || 'unassigned';
+                        if(!acc[siteId]) acc[siteId] = [];
+                        acc[siteId].push(event);
+                        return acc;
+                    }, {});
+
+                    // Iterate through sites within the study
+                    Object.keys(eventsBySite).forEach(siteId => {
+                        const site = state.crc_sites.find(s => s.id === siteId);
+                        const siteName = site ? site.name : 'Unassigned Site';
                         
-                        tableHtml += `<td class="global-view-cell bg-white dark:bg-gray-900 align-top custom-scrollbar" data-action="open-crc-event-modal" data-date="${dateStr}">`;
-                        dayEvents.forEach(event => {
-                            const crc = state.crcs.find(c => c.id === event.crcId);
-                            const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)?.name).filter(Boolean).join(', ');
-                            const eventColor = event.type === 'Open Shift' ? 'bg-red-200 dark:bg-red-900/50 text-red-800 dark:text-red-200' : 'bg-blue-100 dark:bg-blue-900/50';
-                            const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
+                        tableHtml += `<tr class="border-t dark:border-gray-700">
+                                        <td class="global-view-header global-view-site-header sticky left-0 bg-white dark:bg-gray-900 pl-8">${siteName}</td>`;
+
+                        for (let day = 1; day <= daysInMonth; day++) {
+                            const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                            const dayEvents = (eventsBySite[siteId] || []).filter(e => e.date === dateStr);
                             
-                            tableHtml += `<div class="global-view-event ${eventColor}" data-action="view-crc-event" data-event-id="${event.id}">
-                                                <strong>${crc ? crc.name : 'Open Shift'}</strong> ${overrideIcon}<br>
-                                                <span class="text-gray-600 dark:text-gray-400">
-                                                    ${studies ? `Study: ${studies}<br>` : ''}
-                                                    ${event.visitNumber ? `Visit: ${event.visitNumber}<br>` : ''}
-                                                    ${(event.roles || []).length > 0 ? `Role: ${(event.roles).join(', ')}` : ''}
-                                                    ${event.period !== 'Full Day' ? `(${event.period})` : ''}
-                                                </span>
-                                            </div>`;
-                        });
-                        tableHtml += `</td>`;
-                    }
-                    tableHtml += `</tr>`;
+                            tableHtml += `<td class="global-view-cell bg-white dark:bg-gray-900 align-top custom-scrollbar" data-action="open-crc-event-modal" data-date="${dateStr}">`;
+                            dayEvents.forEach(event => {
+                                const crc = state.crcs.find(c => c.id === event.crcId);
+                                const eventColor = event.type === 'Open Shift' ? 'bg-red-200 dark:bg-red-900/50 text-red-800 dark:text-red-200' : 'bg-blue-100 dark:bg-blue-900/50';
+                                const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
+                                
+                                tableHtml += `<div class="global-view-event ${eventColor}" data-action="view-crc-event" data-event-id="${event.id}">
+                                                    <strong>${crc ? crc.name : 'Open Shift'}</strong> ${overrideIcon}<br>
+                                                    <span class="text-gray-600 dark:text-gray-400">
+                                                        ${event.visitNumber ? `Visit: ${event.visitNumber}<br>` : ''}
+                                                        ${(event.roles || []).length > 0 ? `Role: ${(event.roles).join(', ')}` : ''}
+                                                        ${event.period !== 'Full Day' ? `(${event.period})` : ''}
+                                                    </span>
+                                                </div>`;
+                            });
+                            tableHtml += `</td>`;
+                        }
+                        tableHtml += `</tr>`;
+                    });
                 });
 
                 tableHtml += `</tbody></table></div>`;
@@ -1170,11 +1194,8 @@
                             ` : '' }
                             ${ tabIs('studies') ? `
                                 <div class="space-y-4">
-                                    <form id="add-study-form" class="space-y-3">
-                                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Manage Studies</h3>
-                                        <input type="text" name="studyName" placeholder="Study Name / Number" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Study</button>
-                                    </form>
+                                     <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Manage Studies</h3>
+                                    <button data-action="open-add-study-modal" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Study</button>
                                     <div id="studyList" class="space-y-2 max-h-60 overflow-y-auto custom-scrollbar pr-2"></div>
                                 </div>
                             ` : '' }
@@ -1213,7 +1234,7 @@
                 if (studyList) {
                     studyList.innerHTML = state.studies.map(study => `
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
-                            <span class="text-sm font-medium text-gray-800 dark:text-gray-200">${study.name}</span>
+                            <button data-action="view-study-details" data-id="${study.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${study.name}</button>
                             <button data-action="delete-study" data-id="${study.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
                         </div>
                     `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No studies added yet.</p>';
@@ -1548,16 +1569,16 @@
                             <div id="crc-hours-info" class="text-sm mt-2 h-5 text-gray-600 dark:text-gray-400"></div>
                         </div>
 
-                        <div id="site-group" class="hidden">
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Site</label>
-                            <select name="siteId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Site</option>${siteOptions}</select>
-                        </div>
-
                         <div id="study-group" class="hidden">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Study/Studies <span class="text-xs font-light">(Hold Ctrl/Cmd to select multiple)</span></label>
                             <select name="studyIds" multiple class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-24"><option value="">Select Study</option>${studyOptions}</select>
                         </div>
                         
+                        <div id="site-group" class="hidden">
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Site</label>
+                            <select name="siteId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Site</option>${siteOptions}</select>
+                        </div>
+
                         <div id="role-group" class="hidden">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Role(s) <span class="text-xs font-light">(Hold Ctrl/Cmd to select multiple)</span></label>
                             <select name="roles" multiple class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-24">
