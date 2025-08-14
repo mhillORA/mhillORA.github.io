@@ -381,7 +381,7 @@
 						eventDate <= endOfWeek;
 				});
 
-				return eventsThisMonth.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+				return eventsThisWeek.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
 			};
 
 			/// --- CORE FUNCTIONS ---
@@ -536,7 +536,7 @@
 				return { headers, data };
 			};
 
-			const handleCsvUpload = async (file) => {
+			const handleCsvUpload = async (file, uploadType = 'shifts') => {
 				if (!file) return;
 
 				openModal(`
@@ -547,7 +547,7 @@
 								<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
 								<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
 							</svg>
-							<p class="dark:text-gray-300">Reading file and preparing shifts. Please wait.</p>
+							<p class="dark:text-gray-300">Reading file and preparing data. Please wait.</p>
 						</div>
 					</div>
 				`);
@@ -557,6 +557,82 @@
 					const text = e.target.result;
 					const { headers, data } = parseCSV(text);
 
+					if (uploadType === 'crcs') {
+						await importCRCs(headers, data);
+					} else {
+						await importShifts(headers, data);
+					}
+				};
+				reader.onerror = () => {
+					openModal(`<h3 class="text-xl font-bold dark:text-white">Import Error</h3><p class="dark:text-gray-300">Could not read the selected file.</p>`);
+				};
+				reader.readAsText(file);
+			};
+
+			const importCRCs = async (headers, data) => {
+				const requiredHeaders = ['CRCName', 'HomeLocation'];
+				const missingHeaders = requiredHeaders.filter(h => !headers.includes(h));
+				if (missingHeaders.length > 0) {
+					openModal(`<h3 class="text-xl font-bold dark:text-white">Import Error</h3><p class="dark:text-gray-300">CRC CSV file is missing required headers. It must contain: ${missingHeaders.join(', ')}</p>`);
+					return;
+				}
+
+				const batch = writeBatch(db);
+				const crcsRef = collection(db, `artifacts/${appId}/public/data/crcs`);
+				const errors = [];
+				let successCount = 0;
+
+				for (const [index, row] of data.entries()) {
+					const rowNum = index + 2;
+					const { CRCName, HomeLocation, Region } = row;
+
+					if (!CRCName || !HomeLocation) {
+						errors.push(`Row ${rowNum}: Missing required value for CRCName or HomeLocation.`);
+						continue;
+					}
+
+					const crcData = {
+						name: CRCName.trim(),
+						homeLocation: HomeLocation.trim(),
+						region: (Region || '').trim(),
+						trainings: [],
+						capabilities: [],
+						trainingLevel: ''
+					};
+					
+					const newCrcRef = doc(crcsRef);
+					batch.set(newCrcRef, crcData);
+					successCount++;
+				}
+
+				if (errors.length > 0) {
+					const errorList = errors.map(err => `<li>${err}</li>`).join('');
+					openModal(`
+						<h3 class="text-xl font-bold text-red-500">Import Complete with Errors</h3>
+						<p class="my-2 dark:text-gray-300">Successfully prepared <strong>${successCount}</strong> CRCs to be created.</p>
+						<p class="my-2 dark:text-gray-300">The following ${errors.length} rows could not be imported:</p>
+						<ul class="list-disc list-inside bg-red-100 dark:bg-red-900/50 p-4 rounded-md text-sm max-h-60 overflow-y-auto custom-scrollbar">
+							${errorList}
+						</ul>
+						<div class="mt-6 text-right">
+							<button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Close</button>
+						</div>
+					`, 'lg');
+				}
+				
+				if (successCount > 0) {
+					await batch.commit();
+					if (errors.length === 0) {
+						closeModal();
+						showNotification(`${successCount} CRCs imported successfully!`, 'success');
+					}
+				} else if (errors.length === 0) {
+					closeModal();
+					showNotification('No new CRCs found in the CSV file.', 'info');
+				}
+			};
+
+			const importShifts = async (headers, data) => {
 					const requiredHeaders = ['Date', 'EventType'];
 					const missingHeaders = requiredHeaders.filter(h => !headers.includes(h));
 					if (missingHeaders.length > 0) {
@@ -668,11 +744,6 @@
 						closeModal();
 						showNotification('No new shifts found in the CSV file.', 'info');
 					}
-				};
-				reader.onerror = () => {
-					openModal('<h3 class="text-xl font-bold dark:text-white">Import Error</h3><p class="dark:text-gray-300">Could not read the selected file.</p>');
-				};
-				reader.readAsText(file);
 			};
 			
 			const exportCurrentMonthToCSV = () => {
@@ -1353,7 +1424,10 @@
 										<input type="text" name="crcName" placeholder="CRC Name" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
 										<input type="text" name="crcLocation" placeholder="Home Location (e.g., City, ST)" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
 										<input type="text" name="crcRegion" placeholder="Region (e.g., East, West)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-										<button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add CRC</button>
+										<div class="flex gap-2">
+											<button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add CRC</button>
+											<button type="button" data-action="import-crcs-btn" class="w-full bg-purple-600 text-white py-2 rounded-md hover:bg-purple-700 transition-colors">Import CRCs</button>
+										</div>
 									</form>
 									<div id="crcList" class="space-y-2 max-h-60 overflow-y-auto custom-scrollbar pr-2"></div>
 								</div>
@@ -1980,6 +2054,34 @@
 					</div>
 				`;
 			};
+
+			const getImportCRCsModalHTML = () => {
+				return `
+					<h2 class="text-2xl font-bold dark:text-white mb-4">Import CRCs from CSV</h2>
+					<div class="space-y-4 text-gray-700 dark:text-gray-300">
+						<p>Please ensure your CSV file has the correct headers before uploading.</p>
+						<div>
+							<h4 class="font-semibold text-gray-800 dark:text-gray-200">Required Columns:</h4>
+							<ul class="list-disc list-inside mt-2 text-sm">
+								<li><strong>CRCName</strong>: The full name of the CRC.</li>
+								<li><strong>HomeLocation</strong>: The home city and state (e.g., "New York, NY") for mapping.</li>
+							</ul>
+						</div>
+						<div>
+							<h4 class="font-semibold text-gray-800 dark:text-gray-200">Optional Columns:</h4>
+							<ul class="list-disc list-inside mt-2 text-sm">
+								<li><strong>Region</strong>: The region the CRC belongs to (e.g., "East", "West").</li>
+							</ul>
+						</div>
+					</div>
+					<div class="mt-6 flex justify-end gap-4">
+						<button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+						<button data-action="trigger-crc-csv-upload" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 flex items-center">
+							<i data-lucide="upload" class="w-4 h-4 mr-2"></i>Choose File & Import
+						</button>
+					</div>
+				`;
+			};
 			
 			const getManageUnavailabilityModalHTML = () => {
 				const crcOptions = state.crcs.map(crc => `<option value="${crc.id}" ${state.selectedCrcForUnavailability === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
@@ -2105,7 +2207,15 @@
 					case 'set-sidebar-tab': setState({ sidebarTab: tabId }); break;
 					case 'set-main-tab': setState({ activeTab: tabId }); break;
 					case 'import-csv-btn': openModal(getImportCsvModalHTML()); break;
-					case 'trigger-csv-upload': document.getElementById('csv-upload-input').click(); break;
+					case 'trigger-csv-upload': 
+						document.getElementById('csv-upload-input').dataset.uploadType = 'shifts';
+						document.getElementById('csv-upload-input').click(); 
+						break;
+					case 'import-crcs-btn': openModal(getImportCRCsModalHTML()); break;
+					case 'trigger-crc-csv-upload':
+						document.getElementById('csv-upload-input').dataset.uploadType = 'crcs';
+						document.getElementById('csv-upload-input').click();
+						break;
 					case 'export-csv-btn': exportCurrentMonthToCSV(); break;
 					case 'open-crc-event-modal':
 						openModal(getCRCEventModalHTML(date), '4xl');
@@ -2689,8 +2799,10 @@
 				const csvInput = document.getElementById('csv-upload-input');
 				csvInput.addEventListener('change', (e) => {
 					if (e.target.files[0]) {
+						const uploadType = e.target.dataset.uploadType || 'shifts';
 						closeModal();
-						handleCsvUpload(e.target.files[0]);
+						handleCsvUpload(e.target.files[0], uploadType);
+						delete e.target.dataset.uploadType; // Reset after use
 					}
 					e.target.value = '';
 				});
