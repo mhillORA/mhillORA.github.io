@@ -1246,20 +1246,24 @@
 					filteredEvents = filteredEvents.filter(e => crcsInRegion.includes(e.crcId));
 				}
 
-				// 2. Aggregate data: { studyId: { dateStr: Set(crcId) } }
-				const staffCountByStudyAndDate = {};
+				// 2. Aggregate data: { siteId: { dateStr: { staff: Set(), roles: Set() } } }
+				const siteDailyStats = {};
 				filteredEvents.forEach(event => {
-					if (!event.crcId) return; // Only count assigned staff
-					const studyIds = (event.studyIds && event.studyIds.length > 0) ? event.studyIds : ['unassigned'];
-					studyIds.forEach(studyId => {
-						if (!staffCountByStudyAndDate[studyId]) {
-							staffCountByStudyAndDate[studyId] = {};
-						}
-						if (!staffCountByStudyAndDate[studyId][event.date]) {
-							staffCountByStudyAndDate[studyId][event.date] = new Set();
-						}
-						staffCountByStudyAndDate[studyId][event.date].add(event.crcId);
-					});
+					if (!event.siteId) return; // Only process events with a site
+					
+					if (!siteDailyStats[event.siteId]) {
+						siteDailyStats[event.siteId] = {};
+					}
+					if (!siteDailyStats[event.siteId][event.date]) {
+						siteDailyStats[event.siteId][event.date] = { staff: new Set(), roles: new Set() };
+					}
+					
+					if (event.crcId) {
+						siteDailyStats[event.siteId][event.date].staff.add(event.crcId);
+					}
+					if (event.roles && event.roles.length > 0) {
+						event.roles.forEach(role => siteDailyStats[event.siteId][event.date].roles.add(role));
+					}
 				});
 
 				// 3. Generate HTML for the table
@@ -1269,34 +1273,43 @@
 				// Header row with day numbers
 				tableHtml += `<thead class="sticky top-0 z-10">
 								<tr class="bg-gray-100 dark:bg-gray-800">
-									<th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold">Study</th>`;
+									<th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold">Site</th>`;
 				for (let day = 1; day <= daysInMonth; day++) {
 					tableHtml += `<th class="p-2 font-normal w-10">${day}</th>`;
 				}
 				tableHtml += `</tr></thead>`;
 
-				// Table body with study rows
+				// Table body with site rows
 				let tbodyHtml = '<tbody>';
-				const sortedStudies = [...state.studies, {id: 'unassigned', name: 'Unassigned Study'}]
-					.filter(study => staffCountByStudyAndDate[study.id])
+				const sortedSites = state.crc_sites
+					.filter(site => siteDailyStats[site.id]) // Only show sites with events this month
 					.sort((a,b) => a.name.localeCompare(b.name));
 
-				sortedStudies.forEach(study => {
+				sortedSites.forEach(site => {
 					tbodyHtml += `<tr class="border-t dark:border-gray-700">
-									<td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${study.name}</td>`;
+									<td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${site.name}</td>`;
 					for (let day = 1; day <= daysInMonth; day++) {
 						const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-						const staffSet = staffCountByStudyAndDate[study.id]?.[dateStr];
-						const staffCount = staffSet ? staffSet.size : 0;
+						const stats = siteDailyStats[site.id]?.[dateStr];
+						const staffCount = stats ? stats.staff.size : 0;
 						
-						let cellClass = 'text-center border-l dark:border-gray-700';
-						let cellContent = staffCount > 0 ? staffCount : '-';
+						let cellClass = 'text-center border-l dark:border-gray-700 cursor-pointer hover:ring-2 hover:ring-blue-500';
+						let cellContent = '';
 
-						if (staffCount === 1) cellClass += ' bg-blue-100 dark:bg-blue-900/50';
-						if (staffCount === 2) cellClass += ' bg-green-100 dark:bg-green-900/50';
-						if (staffCount >= 3) cellClass += ' bg-yellow-100 dark:bg-yellow-900/50 font-bold';
+						if (staffCount > 0) {
+							const roles = stats.roles.size > 0 ? Array.from(stats.roles).map(r => r.charAt(0)).join(', ') : 'N/A';
+							cellContent = `
+								<div class="font-bold text-base">${staffCount}</div>
+								<div class="text-xs text-gray-500 dark:text-gray-400 truncate" title="${Array.from(stats.roles).join(', ')}">${roles}</div>
+							`;
+							if (staffCount === 1) cellClass += ' bg-blue-100 dark:bg-blue-900/50';
+							else cellClass += ' bg-green-100 dark:bg-green-900/50';
+						} else {
+							cellContent = `<div class="text-gray-400">-</div>`;
+							cellClass += ' bg-red-50 dark:bg-red-900/30';
+						}
 						
-						tbodyHtml += `<td class="${cellClass}">${cellContent}</td>`;
+						tbodyHtml += `<td class="${cellClass}" data-action="view-day-events" data-date="${dateStr}" data-site-id="${site.id}">${cellContent}</td>`;
 					}
 					tbodyHtml += `</tr>`;
 				});
@@ -1797,9 +1810,14 @@
 				`;
 			};
 
-			const getDayViewModalHTML = (date, events) => {
+			const getDayViewModalHTML = (date, events, siteId = null) => {
 				const dateObj = new Date(date + 'T00:00:00');
 				const formattedDate = dateObj.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+				let title = `Events for ${formattedDate}`;
+				if(siteId){
+					const site = state.crc_sites.find(s => s.id === siteId);
+					if(site) title = `Events at ${site.name} on ${formattedDate}`;
+				}
 
 				let eventListHTML = events.map(event => {
 					const crc = state.crcs.find(c => c.id === event.crcId);
@@ -1812,7 +1830,7 @@
 							<div class="flex-grow">
 								<p class="font-semibold">${event.type} (${event.hours || 'N/A'} hrs)</p>
 								<p class="text-sm text-gray-600 dark:text-gray-300">
-									${crc ? crc.name : ''} ${site ? `at ${site.name}` : ''} ${(event.roles || []).length > 0 ? `(${(event.roles).join(', ')})` : ''}
+									${crc ? crc.name : 'Open Shift'} ${site ? `at ${site.name}` : ''} ${(event.roles || []).length > 0 ? `(${(event.roles).join(', ')})` : ''}
 								</p>
 								${event.notes ? `<p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${event.notes}</p>` : ''}
 							</div>
@@ -1828,7 +1846,7 @@
 				}
 
 				return `
-					<h2 class="text-2xl font-bold dark:text-white mb-4">${formattedDate}</h2>
+					<h2 class="text-2xl font-bold dark:text-white mb-4">${title}</h2>
 					<div class="space-y-2">${eventListHTML}</div>
 				`;
 			};
@@ -2054,7 +2072,7 @@
 					e.stopPropagation();
 				}
 
-				const { action, id, date, eventId, groupId, view, tabId, mode } = actionButton.dataset;
+				const { action, id, date, eventId, groupId, view, tabId, mode, siteId } = actionButton.dataset;
 				const getCollectionRef = (name) => collection(db, `artifacts/${appId}/public/data/${name}`);
 
 				switch(action) {
@@ -2087,8 +2105,11 @@
 						openModal(getCRCEventModalHTML(date), '4xl');
 						break;
 					case 'view-day-events': {
-						const todaysEvents = state.crc_events.filter(event => event.date === date);
-						openModal(getDayViewModalHTML(date, todaysEvents), 'lg');
+						let todaysEvents = state.crc_events.filter(event => event.date === date);
+						if (siteId) {
+							todaysEvents = todaysEvents.filter(event => event.siteId === siteId);
+						}
+						openModal(getDayViewModalHTML(date, todaysEvents, siteId), 'lg');
 						break;
 					}
 					case 'view-crc-event': {
@@ -2700,7 +2721,7 @@
 				}
 			};
 
-			//// --- START THE APP ---
+			/// --- START THE APP ---
 			init();
 
 		})();
