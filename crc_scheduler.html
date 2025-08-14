@@ -310,6 +310,14 @@
 				return (day + 1) % 7; // Saturday = 0, Sunday = 1, ..., Friday = 6
 			};
 
+			const getAllRoles = () => {
+				const roles = new Set(['Lead', 'Support', 'Trainee', 'Phlebotomist', 'Coordinator']);
+				state.crc_events.forEach(event => {
+					(event.roles || []).forEach(role => roles.add(role));
+				});
+				return Array.from(roles).sort();
+			};
+
 			// --- CALCULATION FUNCTIONS ---
 			const calculateAllCrcStats = () => {
 				const now = state.crcCalendarDate;
@@ -642,9 +650,12 @@
 
 					const batch = writeBatch(db);
 					const crcEventsRef = collection(db, `artifacts/${appId}/public/data/crc_events`);
+					const sitesRef = collection(db, `artifacts/${appId}/public/data/crc_sites`);
+					const studiesRef = collection(db, `artifacts/${appId}/public/data/studies`);
 					const errors = [];
 					let successCount = 0;
 
+					// Create local maps for efficient lookup during the import process
 					const crcMap = new Map(state.crcs.map(c => [c.name.toLowerCase(), c.id]));
 					const siteMap = new Map(state.crc_sites.map(s => [s.name.toLowerCase(), s.id]));
 					const studyMap = new Map(state.studies.map(s => [s.name.toLowerCase(), s.id]));
@@ -679,38 +690,51 @@
 						
 						let hasError = false;
 
+						// CRC validation (CRCs must exist)
 						if (EventType !== 'Open Shift' && !CRCName) {
 							errors.push(`Row ${rowNum}: CRCName is required for EventType "${EventType}".`);
 							hasError = true;
 						}
-
 						if (CRCName) {
 							const crcId = crcMap.get(CRCName.toLowerCase());
-							if (crcId) eventData.crcId = crcId;
-							else {
+							if (crcId) {
+								eventData.crcId = crcId;
+							} else {
 								errors.push(`Row ${rowNum}: CRC "${CRCName}" not found.`);
 								hasError = true;
 							}
 						}
+
+						// Site handling (auto-create if not found)
 						if (SiteName) {
-							const siteId = siteMap.get(SiteName.toLowerCase());
-							if (siteId) eventData.siteId = siteId;
-							else {
-								errors.push(`Row ${rowNum}: Site "${SiteName}" not found.`);
-								hasError = true;
+							const siteNameTrimmed = SiteName.trim();
+							const siteNameLower = siteNameTrimmed.toLowerCase();
+							let siteId = siteMap.get(siteNameLower);
+							if (!siteId) {
+								const newSiteDoc = await addDoc(sitesRef, { name: siteNameTrimmed });
+								siteId = newSiteDoc.id;
+								siteMap.set(siteNameLower, siteId);
 							}
+							eventData.siteId = siteId;
 						}
+						
+						// Study handling (auto-create if not found)
 						if (StudyName) {
-							const studyIds = StudyName.split(';').map(sName => {
-								const studyId = studyMap.get(sName.trim().toLowerCase());
+							const studyNames = StudyName.split(';').map(s => s.trim()).filter(Boolean);
+							const studyIds = [];
+							for (const sName of studyNames) {
+								const sNameLower = sName.toLowerCase();
+								let studyId = studyMap.get(sNameLower);
 								if (!studyId) {
-									errors.push(`Row ${rowNum}: Study "${sName.trim()}" not found.`);
-									hasError = true;
+									const newStudyDoc = await addDoc(studiesRef, { name: sName });
+									studyId = newStudyDoc.id;
+									studyMap.set(sNameLower, studyId);
 								}
-								return studyId;
-							}).filter(Boolean);
+								studyIds.push(studyId);
+							}
 							if (studyIds.length > 0) eventData.studyIds = studyIds;
 						}
+
 
 						if (!hasError) {
 							const newEventRef = doc(crcEventsRef);
@@ -1683,7 +1707,7 @@
 						if (el) el.classList.remove('hidden');
 					});
 				} else if (eventType === 'Travel Day') {
-					[crcGroup, siteGroup, mileageGroup, periodGroup].forEach(el => {
+					[crcGroup, siteGroup, studyGroup, mileageGroup, periodGroup].forEach(el => {
 						if (el) el.classList.remove('hidden');
 					});
 				} else if (eventType === 'Paid Time Off' || eventType === 'Unavailable') {
@@ -1778,7 +1802,7 @@
 				const selectedStudyIds = new Set(event ? event.studyIds || [] : []);
 				const studyOptions = state.studies.map(study => `<option value="${study.id}" ${selectedStudyIds.has(study.id) ? 'selected' : ''}>${study.name}</option>`).join('');
 
-				const allRoles = ['Lead', 'Support', 'Trainee', 'Phlebotomist', 'Coordinator']; // Example roles
+				const allRoles = getAllRoles();
 				const selectedRoles = new Set(event ? event.roles || [] : []);
 				const roleOptions = allRoles.map(r => `<option value="${r}" ${selectedRoles.has(r) ? 'selected' : ''}>${r}</option>`).join('');
 
@@ -1789,7 +1813,7 @@
 				const show = {
 					crc: !['Open Shift'].includes(eventType),
 					site: ['Site Assignment', 'Travel Day', 'Open Shift'].includes(eventType),
-					study: ['Site Assignment', 'Open Shift'].includes(eventType),
+					study: ['Site Assignment', 'Open Shift', 'Travel Day'].includes(eventType),
 					role: ['Site Assignment', 'Open Shift'].includes(eventType),
 					visit: ['Site Assignment', 'Open Shift'].includes(eventType),
 					period: true, // Always shown
@@ -2031,8 +2055,8 @@
 							<h4 class="font-semibold text-gray-800 dark:text-gray-200">Optional Columns:</h4>
 							<ul class="list-disc list-inside mt-2 text-sm">
 								<li><strong>CRCName</strong>: The name of the CRC. Must match an existing CRC. (Required for most event types).</li>
-								<li><strong>SiteName</strong>: The name of the Site. Must match an existing Site.</li>
-								<li><strong>StudyName</strong>: Study names, separated by a semicolon (;).</li>
+								<li><strong>SiteName</strong>: The name of the Site. If the site doesn't exist, it will be created.</li>
+								<li><strong>StudyName</strong>: Study names, separated by a semicolon (;). If a study doesn't exist, it will be created.</li>
 								<li><strong>Roles</strong>: Roles for the assignment, separated by a semicolon (;).</li>
 								<li><strong>Hours</strong>: Number of hours for the shift (defaults to 8).</li>
 								<li><strong>Period</strong>: For Unavailable/PTO shifts ('Full Day', 'AM', 'PM').</li>
