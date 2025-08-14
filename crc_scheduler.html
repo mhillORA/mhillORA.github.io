@@ -273,6 +273,7 @@
 				selectedCrcForUnavailability: null,
 				calendarView: 'global', // 'month', 'week', or 'global'
 				calendarDisplayMode: 'employee', // 'employee', 'study', 'site', 'at-a-glance'
+				atAGlanceGroupBy: 'study', // 'study' or 'site'
 				activeTab: 'scheduler', // 'scheduler', 'reporting'
 				sidebarTab: 'crcs',
 				crcs: [],
@@ -380,7 +381,7 @@
 						eventDate <= endOfWeek;
 				});
 
-				return eventsThisWeek.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+				return eventsThisMonth.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
 			};
 
 			/// --- CORE FUNCTIONS ---
@@ -849,9 +850,8 @@
 				} else if (state.calendarView === 'week') {
 					container.innerHTML = getWeeklyCalendarHTML();
 				} else if (state.calendarView === 'global') {
-                    // The "at-a-glance" view is now a mode within the global view
 					if (state.calendarDisplayMode === 'at-a-glance') {
-						container.innerHTML = getAtAGlanceViewHTML();
+						container.innerHTML = getAtAGlanceViewHTML(state.atAGlanceGroupBy);
 					} else {
 						container.innerHTML = getGlobalViewDetailedHTML();
 					}
@@ -872,6 +872,18 @@
 				const prevAction = state.calendarView === 'week' ? 'prev-crc-week' : 'prev-crc-month';
 				const nextAction = state.calendarView === 'week' ? 'next-crc-week' : 'next-crc-month';
 
+				// Conditional toggle for the "At-a-Glance" view
+				let atAGlanceToggle = '';
+				if (state.calendarView === 'global' && state.calendarDisplayMode === 'at-a-glance') {
+					atAGlanceToggle = `
+						<div class="flex items-center rounded-md border dark:border-gray-600 ml-4">
+							<span class="px-3 py-1 text-sm bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300">Group By:</span>
+							<button data-action="set-at-a-glance-group" data-group="study" class="px-3 py-1 text-sm ${state.atAGlanceGroupBy === 'study' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Study</button>
+							<button data-action="set-at-a-glance-group" data-group="site" class="px-3 py-1 text-sm ${state.atAGlanceGroupBy === 'site' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Site</button>
+						</div>
+					`;
+				}
+
 				return `
 					<div class="flex flex-wrap justify-between items-center mb-4 gap-2">
 						<div class="flex items-center gap-4">
@@ -882,6 +894,7 @@
 								<button data-action="set-display-mode" data-mode="site" class="px-3 py-1 text-sm ${state.calendarDisplayMode === 'site' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Site</button>
 								<button data-action="set-display-mode" data-mode="at-a-glance" class="px-3 py-1 text-sm ${state.calendarDisplayMode === 'at-a-glance' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">At-a-Glance</button>
 							</div>
+							${atAGlanceToggle}
 						</div>
 						<div class="flex items-center space-x-2">
 							<div class="flex items-center rounded-md border dark:border-gray-600">
@@ -1224,7 +1237,7 @@
 				return getCalendarHeaderHTML() + tableHtml;
 			};
 
-			const getAtAGlanceViewHTML = () => {
+			const getAtAGlanceViewHTML = (groupBy = 'study') => {
 				const now = state.crcCalendarDate;
 				const year = now.getFullYear();
 				const month = now.getMonth();
@@ -1246,70 +1259,67 @@
 					filteredEvents = filteredEvents.filter(e => crcsInRegion.includes(e.crcId));
 				}
 
-				// 2. Aggregate data: { siteId: { dateStr: { staff: Set(), roles: Set() } } }
-				const siteDailyStats = {};
+				// 2. Aggregate data based on the groupBy parameter
+				const staffCountByGroupAndDate = {};
 				filteredEvents.forEach(event => {
-					if (!event.siteId) return; // Only process events with a site
-					
-					if (!siteDailyStats[event.siteId]) {
-						siteDailyStats[event.siteId] = {};
+					if (!event.crcId) return; // Only count assigned staff
+
+					let groupIds = [];
+					if (groupBy === 'study') {
+						groupIds = (event.studyIds && event.studyIds.length > 0) ? event.studyIds : ['unassigned'];
+					} else { // groupBy === 'site'
+						groupIds = event.siteId ? [event.siteId] : ['unassigned'];
 					}
-					if (!siteDailyStats[event.siteId][event.date]) {
-						siteDailyStats[event.siteId][event.date] = { staff: new Set(), roles: new Set() };
-					}
-					
-					if (event.crcId) {
-						siteDailyStats[event.siteId][event.date].staff.add(event.crcId);
-					}
-					if (event.roles && event.roles.length > 0) {
-						event.roles.forEach(role => siteDailyStats[event.siteId][event.date].roles.add(role));
-					}
+
+					groupIds.forEach(groupId => {
+						if (!staffCountByGroupAndDate[groupId]) {
+							staffCountByGroupAndDate[groupId] = {};
+						}
+						if (!staffCountByGroupAndDate[groupId][event.date]) {
+							staffCountByGroupAndDate[groupId][event.date] = new Set();
+						}
+						staffCountByGroupAndDate[groupId][event.date].add(event.crcId);
+					});
 				});
 
 				// 3. Generate HTML for the table
+				const collection = groupBy === 'study' ? state.studies : state.crc_sites;
+				const unassignedGroup = { id: 'unassigned', name: `Unassigned ${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}` };
+
 				let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;">
 									<table class="min-w-full text-sm border-collapse">`;
 				
 				// Header row with day numbers
 				tableHtml += `<thead class="sticky top-0 z-10">
 								<tr class="bg-gray-100 dark:bg-gray-800">
-									<th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold">Site</th>`;
+									<th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold">${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}</th>`;
 				for (let day = 1; day <= daysInMonth; day++) {
 					tableHtml += `<th class="p-2 font-normal w-10">${day}</th>`;
 				}
 				tableHtml += `</tr></thead>`;
 
-				// Table body with site rows
+				// Table body with study/site rows
 				let tbodyHtml = '<tbody>';
-				const sortedSites = state.crc_sites
-					.filter(site => siteDailyStats[site.id]) // Only show sites with events this month
+				const sortedGroups = [...collection, unassignedGroup]
+					.filter(group => staffCountByGroupAndDate[group.id])
 					.sort((a,b) => a.name.localeCompare(b.name));
 
-				sortedSites.forEach(site => {
+				sortedGroups.forEach(group => {
 					tbodyHtml += `<tr class="border-t dark:border-gray-700">
-									<td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${site.name}</td>`;
+									<td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${group.name}</td>`;
 					for (let day = 1; day <= daysInMonth; day++) {
 						const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-						const stats = siteDailyStats[site.id]?.[dateStr];
-						const staffCount = stats ? stats.staff.size : 0;
+						const staffSet = staffCountByGroupAndDate[group.id]?.[dateStr];
+						const staffCount = staffSet ? staffSet.size : 0;
 						
-						let cellClass = 'text-center border-l dark:border-gray-700 cursor-pointer hover:ring-2 hover:ring-blue-500';
-						let cellContent = '';
+						let cellClass = 'text-center border-l dark:border-gray-700';
+						let cellContent = staffCount > 0 ? staffCount : '-';
 
-						if (staffCount > 0) {
-							const roles = stats.roles.size > 0 ? Array.from(stats.roles).map(r => r.charAt(0)).join(', ') : 'N/A';
-							cellContent = `
-								<div class="font-bold text-base">${staffCount}</div>
-								<div class="text-xs text-gray-500 dark:text-gray-400 truncate" title="${Array.from(stats.roles).join(', ')}">${roles}</div>
-							`;
-							if (staffCount === 1) cellClass += ' bg-blue-100 dark:bg-blue-900/50';
-							else cellClass += ' bg-green-100 dark:bg-green-900/50';
-						} else {
-							cellContent = `<div class="text-gray-400">-</div>`;
-							cellClass += ' bg-red-50 dark:bg-red-900/30';
-						}
+						if (staffCount === 1) cellClass += ' bg-blue-100 dark:bg-blue-900/50';
+						if (staffCount === 2) cellClass += ' bg-green-100 dark:bg-green-900/50';
+						if (staffCount >= 3) cellClass += ' bg-yellow-100 dark:bg-yellow-900/50 font-bold';
 						
-						tbodyHtml += `<td class="${cellClass}" data-action="view-day-events" data-date="${dateStr}" data-site-id="${site.id}">${cellContent}</td>`;
+						tbodyHtml += `<td class="${cellClass}">${cellContent}</td>`;
 					}
 					tbodyHtml += `</tr>`;
 				});
@@ -1810,14 +1820,9 @@
 				`;
 			};
 
-			const getDayViewModalHTML = (date, events, siteId = null) => {
+			const getDayViewModalHTML = (date, events) => {
 				const dateObj = new Date(date + 'T00:00:00');
 				const formattedDate = dateObj.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-				let title = `Events for ${formattedDate}`;
-				if(siteId){
-					const site = state.crc_sites.find(s => s.id === siteId);
-					if(site) title = `Events at ${site.name} on ${formattedDate}`;
-				}
 
 				let eventListHTML = events.map(event => {
 					const crc = state.crcs.find(c => c.id === event.crcId);
@@ -1830,7 +1835,7 @@
 							<div class="flex-grow">
 								<p class="font-semibold">${event.type} (${event.hours || 'N/A'} hrs)</p>
 								<p class="text-sm text-gray-600 dark:text-gray-300">
-									${crc ? crc.name : 'Open Shift'} ${site ? `at ${site.name}` : ''} ${(event.roles || []).length > 0 ? `(${(event.roles).join(', ')})` : ''}
+									${crc ? crc.name : ''} ${site ? `at ${site.name}` : ''} ${(event.roles || []).length > 0 ? `(${(event.roles).join(', ')})` : ''}
 								</p>
 								${event.notes ? `<p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${event.notes}</p>` : ''}
 							</div>
@@ -1846,7 +1851,7 @@
 				}
 
 				return `
-					<h2 class="text-2xl font-bold dark:text-white mb-4">${title}</h2>
+					<h2 class="text-2xl font-bold dark:text-white mb-4">${formattedDate}</h2>
 					<div class="space-y-2">${eventListHTML}</div>
 				`;
 			};
@@ -2072,7 +2077,7 @@
 					e.stopPropagation();
 				}
 
-				const { action, id, date, eventId, groupId, view, tabId, mode, siteId } = actionButton.dataset;
+				const { action, id, date, eventId, groupId, view, tabId, mode, group } = actionButton.dataset;
 				const getCollectionRef = (name) => collection(db, `artifacts/${appId}/public/data/${name}`);
 
 				switch(action) {
@@ -2096,6 +2101,7 @@
 						break;
 					case 'set-view': setState({ calendarView: view }); break;
 					case 'set-display-mode': setState({ calendarDisplayMode: mode }); break;
+					case 'set-at-a-glance-group': setState({ atAGlanceGroupBy: group }); break;
 					case 'set-sidebar-tab': setState({ sidebarTab: tabId }); break;
 					case 'set-main-tab': setState({ activeTab: tabId }); break;
 					case 'import-csv-btn': openModal(getImportCsvModalHTML()); break;
@@ -2105,11 +2111,8 @@
 						openModal(getCRCEventModalHTML(date), '4xl');
 						break;
 					case 'view-day-events': {
-						let todaysEvents = state.crc_events.filter(event => event.date === date);
-						if (siteId) {
-							todaysEvents = todaysEvents.filter(event => event.siteId === siteId);
-						}
-						openModal(getDayViewModalHTML(date, todaysEvents, siteId), 'lg');
+						const todaysEvents = state.crc_events.filter(event => event.date === date);
+						openModal(getDayViewModalHTML(date, todaysEvents), 'lg');
 						break;
 					}
 					case 'view-crc-event': {
