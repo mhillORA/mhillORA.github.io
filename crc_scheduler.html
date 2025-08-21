@@ -2997,6 +2997,55 @@
 			});
 			
 			// --- INITIALIZATION ---
+			const cleanupInvalidRoles = async (events, existingRoles) => {
+				const cleanupFlag = 'roleCleanupCompleted_v2';
+				if (localStorage.getItem(cleanupFlag)) {
+					return; // Cleanup has already run
+				}
+
+				const rolesToDelete = ["Alcon E002", "Alcon E003", "Azura", "Regeneron (birch)", "Regeneron CAT"];
+				const defaultRole = (existingRoles.find(r => r.name === 'Coordinator') || existingRoles[0])?.name || 'Support';
+
+				const eventsToUpdate = events.filter(event => 
+					Array.isArray(event.roles) && event.roles.some(r => rolesToDelete.includes(r))
+				);
+
+				const rolesInDBToDelete = existingRoles.filter(r => rolesToDelete.includes(r.name));
+
+				if (eventsToUpdate.length === 0 && rolesInDBToDelete.length === 0) {
+					localStorage.setItem(cleanupFlag, 'true');
+					return; // Nothing to do at all.
+				}
+				
+				loadingMessage.textContent = 'Cleaning up data...';
+
+				const batch = writeBatch(db);
+				const eventsRef = collection(db, `artifacts/${appId}/public/data/crc_events`);
+				
+				eventsToUpdate.forEach(event => {
+					const updatedRoles = event.roles.filter(r => !rolesToDelete.includes(r));
+					if (updatedRoles.length === 0) {
+						updatedRoles.push(defaultRole);
+					}
+					const eventDocRef = doc(eventsRef, event.id);
+					batch.update(eventDocRef, { roles: updatedRoles });
+				});
+
+				const rolesCollectionRef = collection(db, `artifacts/${appId}/public/data/roles`);
+				rolesInDBToDelete.forEach(role => {
+					batch.delete(doc(rolesCollectionRef, role.id));
+				});
+
+				try {
+					await batch.commit();
+					console.log("Role cleanup successful.");
+					localStorage.setItem(cleanupFlag, 'true');
+				} catch (error) {
+					console.error("Error during role cleanup:", error);
+					loadingError.textContent = "Failed to clean up roles. Please check the console.";
+				}
+			};
+
 			const setupRealtimeListeners = () => {
 				const collectionsToWatch = ["crcs", "crc_sites", "studies", "crc_events", "roles"];
 				collectionsToWatch.forEach(colName => {
@@ -3030,7 +3079,7 @@
 				};
 
 				try {
-					const [crcsSnapshot, sitesSnapshot, studiesSnapshot, eventsSnapshot, rolesSnapshot] = await Promise.all([
+					let [crcsSnapshot, sitesSnapshot, studiesSnapshot, eventsSnapshot, rolesSnapshot] = await Promise.all([
 						getDocs(collectionsToFetch.crcs),
 						getDocs(collectionsToFetch.crc_sites),
 						getDocs(collectionsToFetch.studies),
@@ -3038,12 +3087,23 @@
 						getDocs(collectionsToFetch.roles),
 					]);
 
-					const crcs = crcsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-					const crc_sites = sitesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-					const studies = studiesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-					const crc_events = eventsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+					let crcs = crcsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+					let crc_sites = sitesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+					let studies = studiesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+					let crc_events = eventsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 					let roles = rolesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 					
+					await cleanupInvalidRoles(crc_events, roles);
+
+					// Refetch data that might have been changed by the cleanup
+					[eventsSnapshot, rolesSnapshot] = await Promise.all([
+						getDocs(collectionsToFetch.crc_events),
+						getDocs(collectionsToFetch.roles)
+					]);
+					crc_events = eventsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+					roles = rolesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+
 					if (roles.length === 0) {
 						const defaultRoles = ['Lead', 'Support', 'Trainee', 'Phlebotomist', 'Coordinator'];
 						const batch = writeBatch(db);
@@ -3142,7 +3202,7 @@
 				}
 			};
 
-			//// --- START THE APP ---
+			/// --- START THE APP ---
 			init();
 
 		})();
