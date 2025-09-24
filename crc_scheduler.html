@@ -358,6 +358,23 @@
                 }
             };
 
+            const getEventRoles = (event) => {
+                let roleNames = [];
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    // New role assignment system - only show roles assigned to this specific CRC
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        const role = state.roles.find(r => r.id === roleId);
+                        if (role && assignments.includes(event.crcId)) {
+                            roleNames.push(role.name);
+                        }
+                    });
+                } else if (event.roles && event.roles.length > 0) {
+                    // Legacy roles system - ensure we get role names properly
+                    roleNames = event.roles.filter(role => role && role.trim() !== '');
+                }
+                return roleNames;
+            };
+
             const checkRoleFulfillment = (event) => {
                 if (!event.studyIds || event.studyIds.length === 0 || !event.siteId) return { fulfilled: true, missingRoles: [] };
                 
@@ -373,9 +390,18 @@
                     }
                 });
                 
-                // Count assigned roles
+                // Count assigned roles - handle both new roleAssignments and legacy roles
                 const assignedRoles = {};
-                if (event.roles && event.roles.length > 0) {
+                
+                // Check for new roleAssignments structure first
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        const validAssignments = assignments.filter(Boolean); // Filter out empty/null assignments
+                        assignedRoles[roleId] = validAssignments.length;
+                    });
+                }
+                // Fallback to legacy roles structure
+                else if (event.roles && event.roles.length > 0) {
                     event.roles.forEach(roleName => {
                         const role = state.roles.find(r => r.name === roleName);
                         if (role) {
@@ -590,11 +616,21 @@
                     form.querySelectorAll('input[type="date"], select').forEach(el => {
                         el.addEventListener('change', updateCrcDropdownAvailability);
                     });
+                    
+                    // Add event listeners for study and site selection to update role assignments
+                    const studySelect = form.querySelector('select[name="studyIds"]');
+                    const siteSelect = form.querySelector('select[name="siteId"]');
+                    if (studySelect) {
+                        studySelect.addEventListener('change', handleShiftStudySiteSelection);
+                    }
+                    if (siteSelect) {
+                        siteSelect.addEventListener('change', handleShiftStudySiteSelection);
+                    }
                      if(crcSelect) crcSelect.addEventListener('change', (e) => {
                         updateCrcHoursDisplay(e.target.value, startDateInput.value);
-                        renderRoleAssignments(form);
+                        handleShiftStudySiteSelection();
                     });
-                    renderRoleAssignments(form);
+                    handleShiftStudySiteSelection();
                 }
                 if (modalContainer.querySelector('#unavailability-calendar-container')) {
                     renderUnavailabilityCalendar();
@@ -1554,11 +1590,17 @@
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
                 let filteredEvents = state.crc_events;
+                console.log('All events:', state.crc_events.length);
+                console.log('Travel Day events in state:', state.crc_events.filter(e => e.type === 'Travel Day'));
+                
                 if (state.selectedCrcFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
                 } else {
                     filteredEvents = filteredEvents.filter(e => e.crcId === null || crcIdsToDisplay.includes(e.crcId));
                 }
+                console.log('After CRC filter:', filteredEvents.length);
+                console.log('Travel Day events after CRC filter:', filteredEvents.filter(e => e.type === 'Travel Day'));
+                
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
                 }
@@ -1569,6 +1611,8 @@
                 if (state.selectedEventTypeFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.type === state.selectedEventTypeFilter);
                 }
+                console.log('Final filtered events:', filteredEvents.length);
+                console.log('Final Travel Day events:', filteredEvents.filter(e => e.type === 'Travel Day'));
                 
                 const firstDayOfMonth = getDaySaturdayStart(new Date(year, month, 1));
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
@@ -1588,7 +1632,9 @@
                     const todaysEvents = filteredEvents.filter(e => e.date === dateStr);
                     
                     let eventTags = todaysEvents.slice(0, 2).map(event => {
+                        console.log('Processing event for calendar:', event);
                         const crc = state.crcs.find(c => c.id === event.crcId);
+                        console.log('CRC lookup:', { eventCrcId: event.crcId, foundCrc: crc, allCrcs: state.crcs.map(c => ({ id: c.id, name: c.name })) });
                         const site = state.crc_sites.find(s => s.id === event.siteId);
                         const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
                         const eventTypeColors = { 'Site Assignment': '#3b82f6', 'Travel Day': '#f97316', 'Paid Time Off': '#a855f7', 'Unavailable': '#6b7280', 'Open Shift': '#ef4444' };
@@ -1596,7 +1642,11 @@
                         const textColor = getContrastColor(bgColor);
                         let title = crc ? `${crc.name.split(' ')[0]}: ${event.type}` : `Open: ${event.type}`;
                         if(event.period && event.period !== 'Full Day') title += ` (${event.period})`;
-                        if(event.roles && event.roles.length > 0) title += ` (${event.roles.join(', ')})`;
+                        
+                        // Display roles using the helper function
+                        const roleNames = getEventRoles(event);
+                        if (roleNames.length > 0) title += ` (${roleNames.join(', ')})`;
+                        
                         const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-300 ml-1"></i>` : '';
                         
                         // Check role fulfillment
@@ -1609,6 +1659,7 @@
                             (event.notes || title) : 
                             `${event.notes || title}\nMissing roles: ${roleFulfillment.missingRoles.join(', ')}`;
                         
+                        console.log('Event processed for calendar:', { event, title, bgColor, roleNames, crcName: crc?.name });
                         return `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}">${title}${overrideIcon}${roleIcon}</div>`;
                     }).join('');
 
@@ -1685,7 +1736,11 @@
                         const textColor = getContrastColor(bgColor);
                         let title = crc ? `${crc.name.split(' ')[0]}: ${event.type}` : `Open: ${event.type}`;
                         if(event.period && event.period !== 'Full Day') title += ` (${event.period})`;
-                        if(event.roles && event.roles.length > 0) title += ` (${event.roles.join(', ')})`;
+                        
+                        // Display roles using the helper function
+                        const roleNames = getEventRoles(event);
+                        if (roleNames.length > 0) title += ` (${roleNames.join(', ')})`;
+                        
                         const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-300 ml-1"></i>` : '';
                         
                         // Check role fulfillment
@@ -2619,26 +2674,42 @@
                         <div id="travel-day-group" class="${show.travel ? '' : 'hidden'} space-y-2 border-t dark:border-gray-700 pt-4">
                             <label class="block text-sm font-medium dark:text-gray-300">Include Travel Days</label>
                             <div class="flex items-center space-x-4">
-                                <label class="flex items-center"><input type="checkbox" name="includeStartTravel" class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"> <span class="ml-2 text-sm">Travel Day at Start</span></label>
-                                <label class="flex items-center"><input type="checkbox" name="includeEndTravel" class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"> <span class="ml-2 text-sm">Travel Day at End</span></label>
+                                <label class="flex items-center"><input type="checkbox" name="includeStartTravel" ${!isEditing ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"> <span class="ml-2 text-sm">Travel Day at Start</span></label>
+                                <label class="flex items-center"><input type="checkbox" name="includeEndTravel" ${!isEditing ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"> <span class="ml-2 text-sm">Travel Day at End</span></label>
                             </div>
                         </div>
-                        <div id="crc-group" class="${show.crc ? '' : 'hidden'}">
+                        
+                        <!-- Study and Site Selection (Step 1) -->
+                        <div id="study-site-selection" class="${show.study && show.site ? '' : 'hidden'} space-y-4 border-t dark:border-gray-700 pt-4">
+                            <h3 class="text-lg font-semibold dark:text-white">Step 1: Select Study and Site</h3>
+                            <div id="study-group">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Study/Studies <span class="text-xs font-light">(Hold Ctrl/Cmd to select multiple)</span></label>
+                                <select name="studyIds" multiple class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-24"><option value="">Select Study</option>${studyOptions}</select>
+                            </div>
+                            <div id="site-group">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Site</label>
+                                <select name="siteId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Site</option>${siteOptions}</select>
+                            </div>
+                        </div>
+                        
+                        <!-- Role Assignment (Step 2) -->
+                        <div id="role-assignment-section" class="${show.role ? '' : 'hidden'} space-y-4 border-t dark:border-gray-700 pt-4">
+                            <h3 class="text-lg font-semibold dark:text-white">Step 2: Assign Staff to Roles</h3>
+                            <div id="role-assignment-container" class="space-y-4">
+                                <p class="text-sm text-gray-600 dark:text-gray-400">Select study and site first to see required roles.</p>
+                                <button type="button" id="test-role-assignment" class="text-xs bg-blue-200 dark:bg-blue-700 px-2 py-1 rounded">Test: Load Roles</button>
+                            </div>
+                        </div>
+                        
+                        <!-- Legacy CRC Selection (for non-Site Assignment events) -->
+                        <div id="crc-group" class="${show.crc && !show.role ? '' : 'hidden'}">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">CRC(s) <span class="text-xs font-light">(Hold Ctrl/Cmd to select multiple)</span></label>
                             <select name="crcId" ${!isEditing ? 'multiple' : ''} class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-32">
                                 ${!isEditing ? crcOptions : `<option value="">Select CRC</option>${crcOptions}`}
                             </select>
                             <div id="crc-hours-info" class="text-sm mt-2 h-5 text-gray-600 dark:text-gray-400"></div>
                         </div>
-                        <div id="role-assignment-container" class="${show.role ? '' : 'hidden'} mt-4"></div>
-                        <div id="study-group" class="${show.study ? '' : 'hidden'}">
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Study/Studies <span class="text-xs font-light">(Hold Ctrl/Cmd to select multiple)</span></label>
-                            <select name="studyIds" multiple class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-24"><option value="">Select Study</option>${studyOptions}</select>
-                        </div>
-                        <div id="site-group" class="${show.site ? '' : 'hidden'}">
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Site</label>
-                            <select name="siteId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Site</option>${siteOptions}</select>
-                        </div>
+                        
                         <div id="visit-group" class="${show.visit ? '' : 'hidden'} grid grid-cols-1 sm:grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit Number</label>
@@ -2683,7 +2754,7 @@
                             <div class="flex-grow">
                                 <p class="font-semibold">${event.type} (${event.hours || 'N/A'} hrs)</p>
                                 <p class="text-sm text-gray-600 dark:text-gray-300">
-                                    ${crc ? crc.name : ''} ${site ? `at ${site.name}` : ''} ${(event.roles || []).length > 0 ? `(${(event.roles).join(', ')})` : ''}
+                                    ${crc ? crc.name : ''} ${site ? `at ${site.name}` : ''} ${getEventRoles(event).length > 0 ? `(${getEventRoles(event).join(', ')})` : ''}
                                 </p>
                                 ${event.notes ? `<p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${event.notes}</p>` : ''}
                             </div>
@@ -2748,7 +2819,7 @@
                             </div>
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Roles</label>
-                                <p class="text-sm dark:text-gray-200">${(event.roles || []).join(', ') || 'None'}</p>
+                                <p class="text-sm dark:text-gray-200">${getEventRoles(event).join(', ') || 'None'}</p>
                             </div>
                         </div>
                         ${event.visitNumber ? `
@@ -2805,7 +2876,7 @@
                                             </div>
                                             <div>
                                                 <span class="font-medium dark:text-gray-300">Roles:</span>
-                                                <span class="dark:text-gray-200">${(shiftEvent.roles || []).join(', ') || 'None'}</span>
+                                                <span class="dark:text-gray-200">${getEventRoles(shiftEvent).join(', ') || 'None'}</span>
                                             </div>
                                             ${shiftEvent.period && shiftEvent.period !== 'Full Day' ? `
                                                 <div>
@@ -3345,7 +3416,14 @@
                         document.getElementById('csv-upload-input').click();
                         break;
                     case 'export-csv-btn': exportCurrentMonthToCSV(); break;
-                    case 'open-crc-event-modal': openModal(getCRCEventModalHTML(date), '4xl'); break;
+                    case 'open-crc-event-modal': 
+                        openModal(getCRCEventModalHTML(date), '4xl'); 
+                        // Initialize the role assignment interface after modal opens
+                        setTimeout(() => {
+                            console.log('Initializing role assignment after modal open');
+                            handleShiftStudySiteSelection();
+                        }, 300);
+                        break;
                     case 'open-add-study-modal': openModal(getAddStudyModalHTML()); break;
                     case 'view-day-events': {
                         if (copiedShiftData) {
@@ -3404,6 +3482,11 @@
                                 }
                             }
                             openModal(getCRCEventModalHTML(event.date, event, seriesStartDate, seriesEndDate), '4xl');
+                            // Initialize the role assignment interface after modal opens
+                            setTimeout(() => {
+                                console.log('Initializing role assignment after edit modal open');
+                                handleShiftStudySiteSelection();
+                            }, 300);
                         }
                         break;
                     }
@@ -3654,10 +3737,43 @@
                         if (errorMessageDiv) errorMessageDiv.textContent = '';
 
                         const eventType = data.eventType;
-                        const crcIds = formData.getAll('crcId');
+                        let crcIds = formData.getAll('crcId');
                         const studyIds = formData.getAll('studyIds');
                         
-                        if ((eventType !== 'Open Shift') && crcIds.length === 0) {
+                        // For role-based events, collect CRC IDs from role assignments
+                        if (['Site Assignment', 'Travel Day'].includes(eventType)) {
+                            const roleAssignmentInputs = form.querySelectorAll('select[name^="role-"]');
+                            const assignedCrcIds = new Set();
+                            roleAssignmentInputs.forEach(input => {
+                                if (input.value) {
+                                    assignedCrcIds.add(input.value);
+                                }
+                            });
+                            crcIds = Array.from(assignedCrcIds);
+                            console.log('Collected CRC IDs from role assignments:', crcIds);
+                        }
+                        
+                        // Check for CRC selection based on event type
+                        let hasValidCrcSelection = false;
+                        
+                        if (eventType === 'Open Shift') {
+                            hasValidCrcSelection = true; // Open shifts don't require CRC selection
+                        } else if (['Site Assignment', 'Travel Day'].includes(eventType)) {
+                            // For role-based events, check if role assignments exist
+                            const roleAssignmentInputs = form.querySelectorAll('select[name^="role-"]');
+                            const hasRoleAssignments = Array.from(roleAssignmentInputs).some(input => input.value);
+                            console.log('Role assignment validation:', {
+                                inputs: roleAssignmentInputs.length,
+                                hasAssignments: hasRoleAssignments,
+                                values: Array.from(roleAssignmentInputs).map(input => ({ name: input.name, value: input.value }))
+                            });
+                            hasValidCrcSelection = hasRoleAssignments;
+                        } else {
+                            // For other event types, use the legacy CRC selection
+                            hasValidCrcSelection = crcIds.length > 0;
+                        }
+                        
+                        if (!hasValidCrcSelection) {
                             if (errorMessageDiv) errorMessageDiv.textContent = 'At least one CRC must be selected for this event type.';
                             return;
                         }
@@ -3673,6 +3789,19 @@
 
                         const processSubmit = async (confirmedOverride = false) => {
                             try {
+                                // Collect role assignments from the new interface
+                                const roleAssignments = {};
+                                const roleAssignmentInputs = form.querySelectorAll('select[name^="role-"]');
+                                roleAssignmentInputs.forEach(input => {
+                                    const [roleId, index] = input.name.split('-').slice(1);
+                                    if (input.value) {
+                                        if (!roleAssignments[roleId]) {
+                                            roleAssignments[roleId] = [];
+                                        }
+                                        roleAssignments[roleId][parseInt(index)] = input.value;
+                                    }
+                                });
+
                                 const baseEventData = {
                                     siteId: data.siteId || null,
                                     studyIds: studyIds,
@@ -3683,6 +3812,7 @@
                                     principalInvestigator: data.principalInvestigator || null,
                                     mileage: data.mileage ? parseFloat(data.mileage) : null,
                                     isOverridden: confirmedOverride,
+                                    roleAssignments: roleAssignments,
                                 };
                                 
                                 if (isEditing) {
@@ -3696,33 +3826,105 @@
                                     const endDate = data.endDate ? new Date(data.endDate + 'T00:00:00') : new Date(startDate);
                                     const includeStartTravel = data.includeStartTravel === 'on';
                                     const includeEndTravel = data.includeEndTravel === 'on';
-                                    const targetCrcs = eventType === 'Open Shift' ? [null] : crcIds;
-
-                                    for (const crcId of targetCrcs) {
-                                        const roles = crcId ? formData.getAll(`roles-${crcId}`) : [];
-                                        for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-                                            const dateStr = d.toISOString().split('T')[0];
-                                            const newEventRef = doc(crcEventsRef);
-                                            let currentEventData = { ...baseEventData, crcId, roles, date: dateStr, groupId };
-                                            if (eventType === 'Site Assignment') {
-                                                const isStartDate = dateStr === startDate.toISOString().split('T')[0];
-                                                const isEndDate = dateStr === endDate.toISOString().split('T')[0];
-                                                if (includeStartTravel && isStartDate) {
-                                                    currentEventData.type = 'Travel Day';
-                                                    currentEventData.roles = [];
-                                                } else if (includeEndTravel && isEndDate && !isStartDate) {
-                                                    currentEventData.type = 'Travel Day';
-                                                    currentEventData.roles = [];
-                                                } else {
-                                                    currentEventData.type = 'Site Assignment';
+                                    console.log('Travel day settings:', { includeStartTravel, includeEndTravel, data: data.includeStartTravel, data2: data.includeEndTravel });
+                                    
+                                    // For Site Assignment with role assignments, create separate events for each assigned CRC
+                                    if (eventType === 'Site Assignment' && Object.keys(roleAssignments).length > 0) {
+                                        const assignedCrcs = new Set();
+                                        Object.values(roleAssignments).forEach(assignments => {
+                                            assignments.forEach(crcId => {
+                                                if (crcId) assignedCrcs.add(crcId);
+                                            });
+                                        });
+                                        
+                                        for (const crcId of assignedCrcs) {
+                                            const roles = [];
+                                            Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                                                if (assignments.includes(crcId)) {
+                                                    const role = state.roles.find(r => r.id === roleId);
+                                                    if (role) roles.push(role.name);
                                                 }
-                                            } else {
-                                                currentEventData.type = eventType;
+                                            });
+                                            
+                                            // Create start travel day if requested (day before start date)
+                                            if (includeStartTravel) {
+                                                const startTravelDate = new Date(startDate);
+                                                startTravelDate.setDate(startTravelDate.getDate() - 1);
+                                                const startTravelDateStr = startTravelDate.toISOString().split('T')[0];
+                                                const startTravelEventRef = doc(crcEventsRef);
+                                                const startTravelEventData = { ...baseEventData, crcId, roles: [], date: startTravelDateStr, groupId, type: 'Travel Day' };
+                                                console.log('Creating start travel day for:', startTravelDateStr, 'with data:', startTravelEventData);
+                                                batch.set(startTravelEventRef, startTravelEventData);
                                             }
-                                            batch.set(newEventRef, currentEventData);
+                                            
+                                            // Create main assignment events
+                                            for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+                                                const dateStr = d.toISOString().split('T')[0];
+                                                const newEventRef = doc(crcEventsRef);
+                                                let currentEventData = { ...baseEventData, crcId, roles, date: dateStr, groupId, type: 'Site Assignment' };
+                                                batch.set(newEventRef, currentEventData);
+                                            }
+                                            
+                                            // Create end travel day if requested (day after end date)
+                                            if (includeEndTravel) {
+                                                const endTravelDate = new Date(endDate);
+                                                endTravelDate.setDate(endTravelDate.getDate() + 1);
+                                                const endTravelDateStr = endTravelDate.toISOString().split('T')[0];
+                                                const endTravelEventRef = doc(crcEventsRef);
+                                                const endTravelEventData = { ...baseEventData, crcId, roles: [], date: endTravelDateStr, groupId, type: 'Travel Day' };
+                                                console.log('Creating end travel day for:', endTravelDateStr, 'with data:', endTravelEventData);
+                                                batch.set(endTravelEventRef, endTravelEventData);
+                                            }
+                                        }
+                                    } else {
+                                        // Legacy handling for non-Site Assignment events or when no role assignments
+                                        const targetCrcs = eventType === 'Open Shift' ? [null] : crcIds;
+                                        for (const crcId of targetCrcs) {
+                                            const roles = crcId ? formData.getAll(`roles-${crcId}`) : [];
+                                            
+                                            // Create start travel day if requested (day before start date)
+                                            if (eventType === 'Site Assignment' && includeStartTravel) {
+                                                const startTravelDate = new Date(startDate);
+                                                startTravelDate.setDate(startTravelDate.getDate() - 1);
+                                                const startTravelDateStr = startTravelDate.toISOString().split('T')[0];
+                                                const startTravelEventRef = doc(crcEventsRef);
+                                                const startTravelEventData = { ...baseEventData, crcId, roles: [], date: startTravelDateStr, groupId, type: 'Travel Day' };
+                                                console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'with data:', startTravelEventData);
+                                                batch.set(startTravelEventRef, startTravelEventData);
+                                            }
+                                            
+                                            // Create main assignment events
+                                            for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+                                                const dateStr = d.toISOString().split('T')[0];
+                                                const newEventRef = doc(crcEventsRef);
+                                                let currentEventData = { ...baseEventData, crcId, roles, date: dateStr, groupId };
+                                                if (eventType === 'Site Assignment') {
+                                                    currentEventData.type = 'Site Assignment';
+                                                } else {
+                                                    currentEventData.type = eventType;
+                                                }
+                                                batch.set(newEventRef, currentEventData);
+                                            }
+                                            
+                                            // Create end travel day if requested (day after end date)
+                                            if (eventType === 'Site Assignment' && includeEndTravel) {
+                                                const endTravelDate = new Date(endDate);
+                                                endTravelDate.setDate(endTravelDate.getDate() + 1);
+                                                const endTravelDateStr = endTravelDate.toISOString().split('T')[0];
+                                                const endTravelEventRef = doc(crcEventsRef);
+                                                const endTravelEventData = { ...baseEventData, crcId, roles: [], date: endTravelDateStr, groupId, type: 'Travel Day' };
+                                                console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'with data:', endTravelEventData);
+                                                batch.set(endTravelEventRef, endTravelEventData);
+                                            }
                                         }
                                     }
                                     await batch.commit();
+                                    console.log('Batch committed successfully');
+                                    // Check if Travel Day events were created
+                                    setTimeout(() => {
+                                        const travelDayEvents = state.crc_events.filter(e => e.type === 'Travel Day');
+                                        console.log('Travel Day events after creation:', travelDayEvents);
+                                    }, 1000);
                                 }
                                 closeModal();
                                 showNotification(isEditing ? 'Shift updated!' : 'Shift(s) created!', 'success');
@@ -3855,6 +4057,30 @@
                 if (target.name === 'selectedRoles') {
                     handleRoleSelection();
                 }
+                // Handle study/site selection for shift creation
+                if (target.name === 'studyIds' || target.name === 'siteId') {
+                    console.log('Study or site selection changed:', target.name, target.value);
+                    // Add a small delay to ensure DOM is updated
+                    setTimeout(() => {
+                        handleShiftStudySiteSelection();
+                    }, 100);
+                }
+                // Test button for role assignment
+                if (target.id === 'test-role-assignment') {
+                    console.log('Test button clicked - forcing role assignment');
+                    handleShiftStudySiteSelection();
+                }
+            });
+
+            // Also listen for input events for better responsiveness
+            document.addEventListener('input', (e) => {
+                const target = e.target;
+                if (target.name === 'studyIds' || target.name === 'siteId') {
+                    console.log('Study or site input changed:', target.name, target.value);
+                    setTimeout(() => {
+                        handleShiftStudySiteSelection();
+                    }, 100);
+                }
             });
 
             const handleStudySiteSelection = (selectElement) => {
@@ -3930,6 +4156,279 @@
                 } else {
                     siteRoleQuantities.classList.add('hidden');
                 }
+            };
+
+            // New function to handle study/site selection for shift creation
+            const handleShiftStudySiteSelection = () => {
+                console.log('handleShiftStudySiteSelection called');
+                const studySelect = document.querySelector('select[name="studyIds"]');
+                const siteSelect = document.querySelector('select[name="siteId"]');
+                const roleAssignmentContainer = document.getElementById('role-assignment-container');
+                const form = document.getElementById('crc-event-form');
+                
+                console.log('Elements found:', { studySelect, siteSelect, roleAssignmentContainer });
+                
+                if (!studySelect || !siteSelect || !roleAssignmentContainer) {
+                    console.log('Missing elements, returning early');
+                    return;
+                }
+                
+                // Check if we're editing an existing event
+                const isEditing = form && form.dataset.eventId;
+                const existingEvent = isEditing ? state.crc_events.find(e => e.id === form.dataset.eventId) : null;
+                console.log('Is editing:', isEditing, 'Existing event:', existingEvent);
+                if (existingEvent) {
+                    console.log('Event roleAssignments:', existingEvent.roleAssignments);
+                    console.log('Event roles:', existingEvent.roles);
+                    console.log('Event crcId:', existingEvent.crcId);
+                }
+                
+                const selectedStudyIds = Array.from(studySelect.selectedOptions).map(option => option.value).filter(id => id);
+                const selectedSiteId = siteSelect.value;
+                
+                console.log('Selected study IDs:', selectedStudyIds);
+                console.log('Selected site ID:', selectedSiteId);
+                console.log('Available studies:', state.studies);
+                console.log('Available roles:', state.roles);
+                console.log('Available CRCs:', state.crcs);
+                
+                // Filter sites based on selected studies
+                if (selectedStudyIds.length > 0) {
+                    const availableSiteIds = new Set();
+                    selectedStudyIds.forEach(studyId => {
+                        const study = state.studies.find(s => s.id === studyId);
+                        console.log('Study found:', study);
+                        if (study && study.sites) {
+                            console.log('Study sites:', study.sites);
+                            study.sites.forEach(siteId => availableSiteIds.add(siteId));
+                        }
+                    });
+                    
+                    console.log('Available site IDs:', Array.from(availableSiteIds));
+                    
+                    // Update site options - only show available sites
+                    const currentSiteId = siteSelect.value;
+                    const availableSites = state.crc_sites.filter(site => availableSiteIds.has(site.id));
+                    console.log('Available sites:', availableSites);
+                    
+                    const siteOptions = availableSites.map(site => 
+                        `<option value="${site.id}" ${site.id === currentSiteId ? 'selected' : ''}>${site.name}</option>`
+                    ).join('');
+                    
+                    siteSelect.innerHTML = `<option value="">Select Site</option>${siteOptions}`;
+                    if (currentSiteId && !availableSiteIds.has(currentSiteId)) {
+                        siteSelect.value = '';
+                    }
+                }
+                
+                if (selectedStudyIds.length === 0 || !selectedSiteId) {
+                    // If editing and we have existing role assignments, show them even without study/site selection
+                    if (isEditing && existingEvent) {
+                        // Check for new roleAssignments structure first
+                        if (existingEvent.roleAssignments && Object.keys(existingEvent.roleAssignments).length > 0) {
+                            console.log('Editing mode: showing existing role assignments (new structure)');
+                            let roleAssignmentHTML = '<div class="space-y-4">';
+                            roleAssignmentHTML += '<p class="text-sm text-blue-600 dark:text-blue-400 mb-4">Current role assignments:</p>';
+                            
+                            Object.entries(existingEvent.roleAssignments).forEach(([roleId, assignments]) => {
+                                const role = state.roles.find(r => r.id === roleId);
+                                if (!role) return;
+                                
+                                roleAssignmentHTML += `
+                                    <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
+                                        <h4 class="font-medium dark:text-white mb-2">${role.name}</h4>
+                                        <div class="space-y-2">
+                                            ${assignments.map((crcId, index) => {
+                                                const crc = state.crcs.find(c => c.id === crcId);
+                                                return `
+                                                    <div class="flex items-center gap-2">
+                                                        <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
+                                                        <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                                            <option value="">Select Staff</option>
+                                                            ${state.crcs.map(crc => 
+                                                                `<option value="${crc.id}" ${crc.id === crcId ? 'selected' : ''}>${crc.name}</option>`
+                                                            ).join('')}
+                                                        </select>
+                                                    </div>
+                                                `;
+                                            }).join('')}
+                                        </div>
+                                    </div>
+                                `;
+                            });
+                            
+                            roleAssignmentHTML += '</div>';
+                            roleAssignmentContainer.innerHTML = roleAssignmentHTML;
+                            return;
+                        }
+                        // Check for legacy roles structure
+                        else if (existingEvent.roles && existingEvent.roles.length > 0 && existingEvent.crcId) {
+                            console.log('Editing mode: showing existing roles (legacy structure)');
+                            let roleAssignmentHTML = '<div class="space-y-4">';
+                            roleAssignmentHTML += '<p class="text-sm text-blue-600 dark:text-blue-400 mb-4">Current role assignments:</p>';
+                            
+                            // Create a simple role assignment for the existing CRC
+                            const crc = state.crcs.find(c => c.id === existingEvent.crcId);
+                            if (crc) {
+                                roleAssignmentHTML += `
+                                    <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
+                                        <h4 class="font-medium dark:text-white mb-2">Assigned Staff</h4>
+                                        <div class="space-y-2">
+                                            <div class="flex items-center gap-2">
+                                                <label class="text-sm text-gray-600 dark:text-gray-400 w-16">1:</label>
+                                                <select name="role-legacy-0" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                                    <option value="">Select Staff</option>
+                                                    ${state.crcs.map(c => 
+                                                        `<option value="${c.id}" ${c.id === existingEvent.crcId ? 'selected' : ''}>${c.name}</option>`
+                                                    ).join('')}
+                                                </select>
+                                            </div>
+                                        </div>
+                                    </div>
+                                `;
+                            }
+                            
+                            roleAssignmentHTML += '</div>';
+                            roleAssignmentContainer.innerHTML = roleAssignmentHTML;
+                            return;
+                        }
+                    }
+                    
+                    roleAssignmentContainer.innerHTML = '<p class="text-sm text-gray-600 dark:text-gray-400">Select study and site first to see required roles.</p>';
+                    return;
+                }
+                
+                // Get required roles for the selected studies at the selected site
+                const requiredRoles = new Map();
+                selectedStudyIds.forEach(studyId => {
+                    const study = state.studies.find(s => s.id === studyId);
+                    console.log('Processing study:', study);
+                    if (study && study.siteRoleRequirements && study.siteRoleRequirements[selectedSiteId]) {
+                        console.log('Found site role requirements:', study.siteRoleRequirements[selectedSiteId]);
+                        Object.entries(study.siteRoleRequirements[selectedSiteId]).forEach(([roleId, quantity]) => {
+                            const role = state.roles.find(r => r.id === roleId);
+                            if (role) {
+                                const currentQuantity = requiredRoles.get(roleId) || 0;
+                                requiredRoles.set(roleId, currentQuantity + quantity);
+                                console.log(`Added role ${role.name} with quantity ${quantity}`);
+                            }
+                        });
+                    } else {
+                        console.log('No site role requirements found for study', studyId, 'at site', selectedSiteId);
+                    }
+                });
+                
+                console.log('Required roles map:', requiredRoles);
+                
+                if (requiredRoles.size === 0) {
+                    // Fallback: show all available roles if no specific requirements found
+                    console.log('No specific roles found, showing all available roles as fallback');
+                    const allRoles = state.roles;
+                    console.log('All roles available:', allRoles);
+                    console.log('All CRCs available:', state.crcs);
+                    
+                    if (allRoles.length === 0) {
+                        roleAssignmentContainer.innerHTML = '<p class="text-sm text-gray-600 dark:text-gray-400">No roles available. Please add roles first.</p>';
+                        return;
+                    }
+                    
+                    if (state.crcs.length === 0) {
+                        roleAssignmentContainer.innerHTML = '<p class="text-sm text-gray-600 dark:text-gray-400">No staff available. Please add CRCs first.</p>';
+                        return;
+                    }
+                    
+                    // Generate fallback interface with all roles
+                    let roleAssignmentHTML = '<div class="space-y-4">';
+                    roleAssignmentHTML += '<p class="text-sm text-blue-600 dark:text-blue-400 mb-4">No specific role requirements found. Please select which roles are needed:</p>';
+                    
+                    allRoles.forEach(role => {
+                        // Get existing assignments for this role if editing
+                        const existingAssignments = existingEvent && existingEvent.roleAssignments && existingEvent.roleAssignments[role.id] 
+                            ? existingEvent.roleAssignments[role.id].filter(Boolean) 
+                            : [];
+                        const existingCrcId = existingAssignments[0] || '';
+                        
+                        const crcOptions = state.crcs.map(crc => 
+                            `<option value="${crc.id}" ${crc.id === existingCrcId ? 'selected' : ''}>${crc.name}</option>`
+                        ).join('');
+                        
+                        console.log(`CRC options for role ${role.name}:`, crcOptions);
+                        
+                        roleAssignmentHTML += `
+                            <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
+                                <h4 class="font-medium dark:text-white mb-2">${role.name}</h4>
+                                <div class="space-y-2">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-gray-600 dark:text-gray-400 w-16">1:</label>
+                                        <select name="role-${role.id}-0" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                            <option value="">Select Staff</option>
+                                            ${crcOptions}
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    
+                    roleAssignmentHTML += '</div>';
+                    roleAssignmentContainer.innerHTML = roleAssignmentHTML;
+                    console.log('Fallback role assignment HTML generated and inserted');
+                    return;
+                }
+                
+                // Generate role assignment interface
+                let roleAssignmentHTML = '<div class="space-y-4">';
+                console.log('Generating role assignment interface for', requiredRoles.size, 'roles');
+                
+                requiredRoles.forEach((quantity, roleId) => {
+                    const role = state.roles.find(r => r.id === roleId);
+                    if (!role) {
+                        console.log('Role not found for ID:', roleId);
+                        return;
+                    }
+                    
+                    console.log(`Processing role: ${role.name} (${quantity} needed)`);
+                    
+                    // Get existing assignments for this role if editing
+                    const existingAssignments = existingEvent && existingEvent.roleAssignments && existingEvent.roleAssignments[roleId] 
+                        ? existingEvent.roleAssignments[roleId].filter(Boolean) 
+                        : [];
+                    console.log(`Existing assignments for ${role.name}:`, existingAssignments);
+                    
+                    // Get CRCs who can fill this role (for now, all CRCs)
+                    const crcOptions = state.crcs.map(crc => {
+                        const isSelected = existingAssignments.includes(crc.id);
+                        return `<option value="${crc.id}" ${isSelected ? 'selected' : ''}>${crc.name}</option>`;
+                    }).join('');
+                    
+                    console.log(`CRC options for ${role.name}:`, crcOptions);
+                    
+                    roleAssignmentHTML += `
+                        <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
+                            <h4 class="font-medium dark:text-white mb-2">${role.name} (${quantity} needed)</h4>
+                            <div class="space-y-2">
+                                ${Array.from({length: quantity}, (_, index) => {
+                                    const existingCrcId = existingAssignments[index] || '';
+                                    return `
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
+                                            <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                                <option value="">Select Staff</option>
+                                                ${state.crcs.map(crc => 
+                                                    `<option value="${crc.id}" ${crc.id === existingCrcId ? 'selected' : ''}>${crc.name}</option>`
+                                                ).join('')}
+                                            </select>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                roleAssignmentHTML += '</div>';
+                roleAssignmentContainer.innerHTML = roleAssignmentHTML;
+                console.log('Role assignment HTML generated and inserted');
             };
 
             const generateSiteRoleQuantities = (selectedRoles, selectedSites) => {
