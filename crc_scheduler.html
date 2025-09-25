@@ -12,6 +12,8 @@
     </script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/handsontable@14.3.0/dist/handsontable.full.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/handsontable@14.3.0/dist/handsontable.full.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
@@ -158,6 +160,38 @@
                 width: 100%;
             }
         }
+        
+        /* Handsontable styles for Corbin's Scheduler */
+        .handsontable th { background:#eee !important; }
+        td.day-sep { border-right: 1px solid #aaa !important; }
+        .palette { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
+        .swatch { width:22px; height:22px; border:1px solid #999; border-radius:4px; cursor:pointer; }
+        .swatch.clear { display:flex; align-items:center; justify-content:center; font-size:14px; }
+        .scheduler-wrap { display:flex; gap:16px; align-items:flex-start; }
+        #corbinGrid { flex: 1 1 auto; min-width: 0; }
+        #availabilitySidebar {
+            width: 260px; border:1px solid #ddd; border-radius:8px; padding:10px;
+            background:#fafafa; flex: 0 0 auto; max-height: 80vh; overflow:auto;
+        }
+        .aside-title { font-weight:700; margin-bottom:8px; }
+        .emp-row { margin:4px 0; font-size: 13px; }
+        .emp-name { font-weight:600; }
+        #availabilityModal {
+            position: fixed; inset:0; display:none; align-items:center; justify-content:center;
+            background: rgba(0,0,0,0.35); z-index: 9999;
+        }
+        #availabilityModal.open { display:flex; }
+        .modal-card {
+            background:#fff; border-radius:10px; padding:16px; width: 420px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        .modal-header { font-weight:700; margin-bottom:10px; }
+        .modal-row { margin:8px 0; }
+        .days-grid { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+        .daychip {
+            border:1px solid #bbb; border-radius:6px; padding:6px 10px; background:#fff; cursor:pointer; font-size:13px;
+        }
+        .daychip.selected { background:#304ffe; color:#fff; border-color:#304ffe; }
+        .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
     </style>
     <script>
         // Apply theme as early as possible to prevent Flash of Unstyled Content (FOUC)
@@ -286,7 +320,7 @@
                 calendarDisplayMode: 'employee', // 'employee', 'study', 'site', 'at-a-glance', 'world'
                 atAGlanceGroupBy: 'study', // 'study' or 'site'
                 // --- FIX: Corrected syntax error from original file ---
-                activeTab: 'scheduler', // Can be 'scheduler', 'dashboard', 'reporting', 'training', or 'trucks'
+                activeTab: 'scheduler', // Can be 'scheduler', 'dashboard', 'reporting', 'training', 'trucks', or 'corbin-scheduler'
                 sidebarTab: 'crcs',
                 trainingTab: 'overview', // Can be 'overview', 'reporting', or 'expired'
                 trucksTab: 'overview', // Can be 'overview', 'schedule', or 'maintenance'
@@ -544,6 +578,7 @@
                         <button data-action="set-main-tab" data-tab-id="reporting" class="${state.activeTab === 'reporting' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Reporting</button>
                         <button data-action="set-main-tab" data-tab-id="training" class="${state.activeTab === 'training' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Training</button>
                         <button data-action="set-main-tab" data-tab-id="trucks" class="${state.activeTab === 'trucks' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">CAE Trucks</button>
+                        <button data-action="set-main-tab" data-tab-id="corbin-scheduler" class="${state.activeTab === 'corbin-scheduler' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Corbin's Scheduler</button>
                     </nav>
                 `;
             };
@@ -574,7 +609,602 @@
                     mainAppContent.innerHTML = getTrucksHTML();
                     mainAppContent.className = 'w-full';
                     renderTrucksContent();
+                } else if (state.activeTab === 'corbin-scheduler') {
+                    mainAppContent.innerHTML = getCorbinSchedulerHTML();
+                    mainAppContent.className = 'w-full';
+                    renderCorbinScheduler();
                 }
+            };
+
+            // --- CORBIN'S SCHEDULER FUNCTIONALITY ---
+            // Corbin's scheduler state (separate from main CHAOS state)
+            let corbinState = {
+                monthStore: {},
+                current: new Date(),
+                hot: null,
+                directoryHot: null,
+                lastSel: null,
+                clipboardMeta: null,
+                bodyRows: [],
+                currentAvailEmployee: null,
+                selectedDays: new Set()
+            };
+
+            const COLS_PER_DAY = 2;
+            const DAYS_PER_WEEK = 7;
+            const TOTAL_COLS = DAYS_PER_WEEK * COLS_PER_DAY;
+
+            // Helper functions for Corbin's scheduler
+            const corbinMonthKey = (y, m) => `${y}-${String(m + 1).padStart(2, '0')}`;
+            const corbinPad2 = (n) => String(n).padStart(2, '0');
+            const corbinDaysInMonth = (y, m) => new Date(y, m + 1, 0).getDate();
+            const corbinEmpIdFromName = (name) => (name || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-");
+
+            const corbinStartOfCalendar = (year, monthIdx) => {
+                const first = new Date(year, monthIdx, 1);
+                const dow = (first.getDay() + 6) % 7; // Mon=0
+                const d = new Date(first);
+                d.setDate(first.getDate() - dow);
+                return d;
+            };
+
+            const corbinNumWeeks = (year, monthIdx) => {
+                const start = corbinStartOfCalendar(year, monthIdx);
+                const end = new Date(year, monthIdx + 1, 0);
+                const diff = Math.ceil((end - start) / 86400000) + 1;
+                return Math.ceil(diff / 7);
+            };
+
+            const corbinBuildWeekMatrix = (year, monthIdx, weeks) => {
+                const start = corbinStartOfCalendar(year, monthIdx);
+                const matrix = [];
+                for (let w = 0; w < weeks; w++) {
+                    const row = [];
+                    for (let d = 0; d < DAYS_PER_WEEK; d++) {
+                        const cell = new Date(start);
+                        cell.setDate(start.getDate() + w * 7 + d);
+                        row.push({ date: new Date(cell), inMonth: cell.getMonth() === monthIdx });
+                    }
+                    matrix.push(row);
+                }
+                return matrix;
+            };
+
+            const corbinBuildDataFor = (y, m, weeks, br) => {
+                const rows = br.reduce((s, b) => s + 1 + b, 0);
+                return Array.from({ length: rows }, () => Array(TOTAL_COLS).fill(""));
+            };
+
+            const renderCorbinScheduler = () => {
+                if (state.activeTab !== 'corbin-scheduler') return;
+                
+                // Initialize Corbin's scheduler on first render
+                if (!corbinState.initialized) {
+                    corbinState.initialized = true;
+                    corbinInitializeScheduler();
+                }
+                
+                corbinRenderMonth();
+                lucide.createIcons();
+            };
+
+            // Initialize Corbin's scheduler
+            const corbinInitializeScheduler = () => {
+                corbinInitializePalette();
+                corbinInitializeDirectory();
+                corbinInitializeAvailabilityModal();
+            };
+
+            // Initialize color palette for Corbin's scheduler
+            const corbinInitializePalette = () => {
+                const colors = ["#f28b82","#fbbc04","#fff475","#ccff90","#a7ffeb","#cbf0f8","#aecbfa","#d7aefb","#fdcfe8","#e6c9a8","#e8eaed","#d50000","#c51162","#aa00ff","#304ffe","#2962ff","#0091ea","#00b8d4","#00c853","#64dd17"];
+                const p = document.getElementById('corbinPalette');
+                if (!p) return;
+                
+                p.innerHTML = '';
+                colors.forEach(c => {
+                    let sw = document.createElement('div');
+                    sw.className = 'swatch';
+                    sw.style.background = c;
+                    sw.onclick = () => corbinApplyColor(c);
+                    p.appendChild(sw);
+                });
+                let clr = document.createElement('div');
+                clr.className = 'swatch clear';
+                clr.textContent = '×';
+                clr.onclick = () => corbinApplyColor(null);
+                p.appendChild(clr);
+            };
+
+            // Apply color to selected cells
+            const corbinApplyColor = (color) => {
+                const sel = corbinState.lastSel || (corbinState.hot ? corbinState.hot.getSelectedLast() : null);
+                if (!sel) return;
+                
+                const [r1, c1, r2, c2] = sel;
+                const key = corbinMonthKey(corbinState.current.getFullYear(), corbinState.current.getMonth());
+                if (!corbinState.monthStore[key].meta) corbinState.monthStore[key].meta = {};
+                
+                for (let r = Math.min(r1, r2); r <= Math.max(r1, r2); r++) {
+                    if (corbinWeekStarts().includes(r)) continue;
+                    for (let c = Math.min(c1, c2); c <= Math.max(c1, c2); c++) {
+                        if (color) corbinState.monthStore[key].meta[`${r}:${c}`] = color;
+                        else delete corbinState.monthStore[key].meta[`${r}:${c}`];
+                    }
+                }
+                corbinState.hot.render();
+                corbinSaveMonthToFirebase(corbinState.current.getFullYear(), corbinState.current.getMonth());
+            };
+
+            // Initialize directory
+            const corbinInitializeDirectory = () => {
+                const directoryContainer = document.getElementById('corbinDirectory');
+                if (!directoryContainer) return;
+                
+                corbinState.directoryHot = new Handsontable(directoryContainer, {
+                    data: [["", "", "", "Set ▶"]], // Name, Email, Phone, Availability button label
+                    colHeaders: ["Name", "Email", "Phone", "Availability"],
+                    columns: [
+                        { type: 'text' }, { type: 'text' }, { type: 'text' },
+                        { renderer: corbinAvailabilityButtonRenderer, readOnly: true }
+                    ],
+                    rowHeaders: true,
+                    minSpareRows: 1,
+                    contextMenu: true,
+                    licenseKey: 'non-commercial-and-evaluation',
+                    afterChange: (changes, source) => {
+                        if (source === 'loadData' || !changes) return;
+                        corbinSaveDirectoryToFirebase();
+                    },
+                    afterCreateRow: () => corbinSaveDirectoryToFirebase(),
+                    afterRemoveRow: () => corbinSaveDirectoryToFirebase(),
+                });
+                
+                corbinLoadDirectoryFromFirebase();
+            };
+
+            // Custom renderer for availability button
+            const corbinAvailabilityButtonRenderer = (instance, td, row, col, prop, value) => {
+                td.innerHTML = "";
+                const btn = document.createElement('button');
+                btn.textContent = "Set ▶";
+                btn.style.padding = "2px 6px";
+                btn.style.fontSize = "12px";
+                btn.className = "bg-blue-600 text-white rounded hover:bg-blue-700";
+                btn.onclick = (e) => {
+                    e.stopPropagation();
+                    const name = (corbinState.directoryHot.getDataAtCell(row, 0) || "").trim();
+                    if (!name) {
+                        showNotification("Please enter a Name first.", 'error');
+                        return;
+                    }
+                    corbinOpenAvailabilityModal(name);
+                };
+                td.appendChild(btn);
+            };
+
+            // Global functions for button clicks
+            window.corbinPrevMonth = () => {
+                corbinState.current.setMonth(corbinState.current.getMonth() - 1);
+                corbinRenderMonth();
+            };
+
+            window.corbinNextMonth = () => {
+                corbinState.current.setMonth(corbinState.current.getMonth() + 1);
+                corbinRenderMonth();
+            };
+
+            window.corbinAddRows = () => {
+                const n = parseInt(document.getElementById('corbinRowsToModify').value || '1', 10);
+                const sel = corbinState.lastSel || (corbinState.hot ? corbinState.hot.getSelectedLast() : null);
+                if (!sel) return;
+                
+                const w = corbinWeekIndexForRow(sel[0]);
+                if (w < 0) return;
+                
+                const key = corbinMonthKey(corbinState.current.getFullYear(), corbinState.current.getMonth());
+                const start = corbinWeekStarts()[w] + 1;
+                corbinState.bodyRows[w] += n;
+                corbinState.monthStore[key].bodyRows = corbinState.bodyRows.slice();
+                corbinState.monthStore[key].data.splice(start, 0, ...Array.from({ length: n }, () => Array(TOTAL_COLS).fill("")));
+                corbinState.monthStore[key].meta = corbinShiftMeta(corbinState.monthStore[key].meta, start, n);
+                corbinRenderMonth();
+                corbinSaveMonthToFirebase(corbinState.current.getFullYear(), corbinState.current.getMonth());
+            };
+
+            window.corbinDelRows = () => {
+                const n = parseInt(document.getElementById('corbinRowsToModify').value || '1', 10);
+                const sel = corbinState.lastSel || (corbinState.hot ? corbinState.hot.getSelectedLast() : null);
+                if (!sel) return;
+                
+                const w = corbinWeekIndexForRow(sel[0]);
+                if (w < 0) return;
+                if (corbinState.bodyRows[w] <= n) return;
+                
+                const key = corbinMonthKey(corbinState.current.getFullYear(), corbinState.current.getMonth());
+                const start = corbinWeekStarts()[w] + 1;
+                corbinState.bodyRows[w] -= n;
+                corbinState.monthStore[key].bodyRows = corbinState.bodyRows.slice();
+                corbinState.monthStore[key].data.splice(start, n);
+                corbinState.monthStore[key].meta = corbinShiftMeta(corbinState.monthStore[key].meta, start, -n);
+                corbinRenderMonth();
+                corbinSaveMonthToFirebase(corbinState.current.getFullYear(), corbinState.current.getMonth());
+            };
+
+            // Helper functions
+            const corbinWeekStarts = () => {
+                let starts = [], acc = 0;
+                for (let i = 0; i < corbinState.bodyRows.length; i++) {
+                    starts.push(acc);
+                    acc += 1 + corbinState.bodyRows[i];
+                }
+                return starts;
+            };
+
+            const corbinWeekIndexForRow = (rowIdx) => {
+                const starts = corbinWeekStarts();
+                for (let i = 0; i < corbinState.bodyRows.length; i++) {
+                    if (rowIdx >= starts[i] && rowIdx <= starts[i] + corbinState.bodyRows[i]) return i;
+                }
+                return -1;
+            };
+
+            const corbinShiftMeta = (meta, startRow, delta) => {
+                const newMeta = {};
+                Object.entries(meta).forEach(([k, v]) => {
+                    let [r, c] = k.split(":").map(Number);
+                    if (r >= startRow) r += delta;
+                    newMeta[`${r}:${c}`] = v;
+                });
+                return newMeta;
+            };
+
+            // Main render function for the month
+            const corbinRenderMonth = async () => {
+                const y = corbinState.current.getFullYear(), m = corbinState.current.getMonth(), key = corbinMonthKey(y, m);
+                const weeks = corbinNumWeeks(y, m);
+
+                if (!corbinState.monthStore[key]) {
+                    await corbinLoadMonthFromFirebase(y, m);
+                }
+
+                if (!corbinState.monthStore[key] || !corbinState.monthStore[key].data) {
+                    const br = Array(weeks).fill(8);
+                    const data = corbinBuildDataFor(y, m, weeks, br);
+                    const matrix = corbinBuildWeekMatrix(y, m, weeks);
+                    const dayMeta = {};
+                    let acc = 0;
+                    for (let w = 0; w < weeks; w++) {
+                        for (let d = 0; d < DAYS_PER_WEEK; d++) {
+                            const c = d * COLS_PER_DAY;
+                            data[acc][c] = matrix[w][d].date.toLocaleString('default', { weekday: 'short' }) + " " + matrix[w][d].date.getDate();
+                            dayMeta[`${acc}:${c}`] = matrix[w][d];
+                        }
+                        acc += 1 + br[w];
+                    }
+                    corbinState.monthStore[key] = { data, bodyRows: br, meta: {}, dayMeta, calendar: matrix, shiftLog: [], summary: [], summaryStudy: [], summarySite: [], loaded: true };
+                }
+
+                corbinState.bodyRows = corbinState.monthStore[key].bodyRows.slice();
+                const monthLabel = document.getElementById("corbinMonthLabel");
+                if (monthLabel) {
+                    monthLabel.textContent = corbinState.current.toLocaleString('default', { month: 'long' }) + " " + y;
+                }
+
+                if (corbinState.hot) corbinState.hot.destroy();
+                const gridElement = document.getElementById('corbinGrid');
+                if (gridElement) {
+                    corbinState.hot = new Handsontable(gridElement, {
+                        data: corbinState.monthStore[key].data,
+                        colHeaders: false,
+                        rowHeaders: true,
+                        columns: Array.from({ length: TOTAL_COLS }, () => ({ type: 'text' })),
+                        licenseKey: 'non-commercial-and-evaluation',
+                        contextMenu: true,
+                        cells: (r, c) => {
+                            let props = { renderer: corbinColorRenderer };
+                            if (corbinWeekStarts().includes(r)) props.readOnly = true;
+                            return props;
+                        },
+                        afterSelectionEnd: (r1, c1, r2, c2) => { corbinState.lastSel = [r1, c1, r2, c2]; },
+                        afterCopy: (data, coords) => {
+                            corbinState.clipboardMeta = [];
+                            coords.forEach(({ startRow, startCol, endRow, endCol }) => {
+                                for (let r = startRow; r <= endRow; r++) {
+                                    for (let c = startCol; c <= endCol; c++) {
+                                        const key = corbinMonthKey(corbinState.current.getFullYear(), corbinState.current.getMonth());
+                                        const color = corbinState.monthStore[key]?.meta?.[`${r}:${c}`] || null;
+                                        corbinState.clipboardMeta.push({ r: r - startRow, c: c - startCol, color });
+                                    }
+                                }
+                            });
+                        },
+                        afterPaste: (data, coords) => {
+                            if (!corbinState.clipboardMeta) return;
+                            const { startRow, startCol } = coords[0];
+                            const key = corbinMonthKey(corbinState.current.getFullYear(), corbinState.current.getMonth());
+                            corbinState.clipboardMeta.forEach(item => {
+                                if (item.color) {
+                                    const rr = startRow + item.r, cc = startCol + item.c;
+                                    corbinState.monthStore[key].meta[`${rr}:${cc}`] = item.color;
+                                }
+                            });
+                            corbinState.hot.render();
+                            corbinSaveMonthToFirebase(y, m);
+                        },
+                        afterChange: () => { corbinSaveMonthToFirebase(y, m); }
+                    });
+                }
+
+                // Refresh the availability sidebar for this (y,m)
+                corbinRefreshAvailabilitySidebar(y, m);
+            };
+
+            // Color renderer for cells
+            const corbinColorRenderer = (instance, td, row, col) => {
+                Handsontable.renderers.TextRenderer.apply(this, arguments);
+                const key = corbinMonthKey(corbinState.current.getFullYear(), corbinState.current.getMonth());
+                const color = corbinState.monthStore[key]?.meta?.[`${row}:${col}`];
+                if (color) td.style.background = color;
+
+                const state = corbinState.monthStore[key];
+                if (state && state.calendar) {
+                    const weekIdx = corbinWeekIndexForRow(row);
+                    const dayIdx = Math.floor(col / 2);
+                    if (weekIdx >= 0 && state.calendar[weekIdx] && !state.calendar[weekIdx][dayIdx].inMonth) {
+                        td.style.background = "#f0f0f0";
+                        td.style.color = "#999";
+                    }
+                }
+                if (corbinWeekStarts().includes(row)) {
+                    td.style.background = "#e0e0e0";
+                    td.style.fontWeight = "600";
+                }
+                if (col % 2 === 1) td.classList.add('day-sep');
+            };
+
+            // Firebase save/load functions (using existing CHAOS Firebase setup)
+            const corbinSaveMonthToFirebase = async (y, m) => {
+                const key = corbinMonthKey(y, m);
+                const stateData = corbinState.monthStore[key];
+                if (!stateData) return;
+                try {
+                    const payload = {
+                        data: JSON.stringify(stateData.data || []),
+                        bodyRows: JSON.stringify(stateData.bodyRows || []),
+                        meta: JSON.stringify(stateData.meta || {})
+                    };
+                    const corbinMonthsRef = collection(db, `artifacts/${appId}/public/data/corbin_months`);
+                    await setDoc(doc(corbinMonthsRef, key), payload);
+                } catch (e) {
+                    console.error("Corbin scheduler save error", e);
+                }
+            };
+
+            const corbinLoadMonthFromFirebase = async (y, m) => {
+                const key = corbinMonthKey(y, m);
+                try {
+                    const corbinMonthsRef = collection(db, `artifacts/${appId}/public/data/corbin_months`);
+                    const snap = await getDoc(doc(corbinMonthsRef, key));
+                    if (snap.exists()) {
+                        const raw = snap.data();
+                        corbinState.monthStore[key] = {
+                            data: JSON.parse(raw.data || "[]"),
+                            bodyRows: JSON.parse(raw.bodyRows || "[]"),
+                            meta: JSON.parse(raw.meta || "{}"),
+                            calendar: corbinBuildWeekMatrix(y, m, corbinNumWeeks(y, m)),
+                            dayMeta: {},
+                            shiftLog: [], summary: [], summaryStudy: [], summarySite: [],
+                            loaded: true
+                        };
+                    }
+                } catch (e) {
+                    console.error("Corbin scheduler load error", e);
+                }
+            };
+
+            const corbinSaveDirectoryToFirebase = async () => {
+                try {
+                    const data = corbinState.directoryHot.getData();
+                    const payload = { data: JSON.stringify(data) };
+                    const corbinDirectoryRef = collection(db, `artifacts/${appId}/public/data/corbin_directory`);
+                    await setDoc(doc(corbinDirectoryRef, "main"), payload);
+                } catch (e) {
+                    console.error("Corbin directory save error", e);
+                }
+            };
+
+            const corbinLoadDirectoryFromFirebase = async () => {
+                try {
+                    const corbinDirectoryRef = collection(db, `artifacts/${appId}/public/data/corbin_directory`);
+                    const snap = await getDoc(doc(corbinDirectoryRef, "main"));
+                    if (snap.exists()) {
+                        const raw = snap.data();
+                        const arr = JSON.parse(raw.data || "[]");
+                        if (Array.isArray(arr) && arr.length) {
+                            corbinState.directoryHot.loadData(arr);
+                        }
+                    }
+                } catch (e) {
+                    console.error("Corbin directory load error", e);
+                }
+            };
+
+            // Availability modal and sidebar functions
+            const corbinInitializeAvailabilityModal = () => {
+                const modal = document.getElementById('availabilityModal');
+                const cancelBtn = document.getElementById('cancelAvailabilityBtn');
+                const saveBtn = document.getElementById('saveAvailabilityBtn');
+                const monthInput = document.getElementById('availabilityMonth');
+
+                if (cancelBtn) {
+                    cancelBtn.addEventListener('click', corbinCloseAvailabilityModal);
+                }
+
+                if (saveBtn) {
+                    saveBtn.addEventListener('click', corbinSaveAvailability);
+                }
+
+                if (monthInput) {
+                    monthInput.addEventListener('change', corbinBuildDaysGridFromInput);
+                }
+            };
+
+            const corbinOpenAvailabilityModal = (employeeName) => {
+                corbinState.currentAvailEmployee = employeeName;
+                const modalTitle = document.getElementById('availabilityModalTitle');
+                const monthInput = document.getElementById('availabilityMonth');
+                const modal = document.getElementById('availabilityModal');
+                
+                if (modalTitle) modalTitle.textContent = `Set Unavailable Days — ${employeeName}`;
+                
+                // Default to current month
+                const y = corbinState.current.getFullYear();
+                const m = corbinState.current.getMonth() + 1;
+                if (monthInput) monthInput.value = `${y}-${corbinPad2(m)}`;
+                
+                corbinBuildDaysGridFromInput();
+                corbinPreloadAvailability(employeeName, y, m - 1).then(() => {});
+                
+                if (modal) modal.classList.remove('hidden');
+            };
+
+            const corbinCloseAvailabilityModal = () => {
+                const modal = document.getElementById('availabilityModal');
+                if (modal) modal.classList.add('hidden');
+                corbinState.currentAvailEmployee = null;
+                corbinState.selectedDays.clear();
+            };
+
+            const corbinBuildDaysGridFromInput = () => {
+                const daysGrid = document.getElementById('daysGrid');
+                const monthInput = document.getElementById('availabilityMonth');
+                if (!daysGrid || !monthInput) return;
+                
+                daysGrid.innerHTML = "";
+                corbinState.selectedDays.clear();
+                const [yy, mm] = monthInput.value.split('-').map(Number);
+                if (!yy || !mm) return;
+                const dcount = corbinDaysInMonth(yy, mm - 1);
+                for (let d = 1; d <= dcount; d++) {
+                    const btn = document.createElement('button');
+                    btn.textContent = d;
+                    btn.className = "daychip";
+                    btn.onclick = () => {
+                        if (corbinState.selectedDays.has(d)) {
+                            corbinState.selectedDays.delete(d);
+                            btn.classList.remove('selected');
+                        } else {
+                            corbinState.selectedDays.add(d);
+                            btn.classList.add('selected');
+                        }
+                    };
+                    daysGrid.appendChild(btn);
+                }
+            };
+
+            const corbinPreloadAvailability = async (employeeName, y, m) => {
+                const empId = corbinEmpIdFromName(employeeName);
+                const ym = `${y}-${corbinPad2(m + 1)}`;
+                try {
+                    const availabilityRef = collection(db, `artifacts/${appId}/public/data/corbin_availability`);
+                    const empRef = collection(availabilityRef, empId, "months");
+                    const snap = await getDoc(doc(empRef, ym));
+                    if (snap.exists()) {
+                        const data = snap.data();
+                        const days = Array.isArray(data.days) ? data.days : [];
+                        corbinState.selectedDays = new Set(days);
+                        // Mark selected in grid
+                        const daysGrid = document.getElementById('daysGrid');
+                        if (daysGrid) {
+                            Array.from(daysGrid.children).forEach(btn => {
+                                const d = Number(btn.textContent);
+                                if (corbinState.selectedDays.has(d)) btn.classList.add('selected');
+                            });
+                        }
+                    }
+                } catch (e) {
+                    console.error("Corbin availability preload error", e);
+                }
+            };
+
+            const corbinSaveAvailability = async () => {
+                if (!corbinState.currentAvailEmployee) {
+                    corbinCloseAvailabilityModal();
+                    return;
+                }
+                const monthInput = document.getElementById('availabilityMonth');
+                if (!monthInput) return;
+                
+                const [yy, mm] = monthInput.value.split('-').map(Number);
+                if (!yy || !mm) {
+                    showNotification("Please choose a month.", 'error');
+                    return;
+                }
+                const empId = corbinEmpIdFromName(corbinState.currentAvailEmployee);
+                const ym = `${yy}-${corbinPad2(mm)}`;
+                try {
+                    const availabilityRef = collection(db, `artifacts/${appId}/public/data/corbin_availability`);
+                    const empRef = collection(availabilityRef, empId, "months");
+                    await setDoc(doc(empRef, ym), {
+                        days: Array.from(corbinState.selectedDays).sort((a, b) => a - b),
+                        updatedAt: new Date()
+                    });
+                    corbinCloseAvailabilityModal();
+                    showNotification('Availability saved successfully!', 'success');
+                    // If sidebar is showing this month, refresh it
+                    const cy = corbinState.current.getFullYear(), cm = corbinState.current.getMonth();
+                    if (yy === cy && mm - 1 === cm) corbinRefreshAvailabilitySidebar(cy, cm);
+                } catch (e) {
+                    console.error("Corbin availability save error", e);
+                    showNotification('Failed to save availability.', 'error');
+                }
+            };
+
+            const corbinRefreshAvailabilitySidebar = async (y, m) => {
+                const sidebar = document.getElementById('availabilitySidebar');
+                if (!sidebar) return;
+                
+                const sidebarBody = sidebar.querySelector('.aside-body');
+                if (sidebarBody) {
+                    sidebarBody.innerHTML = `Loading availability for ${y}-${corbinPad2(m + 1)}...`;
+                }
+
+                // Build list of employees from the directory
+                const rows = corbinState.directoryHot ? corbinState.directoryHot.getData() : [];
+                const employees = [];
+                rows.forEach(row => {
+                    const name = (row?.[0] || "").trim();
+                    if (name) employees.push(name);
+                });
+
+                if (!employees.length) {
+                    if (sidebarBody) sidebarBody.textContent = "No employees in the directory.";
+                    return;
+                }
+
+                // Fetch availability for each employee for this y-m
+                const ym = `${y}-${corbinPad2(m + 1)}`;
+                const fragments = [];
+                for (const name of employees) {
+                    const empId = corbinEmpIdFromName(name);
+                    try {
+                        const availabilityRef = collection(db, `artifacts/${appId}/public/data/corbin_availability`);
+                        const empRef = collection(availabilityRef, empId, "months");
+                        const snap = await getDoc(doc(empRef, ym));
+                        let days = [];
+                        if (snap.exists()) {
+                            const data = snap.data();
+                            days = Array.isArray(data.days) ? data.days : [];
+                        }
+                        const label = days.length ? days.join(", ") : "—";
+                        fragments.push(`<div class="emp-row"><span class="emp-name">${name}:</span> <span class="emp-days">${label}</span></div>`);
+                    } catch (e) {
+                        console.error("Corbin availability load error", e);
+                        fragments.push(`<div class="emp-row"><span class="emp-name">${name}:</span> <span class="emp-days">[error]</span></div>`);
+                    }
+                }
+                if (sidebarBody) sidebarBody.innerHTML = fragments.join("");
             };
             
             // --- NOTIFICATION & MODAL HANDLING ---
@@ -4127,6 +4757,72 @@
                     'preventive': 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'
                 };
                 return colors[type] || colors['service'];
+            };
+
+            // --- CORBIN'S SCHEDULER FUNCTIONS ---
+            const getCorbinSchedulerHTML = () => {
+                return `
+                    <div class="w-full bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
+                        <div class="mb-6">
+                            <h3 class="text-2xl font-bold dark:text-white mb-2">Corbin's Scheduler</h3>
+                            <p class="text-gray-600 dark:text-gray-400">Monthly planning grid with Handsontable integration</p>
+                        </div>
+                        
+                        <div class="mb-6">
+                            <div class="flex flex-wrap items-center gap-4 mb-4">
+                                <button onclick="corbinPrevMonth()" class="flex items-center gap-2 px-3 py-2 bg-gray-200 dark:bg-gray-700 rounded hover:bg-gray-300 dark:hover:bg-gray-600">
+                                    <i data-lucide="chevron-left" class="w-4 h-4"></i>
+                                    Prev
+                                </button>
+                                <span id="corbinMonthLabel" class="text-lg font-semibold dark:text-white"></span>
+                                <button onclick="corbinNextMonth()" class="flex items-center gap-2 px-3 py-2 bg-gray-200 dark:bg-gray-700 rounded hover:bg-gray-300 dark:hover:bg-gray-600">
+                                    Next
+                                    <i data-lucide="chevron-right" class="w-4 h-4"></i>
+                                </button>
+                                <span class="ml-4 text-sm font-medium dark:text-gray-300">Fill color:</span>
+                                <div class="palette" id="corbinPalette"></div>
+                                <span class="ml-4 text-sm font-medium dark:text-gray-300">Rows:</span>
+                                <input id="corbinRowsToModify" type="number" min="1" value="1" class="w-16 px-2 py-1 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                <button onclick="corbinAddRows()" class="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700">+ Add</button>
+                                <button onclick="corbinDelRows()" class="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700">– Delete</button>
+                            </div>
+                        </div>
+                        
+                        <div class="scheduler-wrap">
+                            <div id="corbinGrid" class="bg-white dark:bg-gray-800 rounded border border-gray-300 dark:border-gray-600"></div>
+                            <aside id="availabilitySidebar" class="bg-gray-50 dark:bg-gray-700">
+                                <div class="aside-title dark:text-white">Availability</div>
+                                <div class="aside-body dark:text-gray-300">—</div>
+                            </aside>
+                        </div>
+                        
+                        <div class="mt-6">
+                            <h4 class="text-lg font-semibold dark:text-white mb-4">Directory</h4>
+                            <div id="corbinDirectory" class="bg-white dark:bg-gray-800 rounded border border-gray-300 dark:border-gray-600"></div>
+                            <p class="mt-2 text-sm text-gray-500 dark:text-gray-400">Tip: click "Set ▶" to add unavailable days.</p>
+                        </div>
+                    </div>
+                    
+                    <!-- Availability Modal -->
+                    <div id="availabilityModal" class="hidden">
+                        <div class="modal-card">
+                            <div class="modal-header" id="availabilityModalTitle">Set Unavailable Days</div>
+                            <div class="modal-row">
+                                <label><b>Month</b>:
+                                    <input type="month" id="availabilityMonth" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </label>
+                            </div>
+                            <div class="modal-row">
+                                <b>Select days NOT available:</b>
+                                <div class="days-grid" id="daysGrid"></div>
+                            </div>
+                            <div class="modal-actions">
+                                <button id="cancelAvailabilityBtn" class="px-4 py-2 bg-gray-200 dark:bg-gray-600 rounded hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                <button id="saveAvailabilityBtn" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Save</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
             };
 
             // --- TRUCK MODAL FUNCTIONS ---
