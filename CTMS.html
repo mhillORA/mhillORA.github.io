@@ -221,6 +221,73 @@
         let allPatients = [];
         let user = null;
         let activeTab = 'dashboard'; // 'dashboard', 'studies', 'sites', or 'reporting'
+        let lastReportData = [];
+
+        // --- Utility Functions ---
+        const ensureArray = (value) => {
+            if (Array.isArray(value)) return value;
+            if (value === null || value === undefined) return [];
+            return [value];
+        };
+
+        const getAllWashoutPatients = (studies) => {
+            const washoutPatients = [];
+            
+            studies.forEach(study => {
+                const studyPatients = allPatients.filter(p => {
+                    const pastEnrollments = p.enrollments?.filter(e => e.status === 'past') || [];
+                    return pastEnrollments.some(e => e.studyId === study.id && e.exitedDate);
+                });
+                
+                studyPatients.forEach(patient => {
+                    const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
+                    const enrollment = pastEnrollments.find(e => e.studyId === study.id && e.exitedDate);
+                    
+                    if (enrollment) {
+                        const exitDate = new Date(enrollment.exitedDate);
+                        const washoutCompleteDate = new Date(exitDate);
+                        washoutCompleteDate.setDate(washoutCompleteDate.getDate() + (study.washoutDays || 30));
+                        
+                        const today = new Date();
+                        const diffMs = washoutCompleteDate.getTime() - today.getTime();
+                        const daysRemaining = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+                        
+                        // Include patients who are still in washout or recently became eligible (within last 7 days)
+                        if (daysRemaining > -7) {
+                            washoutPatients.push({
+                                ...patient,
+                                studyId: study.id,
+                                exitDate: enrollment.exitedDate,
+                                washoutCompleteDate: washoutCompleteDate.toISOString(),
+                                daysRemaining: Math.max(0, daysRemaining)
+                            });
+                        }
+                    }
+                });
+            });
+            
+            return washoutPatients;
+        };
+
+        const showNotification = (message, type = 'info') => {
+            // Create a simple notification system
+            const notification = document.createElement('div');
+            notification.className = `fixed top-4 right-4 p-4 rounded-md shadow-lg z-50 ${
+                type === 'success' ? 'bg-green-500 text-white' :
+                type === 'error' ? 'bg-red-500 text-white' :
+                type === 'info' ? 'bg-blue-500 text-white' :
+                'bg-gray-500 text-white'
+            }`;
+            notification.textContent = message;
+            document.body.appendChild(notification);
+            
+            // Remove notification after 3 seconds
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 3000);
+        };
         const indicationOptions = [...new Set([
             "Allergy", "Blepharitis", "Dry Eye", "Glaucoma", "AMD (Wet/Dry)", "Anterior Uveitis", 
             "Cataracts", "Cataract Surgical", "Choroideremia", "Contact Lenses", "Corneal Disorders", 
@@ -233,7 +300,6 @@
             "Refractive Surgical", "Retina", "Retinal Vein Occlusion", "Retina Surgical", "Sjogren's Syndrome", 
             "Stargardt's Disease", "Thyroid Eye Disease", "Allergic Rhinitis", "Anti-Infective"
         ])].sort();
-        let lastReportData = []; // To store filtered data for CSV export
         let enrollmentChart = null;
         let siteDistributionChart = null;
         let nasaWindow = window.opener; // Reference to the N.A.S.A. window
@@ -259,20 +325,6 @@
          */
         const getIcon = (name) => iconCache[name] || '';
 
-        /**
-         * Ensures a value is returned as an array
-         * @param {*} value - Value to convert to array
-         * @returns {Array} Array representation of the value
-         */
-        const ensureArray = (value) => {
-            if (Array.isArray(value)) {
-                return value;
-            }
-            if (typeof value === 'string' && value.length > 0) {
-                return [value];
-            }
-            return [];
-        };
 
         // --- N.A.S.A. Communication ---
         /**
@@ -618,6 +670,7 @@
             const totalStudies = allStudies.length;
             const totalSites = allSites.length;
             const totalEnrolled = allPatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
+            const sources = ['Facebook', 'Instagram', 'Reddit', 'Site', 'Marketing', 'Email'];
 
             return `
                  <div class="px-4 py-6 sm:px-0 space-y-8">
@@ -636,6 +689,88 @@
                          </div>
                      </div>
 
+                     <!-- NASA-style Report Filters -->
+                     <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
+                         <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Advanced Report Filters</h3>
+                         <form id="report-filter-form" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 items-center">
+                             <select name="studyId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                 <option value="all">All Studies</option>
+                                 ${allStudies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
+                             </select>
+                             <select name="siteId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                 <option value="all">All Sites</option>
+                                 ${allSites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}
+                             </select>
+                             <select name="status" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                 <option value="all">All Statuses</option>
+                                 ${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail'].map(s => `<option value="${s}">${s}</option>`).join('')}
+                             </select>
+                             <select name="source" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                 <option value="all">All Sources</option>
+                                 ${sources.map(s => `<option value="${s}">${s}</option>`).join('')}
+                             </select>
+                             <select name="schedulingStatus" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                 <option value="all">All Scheduling Statuses</option>
+                                 <option value="scheduled">Scheduled</option>
+                                 <option value="not-scheduled">Not Scheduled</option>
+                             </select>
+                             <select name="surveyOutcome" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                 <option value="all">All Survey Outcomes</option>
+                                 <option value="Pass">Pass</option>
+                                 <option value="Fail">Fail</option>
+                             </select>
+                             <div class="flex items-center gap-2">
+                                 <input type="number" name="minAge" placeholder="Min Age" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                                 <span>-</span>
+                                 <input type="number" name="maxAge" placeholder="Max Age" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                             </div>
+                             <div class="flex items-center gap-2">
+                                 <input type="checkbox" name="surveyCompleted" id="surveyCompleted" class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                 <label for="surveyCompleted" class="text-sm text-gray-700 dark:text-gray-300">Survey Completed</label>
+                             </div>
+                             <input type="date" name="startDate" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                             <input type="date" name="endDate" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                             <button type="submit" class="bg-blue-600 text-white rounded-md h-10 col-span-full lg:col-span-2">Generate Report</button>
+                         </form>
+                     </div>
+
+                     <!-- Report Metrics -->
+                     <div id="report-metrics" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8"></div>
+
+                     <!-- NASA-style Report Results -->
+                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden">
+                         <div class="flex justify-between items-center p-6">
+                             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Report Results</h3>
+                             <div class="flex gap-2">
+                                 <button id="export-csv-btn" data-action="export-csv" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 flex items-center disabled:bg-gray-400" disabled>
+                                     <i data-lucide="download" class="w-5 h-5 mr-2"></i> Export Report
+                                 </button>
+                                 <button id="export-surveys-btn" data-action="export-surveys-csv" class="bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 flex items-center disabled:bg-gray-400" disabled>
+                                     <i data-lucide="download" class="w-5 h-5 mr-2"></i> Export Survey Results
+                                 </button>
+                             </div>
+                         </div>
+                         <div class="overflow-x-auto">
+                             <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                 <thead class="bg-gray-50 dark:bg-gray-700">
+                                     <tr>
+                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Name</th>
+                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Age</th>
+                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
+                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
+                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Site</th>
+                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Appointment</th>
+                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Survey Outcome</th>
+                                     </tr>
+                                 </thead>
+                                 <tbody id="report-results-body" class="dark:text-gray-300">
+                                     <tr><td colspan="7" class="text-center text-gray-500 dark:text-gray-400 py-8">Generate a report to see results.</td></tr>
+                                 </tbody>
+                             </table>
+                         </div>
+                     </div>
+
+                     <!-- Original ARTEMIS Reporting Sections -->
                      <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md">
                          <div class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
                              <div>
@@ -676,6 +811,22 @@
                              <button id="export-study-stats-btn" class="text-sm bg-green-600 text-white px-3 py-1.5 rounded-md hover:bg-green-700 disabled:bg-gray-400" disabled>Export CSV</button>
                          </div>
                          <div id="report-studies-table-container"></div>
+                     </div>
+
+                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-x-auto">
+                         <div class="flex flex-col sm:flex-row justify-between items-center p-6">
+                             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4 sm:mb-0">Washout Patients</h3>
+                             <button id="export-washout-btn" class="text-sm bg-yellow-600 text-white px-3 py-1.5 rounded-md hover:bg-yellow-700 disabled:bg-gray-400" disabled>Export Washout CSV</button>
+                         </div>
+                         <div id="report-washout-table-container"></div>
+                     </div>
+
+                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-x-auto">
+                         <div class="flex flex-col sm:flex-row justify-between items-center p-6">
+                             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4 sm:mb-0">All Participants</h3>
+                             <button id="export-participants-btn" class="text-sm bg-blue-600 text-white px-3 py-1.5 rounded-md hover:bg-blue-700 disabled:bg-gray-400" disabled>Export Participants CSV</button>
+                         </div>
+                         <div id="report-participants-table-container"></div>
                      </div>
                  </div>
             `;
@@ -742,6 +893,17 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="mb-6">
+                            <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-2 flex items-center">
+                                ${getIcon('clock')}
+                                <span class="ml-2">Washout Statistics</span>
+                            </h3>
+                            <div class="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4">
+                                <div id="washout-stats-${study.id}" class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                                    <!-- Washout statistics will be populated here -->
+                                </div>
+                            </div>
+                        </div>
                         <div>
                             <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-2 flex items-center">
                                 ${getIcon('building')}
@@ -785,6 +947,115 @@
                     </div>
                 </div>
             `;
+        };
+
+        const calculateWashoutInfo = (studyId) => {
+            const study = allStudies.find(s => s.id === studyId);
+            if (!study) return;
+
+            const washoutDays = study.washoutDays || 30;
+            
+            // Get patients who have completed this study and are in washout
+            const washoutPatients = allPatients.filter(p => {
+                const pastEnrollments = p.enrollments?.filter(e => e.status === 'past') || [];
+                const studyEnrollment = pastEnrollments.find(e => e.studyId === studyId);
+                return studyEnrollment && studyEnrollment.exitedDate;
+            });
+
+            const washoutStatsContainer = document.getElementById(`washout-stats-${studyId}`);
+            if (!washoutStatsContainer) return;
+
+            if (washoutPatients.length === 0) {
+                washoutStatsContainer.innerHTML = `
+                    <div class="col-span-full text-center text-gray-500 dark:text-gray-400">
+                        <p>No patients in washout period</p>
+                    </div>
+                `;
+                return;
+            }
+
+            // Calculate statistics
+            const today = new Date();
+            let inWashout = 0;
+            let eligible = 0;
+            let avgDaysRemaining = 0;
+            let totalDaysRemaining = 0;
+
+            washoutPatients.forEach(patient => {
+                const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
+                const studyEnrollment = pastEnrollments.find(e => e.studyId === studyId);
+                
+                if (studyEnrollment && studyEnrollment.exitedDate) {
+                    const exitDate = new Date(studyEnrollment.exitedDate);
+                    const washoutCompleteDate = new Date(exitDate);
+                    washoutCompleteDate.setDate(washoutCompleteDate.getDate() + washoutDays);
+                    
+                    const diffMs = washoutCompleteDate.getTime() - today.getTime();
+                    const daysRemaining = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+                    
+                    if (daysRemaining > 0) {
+                        inWashout++;
+                        totalDaysRemaining += daysRemaining;
+                    } else {
+                        eligible++;
+                    }
+                }
+            });
+
+            avgDaysRemaining = inWashout > 0 ? Math.round(totalDaysRemaining / inWashout) : 0;
+
+            washoutStatsContainer.innerHTML = `
+                <div class="text-center">
+                    <p class="text-lg font-bold text-yellow-600 dark:text-yellow-400">${inWashout}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">In Washout</p>
+                </div>
+                <div class="text-center">
+                    <p class="text-lg font-bold text-green-600 dark:text-green-400">${eligible}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">Eligible</p>
+                </div>
+                <div class="text-center">
+                    <p class="text-lg font-bold text-blue-600 dark:text-blue-400">${avgDaysRemaining}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">Avg Days Left</p>
+                </div>
+                <div class="text-center">
+                    <p class="text-lg font-bold text-purple-600 dark:text-purple-400">${washoutDays}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">Washout Period</p>
+                </div>
+            `;
+        };
+
+        const updateAllWashoutInfo = () => {
+            allStudies.forEach(study => {
+                calculateWashoutInfo(study.id);
+            });
+        };
+
+
+        // Function to check if a patient is eligible for a study based on washout status
+        const isPatientEligibleForStudy = (patientId, studyId) => {
+            const patient = allPatients.find(p => p.id === patientId);
+            const study = allStudies.find(s => s.id === studyId);
+            
+            if (!patient || !study) return false;
+            
+            const washoutDays = study.washoutDays || 30;
+            const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
+            
+            // Check if patient has any past enrollments that are still in washout
+            for (const enrollment of pastEnrollments) {
+                if (enrollment.exitedDate) {
+                    const exitDate = new Date(enrollment.exitedDate);
+                    const washoutCompleteDate = new Date(exitDate);
+                    washoutCompleteDate.setDate(washoutCompleteDate.getDate() + washoutDays);
+                    
+                    const today = new Date();
+                    if (today < washoutCompleteDate) {
+                        return false; // Patient is still in washout
+                    }
+                }
+            }
+            
+            return true; // Patient is eligible
         };
         
         const renderAllSites = (sitesToRender = allSites) => {
@@ -831,6 +1102,10 @@
             if (studiesContainer) {
                 if (allStudies.length > 0) {
                     studiesContainer.innerHTML = allStudies.map(renderStudyCard).join('');
+                    // Update washout information after rendering
+                    setTimeout(() => {
+                        updateAllWashoutInfo();
+                    }, 100);
                 } else {
                     studiesContainer.innerHTML = `
                         <div class="text-center py-12 bg-white dark:bg-gray-800 rounded-lg shadow">
@@ -982,6 +1257,95 @@
             }
         };
 
+        // --- NASA-style Report Filter Handler ---
+        const handleNasaStyleReportFilter = (formData) => {
+            let filteredPatients = [...allPatients];
+            
+            // Apply filters
+            if (formData.studyId !== 'all') {
+                filteredPatients = filteredPatients.filter(p => p.enrollments?.some(e => e.studyId === formData.studyId));
+            }
+            if (formData.siteId !== 'all') {
+                filteredPatients = filteredPatients.filter(p => p.enrollments?.some(e => e.siteId === formData.siteId));
+            }
+            if (formData.status !== 'all') {
+                filteredPatients = filteredPatients.filter(p => p.status === formData.status);
+            }
+            if (formData.source !== 'all') {
+                filteredPatients = filteredPatients.filter(p => p.source === formData.source);
+            }
+            if (formData.minAge) {
+                filteredPatients = filteredPatients.filter(p => p.age >= parseInt(formData.minAge));
+            }
+            if (formData.maxAge) {
+                filteredPatients = filteredPatients.filter(p => p.age <= parseInt(formData.maxAge));
+            }
+            if (formData.schedulingStatus === 'scheduled') {
+                filteredPatients = filteredPatients.filter(p => p.appointment);
+            }
+            if (formData.schedulingStatus === 'not-scheduled') {
+                filteredPatients = filteredPatients.filter(p => !p.appointment);
+            }
+            if (formData.surveyCompleted) {
+                filteredPatients = filteredPatients.filter(p => p.surveyResults && p.surveyResults.length > 0);
+            }
+            if (formData.surveyOutcome !== 'all') {
+                filteredPatients = filteredPatients.filter(p => p.surveyResults?.some(sr => sr.outcome === formData.surveyOutcome));
+            }
+            if (formData.startDate) {
+                filteredPatients = filteredPatients.filter(p => p.appointment && new Date(p.appointment.time) >= new Date(formData.startDate));
+            }
+            if (formData.endDate) {
+                filteredPatients = filteredPatients.filter(p => p.appointment && new Date(p.appointment.time) <= new Date(formData.endDate));
+            }
+            
+            // Store filtered data for export
+            lastReportData = filteredPatients;
+            
+            // Update report results table
+            const resultsBody = document.getElementById('report-results-body');
+            const exportBtn = document.getElementById('export-csv-btn');
+            const exportSurveysBtn = document.getElementById('export-surveys-btn');
+            
+            if (filteredPatients.length > 0) {
+                resultsBody.innerHTML = filteredPatients.map(p => {
+                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                    const lastSurvey = p.surveyResults && p.surveyResults.length > 0 ? p.surveyResults[p.surveyResults.length - 1] : null;
+                    const outcome = lastSurvey ? lastSurvey.outcome : 'N/A';
+                    const outcomeColor = outcome === 'Pass' ? 'text-green-500' : outcome === 'Fail' ? 'text-red-500' : '';
+                    return `
+                        <tr>
+                            <td class="px-6 py-4 whitespace-nowrap">${p.firstName} ${p.lastName}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">${p.age || 'N/A'}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">${p.status || 'N/A'}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? allStudies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A'}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? allSites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A'}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">${p.appointment ? new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : 'Not Scheduled'}</td>
+                            <td class="px-6 py-4 whitespace-nowrap font-semibold ${outcomeColor}">${outcome}</td>
+                        </tr>
+                    `;
+                }).join('');
+                if (exportBtn) exportBtn.disabled = false;
+                if (exportSurveysBtn) exportSurveysBtn.disabled = false;
+            } else {
+                resultsBody.innerHTML = `<tr><td colspan="7" class="text-center text-gray-500 dark:text-gray-400 py-8">No patients match the selected criteria.</td></tr>`;
+                if (exportBtn) exportBtn.disabled = true;
+                if (exportSurveysBtn) exportSurveysBtn.disabled = true;
+            }
+            
+            // Calculate and display metrics
+            const metricsContainer = document.getElementById('report-metrics');
+            const total = filteredPatients.length;
+            const avgAge = total > 0 ? (filteredPatients.reduce((sum, p) => sum + (p.age || 0), 0) / filteredPatients.filter(p => p.age).length).toFixed(1) : 'N/A';
+            const scheduled = filteredPatients.filter(p => p.appointment).length;
+            metricsContainer.innerHTML = `
+                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Total Patients</p><p class="text-2xl font-bold dark:text-white">${total}</p></div>
+                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Average Age</p><p class="text-2xl font-bold dark:text-white">${avgAge}</p></div>
+                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Scheduled</p><p class="text-2xl font-bold dark:text-white">${scheduled}</p></div>
+                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Not Scheduled</p><p class="text-2xl font-bold dark:text-white">${total - scheduled}</p></div>
+            `;
+        };
+
         // --- Reporting Functions ---
         const renderReportTables = () => {
             const studyFilterId = document.getElementById('report-study-filter')?.value;
@@ -1103,6 +1467,116 @@
                     sitesTableContainer.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No site data matches the selected filters.</p>`;
                 }
             }
+
+            // Render Washout Patients Table
+            const washoutTableContainer = document.getElementById('report-washout-table-container');
+            if (washoutTableContainer) {
+                const washoutPatients = getAllWashoutPatients(filteredStudies);
+                if (washoutPatients.length > 0) {
+                    washoutTableContainer.innerHTML = `
+                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                            <thead class="bg-gray-50 dark:bg-gray-700">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Patient</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Exit Date</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Washout Complete</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Days Remaining</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                ${washoutPatients.map(patient => {
+                                    const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
+                                    const study = allStudies.find(s => s.id === patient.studyId);
+                                    const enrollment = pastEnrollments.find(e => e.studyId === patient.studyId);
+                                    
+                                    const exitDate = new Date(enrollment.exitedDate);
+                                    const washoutCompleteDate = new Date(exitDate);
+                                    washoutCompleteDate.setDate(washoutCompleteDate.getDate() + (study.washoutDays || 30));
+                                    
+                                    const today = new Date();
+                                    const diffMs = washoutCompleteDate.getTime() - today.getTime();
+                                    const daysRemaining = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+                                    
+                                    const isEligible = daysRemaining <= 0;
+                                    const statusColor = isEligible ? 'text-green-600 dark:text-green-400' : 'text-yellow-600 dark:text-yellow-400';
+                                    const statusText = isEligible ? 'Eligible' : `${daysRemaining} days`;
+                                    
+                                    return `
+                                        <tr>
+                                            <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${patient.firstName} ${patient.lastName}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${study?.title || 'N/A'}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${exitDate.toLocaleDateString()}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${washoutCompleteDate.toLocaleDateString()}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${Math.max(0, daysRemaining)}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap">
+                                                <span class="font-semibold ${statusColor}">${statusText}</span>
+                                            </td>
+                                        </tr>
+                                    `;
+                                }).join('')}
+                            </tbody>
+                        </table>
+                    `;
+                    document.getElementById('export-washout-btn').disabled = false;
+                } else {
+                    washoutTableContainer.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No patients currently in washout period.</p>`;
+                    document.getElementById('export-washout-btn').disabled = true;
+                }
+            }
+
+            // Render All Participants Table
+            const participantsTableContainer = document.getElementById('report-participants-table-container');
+            if (participantsTableContainer) {
+                // Create a set of relevant study IDs from filtered studies
+                const relevantStudyIds = new Set(filteredStudies.map(s => s.id));
+                const allParticipants = allPatients.filter(p => {
+                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                    return currentEnrollment && relevantStudyIds.has(currentEnrollment.studyId);
+                });
+
+                if (allParticipants.length > 0) {
+                    participantsTableContainer.innerHTML = `
+                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                            <thead class="bg-gray-50 dark:bg-gray-700">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Patient Name</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Site</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Enrolled Date</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Email</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Phone</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                ${allParticipants.map(patient => {
+                                    const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
+                                    const study = allStudies.find(s => s.id === currentEnrollment?.studyId);
+                                    const site = allSites.find(s => s.id === currentEnrollment?.siteId);
+                                    
+                                    return `
+                                        <tr class="dark:text-gray-300">
+                                            <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${patient.firstName} ${patient.lastName}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${study?.title || 'N/A'}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${site?.name || 'N/A'}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${patient.status || 'N/A'}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${currentEnrollment?.enrolledDate ? new Date(currentEnrollment.enrolledDate).toLocaleDateString() : 'N/A'}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${patient.email || 'N/A'}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${patient.phoneNumber || 'N/A'}</td>
+                                        </tr>
+                                    `;
+                                }).join('')}
+                            </tbody>
+                        </table>
+                    `;
+                    document.getElementById('export-participants-btn').disabled = false;
+                } else {
+                    participantsTableContainer.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No participants found with the current filters.</p>`;
+                    document.getElementById('export-participants-btn').disabled = true;
+                }
+            }
         };
         
         const exportReportToCSV = () => {
@@ -1145,6 +1619,210 @@
             document.body.removeChild(link);
         };
 
+        const exportWashoutToCSV = () => {
+            const washoutPatients = getAllWashoutPatients(allStudies);
+            if (washoutPatients.length === 0) {
+                console.log("No washout data to export.");
+                return;
+            }
+
+            let csvContent = "data:text/csv;charset=utf-8,";
+            const headers = ["Patient Name", "Study", "Exit Date", "Washout Complete Date", "Days Remaining", "Status", "Email", "Phone"];
+            csvContent += headers.join(",") + "\r\n";
+
+            washoutPatients.forEach(patient => {
+                const study = allStudies.find(s => s.id === patient.studyId);
+                const exitDate = new Date(patient.exitDate);
+                const washoutCompleteDate = new Date(patient.washoutCompleteDate);
+                const isEligible = patient.daysRemaining <= 0;
+                const status = isEligible ? 'Eligible' : `${patient.daysRemaining} days remaining`;
+                
+                const row = [
+                    `"${patient.firstName} ${patient.lastName}"`,
+                    `"${study?.title || 'N/A'}"`,
+                    exitDate.toLocaleDateString(),
+                    washoutCompleteDate.toLocaleDateString(),
+                    patient.daysRemaining,
+                    status,
+                    `"${patient.email || 'N/A'}"`,
+                    `"${patient.phoneNumber || 'N/A'}"`
+                ];
+                csvContent += row.join(",") + "\r\n";
+            });
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", "washout_patients_report.csv");
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+
+        const exportParticipantsToCSV = () => {
+            const allParticipants = allPatients.filter(p => {
+                const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                return currentEnrollment;
+            });
+
+            if (allParticipants.length === 0) {
+                console.log("No participants data to export.");
+                return;
+            }
+
+            let csvContent = "data:text/csv;charset=utf-8,";
+            const headers = ["Patient Name", "Study", "Site", "Status", "Enrolled Date", "Email", "Phone", "DOB", "Age"];
+            csvContent += headers.join(",") + "\r\n";
+
+            allParticipants.forEach(patient => {
+                const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
+                const study = allStudies.find(s => s.id === currentEnrollment?.studyId);
+                const site = allSites.find(s => s.id === currentEnrollment?.siteId);
+                
+                const row = [
+                    `"${patient.firstName} ${patient.lastName}"`,
+                    `"${study?.title || 'N/A'}"`,
+                    `"${site?.name || 'N/A'}"`,
+                    patient.status || 'N/A',
+                    currentEnrollment?.enrolledDate ? new Date(currentEnrollment.enrolledDate).toLocaleDateString() : 'N/A',
+                    `"${patient.email || 'N/A'}"`,
+                    `"${patient.phoneNumber || 'N/A'}"`,
+                    patient.dob || 'N/A',
+                    patient.age || 'N/A'
+                ];
+                csvContent += row.join(",") + "\r\n";
+            });
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", "participants_report.csv");
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+
+        // --- NASA-style Export Functions ---
+        const exportToCSV = () => {
+            try {
+                const patients = lastReportData;
+                if (!patients || patients.length === 0) {
+                    showNotification("Please generate a report before exporting.", "info");
+                    return;
+                }
+                
+                const headers = ["Name", "Age", "Status", "Study", "Site", "Appointment", "Survey Outcome"];
+                const csvRows = [headers.join(',')];
+                
+                for (const p of patients) {
+                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                    const lastSurvey = p.surveyResults && p.surveyResults.length > 0 ? p.surveyResults[p.surveyResults.length - 1] : null;
+                    const outcome = lastSurvey ? lastSurvey.outcome : 'N/A';
+                    
+                    const row = [
+                        `"${p.firstName} ${p.lastName}"`,
+                        `"${p.age || 'N/A'}"`,
+                        `"${p.status || 'N/A'}"`,
+                        `"${currentEnrollment ? allStudies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A'}"`,
+                        `"${currentEnrollment ? allSites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A'}"`,
+                        `"${p.appointment ? new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : 'Not Scheduled'}"`,
+                        `"${outcome}"`
+                    ];
+                    csvRows.push(row.join(','));
+                }
+                
+                const csvString = csvRows.join('\n');
+                const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement("a");
+                const url = URL.createObjectURL(blob);
+                link.setAttribute("href", url);
+                const date = new Date().toISOString().split('T')[0];
+                link.setAttribute("download", `report_${date}.csv`);
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+                
+                showNotification("Report exported successfully!", "success");
+            } catch (error) {
+                console.error("Failed to export report CSV:", error);
+                showNotification("Failed to export report. See console for details.", "error");
+            }
+        };
+
+        const exportSurveysToCSV = () => {
+            try {
+                const patients = lastReportData;
+                if (!patients || patients.length === 0) {
+                    showNotification("Please generate a report before exporting survey results.", "info");
+                    return;
+                }
+                
+                const headers = ["PatientID", "PatientName", "SurveyTitle", "CompletionDate", "Outcome", "Question", "Answer"];
+                const csvRows = [headers.join(',')];
+                
+                for (const p of patients) {
+                    if (p.surveyResults && p.surveyResults.length > 0) {
+                        for (const result of p.surveyResults) {
+                            if (result.answers && result.answers.length > 0) {
+                                for (const answer of result.answers) {
+                                    csvRows.push([
+                                        `"${p.id}"`,
+                                        `"${p.firstName} ${p.lastName}"`,
+                                        `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
+                                        `"${new Date(result.completedAt).toISOString()}"`,
+                                        `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
+                                        `"${(answer.question || '').replace(/"/g, '""')}"`,
+                                        `"${(answer.answer || '').replace(/"/g, '""')}"`
+                                    ].join(','));
+                                }
+                            } else {
+                                csvRows.push([
+                                    `"${p.id}"`,
+                                    `"${p.firstName} ${p.lastName}"`,
+                                    `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
+                                    `"${new Date(result.completedAt).toISOString()}"`,
+                                    `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
+                                    `"N/A"`,
+                                    `"N/A"`
+                                ].join(','));
+                            }
+                        }
+                    }
+                }
+                
+                if (csvRows.length <= 1) {
+                    showNotification("No survey results found for the patients in the current report.", "info");
+                    return;
+                }
+                
+                const csvString = csvRows.join('\n');
+                const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.setAttribute("href", url);
+                const date = new Date().toISOString().split('T')[0];
+                const filename = `survey_results_${date}.csv`;
+                link.setAttribute("download", filename);
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                try {
+                    link.click();
+                    showNotification(`CSV generated. Download '${filename}' should begin.`, "success");
+                } catch (clickError) {
+                    console.error("Error triggering download link click:", clickError);
+                    showNotification("Could not trigger download. Please check browser console.", "error");
+                }
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                console.error("Failed to export survey CSV:", error);
+                showNotification("Failed to export surveys. See console for details.", "error");
+            }
+        };
+
+
 
         // --- Modal Functions ---
         const showModal = (content) => {
@@ -1161,6 +1839,13 @@
         const renderSiteAssignmentList = (selectedIndications = [], assignedSiteIds = []) => {
             const siteAssignmentContainer = document.getElementById('site-assignment-container');
             if (!siteAssignmentContainer) return;
+            
+            // Debug logging
+            console.log('Rendering site assignment list with:', {
+                selectedIndications,
+                assignedSiteIds,
+                allSites: allSites.length
+            });
 
             const suggestedSites = [];
             const otherSites = [];
@@ -1180,12 +1865,16 @@
                 });
             }
 
-            const createSiteCheckbox = (site) => `
-                <label class="flex items-center">
-                    <input type="checkbox" name="siteIds" value="${site.id}" class="h-4 w-4 rounded border-gray-300 dark:border-gray-600 text-indigo-600" ${assignedSiteIds.includes(site.id) ? 'checked' : ''}>
-                    <span class="ml-2 text-sm text-gray-600 dark:text-gray-300">${site.name}</span>
-                </label>
-            `;
+            const createSiteCheckbox = (site) => {
+                const isChecked = assignedSiteIds.includes(site.id);
+                console.log(`Site ${site.name} (${site.id}): checked=${isChecked}, assignedSiteIds=`, assignedSiteIds);
+                return `
+                    <label class="flex items-center">
+                        <input type="checkbox" name="siteIds" value="${site.id}" class="site-checkbox h-4 w-4 rounded border-gray-300 dark:border-gray-600 text-indigo-600" ${isChecked ? 'checked' : ''}>
+                        <span class="ml-2 text-sm text-gray-600 dark:text-gray-300">${site.name}</span>
+                    </label>
+                `;
+            };
 
             let html = '';
             if (suggestedSites.length > 0) {
@@ -1203,6 +1892,106 @@
             }
 
             siteAssignmentContainer.innerHTML = html;
+            
+            // Add event listeners for site checkboxes
+            const siteCheckboxes = siteAssignmentContainer.querySelectorAll('.site-checkbox');
+            siteCheckboxes.forEach(checkbox => {
+                checkbox.addEventListener('change', updateSiteEnrollmentGoals);
+            });
+            
+            // Update enrollment goals section
+            updateSiteEnrollmentGoals();
+        };
+
+        const updateSiteEnrollmentGoals = () => {
+            const siteEnrollmentSection = document.getElementById('site-enrollment-goals-section');
+            const siteEnrollmentContainer = document.getElementById('site-enrollment-goals-container');
+            const totalTargetInput = document.getElementById('target');
+            const totalAllocatedSpan = document.getElementById('total-allocated');
+            const totalTargetSpan = document.getElementById('total-target');
+            
+            if (!siteEnrollmentSection || !siteEnrollmentContainer || !totalTargetInput) return;
+            
+            // Get selected sites
+            const selectedSites = Array.from(document.querySelectorAll('.site-checkbox:checked'))
+                .map(checkbox => {
+                    const site = allSites.find(s => s.id === checkbox.value);
+                    return site;
+                })
+                .filter(Boolean);
+            
+            if (selectedSites.length === 0) {
+                siteEnrollmentSection.classList.add('hidden');
+                return;
+            }
+            
+            siteEnrollmentSection.classList.remove('hidden');
+            
+            // Update total target display
+            const totalTarget = parseInt(totalTargetInput.value) || 0;
+            totalTargetSpan.textContent = totalTarget;
+            
+            // Get existing study data if editing
+            const studyForm = document.getElementById('study-form');
+            const studyId = studyForm?.dataset.id;
+            const existingStudy = studyId ? allStudies.find(s => s.id === studyId) : null;
+            const existingSiteGoals = existingStudy?.siteEnrollmentGoals || {};
+            
+            // Create enrollment goal inputs for each selected site
+            const siteGoalsHTML = selectedSites.map(site => {
+                const existingGoal = existingSiteGoals[site.id] || 0;
+                return `
+                    <div class="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded-md">
+                        <div class="flex-1">
+                            <label class="text-sm font-medium text-gray-700 dark:text-gray-300">${site.name}</label>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <input type="number" 
+                                   name="siteEnrollmentGoal_${site.id}" 
+                                   value="${existingGoal}"
+                                   min="0" 
+                                   max="${totalTarget}"
+                                   class="site-goal-input w-20 px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-gray-200"
+                                   data-site-id="${site.id}">
+                            <span class="text-xs text-gray-500 dark:text-gray-400">patients</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            
+            siteEnrollmentContainer.innerHTML = siteGoalsHTML;
+            
+            // Add event listeners for goal inputs
+            const goalInputs = siteEnrollmentContainer.querySelectorAll('.site-goal-input');
+            goalInputs.forEach(input => {
+                input.addEventListener('input', updateTotalAllocated);
+            });
+            
+            // Update total allocated
+            updateTotalAllocated();
+        };
+
+        const updateTotalAllocated = () => {
+            const totalAllocatedSpan = document.getElementById('total-allocated');
+            const totalTargetSpan = document.getElementById('total-target');
+            
+            if (!totalAllocatedSpan || !totalTargetSpan) return;
+            
+            const goalInputs = document.querySelectorAll('.site-goal-input');
+            const totalAllocated = Array.from(goalInputs)
+                .reduce((sum, input) => sum + (parseInt(input.value) || 0), 0);
+            
+            totalAllocatedSpan.textContent = totalAllocated;
+            
+            // Color code the total
+            const totalTarget = parseInt(totalTargetSpan.textContent) || 0;
+            if (totalAllocated > totalTarget) {
+                totalAllocatedSpan.className = 'text-red-600 dark:text-red-400 font-semibold';
+            } else if (totalAllocated === totalTarget) {
+                totalAllocatedSpan.className = 'text-green-600 dark:text-green-400 font-semibold';
+            } else {
+                totalAllocatedSpan.className = 'text-yellow-600 dark:text-yellow-400 font-semibold';
+            }
         };
 
         const createStudyModal = (study = null) => {
@@ -1211,7 +2000,20 @@
             const buttonText = isEdit ? 'Save Changes' : 'Create Study';
             const statusOptions = ['Recruiting', 'Enrolling', 'Active', 'Closed'];
             const studyIndications = ensureArray(study?.indication);
-            const assignedSiteIds = study?.siteIds || [];
+            let assignedSiteIds = ensureArray(study?.siteIds);
+            
+            // If siteIds is empty but we have siteEnrollmentGoals, derive siteIds from that
+            if (assignedSiteIds.length === 0 && study?.siteEnrollmentGoals) {
+                assignedSiteIds = Object.keys(study.siteEnrollmentGoals);
+                console.log('Derived site IDs from enrollment goals:', assignedSiteIds);
+            }
+            
+            // Debug logging
+            if (isEdit) {
+                console.log('Editing study:', study);
+                console.log('Assigned site IDs:', assignedSiteIds);
+                console.log('Site enrollment goals:', study?.siteEnrollmentGoals);
+            }
 
             const modalHTML = `
                 <div class="modal-backdrop">
@@ -1246,9 +2048,14 @@
                                             </select>
                                         </div>
                                         <div>
-                                            <label for="target" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Enrollment Target</label>
+                                            <label for="target" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Total Enrollment Target</label>
                                             <input type="number" name="target" id="target" value="${study?.target || 0}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm bg-white dark:bg-gray-700 dark:text-gray-200" required />
                                         </div>
+                                    </div>
+                                    <div>
+                                        <label for="washoutDays" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Washout Period (Days)</label>
+                                        <input type="number" name="washoutDays" id="washoutDays" value="${study?.washoutDays || 30}" min="0" max="365" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
+                                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Number of days patients must wait before enrolling in another study (default: 30 days)</p>
                                     </div>
                                     <div>
                                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Indication</label>
@@ -1266,6 +2073,19 @@
                                         <div id="site-assignment-container" class="mt-2 max-h-40 overflow-y-auto border dark:border-gray-600 rounded-md p-2 space-y-2">
                                             </div>
                                     </div>
+                                    <div id="site-enrollment-goals-section" class="hidden">
+                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Per-Site Enrollment Goals</label>
+                                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Distribute the total enrollment target across selected sites</p>
+                                        <div id="site-enrollment-goals-container" class="mt-2 space-y-3">
+                                            <!-- Site enrollment goals will be populated here -->
+                                        </div>
+                                        <div class="mt-2 text-sm text-gray-600 dark:text-gray-400">
+                                            <span>Total allocated: </span>
+                                            <span id="total-allocated">0</span>
+                                            <span> / </span>
+                                            <span id="total-target">0</span>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                             <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
@@ -1279,6 +2099,12 @@
             showModal(modalHTML);
             // Initial render of the site assignment list
             renderSiteAssignmentList(studyIndications, assignedSiteIds);
+            
+            // Add event listener for total target changes
+            const totalTargetInput = document.getElementById('target');
+            if (totalTargetInput) {
+                totalTargetInput.addEventListener('input', updateSiteEnrollmentGoals);
+            }
         };
 
 
@@ -1461,6 +2287,15 @@
             const selectedSiteIds = Array.from(form.querySelectorAll('input[name="siteIds"]:checked')).map(cb => cb.value);
             const selectedIndications = Array.from(form.querySelectorAll('input[name="indication"]:checked')).map(cb => cb.value);
 
+            // Collect per-site enrollment goals
+            const siteEnrollmentGoals = {};
+            selectedSiteIds.forEach(siteId => {
+                const goalInput = form.querySelector(`input[name="siteEnrollmentGoal_${siteId}"]`);
+                if (goalInput) {
+                    siteEnrollmentGoals[siteId] = parseInt(goalInput.value, 10) || 0;
+                }
+            });
+
             const studyData = {
                 title: form.title.value,
                 protocolNumber: form.protocolNumber.value,
@@ -1469,7 +2304,9 @@
                 startDate: form.startDate.value,
                 endDate: form.endDate.value,
                 siteIds: selectedSiteIds,
-                indication: selectedIndications
+                indication: selectedIndications,
+                washoutDays: parseInt(form.washoutDays.value, 10) || 30,
+                siteEnrollmentGoals: siteEnrollmentGoals
             };
             
             try {
@@ -1848,6 +2685,16 @@
             }
         });
 
+        // Add NASA-style report form handler to main content area
+        mainContentArea.addEventListener('submit', (e) => {
+            if (e.target.id === 'report-filter-form') {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                const data = Object.fromEntries(formData.entries());
+                handleNasaStyleReportFilter(data);
+            }
+        });
+
         mainContentArea.addEventListener('click', (e) => {
             const card = e.target.closest('.study-card');
             if (card) {
@@ -1888,8 +2735,21 @@
              if (e.target.id === 'export-study-stats-btn') {
                 exportReportToCSV();
             }
+            if (e.target.id === 'export-washout-btn') {
+                exportWashoutToCSV();
+            }
+            if (e.target.id === 'export-participants-btn') {
+                exportParticipantsToCSV();
+            }
             if (e.target.id === 'generate-report-btn') {
                 renderReportTables();
+            }
+            // NASA-style export buttons
+            if (e.target.id === 'export-csv-btn') {
+                exportToCSV();
+            }
+            if (e.target.id === 'export-surveys-btn') {
+                exportSurveysToCSV();
             }
             if (e.target.id === 'generate-dashboard-btn') {
                 renderDashboardCharts();
