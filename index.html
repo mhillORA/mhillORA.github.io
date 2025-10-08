@@ -394,36 +394,44 @@ const setupScheduleFormDependencies = () => {
  * @returns {Object|null} - Washout status object or null
  */
 const getWashoutStatus = (patient) => {
-    if (!patient.appointment || !patient.appointment.time) {
-        return null;
-    }
+    if (!patient.enrollments || patient.enrollments.length === 0) return false;
     
-    const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
-    if (!currentEnrollment) {
-        return null;
-    }
+    // Find the most recent past enrollment
+    const pastEnrollments = patient.enrollments.filter(e => e.status === 'past');
+    if (pastEnrollments.length === 0) return null;
     
-    const study = state.studies.find(s => s.id === currentEnrollment.studyId);
-    const washoutDays = Number.isFinite(study?.washoutDays) ? Number(study.washoutDays) : 30;
+    const mostRecentPastEnrollment = pastEnrollments.reduce((latest, current) => {
+        if (!latest.exitedDate || !current.exitedDate) return latest;
+        return new Date(current.exitedDate) > new Date(latest.exitedDate) ? current : latest;
+    });
     
-    const appointmentDate = new Date(patient.appointment.time);
-    const washoutCompleteDate = new Date(appointmentDate);
-    washoutCompleteDate.setDate(washoutCompleteDate.getDate() + washoutDays);
+    if (!mostRecentPastEnrollment.exitedDate) return null;
+    
+    // Get the study to find washout days
+    const study = state.studies.find(s => s.id === mostRecentPastEnrollment.studyId);
+    const washoutDays = study?.washoutDays || 30; // Default to 30 days
+    const studyTitle = study?.title || 'Unknown Study';
+    
+    const exitedDate = new Date(mostRecentPastEnrollment.exitedDate);
+    const washoutEndDate = new Date(exitedDate);
+    washoutEndDate.setDate(exitedDate.getDate() + washoutDays);
     
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    washoutCompleteDate.setHours(0, 0, 0, 0);
+    washoutEndDate.setHours(0, 0, 0, 0);
     
-    const diffMs = washoutCompleteDate.getTime() - today.getTime();
+    const diffMs = washoutEndDate.getTime() - today.getTime();
     const remainingDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
     
     // Only return washout status if still in washout period
-    if (remainingDays > 0) {
+    if (today < washoutEndDate && remainingDays > 0) {
         return {
             washoutDays,
-            appointmentDate,
-            washoutCompleteDate,
-            remainingDays
+            exitedDate,
+            washoutEndDate,
+            remainingDays,
+            studyTitle,
+            studyId: mostRecentPastEnrollment.studyId
         };
     }
     
@@ -991,6 +999,9 @@ const getStudiesHTML = () => {
                     <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Study Participants</h3>
                     <div class="flex gap-2">
                         <input type="text" id="participant-search" placeholder="Search by name, phone, email, or global ID..." class="p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" autocomplete="off" spellcheck="false" oninput="handleParticipantSearchDirect(event)" onclick="console.log('Participant search input clicked')">
+                        <button data-action="add-patient-to-study" data-study-id="${study.id}" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 flex items-center">
+                            <i data-lucide="user-plus" class="w-4 h-4 mr-2"></i> Add Patient
+                        </button>
                         <button data-action="export-participants" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 flex items-center">
                             <i data-lucide="download" class="w-4 h-4 mr-2"></i> Export
                         </button>
@@ -2678,14 +2689,117 @@ const renderModalPatientList = (patients, type) => {
 const getImportPatientsModalHTML = () => {
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-4">Import Patients from CSV</h2>
-        <div class="text-sm text-gray-600 dark:text-gray-400 space-y-2">
-            <p>Upload a CSV file with the following headers (case-sensitive):</p>
-            <code class="text-xs bg-gray-100 dark:bg-gray-700 p-2 rounded-md block whitespace-pre-wrap">${Object.keys(patientTemplate()).filter(k => !['enrollments'].includes(k)).join(', ')},studyId,siteId</code>
-            <p><strong>Note:</strong> The import will only add <strong>new</strong> patients (based on First Name, Last Name, and DOB) and will auto-generate a Global ID.</p>
+        
+        <div class="bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-500 p-4 mb-4">
+            <h3 class="font-bold text-blue-800 dark:text-blue-300 mb-2">📋 CSV Format Requirements</h3>
+            <p class="text-sm text-blue-700 dark:text-blue-200">Upload a CSV file with comma-separated values. Headers are <strong>case-sensitive</strong>.</p>
         </div>
+
+        <div class="max-h-96 overflow-y-auto border dark:border-gray-700 rounded-lg p-4 mb-4 bg-gray-50 dark:bg-gray-800">
+            <h3 class="font-bold text-gray-800 dark:text-gray-200 mb-3">Required Fields <span class="text-red-500">*</span></h3>
+            <div class="space-y-3 text-sm">
+                <div class="bg-white dark:bg-gray-700 p-3 rounded border-l-4 border-red-500">
+                    <p class="font-semibold dark:text-white">firstName <span class="text-red-500">*</span></p>
+                    <p class="text-gray-600 dark:text-gray-400">Format: Text</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: John</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-3 rounded border-l-4 border-red-500">
+                    <p class="font-semibold dark:text-white">lastName <span class="text-red-500">*</span></p>
+                    <p class="text-gray-600 dark:text-gray-400">Format: Text</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: Doe</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-3 rounded border-l-4 border-red-500">
+                    <p class="font-semibold dark:text-white">dob <span class="text-red-500">*</span></p>
+                    <p class="text-gray-600 dark:text-gray-400">Format: YYYY-MM-DD</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: 1985-03-15</p>
+                </div>
+            </div>
+
+            <h3 class="font-bold text-gray-800 dark:text-gray-200 mb-3 mt-6">Optional Fields</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">initials</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: JD</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">phoneNumber</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: (555) 123-4567</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">email</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: john@email.com</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">address</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: 123 Main St</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">city</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: Boston</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">state</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: MA</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">zipCode</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: 02101</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">age</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Example: 38 (auto-calculated from DOB)</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">status</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Candidate, Enrolled, Pre-Screening, Screen Fail</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">registryStatus</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Active, Inactive, Archived</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">source</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Referral, Walk-in, Website, etc.</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">therapeuticArea</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Oncology, Cardiology, etc.</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">studyId</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Study ID (auto-enrolls patient)</p>
+                </div>
+                <div class="bg-white dark:bg-gray-700 p-2 rounded">
+                    <p class="font-semibold dark:text-white">siteId</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-500">Site ID (required if studyId provided)</p>
+                </div>
+            </div>
+
+            <div class="mt-6 bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-500 p-3">
+                <h4 class="font-bold text-yellow-800 dark:text-yellow-300 mb-2">📝 Example CSV Format:</h4>
+                <code class="text-xs bg-white dark:bg-gray-800 p-2 rounded block overflow-x-auto whitespace-pre">firstName,lastName,dob,email,phoneNumber,status,studyId,siteId
+John,Doe,1985-03-15,john@email.com,(555) 123-4567,Candidate,study123,site456
+Jane,Smith,1990-07-22,jane@email.com,(555) 987-6543,Pre-Screening,study123,site456</code>
+            </div>
+        </div>
+
+        <div class="bg-green-50 dark:bg-green-900/20 border-l-4 border-green-500 p-4 mb-4">
+            <h3 class="font-bold text-green-800 dark:text-green-300 mb-2">✅ Important Notes</h3>
+            <ul class="text-sm text-green-700 dark:text-green-200 space-y-1 list-disc list-inside">
+                <li>Only <strong>new</strong> patients will be imported (duplicates are skipped based on firstName, lastName, and DOB)</li>
+                <li><strong>Global ID</strong> is auto-generated for each patient</li>
+                <li><strong>Age</strong> is auto-calculated from DOB if not provided</li>
+                <li>If <strong>studyId</strong> is provided, <strong>siteId</strong> must also be provided</li>
+                <li>Empty optional fields will be left blank</li>
+            </ul>
+        </div>
+
         <form id="import-patients-form" class="mt-6">
             <input type="file" id="csv-file-input" accept=".csv" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" required>
-            <button type="submit" class="mt-4 w-full bg-indigo-600 text-white py-2 rounded-md hover:bg-indigo-700">Import Patients</button>
+            <button type="submit" class="mt-4 w-full bg-indigo-600 text-white py-2 rounded-md hover:bg-indigo-700 flex items-center justify-center">
+                <i data-lucide="upload" class="w-4 h-4 mr-2"></i>
+                Import Patients
+            </button>
         </form>
         <div id="import-status" class="mt-4 text-sm"></div>
     `;
@@ -2703,6 +2817,117 @@ const getAddContactLogModalHTML = (patientId) => {
                 <textarea name="notes" rows="4" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></textarea>
             </div>
             <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700">Save Log</button>
+        </form>
+    `;
+};
+
+const getAddPatientToStudyModalHTML = (studyId) => {
+    const study = state.studies.find(s => s.id === studyId);
+    if (!study) return `<h2>Study not found</h2>`;
+    
+    // Get patients that are NOT currently enrolled in this study
+    const availablePatients = state.patients.filter(p => {
+        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+        // Include patients with no current enrollment OR enrolled in a different study
+        return !currentEnrollment || currentEnrollment.studyId !== studyId;
+    });
+    
+    // Get sites available for this study
+    const studySiteIds = study.siteIds || [];
+    const availableSites = state.sites.filter(site => 
+        studySiteIds.includes(site.id) && site.status === 'Active'
+    );
+    
+    return `
+        <h2 class="text-2xl font-bold dark:text-white mb-4">Add Patient to ${study.title}</h2>
+        <div class="mb-4">
+            <input type="text" id="add-patient-search" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Search patients by name, email, phone, or Global ID..." autocomplete="off">
+        </div>
+        <div class="mb-4 max-h-96 overflow-y-auto border dark:border-gray-700 rounded-lg">
+            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                <thead class="bg-gray-50 dark:bg-gray-700 sticky top-0">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Name</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Global ID</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Current Study</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="add-patient-search-results" class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                    ${availablePatients.length === 0 ? `
+                        <tr><td colspan="5" class="px-6 py-4 text-center text-gray-500 dark:text-gray-400">All patients are already enrolled in this study.</td></tr>
+                    ` : availablePatients.map(p => {
+                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                        const currentStudy = currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId) : null;
+                        const washoutStatus = getWashoutStatus(p);
+                        const canEnroll = !currentEnrollment && !washoutStatus;
+                        
+                        return `
+                            <tr class="dark:text-gray-300 patient-row" data-patient-name="${p.firstName} ${p.lastName}" data-patient-email="${p.email || ''}" data-patient-phone="${p.phoneNumber || ''}" data-patient-id="${p.globalId || ''}">
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    ${p.firstName} ${p.lastName}
+                                    ${washoutStatus ? `<div class="mt-1"><span class="inline-block px-2 py-1 text-xs bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300 rounded-full">Washout: ${washoutStatus.remainingDays}d</span></div>` : ''}
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">${p.globalId || 'N/A'}</td>
+                                <td class="px-6 py-4 whitespace-nowrap">${p.status || 'N/A'}</td>
+                                <td class="px-6 py-4 whitespace-nowrap">${currentStudy ? currentStudy.title : 'None'}</td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    ${canEnroll ? `
+                                        <button data-action="select-patient-for-enrollment" data-patient-id="${p.id}" data-study-id="${studyId}" class="bg-blue-600 text-white px-3 py-1 rounded-md hover:bg-blue-700 text-sm">Select</button>
+                                    ` : currentEnrollment ? `
+                                        <button data-action="transfer-patient-to-study" data-patient-id="${p.id}" data-study-id="${studyId}" class="bg-yellow-600 text-white px-3 py-1 rounded-md hover:bg-yellow-700 text-sm">Transfer</button>
+                                    ` : `
+                                        <span class="text-xs text-gray-500 dark:text-gray-400">In washout</span>
+                                    `}
+                                </td>
+                            </tr>
+                        `;
+                    }).join('')}
+                </tbody>
+            </table>
+        </div>
+        <div class="flex justify-end gap-4 mt-4">
+            <button data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+        </div>
+    `;
+};
+
+const getEnrollPatientFormModalHTML = (patientId, studyId) => {
+    const patient = state.patients.find(p => p.id === patientId);
+    const study = state.studies.find(s => s.id === studyId);
+    if (!patient || !study) return `<h2>Patient or Study not found</h2>`;
+    
+    // Get sites available for this study
+    const studySiteIds = study.siteIds || [];
+    const availableSites = state.sites.filter(site => 
+        studySiteIds.includes(site.id) && site.status === 'Active'
+    );
+    
+    if (availableSites.length === 0) {
+        return `
+            <h2 class="text-2xl font-bold dark:text-white mb-4">No Sites Available</h2>
+            <p class="dark:text-gray-300">This study has no active sites assigned. Please configure sites in ARTEMIS first.</p>
+            <div class="flex justify-end gap-4 mt-4">
+                <button data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
+            </div>
+        `;
+    }
+    
+    return `
+        <h2 class="text-2xl font-bold dark:text-white mb-4">Enroll ${patient.firstName} ${patient.lastName} in ${study.title}</h2>
+        <form id="enroll-patient-form" data-patient-id="${patientId}" data-study-id="${studyId}" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium dark:text-gray-300">Select Site</label>
+                <select name="siteId" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    <option value="">Select a Site</option>
+                    ${availableSites.map(site => `<option value="${site.id}">${site.name}</option>`).join('')}
+                </select>
+            </div>
+            <div class="flex justify-end gap-4">
+                <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                <button type="submit" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">Enroll Patient</button>
+            </div>
         </form>
     `;
 };
@@ -3184,6 +3409,63 @@ document.addEventListener('click', async (e) => {
             case 'import-patients-modal': openModal(getImportPatientsModalHTML()); break;
             case 'add-contact-log': openModal(getAddContactLogModalHTML(patientId)); break;
             case 'add-visit-log': openModal(getAddVisitLogModalHTML(patientId)); break;
+            case 'add-patient-to-study': {
+                const studyId = actionButton.dataset.studyId;
+                openModal(getAddPatientToStudyModalHTML(studyId), true);
+                // Setup search for the modal
+                setTimeout(() => {
+                    const searchInput = document.getElementById('add-patient-search');
+                    if (searchInput) {
+                        searchInput.addEventListener('input', (e) => {
+                            const searchTerm = e.target.value.toLowerCase();
+                            const rows = document.querySelectorAll('.patient-row');
+                            rows.forEach(row => {
+                                const name = row.dataset.patientName?.toLowerCase() || '';
+                                const email = row.dataset.patientEmail?.toLowerCase() || '';
+                                const phone = row.dataset.patientPhone?.toLowerCase() || '';
+                                const globalId = row.dataset.patientId?.toLowerCase() || '';
+                                const matches = name.includes(searchTerm) || email.includes(searchTerm) || phone.includes(searchTerm) || globalId.includes(searchTerm);
+                                row.style.display = matches ? '' : 'none';
+                            });
+                        });
+                    }
+                }, 100);
+                break;
+            }
+            case 'select-patient-for-enrollment': {
+                const patientId = actionButton.dataset.patientId;
+                const studyId = actionButton.dataset.studyId;
+                openModal(getEnrollPatientFormModalHTML(patientId, studyId));
+                break;
+            }
+            case 'transfer-patient-to-study': {
+                const patientId = actionButton.dataset.patientId;
+                const studyId = actionButton.dataset.studyId;
+                const patient = state.patients.find(p => p.id === patientId);
+                const study = state.studies.find(s => s.id === studyId);
+                
+                if (patient.appointment) {
+                    showNotification("Cannot transfer patient with scheduled appointment. Cancel appointment first.", "error");
+                    return;
+                }
+                
+                openModal(`
+                    <h2 class="text-2xl font-bold text-yellow-600 dark:text-yellow-400 mb-4">Confirm Transfer</h2>
+                    <p class="dark:text-gray-300">Are you sure you want to transfer <strong>${patient.firstName} ${patient.lastName}</strong> to <strong>${study.title}</strong>?</p>
+                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">This will mark their current enrollment as past and create a new enrollment.</p>
+                    <div class="flex justify-end gap-4 mt-8">
+                        <button data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                        <button data-action="confirm-transfer-patient" data-patient-id="${patientId}" data-study-id="${studyId}" class="px-4 py-2 rounded-md bg-yellow-600 text-white hover:bg-yellow-700">Confirm Transfer</button>
+                    </div>
+                `);
+                break;
+            }
+            case 'confirm-transfer-patient': {
+                const patientId = actionButton.dataset.patientId;
+                const studyId = actionButton.dataset.studyId;
+                openModal(getEnrollPatientFormModalHTML(patientId, studyId));
+                break;
+            }
             case 'cancel-appointment': 
                 await cancelAppointment(patientId);
                 closeModal();
@@ -3635,6 +3917,133 @@ document.addEventListener('submit', async (e) => {
             openModal(getPatientProfileHTML(state.patients.find(p => p.id === patientId)), true);
             break;
         }
+        case 'enroll-patient-form': {
+            try {
+                const patientId = form.dataset.patientId;
+                const studyId = form.dataset.studyId;
+                const siteId = data.siteId;
+                
+                if (!siteId) {
+                    showNotification("Please select a site.", "error");
+                    return;
+                }
+                
+                const patient = state.patients.find(p => p.id === patientId);
+                if (!patient) {
+                    showNotification("Patient not found.", "error");
+                    return;
+                }
+                
+                // Check if patient is in washout period
+                if (isWashoutPeriodActive(patient) && !data.overrideWashout) {
+                    const washoutStatus = getWashoutStatus(patient);
+                    const targetStudy = state.studies.find(s => s.id === studyId);
+                    closeModal();
+                    openModal(`
+                        <h2 class="text-2xl font-bold text-orange-600 dark:text-orange-400 mb-4">⚠️ Washout Period Warning</h2>
+                        <div class="space-y-4 dark:text-gray-300">
+                            <p><strong>${patient.firstName} ${patient.lastName}</strong> is currently in a washout period.</p>
+                            <div class="bg-orange-50 dark:bg-orange-900/20 border-l-4 border-orange-500 p-4">
+                                <p><strong>Previous Study:</strong> ${washoutStatus.studyTitle}</p>
+                                <p><strong>Exited:</strong> ${new Date(washoutStatus.exitedDate).toLocaleDateString()}</p>
+                                <p><strong>Washout Period:</strong> ${washoutStatus.washoutDays} days</p>
+                                <p><strong>Remaining:</strong> ${washoutStatus.remainingDays} days</p>
+                                <p><strong>Can Re-enroll After:</strong> ${new Date(washoutStatus.washoutEndDate).toLocaleDateString()}</p>
+                            </div>
+                            <p class="text-sm text-gray-600 dark:text-gray-400">You are attempting to enroll this patient in <strong>${targetStudy?.title || 'a new study'}</strong> before the washout period has completed.</p>
+                            <p class="text-sm font-semibold text-red-600 dark:text-red-400">⚠️ This may violate protocol requirements. Ensure you have proper authorization before proceeding.</p>
+                        </div>
+                        <form id="override-enroll-washout-form" data-patient-id="${patientId}" data-study-id="${studyId}" data-site-id="${siteId}" class="mt-6">
+                            <div class="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-500 rounded p-4 mb-4">
+                                <label class="flex items-start">
+                                    <input type="checkbox" name="confirmOverride" required class="mt-1 h-4 w-4 rounded border-gray-300 text-orange-600 focus:ring-orange-500">
+                                    <span class="ml-2 text-sm text-gray-700 dark:text-gray-300">I confirm that I have the authority to override the washout period and understand the protocol implications.</span>
+                                </label>
+                            </div>
+                            <div class="flex justify-end gap-4">
+                                <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                <button type="submit" class="px-4 py-2 rounded-md bg-orange-600 text-white hover:bg-orange-700">Override & Enroll</button>
+                            </div>
+                        </form>
+                    `);
+                    return;
+                }
+                
+                // Prepare the enrollment data
+                const newEnrollments = patient.enrollments ? [...patient.enrollments] : [];
+                const oldEnrollmentIndex = newEnrollments.findIndex(e => e.status === 'current');
+                
+                // Mark old enrollment as past if it exists
+                if (oldEnrollmentIndex > -1) {
+                    newEnrollments[oldEnrollmentIndex].status = 'past';
+                    newEnrollments[oldEnrollmentIndex].exitedDate = new Date().toISOString();
+                }
+                
+                // Add new enrollment
+                newEnrollments.push({
+                    studyId: studyId,
+                    siteId: siteId,
+                    status: 'current',
+                    enrolledDate: new Date().toISOString(),
+                    exitedDate: null
+                });
+                
+                // Update the patient
+                const patientRef = doc(db, "patients", patientId);
+                await updateDoc(patientRef, { enrollments: newEnrollments });
+                
+                closeModal();
+                const overrideMsg = data.overrideWashout ? " (washout override applied)" : "";
+                showNotification(`Patient successfully enrolled!${overrideMsg}`, "success");
+            } catch (error) {
+                console.error("Error enrolling patient:", error);
+                showNotification(`Failed to enroll patient: ${error.message}`, "error");
+            }
+            break;
+        }
+        case 'override-enroll-washout-form': {
+            try {
+                const patientId = form.dataset.patientId;
+                const studyId = form.dataset.studyId;
+                const siteId = form.dataset.siteId;
+                
+                const patient = state.patients.find(p => p.id === patientId);
+                if (!patient) {
+                    showNotification("Patient not found.", "error");
+                    return;
+                }
+                
+                // Prepare the enrollment data
+                const newEnrollments = patient.enrollments ? [...patient.enrollments] : [];
+                const oldEnrollmentIndex = newEnrollments.findIndex(e => e.status === 'current');
+                
+                // Mark old enrollment as past if it exists
+                if (oldEnrollmentIndex > -1) {
+                    newEnrollments[oldEnrollmentIndex].status = 'past';
+                    newEnrollments[oldEnrollmentIndex].exitedDate = new Date().toISOString();
+                }
+                
+                // Add new enrollment
+                newEnrollments.push({
+                    studyId: studyId,
+                    siteId: siteId,
+                    status: 'current',
+                    enrolledDate: new Date().toISOString(),
+                    exitedDate: null
+                });
+                
+                // Update the patient
+                const patientRef = doc(db, "patients", patientId);
+                await updateDoc(patientRef, { enrollments: newEnrollments });
+                
+                closeModal();
+                showNotification("Patient successfully enrolled (washout override applied).", "success");
+            } catch (error) {
+                console.error("Error enrolling patient with override:", error);
+                showNotification(`Failed to enroll patient: ${error.message}`, "error");
+            }
+            break;
+        }
         case 'import-patients-form': {
             const fileInput = document.getElementById('csv-file-input');
             const statusEl = document.getElementById('import-status');
@@ -3771,64 +4180,174 @@ document.addEventListener('submit', async (e) => {
             break;
         }
         case 'edit-patient-form': {
-            const patientId = form.dataset.id;
-            const patient = state.patients.find(p => p.id === patientId);
-            
-            // Check if patient has a scheduled appointment
-            const hasAppointment = patient.appointment && patient.appointment.time;
-            
-            const updatedPatient = { ...patient }; // Start with existing data
-            Object.keys(patientTemplate()).forEach(key => {
-                if (data[key] !== undefined && key !== 'enrollments') {
-                    updatedPatient[key] = data[key] || null;
-                }
-            });
-            updatedPatient.age = data.age ? parseInt(data.age) : null;
-            
-            // Check if trying to set status to Pre-Screening while in washout
-            if (data.status === 'Pre-Screening' && isWashoutPeriodActive(patient)) {
-                const washoutStatus = getWashoutStatus(patient);
-                showNotification(`Cannot set status to Pre-Screening while patient is in washout period from ${washoutStatus.studyTitle}. ${washoutStatus.remainingDays} days remaining.`, "error");
-                return;
-            }
-            
-            const currentEnrollment = updatedPatient.enrollments?.find(e => e.status === 'current');
-            
-            // If study or site has changed, check for appointment and washout
-            if (data.studyId && (currentEnrollment?.studyId !== data.studyId || currentEnrollment?.siteId !== data.siteId)) {
-                if (hasAppointment) {
-                    showNotification("Cannot change study assignment while patient has a scheduled appointment. Please cancel the appointment first.", "error");
-                    return;
+            try {
+                const submitBtn = form.querySelector('button[type="submit"]');
+                const originalBtnText = submitBtn.innerHTML;
+                submitBtn.disabled = true;
+                submitBtn.innerHTML = '<span class="flex items-center justify-center"><svg class="animate-spin h-5 w-5 mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Saving...</span>';
+                
+                const patientId = form.dataset.id;
+                const patient = state.patients.find(p => p.id === patientId);
+                
+                if (!patient) {
+                    throw new Error("Patient not found");
                 }
                 
-                // Check if patient is in washout period
-                if (isWashoutPeriodActive(patient)) {
+                // Check if patient has a scheduled appointment
+                const hasAppointment = patient.appointment && patient.appointment.time;
+                
+                const updatedPatient = { ...patient }; // Start with existing data
+                Object.keys(patientTemplate()).forEach(key => {
+                    if (data[key] !== undefined && key !== 'enrollments') {
+                        updatedPatient[key] = data[key] || null;
+                    }
+                });
+                updatedPatient.age = data.age ? parseInt(data.age) : null;
+                
+                // Check if trying to set status to Pre-Screening while in washout
+                if (data.status === 'Pre-Screening' && isWashoutPeriodActive(patient)) {
                     const washoutStatus = getWashoutStatus(patient);
-                    showNotification(`Patient is in washout period from ${washoutStatus.studyTitle}. Cannot be enrolled in a new study until ${washoutStatus.remainingDays} days remaining.`, "error");
+                    showNotification(`Cannot set status to Pre-Screening while patient is in washout period from ${washoutStatus.studyTitle}. ${washoutStatus.remainingDays} days remaining.`, "error");
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = originalBtnText;
                     return;
                 }
                 
+                const currentEnrollment = updatedPatient.enrollments?.find(e => e.status === 'current');
+                
+                // If study or site has changed, check for appointment and washout
+                if (data.studyId && (currentEnrollment?.studyId !== data.studyId || currentEnrollment?.siteId !== data.siteId)) {
+                    if (hasAppointment) {
+                        showNotification("Cannot change study assignment while patient has a scheduled appointment. Please cancel the appointment first.", "error");
+                        submitBtn.disabled = false;
+                        submitBtn.innerHTML = originalBtnText;
+                        return;
+                    }
+                    
+                    // Check if patient is in washout period
+                    if (isWashoutPeriodActive(patient) && !data.overrideWashout) {
+                        const washoutStatus = getWashoutStatus(patient);
+                        const targetStudy = state.studies.find(s => s.id === data.studyId);
+                        closeModal();
+                        openModal(`
+                            <h2 class="text-2xl font-bold text-orange-600 dark:text-orange-400 mb-4">⚠️ Washout Period Warning</h2>
+                            <div class="space-y-4 dark:text-gray-300">
+                                <p><strong>${patient.firstName} ${patient.lastName}</strong> is currently in a washout period.</p>
+                                <div class="bg-orange-50 dark:bg-orange-900/20 border-l-4 border-orange-500 p-4">
+                                    <p><strong>Previous Study:</strong> ${washoutStatus.studyTitle}</p>
+                                    <p><strong>Exited:</strong> ${new Date(washoutStatus.exitedDate).toLocaleDateString()}</p>
+                                    <p><strong>Washout Period:</strong> ${washoutStatus.washoutDays} days</p>
+                                    <p><strong>Remaining:</strong> ${washoutStatus.remainingDays} days</p>
+                                    <p><strong>Can Re-enroll After:</strong> ${new Date(washoutStatus.washoutEndDate).toLocaleDateString()}</p>
+                                </div>
+                                <p class="text-sm text-gray-600 dark:text-gray-400">You are attempting to enroll this patient in <strong>${targetStudy?.title || 'a new study'}</strong> before the washout period has completed.</p>
+                                <p class="text-sm font-semibold text-red-600 dark:text-red-400">⚠️ This may violate protocol requirements. Ensure you have proper authorization before proceeding.</p>
+                            </div>
+                            <form id="override-washout-form" data-patient-id="${patientId}" data-study-id="${data.studyId}" data-site-id="${data.siteId}" class="mt-6">
+                                <input type="hidden" name="allFormData" value='${JSON.stringify(data)}' />
+                                <div class="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-500 rounded p-4 mb-4">
+                                    <label class="flex items-start">
+                                        <input type="checkbox" name="confirmOverride" required class="mt-1 h-4 w-4 rounded border-gray-300 text-orange-600 focus:ring-orange-500">
+                                        <span class="ml-2 text-sm text-gray-700 dark:text-gray-300">I confirm that I have the authority to override the washout period and understand the protocol implications.</span>
+                                    </label>
+                                </div>
+                                <div class="flex justify-end gap-4">
+                                    <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                    <button type="submit" class="px-4 py-2 rounded-md bg-orange-600 text-white hover:bg-orange-700">Override & Continue</button>
+                                </div>
+                            </form>
+                        `);
+                        submitBtn.disabled = false;
+                        submitBtn.innerHTML = originalBtnText;
+                        return;
+                    }
+                    
+                    const newEnrollments = updatedPatient.enrollments ? [...updatedPatient.enrollments] : [];
+                    const oldEnrollmentIndex = newEnrollments.findIndex(e => e.status === 'current');
+                    // Mark old one as past
+                    if (oldEnrollmentIndex > -1) {
+                        newEnrollments[oldEnrollmentIndex].status = 'past';
+                        newEnrollments[oldEnrollmentIndex].exitedDate = new Date().toISOString();
+                    }
+                    // Add new one as current
+                    newEnrollments.push({
+                        studyId: data.studyId,
+                        siteId: data.siteId,
+                        status: 'current',
+                        enrolledDate: new Date().toISOString(),
+                        exitedDate: null
+                    });
+                    updatedPatient.enrollments = newEnrollments;
+                }
+                
+                await updateDoc(doc(db, "patients", patientId), updatedPatient);
+                closeModal();
+                showNotification("Patient updated successfully.", "success");
+            } catch (error) {
+                console.error("Error updating patient:", error);
+                showNotification(`Failed to update patient: ${error.message}`, "error");
+                const submitBtn = form.querySelector('button[type="submit"]');
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = 'Save Changes';
+                }
+            }
+            break;
+        }
+        case 'override-washout-form': {
+            try {
+                const patientId = form.dataset.patientId;
+                const studyId = form.dataset.studyId;
+                const siteId = form.dataset.siteId;
+                const allFormDataJson = form.querySelector('input[name="allFormData"]').value;
+                const originalData = JSON.parse(allFormDataJson);
+                
+                // Add override flag
+                originalData.overrideWashout = true;
+                
+                const patient = state.patients.find(p => p.id === patientId);
+                if (!patient) {
+                    showNotification("Patient not found.", "error");
+                    return;
+                }
+                
+                // Prepare the updated patient data
+                const updatedPatient = { ...patient };
+                Object.keys(patientTemplate()).forEach(key => {
+                    if (originalData[key] !== undefined && key !== 'enrollments') {
+                        updatedPatient[key] = originalData[key] || null;
+                    }
+                });
+                updatedPatient.age = originalData.age ? parseInt(originalData.age) : null;
+                
+                // Update enrollments
                 const newEnrollments = updatedPatient.enrollments ? [...updatedPatient.enrollments] : [];
                 const oldEnrollmentIndex = newEnrollments.findIndex(e => e.status === 'current');
-                // Mark old one as past
+                
+                // Mark old enrollment as past
                 if (oldEnrollmentIndex > -1) {
                     newEnrollments[oldEnrollmentIndex].status = 'past';
                     newEnrollments[oldEnrollmentIndex].exitedDate = new Date().toISOString();
                 }
-                // Add new one as current
+                
+                // Add new enrollment
                 newEnrollments.push({
-                    studyId: data.studyId,
-                    siteId: data.siteId,
+                    studyId: studyId,
+                    siteId: siteId,
                     status: 'current',
                     enrolledDate: new Date().toISOString(),
                     exitedDate: null
                 });
                 updatedPatient.enrollments = newEnrollments;
+                
+                // Save to database
+                await updateDoc(doc(db, "patients", patientId), updatedPatient);
+                closeModal();
+                showNotification("Patient updated successfully (washout override applied).", "success");
+            } catch (error) {
+                console.error("Error overriding washout:", error);
+                showNotification(`Failed to update patient: ${error.message}`, "error");
             }
-            
-            await updateDoc(doc(db, "patients", patientId), updatedPatient);
-            closeModal();
-            showNotification("Patient updated successfully.", "success");
             break;
         }
         case 'edit-study-form': {
