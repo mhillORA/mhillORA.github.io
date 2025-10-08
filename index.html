@@ -343,6 +343,94 @@ const toggleTheme = () => {
 };
 
 /**
+ * Setup dependencies for schedule form (study-site filtering)
+ */
+const setupScheduleFormDependencies = () => {
+    const studySelect = document.getElementById('schedule-study-select');
+    const siteSelect = document.getElementById('schedule-site-select');
+    
+    if (!studySelect || !siteSelect) return;
+    
+    studySelect.addEventListener('change', (e) => {
+        const selectedStudyId = e.target.value;
+        
+        if (!selectedStudyId) {
+            siteSelect.innerHTML = '<option value="">Select a Study First</option>';
+            siteSelect.disabled = true;
+            return;
+        }
+        
+        // Find the selected study
+        const selectedStudy = state.studies.find(s => s.id === selectedStudyId);
+        
+        if (!selectedStudy) {
+            siteSelect.innerHTML = '<option value="">No sites available</option>';
+            siteSelect.disabled = true;
+            return;
+        }
+        
+        // Get sites assigned to this study in ARTEMIS
+        const studySiteIds = selectedStudy.siteIds || [];
+        const availableSites = state.sites.filter(site => 
+            studySiteIds.includes(site.id) && site.status === 'Active'
+        );
+        
+        if (availableSites.length === 0) {
+            siteSelect.innerHTML = '<option value="">No sites assigned to this study</option>';
+            siteSelect.disabled = true;
+            return;
+        }
+        
+        // Populate site dropdown with filtered sites
+        siteSelect.innerHTML = '<option value="">Select a Site</option>' + 
+            availableSites.map(site => `<option value="${site.id}">${site.name}</option>`).join('');
+        siteSelect.disabled = false;
+    });
+};
+
+/**
+ * Get washout status for a patient
+ * @param {Object} patient - Patient object
+ * @returns {Object|null} - Washout status object or null
+ */
+const getWashoutStatus = (patient) => {
+    if (!patient.appointment || !patient.appointment.time) {
+        return null;
+    }
+    
+    const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
+    if (!currentEnrollment) {
+        return null;
+    }
+    
+    const study = state.studies.find(s => s.id === currentEnrollment.studyId);
+    const washoutDays = Number.isFinite(study?.washoutDays) ? Number(study.washoutDays) : 30;
+    
+    const appointmentDate = new Date(patient.appointment.time);
+    const washoutCompleteDate = new Date(appointmentDate);
+    washoutCompleteDate.setDate(washoutCompleteDate.getDate() + washoutDays);
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    washoutCompleteDate.setHours(0, 0, 0, 0);
+    
+    const diffMs = washoutCompleteDate.getTime() - today.getTime();
+    const remainingDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+    
+    // Only return washout status if still in washout period
+    if (remainingDays > 0) {
+        return {
+            washoutDays,
+            appointmentDate,
+            washoutCompleteDate,
+            remainingDays
+        };
+    }
+    
+    return null;
+};
+
+/**
  * Update chart colors based on theme
  * @param {string} theme - Current theme
  */
@@ -398,6 +486,7 @@ const render = () => {
         // Ensure search inputs are properly initialized after a short delay
         setTimeout(() => {
             setupSearchInputs();
+            setupScheduleFormDependencies();
         }, 200);
     } catch (error) {
         console.error('Error in render function:', error);
@@ -872,7 +961,7 @@ const getStudiesHTML = () => {
             <!-- Enrollment Numbers Display -->
             <div class="mb-6 bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
                 <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Study Enrollment Summary</h3>
-                <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
                     <div class="text-center">
                         <p class="text-sm text-gray-500 dark:text-gray-400">Total Enrolled</p>
                         <p id="total-enrolled" class="text-2xl font-bold text-blue-600 dark:text-blue-400">0</p>
@@ -884,6 +973,10 @@ const getStudiesHTML = () => {
                     <div class="text-center">
                         <p class="text-sm text-gray-500 dark:text-gray-400">Screen Fails</p>
                         <p id="screen-fails" class="text-2xl font-bold text-red-600 dark:text-red-400">0</p>
+                    </div>
+                    <div class="text-center">
+                        <p class="text-sm text-gray-500 dark:text-gray-400">Open Appointments</p>
+                        <p id="open-appointments" class="text-2xl font-bold text-orange-600 dark:text-orange-400">0</p>
                     </div>
                     <div class="text-center">
                         <p class="text-sm text-gray-500 dark:text-gray-400">Enrollment Progress</p>
@@ -1195,15 +1288,30 @@ const updateEnrollmentNumbers = (studyId) => {
     const targetEnrollment = study.target || 0;
     const enrollmentProgress = targetEnrollment > 0 ? Math.round((enrolledCount / targetEnrollment) * 100) : 0;
     
+    // Calculate open appointment slots for this study
+    const studySchedules = state.schedules.filter(s => s.studyId === studyId);
+    let openAppointments = 0;
+    studySchedules.forEach(schedule => {
+        schedule.slots.forEach(slot => {
+            const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
+            const availableSlots = slot.capacity - bookedCount;
+            if (availableSlots > 0) {
+                openAppointments += availableSlots;
+            }
+        });
+    });
+    
     // Update the display
     const totalEnrolledEl = document.getElementById('total-enrolled');
     const targetEnrollmentEl = document.getElementById('target-enrollment');
     const screenFailsEl = document.getElementById('screen-fails');
+    const openAppointmentsEl = document.getElementById('open-appointments');
     const enrollmentProgressEl = document.getElementById('enrollment-progress');
     
     if (totalEnrolledEl) totalEnrolledEl.textContent = enrolledCount;
     if (targetEnrollmentEl) targetEnrollmentEl.textContent = targetEnrollment;
     if (screenFailsEl) screenFailsEl.textContent = screenFailCount;
+    if (openAppointmentsEl) openAppointmentsEl.textContent = openAppointments;
     if (enrollmentProgressEl) enrollmentProgressEl.textContent = `${enrollmentProgress}%`;
 };
 
@@ -1277,12 +1385,19 @@ const renderStudyParticipants = (studyId) => {
             `${new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })} (${p.appointment.visit || 'General'})` 
             : 'Not Scheduled';
         
+        // Check washout status
+        const washoutStatus = getWashoutStatus(p);
+        const washoutIndicator = washoutStatus ? `<div class="mt-1"><span class="inline-block px-2 py-1 text-xs bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300 rounded-full">Washout: ${washoutStatus.remainingDays}d</span></div>` : '';
+        
         return `
             <tr class="dark:text-gray-300">
                 <td class="px-6 py-4">
-                    <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">
-                        ${p.firstName} ${p.lastName}
-                    </button>
+                    <div>
+                        <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">
+                            ${p.firstName} ${p.lastName}
+                        </button>
+                        ${washoutIndicator}
+                    </div>
                 </td>
                 <td class="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                     ${p.globalId || 'N/A'}
@@ -1423,16 +1538,9 @@ const renderPatientTable = () => {
         const siteName = currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A';
         const studyName = currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A';
         
-        // Check washout status
-        const washoutStatus = getWashoutStatus(p);
-        const washoutIndicator = washoutStatus ? `<span class="inline-block px-2 py-1 text-xs bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300 rounded-full">Washout: ${washoutStatus.remainingDays}d</span>` : '';
-        
         return `<tr class="dark:text-gray-300">
                 <td class="px-6 py-4">
-                    <div class="flex flex-col">
-                        <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium text-left">${p.firstName} ${p.lastName}</button>
-                        ${washoutIndicator}
-                    </div>
+                    <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium text-left">${p.firstName} ${p.lastName}</button>
                 </td>
                 <td class="px-6 py-4">${siteName}</td>
                 <td class="px-6 py-4">${studyName}</td>
@@ -1609,13 +1717,16 @@ const getDuplicatesHTML = () => `
         </div>
         `;
 const getSchedulingHTML = () => {
+    // Filter studies to only show active ones
+    const activeStudies = state.studies.filter(s => ['Recruiting', 'Enrolling', 'Active'].includes(s.status));
+    
     const creatorView = `
         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Create Appointment Schedule</h3>
             <form id="schedule-creator-form" class="space-y-4">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site</label><select name="siteId" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"><option value="">Select a Site</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
-                    <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Study</label><select name="studyId" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"><option value="">Select a Study</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
+                    <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Study</label><select name="studyId" id="schedule-study-select" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"><option value="">Select a Study</option>${activeStudies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
+                    <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site</label><select name="siteId" id="schedule-site-select" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"><option value="">Select a Study First</option></select></div>
                     <div>
                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Visit</label>
                         <select name="visit" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
@@ -1767,61 +1878,6 @@ const getPatientProfileHTML = (patient) => {
     const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
     const study = currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId) : null;
     const site = currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId) : null;
-    // --- Washout Calculation (based on last scheduled appointment) ---
-    let washoutHTML = '';
-    
-    // Debug logging for washout calculation
-    console.log('Washout calculation for patient:', patient.firstName, patient.lastName);
-    console.log('Patient object:', patient);
-    console.log('Patient appointment:', patient.appointment);
-    console.log('Study:', study);
-    console.log('Study washout days:', study?.washoutDays);
-    console.log('Current enrollment:', currentEnrollment);
-    
-    // Get washout days from study config, fallback to 30
-    const washoutDays = Number.isFinite(study?.washoutDays) ? Number(study.washoutDays) : 30;
-    
-    if (patient.appointment && patient.appointment.time) {
-        const appointmentDate = new Date(patient.appointment.time);
-        const washoutCompleteDate = new Date(appointmentDate);
-        washoutCompleteDate.setDate(washoutCompleteDate.getDate() + washoutDays);
-        
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        washoutCompleteDate.setHours(0, 0, 0, 0);
-        
-        const diffMs = washoutCompleteDate.getTime() - today.getTime();
-        const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-        const daysText = diffDays > 0 ? `${diffDays} day${diffDays === 1 ? '' : 's'} remaining` : 'Completed';
-        
-        // Debug logging for calculation
-        console.log('Appointment date:', appointmentDate);
-        console.log('Washout complete date:', washoutCompleteDate);
-        console.log('Today:', today);
-        console.log('Diff days:', diffDays);
-        console.log('Days text:', daysText);
-        
-        washoutHTML = `
-            <div class="mt-4 p-3 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-700/50">
-                <h4 class="font-semibold text-lg dark:text-white">Washout Status</h4>
-                <p><strong>Washout Period:</strong> ${washoutDays} days</p>
-                <p><strong>Last Scheduled Appointment:</strong> ${appointmentDate.toLocaleDateString()}</p>
-                <p><strong>Washout Complete Date:</strong> ${washoutCompleteDate.toLocaleDateString()}</p>
-                <p><strong>Days Until Washout Complete:</strong> ${daysText}</p>
-            </div>
-        `;
-    } else {
-        washoutHTML = `
-            <div class="mt-4 p-3 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-700/50">
-                <h4 class="font-semibold text-lg dark:text-white">Washout Status</h4>
-                <p>No scheduled appointments found. Washout cannot be calculated.</p>
-                <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">Patient appointment: ${patient.appointment ? 'Found but no time' : 'Not found'}</p>
-            </div>
-        `;
-    }
-    
-    // Debug logging
-    console.log('Washout HTML generated:', washoutHTML);
     // --- Survey Results ---
     let surveyResultsHTML = '<p class="text-gray-500 dark:text-gray-400">No survey results found.</p>';
     if (patient.surveyResults && patient.surveyResults.length > 0) {
@@ -1965,7 +2021,6 @@ const getPatientProfileHTML = (patient) => {
                         <p><strong>Current Study:</strong> ${study?.title || 'N/A'}</p>
                         <p><strong>Site:</strong> ${site?.name || 'N/A'}</p>
                         ${appointmentHTML}
-                        ${washoutHTML}
                     </div>
                 </div>
                 <div class="mt-6">
@@ -2601,9 +2656,16 @@ const renderModalPatientList = (patients, type) => {
     } else if (type === 'site') {
         tableRowsHTML = patients.map(p => {
             const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+            const washoutStatus = getWashoutStatus(p);
+            const washoutIndicator = washoutStatus ? `<div class="mt-1"><span class="inline-block px-2 py-1 text-xs bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300 rounded-full">Washout: ${washoutStatus.remainingDays}d</span></div>` : '';
             return `
                 <tr class="dark:text-gray-300">
-                    <td class="px-6 py-4"><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${p.firstName} ${p.lastName}</button></td>
+                    <td class="px-6 py-4">
+                        <div>
+                            <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${p.firstName} ${p.lastName}</button>
+                            ${washoutIndicator}
+                        </div>
+                    </td>
                     <td class="px-6 py-4">${currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A'}</td>
                     <td class="px-6 py-4">${p.status || 'N/A'}</td>
                 </tr>
@@ -2965,32 +3027,7 @@ const isWashoutPeriodActive = (patient) => {
     return washoutEndDate && today < washoutEndDate;
 };
 
-const getWashoutStatus = (patient) => {
-    if (!isWashoutPeriodActive(patient)) return null;
-    
-    const pastEnrollments = patient.enrollments.filter(e => e.status === 'past');
-    const mostRecentPastEnrollment = pastEnrollments.reduce((latest, current) => {
-        if (!latest.exitedDate || !current.exitedDate) return latest;
-        return new Date(current.exitedDate) > new Date(latest.exitedDate) ? current : latest;
-    });
-    
-    const study = state.studies.find(s => s.id === mostRecentPastEnrollment.studyId);
-    const washoutDays = study?.washoutDays || 30;
-    const washoutEndDate = calculateWashoutEndDate(mostRecentPastEnrollment.exitedDate, washoutDays);
-    
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const remainingDays = Math.ceil((washoutEndDate - today) / (1000 * 60 * 60 * 24));
-    
-    return {
-        isActive: true,
-        studyTitle: study?.title || 'Unknown Study',
-        exitedDate: mostRecentPastEnrollment.exitedDate,
-        washoutEndDate: washoutEndDate.toISOString(),
-        remainingDays: Math.max(0, remainingDays),
-        washoutDays: washoutDays
-    };
-};
+// getWashoutStatus function moved to line 350 for better organization
 
 const canBePrescreened = (patient) => {
     // Check if patient is in washout period
