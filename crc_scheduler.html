@@ -5742,6 +5742,19 @@
                 updateCrcDropdownAvailability();
             };
 
+            // Helper function to check if CRC has valid training for a role
+            const hasValidTraining = (crc, roleName) => {
+                if (!crc.trainings || crc.trainings.length === 0) return false;
+                
+                const today = new Date();
+                const matchingTraining = crc.trainings.find(training => training.name === roleName);
+                
+                if (!matchingTraining) return false;
+                
+                const expirationDate = new Date(matchingTraining.expirationDate);
+                return expirationDate > today; // Training must not be expired
+            };
+
             const renderRoleAssignments = (form, event = null) => {
                 const container = form.querySelector('#role-assignment-container');
                 const crcSelect = form.querySelector('select[name="crcId"]');
@@ -5755,7 +5768,7 @@
                 }
                 
                 container.classList.remove('hidden');
-                let html = '<label class="block text-sm font-medium dark:text-gray-300 mb-2">Assign Roles</label>';
+                let html = '<label class="block text-sm font-medium dark:text-gray-300 mb-2">Assign Roles (Only roles with valid training are available)</label>';
                 const allRoles = getAllRoles(state.crc_events, state.roles);
 
                 selectedCrcIds.forEach(crcId => {
@@ -5766,7 +5779,15 @@
                     if (event && event.crcId === crcId) {
                         selectedRoles = new Set(event.roles || []);
                     }
-                    const roleOptions = allRoles.map(r => `<option value="${r}" ${selectedRoles.has(r) ? 'selected' : ''}>${r}</option>`).join('');
+                    
+                    // Filter roles to only show those with valid training
+                    const roleOptions = allRoles.map(r => {
+                        const hasTraining = hasValidTraining(crc, r);
+                        const isSelected = selectedRoles.has(r);
+                        const disabledAttr = !hasTraining && !isSelected ? 'disabled' : '';
+                        const trainingStatus = !hasTraining ? ' (No valid training)' : '';
+                        return `<option value="${r}" ${isSelected ? 'selected' : ''} ${disabledAttr}>${r}${trainingStatus}</option>`;
+                    }).join('');
 
                     html += `
                         <div class="grid grid-cols-3 items-center gap-4 mb-2">
@@ -8679,8 +8700,17 @@
                     const crcOptions = state.crcs.map(crc => {
                         const isSelected = existingAssignments.includes(crc.id);
                         const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                        const unavailableText = isUnavailable ? ' (Unavailable)' : '';
-                        return `<option value="${crc.id}" ${isSelected ? 'selected' : ''}>${crc.name}${unavailableText}</option>`;
+                        const hasTraining = hasValidTraining(crc, role.name);
+                        
+                        let statusText = '';
+                        if (isUnavailable) statusText = ' (Unavailable)';
+                        else if (!hasTraining) statusText = ' (No valid training)';
+                        
+                        // Disable option if they don't have valid training and aren't already selected
+                        const isDisabled = !hasTraining && !isSelected;
+                        const disabledAttr = isDisabled ? 'disabled' : '';
+                        
+                        return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} ${disabledAttr}>${crc.name}${statusText}</option>`;
                     }).join('');
                     
                     console.log(`CRC options for ${role.name}:`, crcOptions);
@@ -8698,8 +8728,18 @@
                                                 <option value="">Select Staff</option>
                                                 ${state.crcs.map(crc => {
                                                     const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                                                    const unavailableText = isUnavailable ? ' (Unavailable)' : '';
-                                                    return `<option value="${crc.id}" ${crc.id === existingCrcId ? 'selected' : ''}>${crc.name}${unavailableText}</option>`;
+                                                    const hasTraining = hasValidTraining(crc, role.name);
+                                                    const isCurrentlySelected = crc.id === existingCrcId;
+                                                    
+                                                    let statusText = '';
+                                                    if (isUnavailable) statusText = ' (Unavailable)';
+                                                    else if (!hasTraining) statusText = ' (No valid training)';
+                                                    
+                                                    // Disable if no training and not currently selected
+                                                    const isDisabled = !hasTraining && !isCurrentlySelected;
+                                                    const disabledAttr = isDisabled ? 'disabled' : '';
+                                                    
+                                                    return `<option value="${crc.id}" ${isCurrentlySelected ? 'selected' : ''} ${disabledAttr}>${crc.name}${statusText}</option>`;
                                                 }).join('')}
                                             </select>
                                         </div>
@@ -8777,6 +8817,61 @@
             };
 
             // --- INITIALIZATION ---
+            // Standard training/role categories (training name = role name)
+            const STANDARD_TRAINING_ROLES = [
+                'ICF', 'MedHx', 'EyeCup', 'CAE', 'Schirmers', 'Doc Tech', 
+                'Dispense', 'Tear Collection', 'Skin Test', 'Allergy Doc Tech', 
+                'CAC (Timed)', 'CAC (Titration) Allergen', 'QC', 'SV'
+            ];
+
+            const initializeStandardRoles = async () => {
+                const rolesRef = collection(db, `artifacts/${appId}/public/data/roles`);
+                const trainingTypesRef = collection(db, `artifacts/${appId}/public/data/training_types`);
+                
+                const [rolesSnapshot, trainingTypesSnapshot] = await Promise.all([
+                    getDocs(rolesRef),
+                    getDocs(trainingTypesRef)
+                ]);
+                
+                const existingRoleNames = rolesSnapshot.docs.map(doc => doc.data().name);
+                const existingTrainingNames = trainingTypesSnapshot.docs.map(doc => doc.data().name);
+                
+                const batch = writeBatch(db);
+                let rolesAddedCount = 0;
+                let trainingsAddedCount = 0;
+                
+                STANDARD_TRAINING_ROLES.forEach(name => {
+                    // Add to roles if not exists
+                    if (!existingRoleNames.includes(name)) {
+                        const newRoleRef = doc(rolesRef);
+                        batch.set(newRoleRef, { name: name });
+                        rolesAddedCount++;
+                    }
+                    
+                    // Add to training_types if not exists
+                    if (!existingTrainingNames.includes(name)) {
+                        const newTrainingRef = doc(trainingTypesRef);
+                        batch.set(newTrainingRef, { 
+                            name: name,
+                            defaultDuration: 1, // 1 year default
+                            description: `${name} Training`,
+                            requiredObservations: 0,
+                            requiredPerformances: 0
+                        });
+                        trainingsAddedCount++;
+                    }
+                });
+                
+                if (rolesAddedCount > 0 || trainingsAddedCount > 0) {
+                    try {
+                        await batch.commit();
+                        console.log(`CHAOS: Added ${rolesAddedCount} standard roles and ${trainingsAddedCount} standard training types`);
+                    } catch (error) {
+                        console.error('Error initializing standard roles/training types:', error);
+                    }
+                }
+            };
+
             const cleanupInvalidRoles = async (events, existingRoles) => {
                 const cleanupFlag = 'roleCleanupCompleted_v2';
                 if (localStorage.getItem(cleanupFlag)) return;
@@ -8861,8 +8956,12 @@
                     console.log('CHAOS: Running cleanup...');
                     await cleanupInvalidRoles(crc_events, roles);
                     
-                    // Refetch data that might have been changed by the cleanup
-                    console.log('CHAOS: Refetching after cleanup...');
+                    // Initialize standard training/role categories
+                    console.log('CHAOS: Initializing standard training/role categories...');
+                    await initializeStandardRoles();
+                    
+                    // Refetch data that might have been changed by the cleanup or initialization
+                    console.log('CHAOS: Refetching after cleanup and initialization...');
 					[eventsSnapshot, rolesSnapshot] = await Promise.all([
 						getDocs(collectionsToFetch.crc_events),
 						getDocs(collectionsToFetch.roles)
