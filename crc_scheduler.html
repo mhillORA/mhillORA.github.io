@@ -14,6 +14,8 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/handsontable@14.3.0/dist/handsontable.full.min.css">
     <script src="https://cdn.jsdelivr.net/npm/handsontable@14.3.0/dist/handsontable.full.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
@@ -591,6 +593,11 @@
                     renderCRCLists();
                     renderUtilization();
                     renderSidebarAvailability();
+                    // Initialize map after a short delay to ensure DOM is ready
+                    setTimeout(() => {
+                        updateCRCMap();
+                        lucide.createIcons();
+                    }, 100);
                 } else if (state.activeTab === 'allSchedule') {
                     mainAppContent.innerHTML = getAllInclusiveScheduleHTML();
                     mainAppContent.className = 'w-full';
@@ -1054,11 +1061,23 @@
                     <div id="sidebar-tabs-container"></div>
                     <div id="sidebar-availability-container" class="space-y-3"></div>
                     <div class="flex-grow flex flex-col min-h-[300px]">
-                        <h3 class="text-lg font-semibold mb-2 text-gray-700 dark:text-gray-300">CRC Home Locations</h3>
-                        <div class="flex-grow rounded-lg overflow-hidden border dark:border-gray-700">
-                            <iframe id="mapFrame" class="w-full h-full" style="border:0;" loading="lazy" allowfullscreen referrerpolicy="no-referrer-when-downgrade" src=""></iframe>
+                        <div class="flex justify-between items-center mb-2">
+                            <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">CRC Home Locations</h3>
+                            <button id="refresh-chaos-map-btn" class="px-2 py-1 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-xs">
+                                <i data-lucide="refresh-cw" class="w-3 h-3 inline"></i>
+                            </button>
                         </div>
-                        <p class="text-xs text-center text-gray-500 dark:text-gray-400 mt-2">Map requires a valid Google Maps Embed API Key.</p>
+                        <div class="mb-2">
+                            <input type="text" id="chaos-map-search" placeholder="Search CRCs, Sites, or Studies..." class="w-full px-3 py-1.5 text-sm border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" />
+                        </div>
+                        <div class="mb-2 flex gap-2 flex-wrap">
+                            <button data-action="filter-map" data-type="all" class="map-filter-btn px-2 py-1 text-xs bg-gray-600 text-white rounded hover:bg-gray-700">All</button>
+                            <button data-action="filter-map" data-type="crcs" class="map-filter-btn px-2 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700">CRCs</button>
+                            <button data-action="filter-map" data-type="sites" class="map-filter-btn px-2 py-1 text-xs bg-green-600 text-white rounded hover:bg-green-700">Sites</button>
+                        </div>
+                        <div class="flex-grow rounded-lg overflow-hidden border dark:border-gray-700">
+                            <div id="chaos-leaflet-map" class="w-full h-full"></div>
+                        </div>
                     </div>
                 </aside>
                 <div class="w-full lg:w-2/3 xl:w-3/4 bg-white dark:bg-gray-800 p-3 md:p-6 rounded-lg shadow-md">
@@ -1424,17 +1443,17 @@
                         </div>
                         
                         ${state.crcViewMode === 'tiles' ? `
-                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 md:gap-4">
-                                ${sortedCrcs.map(crc => {
-                                    const trainings = crc.trainings || [];
-                                    const today = new Date();
-                                    const currentTrainings = trainings.filter(t => new Date(t.expirationDate) > today).length;
-                                    const expiredTrainings = trainings.filter(t => new Date(t.expirationDate) <= today).length;
-                                    const expiringSoon = trainings.filter(t => {
-                                        const expDate = new Date(t.expirationDate);
-                                        const thirtyDays = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
-                                        return expDate > today && expDate <= thirtyDays;
-                                    }).length;
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 md:gap-4">
+                            ${sortedCrcs.map(crc => {
+                                const trainings = crc.trainings || [];
+                                const today = new Date();
+                                const currentTrainings = trainings.filter(t => new Date(t.expirationDate) > today).length;
+                                const expiredTrainings = trainings.filter(t => new Date(t.expirationDate) <= today).length;
+                                const expiringSoon = trainings.filter(t => {
+                                    const expDate = new Date(t.expirationDate);
+                                    const thirtyDays = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
+                                    return expDate > today && expDate <= thirtyDays;
+                                }).length;
                                     
                                     // Calculate monthly hours
                                     const productiveEventTypes = ['Site Assignment', 'Travel Day'];
@@ -1444,33 +1463,33 @@
                                     });
                                     const monthlyHours = eventsThisMonth.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
                                     const utilizationData = utilization[crc.id] || { utilizationPercent: 0 };
-                                    
-                                    return `
-                                        <div class="crc-card bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition-shadow cursor-pointer" data-crc-name="${crc.name.toLowerCase()}" data-crc-title="${(crc.title || '').toLowerCase()}" data-crc-location="${(crc.homeLocation || '').toLowerCase()}" data-crc-region="${(crc.region || '').toLowerCase()}">
-                                            <div class="flex justify-between items-start mb-3">
-                                                <div class="flex-1 min-w-0">
-                                                    <h4 class="text-lg font-semibold text-gray-900 dark:text-gray-100 truncate">${crc.name}</h4>
-                                                    ${crc.title ? `<p class="text-sm text-gray-600 dark:text-gray-400">${crc.title}</p>` : ''}
+                                
+                                return `
+                                    <div class="crc-card bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition-shadow cursor-pointer" data-crc-name="${crc.name.toLowerCase()}" data-crc-title="${(crc.title || '').toLowerCase()}" data-crc-location="${(crc.homeLocation || '').toLowerCase()}" data-crc-region="${(crc.region || '').toLowerCase()}">
+                                        <div class="flex justify-between items-start mb-3">
+                                            <div class="flex-1 min-w-0">
+                                                <h4 class="text-lg font-semibold text-gray-900 dark:text-gray-100 truncate">${crc.name}</h4>
+                                                ${crc.title ? `<p class="text-sm text-gray-600 dark:text-gray-400">${crc.title}</p>` : ''}
+                                            </div>
+                                            <span class="ml-2 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${crc.employmentType === 'FTE' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' : 'bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200'}">
+                                                ${crc.employmentType || 'FTE'}
+                                            </span>
+                                        </div>
+                                        
+                                        <div class="space-y-2 mb-3">
+                                            ${crc.homeLocation ? `
+                                                <div class="flex items-center text-sm text-gray-600 dark:text-gray-400">
+                                                    <i data-lucide="map-pin" class="w-4 h-4 mr-2"></i>
+                                                    <span>${crc.homeLocation}</span>
                                                 </div>
-                                                <span class="ml-2 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${crc.employmentType === 'FTE' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' : 'bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200'}">
-                                                    ${crc.employmentType || 'FTE'}
-                                                </span>
-                                            </div>
-                                            
-                                            <div class="space-y-2 mb-3">
-                                                ${crc.homeLocation ? `
-                                                    <div class="flex items-center text-sm text-gray-600 dark:text-gray-400">
-                                                        <i data-lucide="map-pin" class="w-4 h-4 mr-2"></i>
-                                                        <span>${crc.homeLocation}</span>
-                                                    </div>
-                                                ` : ''}
-                                                ${crc.region ? `
-                                                    <div class="flex items-center text-sm text-gray-600 dark:text-gray-400">
-                                                        <i data-lucide="globe" class="w-4 h-4 mr-2"></i>
-                                                        <span>${crc.region}</span>
-                                                    </div>
-                                                ` : ''}
-                                            </div>
+                                            ` : ''}
+                                            ${crc.region ? `
+                                                <div class="flex items-center text-sm text-gray-600 dark:text-gray-400">
+                                                    <i data-lucide="globe" class="w-4 h-4 mr-2"></i>
+                                                    <span>${crc.region}</span>
+                                                </div>
+                                            ` : ''}
+                                        </div>
                                             
                                             <div class="grid grid-cols-2 gap-2 mb-3">
                                                 <div class="bg-indigo-50 dark:bg-indigo-900/20 p-2 rounded text-center">
@@ -1482,36 +1501,36 @@
                                                     <div class="text-xs text-cyan-800 dark:text-cyan-300">Monthly Hrs</div>
                                                 </div>
                                             </div>
-                                            
-                                            <div class="grid grid-cols-3 gap-2 mb-3">
-                                                <div class="bg-green-50 dark:bg-green-900/20 p-2 rounded text-center">
-                                                    <div class="text-lg font-bold text-green-600 dark:text-green-400">${currentTrainings}</div>
-                                                    <div class="text-xs text-green-800 dark:text-green-300">Current</div>
-                                                </div>
-                                                <div class="bg-yellow-50 dark:bg-yellow-900/20 p-2 rounded text-center">
-                                                    <div class="text-lg font-bold text-yellow-600 dark:text-yellow-400">${expiringSoon}</div>
-                                                    <div class="text-xs text-yellow-800 dark:text-yellow-300">Expiring</div>
-                                                </div>
-                                                <div class="bg-red-50 dark:bg-red-900/20 p-2 rounded text-center">
-                                                    <div class="text-lg font-bold text-red-600 dark:text-red-400">${expiredTrainings}</div>
-                                                    <div class="text-xs text-red-800 dark:text-red-300">Expired</div>
-                                                </div>
+                                        
+                                        <div class="grid grid-cols-3 gap-2 mb-3">
+                                            <div class="bg-green-50 dark:bg-green-900/20 p-2 rounded text-center">
+                                                <div class="text-lg font-bold text-green-600 dark:text-green-400">${currentTrainings}</div>
+                                                <div class="text-xs text-green-800 dark:text-green-300">Current</div>
                                             </div>
-                                            
-                                            <button data-action="view-crc-profile" data-id="${crc.id}" class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors text-sm">
-                                                View & Edit Profile
-                                            </button>
+                                            <div class="bg-yellow-50 dark:bg-yellow-900/20 p-2 rounded text-center">
+                                                <div class="text-lg font-bold text-yellow-600 dark:text-yellow-400">${expiringSoon}</div>
+                                                <div class="text-xs text-yellow-800 dark:text-yellow-300">Expiring</div>
+                                            </div>
+                                            <div class="bg-red-50 dark:bg-red-900/20 p-2 rounded text-center">
+                                                <div class="text-lg font-bold text-red-600 dark:text-red-400">${expiredTrainings}</div>
+                                                <div class="text-xs text-red-800 dark:text-red-300">Expired</div>
+                                            </div>
                                         </div>
-                                    `;
-                                }).join('')}
-                                ${sortedCrcs.length === 0 ? `
-                                    <div class="col-span-full bg-white dark:bg-gray-800 p-8 rounded-lg shadow text-center">
-                                        <i data-lucide="users" class="w-12 h-12 mx-auto mb-3 text-gray-400"></i>
-                                        <h3 class="text-lg font-semibold text-gray-600 dark:text-gray-400 mb-2">No CRCs Found</h3>
-                                        <p class="text-gray-500 dark:text-gray-500 text-sm">Add CRCs from the sidebar to get started.</p>
+                                        
+                                        <button data-action="view-crc-profile" data-id="${crc.id}" class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors text-sm">
+                                            View & Edit Profile
+                                        </button>
                                     </div>
-                                ` : ''}
-                            </div>
+                                `;
+                            }).join('')}
+                            ${sortedCrcs.length === 0 ? `
+                                <div class="col-span-full bg-white dark:bg-gray-800 p-8 rounded-lg shadow text-center">
+                                    <i data-lucide="users" class="w-12 h-12 mx-auto mb-3 text-gray-400"></i>
+                                    <h3 class="text-lg font-semibold text-gray-600 dark:text-gray-400 mb-2">No CRCs Found</h3>
+                                    <p class="text-gray-500 dark:text-gray-500 text-sm">Add CRCs from the sidebar to get started.</p>
+                                </div>
+                            ` : ''}
+                        </div>
                         ` : `
                             <div class="overflow-x-auto">
                                 <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
@@ -3410,6 +3429,7 @@
                 const year = now.getFullYear();
                 const month = now.getMonth();
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
+                const isDarkMode = document.documentElement.classList.contains('dark');
 
                 let filteredEvents = state.crc_events.filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
@@ -3426,86 +3446,111 @@
                     filteredEvents = filteredEvents.filter(e => crcsInRegion.includes(e.crcId));
                 }
 
-                const staffCountByGroupAndDate = {};
+                // Group events by Study -> Site -> Date -> Events with employee details
+                const eventsByStudySiteDate = {};
                 filteredEvents.forEach(event => {
-                    if (!event.crcId) return;
-                    const groupIds = (groupBy === 'study')
-                        ? (event.studyIds && event.studyIds.length > 0 ? event.studyIds : ['unassigned'])
-                        : (event.siteId ? [event.siteId] : ['unassigned']);
+                    const studyIds = (event.studyIds && event.studyIds.length > 0) ? event.studyIds : ['unassigned'];
+                    const siteId = event.siteId || 'unassigned';
                     
-                    groupIds.forEach(groupId => {
-                        if (!staffCountByGroupAndDate[groupId]) staffCountByGroupAndDate[groupId] = {};
-                        if (!staffCountByGroupAndDate[groupId][event.date]) staffCountByGroupAndDate[groupId][event.date] = new Set();
-                        staffCountByGroupAndDate[groupId][event.date].add(event.crcId);
+                    studyIds.forEach(studyId => {
+                        if (!eventsByStudySiteDate[studyId]) eventsByStudySiteDate[studyId] = {};
+                        if (!eventsByStudySiteDate[studyId][siteId]) eventsByStudySiteDate[studyId][siteId] = {};
+                        if (!eventsByStudySiteDate[studyId][siteId][event.date]) {
+                            eventsByStudySiteDate[studyId][siteId][event.date] = [];
+                        }
+                        eventsByStudySiteDate[studyId][siteId][event.date].push(event);
                     });
                 });
 
-                const collection = groupBy === 'study' ? state.studies : state.crc_sites;
-                const unassignedGroup = { id: 'unassigned', name: `Unassigned ${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}` };
-                
-                let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;"><table class="min-w-full text-sm border-collapse">`;
-                tableHtml += `<thead class="sticky top-0 z-10"><tr class="bg-gray-100 dark:bg-gray-800"><th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold">${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}</th>`;
+                let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;"><table class="min-w-full border-collapse" style="font-size: 0.7rem;">`;
+                tableHtml += `<thead><tr class="bg-gray-100 dark:bg-gray-800" style="position: sticky; top: 0; z-index: 21;"><th class="p-2 text-left sticky left-0 z-30 bg-gray-100 dark:bg-gray-800 font-bold" style="min-width: 180px;">Study / Site</th>`;
                 for (let day = 1; day <= daysInMonth; day++) {
-                    tableHtml += `<th class="p-2 font-normal w-10">${day}</th>`;
+                    const date = new Date(year, month, day);
+                    const dayOfWeek = date.toLocaleDateString('en-US', { weekday: 'narrow' });
+                    tableHtml += `<th class="p-1 font-normal text-center" style="min-width: 80px;">${dayOfWeek}<br>${day}</th>`;
                 }
                 tableHtml += `</tr></thead>`;
                 
                 let tbodyHtml = '<tbody>';
-                const sortedGroups = [...collection, unassignedGroup]
-                    .filter(group => staffCountByGroupAndDate[group.id])
+                const sortedStudies = [...state.studies, {id: 'unassigned', name: 'Unassigned Study'}]
+                    .filter(study => eventsByStudySiteDate[study.id])
                     .sort((a,b) => a.name.localeCompare(b.name));
                 
-                sortedGroups.forEach(group => {
-                    tbodyHtml += `<tr class="border-t dark:border-gray-700"><td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${group.name}</td>`;
+                sortedStudies.forEach(study => {
+                    const studyColor = study.color || (isDarkMode ? '#374151' : '#e5e7eb');
+                    const studyTextColor = getContrastColor(studyColor);
+                    
+                    tbodyHtml += `<tr class="border-t-2 dark:border-gray-600"><td class="p-2 text-left sticky left-0 bg-gray-50 dark:bg-gray-900/50 font-bold" colspan="${daysInMonth + 1}" style="background-color: ${studyColor}; color: ${studyTextColor}; position: sticky; top: 2.5rem; z-index: 19;">${study.name}</td></tr>`;
+                    
+                    const sortedSiteIds = Object.keys(eventsByStudySiteDate[study.id]).sort((a, b) => {
+                        const siteA = state.crc_sites.find(s => s.id === a)?.name || 'zz';
+                        const siteB = state.crc_sites.find(s => s.id === b)?.name || 'zz';
+                        return siteA.localeCompare(siteB);
+                    });
+
+                    sortedSiteIds.forEach(siteId => {
+                        const site = state.crc_sites.find(s => s.id === siteId);
+                        const siteName = site ? site.name : 'Unassigned Site';
+                        
+                        tbodyHtml += `<tr class="border-t dark:border-gray-700"><td class="p-2 pl-8 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${siteName}</td>`;
+                        
                     for (let day = 1; day <= daysInMonth; day++) {
                         const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                        const staffSet = staffCountByGroupAndDate[group.id]?.[dateStr];
-                        const staffCount = staffSet ? staffSet.size : 0;
-                        
-                        // Calculate required staff based on study's site role requirements
+                            const dayEvents = eventsByStudySiteDate[study.id][siteId]?.[dateStr] || [];
+                            
+                            // Get unique CRCs and their roles
+                            const staffDetails = dayEvents.map(event => {
+                                const crc = state.crcs.find(c => c.id === event.crcId);
+                                const roles = getEventRoles(event);
+                                const firstName = crc ? crc.name.split(' ')[0] : 'Open';
+                                const roleText = roles.length > 0 ? roles.join(', ') : '';
+                                return {
+                                    name: firstName,
+                                    roles: roleText,
+                                    hours: event.hours || 0,
+                                    type: event.type
+                                };
+                            });
+                            
+                            const totalHours = dayEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                            
+                            // Calculate required staff
                         let requiredStaff = 0;
-                        if (groupBy === 'study' && group.id !== 'unassigned') {
-                            const study = state.studies.find(s => s.id === group.id);
-                            if (study && study.siteRoleRequirements) {
-                                // Sum all role requirements across all sites for this study
-                                Object.values(study.siteRoleRequirements).forEach(siteRequirements => {
-                                    Object.values(siteRequirements).forEach(roleCount => {
-                                        requiredStaff += roleCount;
-                                    });
-                                });
-                            }
-                        } else if (groupBy === 'site' && group.id !== 'unassigned') {
-                            // For site view, sum requirements across all studies that use this site
-                            state.studies.forEach(study => {
-                                if (study.siteRoleRequirements && study.siteRoleRequirements[group.id]) {
-                                    Object.values(study.siteRoleRequirements[group.id]).forEach(roleCount => {
+                            if (study.id !== 'unassigned' && siteId !== 'unassigned') {
+                                const actualStudy = state.studies.find(s => s.id === study.id);
+                                if (actualStudy && actualStudy.siteRoleRequirements && actualStudy.siteRoleRequirements[siteId]) {
+                                    Object.values(actualStudy.siteRoleRequirements[siteId]).forEach(roleCount => {
                                         requiredStaff += roleCount;
                                     });
                                 }
-                            });
-                        }
-                        
-                        let cellClass = 'text-center border-l dark:border-gray-700';
-                        if (requiredStaff > 0) {
-                            // Use green/red based on whether staffing meets requirements
-                            if (staffCount >= requiredStaff) {
-                                cellClass += ' bg-green-100 dark:bg-green-900/50';
-                            } else if (staffCount > 0) {
-                                cellClass += ' bg-yellow-100 dark:bg-yellow-900/50';
-                            } else {
-                                cellClass += ' bg-red-100 dark:bg-red-900/50';
                             }
-                        } else {
-                            // Fallback to original logic if no requirements defined
-                            if (staffCount === 1) cellClass += ' bg-blue-100 dark:bg-blue-900/50';
-                            if (staffCount === 2) cellClass += ' bg-green-100 dark:bg-green-900/50';
-                            if (staffCount >= 3) cellClass += ' bg-yellow-100 dark:bg-yellow-900/50 font-bold';
-                        }
-                        
-                        const displayText = staffCount > 0 ? (requiredStaff > 0 ? `${staffCount}/${requiredStaff}` : staffCount) : '-';
-                        tbodyHtml += `<td class="${cellClass}">${displayText}</td>`;
+                            
+                            let cellClass = 'border-l dark:border-gray-700 p-1 align-top';
+                        if (requiredStaff > 0) {
+                                if (staffDetails.length >= requiredStaff) cellClass += ' bg-green-50 dark:bg-green-900/20';
+                                else if (staffDetails.length > 0) cellClass += ' bg-yellow-50 dark:bg-yellow-900/20';
+                                else cellClass += ' bg-red-50 dark:bg-red-900/20';
+                            } else {
+                                if (staffDetails.length > 0) cellClass += ' bg-blue-50 dark:bg-blue-900/20';
+                            }
+                            
+                            // Build cell content with employee names and roles
+                            let cellContent = '';
+                            if (staffDetails.length > 0) {
+                                cellContent = staffDetails.map(staff => {
+                                    const roleDisplay = staff.roles ? `<br><span class="text-gray-600 dark:text-gray-400" style="font-size: 0.65rem;">${staff.roles}</span>` : '';
+                                    return `<div class="mb-1"><strong>${staff.name}</strong>${roleDisplay}</div>`;
+                                }).join('');
+                                
+                                if (totalHours > 0) {
+                                    cellContent += `<div class="text-gray-500 dark:text-gray-500 mt-1 border-t border-gray-300 dark:border-gray-600 pt-1" style="font-size: 0.65rem;">${totalHours}h total</div>`;
+                                }
+                            }
+                            
+                            tbodyHtml += `<td class="${cellClass}" style="min-height: 60px; cursor: pointer;" data-action="view-day-details" data-date="${dateStr}" data-site-id="${siteId}" data-study-id="${study.id}" title="${staffDetails.map(s => s.name + (s.roles ? ': ' + s.roles : '')).join(', ')}">${cellContent || '<span class="text-gray-400">-</span>'}</td>`;
                     }
                     tbodyHtml += `</tr>`;
+                    });
                 });
                 tbodyHtml += '</tbody>';
 
@@ -3637,29 +3682,18 @@
                                 </div>` : '' }
                             ${ tabIs('sites') ? `
                                 <div class="space-y-4">
-                                    <form id="add-crc-site-form" class="space-y-3">
-                                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Manage Sites</h3>
-                                        <input type="text" name="crcSiteName" placeholder="Site Name" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <input type="text" name="address1" placeholder="Address 1" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <input type="text" name="address2" placeholder="Address 2" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <div class="grid grid-cols-3 gap-2">
-                                            <input type="text" name="city" placeholder="City" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                            <input type="text" name="state" placeholder="State" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                            <input type="text" name="zip" placeholder="Zip" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        </div>
-                                        <input type="text" name="crcSitePI" placeholder="Principal Investigator" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <div>
-                                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Display Color</label>
-                                            <input type="color" name="color" value="#10b981" class="w-full h-10 p-1 border dark:border-gray-600 rounded-md cursor-pointer">
-                                        </div>
-                                        <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Site</button>
-                                    </form>
+                                    <div class="bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-500 p-3 rounded mb-4">
+                                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-2">Sites (Read-Only)</h3>
+                                        <p class="text-xs text-blue-800 dark:text-blue-300">Sites are managed in ARTEMIS. Use ARTEMIS to add or remove sites.</p>
+                                    </div>
                                     <div id="crcSiteList" class="space-y-2 max-h-60 overflow-y-auto custom-scrollbar pr-2"></div>
                                 </div>` : '' }
                             ${ tabIs('studies') ? `
                                 <div class="space-y-4">
-                                    <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Manage Studies</h3>
-                                    <button data-action="open-add-study-modal" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Study</button>
+                                    <div class="bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-500 p-3 rounded mb-4">
+                                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-2">Studies (Read-Only)</h3>
+                                        <p class="text-xs text-blue-800 dark:text-blue-300">Studies are managed in ARTEMIS. Use ARTEMIS to add or remove studies.</p>
+                                    </div>
                                     <div id="studyList" class="space-y-2 max-h-60 overflow-y-auto custom-scrollbar pr-2"></div>
                                 </div>` : '' }
                             ${ tabIs('roles') ? `
@@ -3698,25 +3732,25 @@
                 if (siteList) {
                     siteList.innerHTML = state.crc_sites.map(site => `
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
-                            <div class="flex items-center gap-2">
+                            <div class="flex items-center gap-2 flex-1">
                                 <span class="w-4 h-4 rounded-full" style="background-color: ${site.color || '#cccccc'};"></span>
-                                <button data-action="edit-crc-site" data-id="${site.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${site.name}</button>
+                                <span class="text-sm font-medium text-gray-800 dark:text-gray-200">${site.name}</span>
                             </div>
-                            <button data-action="delete-crc-site" data-id="${site.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            <button data-action="edit-crc-site" data-id="${site.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"><i data-lucide="edit" class="w-4 h-4"></i></button>
                         </div>
-                    `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No sites added yet.</p>';
+                    `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No sites from ARTEMIS yet.</p>';
                 }
 
                 if (studyList) {
                     studyList.innerHTML = state.studies.map(study => `
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
-                            <div class="flex items-center gap-2">
+                            <div class="flex items-center gap-2 flex-1">
                                 <span class="w-4 h-4 rounded-full" style="background-color: ${study.color || '#cccccc'};"></span>
-                                <button data-action="edit-study" data-id="${study.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${study.name}</button>
+                                <span class="text-sm font-medium text-gray-800 dark:text-gray-200">${study.name}</span>
                             </div>
-                            <button data-action="delete-study" data-id="${study.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            <button data-action="edit-study" data-id="${study.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"><i data-lucide="edit" class="w-4 h-4"></i></button>
                         </div>
-                    `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No studies added yet.</p>';
+                    `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No studies from ARTEMIS yet.</p>';
                 }
 
                 if (roleList) {
@@ -6197,18 +6231,145 @@
                 });
             };
             
+            let chaosMap = null;
+            let chaosMapMarkers = [];
+            let chaosMapFilter = 'all';
+            
             const updateCRCMap = () => {
-                const mapFrame = document.getElementById('mapFrame');
-                if (!mapFrame) return;
-                const apiKey = "YOUR_GOOGLE_MAPS_API_KEY";
-                if (apiKey === "YOUR_GOOGLE_MAPS_API_KEY") {
-                    mapFrame.src = "";
-                    return;
+                const mapContainer = document.getElementById('chaos-leaflet-map');
+                if (!mapContainer) return;
+                
+                // Initialize map if not already done
+                if (!chaosMap) {
+                    chaosMap = L.map('chaos-leaflet-map').setView([39.8283, -98.5795], 4); // Center on USA
+                    
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        attribution: '© OpenStreetMap contributors',
+                        maxZoom: 19
+                    }).addTo(chaosMap);
+                    
+                    // Add search input handler
+                    const searchInput = document.getElementById('chaos-map-search');
+                    if (searchInput) {
+                        searchInput.addEventListener('input', (e) => {
+                            filterChaosMapMarkers(e.target.value);
+                        });
+                    }
+                    
+                    // Add refresh button handler
+                    const refreshBtn = document.getElementById('refresh-chaos-map-btn');
+                    if (refreshBtn) {
+                        refreshBtn.addEventListener('click', () => {
+                            updateCRCMap();
+                            lucide.createIcons();
+                        });
+                    }
                 }
-                const locations = state.crcs.map(crc => `markers=color:blue%7Clabel:C%7C${encodeURIComponent(crc.homeLocation)}`).join('&');
-                const mapUrl = `https://www.google.com/maps/embed/v1/place?key=${apiKey}&q=United+States${locations ? '&' + locations : ''}`;
-                if (mapFrame.src !== mapUrl) {
-                    mapFrame.src = mapUrl;
+                
+                // Clear existing markers
+                chaosMapMarkers.forEach(marker => chaosMap.removeLayer(marker));
+                chaosMapMarkers = [];
+                
+                const bounds = [];
+                
+                // Add CRC markers
+                if (chaosMapFilter === 'all' || chaosMapFilter === 'crcs') {
+                    state.crcs.forEach(crc => {
+                        if (crc.coordinates && crc.coordinates.lat && crc.coordinates.lng) {
+                            const marker = L.circleMarker([crc.coordinates.lat, crc.coordinates.lng], {
+                                radius: 8,
+                                fillColor: '#3b82f6',
+                                color: '#1e40af',
+                                weight: 2,
+                                opacity: 1,
+                                fillOpacity: 0.8
+                            }).addTo(chaosMap);
+                            
+                            marker.bindPopup(`
+                                <div class="p-2">
+                                    <strong class="text-blue-600">CRC:</strong> ${crc.name}<br>
+                                    <span class="text-sm text-gray-600">📍 ${crc.homeLocation || 'No location'}</span><br>
+                                    ${crc.region ? `<span class="text-sm text-gray-600">🌍 ${crc.region}</span>` : ''}
+                                </div>
+                            `);
+                            
+                            marker._data = { type: 'crc', name: crc.name, location: crc.homeLocation, id: crc.id };
+                            chaosMapMarkers.push(marker);
+                            bounds.push([crc.coordinates.lat, crc.coordinates.lng]);
+                        }
+                    });
+                }
+                
+                // Add Site markers
+                if (chaosMapFilter === 'all' || chaosMapFilter === 'sites') {
+                    state.crc_sites.forEach(site => {
+                        if (site.coordinates && site.coordinates.lat && site.coordinates.lng) {
+                            const marker = L.circleMarker([site.coordinates.lat, site.coordinates.lng], {
+                                radius: 10,
+                                fillColor: '#10b981',
+                                color: '#047857',
+                                weight: 2,
+                                opacity: 1,
+                                fillOpacity: 0.8
+                            }).addTo(chaosMap);
+                            
+                            marker.bindPopup(`
+                                <div class="p-2">
+                                    <strong class="text-green-600">Site:</strong> ${site.name}<br>
+                                    ${site.city && site.state ? `<span class="text-sm text-gray-600">📍 ${site.city}, ${site.state}</span>` : ''}
+                                    ${site.principalInvestigator ? `<br><span class="text-sm text-gray-600">PI: ${site.principalInvestigator}</span>` : ''}
+                                </div>
+                            `);
+                            
+                            marker._data = { type: 'site', name: site.name, location: `${site.city || ''}, ${site.state || ''}`, id: site.id };
+                            chaosMapMarkers.push(marker);
+                            bounds.push([site.coordinates.lat, site.coordinates.lng]);
+                        }
+                    });
+                }
+                
+                // Fit map to bounds if we have markers
+                if (bounds.length > 0) {
+                    chaosMap.fitBounds(bounds, { padding: [50, 50] });
+                }
+                
+                // Trigger filter if search has text
+                const searchInput = document.getElementById('chaos-map-search');
+                if (searchInput && searchInput.value) {
+                    filterChaosMapMarkers(searchInput.value);
+                }
+            };
+            
+            const filterChaosMapMarkers = (searchTerm) => {
+                const term = searchTerm.toLowerCase();
+                
+                chaosMapMarkers.forEach(marker => {
+                    const data = marker._data;
+                    if (!data) return;
+                    
+                    const matches = !term || 
+                        data.name.toLowerCase().includes(term) ||
+                        (data.location && data.location.toLowerCase().includes(term));
+                    
+                    if (matches) {
+                        marker.setStyle({ fillOpacity: 0.8, opacity: 1 });
+                    } else {
+                        marker.setStyle({ fillOpacity: 0.1, opacity: 0.3 });
+                    }
+                });
+                
+                // If there's a search term, zoom to matching markers
+                if (term && chaosMapMarkers.length > 0) {
+                    const matchingBounds = chaosMapMarkers
+                        .filter(m => m._data && (
+                            m._data.name.toLowerCase().includes(term) ||
+                            (m._data.location && m._data.location.toLowerCase().includes(term))
+                        ))
+                        .map(m => m.getLatLng());
+                    
+                    if (matchingBounds.length > 0) {
+                        chaosMap.fitBounds(matchingBounds, { padding: [50, 50] });
+                    }
                 }
             };
 
@@ -6375,8 +6536,13 @@
                 
                 container.classList.remove('hidden');
                 let html = '<label class="block text-sm font-medium dark:text-gray-300 mb-2">Assign Roles</label>';
-                html += '<p class="text-xs text-gray-500 dark:text-gray-400 mb-3">Only roles with valid, non-expired training are shown for each CRC. If no roles appear, the CRC needs to complete required training.</p>';
+                html += '<p class="text-xs text-gray-500 dark:text-gray-400 mb-3">Only roles with valid, non-expired training are shown for each CRC. Warnings indicate conflicts but can be overridden.</p>';
                 const allRoles = getAllRoles(state.crc_events, state.roles);
+
+                // Get the date, site, and study from the form
+                const formDate = form.querySelector('input[name="startDate"]')?.value;
+                const formSiteId = form.querySelector('select[name="siteId"]')?.value;
+                const formStudyIds = Array.from(form.querySelectorAll('select[name="studyIds"] option:checked')).map(opt => opt.value);
 
                 selectedCrcIds.forEach(crcId => {
                     const crc = state.crcs.find(c => c.id === crcId);
@@ -6387,23 +6553,60 @@
                         selectedRoles = new Set(event.roles || []);
                     }
                     
+                    // Check for existing assignments on same date/site/study
+                    let conflictingAssignments = [];
+                    if (formDate && formSiteId) {
+                        conflictingAssignments = state.crc_events.filter(e => {
+                            // Skip if this is the event being edited
+                            if (event && e.id === event.id) return false;
+                            
+                            // Check if same CRC, date, site
+                            if (e.crcId === crcId && e.date === formDate && e.siteId === formSiteId) {
+                                // Check if any study overlap
+                                if (formStudyIds.length > 0 && e.studyIds && e.studyIds.length > 0) {
+                                    const hasStudyOverlap = formStudyIds.some(sid => e.studyIds.includes(sid));
+                                    return hasStudyOverlap;
+                                }
+                                return true;
+                            }
+                            return false;
+                        });
+                    }
+                    
+                    // Get all roles already assigned to this CRC in conflicting events
+                    const assignedRoles = new Set();
+                    conflictingAssignments.forEach(e => {
+                        const eventRoles = getEventRoles(e);
+                        eventRoles.forEach(role => assignedRoles.add(role));
+                    });
+                    
                     // Only show roles that the CRC has valid training for
                     const trainedRoles = allRoles.filter(r => hasValidTraining(crc, r));
                     const roleOptions = trainedRoles.map(r => {
                         const isSelected = selectedRoles.has(r);
-                        return `<option value="${r}" ${isSelected ? 'selected' : ''}>${r}</option>`;
+                        const isAlreadyAssigned = assignedRoles.has(r);
+                        const warningText = isAlreadyAssigned ? ' ⚠️ Already Assigned' : '';
+                        return `<option value="${r}" ${isSelected ? 'selected' : ''} ${isAlreadyAssigned ? 'style="color: #f59e0b; font-weight: bold;"' : ''}>${r}${warningText}</option>`;
                     }).join('');
+
+                    // Create conflict warning badge
+                    const conflictBadge = conflictingAssignments.length > 0 
+                        ? `<span class="ml-2 px-2 py-1 text-xs bg-yellow-100 dark:bg-yellow-900/30 text-yellow-800 dark:text-yellow-300 border border-yellow-300 dark:border-yellow-700 rounded" title="${assignedRoles.size > 0 ? 'Already assigned: ' + Array.from(assignedRoles).join(', ') : 'Already assigned to this date/site/study'}">⚠️ ${conflictingAssignments.length} conflict${conflictingAssignments.length > 1 ? 's' : ''}</span>`
+                        : '';
 
                     const noTrainingMessage = trainedRoles.length === 0 
                         ? `<div class="col-span-2 text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-2 rounded border border-red-200 dark:border-red-800">⚠️ No valid training for any roles</div>`
                         : `<div class="col-span-2">
                             <select name="roles-${crcId}" multiple class="role-select-individual w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-24">${roleOptions}</select>
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${trainedRoles.length} role${trainedRoles.length !== 1 ? 's' : ''} available</p>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${trainedRoles.length} role${trainedRoles.length !== 1 ? 's' : ''} available${assignedRoles.size > 0 ? ' • ⚠️ indicates conflict (can override)' : ''}</p>
                           </div>`;
 
                     html += `
                         <div class="grid grid-cols-3 items-center gap-4 mb-2">
-                            <span class="text-sm font-medium col-span-1">${crc.name}</span>
+                            <div class="col-span-1 flex items-center">
+                                <span class="text-sm font-medium">${crc.name}</span>
+                                ${conflictBadge}
+                            </div>
                             ${noTrainingMessage}
                         </div>
                     `;
@@ -7677,6 +7880,11 @@
                     case 'set-display-mode': setState({ calendarDisplayMode: mode }); break;
                     case 'set-at-a-glance-group': setState({ atAGlanceGroupBy: group }); break;
                     case 'set-crc-view-mode': setState({ crcViewMode: mode }); break;
+                    case 'filter-map': {
+                        chaosMapFilter = actionButton.dataset.type;
+                        updateCRCMap();
+                        break;
+                    }
                     case 'set-sidebar-tab': setState({ sidebarTab: tabId }); break;
                     case 'set-main-tab': setState({ activeTab: tabId }); break;
                     case 'edit-all-schedule-event': {
@@ -8314,6 +8522,7 @@
                         }
                         break;
                     }
+                    case 'view-day-details':
                     case 'view-study-site-group': {
                         const siteId = actionButton.dataset.siteId;
                         const studyId = actionButton.dataset.studyId;
@@ -8364,9 +8573,10 @@
                             </div>
                             <h3 class="text-lg font-semibold dark:text-white mb-3">Assigned Staff:</h3>
                             <div class="max-h-96 overflow-y-auto custom-scrollbar">
-                                ${eventsHtml}
+                                ${eventsHtml.length > 0 ? eventsHtml : '<p class="text-gray-500 dark:text-gray-400">No staff assigned for this day.</p>'}
                             </div>
-                            <div class="mt-6 flex justify-end">
+                            <div class="mt-6 flex justify-end gap-2">
+                                <button data-action="open-crc-event-modal" data-date="${dateStr}" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Add Staff</button>
                                 <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
                             </div>
                         `;
@@ -9411,6 +9621,14 @@
                         handleShiftStudySiteSelection();
                     }, 100);
                 }
+                // Handle role assignment dropdown changes to update conflict warnings
+                if (target.name && target.name.startsWith('role-')) {
+                    console.log('Role assignment changed:', target.name, target.value);
+                    // Update conflict warnings when selections change
+                    setTimeout(() => {
+                        handleShiftStudySiteSelection();
+                    }, 100);
+                }
                 // Test button for role assignment
                 if (target.id === 'test-role-assignment') {
                     console.log('Test button clicked - forcing role assignment');
@@ -9767,8 +9985,58 @@
                         const qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, role.name));
                         let crcOptions = qualifiedCrcs.map(crc => {
                             const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                            const unavailableText = isUnavailable ? ' (Unavailable)' : '';
-                            return `<option value="${crc.id}" ${crc.id === existingCrcId ? 'selected' : ''}>${crc.name}${unavailableText}</option>`;
+                            
+                            // Check if this CRC is already assigned to OTHER roles in the same shift/date/site/study (from existing events)
+                            let alreadyAssignedRoles = [];
+                            if (formDate && formSiteId) {
+                                const conflictEvents = state.crc_events.filter(e => {
+                                    // Skip if this is the event being edited
+                                    if (existingEvent && e.id === existingEvent.id) return false;
+                                    
+                                    // Check if same CRC, date, site
+                                    if (e.crcId === crc.id && e.date === formDate && e.siteId === formSiteId) {
+                                        // Check if any study overlap
+                                        if (formStudyIds.length > 0 && e.studyIds && e.studyIds.length > 0) {
+                                            return formStudyIds.some(sid => e.studyIds.includes(sid));
+                                        }
+                                        return true;
+                                    }
+                                    return false;
+                                });
+                                
+                                conflictEvents.forEach(e => {
+                                    const eventRoles = getEventRoles(e);
+                                    alreadyAssignedRoles.push(...eventRoles);
+                                });
+                            }
+                            
+                            // Also check if this CRC is selected in OTHER role dropdowns in THIS form
+                            const allRoleSelects = form.querySelectorAll('select[name^="role-"]');
+                            const currentRolePrefix = 'role-' + role.id + '-';
+                            allRoleSelects.forEach(select => {
+                                // Skip the current role's dropdowns
+                                if (select.name.startsWith(currentRolePrefix)) return;
+                                
+                                if (select.value === crc.id) {
+                                    // Extract role name from the select
+                                    const selectRoleId = select.name.split('-')[1];
+                                    const conflictRole = state.roles.find(r => r.id === selectRoleId);
+                                    if (conflictRole && !alreadyAssignedRoles.includes(conflictRole.name)) {
+                                        alreadyAssignedRoles.push(conflictRole.name);
+                                    }
+                                }
+                            });
+                            
+                            let statusText = '';
+                            let optionStyle = '';
+                            if (isUnavailable) {
+                                statusText = ' (Unavailable)';
+                            } else if (alreadyAssignedRoles.length > 0) {
+                                statusText = ' ⚠️ Already in: ' + alreadyAssignedRoles.join(', ');
+                                optionStyle = ' style="color: #f59e0b; font-weight: bold;"';
+                            }
+                            
+                            return '<option value="' + crc.id + '" ' + (crc.id === existingCrcId ? 'selected' : '') + optionStyle + '>' + crc.name + statusText + '</option>';
                         }).join('');
                         
                         if (qualifiedCrcs.length === 0) {
@@ -9789,6 +10057,7 @@
                                         </select>
                                     </div>
                                 </div>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">⚠️ indicates conflict - can be overridden if needed</p>
                             </div>
                         `;
                     });
@@ -9820,21 +10089,6 @@
                     
                     // Get CRCs who can fill this role (only show those with valid training)
                     const qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, role.name));
-                    let crcOptions = qualifiedCrcs.map(crc => {
-                        const isSelected = existingAssignments.includes(crc.id);
-                        const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                        
-                        let statusText = '';
-                        if (isUnavailable) statusText = ' (Unavailable)';
-                        
-                        return `<option value="${crc.id}" ${isSelected ? 'selected' : ''}>${crc.name}${statusText}</option>`;
-                    }).join('');
-                    
-                    if (qualifiedCrcs.length === 0) {
-                        crcOptions += '<option value="" disabled>No qualified staff available</option>';
-                    }
-                    
-                    console.log(`CRC options for ${role.name}:`, crcOptions);
                     
                     roleAssignmentHTML += `
                         <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
@@ -9842,26 +10096,82 @@
                             <div class="space-y-2">
                                 ${Array.from({length: quantity}, (_, index) => {
                                     const existingCrcId = existingAssignments[index] || '';
+                                    
+                                    // Build CRC options with conflict detection
+                                    const crcOptionsHtml = state.crcs.filter(crc => hasValidTraining(crc, role.name)).map(crc => {
+                                                    const isUnavailable = isCRCUnavailable(crc.id, date, period);
+                                                    const isCurrentlySelected = crc.id === existingCrcId;
+                                        
+                                        // Check if this CRC is already assigned to OTHER roles in the same shift/date/site/study (from existing events)
+                                        let alreadyAssignedRoles = [];
+                                        if (formDate && formSiteId) {
+                                            const conflictEvents = state.crc_events.filter(e => {
+                                                // Skip if this is the event being edited
+                                                if (existingEvent && e.id === existingEvent.id) return false;
+                                                
+                                                // Check if same CRC, date, site
+                                                if (e.crcId === crc.id && e.date === formDate && e.siteId === formSiteId) {
+                                                    // Check if any study overlap
+                                                    if (formStudyIds.length > 0 && e.studyIds && e.studyIds.length > 0) {
+                                                        return formStudyIds.some(sid => e.studyIds.includes(sid));
+                                                    }
+                                                    return true;
+                                                }
+                                                return false;
+                                            });
+                                            
+                                            conflictEvents.forEach(e => {
+                                                const eventRoles = getEventRoles(e);
+                                                alreadyAssignedRoles.push(...eventRoles);
+                                            });
+                                        }
+                                        
+                                        // Also check if this CRC is selected in OTHER role dropdowns in THIS form
+                                        const allRoleSelects = form.querySelectorAll('select[name^="role-"]');
+                                        const currentRolePrefix = 'role-' + roleId + '-';
+                                        allRoleSelects.forEach(select => {
+                                            // Skip the current role's dropdowns
+                                            if (select.name.startsWith(currentRolePrefix)) return;
+                                            
+                                            if (select.value === crc.id) {
+                                                // Extract role name from the select
+                                                const selectRoleId = select.name.split('-')[1];
+                                                const conflictRole = state.roles.find(r => r.id === selectRoleId);
+                                                if (conflictRole && !alreadyAssignedRoles.includes(conflictRole.name)) {
+                                                    alreadyAssignedRoles.push(conflictRole.name);
+                                                }
+                                            }
+                                        });
+                                                    
+                                        let statusText = '';
+                                        let optionStyle = '';
+                                        if (isUnavailable) {
+                                            statusText = ' (Unavailable)';
+                                        } else if (alreadyAssignedRoles.length > 0) {
+                                            statusText = ' ⚠️ Already in: ' + alreadyAssignedRoles.join(', ');
+                                            optionStyle = ' style="color: #f59e0b; font-weight: bold;"';
+                                        }
+                                        
+                                        return '<option value="' + crc.id + '" ' + (isCurrentlySelected ? 'selected' : '') + optionStyle + '>' + crc.name + statusText + '</option>';
+                                    }).join('');
+                                    
+                                    const noQualifiedMsg = state.crcs.filter(crc => hasValidTraining(crc, role.name)).length === 0 
+                                        ? '<option value="" disabled>No qualified staff available</option>' 
+                                        : '';
+                                    
                                     return `
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
                                             <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                 <option value="">Select Staff</option>
-                                                ${state.crcs.filter(crc => hasValidTraining(crc, role.name)).map(crc => {
-                                                    const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                                                    const isCurrentlySelected = crc.id === existingCrcId;
-                                                    
-                                                    let statusText = '';
-                                                    if (isUnavailable) statusText = ' (Unavailable)';
-                                                    
-                                                    return `<option value="${crc.id}" ${isCurrentlySelected ? 'selected' : ''}>${crc.name}${statusText}</option>`;
-                                                }).join('')}
-                                                ${state.crcs.filter(crc => hasValidTraining(crc, role.name)).length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
+                                                ${crcOptionsHtml}
+                                                ${noQualifiedMsg}
                                             </select>
                                         </div>
                                     `;
                                 }).join('')}
                             </div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">⚠️ indicates conflict - can be overridden if needed</p>
                         </div>
                     `;
                 });
