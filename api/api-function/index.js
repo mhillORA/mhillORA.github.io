@@ -1,15 +1,16 @@
 const { CosmosClient } = require('@azure/cosmos');
 
-// Cosmos DB configuration
-const COSMOS_ENDPOINT = 'https://ora-clinical-recruiting.documents.azure.com:443/';
-const COSMOS_KEY = 'rl7a83apOq35OqfKpNt7hTRyeeQVftD8SHitw2QW0w7Kd1S39YJfeZEm29fGQapYumgh0Bm6NEbjACDbH1iO9g==';
-const DATABASE_ID = 'crcscheduling';
+// Get from environment variables
+const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
+const COSMOS_KEY = process.env.COSMOS_KEY;
+const DATABASE_ID = process.env.DATABASE_ID;
 
 const client = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
 const database = client.database(DATABASE_ID);
 
 module.exports = async function (context, req) {
-    context.log('Processing request:', req.method, req.url);
+    // ... rest of your API code
+};
 
     try {
         // Handle CORS
