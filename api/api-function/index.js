@@ -1,9 +1,9 @@
 const { CosmosClient } = require('@azure/cosmos');
 
-// Cosmos DB configuration
-const COSMOS_ENDPOINT = 'https://ora-clinical-recruiting.documents.azure.com:443/';
-const COSMOS_KEY = 'rl7a83apOq35OqfKpNt7hTRyeeQVftD8SHitw2QW0w7Kd1S39YJfeZEm29fGQapYumgh0Bm6NEbjACDbH1iO9g==';
-const DATABASE_ID = 'crcscheduling';
+// Get from environment variables
+const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
+const COSMOS_KEY = process.env.COSMOS_KEY;
+const DATABASE_ID = process.env.DATABASE_ID;
 
 const client = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
 const database = client.database(DATABASE_ID);
@@ -40,10 +40,10 @@ module.exports = async function (context, req) {
                     context.res.status = 201;
                     context.res.body = resource;
                 } else if (req.method === 'PUT' && id) {
-                    const { resource } = await database.container('studies').item(id, id).replace(req.body);
+                    const { resource } = await database.container('studies').item(id, '/id').replace(req.body);
                     context.res.body = resource;
                 } else if (req.method === 'DELETE' && id) {
-                    await database.container('studies').item(id, id).delete();
+                    await database.container('studies').item(id, '/id').delete();
                     context.res.status = 204;
                 }
                 break;
@@ -57,10 +57,10 @@ module.exports = async function (context, req) {
                     context.res.status = 201;
                     context.res.body = resource;
                 } else if (req.method === 'PUT' && id) {
-                    const { resource } = await database.container('sites').item(id, id).replace(req.body);
+                    const { resource } = await database.container('sites').item(id, '/id').replace(req.body);
                     context.res.body = resource;
                 } else if (req.method === 'DELETE' && id) {
-                    await database.container('sites').item(id, id).delete();
+                    await database.container('sites').item(id, '/id').delete();
                     context.res.status = 204;
                 }
                 break;
@@ -74,7 +74,7 @@ module.exports = async function (context, req) {
                     context.res.status = 201;
                     context.res.body = resource;
                 } else if (req.method === 'PUT' && id) {
-                    const { resource } = await database.container('patients').item(id, id).replace(req.body);
+                    const { resource } = await database.container('patients').item(id, '/id').replace(req.body);
                     context.res.body = resource;
                 }
                 break;
@@ -88,10 +88,10 @@ module.exports = async function (context, req) {
                     context.res.status = 201;
                     context.res.body = resource;
                 } else if (req.method === 'PUT' && id) {
-                    const { resource } = await database.container('crcs').item(id, id).replace(req.body);
+                    const { resource } = await database.container('crcs').item(id, '/id').replace(req.body);
                     context.res.body = resource;
                 } else if (req.method === 'DELETE' && id) {
-                    await database.container('crcs').item(id, id).delete();
+                    await database.container('crcs').item(id, '/id').delete();
                     context.res.status = 204;
                 }
                 break;
@@ -106,10 +106,10 @@ module.exports = async function (context, req) {
                     context.res.status = 201;
                     context.res.body = resource;
                 } else if (req.method === 'PUT' && id) {
-                    const { resource } = await database.container('events').item(id, id).replace(req.body);
+                    const { resource } = await database.container('events').item(id, '/id').replace(req.body);
                     context.res.body = resource;
                 } else if (req.method === 'DELETE' && id) {
-                    await database.container('events').item(id, id).delete();
+                    await database.container('events').item(id, '/id').delete();
                     context.res.status = 204;
                 }
                 break;
@@ -123,10 +123,10 @@ module.exports = async function (context, req) {
                     context.res.status = 201;
                     context.res.body = resource;
                 } else if (req.method === 'PUT' && id) {
-                    const { resource } = await database.container('schedules').item(id, id).replace(req.body);
+                    const { resource } = await database.container('schedules').item(id, '/id').replace(req.body);
                     context.res.body = resource;
                 } else if (req.method === 'DELETE' && id) {
-                    await database.container('schedules').item(id, id).delete();
+                    await database.container('schedules').item(id, '/id').delete();
                     context.res.status = 204;
                 }
                 break;
@@ -140,10 +140,10 @@ module.exports = async function (context, req) {
                     context.res.status = 201;
                     context.res.body = resource;
                 } else if (req.method === 'PUT' && id) {
-                    const { resource } = await database.container('surveys').item(id, id).replace(req.body);
+                    const { resource } = await database.container('surveys').item(id, '/id').replace(req.body);
                     context.res.body = resource;
                 } else if (req.method === 'DELETE' && id) {
-                    await database.container('surveys').item(id, id).delete();
+                    await database.container('surveys').item(id, '/id').delete();
                     context.res.status = 204;
                 }
                 break;
@@ -157,10 +157,10 @@ module.exports = async function (context, req) {
                     context.res.status = 201;
                     context.res.body = resource;
                 } else if (req.method === 'PUT' && id) {
-                    const { resource } = await database.container('roles').item(id, id).replace(req.body);
+                    const { resource } = await database.container('roles').item(id, '/id').replace(req.body);
                     context.res.body = resource;
                 } else if (req.method === 'DELETE' && id) {
-                    await database.container('roles').item(id, id).delete();
+                    await database.container('roles').item(id, '/id').delete();
                     context.res.status = 204;
                 }
                 break;
