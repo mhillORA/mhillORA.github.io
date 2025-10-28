@@ -176,3 +176,19 @@ app.http('training-types', {
     route: 'training-types/{id?}',
     handler: (request, context) => crudHandler(context, request, 'training_types'),
 });
+
+// --- ADDED HANDLERS ---
+
+app.http('schedules', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'schedules/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'schedules'),
+});
+
+app.http('surveys', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'surveys/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'surveys'),
+});
