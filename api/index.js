@@ -1,7 +1,7 @@
 const { app, HttpRequest, InvocationContext } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
-// --- DATABASE CLIENT INITIALIZATION (Secure) ---
+// --- DATABASE CLIENT INITIALIZATION (Secures) ---
 let cosmosClient = null;
 const getCosmosClient = () => {
     if (!cosmosClient) {
