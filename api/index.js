@@ -102,8 +102,9 @@ async function crudHandler(context, request, containerName) {
                 return { status: 201, jsonBody: createdItem };
             
             case 'PUT':
-                const updateId = id || (await request.json()).id;
-                const updatedItem = { ...(await request.json()), id: updateId };
+                const requestBody = await request.json();
+                const updateId = id || requestBody.id;
+                const updatedItem = { ...requestBody, id: updateId };
                 const { resource: result } = await container.item(updateId).replace(updatedItem);
                 return { jsonBody: result };
 
