@@ -29,35 +29,17 @@ const getContainer = (containerName) => {
     return database.container(containerName);
 };
 
-// Helper function to handle CORS
-const setCorsHeaders = (response) => {
-    response.headers = {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        'Content-Type': 'application/json'
-    };
-};
-
-// Helper function to handle errors
-const handleError = (response, error, message) => {
-    console.error(`${message}:`, error);
-    setCorsHeaders(response);
-    response.status = 500;
-    response.body = { error: error.message };
-};
-
-// Main API function that handles all routes
-app.http('api', {
+// Studies endpoint
+app.http('studies', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
-    route: 'api/{*path}',
+    route: 'studies/{id?}',
     handler: async (request, context) => {
-        const { method, url } = request;
+        const { method } = request;
+        const id = request.params.id;
         
         // Handle CORS preflight
         if (method === 'OPTIONS') {
-            setCorsHeaders(request);
             return {
                 status: 200,
                 headers: {
@@ -69,39 +51,51 @@ app.http('api', {
         }
 
         try {
-            // Parse the URL to get the endpoint
-            const urlPath = url.replace('/api', '');
-            const pathParts = urlPath.split('/').filter(part => part);
-            const endpoint = pathParts[0];
-            const id = pathParts[1];
-
-            console.log(`API Request: ${method} ${urlPath}`);
-
-            // Route handling
-            switch (endpoint) {
-                case 'studies':
-                    return await handleStudies(request, method, id);
-                case 'sites':
-                    return await handleSites(request, method, id);
-                case 'patients':
-                    return await handlePatients(request, method, id);
-                case 'crcs':
-                    return await handleCrcs(request, method, id);
-                case 'events':
-                    return await handleEvents(request, method, id);
-                case 'roles':
-                    return await handleRoles(request, method, id);
-                case 'training-types':
-                    return await handleTrainingTypes(request, method, id);
-                default:
+            console.log(`Studies API Request: ${method} ${id ? `with id: ${id}` : 'all'}`);
+            const container = getContainer('studies');
+            
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resource
+                        };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resources
+                        };
+                    }
+                case 'POST':
+                    const newStudy = { ...request.json(), id: generateId() };
+                    const { resource: createdStudy } = await container.items.create(newStudy);
                     return {
-                        status: 404,
+                        status: 201,
                         headers: { 'Content-Type': 'application/json' },
-                        body: { error: 'Endpoint not found' }
+                        body: createdStudy
+                    };
+                case 'PUT':
+                    const updatedStudy = { ...request.json(), id };
+                    const { resource: studyResult } = await container.item(id).replace(updatedStudy);
+                    return {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: studyResult
+                    };
+                case 'DELETE':
+                    await container.item(id).delete();
+                    return {
+                        status: 204,
+                        headers: { 'Content-Type': 'application/json' }
                     };
             }
         } catch (error) {
-            console.error('API Error:', error);
+            console.error('Studies API Error:', error);
             return {
                 status: 500,
                 headers: { 'Content-Type': 'application/json' },
@@ -111,310 +105,444 @@ app.http('api', {
     }
 });
 
-// Studies handler
-async function handleStudies(request, method, id) {
-    const container = getContainer('studies');
-    
-    switch (method) {
-        case 'GET':
-            if (id) {
-                const { resource } = await container.item(id).read();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resource
-                };
-            } else {
-                const { resources } = await container.items.readAll().fetchAll();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resources
-                };
-            }
-        case 'POST':
-            const newStudy = { ...request.json(), id: generateId() };
-            const { resource: createdStudy } = await container.items.create(newStudy);
-            return {
-                status: 201,
-                headers: { 'Content-Type': 'application/json' },
-                body: createdStudy
-            };
-        case 'PUT':
-            const updatedStudy = { ...request.json(), id };
-            const { resource: studyResult } = await container.item(id).replace(updatedStudy);
+// Sites endpoint
+app.http('sites', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'sites/{id?}',
+    handler: async (request, context) => {
+        const { method } = request;
+        const id = request.params.id;
+        
+        // Handle CORS preflight
+        if (method === 'OPTIONS') {
             return {
                 status: 200,
-                headers: { 'Content-Type': 'application/json' },
-                body: studyResult
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                }
             };
-        case 'DELETE':
-            await container.item(id).delete();
-            return {
-                status: 204,
-                headers: { 'Content-Type': 'application/json' }
-            };
-    }
-}
+        }
 
-// Sites handler
-async function handleSites(request, method, id) {
-    const container = getContainer('sites');
-    
-    switch (method) {
-        case 'GET':
-            if (id) {
-                const { resource } = await container.item(id).read();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resource
-                };
-            } else {
-                const { resources } = await container.items.readAll().fetchAll();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resources
-                };
+        try {
+            console.log(`Sites API Request: ${method} ${id ? `with id: ${id}` : 'all'}`);
+            const container = getContainer('sites');
+            
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resource
+                        };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resources
+                        };
+                    }
+                case 'POST':
+                    const newSite = { ...request.json(), id: generateId() };
+                    const { resource: createdSite } = await container.items.create(newSite);
+                    return {
+                        status: 201,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: createdSite
+                    };
+                case 'PUT':
+                    const updatedSite = { ...request.json(), id };
+                    const { resource: siteResult } = await container.item(id).replace(updatedSite);
+                    return {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: siteResult
+                    };
+                case 'DELETE':
+                    await container.item(id).delete();
+                    return {
+                        status: 204,
+                        headers: { 'Content-Type': 'application/json' }
+                    };
             }
-        case 'POST':
-            const newSite = { ...request.json(), id: generateId() };
-            const { resource: createdSite } = await container.items.create(newSite);
+        } catch (error) {
+            console.error('Sites API Error:', error);
             return {
-                status: 201,
+                status: 500,
                 headers: { 'Content-Type': 'application/json' },
-                body: createdSite
+                body: { error: error.message }
             };
-        case 'PUT':
-            const updatedSite = { ...request.json(), id };
-            const { resource: siteResult } = await container.item(id).replace(updatedSite);
+        }
+    }
+});
+
+// Patients endpoint
+app.http('patients', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patients/{id?}',
+    handler: async (request, context) => {
+        const { method } = request;
+        const id = request.params.id;
+        
+        // Handle CORS preflight
+        if (method === 'OPTIONS') {
             return {
                 status: 200,
-                headers: { 'Content-Type': 'application/json' },
-                body: siteResult
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                }
             };
-        case 'DELETE':
-            await container.item(id).delete();
-            return {
-                status: 204,
-                headers: { 'Content-Type': 'application/json' }
-            };
-    }
-}
+        }
 
-// Patients handler
-async function handlePatients(request, method, id) {
-    const container = getContainer('patients');
-    
-    switch (method) {
-        case 'GET':
-            if (id) {
-                const { resource } = await container.item(id).read();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resource
-                };
-            } else {
-                const { resources } = await container.items.readAll().fetchAll();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resources
-                };
+        try {
+            console.log(`Patients API Request: ${method} ${id ? `with id: ${id}` : 'all'}`);
+            const container = getContainer('patients');
+            
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resource
+                        };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resources
+                        };
+                    }
+                case 'POST':
+                    const newPatient = { ...request.json(), id: generateId() };
+                    const { resource: createdPatient } = await container.items.create(newPatient);
+                    return {
+                        status: 201,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: createdPatient
+                    };
+                case 'PUT':
+                    const updatedPatient = { ...request.json(), id };
+                    const { resource: patientResult } = await container.item(id).replace(updatedPatient);
+                    return {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: patientResult
+                    };
+                case 'DELETE':
+                    await container.item(id).delete();
+                    return {
+                        status: 204,
+                        headers: { 'Content-Type': 'application/json' }
+                    };
             }
-        case 'POST':
-            const newPatient = { ...request.json(), id: generateId() };
-            const { resource: createdPatient } = await container.items.create(newPatient);
+        } catch (error) {
+            console.error('Patients API Error:', error);
             return {
-                status: 201,
+                status: 500,
                 headers: { 'Content-Type': 'application/json' },
-                body: createdPatient
+                body: { error: error.message }
             };
-        case 'PUT':
-            const updatedPatient = { ...request.json(), id };
-            const { resource: patientResult } = await container.item(id).replace(updatedPatient);
+        }
+    }
+});
+
+// CRCs endpoint
+app.http('crcs', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'crcs/{id?}',
+    handler: async (request, context) => {
+        const { method } = request;
+        const id = request.params.id;
+        
+        // Handle CORS preflight
+        if (method === 'OPTIONS') {
             return {
                 status: 200,
-                headers: { 'Content-Type': 'application/json' },
-                body: patientResult
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                }
             };
-        case 'DELETE':
-            await container.item(id).delete();
-            return {
-                status: 204,
-                headers: { 'Content-Type': 'application/json' }
-            };
-    }
-}
+        }
 
-// CRCs handler
-async function handleCrcs(request, method, id) {
-    const container = getContainer('crcs');
-    
-    switch (method) {
-        case 'GET':
-            if (id) {
-                const { resource } = await container.item(id).read();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resource
-                };
-            } else {
-                const { resources } = await container.items.readAll().fetchAll();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resources
-                };
+        try {
+            console.log(`CRCs API Request: ${method} ${id ? `with id: ${id}` : 'all'}`);
+            const container = getContainer('crcs');
+            
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resource
+                        };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resources
+                        };
+                    }
+                case 'POST':
+                    const newCrc = { ...request.json(), id: generateId() };
+                    const { resource: createdCrc } = await container.items.create(newCrc);
+                    return {
+                        status: 201,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: createdCrc
+                    };
+                case 'PUT':
+                    const updatedCrc = { ...request.json(), id };
+                    const { resource: crcResult } = await container.item(id).replace(updatedCrc);
+                    return {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: crcResult
+                    };
+                case 'DELETE':
+                    await container.item(id).delete();
+                    return {
+                        status: 204,
+                        headers: { 'Content-Type': 'application/json' }
+                    };
             }
-        case 'POST':
-            const newCrc = { ...request.json(), id: generateId() };
-            const { resource: createdCrc } = await container.items.create(newCrc);
+        } catch (error) {
+            console.error('CRCs API Error:', error);
             return {
-                status: 201,
+                status: 500,
                 headers: { 'Content-Type': 'application/json' },
-                body: createdCrc
+                body: { error: error.message }
             };
-        case 'PUT':
-            const updatedCrc = { ...request.json(), id };
-            const { resource: crcResult } = await container.item(id).replace(updatedCrc);
+        }
+    }
+});
+
+// Events endpoint
+app.http('events', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'events/{id?}',
+    handler: async (request, context) => {
+        const { method } = request;
+        const id = request.params.id;
+        
+        // Handle CORS preflight
+        if (method === 'OPTIONS') {
             return {
                 status: 200,
-                headers: { 'Content-Type': 'application/json' },
-                body: crcResult
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                }
             };
-        case 'DELETE':
-            await container.item(id).delete();
-            return {
-                status: 204,
-                headers: { 'Content-Type': 'application/json' }
-            };
-    }
-}
+        }
 
-// Events handler
-async function handleEvents(request, method, id) {
-    const container = getContainer('events');
-    
-    switch (method) {
-        case 'GET':
-            if (id) {
-                const { resource } = await container.item(id).read();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resource
-                };
-            } else {
-                const { resources } = await container.items.readAll().fetchAll();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resources
-                };
+        try {
+            console.log(`Events API Request: ${method} ${id ? `with id: ${id}` : 'all'}`);
+            const container = getContainer('events');
+            
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resource
+                        };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resources
+                        };
+                    }
+                case 'POST':
+                    const newEvent = { ...request.json(), id: generateId() };
+                    const { resource: createdEvent } = await container.items.create(newEvent);
+                    return {
+                        status: 201,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: createdEvent
+                    };
+                case 'PUT':
+                    const updatedEvent = { ...request.json(), id };
+                    const { resource: eventResult } = await container.item(id).replace(updatedEvent);
+                    return {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: eventResult
+                    };
+                case 'DELETE':
+                    await container.item(id).delete();
+                    return {
+                        status: 204,
+                        headers: { 'Content-Type': 'application/json' }
+                    };
             }
-        case 'POST':
-            const newEvent = { ...request.json(), id: generateId() };
-            const { resource: createdEvent } = await container.items.create(newEvent);
+        } catch (error) {
+            console.error('Events API Error:', error);
             return {
-                status: 201,
+                status: 500,
                 headers: { 'Content-Type': 'application/json' },
-                body: createdEvent
+                body: { error: error.message }
             };
-        case 'PUT':
-            const updatedEvent = { ...request.json(), id };
-            const { resource: eventResult } = await container.item(id).replace(updatedEvent);
+        }
+    }
+});
+
+// Roles endpoint
+app.http('roles', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'roles/{id?}',
+    handler: async (request, context) => {
+        const { method } = request;
+        const id = request.params.id;
+        
+        // Handle CORS preflight
+        if (method === 'OPTIONS') {
             return {
                 status: 200,
-                headers: { 'Content-Type': 'application/json' },
-                body: eventResult
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                }
             };
-        case 'DELETE':
-            await container.item(id).delete();
-            return {
-                status: 204,
-                headers: { 'Content-Type': 'application/json' }
-            };
-    }
-}
+        }
 
-// Roles handler
-async function handleRoles(request, method, id) {
-    const container = getContainer('roles');
-    
-    switch (method) {
-        case 'GET':
-            if (id) {
-                const { resource } = await container.item(id).read();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resource
-                };
-            } else {
-                const { resources } = await container.items.readAll().fetchAll();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resources
-                };
+        try {
+            console.log(`Roles API Request: ${method} ${id ? `with id: ${id}` : 'all'}`);
+            const container = getContainer('roles');
+            
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resource
+                        };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resources
+                        };
+                    }
+                case 'POST':
+                    const newRole = { ...request.json(), id: generateId() };
+                    const { resource: createdRole } = await container.items.create(newRole);
+                    return {
+                        status: 201,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: createdRole
+                    };
+                case 'PUT':
+                    const updatedRole = { ...request.json(), id };
+                    const { resource: roleResult } = await container.item(id).replace(updatedRole);
+                    return {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: roleResult
+                    };
+                case 'DELETE':
+                    await container.item(id).delete();
+                    return {
+                        status: 204,
+                        headers: { 'Content-Type': 'application/json' }
+                    };
             }
-        case 'POST':
-            const newRole = { ...request.json(), id: generateId() };
-            const { resource: createdRole } = await container.items.create(newRole);
+        } catch (error) {
+            console.error('Roles API Error:', error);
             return {
-                status: 201,
+                status: 500,
                 headers: { 'Content-Type': 'application/json' },
-                body: createdRole
+                body: { error: error.message }
             };
-        case 'PUT':
-            const updatedRole = { ...request.json(), id };
-            const { resource: roleResult } = await container.item(id).replace(updatedRole);
+        }
+    }
+});
+
+// Training Types endpoint
+app.http('training-types', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'training-types/{id?}',
+    handler: async (request, context) => {
+        const { method } = request;
+        const id = request.params.id;
+        
+        // Handle CORS preflight
+        if (method === 'OPTIONS') {
             return {
                 status: 200,
-                headers: { 'Content-Type': 'application/json' },
-                body: roleResult
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                }
             };
-        case 'DELETE':
-            await container.item(id).delete();
-            return {
-                status: 204,
-                headers: { 'Content-Type': 'application/json' }
-            };
-    }
-}
+        }
 
-// Training Types handler
-async function handleTrainingTypes(request, method, id) {
-    const container = getContainer('training_types');
-    
-    switch (method) {
-        case 'GET':
-            if (id) {
-                const { resource } = await container.item(id).read();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resource
-                };
-            } else {
-                const { resources } = await container.items.readAll().fetchAll();
-                return {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: resources
-                };
+        try {
+            console.log(`Training Types API Request: ${method} ${id ? `with id: ${id}` : 'all'}`);
+            const container = getContainer('training_types');
+            
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resource
+                        };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: resources
+                        };
+                    }
+                case 'POST':
+                    const newTrainingType = { ...request.json(), id: generateId() };
+                    const { resource: createdTrainingType } = await container.items.create(newTrainingType);
+                    return {
+                        status: 201,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: createdTrainingType
+                    };
             }
-        case 'POST':
-            const newTrainingType = { ...request.json(), id: generateId() };
-            const { resource: createdTrainingType } = await container.items.create(newTrainingType);
+        } catch (error) {
+            console.error('Training Types API Error:', error);
             return {
-                status: 201,
+                status: 500,
                 headers: { 'Content-Type': 'application/json' },
-                body: createdTrainingType
+                body: { error: error.message }
             };
+        }
     }
-}
+});
