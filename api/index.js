@@ -1,3 +1,4 @@
+const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
 // Helper function to generate unique IDs
@@ -29,8 +30,8 @@ const getContainer = (containerName) => {
 };
 
 // Helper function to handle CORS
-const setCorsHeaders = (res) => {
-    res.headers = {
+const setCorsHeaders = (response) => {
+    response.headers = {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization',
@@ -39,329 +40,381 @@ const setCorsHeaders = (res) => {
 };
 
 // Helper function to handle errors
-const handleError = (res, error, message) => {
+const handleError = (response, error, message) => {
     console.error(`${message}:`, error);
-    setCorsHeaders(res);
-    res.status = 500;
-    res.body = { error: error.message };
+    setCorsHeaders(response);
+    response.status = 500;
+    response.body = { error: error.message };
 };
 
-module.exports = async function (context, req) {
-    const { method, url } = req;
-    
-    // Handle CORS preflight
-    if (method === 'OPTIONS') {
-        setCorsHeaders(context.res);
-        context.res.status = 200;
-        return;
-    }
-
-    try {
-        // Parse the URL to get the endpoint
-        const urlPath = url.replace('/api', '');
-        const pathParts = urlPath.split('/').filter(part => part);
-        const endpoint = pathParts[0];
-        const id = pathParts[1];
-
-        console.log(`API Request: ${method} ${urlPath}`);
-
-        // Route handling
-        switch (endpoint) {
-            case 'studies':
-                await handleStudies(context, req, method, id);
-                break;
-            case 'sites':
-                await handleSites(context, req, method, id);
-                break;
-            case 'patients':
-                await handlePatients(context, req, method, id);
-                break;
-            case 'crcs':
-                await handleCrcs(context, req, method, id);
-                break;
-            case 'events':
-                await handleEvents(context, req, method, id);
-                break;
-            case 'roles':
-                await handleRoles(context, req, method, id);
-                break;
-            case 'training-types':
-                await handleTrainingTypes(context, req, method, id);
-                break;
-            default:
-                setCorsHeaders(context.res);
-                context.res.status = 404;
-                context.res.body = { error: 'Endpoint not found' };
+// Main API function that handles all routes
+app.http('api', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'api/{*path}',
+    handler: async (request, context) => {
+        const { method, url } = request;
+        
+        // Handle CORS preflight
+        if (method === 'OPTIONS') {
+            setCorsHeaders(request);
+            return {
+                status: 200,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                }
+            };
         }
-    } catch (error) {
-        handleError(context.res, error, 'API Error');
+
+        try {
+            // Parse the URL to get the endpoint
+            const urlPath = url.replace('/api', '');
+            const pathParts = urlPath.split('/').filter(part => part);
+            const endpoint = pathParts[0];
+            const id = pathParts[1];
+
+            console.log(`API Request: ${method} ${urlPath}`);
+
+            // Route handling
+            switch (endpoint) {
+                case 'studies':
+                    return await handleStudies(request, method, id);
+                case 'sites':
+                    return await handleSites(request, method, id);
+                case 'patients':
+                    return await handlePatients(request, method, id);
+                case 'crcs':
+                    return await handleCrcs(request, method, id);
+                case 'events':
+                    return await handleEvents(request, method, id);
+                case 'roles':
+                    return await handleRoles(request, method, id);
+                case 'training-types':
+                    return await handleTrainingTypes(request, method, id);
+                default:
+                    return {
+                        status: 404,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: { error: 'Endpoint not found' }
+                    };
+            }
+        } catch (error) {
+            console.error('API Error:', error);
+            return {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' },
+                body: { error: error.message }
+            };
+        }
     }
-};
+});
 
 // Studies handler
-async function handleStudies(context, req, method, id) {
+async function handleStudies(request, method, id) {
     const container = getContainer('studies');
     
     switch (method) {
         case 'GET':
             if (id) {
                 const { resource } = await container.item(id).read();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resource;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resource
+                };
             } else {
                 const { resources } = await container.items.readAll().fetchAll();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resources;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resources
+                };
             }
-            break;
         case 'POST':
-            const newStudy = { ...req.body, id: generateId() };
+            const newStudy = { ...request.json(), id: generateId() };
             const { resource: createdStudy } = await container.items.create(newStudy);
-            setCorsHeaders(context.res);
-            context.res.status = 201;
-            context.res.body = createdStudy;
-            break;
+            return {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+                body: createdStudy
+            };
         case 'PUT':
-            const updatedStudy = { ...req.body, id };
+            const updatedStudy = { ...request.json(), id };
             const { resource: studyResult } = await container.item(id).replace(updatedStudy);
-            setCorsHeaders(context.res);
-            context.res.status = 200;
-            context.res.body = studyResult;
-            break;
+            return {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+                body: studyResult
+            };
         case 'DELETE':
             await container.item(id).delete();
-            setCorsHeaders(context.res);
-            context.res.status = 204;
-            break;
+            return {
+                status: 204,
+                headers: { 'Content-Type': 'application/json' }
+            };
     }
 }
 
 // Sites handler
-async function handleSites(context, req, method, id) {
+async function handleSites(request, method, id) {
     const container = getContainer('sites');
     
     switch (method) {
         case 'GET':
             if (id) {
                 const { resource } = await container.item(id).read();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resource;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resource
+                };
             } else {
                 const { resources } = await container.items.readAll().fetchAll();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resources;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resources
+                };
             }
-            break;
         case 'POST':
-            const newSite = { ...req.body, id: generateId() };
+            const newSite = { ...request.json(), id: generateId() };
             const { resource: createdSite } = await container.items.create(newSite);
-            setCorsHeaders(context.res);
-            context.res.status = 201;
-            context.res.body = createdSite;
-            break;
+            return {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+                body: createdSite
+            };
         case 'PUT':
-            const updatedSite = { ...req.body, id };
+            const updatedSite = { ...request.json(), id };
             const { resource: siteResult } = await container.item(id).replace(updatedSite);
-            setCorsHeaders(context.res);
-            context.res.status = 200;
-            context.res.body = siteResult;
-            break;
+            return {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+                body: siteResult
+            };
         case 'DELETE':
             await container.item(id).delete();
-            setCorsHeaders(context.res);
-            context.res.status = 204;
-            break;
+            return {
+                status: 204,
+                headers: { 'Content-Type': 'application/json' }
+            };
     }
 }
 
 // Patients handler
-async function handlePatients(context, req, method, id) {
+async function handlePatients(request, method, id) {
     const container = getContainer('patients');
     
     switch (method) {
         case 'GET':
             if (id) {
                 const { resource } = await container.item(id).read();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resource;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resource
+                };
             } else {
                 const { resources } = await container.items.readAll().fetchAll();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resources;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resources
+                };
             }
-            break;
         case 'POST':
-            const newPatient = { ...req.body, id: generateId() };
+            const newPatient = { ...request.json(), id: generateId() };
             const { resource: createdPatient } = await container.items.create(newPatient);
-            setCorsHeaders(context.res);
-            context.res.status = 201;
-            context.res.body = createdPatient;
-            break;
+            return {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+                body: createdPatient
+            };
         case 'PUT':
-            const updatedPatient = { ...req.body, id };
+            const updatedPatient = { ...request.json(), id };
             const { resource: patientResult } = await container.item(id).replace(updatedPatient);
-            setCorsHeaders(context.res);
-            context.res.status = 200;
-            context.res.body = patientResult;
-            break;
+            return {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+                body: patientResult
+            };
         case 'DELETE':
             await container.item(id).delete();
-            setCorsHeaders(context.res);
-            context.res.status = 204;
-            break;
+            return {
+                status: 204,
+                headers: { 'Content-Type': 'application/json' }
+            };
     }
 }
 
 // CRCs handler
-async function handleCrcs(context, req, method, id) {
+async function handleCrcs(request, method, id) {
     const container = getContainer('crcs');
     
     switch (method) {
         case 'GET':
             if (id) {
                 const { resource } = await container.item(id).read();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resource;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resource
+                };
             } else {
                 const { resources } = await container.items.readAll().fetchAll();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resources;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resources
+                };
             }
-            break;
         case 'POST':
-            const newCrc = { ...req.body, id: generateId() };
+            const newCrc = { ...request.json(), id: generateId() };
             const { resource: createdCrc } = await container.items.create(newCrc);
-            setCorsHeaders(context.res);
-            context.res.status = 201;
-            context.res.body = createdCrc;
-            break;
+            return {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+                body: createdCrc
+            };
         case 'PUT':
-            const updatedCrc = { ...req.body, id };
+            const updatedCrc = { ...request.json(), id };
             const { resource: crcResult } = await container.item(id).replace(updatedCrc);
-            setCorsHeaders(context.res);
-            context.res.status = 200;
-            context.res.body = crcResult;
-            break;
+            return {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+                body: crcResult
+            };
         case 'DELETE':
             await container.item(id).delete();
-            setCorsHeaders(context.res);
-            context.res.status = 204;
-            break;
+            return {
+                status: 204,
+                headers: { 'Content-Type': 'application/json' }
+            };
     }
 }
 
 // Events handler
-async function handleEvents(context, req, method, id) {
+async function handleEvents(request, method, id) {
     const container = getContainer('events');
     
     switch (method) {
         case 'GET':
             if (id) {
                 const { resource } = await container.item(id).read();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resource;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resource
+                };
             } else {
                 const { resources } = await container.items.readAll().fetchAll();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resources;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resources
+                };
             }
-            break;
         case 'POST':
-            const newEvent = { ...req.body, id: generateId() };
+            const newEvent = { ...request.json(), id: generateId() };
             const { resource: createdEvent } = await container.items.create(newEvent);
-            setCorsHeaders(context.res);
-            context.res.status = 201;
-            context.res.body = createdEvent;
-            break;
+            return {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+                body: createdEvent
+            };
         case 'PUT':
-            const updatedEvent = { ...req.body, id };
+            const updatedEvent = { ...request.json(), id };
             const { resource: eventResult } = await container.item(id).replace(updatedEvent);
-            setCorsHeaders(context.res);
-            context.res.status = 200;
-            context.res.body = eventResult;
-            break;
+            return {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+                body: eventResult
+            };
         case 'DELETE':
             await container.item(id).delete();
-            setCorsHeaders(context.res);
-            context.res.status = 204;
-            break;
+            return {
+                status: 204,
+                headers: { 'Content-Type': 'application/json' }
+            };
     }
 }
 
 // Roles handler
-async function handleRoles(context, req, method, id) {
+async function handleRoles(request, method, id) {
     const container = getContainer('roles');
     
     switch (method) {
         case 'GET':
             if (id) {
                 const { resource } = await container.item(id).read();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resource;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resource
+                };
             } else {
                 const { resources } = await container.items.readAll().fetchAll();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resources;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resources
+                };
             }
-            break;
         case 'POST':
-            const newRole = { ...req.body, id: generateId() };
+            const newRole = { ...request.json(), id: generateId() };
             const { resource: createdRole } = await container.items.create(newRole);
-            setCorsHeaders(context.res);
-            context.res.status = 201;
-            context.res.body = createdRole;
-            break;
+            return {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+                body: createdRole
+            };
         case 'PUT':
-            const updatedRole = { ...req.body, id };
+            const updatedRole = { ...request.json(), id };
             const { resource: roleResult } = await container.item(id).replace(updatedRole);
-            setCorsHeaders(context.res);
-            context.res.status = 200;
-            context.res.body = roleResult;
-            break;
+            return {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+                body: roleResult
+            };
         case 'DELETE':
             await container.item(id).delete();
-            setCorsHeaders(context.res);
-            context.res.status = 204;
-            break;
+            return {
+                status: 204,
+                headers: { 'Content-Type': 'application/json' }
+            };
     }
 }
 
 // Training Types handler
-async function handleTrainingTypes(context, req, method, id) {
+async function handleTrainingTypes(request, method, id) {
     const container = getContainer('training_types');
     
     switch (method) {
         case 'GET':
             if (id) {
                 const { resource } = await container.item(id).read();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resource;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resource
+                };
             } else {
                 const { resources } = await container.items.readAll().fetchAll();
-                setCorsHeaders(context.res);
-                context.res.status = 200;
-                context.res.body = resources;
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: resources
+                };
             }
-            break;
         case 'POST':
-            const newTrainingType = { ...req.body, id: generateId() };
+            const newTrainingType = { ...request.json(), id: generateId() };
             const { resource: createdTrainingType } = await container.items.create(newTrainingType);
-            setCorsHeaders(context.res);
-            context.res.status = 201;
-            context.res.body = createdTrainingType;
-            break;
+            return {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+                body: createdTrainingType
+            };
     }
 }
