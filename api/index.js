@@ -8,6 +8,11 @@ const DATABASE_ID = process.env.DATABASE_ID || 'crcscheduling';
 const client = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
 const database = client.database(DATABASE_ID);
 
+// Helper function to generate unique IDs
+function generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2);
+}
+
 // Helper function to get container
 const getContainer = (containerName) => {
     return database.container(containerName);
@@ -349,9 +354,4 @@ async function handleTrainingTypes(context, req, method, id) {
             context.res.body = createdTrainingType;
             break;
     }
-}
-
-// Helper function to generate unique IDs
-function generateId() {
-    return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
