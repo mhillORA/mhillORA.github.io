@@ -1,20 +1,30 @@
 const { CosmosClient } = require('@azure/cosmos');
 
-// Cosmos DB configuration - using environment variables
-const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT || 'https://ora-clinical-recruiting.documents.azure.com:443/';
-const COSMOS_KEY = process.env.COSMOS_KEY || 'rl7a83apOq35OqfKpNt7hTRyeeQVftD8SHitw2QW0w7Kd1S39YJfeZEm29fGQapYumgh0Bm6NEbjACDbH1iO9g==';
-const DATABASE_ID = process.env.DATABASE_ID || 'crcscheduling';
-
-const client = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
-const database = client.database(DATABASE_ID);
-
 // Helper function to generate unique IDs
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
+// Helper function to get Cosmos DB client (lazy initialization)
+let cosmosClient = null;
+let database = null;
+
+const getCosmosClient = () => {
+    if (!cosmosClient) {
+        // Cosmos DB configuration - using environment variables with fallbacks
+        const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT || 'https://ora-clinical-recruiting.documents.azure.com:443/';
+        const COSMOS_KEY = process.env.COSMOS_KEY || 'rl7a83apOq35OqfKpNt7hTRyeeQVftD8SHitw2QW0w7Kd1S39YJfeZEm29fGQapYumgh0Bm6NEbjACDbH1iO9g==';
+        const DATABASE_ID = process.env.DATABASE_ID || 'crcscheduling';
+
+        cosmosClient = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
+        database = cosmosClient.database(DATABASE_ID);
+    }
+    return { client: cosmosClient, database };
+};
+
 // Helper function to get container
 const getContainer = (containerName) => {
+    const { database } = getCosmosClient();
     return database.container(containerName);
 };
 
