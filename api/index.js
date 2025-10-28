@@ -1,178 +1,163 @@
-const { app } = require('@azure/functions');
+const { app, HttpRequest, InvocationContext } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
-// Helper function to generate unique IDs
-function generateId() {
-    return Date.now().toString(36) + Math.random().toString(36).substr(2);
-}
-
-// Helper function to get Cosmos DB client (lazy initialization)
+// --- DATABASE CLIENT INITIALIZATION (Secure) ---
 let cosmosClient = null;
-let database = null;
-
 const getCosmosClient = () => {
     if (!cosmosClient) {
-        // --- SECURITY FIX: READ SECRETS ONLY FROM PROCESS.ENV ---
+        // Reads secrets from Azure Application Settings (Environment Variables)
         const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
         const COSMOS_KEY = process.env.COSMOS_KEY;
         const DATABASE_ID = process.env.DATABASE_ID;
-        // --------------------------------------------------------
 
         if (!COSMOS_ENDPOINT || !COSMOS_KEY || !DATABASE_ID) {
-            // CRITICAL: Throw a clear, custom error that can be caught and serialized.
-            throw new Error("COSMOS_DB_CONFIG_MISSING: Missing required Cosmos DB environment variables (Endpoint, Key, or Database ID). Check Azure Configuration.");
+            // CRITICAL: This throws an error that gives a 500 status instead of a silent crash.
+            throw new Error("COSMOS_DB_CONFIG_MISSING: Missing required environment variables (ENDPOINT, KEY, or DB_ID). Please configure settings in Azure Portal.");
         }
 
         cosmosClient = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
-        database = cosmosClient.database(DATABASE_ID);
     }
-    return { client: cosmosClient, database };
+    return { client: cosmosClient, database: cosmosClient.database(process.env.DATABASE_ID) };
 };
 
-// Helper function to get container
-const getContainer = (containerName) => {
-    const { database } = getCosmosClient();
-    return database.container(containerName);
-};
-
-// Helper function to handle errors
-// This is the V4-compatible error handler, returning a structured object
-const handleError = (context, error, message) => {
-    context.log.error(`${message}:`, error.message);
-    context.log.error(`Stack:`, error.stack);
-
-    let errorMessage;
-    if (error.message.includes('COSMOS_DB_CONFIG_MISSING')) {
-        errorMessage = "API Configuration Error: Database secrets not set in Azure Configuration.";
-    } else {
-        // For security, only return a generic message to the frontend client
-        errorMessage = "Internal Server Error during data processing.";
-    }
-
-    // Returning a structured V4 response that is guaranteed to be valid JSON
-    return {
-        status: 500,
-        jsonBody: { 
-            error: errorMessage,
-            // Only include detailed message in debug logs, not the response body
-        },
-        headers: {
-            // These headers are technically redundant as staticwebapp.config.json handles them, but good practice
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*'
+// Simplified CRUD Helper (Handles GET, POST, PUT, DELETE for all containers)
+async function handleCrud(req, context, container, id, containerName) {
+    // Attempt to parse body (handles JSON automatically for POST/PUT)
+    let body = req.body;
+    if (req.method === 'POST' || req.method === 'PUT') {
+        try {
+            body = req.body || JSON.parse(req.rawBody || '{}');
+        } catch (e) {
+            body = {};
         }
-    };
-};
-
-
-// =================================================================================
-// DEDICATED HANDLER FUNCTIONS (V4 compatible)
-// =================================================================================
-
-// Helper to get ID from V4 route parameter
-const getIdFromRequest = (request) => {
-    // V4 router provides route parameters in request.params
-    return request.params.id;
-};
-
-// --- Core CRUD Handlers (Template) ---
-async function crudHandler(context, request, containerName) {
-    // This is the first line to be executed inside the function, where the crash prevention starts
+    }
     
-    const container = getContainer(containerName);
-    const { method } = request;
-    const id = getIdFromRequest(request);
+    // Helper to generate a basic ID
+    const generateId = () => (Math.random() + 1).toString(36).substring(7) + Date.now().toString(36);
 
-    try {
-        switch (method) {
-            case 'GET':
-                if (id) {
-                    const { resource } = await container.item(id).read(); 
-                    if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
-                    return { jsonBody: resource };
-                } else {
-                    const { resources } = await container.items.readAll().fetchAll();
-                    return { jsonBody: resources };
-                }
-            
-            case 'POST':
-                const body = await request.json();
-                const newItem = { ...body, id: generateId() };
-                const { resource: createdItem } = await container.items.create(newItem);
-                return { status: 201, jsonBody: createdItem };
-            
-            case 'PUT':
-                const updateId = id || (await request.json()).id;
-                const updatedItem = { ...(await request.json()), id: updateId };
-                const { resource: result } = await container.item(updateId).replace(updatedItem);
-                return { jsonBody: result };
-
-            case 'DELETE':
-                await container.item(id).delete();
-                return { status: 204 };
-
-            case 'OPTIONS':
-                return { status: 200 };
-
-            default:
-                return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
-        }
-    } catch (error) {
-        // Catch any error during the database operation
-        return handleError(context, error, `Database operation failed on ${containerName}`);
+    switch (req.method) {
+        case 'GET':
+            if (id) {
+                // Read by ID (assuming /id partition key)
+                const { resource } = await container.item(id, id).read(); 
+                context.res.body = resource;
+            } else {
+                // Read all items
+                const { resources } = await container.items.readAll().fetchAll();
+                context.res.body = resources;
+            }
+            break;
+        case 'POST':
+            const newItem = { ...body, id: body.id || generateId() };
+            const { resource: postResource } = await container.items.create(newItem);
+            context.res.status = 201;
+            context.res.body = postResource;
+            break;
+        case 'PUT':
+            const updateId = id || body.id;
+            if (!updateId) {
+                context.res.status = 400;
+                context.res.body = { error: 'ID required for PUT operation' };
+                return;
+            }
+            // Replace item (assuming /id partition key)
+            const { resource: putResource } = await container.item(updateId, updateId).replace(body);
+            context.res.body = putResource;
+            break;
+        case 'DELETE':
+            if (!id) {
+                context.res.status = 400;
+                context.res.body = { error: 'ID required for DELETE operation' };
+                return;
+            }
+            // Delete item (assuming /id partition key)
+            await container.item(id, id).delete();
+            context.res.status = 204;
+            break;
+        case 'OPTIONS':
+            context.res.status = 200; // Explicitly handle CORS preflight
+            break;
+        default:
+            context.res.status = 405; // Method Not Allowed
+            context.res.body = { error: 'Method Not Allowed' };
+            break;
     }
 }
 
 
-// =================================================================================
-// V4 FUNCTION REGISTRATION (The Indexing that fixes the 404)
-// =================================================================================
+// --- CORE HANDLER LOGIC (V4 Router) ---
+const mainHandler = async (context, req) => {
+    // Set default response headers and status
+    context.res = {
+        status: 200,
+        headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+        },
+        body: {}
+    };
 
-app.http('studies', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'studies/{id?}', 
-    handler: (request, context) => crudHandler(context, request, 'studies'),
-});
+    if (req.method === 'OPTIONS') {
+        return;
+    }
 
-app.http('sites', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'sites/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'sites'),
-});
+    try {
+        const { database } = getCosmosClient();
 
-app.http('patients', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'patients/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'patients'),
-});
+        // 1. Determine resource and optional ID from the URL path
+        const urlParts = (req.url || '').split('/').filter(part => part);
+        const apiIndex = urlParts.indexOf('api');
+        
+        if (apiIndex === -1 || apiIndex === urlParts.length - 1) {
+            context.res.status = 404;
+            context.res.body = { error: 'API resource not specified' };
+            return;
+        }
 
-app.http('crcs', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'crcs/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'crcs'),
-});
+        const resource = urlParts[apiIndex + 1];
+        const id = urlParts[apiIndex + 2];
+        const containerName = (resource === 'events' || resource === 'crc_events') ? 'events' : resource;
 
-app.http('events', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'events/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'events'),
-});
+        // Route handling 
+        switch (containerName) {
+            case 'studies':
+            case 'sites':
+            case 'patients':
+            case 'crcs':
+            case 'roles':
+            // Add any other top-level containers here (e.g., 'training-types')
+            case 'training-types': 
+                await handleCrud(req, context, database.container(containerName), id, containerName);
+                break;
+            case 'events':
+                // Handles /api/events and /api/crc_events
+                await handleCrud(req, context, database.container('events'), id, 'events');
+                break;
+            default:
+                context.res.status = 404;
+                context.res.body = { error: `Resource not found: /api/${resource}` };
+                break;
+        }
 
-app.http('roles', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'roles/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'roles'),
-});
+    } catch (error) {
+        context.res.status = 500;
+        context.res.body = { error: error.message || 'Internal Server Error (Check Azure Logs)' };
+        context.log.error('FATAL API CRASH:', error.message);
+    }
+    
+    // Final serialization check
+    if (typeof context.res.body === 'object' && context.res.status !== 204) {
+        context.res.body = JSON.stringify(context.res.body);
+    }
+};
 
-app.http('training-types', {
+// --- V4 FUNCTION REGISTRATION ---
+// Register ONE generic function that catches all /api calls.
+app.http('router', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'training-types/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'training_types'),
+    authLevel: 'anonymous',
+    route: '{*path}', 
+    handler: mainHandler
 });
