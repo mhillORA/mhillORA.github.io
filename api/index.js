@@ -68,58 +68,112 @@ const getIdFromRequest = (request) => {
 const validateStudiesSchema = (data) => {
     const errors = [];
     
-    if (!data.title || typeof data.title !== 'string') {
-        errors.push('title is required and must be a string');
-    }
+    // Debug logging
+    console.log('Validating study data:', JSON.stringify(data, null, 2));
     
-    if (data.protocolNumber && typeof data.protocolNumber !== 'string') {
-        errors.push('protocolNumber must be a string');
-    }
+    // Check if this is CHAOS format (has name, color, requiredRoles, sites)
+    const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
     
-    if (data.target !== undefined && (typeof data.target !== 'number' || data.target < 0)) {
-        errors.push('target must be a non-negative number');
-    }
+    console.log('Is CHAOS format:', isChaosFormat);
     
-    if (data.status && !['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended'].includes(data.status)) {
-        errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended');
-    }
-    
-    if (data.indication && !Array.isArray(data.indication)) {
-        errors.push('indication must be an array');
-    }
-    
-    if (data.siteIds && !Array.isArray(data.siteIds)) {
-        errors.push('siteIds must be an array');
-    }
-    
-    if (data.washoutDays !== undefined && (typeof data.washoutDays !== 'number' || data.washoutDays < 0)) {
-        errors.push('washoutDays must be a non-negative number');
-    }
-    
-    if (data.siteEnrollmentGoals && typeof data.siteEnrollmentGoals !== 'object') {
-        errors.push('siteEnrollmentGoals must be an object');
-    }
-    
-    if (data.startDate && typeof data.startDate !== 'string') {
-        errors.push('startDate must be a string');
-    }
-    
-    if (data.endDate && typeof data.endDate !== 'string') {
-        errors.push('endDate must be a string');
-    }
-    
-    if (data.fpfv && typeof data.fpfv !== 'string') {
-        errors.push('fpfv must be a string');
-    }
-    
-    if (data.lplv && typeof data.lplv !== 'string') {
-        errors.push('lplv must be a string');
+    if (isChaosFormat) {
+        // CHAOS format validation
+        if (!data.name || typeof data.name !== 'string') {
+            errors.push('name is required and must be a string');
+        }
+        
+        if (data.title && typeof data.title !== 'string') {
+            errors.push('title must be a string');
+        }
+        
+        if (data.color && typeof data.color !== 'string') {
+            errors.push('color must be a string');
+        }
+        
+        if (data.requiredRoles && !Array.isArray(data.requiredRoles)) {
+            errors.push('requiredRoles must be an array');
+        }
+        
+        if (data.sites && !Array.isArray(data.sites)) {
+            errors.push('sites must be an array');
+        }
+        
+        if (data.siteRoleRequirements && typeof data.siteRoleRequirements !== 'object') {
+            errors.push('siteRoleRequirements must be an object');
+        }
+        
+        if (data.description && typeof data.description !== 'string') {
+            errors.push('description must be a string');
+        }
+        
+        if (data.status && !['active', 'inactive', 'completed', 'suspended'].includes(data.status.toLowerCase())) {
+            errors.push('status must be one of: active, inactive, completed, suspended');
+        }
+        
+        if (data.phase && typeof data.phase !== 'string') {
+            errors.push('phase must be a string');
+        }
+        
+        if (data.lastUpdated && typeof data.lastUpdated !== 'string') {
+            errors.push('lastUpdated must be a string');
+        }
+    } else {
+        // ARTEMIS/NASA format validation
+        if (!data.title || typeof data.title !== 'string') {
+            errors.push('title is required and must be a string');
+        }
+        
+        if (data.protocolNumber && typeof data.protocolNumber !== 'string') {
+            errors.push('protocolNumber must be a string');
+        }
+        
+        if (data.target !== undefined && (typeof data.target !== 'number' || data.target < 0)) {
+            errors.push('target must be a non-negative number');
+        }
+        
+        if (data.status && !['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended'].includes(data.status)) {
+            errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended');
+        }
+        
+        if (data.indication && !Array.isArray(data.indication)) {
+            errors.push('indication must be an array');
+        }
+        
+        if (data.siteIds && !Array.isArray(data.siteIds)) {
+            errors.push('siteIds must be an array');
+        }
+        
+        if (data.washoutDays !== undefined && (typeof data.washoutDays !== 'number' || data.washoutDays < 0)) {
+            errors.push('washoutDays must be a non-negative number');
+        }
+        
+        if (data.siteEnrollmentGoals && typeof data.siteEnrollmentGoals !== 'object') {
+            errors.push('siteEnrollmentGoals must be an object');
+        }
+        
+        if (data.startDate && typeof data.startDate !== 'string') {
+            errors.push('startDate must be a string');
+        }
+        
+        if (data.endDate && typeof data.endDate !== 'string') {
+            errors.push('endDate must be a string');
+        }
+        
+        if (data.fpfv && typeof data.fpfv !== 'string') {
+            errors.push('fpfv must be a string');
+        }
+        
+        if (data.lplv && typeof data.lplv !== 'string') {
+            errors.push('lplv must be a string');
+        }
     }
     
     if (errors.length > 0) {
+        console.error('Study validation errors:', errors);
         throw new Error(`VALIDATION_ERROR: Studies validation failed: ${errors.join(', ')}`);
     }
     
+    console.log('Study validation passed');
     return true;
 };
 
@@ -514,33 +568,42 @@ async function crudHandler(context, request, containerName) {
                 const body = await request.json();
                 
                 // Validate schema based on container
-                switch (containerName) {
-                    case 'studies':
-                        validateStudiesSchema(body);
-                        break;
-                    case 'sites':
-                        validateSitesSchema(body);
-                        break;
-                    case 'patients':
-                        validatePatientsSchema(body);
-                        break;
-                    case 'crcs':
-                        validateCrcsSchema(body);
-                        break;
-                    case 'events':
-                        validateEventsSchema(body);
-                        break;
-                    case 'roles':
-                        validateRolesSchema(body);
-                        break;
-                    case 'schedules':
-                        validateSchedulesSchema(body);
-                        // Validate site-study relationship
-                        await validateSiteStudyRelationship(body.siteId, body.studyId);
-                        break;
-                    case 'surveys':
-                        validateSurveysSchema(body);
-                        break;
+                try {
+                    switch (containerName) {
+                        case 'studies':
+                            validateStudiesSchema(body);
+                            break;
+                        case 'sites':
+                            validateSitesSchema(body);
+                            break;
+                        case 'patients':
+                            validatePatientsSchema(body);
+                            break;
+                        case 'crcs':
+                            validateCrcsSchema(body);
+                            break;
+                        case 'events':
+                            validateEventsSchema(body);
+                            break;
+                        case 'roles':
+                            validateRolesSchema(body);
+                            break;
+                        case 'schedules':
+                            validateSchedulesSchema(body);
+                            // Validate site-study relationship
+                            await validateSiteStudyRelationship(body.siteId, body.studyId);
+                            break;
+                        case 'surveys':
+                            validateSurveysSchema(body);
+                            break;
+                    }
+                } catch (validationError) {
+                    console.error(`Validation error for ${containerName}:`, validationError.message);
+                    return {
+                        status: 400,
+                        jsonBody: { error: validationError.message },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
                 }
                 
                 const newItem = { ...body, id: generateId() };
@@ -559,37 +622,46 @@ async function crudHandler(context, request, containerName) {
                 const updateId = id || requestBody.id;
                 
                 // Validate schema based on container
-                switch (containerName) {
-                    case 'studies':
-                        validateStudiesSchema(requestBody);
-                        break;
-                    case 'sites':
-                        validateSitesSchema(requestBody);
-                        break;
-                    case 'patients':
-                        validatePatientsSchema(requestBody);
-                        break;
-                    case 'crcs':
-                        validateCrcsSchema(requestBody);
-                        break;
-                    case 'events':
-                        validateEventsSchema(requestBody);
-                        break;
-                    case 'roles':
-                        validateRolesSchema(requestBody);
-                        break;
-                    case 'schedules':
-                        validateSchedulesSchema(requestBody);
-                        // Validate site-study relationship
-                        await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
-                        break;
-                    case 'surveys':
-                        validateSurveysSchema(requestBody);
-                        break;
+                try {
+                    switch (containerName) {
+                        case 'studies':
+                            validateStudiesSchema(requestBody);
+                            break;
+                        case 'sites':
+                            validateSitesSchema(requestBody);
+                            break;
+                        case 'patients':
+                            validatePatientsSchema(requestBody);
+                            break;
+                        case 'crcs':
+                            validateCrcsSchema(requestBody);
+                            break;
+                        case 'events':
+                            validateEventsSchema(requestBody);
+                            break;
+                        case 'roles':
+                            validateRolesSchema(requestBody);
+                            break;
+                        case 'schedules':
+                            validateSchedulesSchema(requestBody);
+                            // Validate site-study relationship
+                            await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
+                            break;
+                        case 'surveys':
+                            validateSurveysSchema(requestBody);
+                            break;
+                    }
+                } catch (validationError) {
+                    console.error(`Validation error for ${containerName}:`, validationError.message);
+                    return {
+                        status: 400,
+                        jsonBody: { error: validationError.message },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
                 }
                 
                 const updatedItem = { ...requestBody, id: updateId };
-                const { resource: result } = await container.item(updateId).replace(updatedItem);
+                const { resource: result } = await container.items.upsert(updatedItem);
                 
                 // Calculate enrollment for studies
                 if (containerName === 'studies') {
@@ -660,12 +732,6 @@ app.http('roles', {
     handler: (request, context) => crudHandler(context, request, 'roles'),
 });
 
-app.http('training-types', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'training-types/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'training_types'),
-});
 
 app.http('schedules', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
