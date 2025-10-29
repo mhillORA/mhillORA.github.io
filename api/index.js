@@ -68,8 +68,13 @@ const getIdFromRequest = (request) => {
 const validateStudiesSchema = (data) => {
     const errors = [];
     
+    // Debug logging
+    console.log('Validating study data:', JSON.stringify(data, null, 2));
+    
     // Check if this is CHAOS format (has name, color, requiredRoles, sites)
     const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
+    
+    console.log('Is CHAOS format:', isChaosFormat);
     
     if (isChaosFormat) {
         // CHAOS format validation
@@ -164,9 +169,11 @@ const validateStudiesSchema = (data) => {
     }
     
     if (errors.length > 0) {
+        console.error('Study validation errors:', errors);
         throw new Error(`VALIDATION_ERROR: Studies validation failed: ${errors.join(', ')}`);
     }
     
+    console.log('Study validation passed');
     return true;
 };
 
@@ -561,33 +568,42 @@ async function crudHandler(context, request, containerName) {
                 const body = await request.json();
                 
                 // Validate schema based on container
-                switch (containerName) {
-                    case 'studies':
-                        validateStudiesSchema(body);
-                        break;
-                    case 'sites':
-                        validateSitesSchema(body);
-                        break;
-                    case 'patients':
-                        validatePatientsSchema(body);
-                        break;
-                    case 'crcs':
-                        validateCrcsSchema(body);
-                        break;
-                    case 'events':
-                        validateEventsSchema(body);
-                        break;
-                    case 'roles':
-                        validateRolesSchema(body);
-                        break;
-                    case 'schedules':
-                        validateSchedulesSchema(body);
-                        // Validate site-study relationship
-                        await validateSiteStudyRelationship(body.siteId, body.studyId);
-                        break;
-                    case 'surveys':
-                        validateSurveysSchema(body);
-                        break;
+                try {
+                    switch (containerName) {
+                        case 'studies':
+                            validateStudiesSchema(body);
+                            break;
+                        case 'sites':
+                            validateSitesSchema(body);
+                            break;
+                        case 'patients':
+                            validatePatientsSchema(body);
+                            break;
+                        case 'crcs':
+                            validateCrcsSchema(body);
+                            break;
+                        case 'events':
+                            validateEventsSchema(body);
+                            break;
+                        case 'roles':
+                            validateRolesSchema(body);
+                            break;
+                        case 'schedules':
+                            validateSchedulesSchema(body);
+                            // Validate site-study relationship
+                            await validateSiteStudyRelationship(body.siteId, body.studyId);
+                            break;
+                        case 'surveys':
+                            validateSurveysSchema(body);
+                            break;
+                    }
+                } catch (validationError) {
+                    console.error(`Validation error for ${containerName}:`, validationError.message);
+                    return {
+                        status: 400,
+                        jsonBody: { error: validationError.message },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
                 }
                 
                 const newItem = { ...body, id: generateId() };
@@ -606,33 +622,42 @@ async function crudHandler(context, request, containerName) {
                 const updateId = id || requestBody.id;
                 
                 // Validate schema based on container
-                switch (containerName) {
-                    case 'studies':
-                        validateStudiesSchema(requestBody);
-                        break;
-                    case 'sites':
-                        validateSitesSchema(requestBody);
-                        break;
-                    case 'patients':
-                        validatePatientsSchema(requestBody);
-                        break;
-                    case 'crcs':
-                        validateCrcsSchema(requestBody);
-                        break;
-                    case 'events':
-                        validateEventsSchema(requestBody);
-                        break;
-                    case 'roles':
-                        validateRolesSchema(requestBody);
-                        break;
-                    case 'schedules':
-                        validateSchedulesSchema(requestBody);
-                        // Validate site-study relationship
-                        await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
-                        break;
-                    case 'surveys':
-                        validateSurveysSchema(requestBody);
-                        break;
+                try {
+                    switch (containerName) {
+                        case 'studies':
+                            validateStudiesSchema(requestBody);
+                            break;
+                        case 'sites':
+                            validateSitesSchema(requestBody);
+                            break;
+                        case 'patients':
+                            validatePatientsSchema(requestBody);
+                            break;
+                        case 'crcs':
+                            validateCrcsSchema(requestBody);
+                            break;
+                        case 'events':
+                            validateEventsSchema(requestBody);
+                            break;
+                        case 'roles':
+                            validateRolesSchema(requestBody);
+                            break;
+                        case 'schedules':
+                            validateSchedulesSchema(requestBody);
+                            // Validate site-study relationship
+                            await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
+                            break;
+                        case 'surveys':
+                            validateSurveysSchema(requestBody);
+                            break;
+                    }
+                } catch (validationError) {
+                    console.error(`Validation error for ${containerName}:`, validationError.message);
+                    return {
+                        status: 400,
+                        jsonBody: { error: validationError.message },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
                 }
                 
                 const updatedItem = { ...requestBody, id: updateId };
