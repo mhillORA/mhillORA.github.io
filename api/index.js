@@ -68,52 +68,99 @@ const getIdFromRequest = (request) => {
 const validateStudiesSchema = (data) => {
     const errors = [];
     
-    if (!data.title || typeof data.title !== 'string') {
-        errors.push('title is required and must be a string');
-    }
+    // Check if this is CHAOS format (has name, color, requiredRoles, sites)
+    const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
     
-    if (data.protocolNumber && typeof data.protocolNumber !== 'string') {
-        errors.push('protocolNumber must be a string');
-    }
-    
-    if (data.target !== undefined && (typeof data.target !== 'number' || data.target < 0)) {
-        errors.push('target must be a non-negative number');
-    }
-    
-    if (data.status && !['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended'].includes(data.status)) {
-        errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended');
-    }
-    
-    if (data.indication && !Array.isArray(data.indication)) {
-        errors.push('indication must be an array');
-    }
-    
-    if (data.siteIds && !Array.isArray(data.siteIds)) {
-        errors.push('siteIds must be an array');
-    }
-    
-    if (data.washoutDays !== undefined && (typeof data.washoutDays !== 'number' || data.washoutDays < 0)) {
-        errors.push('washoutDays must be a non-negative number');
-    }
-    
-    if (data.siteEnrollmentGoals && typeof data.siteEnrollmentGoals !== 'object') {
-        errors.push('siteEnrollmentGoals must be an object');
-    }
-    
-    if (data.startDate && typeof data.startDate !== 'string') {
-        errors.push('startDate must be a string');
-    }
-    
-    if (data.endDate && typeof data.endDate !== 'string') {
-        errors.push('endDate must be a string');
-    }
-    
-    if (data.fpfv && typeof data.fpfv !== 'string') {
-        errors.push('fpfv must be a string');
-    }
-    
-    if (data.lplv && typeof data.lplv !== 'string') {
-        errors.push('lplv must be a string');
+    if (isChaosFormat) {
+        // CHAOS format validation
+        if (!data.name || typeof data.name !== 'string') {
+            errors.push('name is required and must be a string');
+        }
+        
+        if (data.title && typeof data.title !== 'string') {
+            errors.push('title must be a string');
+        }
+        
+        if (data.color && typeof data.color !== 'string') {
+            errors.push('color must be a string');
+        }
+        
+        if (data.requiredRoles && !Array.isArray(data.requiredRoles)) {
+            errors.push('requiredRoles must be an array');
+        }
+        
+        if (data.sites && !Array.isArray(data.sites)) {
+            errors.push('sites must be an array');
+        }
+        
+        if (data.siteRoleRequirements && typeof data.siteRoleRequirements !== 'object') {
+            errors.push('siteRoleRequirements must be an object');
+        }
+        
+        if (data.description && typeof data.description !== 'string') {
+            errors.push('description must be a string');
+        }
+        
+        if (data.status && !['active', 'inactive', 'completed', 'suspended'].includes(data.status.toLowerCase())) {
+            errors.push('status must be one of: active, inactive, completed, suspended');
+        }
+        
+        if (data.phase && typeof data.phase !== 'string') {
+            errors.push('phase must be a string');
+        }
+        
+        if (data.lastUpdated && typeof data.lastUpdated !== 'string') {
+            errors.push('lastUpdated must be a string');
+        }
+    } else {
+        // ARTEMIS/NASA format validation
+        if (!data.title || typeof data.title !== 'string') {
+            errors.push('title is required and must be a string');
+        }
+        
+        if (data.protocolNumber && typeof data.protocolNumber !== 'string') {
+            errors.push('protocolNumber must be a string');
+        }
+        
+        if (data.target !== undefined && (typeof data.target !== 'number' || data.target < 0)) {
+            errors.push('target must be a non-negative number');
+        }
+        
+        if (data.status && !['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended'].includes(data.status)) {
+            errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended');
+        }
+        
+        if (data.indication && !Array.isArray(data.indication)) {
+            errors.push('indication must be an array');
+        }
+        
+        if (data.siteIds && !Array.isArray(data.siteIds)) {
+            errors.push('siteIds must be an array');
+        }
+        
+        if (data.washoutDays !== undefined && (typeof data.washoutDays !== 'number' || data.washoutDays < 0)) {
+            errors.push('washoutDays must be a non-negative number');
+        }
+        
+        if (data.siteEnrollmentGoals && typeof data.siteEnrollmentGoals !== 'object') {
+            errors.push('siteEnrollmentGoals must be an object');
+        }
+        
+        if (data.startDate && typeof data.startDate !== 'string') {
+            errors.push('startDate must be a string');
+        }
+        
+        if (data.endDate && typeof data.endDate !== 'string') {
+            errors.push('endDate must be a string');
+        }
+        
+        if (data.fpfv && typeof data.fpfv !== 'string') {
+            errors.push('fpfv must be a string');
+        }
+        
+        if (data.lplv && typeof data.lplv !== 'string') {
+            errors.push('lplv must be a string');
+        }
     }
     
     if (errors.length > 0) {
