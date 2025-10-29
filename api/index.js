@@ -732,6 +732,12 @@ app.http('roles', {
     handler: (request, context) => crudHandler(context, request, 'roles'),
 });
 
+app.http('training-types', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'training-types/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'roles'),  // Use roles container for training types
+});
 
 app.http('schedules', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
