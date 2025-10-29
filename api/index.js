@@ -661,7 +661,7 @@ async function crudHandler(context, request, containerName) {
                 }
                 
                 const updatedItem = { ...requestBody, id: updateId };
-                const { resource: result } = await container.item(updateId).replace(updatedItem);
+                const { resource: result } = await container.items.upsert(updatedItem);
                 
                 // Calculate enrollment for studies
                 if (containerName === 'studies') {
@@ -732,12 +732,6 @@ app.http('roles', {
     handler: (request, context) => crudHandler(context, request, 'roles'),
 });
 
-app.http('training-types', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'training-types/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'training_types'),
-});
 
 app.http('schedules', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
