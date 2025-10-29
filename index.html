@@ -220,58 +220,47 @@ const apiCall = async (endpoint, method = 'GET', data = null) => {
     }
 };
 
-// Data fetching functions with fallback to local storage
+// Data fetching functions
 const fetchData = async (collection) => {
     try {
         const data = await apiCall(collection);
-        return Array.isArray(data) ? data : [];
-    } catch (error) {
-        console.error(`Error fetching ${collection}:`, error);
-        console.log(`NASA: Falling back to local storage for ${collection}`);
+        let result = Array.isArray(data) ? data : [];
         
-        // Try to load from local storage as fallback
-        try {
-            const localData = localStorage.getItem(`nasa_${collection}_fallback`);
-            if (localData) {
-                const parsed = JSON.parse(localData);
-                console.log(`NASA: Loaded ${parsed.length} ${collection} from local storage`);
-                return Array.isArray(parsed) ? parsed : [];
-            }
-        } catch (localError) {
-            console.error(`Error loading local ${collection}:`, localError);
+        // Convert patients from Azure format to NASA format
+        if (collection === 'patients') {
+            result = result.map(patient => convertPatientFromAzureFormat(patient));
         }
         
+        return result;
+    } catch (error) {
+        console.error(`Error fetching ${collection}:`, error);
+        console.error(`NASA: Failed to fetch ${collection} from Azure API`);
         return [];
     }
 };
 
 const createDocument = async (collection, data) => {
     try {
-        return await apiCall(collection, 'POST', data);
+        // Convert patient format if needed
+        let dataToSend = data;
+        if (collection === 'patients') {
+            dataToSend = convertPatientToAzureFormat(data);
+        }
+        return await apiCall(collection, 'POST', dataToSend);
     } catch (error) {
         console.error(`Error creating ${collection}:`, error);
-        console.log(`NASA: Saving ${collection} locally as fallback`);
-        
-        // Generate a local ID and save to localStorage
-        const localId = 'local_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-        const documentWithId = { ...data, id: localId, lastUpdated: new Date().toISOString() };
-        
-        try {
-            const existingData = JSON.parse(localStorage.getItem(`nasa_${collection}_fallback`) || '[]');
-            existingData.push(documentWithId);
-            localStorage.setItem(`nasa_${collection}_fallback`, JSON.stringify(existingData));
-            console.log(`NASA: Saved ${collection} locally with ID: ${localId}`);
-            return documentWithId;
-        } catch (localError) {
-            console.error(`Error saving ${collection} locally:`, localError);
-            throw error;
-        }
+        throw error;
     }
 };
 
 const updateDocument = async (collection, id, data) => {
     try {
-        return await apiCall(`${collection}/${id}`, 'PUT', data);
+        // Convert patient format if needed
+        let dataToSend = data;
+        if (collection === 'patients') {
+            dataToSend = convertPatientToAzureFormat(data);
+        }
+        return await apiCall(`${collection}/${id}`, 'PUT', dataToSend);
     } catch (error) {
         console.error(`Error updating ${collection}:`, error);
         console.log(`NASA: Updating ${collection} locally as fallback`);
@@ -524,6 +513,115 @@ const setupScheduleFormDependencies = () => {
  * @param {Object} patient - Patient object
  * @returns {Object|null} - Washout status object or null
  */
+/**
+ * Convert NASA patient format (with enrollments array) to Azure format (with studyId/siteId)
+ * @param {Object} patient - Patient object with enrollments array
+ * @returns {Object} - Patient object with Azure format
+ */
+const convertPatientToAzureFormat = (patient) => {
+    const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
+    const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
+    
+    // Build studyHistory from past enrollments
+    const studyHistory = pastEnrollments.map(enrollment => ({
+        studyId: enrollment.studyId,
+        siteId: enrollment.siteId,
+        enrolledDate: enrollment.enrolledDate,
+        exitedDate: enrollment.exitedDate
+    }));
+    
+    // Create Azure-formatted patient
+    const azurePatient = {
+        firstName: patient.firstName,
+        lastName: patient.lastName,
+        globalId: patient.globalId || "",
+        phoneNumber: patient.phoneNumber || "",
+        email: patient.email || "",
+        dob: patient.dob,
+        address: patient.address || "",
+        city: patient.city || "",
+        state: patient.state || "",
+        zipCode: patient.zipCode || "",
+        age: patient.age || null,
+        condition: patient.condition || "",
+        status: patient.status || "Candidate",
+        registryStatus: patient.registryStatus || "Active",
+        source: patient.source || "",
+        therapeuticArea: patient.therapeuticArea || "",
+        studyId: currentEnrollment?.studyId || null,
+        siteId: currentEnrollment?.siteId || null,
+        appointment: patient.appointment || null,
+        surveyResults: patient.surveyResults || [],
+        contactLogs: patient.contactLogs || [],
+        studyHistory: studyHistory
+    };
+    
+    return azurePatient;
+};
+
+/**
+ * Convert Azure patient format (with studyId/siteId) to NASA format (with enrollments array)
+ * @param {Object} azurePatient - Patient object from Azure
+ * @returns {Object} - Patient object with NASA format
+ */
+const convertPatientFromAzureFormat = (azurePatient) => {
+    const enrollments = [];
+    
+    // Add current enrollment if exists
+    if (azurePatient.studyId && azurePatient.siteId) {
+        enrollments.push({
+            studyId: azurePatient.studyId,
+            siteId: azurePatient.siteId,
+            status: 'current',
+            enrolledDate: new Date().toISOString(),
+            exitedDate: null
+        });
+    }
+    
+    // Add past enrollments from studyHistory
+    if (azurePatient.studyHistory && Array.isArray(azurePatient.studyHistory)) {
+        azurePatient.studyHistory.forEach(history => {
+            enrollments.push({
+                studyId: history.studyId,
+                siteId: history.siteId,
+                status: 'past',
+                enrolledDate: history.enrolledDate,
+                exitedDate: history.exitedDate
+            });
+        });
+    }
+    
+    // Create NASA-formatted patient
+    const nasaPatient = {
+        firstName: azurePatient.firstName,
+        lastName: azurePatient.lastName,
+        globalId: azurePatient.globalId,
+        phoneNumber: azurePatient.phoneNumber,
+        email: azurePatient.email,
+        dob: azurePatient.dob,
+        address: azurePatient.address,
+        city: azurePatient.city,
+        state: azurePatient.state,
+        zipCode: azurePatient.zipCode,
+        age: azurePatient.age,
+        condition: azurePatient.condition,
+        status: azurePatient.status,
+        registryStatus: azurePatient.registryStatus,
+        source: azurePatient.source,
+        therapeuticArea: azurePatient.therapeuticArea,
+        appointment: azurePatient.appointment,
+        surveyResults: azurePatient.surveyResults,
+        contactLogs: azurePatient.contactLogs,
+        enrollments: enrollments
+    };
+    
+    if (azurePatient.id) {
+        nasaPatient.id = azurePatient.id;
+    }
+    
+    return nasaPatient;
+};
+
 const getWashoutStatus = (patient) => {
     if (!patient.enrollments || patient.enrollments.length === 0) return false;
     
@@ -4074,14 +4172,17 @@ document.addEventListener('click', async (e) => {
                 break;
             }
             case 'confirm-delete-site': {
-                await deleteDoc(doc(db, "sites", id));
+                await deleteDocument('sites', id);
                 closeModal();
                 break;
             }
             case 'delete-slot': {
                 const schedule = state.schedules.find(s => s.id === scheduleId);
                 const updatedSlots = schedule.slots.filter(s => s.id !== slotId);
-                await updateDoc(doc(db, "schedules", scheduleId), { slots: updatedSlots });
+                await updateDocument('schedules', scheduleId, { 
+                    slots: updatedSlots,
+                    lastUpdated: new Date().toISOString()
+                });
                 closeModal();
                 break;
             }
@@ -4715,14 +4816,16 @@ document.addEventListener('submit', async (e) => {
                     answers: answers,
                     outcome: outcome
                 };
-                const patientRef = doc(db, "patients", patient.id);
-                const updates = { surveyResults: arrayUnion(surveyResult) };
+                const updates = { 
+                    surveyResults: [...(patient.surveyResults || []), surveyResult],
+                    lastUpdated: new Date().toISOString()
+                };
                 if (outcome === 'Pass') {
                     updates.status = 'Pre-Screening';
                 } else if (outcome === 'Fail') {
                     updates.status = 'Screen Fail';
                 }
-                await updateDoc(patientRef, updates);
+                await updateDocument('patients', patientId, updates);
                 closeModal();
             };
             if (nextQuestionTarget === 'pass') {
@@ -4754,7 +4857,10 @@ document.addEventListener('submit', async (e) => {
             const slotIndex = schedule.slots.findIndex(s => s.id === slotId);
             if (slotIndex > -1) {
                 schedule.slots[slotIndex].capacity = newCapacity;
-                await updateDoc(doc(db, "schedules", scheduleId), { slots: schedule.slots });
+                await updateDocument('schedules', scheduleId, { 
+                    slots: schedule.slots,
+                    lastUpdated: new Date().toISOString()
+                });
             }
             closeModal();
             break;
@@ -4860,7 +4966,10 @@ document.addEventListener('submit', async (e) => {
                     updatedPatient.enrollments = newEnrollments;
                 }
                 
-                await updateDoc(doc(db, "patients", patientId), updatedPatient);
+                await updateDocument('patients', patientId, {
+                    ...updatedPatient,
+                    lastUpdated: new Date().toISOString()
+                });
                 closeModal();
                 showNotification("Patient updated successfully.", "success");
             } catch (error) {
@@ -5042,12 +5151,12 @@ document.addEventListener('submit', async (e) => {
             }
             
             // Update the schedule
-            const scheduleRef = doc(db, "schedules", scheduleId);
-            await updateDoc(scheduleRef, {
+            await updateDocument('schedules', scheduleId, {
                 siteId: data.siteId,
                 studyId: data.studyId,
                 visit: data.visit,
-                slots: slots
+                slots: slots,
+                lastUpdated: new Date().toISOString()
             });
             
             closeModal();
@@ -5055,8 +5164,13 @@ document.addEventListener('submit', async (e) => {
             break;
         }
         case 'add-site-form': {
-            const newSite = { name: data.siteName, location: data.location, status: 'Active' };
-            await addDoc(getCollectionRef("sites"), newSite);
+            const newSite = { 
+                name: data.siteName, 
+                location: data.location, 
+                status: 'Active',
+                lastUpdated: new Date().toISOString()
+            };
+            await createDocument('sites', newSite);
             form.reset();
             break;
         }
