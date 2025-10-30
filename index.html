@@ -9249,10 +9249,22 @@
                                     console.log(`Geocoded ${data.homeLocation} to:`, coordinates);
                                 }
                             }
-                            
-                            await apiService.updateCrc(crcId, buildCrcUpdatePayload(crc, updateData));
+                            try {
+                                const saved = await apiService.updateCrc(crcId, buildCrcUpdatePayload(crc, updateData));
+                                const updatedCrc = saved && saved.id ? { ...crc, ...saved } : { ...crc, ...updateData };
+                                // Update local state and reflect in UI
+                                state.crcs = state.crcs.map(c => c.id === crcId ? updatedCrc : c);
+                                showNotification('CRC profile updated!', 'success');
+                                // Re-render the profile so the user sees the saved changes immediately
+                                openModal(getCRCProfileModalHTML(updatedCrc), '4xl');
+                                setTimeout(() => {
+                                    setupCRCProfileModal();
+                                }, 50);
+                            } catch (err) {
+                                console.error('Error updating CRC profile:', err);
+                                showNotification('Failed to update CRC profile. See console for details.', 'error');
+                            }
                         }
-                        closeModal();
                         break;
                     }
                     case 'edit-crc-site-form': {
@@ -9418,29 +9430,41 @@
                         
                         for (const crcId of selectedCrcIds) {
                             const crc = state.crcs.find(c => c.id === crcId);
-                            if (crc) {
-                                const updatedTrainings = [...(crc.trainings || [])];
-                                
-                                // Add each selected training
-                                for (const trainingName of selectedTrainings) {
-                                    const newTraining = { 
-                                        name: trainingName, 
-                                        completionDate, 
-                                        expirationDate,
-                                        observations: 0,
-                                        performances: 0
-                                    };
-                                    updatedTrainings.push(newTraining);
-                                    totalAdded++;
-                                }
-                                
-                                await apiService.updateCrc(crcId, buildCrcUpdatePayload(crc, { trainings: updatedTrainings }));
+                            if (!crc) continue;
+                            const updatedTrainings = [...(crc.trainings || [])];
+                            for (const trainingName of selectedTrainings) {
+                                updatedTrainings.push({
+                                    name: trainingName,
+                                    completionDate,
+                                    expirationDate,
+                                    observations: 0,
+                                    performances: 0
+                                });
+                                totalAdded++;
+                            }
+                            try {
+                                const saved = await apiService.updateCrc(crcId, buildCrcUpdatePayload(crc, { trainings: updatedTrainings }));
+                                const updatedCrc = saved && saved.id ? { ...crc, ...saved } : { ...crc, trainings: updatedTrainings };
+                                state.crcs = state.crcs.map(c => c.id === crcId ? updatedCrc : c);
+                            } catch (err) {
+                                console.error('Bulk training update failed for CRC', crcId, err);
                             }
                         }
                         
                         // Batch operations replaced with individual API calls
-                        closeModal();
                         showNotification(`${selectedTrainings.length} training(s) added to ${selectedCrcIds.length} CRC(s) (${totalAdded} total records created)!`, 'success');
+                        // If a CRC profile modal is open, re-render it with updated data
+                        const openProfile = document.querySelector('#modal-container [id="edit-crc-form"]');
+                        if (openProfile) {
+                            const currentCrcId = openProfile.getAttribute('data-id');
+                            const current = state.crcs.find(c => c.id === currentCrcId);
+                            if (current) {
+                                openModal(getCRCProfileModalHTML(current), '4xl');
+                                setTimeout(() => setupCRCProfileModal(), 50);
+                            }
+                        } else {
+                            closeModal();
+                        }
                         break;
                     }
                     case 'add-truck-form': {
@@ -9651,15 +9675,27 @@
                     case 'add-training-type-form': {
                         try {
                             const linkedRoles = formData.getAll('linkedRoles').filter(Boolean);
-                            await apiService.createTrainingType({
+                            const payload = {
                                 name: data.trainingName,
                                 description: data.description || '',
                                 defaultDuration: parseInt(data.defaultDuration) || 1,
                                 requiredObservations: parseInt(data.requiredObservations) || 0,
                                 requiredPerformances: parseInt(data.requiredPerformances) || 0,
                                 linkedRoles
-                            });
-                            showNotification('Training type added successfully!', 'success');
+                            };
+                            let created = null;
+                            try {
+                                created = await apiService.createTrainingType(payload);
+                            } catch (err) {
+                                // If endpoint not available (404), synthesize locally
+                                const msg = err && err.message ? err.message : '';
+                                if (!msg.includes('404')) throw err;
+                                console.warn('CHAOS: Training Types API not available. Saving locally.');
+                                created = { id: payload.name, ...payload };
+                            }
+                            const newType = created && created.id ? created : { id: payload.name, ...payload };
+                            state.training_types = [...(state.training_types || []), newType];
+                            showNotification('Training type added!', 'success');
                             closeModal();
                         } catch (error) {
                             console.error("Error adding training type:", error);
