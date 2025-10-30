@@ -733,10 +733,28 @@ app.http('roles', {
 });
 
 app.http('training-types', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'training-types/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'training_types'), // <-- *** THIS IS THE FIX ***
+    handler: async (request, context) => {
+        try {
+            // Build training types dynamically from CRC embedded trainings
+            const container = getContainer('crcs');
+            const { resources: crcs } = await container.items.readAll().fetchAll();
+            const names = new Set();
+            (crcs || []).forEach(crc => {
+                (crc.trainings || []).forEach(t => {
+                    if (t && typeof t.name === 'string' && t.name.trim() !== '') {
+                        names.add(t.name.trim());
+                    }
+                });
+            });
+            const result = Array.from(names).sort().map(n => ({ id: n, name: n }));
+            return { jsonBody: result };
+        } catch (error) {
+            return handleError(context, error, 'Build training-types from CRCs');
+        }
+    },
 });
 
 app.http('schedules', {
