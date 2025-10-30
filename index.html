@@ -666,6 +666,25 @@
                 initialLoadComplete: false,
                 charts: {}, // To hold chart instances
             };
+
+            // --- Helpers ---
+            const normalizeEmploymentType = (value) => {
+                const v = (value || '').toString().trim().toLowerCase();
+                if (v === 'pte' || v.includes('per-diem') || v.includes('per diem') || v.includes('part-time') || v.includes('part time')) return 'PTE';
+                if (v === 'contractor' || v === 'contract') return 'Contractor';
+                return 'FTE';
+            };
+
+            // Build a safe CRC payload for PUTs (strip system fields and normalize)
+            const buildCrcUpdatePayload = (crc, overrides = {}) => {
+                const src = { ...(crc || {}) };
+                ['_rid','_self','_etag','_attachments','_ts'].forEach(k => { if (k in src) delete src[k]; });
+                const merged = { ...src, ...overrides };
+                merged.name = (merged.name || '').toString();
+                merged.employmentType = normalizeEmploymentType(merged.employmentType || crc?.employmentType);
+                if (!merged.trainings) merged.trainings = crc?.trainings || [];
+                return merged;
+            };
             // --- Temporary storage for event data during confirmation modals ---
             let tempEventData = {};
             let copiedShiftData = null;
@@ -674,30 +693,6 @@
             const mainAppContent = document.getElementById('main-app-content');
             
             // --- HELPER FUNCTIONS ---
-            const buildCrcUpdatePayload = (crc, overrides = {}) => {
-                const normalizeEmploymentType = (value) => {
-                    const v = (value || '').toString();
-                    if (v === 'Per-Diem' || v === 'Per Diem' || v === 'PER-DIEM' || v === 'part-time' || v === 'PT' || v === 'PTE') return 'PTE';
-                    if (v === 'Contractor' || v === 'contractor' || v === 'CTR') return 'Contractor';
-                    if (v === 'FTE' || v === 'Full-Time' || v === 'full-time') return 'FTE';
-                    return 'FTE';
-                };
-                const base = {
-                    name: crc?.name || '',
-                    title: crc?.title || '',
-                    homeLocation: crc?.homeLocation || '',
-                    region: crc?.region || '',
-                    employmentType: normalizeEmploymentType(crc?.employmentType),
-                    trainingLevel: crc?.trainingLevel || '',
-                    capabilities: Array.isArray(crc?.capabilities) ? crc.capabilities : [],
-                    coordinates: crc?.coordinates || null,
-                    trainings: Array.isArray(crc?.trainings) ? crc.trainings : []
-                };
-                const merged = { ...base, ...overrides };
-                // Remove any system fields if present in source
-                ['_rid','_self','_etag','_ts','_attachments','id'].forEach(k => { if (k in merged && k !== 'id') delete merged[k]; });
-                return merged;
-            };
             /**
              * Gets the day of the week with Saturday as the starting day (0).
              * @param {Date} date - The date to check.
@@ -3922,7 +3917,8 @@
                                         <input type="text" name="crcRegion" placeholder="Region (e.g., East, West)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                         <select name="employmentType" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                             <option value="FTE">FTE</option>
-                                            <option value="Per-Diem">Per-Diem</option>
+                                            <option value="PTE">PTE</option>
+                                            <option value="Contractor">Contractor</option>
                                         </select>
                                         <div class="flex gap-2">
                                             <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add CRC</button>
@@ -7251,8 +7247,9 @@
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300">Employment Type</label>
                                 <select name="employmentType" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                    <option value="FTE" ${crc.employmentType === 'FTE' ? 'selected' : ''}>FTE</option>
-                                    <option value="Per-Diem" ${crc.employmentType === 'Per-Diem' ? 'selected' : ''}>Per-Diem</option>
+                                    <option value="FTE" ${normalizeEmploymentType(crc.employmentType) === 'FTE' ? 'selected' : ''}>FTE</option>
+                                    <option value="PTE" ${normalizeEmploymentType(crc.employmentType) === 'PTE' ? 'selected' : ''}>PTE</option>
+                                    <option value="Contractor" ${normalizeEmploymentType(crc.employmentType) === 'Contractor' ? 'selected' : ''}>Contractor</option>
                                 </select>
                             </div>
                             <div>
@@ -8883,7 +8880,7 @@
                                 title: data.crcTitle || '',
                                 homeLocation: data.crcLocation, 
                                 region: data.crcRegion, 
-                                employmentType: data.employmentType, 
+                                employmentType: normalizeEmploymentType(data.employmentType), 
                                 trainings: [], 
                                 capabilities: [], 
                                 trainingLevel: ''
@@ -9110,7 +9107,9 @@
                                                 const startTravelEventRef = null;
                                                 const startTravelEventData = { ...baseEventData, name: 'Travel Day', crcId, roles: [], date: startTravelDateStr, groupId, type: 'Travel Day' };
                                                 console.log('Creating start travel day for:', startTravelDateStr, 'with data:', startTravelEventData);
-                                                await apiService.createEvent(startTravelEventData);
+                                                const created = await apiService.createEvent(startTravelEventData);
+                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
+                                                state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                             
                                             // Create main assignment events
@@ -9118,7 +9117,9 @@
                                                 const dateStr = d.toISOString().split('T')[0];
                                                 const newEventRef = null;
                                                 let currentEventData = { ...baseEventData, name: 'Site Assignment', crcId, roles, date: dateStr, groupId, type: 'Site Assignment' };
-                                                await apiService.createEvent(currentEventData);
+                                                const created = await apiService.createEvent(currentEventData);
+                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...currentEventData };
+                                                state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                             
                                             // Create end travel day if requested (day after end date)
@@ -9129,7 +9130,9 @@
                                                 const endTravelEventRef = null;
                                                 const endTravelEventData = { ...baseEventData, name: 'Travel Day', crcId, roles: [], date: endTravelDateStr, groupId, type: 'Travel Day' };
                                                 console.log('Creating end travel day for:', endTravelDateStr, 'with data:', endTravelEventData);
-                                                await apiService.createEvent(endTravelEventData);
+                                                const created = await apiService.createEvent(endTravelEventData);
+                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
+                                                state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                         }
                                     } else {
@@ -9146,7 +9149,9 @@
                                                 const startTravelEventRef = null;
                                                 const startTravelEventData = { ...baseEventData, name: 'Travel Day', crcId, roles: [], date: startTravelDateStr, groupId, type: 'Travel Day' };
                                                 console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'with data:', startTravelEventData);
-                                                await apiService.createEvent(startTravelEventData);
+                                                const created = await apiService.createEvent(startTravelEventData);
+                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
+                                                state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                             
                                             // Create main assignment events
@@ -9159,7 +9164,9 @@
                                                 } else {
                                                     currentEventData.type = eventType;
                                                 }
-                                                await apiService.createEvent(currentEventData);
+                                                const created = await apiService.createEvent(currentEventData);
+                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...currentEventData };
+                                                state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                             
                                             // Create end travel day if requested (day after end date)
@@ -9170,7 +9177,9 @@
                                                 const endTravelEventRef = null;
                                                 const endTravelEventData = { ...baseEventData, name: 'Travel Day', crcId, roles: [], date: endTravelDateStr, groupId, type: 'Travel Day' };
                                                 console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'with data:', endTravelEventData);
-                                                await apiService.createEvent(endTravelEventData);
+                                                const created = await apiService.createEvent(endTravelEventData);
+                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
+                                                state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                         }
                                     }
@@ -9182,7 +9191,13 @@
                                         console.log('Travel Day events after creation:', travelDayEvents);
                                     }, 1000);
                                 }
-                                closeModal();
+                                // Force UI refreshes so schedule and calendar reflect new events immediately
+                                try {
+                                    setState({ crc_events: state.crc_events.slice() });
+                                } catch {}
+                                if (document.getElementById('crc-unavailability-calendar')) {
+                                    try { renderUnavailabilityCalendar(); } catch {}
+                                }
                                 showNotification(isEditing ? 'Shift updated!' : 'Shift(s) created!', 'success');
                             } catch (err) {
                                 console.error("Error submitting form:", err);
@@ -9218,7 +9233,7 @@
                                 title: data.title || '',
                                 homeLocation: data.homeLocation,
                                 region: data.region,
-                                employmentType: data.employmentType,
+                                employmentType: normalizeEmploymentType(data.employmentType),
                                 trainingLevel: data.trainingLevel,
                                 capabilities: data.capabilities.split(',').map(s => s.trim()).filter(Boolean),
                             };
@@ -9235,7 +9250,7 @@
                                 }
                             }
                             
-                            await apiService.updateCrc(crcId, updateData);
+                            await apiService.updateCrc(crcId, buildCrcUpdatePayload(crc, updateData));
                         }
                         closeModal();
                         break;
