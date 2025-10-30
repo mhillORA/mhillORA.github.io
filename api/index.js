@@ -672,6 +672,17 @@ async function crudHandler(context, request, containerName) {
                 return { jsonBody: result };
 
             case 'DELETE':
+                if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
+                try {
+                    const { resource } = await container.item(id).read();
+                    if (!resource) {
+                        // Treat missing as already deleted
+                        return { status: 204 };
+                    }
+                } catch (e) {
+                    // If read fails (e.g., not found), return 204 for idempotency
+                    return { status: 204 };
+                }
                 await container.item(id).delete();
                 return { status: 204 };
 
