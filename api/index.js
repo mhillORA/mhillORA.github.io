@@ -455,6 +455,46 @@ const validateRolesSchema = (data) => {
     return true;
 };
 
+const validateUsersSchema = (data) => {
+    const errors = [];
+    
+    if (!data.username || typeof data.username !== 'string') {
+        errors.push('username is required and must be a string');
+    }
+    
+    if (data.password && typeof data.password !== 'string') {
+        errors.push('password must be a string');
+    }
+    
+    if (data.permissionLevel && !['Manager', 'Supervisor', 'CRC'].includes(data.permissionLevel)) {
+        errors.push('permissionLevel must be one of: Manager, Supervisor, CRC');
+    }
+    
+    if (data.entraId && typeof data.entraId !== 'string') {
+        errors.push('entraId must be a string');
+    }
+    
+    if (data.email && typeof data.email !== 'string') {
+        errors.push('email must be a string');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Users validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+// Simple password hashing (in production, use bcrypt or similar)
+const hashPassword = (password) => {
+    // Simple hash for now - in production use proper bcrypt
+    return Buffer.from(password).toString('base64');
+};
+
+const verifyPassword = (password, hash) => {
+    return hashPassword(password) === hash;
+};
+
 const validateSchedulesSchema = (data) => {
     const errors = [];
     
@@ -588,6 +628,13 @@ async function crudHandler(context, request, containerName) {
                         case 'roles':
                             validateRolesSchema(body);
                             break;
+                        case 'users':
+                            validateUsersSchema(body);
+                            // Hash password if provided
+                            if (body.password) {
+                                body.password = hashPassword(body.password);
+                            }
+                            break;
                         case 'schedules':
                             validateSchedulesSchema(body);
                             // Validate site-study relationship
@@ -641,6 +688,13 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'roles':
                             validateRolesSchema(requestBody);
+                            break;
+                        case 'users':
+                            validateUsersSchema(requestBody);
+                            // Hash password if provided
+                            if (requestBody.password) {
+                                requestBody.password = hashPassword(requestBody.password);
+                            }
                             break;
                         case 'schedules':
                             validateSchedulesSchema(requestBody);
@@ -781,3 +835,184 @@ app.http('surveys', {
     route: 'surveys/{id?}',
     handler: (request, context) => crudHandler(context, request, 'surveys'),
 });
+
+app.http('users', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'users/{id?}',
+    handler: async (request, context) => {
+        const container = getContainer('users');
+        const { method } = request;
+        const id = getIdFromRequest(request);
+
+        try {
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read(); 
+                        if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
+                        // Don't return password hash
+                        const { password, ...userWithoutPassword } = resource;
+                        return { jsonBody: userWithoutPassword };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        // Remove password hashes from all users
+                        const usersWithoutPasswords = resources.map(({ password, ...user }) => user);
+                        return { jsonBody: usersWithoutPasswords };
+                    }
+                
+                case 'POST':
+                    const body = await request.json();
+                    validateUsersSchema(body);
+                    
+                    // Check if username already exists
+                    const { resources: existingUsers } = await container.items
+                        .query({
+                            query: "SELECT * FROM c WHERE c.username = @username",
+                            parameters: [{ name: "@username", value: body.username }]
+                        })
+                        .fetchAll();
+                    
+                    if (existingUsers.length > 0) {
+                        return {
+                            status: 400,
+                            jsonBody: { error: 'Username already exists' },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                    
+                    // Hash password
+                    const hashedPassword = hashPassword(body.password);
+                    const newUser = { 
+                        ...body, 
+                        id: generateId(),
+                        password: hashedPassword,
+                        createdAt: new Date().toISOString()
+                    };
+                    const { resource: createdUser } = await container.items.create(newUser);
+                    const { password: _, ...userWithoutPassword } = createdUser;
+                    return { status: 201, jsonBody: userWithoutPassword };
+                
+                case 'PUT':
+                    const requestBody = await request.json();
+                    const updateId = id || requestBody.id;
+                    validateUsersSchema(requestBody);
+                    
+                    // If password is being updated, hash it
+                    if (requestBody.password) {
+                        requestBody.password = hashPassword(requestBody.password);
+                    }
+                    
+                    const updatedUser = { ...requestBody, id: updateId };
+                    const { resource: result } = await container.items.upsert(updatedUser);
+                    const { password: __, ...resultWithoutPassword } = result;
+                    return { jsonBody: resultWithoutPassword };
+
+                case 'DELETE':
+                    if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
+                    try {
+                        const { resource } = await container.item(id).read();
+                        if (!resource) {
+                            return { status: 204 };
+                        }
+                    } catch (e) {
+                        return { status: 204 };
+                    }
+                    await container.item(id).delete();
+                    return { status: 204 };
+
+                case 'OPTIONS':
+                    return { status: 200 };
+
+                default:
+                    return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+            }
+        } catch (error) {
+            return handleError(context, error, 'Users operation failed');
+        }
+    },
+});
+
+app.http('usersAuthenticate', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'users/authenticate',
+    handler: async (request, context) => {
+        try {
+            const { username, password } = await request.json();
+            
+            if (!username || !password) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'Username and password are required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            const container = getContainer('users');
+            const { resources: users } = await container.items
+                .query({
+                    query: "SELECT * FROM c WHERE c.username = @username",
+                    parameters: [{ name: "@username", value: username }]
+                })
+                .fetchAll();
+            
+            if (users.length === 0) {
+                return {
+                    status: 401,
+                    jsonBody: { error: 'Invalid username or password' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            const user = users[0];
+            
+            if (!verifyPassword(password, user.password)) {
+                return {
+                    status: 401,
+                    jsonBody: { error: 'Invalid username or password' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Return user without password
+            const { password: _, ...userWithoutPassword } = user;
+            return { jsonBody: userWithoutPassword };
+            
+        } catch (error) {
+            return handleError(context, error, 'Authentication failed');
+        }
+    },
+});
+
+// Initialize default admin user on first run
+const initializeDefaultAdmin = async () => {
+    try {
+        const container = getContainer('users');
+        const { resources: users } = await container.items
+            .query({
+                query: "SELECT * FROM c WHERE c.username = @username",
+                parameters: [{ name: "@username", value: 'admin' }]
+            })
+            .fetchAll();
+        
+        if (users.length === 0) {
+            const adminUser = {
+                id: generateId(),
+                username: 'admin',
+                password: hashPassword('Password1!'),
+                permissionLevel: 'Manager',
+                email: '',
+                entraId: '',
+                createdAt: new Date().toISOString()
+            };
+            await container.items.create(adminUser);
+            console.log('Default admin user created');
+        }
+    } catch (error) {
+        console.error('Error initializing default admin user:', error);
+    }
+};
+
+// Call initialization
+initializeDefaultAdmin();
