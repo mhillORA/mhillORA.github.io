@@ -9815,8 +9815,65 @@
                                 timeOffRequests: state.timeOffRequests.map(r => r.id === id ? updatedRequest : r)
                             });
                             
+                            // Create or update unavailability event for approved requests
+                            const date = request.date || request.startDate;
+                            const existingEvent = state.crc_events.find(e => 
+                                e.crcId === request.crcId && 
+                                e.date === date && 
+                                e.type === 'Unavailable'
+                            );
+                            
+                            if (!existingEvent) {
+                                // Create new unavailability event
+                                const eventData = {
+                                    crcId: request.crcId,
+                                    date: date,
+                                    type: 'Unavailable',
+                                    name: request.type || 'Vacation',
+                                    period: request.period || 'Full Day',
+                                    hours: request.hours || (request.period === 'Full Day' ? 8 : 4),
+                                    notes: request.notes || `Approved time off: ${request.type}`,
+                                    timeOffRequestId: request.id
+                                };
+                                
+                                try {
+                                    const createdEvent = await apiService.createEvent(eventData);
+                                    const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                                    state.crc_events = [...state.crc_events, newEvent];
+                                } catch (eventError) {
+                                    console.error('Error creating unavailability event:', eventError);
+                                }
+                            } else {
+                                // Update existing event to mark it as approved
+                                const updatedEventData = {
+                                    ...existingEvent,
+                                    name: request.type || existingEvent.name,
+                                    period: request.period || existingEvent.period,
+                                    hours: request.hours || existingEvent.hours,
+                                    notes: request.notes || existingEvent.notes || `Approved time off: ${request.type}`,
+                                    timeOffRequestId: request.id
+                                };
+                                
+                                try {
+                                    const updatedEvent = await apiService.updateEvent(existingEvent.id, updatedEventData);
+                                    state.crc_events = state.crc_events.map(e => e.id === existingEvent.id ? updatedEvent : e);
+                                } catch (eventError) {
+                                    console.error('Error updating unavailability event:', eventError);
+                                }
+                            }
+                            
                             showNotification('Time off request approved!', 'success');
                             renderTimeOffRequestsContent();
+                            
+                            // Refresh calendar views
+                            if (state.activeTab === 'unavailability') {
+                                renderUnavailabilityCalendar();
+                            }
+                            
+                            // Refresh main calendar if it's showing
+                            if (typeof renderCRCLists === 'function') {
+                                renderCRCLists();
+                            }
                         } catch (error) {
                             console.error('Error approving time off request:', error);
                             showNotification('Failed to approve time off request. See console for details.', 'error');
@@ -9842,8 +9899,36 @@
                                 timeOffRequests: state.timeOffRequests.map(r => r.id === id ? updatedRequest : r)
                             });
                             
+                            // Remove unavailability event if it was created from this time off request
+                            const date = request.date || request.startDate;
+                            const existingEvent = state.crc_events.find(e => 
+                                e.crcId === request.crcId && 
+                                e.date === date && 
+                                e.type === 'Unavailable' &&
+                                (e.timeOffRequestId === request.id || (!e.timeOffRequestId && e.name === request.type))
+                            );
+                            
+                            if (existingEvent) {
+                                try {
+                                    await apiService.deleteEvent(existingEvent.id);
+                                    state.crc_events = state.crc_events.filter(e => e.id !== existingEvent.id);
+                                } catch (eventError) {
+                                    console.error('Error deleting unavailability event:', eventError);
+                                }
+                            }
+                            
                             showNotification('Time off request rejected.', 'success');
                             renderTimeOffRequestsContent();
+                            
+                            // Refresh calendar views
+                            if (state.activeTab === 'unavailability') {
+                                renderUnavailabilityCalendar();
+                            }
+                            
+                            // Refresh main calendar if it's showing
+                            if (typeof renderCRCLists === 'function') {
+                                renderCRCLists();
+                            }
                         } catch (error) {
                             console.error('Error rejecting time off request:', error);
                             showNotification('Failed to reject time off request. See console for details.', 'error');
@@ -13700,6 +13785,50 @@
                 console.log('CHAOS: Realtime listeners not needed for Azure API');
             };
             
+            // Sync approved time off requests with unavailability events
+            const syncApprovedTimeOffRequests = async (timeOffRequests) => {
+                try {
+                    const approvedRequests = timeOffRequests.filter(req => req.status === 'approved');
+                    
+                    for (const request of approvedRequests) {
+                        const date = request.date || request.startDate;
+                        if (!date || !request.crcId) continue;
+                        
+                        // Check if unavailability event already exists
+                        const existingEvent = state.crc_events.find(e => 
+                            e.crcId === request.crcId && 
+                            e.date === date && 
+                            e.type === 'Unavailable' &&
+                            (e.timeOffRequestId === request.id || (!e.timeOffRequestId && e.name === request.type))
+                        );
+                        
+                        if (!existingEvent) {
+                            // Create unavailability event for approved request
+                            const eventData = {
+                                crcId: request.crcId,
+                                date: date,
+                                type: 'Unavailable',
+                                name: request.type || 'Vacation',
+                                period: request.period || 'Full Day',
+                                hours: request.hours || (request.period === 'Full Day' ? 8 : 4),
+                                notes: request.notes || `Approved time off: ${request.type}`,
+                                timeOffRequestId: request.id
+                            };
+                            
+                            try {
+                                const createdEvent = await apiService.createEvent(eventData);
+                                const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                                state.crc_events = [...state.crc_events, newEvent];
+                            } catch (eventError) {
+                                console.error('Error syncing time off request to event:', eventError);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error syncing approved time off requests:', error);
+                }
+            };
+
             const performInitialLoad = async () => {
                 loadingMessage.textContent = 'Loading data from Azure API...';
                 console.log('CHAOS: performInitialLoad started');
@@ -13751,6 +13880,11 @@
                             // Fail silently - endpoint may not exist yet
                             timeOffRequests = [];
                         }
+                    }
+                    
+                    // Sync approved time off requests with unavailability events after events are loaded
+                    if (timeOffRequests && timeOffRequests.length > 0) {
+                        syncApprovedTimeOffRequests(timeOffRequests);
                     }
                     
                     // Load travel information
@@ -13823,6 +13957,15 @@
                         initialLoadComplete: true 
                     });
                     setupRealtimeListeners();
+                    
+                    // Sync approved time off requests with unavailability events after state is fully set
+                    if (timeOffRequests && timeOffRequests.length > 0) {
+                        // Wait a bit for state to be fully set
+                        setTimeout(() => {
+                            syncApprovedTimeOffRequests(timeOffRequests);
+                        }, 200);
+                    }
+                    
                     console.log('CHAOS: performInitialLoad completed successfully');
 
                 } catch (error) {
