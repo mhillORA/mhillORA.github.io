@@ -1086,7 +1086,18 @@ app.http('time-off-requests', {
     authLevel: 'anonymous', 
     route: 'time-off-requests/{id?}',
     handler: async (request, context) => {
-        const container = getContainer('time-off-requests');
+        let container;
+        try {
+            container = getContainer('time-off-requests');
+        } catch (error) {
+            context.log.error('Error getting time-off-requests container:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Database container error. Please ensure the time-off-requests container exists.' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+        
         const { method } = request;
         const id = getIdFromRequest(request);
 
@@ -1104,11 +1115,20 @@ app.http('time-off-requests', {
                 
                 case 'POST':
                     const body = await request.json();
+                    
+                    // Normalize date field - accept startDate if date is not provided
+                    if (!body.date && body.startDate) {
+                        body.date = body.startDate;
+                    }
+                    
                     validateTimeOffRequestsSchema(body);
                     
                     // Set default status to pending if not provided
                     const newRequest = { 
-                        ...body, 
+                        ...body,
+                        date: body.date || body.startDate, // Ensure date is set
+                        startDate: body.startDate || body.date, // Also include startDate for compatibility
+                        endDate: body.endDate || body.date, // Use endDate if provided, otherwise use date
                         id: generateId(),
                         status: body.status || 'pending',
                         createdAt: new Date().toISOString(),
@@ -1556,9 +1576,9 @@ app.http('flightLookup', {
     authLevel: 'anonymous',
     route: 'flight-lookup',
     handler: async (request, context) => {
+        let flightNumber = null;
         try {
             // Get query parameters from request URL
-            let flightNumber = null;
             if (request.url) {
                 try {
                     const url = new URL(request.url);
