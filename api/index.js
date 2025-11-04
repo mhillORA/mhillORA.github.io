@@ -668,7 +668,21 @@ const validateSiteStudyRelationship = async (siteId, studyId) => {
 // =================================================================================
 
 async function crudHandler(context, request, containerName) {
-    const container = getContainer(containerName);
+    let container;
+    try {
+        container = getContainer(containerName);
+    } catch (error) {
+        // If we can't even get the container reference, return empty array for travel
+        if (containerName === 'travel' && request.method === 'GET') {
+            context.log.warn(`Error getting travel container reference, returning empty array. Error: ${error.message}`);
+            return { 
+                jsonBody: [],
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+        throw error;
+    }
+    
     const { method } = request;
     const id = getIdFromRequest(request);
 
@@ -1206,13 +1220,44 @@ app.http('usersAuthenticate', {
                 };
             }
             
-            const container = getContainer('users');
-            const { resources: users } = await container.items
-                .query({
-                    query: "SELECT * FROM c WHERE c.username = @username",
-                    parameters: [{ name: "@username", value: username }]
-                })
-                .fetchAll();
+            let container;
+            try {
+                container = getContainer('users');
+            } catch (error) {
+                context.log.error('Error getting users container:', error);
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Database error. Please check if users container exists.' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            let users;
+            try {
+                const result = await container.items
+                    .query({
+                        query: "SELECT * FROM c WHERE c.username = @username",
+                        parameters: [{ name: "@username", value: username }]
+                    })
+                    .fetchAll();
+                users = result.resources;
+            } catch (error) {
+                context.log.error('Error querying users:', error);
+                // If users container doesn't exist, return 401 (not 500) to indicate auth failure
+                const errorMessage = (error.message || '').toLowerCase();
+                if (errorMessage.includes('notfound') || errorMessage.includes('container') || errorMessage.includes('does not exist')) {
+                    return {
+                        status: 401,
+                        jsonBody: { error: 'Invalid username or password' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Database error during authentication' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
             
             if (users.length === 0) {
                 return {
@@ -1237,7 +1282,12 @@ app.http('usersAuthenticate', {
             return { jsonBody: userWithoutPassword };
             
         } catch (error) {
-            return handleError(context, error, 'Authentication failed');
+            context.log.error('Authentication error:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Authentication failed. Please try again.' },
+                headers: { 'Content-Type': 'application/json' }
+            };
         }
     },
 });
