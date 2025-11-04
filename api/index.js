@@ -1577,6 +1577,8 @@ app.http('flightLookup', {
     route: 'flight-lookup',
     handler: async (request, context) => {
         let flightNumber = null;
+        
+        // Wrap everything in try-catch to ensure we always return 200 instead of 500
         try {
             // Get query parameters from request URL
             if (request.url) {
