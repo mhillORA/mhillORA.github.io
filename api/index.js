@@ -1683,6 +1683,15 @@ app.http('flightLookup', {
                     } else if (!response.ok) {
                         const errorText = await response.text();
                         context.log.error(`AviationStack API error: ${response.status} - ${errorText.substring(0, 200)}`);
+                        // Check if it's an API error response
+                        try {
+                            const errorData = JSON.parse(errorText);
+                            if (errorData.error) {
+                                context.log.error(`AviationStack API error details: ${JSON.stringify(errorData.error)}`);
+                            }
+                        } catch (parseError) {
+                            // Not JSON, that's okay
+                        }
                     }
                 } catch (error) {
                     context.log.error('AviationStack API exception:', error.message);
@@ -1732,8 +1741,10 @@ app.http('flightLookup', {
                 }
             }
             
-            // If no API key configured, return basic info
+            // If no API key configured or API call failed, return basic info with 200 status
+            // This allows the frontend to handle it gracefully
             return {
+                status: 200,
                 jsonBody: {
                     flightNumber: flightNumber,
                     airline: null,
@@ -1745,19 +1756,30 @@ app.http('flightLookup', {
                     delay: null,
                     gate: null,
                     terminal: null,
-                    message: 'Flight API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
+                    message: AVIATIONSTACK_KEY 
+                        ? 'Flight information not available. The flight may not be in the system or the API returned no data.'
+                        : 'Flight API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
                 },
                 headers: { 'Content-Type': 'application/json' }
             };
             
         } catch (error) {
             context.log.error('Flight lookup error:', error.message, error.stack);
+            // Return 200 with error info instead of 500 so frontend can handle it
             return {
-                status: 500,
+                status: 200,
                 jsonBody: { 
-                    error: 'Flight lookup failed',
-                    message: error.message,
-                    flightNumber: flightNumber || 'unknown'
+                    flightNumber: flightNumber || 'unknown',
+                    airline: null,
+                    origin: null,
+                    destination: null,
+                    departureTime: null,
+                    arrivalTime: null,
+                    status: 'scheduled',
+                    delay: null,
+                    gate: null,
+                    terminal: null,
+                    message: `Flight lookup failed: ${error.message}. Please enter flight details manually.`
                 },
                 headers: { 'Content-Type': 'application/json' }
             };
