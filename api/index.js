@@ -1158,112 +1158,7 @@ app.http('time-off-requests', {
     },
 });
 
-app.http('users', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'users/{id?}',
-    handler: async (request, context) => {
-        const container = getContainer('users');
-        const { method } = request;
-        const id = getIdFromRequest(request);
-        
-        // Don't process authenticate requests here - they should go to usersAuthenticate endpoint
-        if (id === 'authenticate') {
-            return {
-                status: 404,
-                jsonBody: { error: 'Use POST /api/users/authenticate for authentication' },
-                headers: { 'Content-Type': 'application/json' }
-            };
-        }
-
-        try {
-            switch (method) {
-                case 'GET':
-                    if (id) {
-                        const { resource } = await container.item(id).read(); 
-                        if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
-                        // Don't return password hash
-                        const { password, ...userWithoutPassword } = resource;
-                        return { jsonBody: userWithoutPassword };
-                    } else {
-                        const { resources } = await container.items.readAll().fetchAll();
-                        // Remove password hashes from all users
-                        const usersWithoutPasswords = resources.map(({ password, ...user }) => user);
-                        return { jsonBody: usersWithoutPasswords };
-                    }
-                
-                case 'POST':
-                    const body = await request.json();
-                    validateUsersSchema(body);
-                    
-                    // Check if username already exists
-                    const { resources: existingUsers } = await container.items
-                        .query({
-                            query: "SELECT * FROM c WHERE c.username = @username",
-                            parameters: [{ name: "@username", value: body.username }]
-                        })
-                        .fetchAll();
-                    
-                    if (existingUsers.length > 0) {
-                        return {
-                            status: 400,
-                            jsonBody: { error: 'Username already exists' },
-                            headers: { 'Content-Type': 'application/json' }
-                        };
-                    }
-                    
-                    // Hash password
-                    const hashedPassword = hashPassword(body.password);
-                    const newUser = { 
-                        ...body, 
-                        id: generateId(),
-                        password: hashedPassword,
-                        createdAt: new Date().toISOString()
-                    };
-                    const { resource: createdUser } = await container.items.create(newUser);
-                    const { password: _, ...userWithoutPassword } = createdUser;
-                    return { status: 201, jsonBody: userWithoutPassword };
-                
-                case 'PUT':
-                    const requestBody = await request.json();
-                    const updateId = id || requestBody.id;
-                    validateUsersSchema(requestBody);
-                    
-                    // If password is being updated, hash it
-                    if (requestBody.password) {
-                        requestBody.password = hashPassword(requestBody.password);
-                    }
-                    
-                    const updatedUser = { ...requestBody, id: updateId };
-                    const { resource: result } = await container.items.upsert(updatedUser);
-                    const { password: __, ...resultWithoutPassword } = result;
-                    return { jsonBody: resultWithoutPassword };
-
-                case 'DELETE':
-                    if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
-                    try {
-                        const { resource } = await container.item(id).read();
-                        if (!resource) {
-                            return { status: 204 };
-                        }
-                    } catch (e) {
-                        return { status: 204 };
-                    }
-                    await container.item(id).delete();
-                    return { status: 204 };
-
-                case 'OPTIONS':
-                    return { status: 200 };
-
-                default:
-                    return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
-            }
-        } catch (error) {
-            return handleError(context, error, 'Users operation failed');
-        }
-    },
-});
-
+// Register authenticate endpoint BEFORE users endpoint to ensure specific route matches first
 app.http('usersAuthenticate', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous', 
@@ -1365,6 +1260,103 @@ app.http('usersAuthenticate', {
     },
 });
 
+app.http('users', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'users/{id?}',
+    handler: async (request, context) => {
+        const container = getContainer('users');
+        const { method } = request;
+        const id = getIdFromRequest(request);
+
+        try {
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read(); 
+                        if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
+                        // Don't return password hash
+                        const { password, ...userWithoutPassword } = resource;
+                        return { jsonBody: userWithoutPassword };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        // Remove password hashes from all users
+                        const usersWithoutPasswords = resources.map(({ password, ...user }) => user);
+                        return { jsonBody: usersWithoutPasswords };
+                    }
+                
+                case 'POST':
+                    const body = await request.json();
+                    validateUsersSchema(body);
+                    
+                    // Check if username already exists
+                    const { resources: existingUsers } = await container.items
+                        .query({
+                            query: "SELECT * FROM c WHERE c.username = @username",
+                            parameters: [{ name: "@username", value: body.username }]
+                        })
+                        .fetchAll();
+                    
+                    if (existingUsers.length > 0) {
+                        return {
+                            status: 400,
+                            jsonBody: { error: 'Username already exists' },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                    
+                    // Hash password
+                    const hashedPassword = hashPassword(body.password);
+                    const newUser = { 
+                        ...body, 
+                        id: generateId(),
+                        password: hashedPassword,
+                        createdAt: new Date().toISOString()
+                    };
+                    const { resource: createdUser } = await container.items.create(newUser);
+                    const { password: _, ...userWithoutPassword } = createdUser;
+                    return { status: 201, jsonBody: userWithoutPassword };
+                
+                case 'PUT':
+                    const requestBody = await request.json();
+                    const updateId = id || requestBody.id;
+                    validateUsersSchema(requestBody);
+                    
+                    // If password is being updated, hash it
+                    if (requestBody.password) {
+                        requestBody.password = hashPassword(requestBody.password);
+                    }
+                    
+                    const updatedUser = { ...requestBody, id: updateId };
+                    const { resource: result } = await container.items.upsert(updatedUser);
+                    const { password: __, ...resultWithoutPassword } = result;
+                    return { jsonBody: resultWithoutPassword };
+
+                case 'DELETE':
+                    if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
+                    try {
+                        const { resource } = await container.item(id).read();
+                        if (!resource) {
+                            return { status: 204 };
+                        }
+                    } catch (e) {
+                        return { status: 204 };
+                    }
+                    await container.item(id).delete();
+                    return { status: 204 };
+
+                case 'OPTIONS':
+                    return { status: 200 };
+
+                default:
+                    return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+            }
+        } catch (error) {
+            return handleError(context, error, 'Users operation failed');
+        }
+    },
+});
+
 // Initialize default admin user on first run
 const initializeDefaultAdmin = async () => {
     try {
@@ -1415,51 +1407,28 @@ app.http('flightLookup', {
                 };
             }
             
-            // Try FlightLabs API first (if API key is configured)
-            const FLIGHT_API_KEY = process.env.FLIGHT_API_KEY || process.env.FLIGHTLABS_API_KEY;
-            const FLIGHT_API_PROVIDER = process.env.FLIGHT_API_PROVIDER || 'flightlabs';
-            
-            if (FLIGHT_API_KEY && FLIGHT_API_PROVIDER === 'flightlabs') {
-                try {
-                    const response = await fetch(`https://app.goflightlabs.com/flights?access_key=${FLIGHT_API_KEY}&flight_iata=${flightNumber}`);
-                    if (response.ok) {
-                        const apiData = await response.json();
-                        if (apiData.data && apiData.data.length > 0) {
-                            const flight = apiData.data[0];
-                            return {
-                                jsonBody: {
-                                    flightNumber: flight.flight?.iata || flightNumber,
-                                    airline: flight.airline?.name || null,
-                                    origin: flight.departure?.airport || flight.departure?.iata || null,
-                                    destination: flight.arrival?.airport || flight.arrival?.iata || null,
-                                    departureTime: flight.departure?.scheduled || null,
-                                    arrivalTime: flight.arrival?.scheduled || null,
-                                    status: flight.flight_status || 'scheduled',
-                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : null,
-                                    gate: flight.departure?.gate || null,
-                                    terminal: flight.departure?.terminal || null
-                                },
-                                headers: { 'Content-Type': 'application/json' }
-                            };
-                        }
-                    }
-                } catch (error) {
-                    context.log.warn('FlightLabs API failed:', error.message);
-                }
-            }
-            
-            // Try AviationStack API if configured (available via Microsoft Connectors)
+            // Try AviationStack API (available via Microsoft Connectors)
             const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY;
-            if (AVIATIONSTACK_KEY && (!FLIGHT_API_KEY || FLIGHT_API_PROVIDER === 'aviationstack')) {
+            context.log.info(`AviationStack API check: Key exists=${!!AVIATIONSTACK_KEY}`);
+            
+            if (AVIATIONSTACK_KEY) {
                 try {
-                    const response = await fetch(`http://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${flightNumber}&limit=1`);
+                    context.log.info(`Calling AviationStack API for flight: ${flightNumber}`);
+                    const apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${flightNumber}&limit=1`;
+                    const response = await fetch(apiUrl);
+                    
+                    context.log.info(`AviationStack API response status: ${response.status}`);
+                    
                     if (response.ok) {
                         const apiData = await response.json();
+                        context.log.info(`AviationStack API response data:`, JSON.stringify(apiData).substring(0, 500));
+                        
                         if (apiData.data && apiData.data.length > 0) {
                             const flight = apiData.data[0];
+                            context.log.info(`Flight found: ${flight.flight?.iata}, Origin: ${flight.departure?.iata}, Dest: ${flight.arrival?.iata}`);
                             return {
                                 jsonBody: {
-                                    flightNumber: flight.flight?.iata || flightNumber,
+                                    flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
                                     airline: flight.airline?.name || null,
                                     origin: flight.departure?.airport || flight.departure?.iata || null,
                                     destination: flight.arrival?.airport || flight.arrival?.iata || null,
@@ -1472,17 +1441,24 @@ app.http('flightLookup', {
                                 },
                                 headers: { 'Content-Type': 'application/json' }
                             };
+                        } else {
+                            context.log.warn('AviationStack API returned no flight data');
                         }
+                    } else {
+                        const errorText = await response.text();
+                        context.log.error(`AviationStack API error: ${response.status} - ${errorText}`);
                     }
                 } catch (error) {
-                    context.log.warn('AviationStack API failed:', error.message);
+                    context.log.error('AviationStack API exception:', error.message, error.stack);
                 }
+            } else {
+                context.log.info('AviationStack API not called - conditions not met');
             }
             
-            // Try OAG Flight Info API via Azure Marketplace (if configured)
+            // Try OAG Flight Info API via Azure Marketplace (if configured, as fallback)
             const OAG_API_KEY = process.env.OAG_API_KEY || process.env.OAG_FLIGHT_INFO_API_KEY;
             const OAG_API_URL = process.env.OAG_API_URL || 'https://api.oag.com/flightinfo/v1';
-            if (OAG_API_KEY && (!FLIGHT_API_KEY && !AVIATIONSTACK_KEY)) {
+            if (OAG_API_KEY && !AVIATIONSTACK_KEY) {
                 try {
                     // OAG API format - adjust based on their actual API documentation
                     const response = await fetch(`${OAG_API_URL}/flights?flightNumber=${flightNumber}`, {
@@ -1531,7 +1507,7 @@ app.http('flightLookup', {
                     delay: null,
                     gate: null,
                     terminal: null,
-                    message: 'Flight API key not configured. Please configure FLIGHT_API_KEY or AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
+                    message: 'Flight API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
                 },
                 headers: { 'Content-Type': 'application/json' }
             };
