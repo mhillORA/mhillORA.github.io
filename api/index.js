@@ -1448,7 +1448,7 @@ app.http('flightLookup', {
                 }
             }
             
-            // Try AviationStack API if configured
+            // Try AviationStack API if configured (available via Microsoft Connectors)
             const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY;
             if (AVIATIONSTACK_KEY && (!FLIGHT_API_KEY || FLIGHT_API_PROVIDER === 'aviationstack')) {
                 try {
@@ -1476,6 +1476,45 @@ app.http('flightLookup', {
                     }
                 } catch (error) {
                     context.log.warn('AviationStack API failed:', error.message);
+                }
+            }
+            
+            // Try OAG Flight Info API via Azure Marketplace (if configured)
+            const OAG_API_KEY = process.env.OAG_API_KEY || process.env.OAG_FLIGHT_INFO_API_KEY;
+            const OAG_API_URL = process.env.OAG_API_URL || 'https://api.oag.com/flightinfo/v1';
+            if (OAG_API_KEY && (!FLIGHT_API_KEY && !AVIATIONSTACK_KEY)) {
+                try {
+                    // OAG API format - adjust based on their actual API documentation
+                    const response = await fetch(`${OAG_API_URL}/flights?flightNumber=${flightNumber}`, {
+                        headers: {
+                            'Authorization': `Bearer ${OAG_API_KEY}`,
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    if (response.ok) {
+                        const apiData = await response.json();
+                        // Adjust response parsing based on OAG API structure
+                        if (apiData.data && apiData.data.length > 0) {
+                            const flight = apiData.data[0];
+                            return {
+                                jsonBody: {
+                                    flightNumber: flight.flightNumber || flightNumber,
+                                    airline: flight.airline?.name || null,
+                                    origin: flight.origin?.airport || flight.origin?.iata || null,
+                                    destination: flight.destination?.airport || flight.destination?.iata || null,
+                                    departureTime: flight.departure?.scheduled || null,
+                                    arrivalTime: flight.arrival?.scheduled || null,
+                                    status: flight.status || 'scheduled',
+                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : null,
+                                    gate: flight.departure?.gate || null,
+                                    terminal: flight.departure?.terminal || null
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                    }
+                } catch (error) {
+                    context.log.warn('OAG API failed:', error.message);
                 }
             }
             
