@@ -624,6 +624,123 @@
                     });
                 }
 
+                // Travel methods
+                async getTravel() {
+                    return this.request('/travel');
+                }
+
+                async getTravelRecord(id) {
+                    return this.request(`/travel/${id}`);
+                }
+
+                async createTravel(data) {
+                    return this.request('/travel', {
+                        method: 'POST',
+                        body: JSON.stringify(data)
+                    });
+                }
+
+                async updateTravel(id, data) {
+                    return this.request(`/travel/${id}`, {
+                        method: 'PUT',
+                        body: JSON.stringify(data)
+                    });
+                }
+
+                async deleteTravel(id) {
+                    return this.request(`/travel/${id}`, {
+                        method: 'DELETE'
+                    });
+                }
+
+                // Flight lookup - using backend proxy endpoint
+                // The backend will call FlightLabs or AviationStack APIs
+                // Configure API keys in Azure environment variables:
+                // - FLIGHT_API_KEY or FLIGHTLABS_API_KEY for FlightLabs
+                // - AVIATIONSTACK_API_KEY for AviationStack
+                // Free tiers available at: https://www.goflightlabs.com/ or https://aviationstack.com/
+                async lookupFlight(flightNumber) {
+                    try {
+                        // Call backend proxy endpoint (avoids CORS issues)
+                        const response = await fetch(`/api/flight-lookup?flightNumber=${encodeURIComponent(flightNumber)}`, {
+                            method: 'GET',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            }
+                        });
+                        
+                        if (response.ok) {
+                            const flightData = await response.json();
+                            return {
+                                flightNumber: flightData.flightNumber || flightNumber,
+                                airline: flightData.airline || this.extractAirline(flightNumber),
+                                origin: flightData.origin || null,
+                                destination: flightData.destination || null,
+                                departureTime: flightData.departureTime || null,
+                                arrivalTime: flightData.arrivalTime || null,
+                                status: this.mapFlightStatus(flightData.status),
+                                delay: flightData.delay || null,
+                                gate: flightData.gate || null,
+                                terminal: flightData.terminal || null
+                            };
+                        }
+                        
+                        // If API call fails, return basic info
+                        return {
+                            flightNumber: flightNumber,
+                            airline: this.extractAirline(flightNumber),
+                            origin: null,
+                            destination: null,
+                            departureTime: null,
+                            arrivalTime: null,
+                            status: 'scheduled',
+                            delay: null,
+                            gate: null,
+                            terminal: null
+                        };
+                        
+                    } catch (error) {
+                        console.error('Error looking up flight:', error);
+                        // Return basic info extracted from flight number
+                        return {
+                            flightNumber: flightNumber,
+                            airline: this.extractAirline(flightNumber),
+                            origin: null,
+                            destination: null,
+                            departureTime: null,
+                            arrivalTime: null,
+                            status: 'scheduled',
+                            delay: null,
+                            gate: null,
+                            terminal: null
+                        };
+                    }
+                }
+                
+                // Map flight status from API format to our format
+                mapFlightStatus(status) {
+                    const statusMap = {
+                        'scheduled': 'scheduled',
+                        'active': 'departed',
+                        'landed': 'arrived',
+                        'arrived': 'arrived',
+                        'cancelled': 'cancelled',
+                        'canceled': 'cancelled',
+                        'incident': 'delayed',
+                        'delayed': 'delayed',
+                        'diverted': 'delayed',
+                        'unknown': 'scheduled',
+                        'on time': 'scheduled'
+                    };
+                    return statusMap[status?.toLowerCase()] || 'scheduled';
+                }
+
+                extractAirline(flightNumber) {
+                    // Extract airline code from flight number (e.g., AA1234 -> AA)
+                    const match = flightNumber.match(/^([A-Z]{2,3})\d+/);
+                    return match ? match[1] : 'Unknown';
+                }
+
                 // Event methods
                 async createEvent(data) {
                     return this.request('/events', {
@@ -745,6 +862,7 @@
                 truck_events: [],
                 users: [], // Users for authentication
                 timeOffRequests: [], // Time off requests awaiting approval
+                travel: [], // Travel/flight information for CRCs
                 crcStats: {},
                 settings: {
                     'Site Assignment': 8,
@@ -773,6 +891,35 @@
             };
 
             // --- Helpers ---
+            // Calculate distance between two coordinates (Haversine formula)
+            const calculateDistance = (lat1, lon1, lat2, lon2) => {
+                const R = 3959; // Earth's radius in miles
+                const dLat = (lat2 - lat1) * Math.PI / 180;
+                const dLon = (lon2 - lon1) * Math.PI / 180;
+                const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+                const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+                return R * c;
+            };
+
+            // Get distance from hotel to site
+            const getHotelToSiteDistance = (travel) => {
+                if (!travel.nearestSiteId || !travel.hotelCity || !travel.hotelState) return null;
+                
+                const site = state.crc_sites.find(s => s.id === travel.nearestSiteId);
+                if (!site || !site.latitude || !site.longitude) return null;
+                
+                // For now, we'll use a simplified calculation or API
+                // In production, you'd use Google Maps Distance Matrix API or similar
+                // For now, return a placeholder that can be calculated
+                return {
+                    siteName: site.name,
+                    distance: null, // Will be calculated when hotel coordinates are available
+                    mileage: null
+                };
+            };
+
             const normalizeEmploymentType = (value) => {
                 const v = (value || '').toString().trim().toLowerCase();
                 if (v === 'pte' || v.includes('per-diem') || v.includes('per diem') || v.includes('part-time') || v.includes('part time')) return 'PTE';
@@ -1096,6 +1243,9 @@
                         <button data-action="set-main-tab" data-tab-id="jennysView" class="${state.activeTab === 'jennysView' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Jenny's View</button>
                         <button data-action="set-main-tab" data-tab-id="sites" class="${state.activeTab === 'sites' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Sites</button>
                         <button data-action="set-main-tab" data-tab-id="studies" class="${state.activeTab === 'studies' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Studies</button>
+                        <button data-action="set-main-tab" data-tab-id="travel" class="${state.activeTab === 'travel' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Travel</button>
+                        ${state.currentUser ? `<button data-action="set-main-tab" data-tab-id="timeOff" class="${state.activeTab === 'timeOff' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Time Off</button>` : ''}
+                        ${state.currentUser && (state.currentUser.permissionLevel === 'Manager' || state.currentUser.permissionLevel === 'Supervisor') ? `<button data-action="set-main-tab" data-tab-id="timeOffRequests" class="${state.activeTab === 'timeOffRequests' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Time Off Requests</button>` : ''}
                         ${state.currentUser && state.currentUser.permissionLevel === 'Manager' ? `<button data-action="set-main-tab" data-tab-id="users" class="${state.activeTab === 'users' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Users</button>` : ''}
                     </nav>
                 `;
@@ -1151,6 +1301,18 @@
                     mainAppContent.innerHTML = getUsersHTML();
                     mainAppContent.className = 'w-full';
                     renderUsersContent();
+                } else if (state.activeTab === 'timeOff') {
+                    mainAppContent.innerHTML = getTimeOffHTML();
+                    mainAppContent.className = 'w-full';
+                    renderTimeOffContent();
+                } else if (state.activeTab === 'timeOffRequests') {
+                    mainAppContent.innerHTML = getTimeOffRequestsHTML();
+                    mainAppContent.className = 'w-full';
+                    renderTimeOffRequestsContent();
+                } else if (state.activeTab === 'travel') {
+                    mainAppContent.innerHTML = getTravelHTML();
+                    mainAppContent.className = 'w-full';
+                    renderTravelContent();
                 }
             };
 
@@ -8897,6 +9059,133 @@
                         }
                         break;
                     }
+                    case 'open-add-travel-modal': {
+                        openModal(getAddTravelModalHTML(), '4xl');
+                        break;
+                    }
+                    case 'edit-travel': {
+                        const travel = state.travel.find(t => t.id === id);
+                        if (travel) openModal(getEditTravelModalHTML(travel), '4xl');
+                        break;
+                    }
+                    case 'delete-travel': {
+                        const travel = state.travel.find(t => t.id === id);
+                        if (travel) {
+                            const crc = state.crcs.find(c => c.id === travel.crcId);
+                            openModal(`
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Delete Travel Record</h3>
+                                <p class="dark:text-gray-300 mb-6">Are you sure you want to delete this travel record for <strong>${crc ? crc.name : 'Unknown CRC'}</strong> on ${new Date(travel.date).toLocaleDateString()}? This action cannot be undone.</p>
+                                <div class="flex justify-end gap-4">
+                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                    <button data-action="confirm-delete-travel" data-travel-id="${travel.id}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Travel</button>
+                                </div>
+                            `);
+                        }
+                        break;
+                    }
+                    case 'confirm-delete-travel': {
+                        try {
+                            await apiService.deleteTravel(id);
+                            setState({
+                                travel: state.travel.filter(t => t.id !== id)
+                            });
+                            showNotification('Travel record deleted successfully!', 'success');
+                            closeModal();
+                            renderTravelContent();
+                        } catch (error) {
+                            console.error('Error deleting travel:', error);
+                            showNotification('Failed to delete travel record. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'lookup-flight': {
+                        const flightNumberInput = document.getElementById('flight-number-input');
+                        if (!flightNumberInput) return;
+                        
+                        const flightNumber = flightNumberInput.value.trim().toUpperCase();
+                        if (!flightNumber) {
+                            showNotification('Please enter a flight number', 'error');
+                            return;
+                        }
+                        
+                        // Validate flight number format (e.g., AA1234, DL456)
+                        if (!/^[A-Z]{2,3}\d{1,4}$/.test(flightNumber)) {
+                            showNotification('Invalid flight number format. Please use format like AA1234 or DL456', 'error');
+                            return;
+                        }
+                        
+                        try {
+                            showNotification('Looking up flight information...', 'info');
+                            
+                            // Disable lookup button during request
+                            const lookupButton = e.target;
+                            const originalText = lookupButton.textContent;
+                            lookupButton.disabled = true;
+                            lookupButton.textContent = 'Looking up...';
+                            
+                            const flightData = await apiService.lookupFlight(flightNumber);
+                            
+                            // Fill in the form fields
+                            if (flightData.origin) {
+                                const originInput = document.getElementById('origin-input');
+                                if (originInput) originInput.value = flightData.origin;
+                            }
+                            if (flightData.destination) {
+                                const destinationInput = document.getElementById('destination-input');
+                                if (destinationInput) destinationInput.value = flightData.destination;
+                            }
+                            if (flightData.departureTime) {
+                                const departureInput = document.getElementById('departure-time-input');
+                                if (departureInput) {
+                                    const depDate = new Date(flightData.departureTime);
+                                    departureInput.value = depDate.toISOString().slice(0, 16);
+                                }
+                            }
+                            if (flightData.arrivalTime) {
+                                const arrivalInput = document.getElementById('arrival-time-input');
+                                if (arrivalInput) {
+                                    const arrDate = new Date(flightData.arrivalTime);
+                                    arrivalInput.value = arrDate.toISOString().slice(0, 16);
+                                }
+                            }
+                            if (flightData.gate) {
+                                const gateInput = document.getElementById('gate-input');
+                                if (gateInput) gateInput.value = flightData.gate;
+                            }
+                            if (flightData.terminal) {
+                                const terminalInput = document.getElementById('terminal-input');
+                                if (terminalInput) terminalInput.value = flightData.terminal;
+                            }
+                            if (flightData.status) {
+                                const statusInput = document.getElementById('status-input');
+                                if (statusInput) statusInput.value = flightData.status;
+                            }
+                            if (flightData.delay) {
+                                const delayInput = document.getElementById('delay-input');
+                                if (delayInput) delayInput.value = flightData.delay;
+                            }
+                            
+                            // Re-enable button
+                            lookupButton.disabled = false;
+                            lookupButton.textContent = originalText;
+                            
+                            if (flightData.origin || flightData.destination) {
+                                showNotification('Flight information loaded successfully!', 'success');
+                            } else {
+                                showNotification('Flight information partially loaded. Some details may need to be entered manually.', 'warning');
+                            }
+                        } catch (error) {
+                            console.error('Error looking up flight:', error);
+                            
+                            // Re-enable button
+                            const lookupButton = e.target;
+                            lookupButton.disabled = false;
+                            lookupButton.textContent = 'Lookup';
+                            
+                            showNotification('Failed to lookup flight information. Please enter details manually.', 'error');
+                        }
+                        break;
+                    }
                     case 'open-add-user-modal': {
                         openModal(getAddUserModalHTML());
                         break;
@@ -9940,6 +10229,37 @@
                         } catch (error) {
                             console.error('Error updating user:', error);
                             showNotification(error.message || 'Failed to update user. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'add-travel-form': {
+                        try {
+                            const newTravel = await apiService.createTravel(data);
+                            setState({
+                                travel: [...state.travel, newTravel]
+                            });
+                            showNotification('Travel record created successfully!', 'success');
+                            closeModal();
+                            renderTravelContent();
+                        } catch (error) {
+                            console.error('Error creating travel:', error);
+                            showNotification(error.message || 'Failed to create travel record. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'edit-travel-form': {
+                        try {
+                            const travelId = form.dataset.id;
+                            const updatedTravel = await apiService.updateTravel(travelId, data);
+                            setState({
+                                travel: state.travel.map(t => t.id === travelId ? updatedTravel : t)
+                            });
+                            showNotification('Travel record updated successfully!', 'success');
+                            closeModal();
+                            renderTravelContent();
+                        } catch (error) {
+                            console.error('Error updating travel:', error);
+                            showNotification(error.message || 'Failed to update travel record. See console for details.', 'error');
                         }
                         break;
                     }
@@ -11488,6 +11808,748 @@
                 lucide.createIcons();
             };
 
+            // Time Off Content Rendering (for users/CRCs)
+            const getTimeOffHTML = () => {
+                return `
+                    <div id="time-off-content" class="space-y-6">
+                        <!-- Content will be rendered here -->
+                    </div>
+                `;
+            };
+
+            const renderTimeOffContent = () => {
+                const container = document.getElementById('time-off-content');
+                if (!container) return;
+
+                // Check if user is logged in
+                if (!state.currentUser) {
+                    container.innerHTML = `
+                        <div class="text-center py-8">
+                            <div class="text-gray-500 dark:text-gray-400 mb-4">
+                                <i data-lucide="log-in" class="w-16 h-16 mx-auto mb-4"></i>
+                                <h3 class="text-lg font-medium">Please Log In</h3>
+                                <p class="text-sm">You must be logged in to view and submit time off requests.</p>
+                            </div>
+                        </div>
+                    `;
+                    lucide.createIcons();
+                    return;
+                }
+
+                // Get current user's time off requests
+                const userRequests = state.timeOffRequests.filter(req => req.requestedBy === state.currentUser.id || req.crcId === state.currentUser.id);
+                const pendingRequests = userRequests.filter(req => req.status === 'pending');
+                const approvedRequests = userRequests.filter(req => req.status === 'approved');
+                const rejectedRequests = userRequests.filter(req => req.status === 'rejected');
+
+                const statusColors = {
+                    'pending': 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300',
+                    'approved': 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300',
+                    'rejected': 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300'
+                };
+
+                let html = `
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Time Off Requests</h2>
+                        <button data-action="open-new-time-off-request" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
+                            <i data-lucide="calendar-plus" class="w-4 h-4 mr-2"></i>Request Time Off
+                        </button>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
+                            <div class="text-sm text-gray-500 dark:text-gray-400 mb-1">Pending</div>
+                            <div class="text-2xl font-bold text-yellow-600 dark:text-yellow-400">${pendingRequests.length}</div>
+                        </div>
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
+                            <div class="text-sm text-gray-500 dark:text-gray-400 mb-1">Approved</div>
+                            <div class="text-2xl font-bold text-green-600 dark:text-green-400">${approvedRequests.length}</div>
+                        </div>
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
+                            <div class="text-sm text-gray-500 dark:text-gray-400 mb-1">Rejected</div>
+                            <div class="text-2xl font-bold text-red-600 dark:text-red-400">${rejectedRequests.length}</div>
+                        </div>
+                    </div>
+
+                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                <thead class="bg-gray-50 dark:bg-gray-700">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Date</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Period</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Status</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Requested</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                    ${userRequests.length === 0 ? `
+                                        <tr>
+                                            <td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500 dark:text-gray-400">
+                                                No time off requests. Click "Request Time Off" to submit a new request.
+                                            </td>
+                                        </tr>
+                                    ` : userRequests.map(request => {
+                                        const crc = state.crcs.find(c => c.id === request.crcId);
+                                        return `
+                                            <tr>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
+                                                    ${new Date(request.date).toLocaleDateString()}
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                    ${request.period || 'Full Day'}
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap">
+                                                    <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${statusColors[request.status] || 'bg-gray-100 text-gray-800'}">
+                                                        ${request.status || 'pending'}
+                                                    </span>
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                    ${request.createdAt ? new Date(request.createdAt).toLocaleDateString() : 'N/A'}
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                    ${request.status === 'pending' ? `<button data-action="cancel-time-off-request" data-id="${request.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Cancel</button>` : ''}
+                                                </td>
+                                            </tr>
+                                        `;
+                                    }).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+
+                container.innerHTML = html;
+                lucide.createIcons();
+            };
+
+            // Time Off Requests Content Rendering (for Managers/Supervisors)
+            const getTimeOffRequestsHTML = () => {
+                return `
+                    <div id="time-off-requests-content" class="space-y-6">
+                        <!-- Content will be rendered here -->
+                    </div>
+                `;
+            };
+
+            const renderTimeOffRequestsContent = () => {
+                const container = document.getElementById('time-off-requests-content');
+                if (!container) return;
+
+                // Check if user has Manager or Supervisor permission
+                if (!state.currentUser || (state.currentUser.permissionLevel !== 'Manager' && state.currentUser.permissionLevel !== 'Supervisor')) {
+                    container.innerHTML = `
+                        <div class="text-center py-8">
+                            <div class="text-gray-500 dark:text-gray-400 mb-4">
+                                <i data-lucide="shield-alert" class="w-16 h-16 mx-auto mb-4"></i>
+                                <h3 class="text-lg font-medium">Access Denied</h3>
+                                <p class="text-sm">You must be a Manager or Supervisor to access the Time Off Requests section.</p>
+                            </div>
+                        </div>
+                    `;
+                    lucide.createIcons();
+                    return;
+                }
+
+                // Get pending requests grouped by CRC
+                const pendingRequests = state.timeOffRequests.filter(req => req.status === 'pending');
+                const requestsByCRC = {};
+                
+                pendingRequests.forEach(request => {
+                    if (!requestsByCRC[request.crcId]) {
+                        requestsByCRC[request.crcId] = [];
+                    }
+                    requestsByCRC[request.crcId].push(request);
+                });
+
+                if (pendingRequests.length === 0) {
+                    container.innerHTML = `
+                        <div class="text-center py-8">
+                            <div class="text-gray-500 dark:text-gray-400 mb-4">
+                                <i data-lucide="check-circle" class="w-16 h-16 mx-auto mb-4"></i>
+                                <h3 class="text-lg font-medium">No Pending Requests</h3>
+                                <p class="text-sm">All time off requests have been reviewed.</p>
+                            </div>
+                        </div>
+                    `;
+                    lucide.createIcons();
+                    return;
+                }
+
+                let html = `
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Time Off Requests - Pending Approval</h2>
+                        <div class="text-sm text-gray-500 dark:text-gray-400">
+                            ${pendingRequests.length} pending request${pendingRequests.length !== 1 ? 's' : ''}
+                        </div>
+                    </div>
+                `;
+
+                // Group requests by CRC
+                Object.keys(requestsByCRC).forEach(crcId => {
+                    const crc = state.crcs.find(c => c.id === crcId);
+                    const requests = requestsByCRC[crcId];
+                    
+                    html += `
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow mb-6">
+                            <div class="px-6 py-4 border-b dark:border-gray-700">
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-white">${crc ? crc.name : 'Unknown CRC'}</h3>
+                                <p class="text-sm text-gray-500 dark:text-gray-400">${requests.length} request${requests.length !== 1 ? 's' : ''} pending</p>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                    <thead class="bg-gray-50 dark:bg-gray-700">
+                                        <tr>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Date</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Period</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Requested</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                        ${requests.map(request => `
+                                            <tr>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
+                                                    ${new Date(request.date).toLocaleDateString()}
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                    ${request.period || 'Full Day'}
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                    ${request.createdAt ? new Date(request.createdAt).toLocaleDateString() : 'N/A'}
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                    <button data-action="approve-time-off-request" data-id="${request.id}" class="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 mr-2">Approve</button>
+                                                    <button data-action="reject-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700">Reject</button>
+                                                </td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                container.innerHTML = html;
+                lucide.createIcons();
+            };
+
+            // Travel Content Rendering
+            const getTravelHTML = () => {
+                return `
+                    <div id="travel-content" class="space-y-6">
+                        <!-- Content will be rendered here -->
+                    </div>
+                `;
+            };
+
+            const renderTravelContent = () => {
+                const container = document.getElementById('travel-content');
+                if (!container) return;
+
+                // Group travel by CRC
+                const travelByCRC = {};
+                state.travel.forEach(travel => {
+                    if (!travelByCRC[travel.crcId]) {
+                        travelByCRC[travel.crcId] = [];
+                    }
+                    travelByCRC[travel.crcId].push(travel);
+                });
+
+                let html = `
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Travel & Flight Information</h2>
+                        <button data-action="open-add-travel-modal" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
+                            <i data-lucide="plane" class="w-4 h-4 mr-2"></i>Add Travel
+                        </button>
+                    </div>
+                `;
+
+                if (state.travel.length === 0) {
+                    html += `
+                        <div class="text-center py-8">
+                            <div class="text-gray-500 dark:text-gray-400 mb-4">
+                                <i data-lucide="plane" class="w-16 h-16 mx-auto mb-4"></i>
+                                <h3 class="text-lg font-medium">No Travel Information</h3>
+                                <p class="text-sm">Click "Add Travel" to add flight information for CRCs.</p>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    // Calculate total costs
+                    let grandTotal = 0;
+                    
+                    // Group by CRC
+                    Object.keys(travelByCRC).forEach(crcId => {
+                        const crc = state.crcs.find(c => c.id === crcId);
+                        const travelRecords = travelByCRC[crcId].sort((a, b) => new Date(a.date) - new Date(b.date));
+                        
+                        // Calculate totals for this CRC
+                        let crcFlightTotal = 0;
+                        let crcCarTotal = 0;
+                        let crcHotelTotal = 0;
+                        let crcTotal = 0;
+                        
+                        travelRecords.forEach(travel => {
+                            crcFlightTotal += parseFloat(travel.flightCost || 0);
+                            crcCarTotal += parseFloat(travel.carRentalCost || 0);
+                            crcHotelTotal += parseFloat(travel.hotelCost || 0);
+                        });
+                        crcTotal = crcFlightTotal + crcCarTotal + crcHotelTotal;
+                        grandTotal += crcTotal;
+                        
+                        html += `
+                            <div class="bg-white dark:bg-gray-800 rounded-lg shadow mb-6">
+                                <div class="px-6 py-4 border-b dark:border-gray-700 flex justify-between items-center">
+                                    <div>
+                                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">${crc ? crc.name : 'Unknown CRC'}</h3>
+                                        <p class="text-sm text-gray-500 dark:text-gray-400">${travelRecords.length} travel record${travelRecords.length !== 1 ? 's' : ''}</p>
+                                    </div>
+                                    <div class="text-right">
+                                        <div class="text-sm text-gray-500 dark:text-gray-400">Total Cost</div>
+                                        <div class="text-2xl font-bold text-green-600 dark:text-green-400">$${crcTotal.toFixed(2)}</div>
+                                        <div class="text-xs text-gray-400 mt-1">
+                                            Flight: $${crcFlightTotal.toFixed(2)} | Car: $${crcCarTotal.toFixed(2)} | Hotel: $${crcHotelTotal.toFixed(2)}
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                ${travelRecords.map(travel => {
+                                    const statusColors = {
+                                        'scheduled': 'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-300',
+                                        'delayed': 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300',
+                                        'cancelled': 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300',
+                                        'departed': 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300',
+                                        'arrived': 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300'
+                                    };
+                                    
+                                    const route = travel.origin && travel.destination 
+                                        ? `${travel.origin} → ${travel.destination}`
+                                        : travel.origin || travel.destination || 'N/A';
+                                    
+                                    const times = travel.departureTime && travel.arrivalTime
+                                        ? `Dep: ${new Date(travel.departureTime).toLocaleTimeString()} | Arr: ${new Date(travel.arrivalTime).toLocaleTimeString()}`
+                                        : travel.departureTime 
+                                            ? `Dep: ${new Date(travel.departureTime).toLocaleTimeString()}`
+                                            : travel.arrivalTime
+                                                ? `Arr: ${new Date(travel.arrivalTime).toLocaleTimeString()}`
+                                                : 'N/A';
+                                    
+                                    const visitTotal = parseFloat(travel.flightCost || 0) + parseFloat(travel.carRentalCost || 0) + parseFloat(travel.hotelCost || 0);
+                                    const distanceInfo = getHotelToSiteDistance(travel);
+                                    const nearestSite = travel.nearestSiteId ? state.crc_sites.find(s => s.id === travel.nearestSiteId) : null;
+                                    
+                                    return `
+                                        <div class="px-6 py-4 border-b dark:border-gray-700">
+                                            <div class="flex justify-between items-start mb-4">
+                                                <div>
+                                                    <h4 class="font-semibold text-gray-900 dark:text-white">${new Date(travel.date).toLocaleDateString()}</h4>
+                                                    <p class="text-sm text-gray-500 dark:text-gray-400">Visit Total: <span class="font-semibold text-green-600 dark:text-green-400">$${visitTotal.toFixed(2)}</span></p>
+                                                </div>
+                                                <div class="text-right">
+                                                    <button data-action="edit-travel" data-id="${travel.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 mr-3">Edit</button>
+                                                    <button data-action="delete-travel" data-id="${travel.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Delete</button>
+                                                </div>
+                                            </div>
+                                            
+                                            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                                <!-- Flight Information -->
+                                                <div class="border dark:border-gray-700 rounded-lg p-4">
+                                                    <h5 class="font-semibold text-gray-900 dark:text-white mb-2 flex items-center">
+                                                        <i data-lucide="plane" class="w-4 h-4 mr-2"></i>Flight
+                                                    </h5>
+                                                    <div class="text-sm space-y-1">
+                                                        <div><span class="font-semibold">${travel.flightNumber || 'N/A'}</span> ${travel.airline ? `(${travel.airline})` : ''}</div>
+                                                        <div>${route}</div>
+                                                        <div>${times}</div>
+                                                        ${travel.confirmationNumber ? `<div>Confirmation: ${travel.confirmationNumber}</div>` : ''}
+                                                        ${travel.gate ? `<div>Gate: ${travel.gate}</div>` : ''}
+                                                        ${travel.terminal ? `<div>Terminal: ${travel.terminal}</div>` : ''}
+                                                        <div class="mt-2">
+                                                            <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${statusColors[travel.status] || 'bg-gray-100 text-gray-800'}">
+                                                                ${travel.status || 'scheduled'}
+                                                            </span>
+                                                        </div>
+                                                        <div class="mt-2 font-semibold text-green-600 dark:text-green-400">
+                                                            Cost: $${(parseFloat(travel.flightCost || 0)).toFixed(2)}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                
+                                                <!-- Car Rental Information -->
+                                                <div class="border dark:border-gray-700 rounded-lg p-4">
+                                                    <h5 class="font-semibold text-gray-900 dark:text-white mb-2 flex items-center">
+                                                        <i data-lucide="car" class="w-4 h-4 mr-2"></i>Car Rental
+                                                    </h5>
+                                                    ${travel.carRentalCompany || travel.carType ? `
+                                                        <div class="text-sm space-y-1">
+                                                            ${travel.carRentalCompany ? `<div><span class="font-semibold">${travel.carRentalCompany}</span></div>` : ''}
+                                                            ${travel.carType ? `<div>${travel.carType}</div>` : ''}
+                                                            ${travel.carPickupDate ? `<div>Pickup: ${new Date(travel.carPickupDate).toLocaleDateString()}</div>` : ''}
+                                                            ${travel.carReturnDate ? `<div>Return: ${new Date(travel.carReturnDate).toLocaleDateString()}</div>` : ''}
+                                                            <div class="mt-2 font-semibold text-green-600 dark:text-green-400">
+                                                                Cost: $${(parseFloat(travel.carRentalCost || 0)).toFixed(2)}
+                                                            </div>
+                                                        </div>
+                                                    ` : '<div class="text-sm text-gray-400">No car rental</div>'}
+                                                </div>
+                                                
+                                                <!-- Hotel Information -->
+                                                <div class="border dark:border-gray-700 rounded-lg p-4">
+                                                    <h5 class="font-semibold text-gray-900 dark:text-white mb-2 flex items-center">
+                                                        <i data-lucide="hotel" class="w-4 h-4 mr-2"></i>Hotel
+                                                    </h5>
+                                                    ${travel.hotelName || travel.hotelAddress ? `
+                                                        <div class="text-sm space-y-1">
+                                                            ${travel.hotelName ? `<div><span class="font-semibold">${travel.hotelName}</span></div>` : ''}
+                                                            ${travel.hotelAddress ? `<div>${travel.hotelAddress}</div>` : ''}
+                                                            ${travel.hotelCity || travel.hotelState ? `<div>${travel.hotelCity || ''}${travel.hotelCity && travel.hotelState ? ', ' : ''}${travel.hotelState || ''} ${travel.hotelZip || ''}</div>` : ''}
+                                                            ${travel.hotelCheckIn ? `<div>Check-in: ${new Date(travel.hotelCheckIn).toLocaleDateString()}</div>` : ''}
+                                                            ${travel.hotelCheckOut ? `<div>Check-out: ${new Date(travel.hotelCheckOut).toLocaleDateString()}</div>` : ''}
+                                                            ${nearestSite ? `<div class="text-xs text-blue-600 dark:text-blue-400 mt-1">Nearest Site: ${nearestSite.name}</div>` : ''}
+                                                            <div class="mt-2 font-semibold text-green-600 dark:text-green-400">
+                                                                Cost: $${(parseFloat(travel.hotelCost || 0)).toFixed(2)}
+                                                            </div>
+                                                        </div>
+                                                    ` : '<div class="text-sm text-gray-400">No hotel</div>'}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        `;
+                    });
+                    
+                    // Add grand total
+                    html += `
+                        <div class="bg-green-50 dark:bg-green-900/20 rounded-lg p-6 mb-6">
+                            <div class="flex justify-between items-center">
+                                <h3 class="text-xl font-bold text-gray-900 dark:text-white">Total Travel Costs</h3>
+                                <div class="text-right">
+                                    <div class="text-3xl font-bold text-green-600 dark:text-green-400">$${grandTotal.toFixed(2)}</div>
+                                    <div class="text-sm text-gray-500 dark:text-gray-400 mt-1">Across all CRCs and visits</div>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                container.innerHTML = html;
+                lucide.createIcons();
+            };
+
+            // Travel Modal Functions
+            const getAddTravelModalHTML = () => {
+                const crcOptions = state.crcs.map(crc => `<option value="${crc.id}">${crc.name}</option>`).join('');
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">Add Travel Information</h2>
+                    <form id="add-travel-form" class="space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Staff Member</label>
+                            <select name="crcId" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="">Select staff member...</option>
+                                ${crcOptions}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Date</label>
+                            <input type="date" name="date" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Flight Number</label>
+                            <div class="flex gap-2">
+                                <input type="text" name="flightNumber" id="flight-number-input" required class="flex-1 p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., AA1234">
+                                <button type="button" data-action="lookup-flight" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Lookup</button>
+                            </div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Enter flight number and click "Lookup" to automatically fill flight information</p>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Origin</label>
+                                <input type="text" name="origin" id="origin-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., JFK">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Destination</label>
+                                <input type="text" name="destination" id="destination-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., LAX">
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Departure Time</label>
+                                <input type="datetime-local" name="departureTime" id="departure-time-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Arrival Time</label>
+                                <input type="datetime-local" name="arrivalTime" id="arrival-time-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Gate</label>
+                                <input type="text" name="gate" id="gate-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Terminal</label>
+                                <input type="text" name="terminal" id="terminal-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Status</label>
+                                <select name="status" id="status-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="scheduled">Scheduled</option>
+                                    <option value="delayed">Delayed</option>
+                                    <option value="departed">Departed</option>
+                                    <option value="arrived">Arrived</option>
+                                    <option value="cancelled">Cancelled</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Confirmation Number</label>
+                            <input type="text" name="confirmationNumber" id="confirmation-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Booking confirmation number">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Delay (if applicable)</label>
+                            <input type="text" name="delay" id="delay-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 30 minutes">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Flight Cost</label>
+                            <input type="number" name="flightCost" id="flight-cost-input" step="0.01" min="0" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                        </div>
+                        
+                        <div class="border-t dark:border-gray-700 pt-6">
+                            <h3 class="text-lg font-semibold dark:text-white mb-4">Car Rental</h3>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Rental Company</label>
+                                    <input type="text" name="carRentalCompany" id="car-rental-company-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Enterprise, Hertz">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Car Type</label>
+                                    <input type="text" name="carType" id="car-type-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Compact, SUV">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-4 mt-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Pickup Date</label>
+                                    <input type="date" name="carPickupDate" id="car-pickup-date-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Return Date</label>
+                                    <input type="date" name="carReturnDate" id="car-return-date-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            </div>
+                            <div class="mt-4">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Rental Cost</label>
+                                <input type="number" name="carRentalCost" id="car-rental-cost-input" step="0.01" min="0" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                            </div>
+                        </div>
+                        
+                        <div class="border-t dark:border-gray-700 pt-6">
+                            <h3 class="text-lg font-semibold dark:text-white mb-4">Hotel</h3>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hotel Name</label>
+                                <input type="text" name="hotelName" id="hotel-name-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Hotel name">
+                            </div>
+                            <div class="mt-4">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hotel Address</label>
+                                <input type="text" name="hotelAddress" id="hotel-address-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white mb-2" placeholder="Street address">
+                                <input type="text" name="hotelCity" id="hotel-city-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white mb-2" placeholder="City">
+                                <div class="grid grid-cols-2 gap-4">
+                                    <input type="text" name="hotelState" id="hotel-state-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="State">
+                                    <input type="text" name="hotelZip" id="hotel-zip-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="ZIP Code">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-4 mt-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Check-in Date</label>
+                                    <input type="date" name="hotelCheckIn" id="hotel-check-in-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Check-out Date</label>
+                                    <input type="date" name="hotelCheckOut" id="hotel-check-out-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            </div>
+                            <div class="mt-4">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hotel Cost</label>
+                                <input type="number" name="hotelCost" id="hotel-cost-input" step="0.01" min="0" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                            </div>
+                            <div class="mt-4">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Nearest Site (for distance calculation)</label>
+                                <select name="nearestSiteId" id="nearest-site-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="">Select site...</option>
+                                    ${state.crc_sites.map(site => `<option value="${site.id}">${site.name} - ${site.city}, ${site.state}</option>`).join('')}
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Add Travel</button>
+                        </div>
+                    </form>
+                `;
+            };
+
+            const getEditTravelModalHTML = (travel) => {
+                const crcOptions = state.crcs.map(crc => `<option value="${crc.id}" ${travel.crcId === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
+                const departureTimeValue = travel.departureTime ? new Date(travel.departureTime).toISOString().slice(0, 16) : '';
+                const arrivalTimeValue = travel.arrivalTime ? new Date(travel.arrivalTime).toISOString().slice(0, 16) : '';
+                
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">Edit Travel Information</h2>
+                    <form id="edit-travel-form" data-id="${travel.id}" class="space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Staff Member</label>
+                            <select name="crcId" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                ${crcOptions}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Date</label>
+                            <input type="date" name="date" value="${travel.date}" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Flight Number</label>
+                            <div class="flex gap-2">
+                                <input type="text" name="flightNumber" id="flight-number-input" value="${travel.flightNumber || ''}" required class="flex-1 p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., AA1234">
+                                <button type="button" data-action="lookup-flight" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Lookup</button>
+                            </div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Enter flight number and click "Lookup" to automatically fill flight information</p>
+                            <p class="text-xs text-blue-600 dark:text-blue-400 mt-1">
+                                <i data-lucide="info" class="w-3 h-3 inline mr-1"></i>
+                                For better results, configure a Flight API key in Settings. Free APIs: <a href="https://www.goflightlabs.com/" target="_blank" class="underline">FlightLabs</a> or <a href="https://aviationstack.com/" target="_blank" class="underline">AviationStack</a>
+                            </p>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Origin</label>
+                                <input type="text" name="origin" id="origin-input" value="${travel.origin || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., JFK">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Destination</label>
+                                <input type="text" name="destination" id="destination-input" value="${travel.destination || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., LAX">
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Departure Time</label>
+                                <input type="datetime-local" name="departureTime" id="departure-time-input" value="${departureTimeValue}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Arrival Time</label>
+                                <input type="datetime-local" name="arrivalTime" id="arrival-time-input" value="${arrivalTimeValue}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Gate</label>
+                                <input type="text" name="gate" id="gate-input" value="${travel.gate || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Terminal</label>
+                                <input type="text" name="terminal" id="terminal-input" value="${travel.terminal || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Status</label>
+                                <select name="status" id="status-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="scheduled" ${travel.status === 'scheduled' ? 'selected' : ''}>Scheduled</option>
+                                    <option value="delayed" ${travel.status === 'delayed' ? 'selected' : ''}>Delayed</option>
+                                    <option value="departed" ${travel.status === 'departed' ? 'selected' : ''}>Departed</option>
+                                    <option value="arrived" ${travel.status === 'arrived' ? 'selected' : ''}>Arrived</option>
+                                    <option value="cancelled" ${travel.status === 'cancelled' ? 'selected' : ''}>Cancelled</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Confirmation Number</label>
+                            <input type="text" name="confirmationNumber" id="confirmation-input" value="${travel.confirmationNumber || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Booking confirmation number">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Delay (if applicable)</label>
+                            <input type="text" name="delay" id="delay-input" value="${travel.delay || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 30 minutes">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Flight Cost</label>
+                            <input type="number" name="flightCost" id="flight-cost-input" step="0.01" min="0" value="${travel.flightCost || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                        </div>
+                        
+                        <div class="border-t dark:border-gray-700 pt-6">
+                            <h3 class="text-lg font-semibold dark:text-white mb-4">Car Rental</h3>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Rental Company</label>
+                                    <input type="text" name="carRentalCompany" id="car-rental-company-input" value="${travel.carRentalCompany || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Enterprise, Hertz">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Car Type</label>
+                                    <input type="text" name="carType" id="car-type-input" value="${travel.carType || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Compact, SUV">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-4 mt-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Pickup Date</label>
+                                    <input type="date" name="carPickupDate" id="car-pickup-date-input" value="${travel.carPickupDate || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Return Date</label>
+                                    <input type="date" name="carReturnDate" id="car-return-date-input" value="${travel.carReturnDate || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            </div>
+                            <div class="mt-4">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Rental Cost</label>
+                                <input type="number" name="carRentalCost" id="car-rental-cost-input" step="0.01" min="0" value="${travel.carRentalCost || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                            </div>
+                        </div>
+                        
+                        <div class="border-t dark:border-gray-700 pt-6">
+                            <h3 class="text-lg font-semibold dark:text-white mb-4">Hotel</h3>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hotel Name</label>
+                                <input type="text" name="hotelName" id="hotel-name-input" value="${travel.hotelName || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Hotel name">
+                            </div>
+                            <div class="mt-4">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hotel Address</label>
+                                <input type="text" name="hotelAddress" id="hotel-address-input" value="${travel.hotelAddress || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white mb-2" placeholder="Street address">
+                                <input type="text" name="hotelCity" id="hotel-city-input" value="${travel.hotelCity || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white mb-2" placeholder="City">
+                                <div class="grid grid-cols-2 gap-4">
+                                    <input type="text" name="hotelState" id="hotel-state-input" value="${travel.hotelState || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="State">
+                                    <input type="text" name="hotelZip" id="hotel-zip-input" value="${travel.hotelZip || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="ZIP Code">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-4 mt-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Check-in Date</label>
+                                    <input type="date" name="hotelCheckIn" id="hotel-check-in-input" value="${travel.hotelCheckIn || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Check-out Date</label>
+                                    <input type="date" name="hotelCheckOut" id="hotel-check-out-input" value="${travel.hotelCheckOut || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            </div>
+                            <div class="mt-4">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hotel Cost</label>
+                                <input type="number" name="hotelCost" id="hotel-cost-input" step="0.01" min="0" value="${travel.hotelCost || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                            </div>
+                            <div class="mt-4">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Nearest Site (for distance calculation)</label>
+                                <select name="nearestSiteId" id="nearest-site-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="">Select site...</option>
+                                    ${state.crc_sites.map(site => `<option value="${site.id}" ${travel.nearestSiteId === site.id ? 'selected' : ''}>${site.name} - ${site.city}, ${site.state}</option>`).join('')}
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Save Changes</button>
+                        </div>
+                    </form>
+                `;
+            };
+
             const setupStudyRoleConfigurationModal = (study) => {
                 const roleCheckboxes = document.querySelectorAll('input[name="selectedRoles"]');
                 const siteCheckboxes = document.querySelectorAll('input[name="studySites"]');
@@ -11805,6 +12867,7 @@
                         truck_events,
                         users,
                         timeOffRequests,
+                        travel,
                         initialLoadComplete: true 
                     });
                     setupRealtimeListeners();
