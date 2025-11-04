@@ -423,9 +423,39 @@
                     return this.request('/studies');
                 }
 
-                // Sites
-                async getSites() {
-                    return this.request('/sites');
+                // Sites with caching
+                async getSites(useCache = true) {
+                    // Check cache first
+                    if (useCache && state.siteCache.data && state.siteCache.timestamp) {
+                        const cacheAge = Date.now() - state.siteCache.timestamp;
+                        if (cacheAge < state.siteCache.ttl) {
+                            console.log('CHAOS: Using cached sites data');
+                            return state.siteCache.data;
+                        }
+                    }
+                    
+                    // Fetch from API
+                    const sites = await this.request('/sites');
+                    
+                    // Update cache
+                    state.siteCache = {
+                        data: sites,
+                        timestamp: Date.now(),
+                        ttl: state.siteCache.ttl
+                    };
+                    
+                    return sites;
+                }
+
+                // Invalidate site cache
+                invalidateSiteCache() {
+                    if (state && state.siteCache) {
+                        state.siteCache = {
+                            data: null,
+                            timestamp: null,
+                            ttl: state.siteCache.ttl
+                        };
+                    }
                 }
 
                 // CRCs
@@ -529,6 +559,42 @@
                     });
                 }
 
+                // Users methods
+                async getUsers() {
+                    return this.request('/users');
+                }
+
+                async getUser(id) {
+                    return this.request(`/users/${id}`);
+                }
+
+                async createUser(data) {
+                    return this.request('/users', {
+                        method: 'POST',
+                        body: JSON.stringify(data)
+                    });
+                }
+
+                async updateUser(id, data) {
+                    return this.request(`/users/${id}`, {
+                        method: 'PUT',
+                        body: JSON.stringify(data)
+                    });
+                }
+
+                async deleteUser(id) {
+                    return this.request(`/users/${id}`, {
+                        method: 'DELETE'
+                    });
+                }
+
+                async authenticateUser(username, password) {
+                    return this.request('/users/authenticate', {
+                        method: 'POST',
+                        body: JSON.stringify({ username, password })
+                    });
+                }
+
                 // Event methods
                 async createEvent(data) {
                     return this.request('/events', {
@@ -626,6 +692,8 @@
             let state = {
                 authReady: false,
                 userId: 'chaos-user', // Simple user ID for CHAOS
+                currentUser: null, // Current authenticated user
+                isAuthenticated: false,
                 crcCalendarDate: new Date(),
                 unavailabilityDate: new Date(),
                 selectedCrcForUnavailability: null,
@@ -646,6 +714,7 @@
                 training_types: [],
                 trucks: [],
                 truck_events: [],
+                users: [], // Users for authentication
                 crcStats: {},
                 settings: {
                     'Site Assignment': 8,
@@ -665,6 +734,12 @@
                 dashboardStudyFilter: 'all',
                 initialLoadComplete: false,
                 charts: {}, // To hold chart instances
+                // Cache for sites to improve loading performance
+                siteCache: {
+                    data: null,
+                    timestamp: null,
+                    ttl: 5 * 60 * 1000 // 5 minutes cache
+                }
             };
 
             // --- Helpers ---
@@ -991,6 +1066,7 @@
                         <button data-action="set-main-tab" data-tab-id="jennysView" class="${state.activeTab === 'jennysView' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Jenny's View</button>
                         <button data-action="set-main-tab" data-tab-id="sites" class="${state.activeTab === 'sites' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Sites</button>
                         <button data-action="set-main-tab" data-tab-id="studies" class="${state.activeTab === 'studies' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Studies</button>
+                        ${state.currentUser && state.currentUser.permissionLevel === 'Manager' ? `<button data-action="set-main-tab" data-tab-id="users" class="${state.activeTab === 'users' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Users</button>` : ''}
                     </nav>
                 `;
             };
@@ -1041,6 +1117,10 @@
                     mainAppContent.innerHTML = getStudiesHTML();
                     mainAppContent.className = 'w-full';
                     renderStudiesContent();
+                } else if (state.activeTab === 'users') {
+                    mainAppContent.innerHTML = getUsersHTML();
+                    mainAppContent.className = 'w-full';
+                    renderUsersContent();
                 }
             };
 
@@ -7845,6 +7925,112 @@
                 `;
             };
 
+            // User Management Modal Functions
+            const getAddUserModalHTML = () => {
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">Add User</h2>
+                    <form id="add-user-form" class="space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Username</label>
+                            <input type="text" name="username" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter username">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Password</label>
+                            <input type="password" name="password" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter password">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Permission Level</label>
+                            <select name="permissionLevel" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="CRC">CRC</option>
+                                <option value="Supervisor">Supervisor</option>
+                                <option value="Manager">Manager</option>
+                            </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                <strong>Manager:</strong> Full access to all features<br>
+                                <strong>Supervisor:</strong> View all schedules<br>
+                                <strong>CRC:</strong> View schedules they are assigned to
+                            </p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Email</label>
+                            <input type="email" name="email" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter email (optional)">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Microsoft Entra ID</label>
+                            <input type="text" name="entraId" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter Microsoft Entra ID (optional)">
+                        </div>
+                        <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Add User</button>
+                        </div>
+                    </form>
+                `;
+            };
+
+            const getEditUserModalHTML = (user) => {
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">Edit User</h2>
+                    <form id="edit-user-form" data-id="${user.id}" class="space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Username</label>
+                            <input type="text" name="username" value="${user.username}" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" readonly>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Username cannot be changed</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">New Password</label>
+                            <input type="password" name="password" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Leave blank to keep current password">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Permission Level</label>
+                            <select name="permissionLevel" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="CRC" ${user.permissionLevel === 'CRC' ? 'selected' : ''}>CRC</option>
+                                <option value="Supervisor" ${user.permissionLevel === 'Supervisor' ? 'selected' : ''}>Supervisor</option>
+                                <option value="Manager" ${user.permissionLevel === 'Manager' ? 'selected' : ''}>Manager</option>
+                            </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                <strong>Manager:</strong> Full access to all features<br>
+                                <strong>Supervisor:</strong> View all schedules<br>
+                                <strong>CRC:</strong> View schedules they are assigned to
+                            </p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Email</label>
+                            <input type="email" name="email" value="${user.email || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter email (optional)">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Microsoft Entra ID</label>
+                            <input type="text" name="entraId" value="${user.entraId || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter Microsoft Entra ID (optional)">
+                        </div>
+                        <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Save Changes</button>
+                        </div>
+                    </form>
+                `;
+            };
+
+            const getLoginModalHTML = () => {
+                return `
+                    <div class="text-center">
+                        <h2 class="text-2xl font-bold dark:text-white mb-6">Login to CHAOS</h2>
+                        <form id="login-form" class="space-y-6">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Username</label>
+                                <input type="text" name="username" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter username" autofocus>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Password</label>
+                                <input type="password" name="password" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter password">
+                            </div>
+                            <div id="login-error" class="hidden text-red-600 dark:text-red-400 text-sm"></div>
+                            <div class="flex justify-end gap-4 pt-4">
+                                <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 w-full">Login</button>
+                            </div>
+                        </form>
+                    </div>
+                `;
+            };
+
             const getBulkTrainingModalHTML = () => {
                 // Get training names from training_types collection and existing CRC trainings
                 const allTrainings = new Set();
@@ -8678,6 +8864,43 @@
                             setTimeout(() => {
                                 setupCRCProfileModal();
                             }, 100);
+                        }
+                        break;
+                    }
+                    case 'open-add-user-modal': {
+                        openModal(getAddUserModalHTML());
+                        break;
+                    }
+                    case 'edit-user': {
+                        const user = state.users.find(u => u.id === id);
+                        if (user) openModal(getEditUserModalHTML(user));
+                        break;
+                    }
+                    case 'delete-user': {
+                        const user = state.users.find(u => u.id === id);
+                        if (user) {
+                            openModal(`
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Delete User</h3>
+                                <p class="dark:text-gray-300 mb-6">Are you sure you want to delete user <strong>${user.username}</strong>? This action cannot be undone.</p>
+                                <div class="flex justify-end gap-4">
+                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                    <button data-action="confirm-delete-user" data-user-id="${user.id}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete User</button>
+                                </div>
+                            `);
+                        }
+                        break;
+                    }
+                    case 'confirm-delete-user': {
+                        try {
+                            await apiService.deleteUser(id);
+                            setState({
+                                users: state.users.filter(u => u.id !== id)
+                            });
+                            showNotification('User deleted successfully!', 'success');
+                            closeModal();
+                        } catch (error) {
+                            console.error('Error deleting user:', error);
+                            showNotification('Failed to delete user. See console for details.', 'error');
                         }
                         break;
                     }
@@ -9619,6 +9842,74 @@
                         } catch (error) {
                             console.error("Error updating truck event:", error);
                             showNotification('Failed to update truck event. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'login-form': {
+                        try {
+                            const { username, password } = data;
+                            const user = await apiService.authenticateUser(username, password);
+                            if (user) {
+                                setState({
+                                    currentUser: user,
+                                    isAuthenticated: true
+                                });
+                                // Store in localStorage for persistence
+                                localStorage.setItem('chaos_user', JSON.stringify(user));
+                                showNotification('Login successful!', 'success');
+                                closeModal();
+                                // Load data after successful login
+                                state.authReady = true;
+                                state.userId = 'chaos-user';
+                                performInitialLoad();
+                            } else {
+                                const errorDiv = document.getElementById('login-error');
+                                if (errorDiv) {
+                                    errorDiv.textContent = 'Invalid username or password';
+                                    errorDiv.classList.remove('hidden');
+                                }
+                            }
+                        } catch (error) {
+                            console.error('Error logging in:', error);
+                            const errorDiv = document.getElementById('login-error');
+                            if (errorDiv) {
+                                errorDiv.textContent = error.message || 'Login failed. Please try again.';
+                                errorDiv.classList.remove('hidden');
+                            }
+                        }
+                        break;
+                    }
+                    case 'add-user-form': {
+                        try {
+                            const newUser = await apiService.createUser(data);
+                            setState({
+                                users: [...state.users, newUser]
+                            });
+                            showNotification('User created successfully!', 'success');
+                            closeModal();
+                        } catch (error) {
+                            console.error('Error creating user:', error);
+                            showNotification(error.message || 'Failed to create user. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'edit-user-form': {
+                        try {
+                            const userId = form.dataset.id;
+                            // Only send password if provided
+                            const updateData = { ...data };
+                            if (!updateData.password || updateData.password.trim() === '') {
+                                delete updateData.password;
+                            }
+                            const updatedUser = await apiService.updateUser(userId, updateData);
+                            setState({
+                                users: state.users.map(u => u.id === userId ? updatedUser : u)
+                            });
+                            showNotification('User updated successfully!', 'success');
+                            closeModal();
+                        } catch (error) {
+                            console.error('Error updating user:', error);
+                            showNotification(error.message || 'Failed to update user. See console for details.', 'error');
                         }
                         break;
                     }
@@ -11063,6 +11354,110 @@
                 lucide.createIcons();
             };
 
+            // Users Content Rendering
+            const getUsersHTML = () => {
+                return `
+                    <div id="users-content" class="space-y-6">
+                        <!-- Content will be rendered here -->
+                    </div>
+                `;
+            };
+
+            const renderUsersContent = () => {
+                const container = document.getElementById('users-content');
+                if (!container) return;
+
+                // Check if user has Manager permission
+                if (!state.currentUser || state.currentUser.permissionLevel !== 'Manager') {
+                    container.innerHTML = `
+                        <div class="text-center py-8">
+                            <div class="text-gray-500 dark:text-gray-400 mb-4">
+                                <i data-lucide="shield-alert" class="w-16 h-16 mx-auto mb-4"></i>
+                                <h3 class="text-lg font-medium">Access Denied</h3>
+                                <p class="text-sm">You must be a Manager to access the Users section.</p>
+                            </div>
+                        </div>
+                    `;
+                    lucide.createIcons();
+                    return;
+                }
+
+                if (!state.users || state.users.length === 0) {
+                    container.innerHTML = `
+                        <div class="text-center py-8">
+                            <div class="text-gray-500 dark:text-gray-400 mb-4">
+                                <i data-lucide="users" class="w-16 h-16 mx-auto mb-4"></i>
+                                <h3 class="text-lg font-medium">No users available</h3>
+                                <p class="text-sm">Click "Add User" to create a new user account.</p>
+                            </div>
+                        </div>
+                    `;
+                    lucide.createIcons();
+                    return;
+                }
+
+                const permissionLevelColors = {
+                    'Manager': 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300',
+                    'Supervisor': 'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-300',
+                    'CRC': 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300'
+                };
+
+                let html = `
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold text-gray-900 dark:text-white">User Management</h2>
+                        <button data-action="open-add-user-modal" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
+                            <i data-lucide="user-plus" class="w-4 h-4 mr-2"></i>Add User
+                        </button>
+                    </div>
+                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                <thead class="bg-gray-50 dark:bg-gray-700">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Username</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Permission Level</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Email</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Entra ID</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Created</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                    ${state.users.map(user => `
+                                        <tr>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
+                                                ${user.username}
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap">
+                                                <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${permissionLevelColors[user.permissionLevel] || 'bg-gray-100 text-gray-800'}">
+                                                    ${user.permissionLevel || 'CRC'}
+                                                </span>
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                ${user.email || 'N/A'}
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                ${user.entraId || 'N/A'}
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                ${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'N/A'}
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                <button data-action="edit-user" data-id="${user.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 mr-3">Edit</button>
+                                                ${user.username !== 'admin' ? `<button data-action="delete-user" data-id="${user.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Delete</button>` : ''}
+                                            </td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+
+                container.innerHTML = html;
+                lucide.createIcons();
+            };
+
             const setupStudyRoleConfigurationModal = (study) => {
                 const roleCheckboxes = document.querySelectorAll('input[name="selectedRoles"]');
                 const siteCheckboxes = document.querySelectorAll('input[name="studySites"]');
@@ -11301,6 +11696,17 @@
                         apiService.getTrainingTypes()
                     ]);
                     
+                    // Load users if current user is Manager
+                    let users = [];
+                    if (state.currentUser && state.currentUser.permissionLevel === 'Manager') {
+                        try {
+                            users = await apiService.getUsers();
+                            console.log('CHAOS: Loaded', users.length, 'users');
+                        } catch (error) {
+                            console.error('CHAOS: Error loading users:', error);
+                        }
+                    }
+                    
                     console.log('CHAOS: Data fetched successfully from Azure API');
                     console.log('CHAOS: Loaded', crcs.length, 'CRCs');
                     console.log('CHAOS: Loaded', sites.length, 'sites');
@@ -11354,7 +11760,8 @@
                         roles, 
                         training_types,
                         trucks, 
-                        truck_events, 
+                        truck_events,
+                        users,
                         initialLoadComplete: true 
                     });
                     setupRealtimeListeners();
@@ -11426,6 +11833,30 @@
 					const apiHealthy = await checkApiHealth();
 					if (!apiHealthy) {
 						showNotification('API server is not responding. Data will be saved locally.', 'warning');
+					}
+					
+					// Check for stored user in localStorage
+					const storedUser = localStorage.getItem('chaos_user');
+					if (storedUser) {
+						try {
+							const user = JSON.parse(storedUser);
+							setState({
+								currentUser: user,
+								isAuthenticated: true
+							});
+							console.log('CHAOS: Restored user from localStorage:', user.username);
+						} catch (error) {
+							console.error('CHAOS: Error parsing stored user:', error);
+							localStorage.removeItem('chaos_user');
+						}
+					}
+					
+					// Show login modal if not authenticated
+					if (!state.currentUser || !state.isAuthenticated) {
+						console.log('CHAOS: No user authenticated, showing login modal');
+						openModal(getLoginModalHTML());
+						// Don't proceed with data load until authenticated
+						return;
 					}
 					
 					console.log('CHAOS: Initializing with Azure API...');
