@@ -600,16 +600,31 @@ const validateTravelSchema = (data) => {
         errors.push('destination must be a string');
     }
     
-    if (data.flightCost !== undefined && (typeof data.flightCost !== 'number' || data.flightCost < 0)) {
-        errors.push('flightCost must be a non-negative number');
+    // Convert empty strings to undefined for cost fields, then validate
+    const flightCost = data.flightCost === '' || data.flightCost === null ? undefined : data.flightCost;
+    const carRentalCost = data.carRentalCost === '' || data.carRentalCost === null ? undefined : data.carRentalCost;
+    const hotelCost = data.hotelCost === '' || data.hotelCost === null ? undefined : data.hotelCost;
+    
+    // Convert string numbers to numbers
+    if (flightCost !== undefined) {
+        const num = typeof flightCost === 'string' ? parseFloat(flightCost) : flightCost;
+        if (isNaN(num) || num < 0) {
+            errors.push('flightCost must be a non-negative number');
+        }
     }
     
-    if (data.carRentalCost !== undefined && (typeof data.carRentalCost !== 'number' || data.carRentalCost < 0)) {
-        errors.push('carRentalCost must be a non-negative number');
+    if (carRentalCost !== undefined) {
+        const num = typeof carRentalCost === 'string' ? parseFloat(carRentalCost) : carRentalCost;
+        if (isNaN(num) || num < 0) {
+            errors.push('carRentalCost must be a non-negative number');
+        }
     }
     
-    if (data.hotelCost !== undefined && (typeof data.hotelCost !== 'number' || data.hotelCost < 0)) {
-        errors.push('hotelCost must be a non-negative number');
+    if (hotelCost !== undefined) {
+        const num = typeof hotelCost === 'string' ? parseFloat(hotelCost) : hotelCost;
+        if (isNaN(num) || num < 0) {
+            errors.push('hotelCost must be a non-negative number');
+        }
     }
     
     if (data.status && !['scheduled', 'delayed', 'departed', 'arrived', 'cancelled'].includes(data.status)) {
@@ -748,6 +763,24 @@ async function crudHandler(context, request, containerName) {
             case 'POST':
                 const body = await request.json();
                 
+                // Normalize cost fields for travel - convert empty strings to undefined
+                if (containerName === 'travel') {
+                    if (body.flightCost === '' || body.flightCost === null) body.flightCost = undefined;
+                    if (body.carRentalCost === '' || body.carRentalCost === null) body.carRentalCost = undefined;
+                    if (body.hotelCost === '' || body.hotelCost === null) body.hotelCost = undefined;
+                    
+                    // Convert string numbers to numbers
+                    if (body.flightCost !== undefined && typeof body.flightCost === 'string') {
+                        body.flightCost = parseFloat(body.flightCost) || undefined;
+                    }
+                    if (body.carRentalCost !== undefined && typeof body.carRentalCost === 'string') {
+                        body.carRentalCost = parseFloat(body.carRentalCost) || undefined;
+                    }
+                    if (body.hotelCost !== undefined && typeof body.hotelCost === 'string') {
+                        body.hotelCost = parseFloat(body.hotelCost) || undefined;
+                    }
+                }
+                
                 // Validate schema based on container
                 try {
                     switch (containerName) {
@@ -814,6 +847,24 @@ async function crudHandler(context, request, containerName) {
             case 'PUT':
                 const requestBody = await request.json();
                 const updateId = id || requestBody.id;
+                
+                // Normalize cost fields for travel - convert empty strings to undefined
+                if (containerName === 'travel') {
+                    if (requestBody.flightCost === '' || requestBody.flightCost === null) requestBody.flightCost = undefined;
+                    if (requestBody.carRentalCost === '' || requestBody.carRentalCost === null) requestBody.carRentalCost = undefined;
+                    if (requestBody.hotelCost === '' || requestBody.hotelCost === null) requestBody.hotelCost = undefined;
+                    
+                    // Convert string numbers to numbers
+                    if (requestBody.flightCost !== undefined && typeof requestBody.flightCost === 'string') {
+                        requestBody.flightCost = parseFloat(requestBody.flightCost) || undefined;
+                    }
+                    if (requestBody.carRentalCost !== undefined && typeof requestBody.carRentalCost === 'string') {
+                        requestBody.carRentalCost = parseFloat(requestBody.carRentalCost) || undefined;
+                    }
+                    if (requestBody.hotelCost !== undefined && typeof requestBody.hotelCost === 'string') {
+                        requestBody.hotelCost = parseFloat(requestBody.hotelCost) || undefined;
+                    }
+                }
                 
                 // Validate schema based on container
                 try {
@@ -1115,6 +1166,15 @@ app.http('users', {
         const container = getContainer('users');
         const { method } = request;
         const id = getIdFromRequest(request);
+        
+        // Don't process authenticate requests here - they should go to usersAuthenticate endpoint
+        if (id === 'authenticate') {
+            return {
+                status: 404,
+                jsonBody: { error: 'Use POST /api/users/authenticate for authentication' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
 
         try {
             switch (method) {
