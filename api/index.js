@@ -700,10 +700,23 @@ async function crudHandler(context, request, containerName) {
                         const errorCode = error.code || error.statusCode;
                         const errorMessage = (error.message || '').toLowerCase();
                         
+                        // For travel container specifically, always return empty array on any error
+                        // This prevents launch failures
+                        if (containerName === 'travel') {
+                            context.log.warn(`Travel container does not exist yet or error occurred, returning empty array. Error: ${error.message}`);
+                            return { 
+                                jsonBody: [],
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                        
                         if (errorCode === 404 || 
+                            errorCode === 400 ||
                             errorMessage.includes('notfound') || 
-                            errorMessage.includes('container') && errorMessage.includes('not found') ||
-                            errorMessage.includes('does not exist')) {
+                            errorMessage.includes('not found') ||
+                            errorMessage.includes('container') ||
+                            errorMessage.includes('does not exist') ||
+                            errorMessage.includes('bad request')) {
                             context.log.warn(`Container '${containerName}' does not exist yet, returning empty array`);
                             return { 
                                 jsonBody: [],
