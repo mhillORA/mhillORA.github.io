@@ -577,6 +577,52 @@ const validateTimeOffRequestsSchema = (data) => {
     return true;
 };
 
+const validateTravelSchema = (data) => {
+    const errors = [];
+    
+    if (!data.crcId || typeof data.crcId !== 'string') {
+        errors.push('crcId is required and must be a string');
+    }
+    
+    if (!data.date || typeof data.date !== 'string') {
+        errors.push('date is required and must be a string');
+    }
+    
+    if (data.flightNumber && typeof data.flightNumber !== 'string') {
+        errors.push('flightNumber must be a string');
+    }
+    
+    if (data.origin && typeof data.origin !== 'string') {
+        errors.push('origin must be a string');
+    }
+    
+    if (data.destination && typeof data.destination !== 'string') {
+        errors.push('destination must be a string');
+    }
+    
+    if (data.flightCost !== undefined && (typeof data.flightCost !== 'number' || data.flightCost < 0)) {
+        errors.push('flightCost must be a non-negative number');
+    }
+    
+    if (data.carRentalCost !== undefined && (typeof data.carRentalCost !== 'number' || data.carRentalCost < 0)) {
+        errors.push('carRentalCost must be a non-negative number');
+    }
+    
+    if (data.hotelCost !== undefined && (typeof data.hotelCost !== 'number' || data.hotelCost < 0)) {
+        errors.push('hotelCost must be a non-negative number');
+    }
+    
+    if (data.status && !['scheduled', 'delayed', 'departed', 'arrived', 'cancelled'].includes(data.status)) {
+        errors.push('status must be one of: scheduled, delayed, departed, arrived, cancelled');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Travel validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
 // =================================================================================
 // BUSINESS LOGIC FUNCTIONS
 // =================================================================================
@@ -680,6 +726,9 @@ async function crudHandler(context, request, containerName) {
                         case 'time-off-requests':
                             validateTimeOffRequestsSchema(body);
                             break;
+                        case 'travel':
+                            validateTravelSchema(body);
+                            break;
                     }
                 } catch (validationError) {
                     console.error(`Validation error for ${containerName}:`, validationError.message);
@@ -743,6 +792,9 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'time-off-requests':
                             validateTimeOffRequestsSchema(requestBody);
+                            break;
+                        case 'travel':
+                            validateTravelSchema(requestBody);
                             break;
                     }
                 } catch (validationError) {
@@ -874,6 +926,13 @@ app.http('surveys', {
     authLevel: 'anonymous', 
     route: 'surveys/{id?}',
     handler: (request, context) => crudHandler(context, request, 'surveys'),
+});
+
+app.http('travel', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'travel/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'travel'),
 });
 
 app.http('time-off-requests', {
@@ -1133,3 +1192,109 @@ const initializeDefaultAdmin = async () => {
 
 // Call initialization
 initializeDefaultAdmin();
+
+// Flight lookup proxy endpoint
+app.http('flightLookup', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'flight-lookup',
+    handler: async (request, context) => {
+        try {
+            const { searchParams } = new URL(request.url);
+            const flightNumber = searchParams.get('flightNumber');
+            
+            if (!flightNumber) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'flightNumber parameter is required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Try FlightLabs API first (if API key is configured)
+            const FLIGHT_API_KEY = process.env.FLIGHT_API_KEY || process.env.FLIGHTLABS_API_KEY;
+            const FLIGHT_API_PROVIDER = process.env.FLIGHT_API_PROVIDER || 'flightlabs';
+            
+            if (FLIGHT_API_KEY && FLIGHT_API_PROVIDER === 'flightlabs') {
+                try {
+                    const response = await fetch(`https://app.goflightlabs.com/flights?access_key=${FLIGHT_API_KEY}&flight_iata=${flightNumber}`);
+                    if (response.ok) {
+                        const apiData = await response.json();
+                        if (apiData.data && apiData.data.length > 0) {
+                            const flight = apiData.data[0];
+                            return {
+                                jsonBody: {
+                                    flightNumber: flight.flight?.iata || flightNumber,
+                                    airline: flight.airline?.name || null,
+                                    origin: flight.departure?.airport || flight.departure?.iata || null,
+                                    destination: flight.arrival?.airport || flight.arrival?.iata || null,
+                                    departureTime: flight.departure?.scheduled || null,
+                                    arrivalTime: flight.arrival?.scheduled || null,
+                                    status: flight.flight_status || 'scheduled',
+                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : null,
+                                    gate: flight.departure?.gate || null,
+                                    terminal: flight.departure?.terminal || null
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                    }
+                } catch (error) {
+                    context.log.warn('FlightLabs API failed:', error.message);
+                }
+            }
+            
+            // Try AviationStack API if configured
+            const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY;
+            if (AVIATIONSTACK_KEY && (!FLIGHT_API_KEY || FLIGHT_API_PROVIDER === 'aviationstack')) {
+                try {
+                    const response = await fetch(`http://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${flightNumber}&limit=1`);
+                    if (response.ok) {
+                        const apiData = await response.json();
+                        if (apiData.data && apiData.data.length > 0) {
+                            const flight = apiData.data[0];
+                            return {
+                                jsonBody: {
+                                    flightNumber: flight.flight?.iata || flightNumber,
+                                    airline: flight.airline?.name || null,
+                                    origin: flight.departure?.airport || flight.departure?.iata || null,
+                                    destination: flight.arrival?.airport || flight.arrival?.iata || null,
+                                    departureTime: flight.departure?.scheduled || null,
+                                    arrivalTime: flight.arrival?.scheduled || null,
+                                    status: flight.flight_status || 'scheduled',
+                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : null,
+                                    gate: flight.departure?.gate || null,
+                                    terminal: flight.departure?.terminal || null
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                    }
+                } catch (error) {
+                    context.log.warn('AviationStack API failed:', error.message);
+                }
+            }
+            
+            // If no API key configured, return basic info
+            return {
+                jsonBody: {
+                    flightNumber: flightNumber,
+                    airline: null,
+                    origin: null,
+                    destination: null,
+                    departureTime: null,
+                    arrivalTime: null,
+                    status: 'scheduled',
+                    delay: null,
+                    gate: null,
+                    terminal: null,
+                    message: 'Flight API key not configured. Please configure FLIGHT_API_KEY or AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
+            
+        } catch (error) {
+            return handleError(context, error, 'Flight lookup failed');
+        }
+    },
+});
