@@ -676,12 +676,29 @@ async function crudHandler(context, request, containerName) {
         switch (method) {
             case 'GET':
                 if (id) {
-                    const { resource } = await container.item(id).read(); 
-                    if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
-                    return { jsonBody: resource };
+                    try {
+                        const { resource } = await container.item(id).read(); 
+                        if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
+                        return { jsonBody: resource };
+                    } catch (error) {
+                        // If container doesn't exist, return 404
+                        if (error.code === 404 || error.message.includes('NotFound')) {
+                            return { status: 404, jsonBody: { error: `${containerName} not found` } };
+                        }
+                        throw error;
+                    }
                 } else {
-                    const { resources } = await container.items.readAll().fetchAll();
-                    return { jsonBody: resources };
+                    try {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return { jsonBody: resources };
+                    } catch (error) {
+                        // If container doesn't exist yet, return empty array
+                        if (error.code === 404 || error.message.includes('NotFound') || error.message.includes('Container')) {
+                            context.log.warn(`Container '${containerName}' does not exist yet, returning empty array`);
+                            return { jsonBody: [] };
+                        }
+                        throw error;
+                    }
                 }
             
             case 'POST':
