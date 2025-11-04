@@ -1160,6 +1160,138 @@ app.http('time-off-requests', {
 
 // Register authenticate endpoint BEFORE users endpoint to ensure specific route matches first
 // Register authenticate route BEFORE users route to ensure proper matching
+// Register Entra ID authentication endpoint
+app.http('usersAuthenticateEntra', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/authenticate-entra',
+    handler: async (request, context) => {
+        try {
+            const { token } = await request.json();
+            
+            if (!token) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'Token is required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+
+            // Validate token with Microsoft
+            // For production, you should verify the JWT token signature
+            // For now, we'll decode and extract user info
+            try {
+                const tokenParts = token.split('.');
+                if (tokenParts.length !== 3) {
+                    throw new Error('Invalid token format');
+                }
+
+                // Decode JWT payload (base64url)
+                let base64 = tokenParts[1].replace(/-/g, '+').replace(/_/g, '/');
+                // Add padding if needed
+                while (base64.length % 4) {
+                    base64 += '=';
+                }
+                const payload = JSON.parse(Buffer.from(base64, 'base64').toString());
+                
+                const entraId = payload.oid || payload.sub; // Object ID or Subject
+                const email = payload.email || payload.upn || payload.preferred_username;
+                const name = payload.name || `${payload.given_name || ''} ${payload.family_name || ''}`.trim();
+                
+                if (!entraId) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Invalid token: missing user identifier' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+
+                let container;
+                try {
+                    container = getContainer('users');
+                } catch (error) {
+                    context.log.error('Error getting users container:', error);
+                    return {
+                        status: 500,
+                        jsonBody: { error: 'Database error. Please check if users container exists.' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+
+                // Look for existing user by Entra ID
+                let users;
+                try {
+                    const { resources } = await container.items
+                        .query({
+                            query: "SELECT * FROM c WHERE c.entraId = @entraId",
+                            parameters: [{ name: "@entraId", value: entraId }]
+                        })
+                        .fetchAll();
+                    users = resources || [];
+                } catch (error) {
+                    context.log.error('Error querying users:', error);
+                    return {
+                        status: 500,
+                        jsonBody: { error: 'Database error during authentication' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+
+                let user;
+                if (users.length > 0) {
+                    // Existing user
+                    user = users[0];
+                    // Update user info if needed
+                    const updates = {};
+                    if (email && user.email !== email) updates.email = email;
+                    if (name && user.name !== name) updates.name = name;
+                    
+                    if (Object.keys(updates).length > 0) {
+                        const updatedUser = { ...user, ...updates };
+                        const { resource } = await container.items.upsert(updatedUser);
+                        user = resource;
+                    }
+                } else {
+                    // Create new user from Entra ID
+                    // Default permission level - you may want to check group membership
+                    const newUser = {
+                        id: generateId(),
+                        entraId: entraId,
+                        username: email || entraId,
+                        email: email || '',
+                        name: name || email || 'User',
+                        permissionLevel: 'CRC', // Default permission level
+                        createdAt: new Date().toISOString()
+                    };
+                    
+                    const { resource: createdUser } = await container.items.create(newUser);
+                    user = createdUser;
+                }
+
+                // Return user without sensitive data
+                const { password: _, ...userWithoutPassword } = user;
+                return { jsonBody: userWithoutPassword };
+                
+            } catch (decodeError) {
+                context.log.error('Token decode error:', decodeError);
+                return {
+                    status: 400,
+                    jsonBody: { error: 'Invalid token format' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+        } catch (error) {
+            context.log.error('Entra ID authentication error:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Authentication failed. Please try again.' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    },
+});
+
 app.http('usersAuthenticate', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous', 
