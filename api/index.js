@@ -1607,6 +1607,28 @@ app.http('flightLookup', {
             const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY;
             context.log.info(`AviationStack API check: Key exists=${!!AVIATIONSTACK_KEY}`);
             
+            // If no API key, return basic info immediately
+            if (!AVIATIONSTACK_KEY) {
+                context.log.info('AviationStack API key not configured, returning basic info');
+                return {
+                    status: 200,
+                    jsonBody: {
+                        flightNumber: flightNumber,
+                        airline: null,
+                        origin: null,
+                        destination: null,
+                        departureTime: null,
+                        arrivalTime: null,
+                        status: 'scheduled',
+                        delay: null,
+                        gate: null,
+                        terminal: null,
+                        message: 'Flight API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
             if (AVIATIONSTACK_KEY) {
                 try {
                     context.log.info(`Calling AviationStack API for flight: ${flightNumber}`);
@@ -1614,24 +1636,95 @@ app.http('flightLookup', {
                     // Try multiple API parameter formats based on AviationStack documentation
                     // Format 1: flight_iata (full IATA code like DAL1478)
                     let apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${encodeURIComponent(flightNumber.toUpperCase())}&limit=100`;
-                    let response = await fetch(apiUrl);
+                    let response;
                     let apiData = null;
                     
-                    context.log.info(`AviationStack API response status (flight_iata): ${response.status}`);
+                    try {
+                        response = await fetch(apiUrl);
+                        context.log.info(`AviationStack API response status (flight_iata): ${response.status}`);
+                    } catch (fetchError) {
+                        context.log.error('AviationStack API fetch error:', fetchError.message);
+                        // Fall through to return basic info
+                        response = null;
+                    }
                     
-                    if (response.ok) {
-                        apiData = await response.json();
-                        context.log.info(`AviationStack API response: ${apiData.data?.length || 0} flights found`);
+                    if (response && response.ok) {
+                        try {
+                            apiData = await response.json();
+                            context.log.info(`AviationStack API response: ${apiData.data?.length || 0} flights found`);
+                        } catch (jsonError) {
+                            context.log.error('AviationStack API JSON parse error:', jsonError.message);
+                            // Fall through to try alternative method
+                            apiData = null;
+                        }
+                    }
+                    
+                    if (apiData && apiData.data && apiData.data.length > 0) {
+                        const exactMatch = apiData.data.find(f => 
+                            f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
+                            f.flight?.number?.toString() === flightNumber.replace(/^[A-Z]{2,3}/i, '')
+                        );
                         
-                        // Filter to find exact match
-                        if (apiData.data && apiData.data.length > 0) {
-                            const exactMatch = apiData.data.find(f => 
-                                f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
-                                f.flight?.number?.toString() === flightNumber.replace(/^[A-Z]{2,3}/i, '')
-                            );
+                        if (exactMatch) {
+                            const flight = exactMatch;
+                            context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
                             
-                            if (exactMatch) {
-                                const flight = exactMatch;
+                            return {
+                                jsonBody: {
+                                    flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
+                                    airline: flight.airline?.name || flight.airline?.iata || null,
+                                    origin: flight.departure?.iata || flight.departure?.airport || flight.departure?.airport_name || null,
+                                    destination: flight.arrival?.iata || flight.arrival?.airport || flight.arrival?.airport_name || null,
+                                    departureTime: flight.departure?.scheduled || flight.departure?.estimated || null,
+                                    arrivalTime: flight.arrival?.scheduled || flight.arrival?.estimated || null,
+                                    status: flight.flight_status || 'scheduled',
+                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : (flight.arrival?.delay ? `${flight.arrival.delay} minutes` : null),
+                                    gate: flight.departure?.gate || flight.arrival?.gate || null,
+                                    terminal: flight.departure?.terminal || flight.arrival?.terminal || null
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                    } else if (response && !response.ok) {
+                        const errorText = await response.text();
+                        context.log.error(`AviationStack API error: ${response.status} - ${errorText.substring(0, 200)}`);
+                    }
+                    
+                    // If not found with flight_iata, try splitting into airline_iata + flight_number
+                    if (!apiData || !apiData.data || apiData.data.length === 0) {
+                        context.log.info('Trying airline_iata + flight_number parameter format');
+                        const flightMatch = flightNumber.match(/^([A-Z]{2,3})(\d+)$/i);
+                        if (flightMatch) {
+                            const [, airlineCode, flightNum] = flightMatch;
+                            apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&airline_iata=${airlineCode.toUpperCase()}&flight_number=${flightNum}&limit=100`;
+                            
+                            try {
+                                response = await fetch(apiUrl);
+                                context.log.info(`AviationStack API response status (airline_iata+flight_number): ${response.status}`);
+                            } catch (fetchError) {
+                                context.log.error('AviationStack API fetch error (alternative):', fetchError.message);
+                                response = null;
+                            }
+                            
+                            if (response && response.ok) {
+                                try {
+                                    apiData = await response.json();
+                                    context.log.info(`AviationStack API response: ${apiData.data?.length || 0} flights found`);
+                                } catch (jsonError) {
+                                    context.log.error('AviationStack API JSON parse error (alternative):', jsonError.message);
+                                    apiData = null;
+                                }
+                            }
+                            
+                            if (apiData && apiData.data && apiData.data.length > 0) {
+                                // Find the best match
+                                const bestMatch = apiData.data.find(f => 
+                                    f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
+                                    (f.airline?.iata?.toUpperCase() === airlineCode.toUpperCase() && 
+                                     f.flight?.number?.toString() === flightNum)
+                                ) || apiData.data[0];
+                                
+                                const flight = bestMatch;
                                 context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
                                 
                                 return {
@@ -1649,68 +1742,10 @@ app.http('flightLookup', {
                                     },
                                     headers: { 'Content-Type': 'application/json' }
                                 };
-                            }
-                        }
-                    }
-                    
-                    // If not found with flight_iata, try splitting into airline_iata + flight_number
-                    if (!apiData || !apiData.data || apiData.data.length === 0) {
-                        context.log.info('Trying airline_iata + flight_number parameter format');
-                        const flightMatch = flightNumber.match(/^([A-Z]{2,3})(\d+)$/i);
-                        if (flightMatch) {
-                            const [, airlineCode, flightNum] = flightMatch;
-                            apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&airline_iata=${airlineCode.toUpperCase()}&flight_number=${flightNum}&limit=100`;
-                            response = await fetch(apiUrl);
-                            
-                            context.log.info(`AviationStack API response status (airline_iata+flight_number): ${response.status}`);
-                            
-                            if (response.ok) {
-                                apiData = await response.json();
-                                context.log.info(`AviationStack API response: ${apiData.data?.length || 0} flights found`);
-                                
-                                if (apiData.data && apiData.data.length > 0) {
-                                    // Find the best match
-                                    const bestMatch = apiData.data.find(f => 
-                                        f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
-                                        (f.airline?.iata?.toUpperCase() === airlineCode.toUpperCase() && 
-                                         f.flight?.number?.toString() === flightNum)
-                                    ) || apiData.data[0];
-                                    
-                                    const flight = bestMatch;
-                                    context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
-                                    
-                                    return {
-                                        jsonBody: {
-                                            flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
-                                            airline: flight.airline?.name || flight.airline?.iata || null,
-                                            origin: flight.departure?.iata || flight.departure?.airport || flight.departure?.airport_name || null,
-                                            destination: flight.arrival?.iata || flight.arrival?.airport || flight.arrival?.airport_name || null,
-                                            departureTime: flight.departure?.scheduled || flight.departure?.estimated || null,
-                                            arrivalTime: flight.arrival?.scheduled || flight.arrival?.estimated || null,
-                                            status: flight.flight_status || 'scheduled',
-                                            delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : (flight.arrival?.delay ? `${flight.arrival.delay} minutes` : null),
-                                            gate: flight.departure?.gate || flight.arrival?.gate || null,
-                                            terminal: flight.departure?.terminal || flight.arrival?.terminal || null
-                                        },
-                                        headers: { 'Content-Type': 'application/json' }
-                                    };
-                                }
-                            } else {
+                            } else if (response && !response.ok) {
                                 const errorText = await response.text();
-                                context.log.error(`AviationStack API error: ${response.status} - ${errorText.substring(0, 200)}`);
+                                context.log.error(`AviationStack API error (alternative): ${response.status} - ${errorText.substring(0, 200)}`);
                             }
-                        }
-                    } else if (!response.ok) {
-                        const errorText = await response.text();
-                        context.log.error(`AviationStack API error: ${response.status} - ${errorText.substring(0, 200)}`);
-                        // Check if it's an API error response
-                        try {
-                            const errorData = JSON.parse(errorText);
-                            if (errorData.error) {
-                                context.log.error(`AviationStack API error details: ${JSON.stringify(errorData.error)}`);
-                            }
-                        } catch (parseError) {
-                            // Not JSON, that's okay
                         }
                     }
                 } catch (error) {
