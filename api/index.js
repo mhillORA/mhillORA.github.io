@@ -1234,27 +1234,40 @@ app.http('usersAuthenticate', {
             
             let users;
             try {
-                const result = await container.items
+                const { resources } = await container.items
                     .query({
                         query: "SELECT * FROM c WHERE c.username = @username",
                         parameters: [{ name: "@username", value: username }]
                     })
                     .fetchAll();
-                users = result.resources;
+                users = resources || [];
             } catch (error) {
                 context.log.error('Error querying users:', error);
+                context.log.error('Error details:', {
+                    message: error.message,
+                    code: error.code,
+                    statusCode: error.statusCode,
+                    stack: error.stack
+                });
                 // If users container doesn't exist, return 401 (not 500) to indicate auth failure
                 const errorMessage = (error.message || '').toLowerCase();
-                if (errorMessage.includes('notfound') || errorMessage.includes('container') || errorMessage.includes('does not exist')) {
+                if (errorMessage.includes('notfound') || 
+                    errorMessage.includes('container') || 
+                    errorMessage.includes('does not exist') ||
+                    errorMessage.includes('not found')) {
                     return {
                         status: 401,
                         jsonBody: { error: 'Invalid username or password' },
                         headers: { 'Content-Type': 'application/json' }
                     };
                 }
+                // Return more detailed error for debugging
                 return {
                     status: 500,
-                    jsonBody: { error: 'Database error during authentication' },
+                    jsonBody: { 
+                        error: 'Database error during authentication',
+                        details: process.env.NODE_ENV === 'development' ? error.message : undefined
+                    },
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
