@@ -1269,6 +1269,15 @@ app.http('users', {
         const { method } = request;
         const id = getIdFromRequest(request);
 
+        // If id is 'authenticate', this request should go to the authenticate endpoint
+        if (id === 'authenticate') {
+            return {
+                status: 404,
+                jsonBody: { error: 'Use POST /api/users/authenticate for authentication' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+
         try {
             switch (method) {
                 case 'GET':
@@ -1396,16 +1405,31 @@ app.http('flightLookup', {
     route: 'flight-lookup',
     handler: async (request, context) => {
         try {
-            const { searchParams } = new URL(request.url);
-            const flightNumber = searchParams.get('flightNumber');
+            // Get query parameters from request URL
+            let flightNumber = null;
+            if (request.url) {
+                try {
+                    const url = new URL(request.url);
+                    flightNumber = url.searchParams.get('flightNumber');
+                } catch (error) {
+                    context.log.warn('Error parsing URL:', error.message);
+                }
+            }
+            // Fallback: try request.query if available
+            if (!flightNumber && request.query) {
+                flightNumber = request.query.flightNumber || request.query.get?.('flightNumber');
+            }
             
             if (!flightNumber) {
+                context.log.error('Flight lookup: flightNumber parameter missing. URL:', request.url);
                 return {
                     status: 400,
                     jsonBody: { error: 'flightNumber parameter is required' },
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
+            
+            context.log.info(`Flight lookup request for: ${flightNumber}`);
             
             // Try AviationStack API (available via Microsoft Connectors)
             const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY;
@@ -1513,7 +1537,16 @@ app.http('flightLookup', {
             };
             
         } catch (error) {
-            return handleError(context, error, 'Flight lookup failed');
+            context.log.error('Flight lookup error:', error.message, error.stack);
+            return {
+                status: 500,
+                jsonBody: { 
+                    error: 'Flight lookup failed',
+                    message: error.message,
+                    flightNumber: flightNumber || 'unknown'
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
         }
     },
 });
