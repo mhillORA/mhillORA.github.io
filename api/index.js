@@ -1159,6 +1159,7 @@ app.http('time-off-requests', {
 });
 
 // Register authenticate endpoint BEFORE users endpoint to ensure specific route matches first
+// Register authenticate route BEFORE users route to ensure proper matching
 app.http('usersAuthenticate', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous', 
@@ -1260,20 +1261,78 @@ app.http('usersAuthenticate', {
     },
 });
 
+// Register users list endpoint (no id parameter)
+app.http('usersList', {
+    methods: ['GET', 'POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users',
+    handler: async (request, context) => {
+        try {
+            const container = getContainer('users');
+            const { method } = request;
+            
+            if (method === 'GET') {
+                const { resources } = await container.items.readAll().fetchAll();
+                const usersWithoutPasswords = resources.map(({ password, ...user }) => user);
+                return { jsonBody: usersWithoutPasswords };
+            }
+            
+            if (method === 'POST') {
+                const body = await request.json();
+                validateUsersSchema(body);
+                
+                // Check if username already exists
+                const { resources: existingUsers } = await container.items
+                    .query({
+                        query: "SELECT * FROM c WHERE c.username = @username",
+                        parameters: [{ name: "@username", value: body.username }]
+                    })
+                    .fetchAll();
+                
+                if (existingUsers.length > 0) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Username already exists' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                
+                // Hash password
+                const hashedPassword = hashPassword(body.password);
+                const newUser = { 
+                    ...body, 
+                    id: generateId(),
+                    password: hashedPassword,
+                    createdAt: new Date().toISOString()
+                };
+                const { resource: createdUser } = await container.items.create(newUser);
+                const { password: _, ...userWithoutPassword } = createdUser;
+                return { status: 201, jsonBody: userWithoutPassword };
+            }
+            
+            return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+        } catch (error) {
+            return handleError(context, error, 'Users operation failed');
+        }
+    },
+});
+
+// Register users individual endpoint (with id parameter)
 app.http('users', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
-    route: 'users/{id?}',
+    route: 'users/{id}',
     handler: async (request, context) => {
         const container = getContainer('users');
         const { method } = request;
         const id = getIdFromRequest(request);
-
-        // If id is 'authenticate', this request should go to the authenticate endpoint
+        
+        // Explicitly exclude 'authenticate' from being handled by this route
         if (id === 'authenticate') {
+            context.log.warn('Authenticate request matched users/{id} route - should use users/authenticate');
             return {
                 status: 404,
-                jsonBody: { error: 'Use POST /api/users/authenticate for authentication' },
+                jsonBody: { error: 'Route not found. Use POST /api/users/authenticate for authentication.' },
                 headers: { 'Content-Type': 'application/json' }
             };
         }
@@ -1281,50 +1340,11 @@ app.http('users', {
         try {
             switch (method) {
                 case 'GET':
-                    if (id) {
-                        const { resource } = await container.item(id).read(); 
-                        if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
-                        // Don't return password hash
-                        const { password, ...userWithoutPassword } = resource;
-                        return { jsonBody: userWithoutPassword };
-                    } else {
-                        const { resources } = await container.items.readAll().fetchAll();
-                        // Remove password hashes from all users
-                        const usersWithoutPasswords = resources.map(({ password, ...user }) => user);
-                        return { jsonBody: usersWithoutPasswords };
-                    }
-                
-                case 'POST':
-                    const body = await request.json();
-                    validateUsersSchema(body);
-                    
-                    // Check if username already exists
-                    const { resources: existingUsers } = await container.items
-                        .query({
-                            query: "SELECT * FROM c WHERE c.username = @username",
-                            parameters: [{ name: "@username", value: body.username }]
-                        })
-                        .fetchAll();
-                    
-                    if (existingUsers.length > 0) {
-                        return {
-                            status: 400,
-                            jsonBody: { error: 'Username already exists' },
-                            headers: { 'Content-Type': 'application/json' }
-                        };
-                    }
-                    
-                    // Hash password
-                    const hashedPassword = hashPassword(body.password);
-                    const newUser = { 
-                        ...body, 
-                        id: generateId(),
-                        password: hashedPassword,
-                        createdAt: new Date().toISOString()
-                    };
-                    const { resource: createdUser } = await container.items.create(newUser);
-                    const { password: _, ...userWithoutPassword } = createdUser;
-                    return { status: 201, jsonBody: userWithoutPassword };
+                    const { resource } = await container.item(id).read(); 
+                    if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
+                    // Don't return password hash
+                    const { password: pwd, ...userWithoutPassword } = resource;
+                    return { jsonBody: userWithoutPassword };
                 
                 case 'PUT':
                     const requestBody = await request.json();
@@ -1338,7 +1358,7 @@ app.http('users', {
                     
                     const updatedUser = { ...requestBody, id: updateId };
                     const { resource: result } = await container.items.upsert(updatedUser);
-                    const { password: __, ...resultWithoutPassword } = result;
+                    const { password: pwd2, ...resultWithoutPassword } = result;
                     return { jsonBody: resultWithoutPassword };
 
                 case 'DELETE':
@@ -1438,45 +1458,107 @@ app.http('flightLookup', {
             if (AVIATIONSTACK_KEY) {
                 try {
                     context.log.info(`Calling AviationStack API for flight: ${flightNumber}`);
-                    const apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${flightNumber}&limit=1`;
-                    const response = await fetch(apiUrl);
                     
-                    context.log.info(`AviationStack API response status: ${response.status}`);
+                    // Try multiple API parameter formats based on AviationStack documentation
+                    // Format 1: flight_iata (full IATA code like DAL1478)
+                    let apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${encodeURIComponent(flightNumber.toUpperCase())}&limit=100`;
+                    let response = await fetch(apiUrl);
+                    let apiData = null;
+                    
+                    context.log.info(`AviationStack API response status (flight_iata): ${response.status}`);
                     
                     if (response.ok) {
-                        const apiData = await response.json();
-                        context.log.info(`AviationStack API response data:`, JSON.stringify(apiData).substring(0, 500));
+                        apiData = await response.json();
+                        context.log.info(`AviationStack API response: ${apiData.data?.length || 0} flights found`);
                         
+                        // Filter to find exact match
                         if (apiData.data && apiData.data.length > 0) {
-                            const flight = apiData.data[0];
-                            context.log.info(`Flight found: ${flight.flight?.iata}, Origin: ${flight.departure?.iata}, Dest: ${flight.arrival?.iata}`);
-                            return {
-                                jsonBody: {
-                                    flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
-                                    airline: flight.airline?.name || null,
-                                    origin: flight.departure?.airport || flight.departure?.iata || null,
-                                    destination: flight.arrival?.airport || flight.arrival?.iata || null,
-                                    departureTime: flight.departure?.scheduled || null,
-                                    arrivalTime: flight.arrival?.scheduled || null,
-                                    status: flight.flight_status || 'scheduled',
-                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : null,
-                                    gate: flight.departure?.gate || null,
-                                    terminal: flight.departure?.terminal || null
-                                },
-                                headers: { 'Content-Type': 'application/json' }
-                            };
-                        } else {
-                            context.log.warn('AviationStack API returned no flight data');
+                            const exactMatch = apiData.data.find(f => 
+                                f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
+                                f.flight?.number?.toString() === flightNumber.replace(/^[A-Z]{2,3}/i, '')
+                            );
+                            
+                            if (exactMatch) {
+                                const flight = exactMatch;
+                                context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
+                                
+                                return {
+                                    jsonBody: {
+                                        flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
+                                        airline: flight.airline?.name || flight.airline?.iata || null,
+                                        origin: flight.departure?.iata || flight.departure?.airport || flight.departure?.airport_name || null,
+                                        destination: flight.arrival?.iata || flight.arrival?.airport || flight.arrival?.airport_name || null,
+                                        departureTime: flight.departure?.scheduled || flight.departure?.estimated || null,
+                                        arrivalTime: flight.arrival?.scheduled || flight.arrival?.estimated || null,
+                                        status: flight.flight_status || 'scheduled',
+                                        delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : (flight.arrival?.delay ? `${flight.arrival.delay} minutes` : null),
+                                        gate: flight.departure?.gate || flight.arrival?.gate || null,
+                                        terminal: flight.departure?.terminal || flight.arrival?.terminal || null
+                                    },
+                                    headers: { 'Content-Type': 'application/json' }
+                                };
+                            }
                         }
-                    } else {
+                    }
+                    
+                    // If not found with flight_iata, try splitting into airline_iata + flight_number
+                    if (!apiData || !apiData.data || apiData.data.length === 0) {
+                        context.log.info('Trying airline_iata + flight_number parameter format');
+                        const flightMatch = flightNumber.match(/^([A-Z]{2,3})(\d+)$/i);
+                        if (flightMatch) {
+                            const [, airlineCode, flightNum] = flightMatch;
+                            apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&airline_iata=${airlineCode.toUpperCase()}&flight_number=${flightNum}&limit=100`;
+                            response = await fetch(apiUrl);
+                            
+                            context.log.info(`AviationStack API response status (airline_iata+flight_number): ${response.status}`);
+                            
+                            if (response.ok) {
+                                apiData = await response.json();
+                                context.log.info(`AviationStack API response: ${apiData.data?.length || 0} flights found`);
+                                
+                                if (apiData.data && apiData.data.length > 0) {
+                                    // Find the best match
+                                    const bestMatch = apiData.data.find(f => 
+                                        f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
+                                        (f.airline?.iata?.toUpperCase() === airlineCode.toUpperCase() && 
+                                         f.flight?.number?.toString() === flightNum)
+                                    ) || apiData.data[0];
+                                    
+                                    const flight = bestMatch;
+                                    context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
+                                    
+                                    return {
+                                        jsonBody: {
+                                            flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
+                                            airline: flight.airline?.name || flight.airline?.iata || null,
+                                            origin: flight.departure?.iata || flight.departure?.airport || flight.departure?.airport_name || null,
+                                            destination: flight.arrival?.iata || flight.arrival?.airport || flight.arrival?.airport_name || null,
+                                            departureTime: flight.departure?.scheduled || flight.departure?.estimated || null,
+                                            arrivalTime: flight.arrival?.scheduled || flight.arrival?.estimated || null,
+                                            status: flight.flight_status || 'scheduled',
+                                            delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : (flight.arrival?.delay ? `${flight.arrival.delay} minutes` : null),
+                                            gate: flight.departure?.gate || flight.arrival?.gate || null,
+                                            terminal: flight.departure?.terminal || flight.arrival?.terminal || null
+                                        },
+                                        headers: { 'Content-Type': 'application/json' }
+                                    };
+                                }
+                            } else {
+                                const errorText = await response.text();
+                                context.log.error(`AviationStack API error: ${response.status} - ${errorText.substring(0, 200)}`);
+                            }
+                        }
+                    } else if (!response.ok) {
                         const errorText = await response.text();
-                        context.log.error(`AviationStack API error: ${response.status} - ${errorText}`);
+                        context.log.error(`AviationStack API error: ${response.status} - ${errorText.substring(0, 200)}`);
                     }
                 } catch (error) {
-                    context.log.error('AviationStack API exception:', error.message, error.stack);
+                    context.log.error('AviationStack API exception:', error.message);
+                    context.log.error('Stack:', error.stack);
+                    // Don't throw, fall through to return basic info
                 }
             } else {
-                context.log.info('AviationStack API not called - conditions not met');
+                context.log.info('AviationStack API key not configured');
             }
             
             // Try OAG Flight Info API via Azure Marketplace (if configured, as fallback)
