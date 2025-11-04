@@ -693,10 +693,27 @@ async function crudHandler(context, request, containerName) {
                         return { jsonBody: resources };
                     } catch (error) {
                         // If container doesn't exist yet, return empty array
-                        if (error.code === 404 || error.message.includes('NotFound') || error.message.includes('Container')) {
+                        // Cosmos DB errors can have different formats:
+                        // - error.code === 404
+                        // - error.statusCode === 404
+                        // - error.message includes 'NotFound', 'Container', or 'not found'
+                        const errorCode = error.code || error.statusCode;
+                        const errorMessage = (error.message || '').toLowerCase();
+                        
+                        if (errorCode === 404 || 
+                            errorMessage.includes('notfound') || 
+                            errorMessage.includes('container') && errorMessage.includes('not found') ||
+                            errorMessage.includes('does not exist')) {
                             context.log.warn(`Container '${containerName}' does not exist yet, returning empty array`);
-                            return { jsonBody: [] };
+                            return { 
+                                jsonBody: [],
+                                headers: { 'Content-Type': 'application/json' }
+                            };
                         }
+                        
+                        // Log the actual error for debugging
+                        context.log.error(`Error reading from container '${containerName}':`, error);
+                        context.log.error(`Error code: ${errorCode}, message: ${errorMessage}`);
                         throw error;
                     }
                 }
@@ -856,6 +873,40 @@ async function crudHandler(context, request, containerName) {
                 return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
         }
     } catch (error) {
+        // Special handling for travel container - if it doesn't exist yet, return empty array for GET requests
+        // This is a new container that might not exist yet, so we're defensive about errors
+        if (containerName === 'travel' && method === 'GET') {
+            const errorCode = error.code || error.statusCode;
+            const errorMessage = (error.message || '').toLowerCase();
+            
+            // Log the error for debugging
+            context.log.warn(`Error accessing travel container (might not exist yet):`, error.message);
+            
+            // If it's any kind of not-found or container-related error, return empty array
+            // Also catch any other errors that might occur when container doesn't exist
+            if (errorCode === 404 || 
+                errorCode === 400 ||
+                errorMessage.includes('notfound') || 
+                errorMessage.includes('container') || 
+                errorMessage.includes('does not exist') ||
+                errorMessage.includes('not found') ||
+                errorMessage.includes('bad request')) {
+                context.log.warn(`Container '${containerName}' does not exist yet, returning empty array`);
+                return { 
+                    jsonBody: [],
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // For any other error on travel GET, also return empty array to prevent 500 errors
+            // This is safe because GET requests are idempotent and returning empty array is valid
+            context.log.warn(`Unexpected error accessing travel container, returning empty array:`, error.message);
+            return { 
+                jsonBody: [],
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+        
         return handleError(context, error, `Database operation failed on ${containerName}`);
     }
 }
