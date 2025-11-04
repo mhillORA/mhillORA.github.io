@@ -543,6 +543,40 @@ const validateSurveysSchema = (data) => {
     return true;
 };
 
+const validateTimeOffRequestsSchema = (data) => {
+    const errors = [];
+    
+    if (!data.crcId || typeof data.crcId !== 'string') {
+        errors.push('crcId is required and must be a string');
+    }
+    
+    if (!data.date || typeof data.date !== 'string') {
+        errors.push('date is required and must be a string');
+    }
+    
+    if (!data.type || typeof data.type !== 'string') {
+        errors.push('type is required and must be a string');
+    }
+    
+    if (data.period && typeof data.period !== 'string') {
+        errors.push('period must be a string');
+    }
+    
+    if (data.hours !== undefined && (typeof data.hours !== 'number' || data.hours < 0)) {
+        errors.push('hours must be a non-negative number');
+    }
+    
+    if (data.status && !['pending', 'approved', 'rejected'].includes(data.status)) {
+        errors.push('status must be one of: pending, approved, rejected');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Time Off Requests validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
 // =================================================================================
 // BUSINESS LOGIC FUNCTIONS
 // =================================================================================
@@ -643,6 +677,9 @@ async function crudHandler(context, request, containerName) {
                         case 'surveys':
                             validateSurveysSchema(body);
                             break;
+                        case 'time-off-requests':
+                            validateTimeOffRequestsSchema(body);
+                            break;
                     }
                 } catch (validationError) {
                     console.error(`Validation error for ${containerName}:`, validationError.message);
@@ -703,6 +740,9 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'surveys':
                             validateSurveysSchema(requestBody);
+                            break;
+                        case 'time-off-requests':
+                            validateTimeOffRequestsSchema(requestBody);
                             break;
                     }
                 } catch (validationError) {
@@ -834,6 +874,83 @@ app.http('surveys', {
     authLevel: 'anonymous', 
     route: 'surveys/{id?}',
     handler: (request, context) => crudHandler(context, request, 'surveys'),
+});
+
+app.http('time-off-requests', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'time-off-requests/{id?}',
+    handler: async (request, context) => {
+        const container = getContainer('time-off-requests');
+        const { method } = request;
+        const id = getIdFromRequest(request);
+
+        try {
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        const { resource } = await container.item(id).read(); 
+                        if (!resource) return { status: 404, jsonBody: { error: 'Time off request not found' } };
+                        return { jsonBody: resource };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return { jsonBody: resources };
+                    }
+                
+                case 'POST':
+                    const body = await request.json();
+                    validateTimeOffRequestsSchema(body);
+                    
+                    // Set default status to pending if not provided
+                    const newRequest = { 
+                        ...body, 
+                        id: generateId(),
+                        status: body.status || 'pending',
+                        createdAt: new Date().toISOString(),
+                        requestedBy: body.requestedBy || null,
+                        approvedBy: null,
+                        approvedAt: null
+                    };
+                    const { resource: createdRequest } = await container.items.create(newRequest);
+                    return { status: 201, jsonBody: createdRequest };
+                
+                case 'PUT':
+                    const requestBody = await request.json();
+                    const updateId = id || requestBody.id;
+                    validateTimeOffRequestsSchema(requestBody);
+                    
+                    // If status is being changed to approved, set approvedBy and approvedAt
+                    if (requestBody.status === 'approved' && !requestBody.approvedBy) {
+                        requestBody.approvedAt = new Date().toISOString();
+                    }
+                    
+                    const updatedRequest = { ...requestBody, id: updateId };
+                    const { resource: result } = await container.items.upsert(updatedRequest);
+                    return { jsonBody: result };
+
+                case 'DELETE':
+                    if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
+                    try {
+                        const { resource } = await container.item(id).read();
+                        if (!resource) {
+                            return { status: 204 };
+                        }
+                    } catch (e) {
+                        return { status: 204 };
+                    }
+                    await container.item(id).delete();
+                    return { status: 204 };
+
+                case 'OPTIONS':
+                    return { status: 200 };
+
+                default:
+                    return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+            }
+        } catch (error) {
+            return handleError(context, error, 'Time off requests operation failed');
+        }
+    },
 });
 
 app.http('users', {
