@@ -5,17 +5,107 @@ const { CosmosClient } = require('@azure/cosmos');
 let fetch;
 try {
     // Try to use built-in fetch (Node.js 18+)
-    fetch = globalThis.fetch;
-    if (!fetch) {
-        // Fallback to node-fetch if available
-        fetch = require('node-fetch');
+    if (typeof globalThis !== 'undefined' && globalThis.fetch) {
+        fetch = globalThis.fetch;
+    } else if (typeof global !== 'undefined' && global.fetch) {
+        fetch = global.fetch;
+    } else {
+        // Try to require node-fetch as fallback
+        try {
+            fetch = require('node-fetch');
+        } catch (e) {
+            // If node-fetch is not available, create a simple fetch polyfill using https module
+            const https = require('https');
+            const http = require('http');
+            const { URL } = require('url');
+            
+            fetch = async (url, options = {}) => {
+                return new Promise((resolve, reject) => {
+                    const urlObj = new URL(url);
+                    const protocol = urlObj.protocol === 'https:' ? https : http;
+                    const requestOptions = {
+                        hostname: urlObj.hostname,
+                        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+                        path: urlObj.pathname + urlObj.search,
+                        method: options.method || 'GET',
+                        headers: options.headers || {}
+                    };
+                    
+                    const req = protocol.request(requestOptions, (res) => {
+                        let data = '';
+                        res.on('data', (chunk) => {
+                            data += chunk;
+                        });
+                        res.on('end', () => {
+                            resolve({
+                                ok: res.statusCode >= 200 && res.statusCode < 300,
+                                status: res.statusCode,
+                                statusText: res.statusMessage,
+                                json: async () => JSON.parse(data),
+                                text: async () => data
+                            });
+                        });
+                    });
+                    
+                    req.on('error', (error) => {
+                        reject(error);
+                    });
+                    
+                    if (options.body) {
+                        req.write(options.body);
+                    }
+                    
+                    req.end();
+                });
+            };
+        }
     }
 } catch (e) {
-    // If node-fetch is not installed, we'll use a workaround
-    // For Azure Functions, fetch should be available in newer runtimes
-    fetch = globalThis.fetch || (() => {
-        throw new Error('fetch is not available. Please upgrade to Node.js 18+ or install node-fetch');
-    });
+    console.error('Error setting up fetch:', e);
+    // Fallback to simple implementation
+    const https = require('https');
+    const http = require('http');
+    const { URL } = require('url');
+    
+    fetch = async (url, options = {}) => {
+        return new Promise((resolve, reject) => {
+            const urlObj = new URL(url);
+            const protocol = urlObj.protocol === 'https:' ? https : http;
+            const requestOptions = {
+                hostname: urlObj.hostname,
+                port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+                path: urlObj.pathname + urlObj.search,
+                method: options.method || 'GET',
+                headers: options.headers || {}
+            };
+            
+            const req = protocol.request(requestOptions, (res) => {
+                let data = '';
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+                res.on('end', () => {
+                    resolve({
+                        ok: res.statusCode >= 200 && res.statusCode < 300,
+                        status: res.statusCode,
+                        statusText: res.statusMessage,
+                        json: async () => JSON.parse(data),
+                        text: async () => data
+                    });
+                });
+            });
+            
+            req.on('error', (error) => {
+                reject(error);
+            });
+            
+            if (options.body) {
+                req.write(options.body);
+            }
+            
+            req.end();
+        });
+    };
 }
 
 // Helper function to generate unique IDs
@@ -1638,18 +1728,29 @@ app.http('flightLookup', {
         
         // Wrap everything in try-catch to ensure we always return 200 instead of 500
         try {
-            // Get query parameters from request URL
-            if (request.url) {
+            // Get query parameters - try multiple methods for compatibility
+            if (request.query && request.query.flightNumber) {
+                flightNumber = request.query.flightNumber;
+            } else if (request.query && typeof request.query.get === 'function') {
+                flightNumber = request.query.get('flightNumber');
+            } else if (request.url) {
                 try {
-                    const url = new URL(request.url);
+                    // Try to parse as full URL
+                    let urlString = request.url;
+                    if (!urlString.startsWith('http')) {
+                        // If relative, construct full URL
+                        urlString = `https://${request.headers?.['host'] || 'localhost'}${urlString}`;
+                    }
+                    const url = new URL(urlString);
                     flightNumber = url.searchParams.get('flightNumber');
                 } catch (error) {
                     context.log.warn('Error parsing URL:', error.message);
+                    // Try simple query string parsing
+                    const match = request.url.match(/[?&]flightNumber=([^&]+)/);
+                    if (match) {
+                        flightNumber = decodeURIComponent(match[1]);
+                    }
                 }
-            }
-            // Fallback: try request.query if available
-            if (!flightNumber && request.query) {
-                flightNumber = request.query.flightNumber || request.query.get?.('flightNumber');
             }
             
             if (!flightNumber) {
@@ -1920,11 +2021,32 @@ app.http('geocode', {
             }
             
             // Get query parameters from the original request
-            const url = new URL(request.url);
-            const queryParams = url.searchParams;
+            let queryParams = '';
+            if (request.url) {
+                try {
+                    // Extract query string from URL
+                    let urlString = request.url;
+                    if (!urlString.startsWith('http')) {
+                        // Construct full URL if relative
+                        const host = request.headers?.['host'] || request.headers?.['x-forwarded-host'] || 'localhost';
+                        urlString = `https://${host}${urlString}`;
+                    }
+                    const url = new URL(urlString);
+                    queryParams = url.search; // This includes the leading ?
+                } catch (error) {
+                    context.log.warn('Error parsing URL for geocode:', error.message);
+                    // Fallback: extract query string manually
+                    const match = request.url.match(/\?(.+)/);
+                    if (match) {
+                        queryParams = '?' + match[1];
+                    } else {
+                        queryParams = '';
+                    }
+                }
+            }
             
-            // Build the Azure Maps API URL
-            const apiUrl = `https://atlas.microsoft.com/search/address/json?api-version=1.0&subscription-key=${azureMapsKey}&${queryParams.toString()}`;
+            // Build the Azure Maps API URL - pass all query params and add subscription-key
+            const apiUrl = `https://atlas.microsoft.com/search/address/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
                 const response = await fetch(apiUrl);
@@ -1970,11 +2092,32 @@ app.http('routeDirections', {
             }
             
             // Get query parameters from the original request
-            const url = new URL(request.url);
-            const queryParams = url.searchParams;
+            let queryParams = '';
+            if (request.url) {
+                try {
+                    // Extract query string from URL
+                    let urlString = request.url;
+                    if (!urlString.startsWith('http')) {
+                        // Construct full URL if relative
+                        const host = request.headers?.['host'] || request.headers?.['x-forwarded-host'] || 'localhost';
+                        urlString = `https://${host}${urlString}`;
+                    }
+                    const url = new URL(urlString);
+                    queryParams = url.search; // This includes the leading ?
+                } catch (error) {
+                    context.log.warn('Error parsing URL for route directions:', error.message);
+                    // Fallback: extract query string manually
+                    const match = request.url.match(/\?(.+)/);
+                    if (match) {
+                        queryParams = '?' + match[1];
+                    } else {
+                        queryParams = '';
+                    }
+                }
+            }
             
-            // Build the Azure Maps API URL
-            const apiUrl = `https://atlas.microsoft.com/route/directions/json?api-version=1.0&subscription-key=${azureMapsKey}&${queryParams.toString()}`;
+            // Build the Azure Maps API URL - pass all query params and add subscription-key
+            const apiUrl = `https://atlas.microsoft.com/route/directions/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
                 const response = await fetch(apiUrl);
