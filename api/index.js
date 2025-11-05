@@ -1570,6 +1570,44 @@ const initializeDefaultAdmin = async () => {
 // Call initialization
 initializeDefaultAdmin();
 
+// Azure Maps key endpoint (for frontend to get key securely)
+app.http('azure-maps-config', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'azure-maps-config',
+    handler: async (request, context) => {
+        try {
+            const azureMapsKey = process.env.AZURE_MAPS_KEY || process.env.AZURE_MAPS_SUBSCRIPTION_KEY;
+            
+            if (!azureMapsKey) {
+                return {
+                    status: 200,
+                    jsonBody: {
+                        error: 'Azure Maps key not configured. Please set AZURE_MAPS_KEY in Azure environment variables.',
+                        key: null
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            return {
+                status: 200,
+                jsonBody: {
+                    key: azureMapsKey
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        } catch (error) {
+            context.log.error('Error getting Azure Maps config:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Failed to get Azure Maps configuration' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    }
+});
+
 // Flight lookup proxy endpoint
 app.http('flightLookup', {
     methods: ['GET', 'OPTIONS'],
