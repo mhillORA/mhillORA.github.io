@@ -1066,7 +1066,38 @@
                             };
                         }
                         
-                        // If API call fails, return basic info
+                        // Handle specific error statuses
+                        let errorMessage = 'Flight lookup unavailable';
+                        if (response.status === 500) {
+                            errorMessage = 'Flight lookup service temporarily unavailable (server error)';
+                            console.error(`Flight lookup API returned 500 error for flight ${flightNumber}`);
+                        } else if (response.status === 404) {
+                            errorMessage = 'Flight not found';
+                            console.warn(`Flight ${flightNumber} not found in database`);
+                        } else {
+                            errorMessage = `Flight lookup failed (status: ${response.status})`;
+                            console.error(`Flight lookup API returned ${response.status} for flight ${flightNumber}`);
+                        }
+                        
+                        // Try to get error details from response
+                        try {
+                            const errorText = await response.text();
+                            if (errorText) {
+                                try {
+                                    const errorData = JSON.parse(errorText);
+                                    if (errorData && errorData.error) {
+                                        console.error('Flight lookup error details:', errorData.error);
+                                    }
+                                } catch (e) {
+                                    // If not JSON, log as text
+                                    console.error('Flight lookup error response:', errorText);
+                                }
+                            }
+                        } catch (e) {
+                            // Ignore errors reading response
+                        }
+                        
+                        // If API call fails, return basic info with error message
                         return {
                             flightNumber: flightNumber,
                             airline: this.extractAirline(flightNumber),
@@ -1077,11 +1108,18 @@
                             status: 'scheduled',
                             delay: null,
                             gate: null,
-                            terminal: null
+                            terminal: null,
+                            error: errorMessage
                         };
                         
                     } catch (error) {
                         console.error('Error looking up flight:', error);
+                        console.error('Error details:', {
+                            message: error.message,
+                            stack: error.stack,
+                            flightNumber: flightNumber
+                        });
+                        
                         // Return basic info extracted from flight number
                         return {
                             flightNumber: flightNumber,
@@ -1093,7 +1131,8 @@
                             status: 'scheduled',
                             delay: null,
                             gate: null,
-                            terminal: null
+                            terminal: null,
+                            error: 'Network error: Unable to reach flight lookup service'
                         };
                     }
                 }
@@ -1400,8 +1439,78 @@
                 }
             };
             
+            // Helper function to parse route response
+            const parseRouteResponse = (data, hotelGeocode, siteGeocode) => {
+                if (!data || !data.routes || data.routes.length === 0) {
+                    return null;
+                }
+                
+                const route = data.routes[0];
+                const distanceInMeters = route.summary.lengthInMeters;
+                const distanceInMiles = (distanceInMeters / 1609.34).toFixed(2);
+                const travelTimeInSeconds = route.summary.travelTimeInSeconds;
+                const travelTimeInMinutes = Math.round(travelTimeInSeconds / 60);
+                
+                // Extract route path points for animation
+                const path = [];
+                if (route.legs && route.legs.length > 0) {
+                    route.legs.forEach(leg => {
+                        if (leg.points && leg.points.length > 0) {
+                            leg.points.forEach(point => {
+                                // Azure Maps uses [longitude, latitude] format
+                                if (point.longitude !== undefined && point.latitude !== undefined) {
+                                    path.push([point.longitude, point.latitude]);
+                                } else if (point.position && point.position.longitude !== undefined && point.position.latitude !== undefined) {
+                                    path.push([point.position.longitude, point.position.latitude]);
+                                }
+                            });
+                        }
+                    });
+                }
+                
+                // Extract coordinates from route response or use geocoded coordinates
+                let hotelCoords = null;
+                let siteCoords = null;
+                
+                // Try to get coordinates from route response first
+                if (route.legs && route.legs.length > 0) {
+                    const firstLeg = route.legs[0];
+                    const lastLeg = route.legs[route.legs.length - 1];
+                    if (firstLeg.points && firstLeg.points.length > 0) {
+                        const firstPoint = firstLeg.points[0];
+                        if (firstPoint.longitude !== undefined && firstPoint.latitude !== undefined) {
+                            hotelCoords = { lat: firstPoint.latitude, lng: firstPoint.longitude };
+                        }
+                    }
+                    if (lastLeg.points && lastLeg.points.length > 0) {
+                        const lastPoint = lastLeg.points[lastLeg.points.length - 1];
+                        if (lastPoint.longitude !== undefined && lastPoint.latitude !== undefined) {
+                            siteCoords = { lat: lastPoint.latitude, lng: lastPoint.longitude };
+                        }
+                    }
+                }
+                
+                // Fallback to geocoded coordinates if route response doesn't have them
+                if (!hotelCoords && hotelGeocode) {
+                    hotelCoords = { lat: hotelGeocode.lat, lng: hotelGeocode.lng };
+                }
+                if (!siteCoords && siteGeocode) {
+                    siteCoords = { lat: siteGeocode.lat, lng: siteGeocode.lng };
+                }
+                
+                return {
+                    distance: distanceInMiles,
+                    distanceMeters: distanceInMeters,
+                    travelTime: travelTimeInMinutes,
+                    travelTimeSeconds: travelTimeInSeconds,
+                    path: path,
+                    hotelCoords: hotelCoords,
+                    siteCoords: siteCoords
+                };
+            };
+            
             // Calculate distance between two addresses using Azure Maps Route API
-            // Use addresses directly in the query parameter
+            // First geocode addresses, then use coordinates in route API
             const calculateDistance = async (hotelAddress, siteAddress) => {
                 try {
                     if (!hotelAddress || !siteAddress) {
@@ -1413,11 +1522,29 @@
                     console.log('Hotel address:', hotelAddress);
                     console.log('Site address:', siteAddress);
                     
-                    // Use addresses directly in query parameter (Azure Maps Route API accepts addresses)
-                    // Format: query=address1:address2 (URL encoded addresses)
-                    const queryParam = `${encodeURIComponent(hotelAddress)}:${encodeURIComponent(siteAddress)}`;
-                    let url = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=shortest`;
-                    console.log('calculateDistance: Calling route API with addresses directly');
+                    // First, geocode both addresses to get coordinates
+                    console.log('calculateDistance: Geocoding addresses...');
+                    const hotelGeocode = await geocodeLocation(hotelAddress);
+                    const siteGeocode = await geocodeLocation(siteAddress);
+                    
+                    if (!hotelGeocode || !siteGeocode) {
+                        console.error('calculateDistance: Failed to geocode addresses', { hotelGeocode, siteGeocode });
+                        // Fallback: try with addresses directly
+                        console.log('calculateDistance: Trying with addresses directly as fallback');
+                        const queryParam = `${encodeURIComponent(hotelAddress)}:${encodeURIComponent(siteAddress)}`;
+                        const url = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=shortest`;
+                        const response = await fetch(url);
+                        const data = await response.json();
+                        if (data && data.routes && data.routes.length > 0) {
+                            return parseRouteResponse(data, hotelGeocode, siteGeocode);
+                        }
+                        return null;
+                    }
+                    
+                    // Use coordinates in route API (Azure Maps format: lon,lat)
+                    const queryParam = `${hotelGeocode.lng},${hotelGeocode.lat}:${siteGeocode.lng},${siteGeocode.lat}`;
+                    const url = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=shortest`;
+                    console.log('calculateDistance: Calling route API with coordinates');
                     
                     const response = await fetch(url);
                     console.log('calculateDistance: Response status:', response.status);
@@ -1439,67 +1566,22 @@
                         
                         // Handle specific error codes
                         if (errorCode.includes('MAP_MATCHING_FAILURE') || errorMessage.includes('MAP_MATCHING_FAILURE')) {
-                            console.warn('Map matching failure - coordinates may be invalid or not on a road. Trying with routeType=shortest');
-                            // Try with routeType=shortest as fallback
-                            // For now, return null and let the user know
-                            return null;
+                            console.warn('Map matching failure - trying with routeType=fastest');
+                            // Try with routeType=fastest as fallback
+                            const fallbackUrl = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=fastest`;
+                            const fallbackResponse = await fetch(fallbackUrl);
+                            if (fallbackResponse.ok) {
+                                const fallbackData = await fallbackResponse.json();
+                                if (fallbackData && fallbackData.routes && fallbackData.routes.length > 0) {
+                                    return parseRouteResponse(fallbackData, hotelGeocode, siteGeocode);
+                                }
+                            }
                         }
                         return null;
                     }
                     
                     if (data && data.routes && data.routes.length > 0) {
-                        const route = data.routes[0];
-                        const distanceInMeters = route.summary.lengthInMeters;
-                        const distanceInMiles = (distanceInMeters / 1609.34).toFixed(2);
-                        const travelTimeInSeconds = route.summary.travelTimeInSeconds;
-                        const travelTimeInMinutes = Math.round(travelTimeInSeconds / 60);
-                        
-                        // Extract route path points for animation
-                        const path = [];
-                        if (route.legs && route.legs.length > 0) {
-                            route.legs.forEach(leg => {
-                                if (leg.points && leg.points.length > 0) {
-                                    leg.points.forEach(point => {
-                                        // Azure Maps uses [longitude, latitude] format
-                                        if (point.longitude !== undefined && point.latitude !== undefined) {
-                                            path.push([point.longitude, point.latitude]);
-                                        } else if (point.position && point.position.longitude !== undefined && point.position.latitude !== undefined) {
-                                            path.push([point.position.longitude, point.position.latitude]);
-                                        }
-                                    });
-                                }
-                            });
-                        }
-                        
-                        // Extract coordinates from route response for map display (not stored)
-                        let hotelCoords = null;
-                        let siteCoords = null;
-                        if (route.legs && route.legs.length > 0) {
-                            const firstLeg = route.legs[0];
-                            const lastLeg = route.legs[route.legs.length - 1];
-                            if (firstLeg.points && firstLeg.points.length > 0) {
-                                const firstPoint = firstLeg.points[0];
-                                if (firstPoint.longitude !== undefined && firstPoint.latitude !== undefined) {
-                                    hotelCoords = { lat: firstPoint.latitude, lng: firstPoint.longitude };
-                                }
-                            }
-                            if (lastLeg.points && lastLeg.points.length > 0) {
-                                const lastPoint = lastLeg.points[lastLeg.points.length - 1];
-                                if (lastPoint.longitude !== undefined && lastPoint.latitude !== undefined) {
-                                    siteCoords = { lat: lastPoint.latitude, lng: lastPoint.longitude };
-                                }
-                            }
-                        }
-                        
-                        return {
-                            distance: distanceInMiles,
-                            distanceMeters: distanceInMeters,
-                            travelTime: travelTimeInMinutes,
-                            travelTimeSeconds: travelTimeInSeconds,
-                            path: path,
-                            hotelCoords: hotelCoords, // From route response, not stored
-                            siteCoords: siteCoords    // From route response, not stored
-                        };
+                        return parseRouteResponse(data, hotelGeocode, siteGeocode);
                     }
                 } catch (error) {
                     console.error('Error calculating distance:', error);
@@ -1817,6 +1899,19 @@
                 if (!mapContainer || !mapContainerWrapper) {
                     console.error('Hotel-site map container not found in DOM');
                     return;
+                }
+                
+                // Validate coordinates before proceeding
+                if (!hotelCoords || !siteCoords || !hotelCoords.lng || !hotelCoords.lat || !siteCoords.lng || !siteCoords.lat) {
+                    console.error('showHotelSiteMap: Invalid coordinates', { hotelCoords, siteCoords });
+                    console.warn('Cannot display map without valid coordinates');
+                    return;
+                }
+                
+                // Validate path
+                if (!path || !Array.isArray(path) || path.length === 0) {
+                    console.warn('showHotelSiteMap: Invalid or empty path, using direct line between points');
+                    path = [[hotelCoords.lng, hotelCoords.lat], [siteCoords.lng, siteCoords.lat]];
                 }
                 
                 // Make sure the container is visible
