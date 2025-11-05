@@ -1694,9 +1694,7 @@ app.http('flightLookup', {
             context.log.info('Calling AviationStack API directly - NOT searching database');
             
             // Try AviationStack API (available via Microsoft Connectors)
-            // API Endpoint: https://api.aviationstack.com/v1/flights
             // Use environment variable if set, otherwise use provided key
-            // API Key: f4d364ba3a06f3498403ff1958d6d608
             const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY || 'f4d364ba3a06f3498403ff1958d6d608';
             context.log.info(`AviationStack API check: Key exists=${!!AVIATIONSTACK_KEY}`);
             
@@ -1731,6 +1729,7 @@ app.http('flightLookup', {
                     let apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${encodeURIComponent(flightNumber.toUpperCase())}&limit=100`;
                     let response;
                     let apiData = null;
+                    let responseText = ''; // <-- Store response text
                     
                     try {
                         response = await fetch(apiUrl, {
@@ -1739,7 +1738,7 @@ app.http('flightLookup', {
                         context.log.info(`AviationStack API response status (flight_iata): ${response.status}`);
                         
                         // Get response text first to check for errors
-                        const responseText = await response.text();
+                        responseText = await response.text(); // <-- Read text ONCE
                         context.log.info(`AviationStack API raw response (first 500 chars): ${responseText.substring(0, 500)}`);
                         
                         try {
@@ -1814,11 +1813,13 @@ app.http('flightLookup', {
                                 headers: { 'Content-Type': 'application/json' }
                             };
                         }
+                    // ============ START: CORRECTED CODE ============
                     } else if (response && !response.ok) {
                         // We already read the response text into the 'responseText' variable earlier.
                         // We just log that we received a non-OK response. The text was logged earlier.
                         context.log.error(`AviationStack API HTTP error: ${response.status}. See raw response above.`);
                     }
+                    // ============ END: CORRECTED CODE ============
                     
                     // If not found with flight_iata, try splitting into airline_iata + flight_number
                     if (!apiData || !apiData.data || apiData.data.length === 0) {
@@ -1835,7 +1836,7 @@ app.http('flightLookup', {
                                 context.log.info(`AviationStack API response status (airline_iata+flight_number): ${response.status}`);
                                 
                                 // Get response text first to check for errors
-                                const responseText = await response.text();
+                                responseText = await response.text(); // <-- Read text ONCE
                                 context.log.info(`AviationStack API raw response (alternative, first 500 chars): ${responseText.substring(0, 500)}`);
                                 
                                 try {
@@ -1908,10 +1909,12 @@ app.http('flightLookup', {
                                     },
                                     headers: { 'Content-Type': 'application/json' }
                                 };
+                            // ============ START: CORRECTED CODE ============
                             } else if (response && !response.ok) {
                                 // We already read the response text into the 'responseText' variable earlier.
                                 context.log.error(`AviationStack API HTTP error (alternative): ${response.status}. See raw response above.`);
                             }
+                            // ============ END: CORRECTED CODE ============
                         }
                     }
                 } catch (error) {
