@@ -1597,15 +1597,19 @@
             let currentHotelCoords = null;
             let currentSiteCoords = null;
             
-            // Show hotel location on map (without route)
-            const showHotelLocationOnly = async (hotelCoords) => {
-                if (!hotelCoords) return;
-                
+            // Update map with current pins (hotel and/or site)
+            // This function updates the map whenever hotel or site coordinates change
+            const updateMapWithPins = async () => {
                 const mapContainer = document.getElementById('hotel-site-map');
                 const mapContainerWrapper = document.getElementById('hotel-site-map-container');
                 
                 if (!mapContainer || !mapContainerWrapper) {
-                    console.error('Hotel-site map container not found in DOM');
+                    return; // Map container not available yet
+                }
+                
+                // Only show map if at least one location is pinned
+                if (!currentHotelCoords && !currentSiteCoords) {
+                    mapContainerWrapper.classList.add('hidden');
                     return;
                 }
                 
@@ -1613,11 +1617,9 @@
                 mapContainerWrapper.classList.remove('hidden');
                 mapContainerWrapper.style.display = 'block';
                 
-                currentHotelCoords = hotelCoords;
-                
                 // Wait for Azure Maps key
                 if (!AZURE_MAPS_KEY) {
-                    setTimeout(() => showHotelLocationOnly(hotelCoords), 500);
+                    setTimeout(() => updateMapWithPins(), 500);
                     return;
                 }
                 
@@ -1637,10 +1639,29 @@
                 }
                 
                 try {
+                    // Determine center and zoom based on available pins
+                    let center = null;
+                    let zoom = 13;
+                    
+                    if (currentHotelCoords && currentSiteCoords) {
+                        // Both pins - center between them
+                        center = [
+                            (currentHotelCoords.lng + currentSiteCoords.lng) / 2,
+                            (currentHotelCoords.lat + currentSiteCoords.lat) / 2
+                        ];
+                        zoom = 10;
+                    } else if (currentHotelCoords) {
+                        center = [currentHotelCoords.lng, currentHotelCoords.lat];
+                    } else if (currentSiteCoords) {
+                        center = [currentSiteCoords.lng, currentSiteCoords.lat];
+                    }
+                    
+                    if (!center) return;
+                    
                     // Initialize map
                     hotelSiteMap = new atlas.Map('hotel-site-map', {
-                        center: [hotelCoords.lng, hotelCoords.lat],
-                        zoom: 13,
+                        center: center,
+                        zoom: zoom,
                         authOptions: {
                             authType: 'subscriptionKey',
                             subscriptionKey: AZURE_MAPS_KEY
@@ -1653,27 +1674,233 @@
                         hotelSiteDataSource = new atlas.source.DataSource();
                         hotelSiteMap.sources.add(hotelSiteDataSource);
                         
-                        // Add hotel marker
+                        // Add hotel marker if available
+                        if (currentHotelCoords) {
+                            const hotelMarker = new atlas.HtmlMarker({
+                                htmlContent: `
+                                    <div style="background-color: #10b981; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
+                                        🏨
+                                    </div>
+                                `,
+                                position: [currentHotelCoords.lng, currentHotelCoords.lat],
+                                pixelOffset: [0, -16]
+                            });
+                            hotelSiteMap.markers.add(hotelMarker);
+                        }
+                        
+                        // Add site marker if available
+                        if (currentSiteCoords) {
+                            const siteMarker = new atlas.HtmlMarker({
+                                htmlContent: `
+                                    <div style="background-color: #3b82f6; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
+                                        📍
+                                    </div>
+                                `,
+                                position: [currentSiteCoords.lng, currentSiteCoords.lat],
+                                pixelOffset: [0, -16]
+                            });
+                            hotelSiteMap.markers.add(siteMarker);
+                        }
+                        
+                        // Fit map to show both pins if both exist
+                        if (currentHotelCoords && currentSiteCoords) {
+                            const bounds = atlas.data.BoundingBox.fromPositions([
+                                [currentHotelCoords.lng, currentHotelCoords.lat],
+                                [currentSiteCoords.lng, currentSiteCoords.lat]
+                            ]);
+                            hotelSiteMap.setCamera({
+                                bounds: bounds,
+                                padding: 50
+                            });
+                        } else {
+                            // Center on single pin
+                            hotelSiteMap.setCamera({
+                                center: center,
+                                zoom: zoom
+                            });
+                        }
+                        
+                        // If both pins exist, calculate route
+                        if (currentHotelCoords && currentSiteCoords) {
+                            calculateRouteFromCoords();
+                        }
+                    });
+                } catch (error) {
+                    console.error('Error updating map with pins:', error);
+                }
+            };
+            
+            // Calculate route using coordinates (called when both pins are on map)
+            const calculateRouteFromCoords = async () => {
+                if (!currentHotelCoords || !currentSiteCoords) {
+                    return;
+                }
+                
+                const distanceDisplay = document.getElementById('distance-display');
+                const distanceText = document.getElementById('distance-text');
+                const calculateBtn = document.getElementById('calculate-route-btn');
+                
+                if (!distanceDisplay || !distanceText) return;
+                
+                distanceDisplay.classList.remove('hidden');
+                distanceText.textContent = 'Calculating route...';
+                if (calculateBtn) calculateBtn.classList.add('hidden');
+                
+                try {
+                    // Use coordinates directly for route calculation
+                    const queryParam = `${currentHotelCoords.lng},${currentHotelCoords.lat}:${currentSiteCoords.lng},${currentSiteCoords.lat}`;
+                    const url = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=shortest`;
+                    
+                    console.log('calculateRouteFromCoords: Calling route API with coordinates');
+                    
+                    const response = await fetch(url);
+                    
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        console.error('calculateRouteFromCoords: API error response:', response.status, errorText);
+                        distanceText.textContent = 'Unable to calculate route. Please try again.';
+                        if (calculateBtn) calculateBtn.classList.remove('hidden');
+                        return;
+                    }
+                    
+                    const data = await response.json();
+                    
+                    // Check for error in response
+                    if (data && data.error) {
+                        const errorCode = data.error.code || 'unknown';
+                        const errorMessage = data.error.message || 'Unknown error';
+                        console.error('calculateRouteFromCoords: API returned error:', JSON.stringify(data.error, null, 2));
+                        
+                        // Try with routeType=fastest as fallback
+                        if (errorCode.includes('MAP_MATCHING_FAILURE') || errorMessage.includes('MAP_MATCHING_FAILURE')) {
+                            console.warn('Map matching failure - trying with routeType=fastest');
+                            const fallbackUrl = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=fastest`;
+                            const fallbackResponse = await fetch(fallbackUrl);
+                            if (fallbackResponse.ok) {
+                                const fallbackData = await fallbackResponse.json();
+                                if (fallbackData && fallbackData.routes && fallbackData.routes.length > 0) {
+                                    displayRouteOnMap(fallbackData);
+                                    return;
+                                }
+                            }
+                        }
+                        
+                        distanceText.textContent = 'Unable to calculate route. Please check the addresses.';
+                        if (calculateBtn) calculateBtn.classList.remove('hidden');
+                        return;
+                    }
+                    
+                    if (data && data.routes && data.routes.length > 0) {
+                        displayRouteOnMap(data);
+                    } else {
+                        distanceText.textContent = 'No route found.';
+                        if (calculateBtn) calculateBtn.classList.remove('hidden');
+                    }
+                } catch (error) {
+                    console.error('Error calculating route from coordinates:', error);
+                    distanceText.textContent = `Error calculating route: ${error.message || 'Unknown error'}. Please try again.`;
+                    if (calculateBtn) calculateBtn.classList.remove('hidden');
+                }
+            };
+            
+            // Display route on map
+            const displayRouteOnMap = (routeData) => {
+                if (!routeData || !routeData.routes || routeData.routes.length === 0) {
+                    return;
+                }
+                
+                const route = routeData.routes[0];
+                const distanceInMeters = route.summary.lengthInMeters;
+                const distanceInMiles = (distanceInMeters / 1609.34).toFixed(2);
+                const travelTimeInSeconds = route.summary.travelTimeInSeconds;
+                const travelTimeInMinutes = Math.round(travelTimeInSeconds / 60);
+                
+                // Update distance text
+                const distanceText = document.getElementById('distance-text');
+                const siteVisitingInput = document.getElementById('site-visiting-input');
+                const siteId = siteVisitingInput?.value;
+                const site = state.crc_sites?.find(s => s.id === siteId);
+                const siteName = site?.name || 'site';
+                
+                const calculateBtn = document.getElementById('calculate-route-btn');
+                
+                if (distanceText) {
+                    distanceText.textContent = `Distance to ${siteName}: ${distanceInMiles} miles (${travelTimeInMinutes} minutes drive)`;
+                }
+                if (calculateBtn) {
+                    calculateBtn.classList.add('hidden');
+                }
+                
+                // Extract route path points
+                const path = [];
+                if (route.legs && route.legs.length > 0) {
+                    route.legs.forEach(leg => {
+                        if (leg.points && leg.points.length > 0) {
+                            leg.points.forEach(point => {
+                                if (point.longitude !== undefined && point.latitude !== undefined) {
+                                    path.push([point.longitude, point.latitude]);
+                                } else if (point.position && point.position.longitude !== undefined && point.position.latitude !== undefined) {
+                                    path.push([point.position.longitude, point.position.latitude]);
+                                }
+                            });
+                        }
+                    });
+                }
+                
+                // Add route line to map
+                if (path.length > 0 && hotelSiteMap && hotelSiteDataSource) {
+                    // Clear existing route if any
+                    hotelSiteDataSource.clear();
+                    
+                    // Re-add markers
+                    if (currentHotelCoords) {
                         const hotelMarker = new atlas.HtmlMarker({
                             htmlContent: `
                                 <div style="background-color: #10b981; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
                                     🏨
                                 </div>
                             `,
-                            position: [hotelCoords.lng, hotelCoords.lat],
+                            position: [currentHotelCoords.lng, currentHotelCoords.lat],
                             pixelOffset: [0, -16]
                         });
-                        
                         hotelSiteMap.markers.add(hotelMarker);
-                        
-                        // Center map on hotel
-                        hotelSiteMap.setCamera({
-                            center: [hotelCoords.lng, hotelCoords.lat],
-                            zoom: 13
+                    }
+                    
+                    if (currentSiteCoords) {
+                        const siteMarker = new atlas.HtmlMarker({
+                            htmlContent: `
+                                <div style="background-color: #3b82f6; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
+                                    📍
+                                </div>
+                            `,
+                            position: [currentSiteCoords.lng, currentSiteCoords.lat],
+                            pixelOffset: [0, -16]
                         });
-                    });
-                } catch (error) {
-                    console.error('Error initializing hotel map:', error);
+                        hotelSiteMap.markers.add(siteMarker);
+                    }
+                    
+                    // Add route line
+                    hotelSiteDataSource.add(new atlas.data.LineString(path));
+                    
+                    // Add line layer if not already added
+                    if (!hotelSiteMap.layers.getLayerById('route-line')) {
+                        hotelSiteMap.layers.add(new atlas.layer.LineLayer(hotelSiteDataSource, 'route-line', {
+                            strokeColor: '#3b82f6',
+                            strokeWidth: 4
+                        }));
+                    }
+                    
+                    // Fit map to show route
+                    if (currentHotelCoords && currentSiteCoords) {
+                        const bounds = atlas.data.BoundingBox.fromPositions([
+                            [currentHotelCoords.lng, currentHotelCoords.lat],
+                            [currentSiteCoords.lng, currentSiteCoords.lat]
+                        ]);
+                        hotelSiteMap.setCamera({
+                            bounds: bounds,
+                            padding: 50
+                        });
+                    }
                 }
             };
             
@@ -1728,7 +1955,7 @@
                 let hotelDebounceTimer;
                 let routeDebounceTimer;
                 
-                // Function to show hotel location (called when address is typed)
+                // Function to pin hotel location (called when address is typed)
                 const updateHotelLocation = async () => {
                     const address = hotelAddressInput?.value || '';
                     const city = hotelCityInput?.value || '';
@@ -1738,90 +1965,60 @@
                     // Build full address string
                     const addressParts = [address, city, state, zip].filter(p => p && p.trim());
                     if (addressParts.length === 0) {
+                        // Clear hotel pin if address is cleared
+                        currentHotelCoords = null;
+                        updateMapWithPins();
                         return;
                     }
                     
                     const fullAddress = addressParts.join(', ');
                     
                     try {
-                        // Geocode hotel address for map display only
+                        // Geocode hotel address and pin it on map
+                        console.log('Geocoding hotel address:', fullAddress);
                         const hotelCoords = await geocodeLocation(fullAddress);
                         if (hotelCoords) {
-                            // Show hotel location on map
-                            await showHotelLocationOnly(hotelCoords);
                             currentHotelCoords = hotelCoords;
-                            
-                            // If site is selected, show button and calculate route using addresses
-                            const siteId = siteVisitingInput?.value;
-                            if (siteId && state.crc_sites && Array.isArray(state.crc_sites)) {
-                                const site = state.crc_sites.find(s => s.id === siteId);
-                                if (site) {
-                                    // Build site address from ARTEMIS (always use addresses for routing)
-                                    const siteAddressParts = [
-                                        site.address1 || '', 
-                                        site.city || '', 
-                                        site.state || '', 
-                                        site.zipCode || site.zip || ''
-                                    ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
-                                    
-                                    if (siteAddressParts.length > 0) {
-                                        const siteAddress = siteAddressParts.join(', ');
-                                        console.log('Calculating route using addresses - Hotel:', fullAddress, 'Site:', siteAddress);
-                                        
-                                        // Show button and distance display
-                                        if (calculateBtn && distanceDisplay) {
-                                            distanceDisplay.classList.remove('hidden');
-                                            calculateBtn.classList.remove('hidden');
-                                        }
-                                        
-                                        // Use address-to-address routing (no geocoding needed for routing)
-                                        await calculateRoute(fullAddress, siteAddress, site.name);
-                                    } else if (distanceDisplay && calculateBtn) {
-                                        // Site has no address - show button for manual calculation
-                                        distanceDisplay.classList.remove('hidden');
-                                        calculateBtn.classList.remove('hidden');
-                                        distanceText.textContent = 'Site address not found. Please check the site address in ARTEMIS.';
-                                    }
-                                }
-                            }
+                            console.log('Hotel pinned at:', hotelCoords);
+                            // Update map with hotel pin
+                            updateMapWithPins();
+                        } else {
+                            console.warn('Failed to geocode hotel address');
+                            currentHotelCoords = null;
+                            updateMapWithPins();
                         }
                     } catch (error) {
                         console.error('Error geocoding hotel address:', error);
+                        currentHotelCoords = null;
+                        updateMapWithPins();
                     }
                 };
                 
-                // Function to calculate route when site is selected (using addresses)
-                const updateRoute = async () => {
+                // Function to pin site location (called when site is selected)
+                const updateSiteLocation = async () => {
                     const siteId = siteVisitingInput?.value;
                     
-                    // Get hotel address from inputs
-                    const hotelAddress = hotelAddressInput?.value || '';
-                    const hotelCity = hotelCityInput?.value || '';
-                    const hotelState = hotelStateInput?.value || '';
-                    const hotelZip = hotelZipInput?.value || '';
-                    const hotelAddressParts = [hotelAddress, hotelCity, hotelState, hotelZip].filter(p => p && p.trim());
-                    const fullHotelAddress = hotelAddressParts.length > 0 ? hotelAddressParts.join(', ') : null;
-                    
-                    if (!siteId || !fullHotelAddress) {
-                        if (distanceDisplay) distanceDisplay.classList.add('hidden');
-                        if (calculateBtn) calculateBtn.classList.add('hidden');
+                    if (!siteId) {
+                        // Clear site pin if no site selected
+                        currentSiteCoords = null;
+                        updateMapWithPins();
                         return;
                     }
                     
                     if (!state.crc_sites || !Array.isArray(state.crc_sites)) {
-                        if (distanceDisplay) distanceDisplay.classList.add('hidden');
-                        if (calculateBtn) calculateBtn.classList.add('hidden');
+                        currentSiteCoords = null;
+                        updateMapWithPins();
                         return;
                     }
                     
                     const site = state.crc_sites.find(s => s.id === siteId);
                     if (!site) {
-                        if (distanceDisplay) distanceDisplay.classList.add('hidden');
-                        if (calculateBtn) calculateBtn.classList.add('hidden');
+                        currentSiteCoords = null;
+                        updateMapWithPins();
                         return;
                     }
                     
-                    // Build site address from ARTEMIS (always use addresses for routing)
+                    // Build site address from ARTEMIS
                     const siteAddressParts = [
                         site.address1 || '', 
                         site.city || '', 
@@ -1830,27 +2027,37 @@
                     ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
                     
                     if (siteAddressParts.length === 0) {
-                        if (distanceDisplay) {
-                            distanceDisplay.classList.remove('hidden');
-                            distanceText.textContent = 'Site address not found. Please check the site address in ARTEMIS.';
-                        }
-                        if (calculateBtn) {
-                            calculateBtn.classList.remove('hidden');
-                        }
+                        console.warn('Site has no address:', site.name);
+                        currentSiteCoords = null;
+                        updateMapWithPins();
                         return;
                     }
                     
                     const siteAddress = siteAddressParts.join(', ');
                     
-                    // Show button and calculate route
-                    if (calculateBtn && distanceDisplay) {
-                        distanceDisplay.classList.remove('hidden');
-                        calculateBtn.classList.remove('hidden');
+                    try {
+                        // Geocode site address and pin it on map
+                        console.log('Geocoding site address:', siteAddress);
+                        const siteCoords = await geocodeLocation(siteAddress);
+                        if (siteCoords) {
+                            currentSiteCoords = siteCoords;
+                            console.log('Site pinned at:', siteCoords);
+                            // Update map with site pin (route will be calculated automatically if hotel is also pinned)
+                            updateMapWithPins();
+                        } else {
+                            console.warn('Failed to geocode site address');
+                            currentSiteCoords = null;
+                            updateMapWithPins();
+                        }
+                    } catch (error) {
+                        console.error('Error geocoding site address:', error);
+                        currentSiteCoords = null;
+                        updateMapWithPins();
                     }
-                    
-                    // Use address-to-address routing (no geocoding needed)
-                    await calculateRoute(fullHotelAddress, siteAddress, site.name);
                 };
+                
+                // Note: Route calculation now happens automatically in updateMapWithPins() 
+                // when both hotel and site are pinned
                 
                 // Add event listeners for hotel address inputs (debounced)
                 const hotelInputs = [hotelAddressInput, hotelCityInput, hotelStateInput, hotelZipInput];
@@ -1868,18 +2075,15 @@
                 if (siteVisitingInput) {
                     siteVisitingInput.addEventListener('change', () => {
                         clearTimeout(routeDebounceTimer);
-                        routeDebounceTimer = setTimeout(updateRoute, 300);
+                        routeDebounceTimer = setTimeout(updateSiteLocation, 300);
                     });
                 }
                 
-                // Add event listener for Calculate Route button
+                // Add event listener for Calculate Route button (manual trigger)
                 if (calculateBtn) {
                     calculateBtn.addEventListener('click', async () => {
-                        if (currentHotelCoords && currentSiteCoords && siteVisitingInput?.value) {
-                            const site = state.crc_sites.find(s => s.id === siteVisitingInput.value);
-                            if (site) {
-                                await calculateRoute(currentHotelCoords, currentSiteCoords, site.name);
-                            }
+                        if (currentHotelCoords && currentSiteCoords) {
+                            calculateRouteFromCoords();
                         }
                     });
                 }
@@ -1887,6 +2091,9 @@
                 // Initialize if values are already present
                 if (hotelAddressInput.value || hotelCityInput.value) {
                     updateHotelLocation();
+                }
+                if (siteVisitingInput?.value) {
+                    updateSiteLocation();
                 }
             };
             
