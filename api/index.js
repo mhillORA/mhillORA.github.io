@@ -1,6 +1,23 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
+// Polyfill fetch for Node.js < 18
+let fetch;
+try {
+    // Try to use built-in fetch (Node.js 18+)
+    fetch = globalThis.fetch;
+    if (!fetch) {
+        // Fallback to node-fetch if available
+        fetch = require('node-fetch');
+    }
+} catch (e) {
+    // If node-fetch is not installed, we'll use a workaround
+    // For Azure Functions, fetch should be available in newer runtimes
+    fetch = globalThis.fetch || (() => {
+        throw new Error('fetch is not available. Please upgrade to Node.js 18+ or install node-fetch');
+    });
+}
+
 // Helper function to generate unique IDs
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
@@ -1609,6 +1626,9 @@ app.http('azure-maps-config', {
 });
 
 // Flight lookup proxy endpoint
+// This endpoint calls AviationStack API directly - it does NOT search the database
+// Flight data is only saved to the database when the user saves a travel record via /api/travel
+// All travel records (including flight data) are stored in the "travel" container, not a separate "flight-lookup" container
 app.http('flightLookup', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
@@ -1642,6 +1662,7 @@ app.http('flightLookup', {
             }
             
             context.log.info(`Flight lookup request for: ${flightNumber}`);
+            context.log.info('Calling AviationStack API directly - NOT searching database');
             
             // Try AviationStack API (available via Microsoft Connectors)
             const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY;
@@ -1880,4 +1901,104 @@ app.http('flightLookup', {
             };
         }
     },
+});
+
+// Azure Maps Geocoding Proxy
+app.http('geocode', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'geocode',
+    handler: async (request, context) => {
+        try {
+            const azureMapsKey = process.env.AZURE_MAPS_KEY || process.env.AZURE_MAPS_SUBSCRIPTION_KEY;
+            if (!azureMapsKey) {
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Azure Maps key not configured' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Get query parameters from the original request
+            const url = new URL(request.url);
+            const queryParams = url.searchParams;
+            
+            // Build the Azure Maps API URL
+            const apiUrl = `https://atlas.microsoft.com/search/address/json?api-version=1.0&subscription-key=${azureMapsKey}&${queryParams.toString()}`;
+            
+            try {
+                const response = await fetch(apiUrl);
+                const data = await response.json();
+                return {
+                    status: 200,
+                    jsonBody: data,
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            } catch (error) {
+                context.log.error('Azure Maps geocoding error:', error.message);
+                return {
+                    status: 500,
+                    jsonBody: { error: error.message },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+        } catch (error) {
+            context.log.error('Geocode endpoint error:', error.message);
+            return {
+                status: 500,
+                jsonBody: { error: error.message },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    }
+});
+
+// Azure Maps Route Directions Proxy
+app.http('routeDirections', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'route/directions',
+    handler: async (request, context) => {
+        try {
+            const azureMapsKey = process.env.AZURE_MAPS_KEY || process.env.AZURE_MAPS_SUBSCRIPTION_KEY;
+            if (!azureMapsKey) {
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Azure Maps key not configured' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Get query parameters from the original request
+            const url = new URL(request.url);
+            const queryParams = url.searchParams;
+            
+            // Build the Azure Maps API URL
+            const apiUrl = `https://atlas.microsoft.com/route/directions/json?api-version=1.0&subscription-key=${azureMapsKey}&${queryParams.toString()}`;
+            
+            try {
+                const response = await fetch(apiUrl);
+                const data = await response.json();
+                return {
+                    status: 200,
+                    jsonBody: data,
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            } catch (error) {
+                context.log.error('Azure Maps route directions error:', error.message);
+                return {
+                    status: 500,
+                    jsonBody: { error: error.message },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+        } catch (error) {
+            context.log.error('Route directions endpoint error:', error.message);
+            return {
+                status: 500,
+                jsonBody: { error: error.message },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    }
 });
