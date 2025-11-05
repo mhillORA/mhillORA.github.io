@@ -344,9 +344,9 @@
     </style>
     <script>
         // Apply theme as early as possible to prevent Flash of Unstyled Content (FOUC)
+        // No localStorage - use system preference only
         (function() {
-            const savedTheme = localStorage.getItem('theme');
-            if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+            if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
                 document.documentElement.classList.add('dark');
             } else {
                 document.documentElement.classList.remove('dark');
@@ -393,6 +393,9 @@
                 <button data-action="manage-unavailability" class="bg-yellow-600 text-white py-2 px-4 rounded-md hover:bg-yellow-700 transition-colors flex items-center">
                     <i data-lucide="calendar-off" class="w-4 h-4 mr-2"></i>Unavailable
                 </button>
+                <button data-action="bulk-delete-events" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700 transition-colors flex items-center">
+                    <i data-lucide="trash-2" class="w-4 h-4 mr-2"></i>Bulk Delete
+                </button>
                 <button data-action="view-availability" class="bg-teal-600 text-white py-2 px-4 rounded-md hover:bg-teal-700 transition-colors flex items-center">
                     <i data-lucide="calendar-check" class="w-4 h-4 mr-2"></i>Availability
                 </button>
@@ -429,7 +432,7 @@
         // --- WRAP ENTIRE SCRIPT IN AN ASYNC IIFE TO ALLOW TOP-LEVEL AWAIT and RETURN ---
         (async () => {
             // Azure Cosmos DB API Configuration
-            const API_KEY = 'rl7a83apOq35OqfKpNt7hTRyeeQVftD8SHitw2QW0w7Kd1S39YJfeZEm29fGQapYumgh0Bm6NEbjACDbH1iO9g==';
+            // No API key needed - backend uses authLevel: 'anonymous'
 
             // API Helper Functions
             const apiCall = async (endpoint, method = 'GET', data = null) => {
@@ -437,8 +440,7 @@
                     const options = {
                         method,
                         headers: {
-                            'Content-Type': 'application/json',
-                            'x-functions-key': API_KEY
+                            'Content-Type': 'application/json'
                         }
                     };
                     
@@ -504,7 +506,6 @@
                     const config = {
                         headers: {
                             'Content-Type': 'application/json',
-                            'x-functions-key': API_KEY,
                             ...options.headers
                         },
                         ...options
@@ -9150,7 +9151,7 @@
                                 currentUser: user,
                                 isAuthenticated: true
                             });
-                            localStorage.setItem('chaos_user', JSON.stringify(user));
+                            // No localStorage - user session managed in memory only
                             showNotification('Login successful!', 'success');
                             closeModal();
                             renderNav();
@@ -10164,8 +10165,8 @@
                         try {
                             if (operation === 'delete') {
                                 await apiService.deleteEvent(eventId);
-                                // Optimistically remove from local state
-                                state.crc_events = state.crc_events.filter(e => e.id !== eventId);
+                                // Re-fetch from DB instead of optimistic update
+                                await performInitialLoad();
                                 showNotification('Unavailability removed. Day is now available.', 'success');
                             } else {
                                 const eventData = { 
@@ -10206,8 +10207,8 @@
                             `);
                         } else {
                             await apiService.deleteEvent(eventId);
-                            // Update local state
-                            state.crc_events = state.crc_events.filter(e => e.id !== eventId);
+                            // Re-fetch from DB instead of optimistic update
+                            await performInitialLoad();
                             closeModal();
                             // Refresh calendar views
                             renderCRCCalendar();
@@ -10219,8 +10220,8 @@
                     }
                     case 'delete-single-event': {
                         await apiService.deleteEvent(eventId);
-                        // Update local state
-                        state.crc_events = state.crc_events.filter(e => e.id !== eventId);
+                        // Re-fetch from DB instead of optimistic update
+                        await performInitialLoad();
                         closeModal();
                         // Refresh calendar views
                         renderCRCCalendar();
@@ -10236,9 +10237,8 @@
                         for (const event of eventsToDelete) {
                             await apiService.deleteEvent(event.id);
                         }
-                        // Update local state
-                        const deletedEventIds = eventsToDelete.map(e => e.id);
-                        state.crc_events = state.crc_events.filter(e => !deletedEventIds.includes(e.id));
+                        // Re-fetch from DB instead of optimistic update
+                        await performInitialLoad();
                         closeModal();
                         // Refresh calendar views
                         renderCRCCalendar();
@@ -10264,8 +10264,8 @@
                     case 'confirm-delete-individual-event': {
                         try {
                             await apiService.deleteEvent(eventId);
-                            // Update local state
-                            state.crc_events = state.crc_events.filter(e => e.id !== eventId);
+                            // Re-fetch from DB instead of optimistic update
+                            await performInitialLoad();
                             showNotification('Event deleted successfully!', 'success');
                             closeModal();
                             // Refresh calendar views
@@ -10319,9 +10319,8 @@
                                 await apiService.deleteEvent(event.id);
                             }
                             
-                            // Update local state
-                            const deletedEventIds = eventsToDelete.map(e => e.id);
-                            state.crc_events = state.crc_events.filter(e => !deletedEventIds.includes(e.id));
+                            // Re-fetch from DB instead of optimistic update
+                            await performInitialLoad();
                             
                             showNotification(`Deleted ${eventsToDelete.length} events from the shift!`, 'success');
                             closeModal();
@@ -10333,6 +10332,110 @@
                         } catch (error) {
                             console.error("Error deleting whole shift:", error);
                             showNotification('Failed to delete shift. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'bulk-delete-events': {
+                        // Find all Unavailable events and unassigned study events
+                        const unavailableEvents = state.crc_events.filter(event => event.type === 'Unavailable');
+                        const unassignedEvents = state.crc_events.filter(event => 
+                            !event.studyIds || 
+                            event.studyIds.length === 0 || 
+                            (Array.isArray(event.studyIds) && event.studyIds.filter(Boolean).length === 0)
+                        );
+                        
+                        const totalToDelete = unavailableEvents.length + unassignedEvents.length;
+                        
+                        if (totalToDelete === 0) {
+                            showNotification('No events found to delete.', 'info');
+                            break;
+                        }
+                        
+                        // Create a Set to avoid duplicates (an event can be both unavailable and unassigned)
+                        const allEventIds = new Set([
+                            ...unavailableEvents.map(e => e.id),
+                            ...unassignedEvents.map(e => e.id)
+                        ]);
+                        
+                        const uniqueEventIds = Array.from(allEventIds);
+                        
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-4">Bulk Delete Events</h3>
+                            <div class="dark:text-gray-300 mb-6">
+                                <p class="mb-2">The following events will be deleted:</p>
+                                <ul class="list-disc list-inside mb-4 space-y-1">
+                                    <li><strong>${unavailableEvents.length}</strong> Unavailable events</li>
+                                    <li><strong>${unassignedEvents.length}</strong> Unassigned study events</li>
+                                    <li class="text-sm text-gray-500 dark:text-gray-400"><strong>${uniqueEventIds.length}</strong> unique events total (duplicates removed)</li>
+                                </ul>
+                                <p class="text-red-600 dark:text-red-400 font-semibold">This action cannot be undone!</p>
+                            </div>
+                            <div class="flex justify-end gap-4">
+                                <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                <button data-action="confirm-bulk-delete-events" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete All ${uniqueEventIds.length} Events</button>
+                            </div>
+                        `);
+                        break;
+                    }
+                    case 'confirm-bulk-delete-events': {
+                        try {
+                            // Find all Unavailable events and unassigned study events
+                            const unavailableEvents = state.crc_events.filter(event => event.type === 'Unavailable');
+                            const unassignedEvents = state.crc_events.filter(event => 
+                                !event.studyIds || 
+                                event.studyIds.length === 0 || 
+                                (Array.isArray(event.studyIds) && event.studyIds.filter(Boolean).length === 0)
+                            );
+                            
+                            // Create a Set to avoid duplicates
+                            const allEventIds = new Set([
+                                ...unavailableEvents.map(e => e.id),
+                                ...unassignedEvents.map(e => e.id)
+                            ]);
+                            
+                            const uniqueEventIds = Array.from(allEventIds);
+                            
+                            if (uniqueEventIds.length === 0) {
+                                showNotification('No events found to delete.', 'info');
+                                closeModal();
+                                break;
+                            }
+                            
+                            showNotification(`Deleting ${uniqueEventIds.length} events...`, 'info');
+                            
+                            // Delete all events individually
+                            let deletedCount = 0;
+                            let errorCount = 0;
+                            
+                            for (const eventId of uniqueEventIds) {
+                                try {
+                                    await apiService.deleteEvent(eventId);
+                                    deletedCount++;
+                                } catch (error) {
+                                    console.error(`Error deleting event ${eventId}:`, error);
+                                    errorCount++;
+                                }
+                            }
+                            
+                            // Re-fetch from DB instead of optimistic update
+                            await performInitialLoad();
+                            
+                            closeModal();
+                            
+                            if (errorCount === 0) {
+                                showNotification(`Successfully deleted ${deletedCount} events!`, 'success');
+                            } else {
+                                showNotification(`Deleted ${deletedCount} events, but ${errorCount} failed.`, 'warning');
+                            }
+                            
+                            // Refresh calendar views
+                            renderCRCCalendar();
+                            if (typeof renderCRCLists === 'function') {
+                                renderCRCLists();
+                            }
+                        } catch (error) {
+                            console.error("Error during bulk delete:", error);
+                            showNotification('Failed to delete events. See console for details.', 'error');
                         }
                         break;
                     }
@@ -10765,7 +10868,7 @@
                                 currentUser: null,
                                 isAuthenticated: false
                             });
-                            localStorage.removeItem('chaos_user');
+                            // No localStorage - just clear memory
                             showNotification('Logged out successfully', 'success');
                             renderNav(); // Refresh navigation to show login button
                         })();
@@ -11758,8 +11861,7 @@
                                     currentUser: user,
                                     isAuthenticated: true
                                 });
-                                // Store in localStorage for persistence
-                                localStorage.setItem('chaos_user', JSON.stringify(user));
+                                // No localStorage - user session managed in memory only
                                 showNotification('Login successful!', 'success');
                                 closeModal();
                                 // Refresh navigation to show user info and Users tab (if Manager)
@@ -14962,17 +15064,15 @@
             };
 
             const cleanupInvalidRoles = async (events, existingRoles) => {
-                const cleanupFlag = 'roleCleanupCompleted_v2';
-                if (localStorage.getItem(cleanupFlag)) return;
-
+                // No localStorage - check DB for cleanup status instead
+                // For now, always run cleanup if needed (can add DB flag later if needed)
                 const rolesToDelete = ["Alcon E002", "Alcon E003", "Azura", "Regeneron (birch)", "Regeneron CAT"];
                 const defaultRole = (existingRoles.find(r => r.name === 'Coordinator') || existingRoles[0])?.name || 'Support';
                 const eventsToUpdate = events.filter(event => Array.isArray(event.roles) && event.roles.some(r => rolesToDelete.includes(r)));
                 const rolesInDBToDelete = existingRoles.filter(r => rolesToDelete.includes(r.name));
 
                 if (eventsToUpdate.length === 0 && rolesInDBToDelete.length === 0) {
-                    localStorage.setItem(cleanupFlag, 'true');
-                    return;
+                    return; // Nothing to clean up
                 }
                 
                 loadingMessage.textContent = 'Cleaning up data...';
@@ -14991,7 +15091,6 @@
                 try {
                     // Batch operations replaced with individual API calls
                     console.log("Role cleanup successful.");
-                    localStorage.setItem(cleanupFlag, 'true');
                 } catch (error) {
                     console.error("Error during role cleanup:", error);
                     loadingError.textContent = "Failed to clean up roles. Please check the console.";
@@ -15256,21 +15355,7 @@
 					}
 					
 					// Check for stored user in localStorage
-					const storedUser = localStorage.getItem('chaos_user');
-					if (storedUser) {
-						try {
-							const user = JSON.parse(storedUser);
-							setState({
-								currentUser: user,
-								isAuthenticated: true
-							});
-							console.log('CHAOS: Restored user from localStorage:', user.username);
-						} catch (error) {
-							console.error('CHAOS: Error parsing stored user:', error);
-							localStorage.removeItem('chaos_user');
-						}
-					}
-					
+					// No localStorage - authentication must be done fresh each session
 					// Authentication is optional - allow app to load without login
 					// Login modal can be shown later if needed for restricted features
 					console.log('CHAOS: Initializing with Azure API...');
