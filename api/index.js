@@ -1753,6 +1753,7 @@ app.http('flightLookup', {
                             context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
                             
                             return {
+                                status: 200,
                                 jsonBody: {
                                     flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
                                     airline: flight.airline?.name || flight.airline?.iata || null,
@@ -1811,6 +1812,7 @@ app.http('flightLookup', {
                                 context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
                                 
                                 return {
+                                    status: 200,
                                     jsonBody: {
                                         flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
                                         airline: flight.airline?.name || flight.airline?.iata || null,
@@ -1858,6 +1860,7 @@ app.http('flightLookup', {
                         if (apiData.data && apiData.data.length > 0) {
                             const flight = apiData.data[0];
                             return {
+                                status: 200,
                                 jsonBody: {
                                     flightNumber: flight.flightNumber || flightNumber,
                                     airline: flight.airline?.name || null,
