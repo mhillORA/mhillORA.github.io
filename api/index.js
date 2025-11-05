@@ -708,7 +708,8 @@ async function crudHandler(context, request, containerName) {
             case 'GET':
                 if (id) {
                     try {
-                        const { resource } = await container.item(id).read(); 
+                        // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                        const { resource } = await container.item(id, id).read(); 
                         if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
                         return { jsonBody: resource };
                     } catch (error) {
@@ -960,7 +961,8 @@ async function crudHandler(context, request, containerName) {
             case 'DELETE':
                 if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
                 try {
-                    const { resource } = await container.item(id).read();
+                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                    const { resource } = await container.item(id, id).read();
                     if (!resource) {
                         // Treat missing as already deleted
                         return { status: 204 };
@@ -969,7 +971,8 @@ async function crudHandler(context, request, containerName) {
                     // If read fails (e.g., not found), return 204 for idempotency
                     return { status: 204 };
                 }
-                await container.item(id).delete();
+                // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                await container.item(id, id).delete();
                 return { status: 204 };
 
             case 'OPTIONS':
@@ -1133,7 +1136,8 @@ app.http('time-off-requests', {
             switch (method) {
                 case 'GET':
                     if (id) {
-                        const { resource } = await container.item(id).read(); 
+                        // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                        const { resource } = await container.item(id, id).read(); 
                         if (!resource) return { status: 404, jsonBody: { error: 'Time off request not found' } };
                         return { jsonBody: resource };
                     } else {
@@ -1184,14 +1188,16 @@ app.http('time-off-requests', {
                 case 'DELETE':
                     if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
                     try {
-                        const { resource } = await container.item(id).read();
+                        // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                        const { resource } = await container.item(id, id).read();
                         if (!resource) {
                             return { status: 204 };
                         }
                     } catch (e) {
                         return { status: 204 };
                     }
-                    await container.item(id).delete();
+                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                    await container.item(id, id).delete();
                     return { status: 204 };
 
                 case 'OPTIONS':
@@ -1520,7 +1526,8 @@ app.http('users', {
         try {
             switch (method) {
                 case 'GET':
-                    const { resource } = await container.item(id).read(); 
+                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                    const { resource } = await container.item(id, id).read(); 
                     if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
                     // Don't return password hash
                     const { password: pwd, ...userWithoutPassword } = resource;
