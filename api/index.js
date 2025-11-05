@@ -1,5754 +1,2157 @@
-<!DOCTYPE html>
-<html lang="en" class="">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ARTEMIS - Clinical Trial Management</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏥</text></svg>">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        // Configure Tailwind to use class-based dark mode
-        tailwind.config = {
-            darkMode: 'class',
-        }
-    </script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <!-- Azure Maps CSS and JS -->
-    <link rel="stylesheet" href="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.css" type="text/css" />
-    <script src="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.js"></script>
-    <!-- Azure Maps Animation Library -->
-    <script src="https://cdn.jsdelivr.net/gh/Azure-Samples/azure-maps-animations@main/dist/azure-maps-animations.min.js"></script>
-    <script>
-        // Azure Maps key will be loaded from backend
-        let AZURE_MAPS_KEY = null;
-        
-        // Fetch Azure Maps key from backend
-        (async () => {
-            try {
-                const response = await fetch('/api/azure-maps-config');
-                const data = await response.json();
-                if (data && data.key) {
-                    AZURE_MAPS_KEY = data.key;
-                } else {
-                    // Fallback to hardcoded key if backend doesn't have it configured
-                    console.warn('Azure Maps key not found in backend, using fallback. Please configure AZURE_MAPS_KEY in Azure environment variables.');
-                    AZURE_MAPS_KEY = 'D2Rh3J4IZYfFzeLI5Lt45UcZmMEVXiaS8vMq8IdVdMqYbIJLTidGJQQJ99BKACYeBjFmjhf4AAAgAZMP3zCN';
-                }
-            } catch (error) {
-                console.error('Error fetching Azure Maps key:', error);
-                // Fallback to hardcoded key
-                AZURE_MAPS_KEY = 'D2Rh3J4IZYfFzeLI5Lt45UcZmMEVXiaS8vMq8IdVdMqYbIJLTidGJQQJ99BKACYeBjFmjhf4AAAgAZMP3zCN';
-            }
-        })();
-    </script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        /* Apply base font to the body */
-        body {
-            font-family: 'Inter', sans-serif;
+const { app } = require('@azure/functions');
+const { CosmosClient } = require('@azure/cosmos');
+
+// Node.js 18+ has fetch built-in, no polyfill needed
+
+// Helper function to generate unique IDs
+function generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2);
+}
+
+// Helper function to get Cosmos DB client (lazy initialization)
+let cosmosClient = null;
+let database = null;
+
+const getCosmosClient = () => {
+    if (!cosmosClient) {
+        const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
+        const COSMOS_KEY = process.env.COSMOS_KEY;
+        const DATABASE_ID = process.env.DATABASE_ID;
+
+        if (!COSMOS_ENDPOINT || !COSMOS_KEY || !DATABASE_ID) {
+            throw new Error("COSMOS_DB_CONFIG_MISSING: Missing required Cosmos DB environment variables (Endpoint, Key, or Database ID). Check Azure Configuration.");
         }
 
-        /* Azure Maps custom styles */
-        #azure-map {
-            width: 100%;
-            height: 100%;
-        }
+        cosmosClient = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
+        database = cosmosClient.database(DATABASE_ID);
+    }
+    return { client: cosmosClient, database };
+};
 
-        /* Enhanced study cards with modern styling */
-        .study-card {
-            background-color: white;
-            border-radius: 0.75rem; /* 12px */
-            overflow: hidden;
-            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            border: 1px solid rgba(0, 0, 0, 0.05);
-        }
+// Helper function to get container
+const getContainer = (containerName) => {
+    const { database } = getCosmosClient();
+    return database.container(containerName);
+};
 
-        .study-card:hover {
-            box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
-            transform: translateY(-2px);
-        }
+// Helper function to handle errors
+const handleError = (context, error, message) => {
+    context.log.error(`${message}:`, error.message);
+    context.log.error(`Stack:`, error.stack);
 
-        .study-card.dark {
-            background-color: #1f2937;
-            border-color: rgba(255, 255, 255, 0.1);
-        }
+    let errorMessage;
+    if (error.message.includes('COSMOS_DB_CONFIG_MISSING')) {
+        errorMessage = "API Configuration Error: Database secrets not set in Azure Configuration.";
+    } else if (error.message.includes('VALIDATION_ERROR')) {
+        errorMessage = error.message.replace('VALIDATION_ERROR: ', '');
+    } else {
+        errorMessage = "Internal Server Error during data processing.";
+    }
 
-        /* Enhanced modal styling with better animations */
-        .modal-backdrop {
-            position: fixed;
-            inset: 0;
-            background-color: rgba(0, 0, 0, 0.5);
-            z-index: 50;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 1rem;
-            backdrop-filter: blur(4px);
-            animation: fadeIn 0.2s ease-out;
+    return {
+        status: 500,
+        jsonBody: { error: errorMessage },
+        headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
         }
+    };
+};
 
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
+// Helper to get ID from V4 route parameter
+const getIdFromRequest = (request) => {
+    return request.params.id;
+};
 
-        .modal-content {
-            background-color: white;
-            border-radius: 0.75rem; /* 12px */
-            box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.25);
-            width: 100%;
-            max-width: 32rem; /* 512px for study modal */
-            max-height: 90vh;
-            overflow-y: auto;
-            animation: slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            border: 1px solid rgba(0, 0, 0, 0.1);
-        }
+// =================================================================================
+// SCHEMA VALIDATION FUNCTIONS
+// =================================================================================
 
-        @keyframes slideIn {
-            from { 
-                opacity: 0;
-                transform: scale(0.95) translateY(-10px);
-            }
-            to { 
-                opacity: 1;
-                transform: scale(1) translateY(0);
-            }
-        }
-        
-        .import-modal-content {
-            max-width: 48rem; /* 768px for import modal */
-        }
-        
-        .site-modal-content {
-            max-width: 48rem; /* 768px for site modal */
-        }
-
-        .confirm-modal-content {
-            max-width: 28rem; /* 448px for confirm modal */
-        }
-
-        /* Dark mode modal styling */
-        .modal-content.dark {
-            background-color: #1f2937;
-            border-color: rgba(255, 255, 255, 0.1);
-        }
-        
-        /* Enhanced progress bar styling */
-        .progress-bar {
-            background-color: #e5e7eb; /* gray-200 */
-            border-radius: 9999px;
-            overflow: hidden;
-            position: relative;
-        }
-        
-        .progress-bar-fill {
-            background: linear-gradient(90deg, #4f46e5 0%, #6366f1 100%);
-            height: 100%;
-            transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-        }
-
-        .progress-bar-fill::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.2) 50%, transparent 100%);
-            animation: shimmer 2s infinite;
-        }
-
-        @keyframes shimmer {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(100%); }
-        }
-
-        /* Dark mode progress bar */
-        .dark .progress-bar {
-            background-color: #374151;
-        }
-
-        .dark .progress-bar-fill {
-            background: linear-gradient(90deg, #6366f1 0%, #8b5cf6 100%);
-        }
-        
-        /* Mobile Menu Styles */
-        .mobile-menu-button {
-            display: none;
-        }
-        
-        @media (max-width: 1024px) {
-            .mobile-menu-button {
-                display: flex !important;
-            }
-            
-            .desktop-nav {
-                display: none !important;
-            }
-        }
-        
-        .mobile-menu-overlay {
-            position: fixed;
-            inset: 0;
-            background-color: rgba(0, 0, 0, 0.5);
-            z-index: 40;
-            opacity: 0;
-            visibility: hidden;
-            transition: opacity 0.3s, visibility 0.3s;
-        }
-        
-        .mobile-menu-overlay.active {
-            opacity: 1;
-            visibility: visible;
-        }
-        
-        .mobile-menu {
-            position: fixed;
-            top: 0;
-            left: 0;
-            height: 100vh;
-            width: 280px;
-            max-width: 85vw;
-            background-color: white;
-            z-index: 50;
-            transform: translateX(-100%);
-            transition: transform 0.3s ease-in-out;
-            overflow-y: auto;
-            box-shadow: 2px 0 10px rgba(0, 0, 0, 0.1);
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .dark .mobile-menu {
-            background-color: #1f2937;
-        }
-        
-        .mobile-menu.active {
-            transform: translateX(0);
-        }
-        
-        .mobile-menu-header {
-            padding: 1rem;
-            border-bottom: 1px solid #e5e7eb;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .dark .mobile-menu-header {
-            border-bottom-color: #374151;
-        }
-        
-        .mobile-menu-close {
-            background: none;
-            border: none;
-            font-size: 1.5rem;
-            cursor: pointer;
-            color: #6b7280;
-            padding: 0.5rem;
-        }
-        
-        .mobile-menu-close:hover {
-            color: #374151;
-        }
-        
-        .dark .mobile-menu-close {
-            color: #9ca3af;
-        }
-        
-        .dark .mobile-menu-close:hover {
-            color: #f3f4f6;
-        }
-        
-        .mobile-menu-nav {
-            padding: 1rem 0;
-            flex: 1;
-        }
-        
-        .mobile-menu-item {
-            display: block;
-            width: 100%;
-            padding: 0.75rem 1.5rem;
-            text-align: left;
-            border: none;
-            background: none;
-            color: #374151;
-            font-size: 0.95rem;
-            cursor: pointer;
-            transition: background-color 0.2s;
-            border-left: 3px solid transparent;
-        }
-        
-        .mobile-menu-item:hover {
-            background-color: #f3f4f6;
-        }
-        
-        .mobile-menu-item.active {
-            background-color: #eff6ff;
-            color: #2563eb;
-            border-left-color: #2563eb;
-            font-weight: 600;
-        }
-        
-        .dark .mobile-menu-item {
-            color: #d1d5db;
-        }
-        
-        .dark .mobile-menu-item:hover {
-            background-color: #374151;
-        }
-        
-        .dark .mobile-menu-item.active {
-            background-color: #1e3a8a;
-            color: #60a5fa;
-        }
-        
-        .mobile-actions-menu {
-            padding: 1rem;
-            border-top: 1px solid #e5e7eb;
-        }
-        
-        .dark .mobile-actions-menu {
-            border-top-color: #374151;
-        }
-        
-        .mobile-action-button {
-            width: 100%;
-            margin-bottom: 0.5rem;
-            padding: 0.75rem;
-            border-radius: 0.5rem;
-            font-size: 0.875rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-        }
-        
-        @media (min-width: 1025px) {
-            .mobile-menu-button,
-            .mobile-menu-overlay,
-            .mobile-menu {
-                display: none !important;
-            }
-        }
-        
-        /* Responsive header improvements */
-        @media (max-width: 768px) {
-            .header-actions {
-                flex-wrap: wrap;
-                gap: 0.5rem;
-            }
-            
-            .header-actions button {
-                font-size: 0.75rem;
-                padding: 0.5rem 0.75rem;
-            }
-            
-            h2 {
-                font-size: 1.5rem;
-            }
-            
-            .text-2xl {
-                font-size: 1.25rem;
-            }
-            
-            .text-3xl {
-                font-size: 1.5rem;
-            }
-        }
-        
-        @media (max-width: 640px) {
-            .header-actions {
-                display: none;
-            }
-        }
-    </style>
-     <script>
-        // Apply theme as early as possible to prevent Flash of Unstyled Content (FOUC)
-        (function() {
-            // No localStorage - use system preference only
-            if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-                document.documentElement.classList.add('dark');
-            } else {
-                document.documentElement.classList.remove('dark');
-            }
-        })();
-    </script>
-</head>
-<body class="bg-gray-50 dark:bg-gray-900 text-gray-800 dark:text-gray-200">
-
-    <!-- Mobile Menu Overlay -->
-    <div id="mobile-menu-overlay" class="mobile-menu-overlay"></div>
+const validateStudiesSchema = (data) => {
+    const errors = [];
     
-    <!-- Mobile Menu -->
-    <div id="mobile-menu" class="mobile-menu">
-        <div class="mobile-menu-header">
-            <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200">Menu</h3>
-            <button id="mobile-menu-close" class="mobile-menu-close" aria-label="Close menu">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-            </button>
-        </div>
-        <div id="mobile-menu-nav" class="mobile-menu-nav"></div>
-        <div id="mobile-actions-menu" class="mobile-actions-menu"></div>
-    </div>
+    // Debug logging
+    console.log('Validating study data:', JSON.stringify(data, null, 2));
     
-    <div id="app-container">
-        <header class="bg-white dark:bg-gray-800 shadow-sm">
-            <div class="max-w-7xl mx-auto py-4 px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-center">
-                <div class="flex items-center">
-                    <button id="mobile-menu-button" class="mobile-menu-button items-center justify-center p-2 rounded-md text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 mr-2" aria-label="Open menu">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
-                        </svg>
-                    </button>
-                    <button id="theme-toggle-logo-btn" class="flex items-center mb-4 sm:mb-0 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 rounded-full transition-transform duration-200 hover:scale-105">
-                        <svg class="w-10 h-10 sm:w-12 sm:h-12" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                            <circle id="logo-bg-circle" cx="50" cy="50" r="48" fill="#0B3D91"/>
-                            <path id="logo-arc" d="M25,50 A40,40 0 0,1 75,50" fill="none" stroke="#FFFFFF" stroke-width="6"/>
-                            <circle id="logo-center-circle" cx="50" cy="50" r="15" fill="#FFFFFF"/>
-                            <circle id="logo-inner-dot" cx="50" cy="50" r="7" fill="#0B3D91"/>
-                            <path d="M20 50 L80 50" stroke="#B31942" stroke-width="8" transform="rotate(-45 50 50)"/>
-                        </svg>
-                        <span class="ml-2 sm:ml-3 text-left">
-                            <span class="text-xl sm:text-2xl md:text-3xl font-bold text-gray-900 dark:text-gray-100 block">ARTEMIS</span>
-                            <span class="text-xs text-gray-500 dark:text-gray-400 hidden md:block">Advanced Research & Trial Event Management Interface System</span>
-                        </span>
-                    </button>
-                </div>
-                <div id="header-buttons" class="header-actions flex flex-wrap justify-center sm:justify-end items-center gap-2 mt-4 sm:mt-0">
-                    </div>
-            </div>
-        </header>
-
-        <main class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-            <div id="main-content-area">
-                </div>
-            <div id="loading-indicator" class="flex items-center justify-center h-screen">
-                <div class="text-xl font-semibold">Loading CTMS Dashboard...</div>
-            </div>
-        </main>
-    </div>
-
-    <div id="modal-container"></div>
-
-    <script>
-        // --- Azure API Configuration ---
-        const API_BASE_URL = '/api';
-        
-        // --- API Service ---
-        class ApiService {
-            constructor() {
-                this.baseUrl = API_BASE_URL;
-                this.apiKey = 'your-api-key-here'; // This should be set from environment or config
-                this.retryAttempts = 3;
-                this.retryDelay = 1000; // 1 second
-            }
-            
-            async request(endpoint, options = {}) {
-                const url = `${API_BASE_URL}${endpoint}`;
-                const config = {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        ...options.headers
-                    },
-                    ...options
-                };
-
-                // Debug logging
-                console.log('API Request:', {
-                    url,
-                    method: config.method || 'GET',
-                    body: config.body ? JSON.parse(config.body) : undefined
-                });
-
-                try {
-                    const response = await fetch(url, config);
-                    
-                    if (!response.ok) {
-                        let errorText;
-                        try {
-                            const errorJson = await response.json();
-                            errorText = typeof errorJson === 'string' ? errorJson : JSON.stringify(errorJson);
-                            console.error('API Error Response:', {
-                                status: response.status,
-                                statusText: response.statusText,
-                                body: errorText,
-                                errorJson: errorJson,
-                                url: url,
-                                method: config.method || 'GET',
-                                requestBody: config.body ? JSON.parse(config.body) : undefined
-                            });
-                        } catch (parseError) {
-                            errorText = await response.text();
-                            console.error('API Error Response (text):', {
-                                status: response.status,
-                                statusText: response.statusText,
-                                body: errorText,
-                                url: url,
-                                method: config.method || 'GET',
-                                requestBody: config.body ? JSON.parse(config.body) : undefined
-                            });
-                        }
-                        throw new Error(`API request failed: ${response.status} ${response.statusText} - ${errorText}`);
-                    }
-                    
-                    // Handle different response types
-                    if (response.status === 204) {
-                        return null; // No content
-                    }
-                    
-                    const contentType = response.headers.get('content-type');
-                    if (contentType && contentType.includes('application/json')) {
-                        return await response.json();
-                    }
-                    
-                    return await response.text();
-                } catch (error) {
-                    console.error('API request error:', error);
-                    throw error;
-                }
-            }
-
-            // Studies
-            async getStudies() {
-                return this.request('/studies');
-            }
-
-            async getStudy(id) {
-                return this.request(`/studies/${id}`);
-            }
-
-            async createStudy(study) {
-                return this.request('/studies', {
-                    method: 'POST',
-                    body: JSON.stringify(study)
-                });
-            }
-
-            async updateStudy(id, study) {
-                return this.request(`/studies/${id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(study)
-                });
-            }
-
-            async deleteStudy(id) {
-                return this.request(`/studies/${id}`, {
-                    method: 'DELETE'
-                });
-            }
-
-            // Sites
-            async getSites() {
-                return this.request('/sites');
-            }
-
-            async getSite(id) {
-                return this.request(`/sites/${id}`);
-            }
-
-            async createSite(site) {
-                return this.request('/sites', {
-                    method: 'POST',
-                    body: JSON.stringify(site)
-                });
-            }
-
-            async updateSite(id, site) {
-                return this.request(`/sites/${id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(site)
-                });
-            }
-
-            async deleteSite(id) {
-                return this.request(`/sites/${id}`, {
-                    method: 'DELETE'
-                });
-            }
-
-            // Patients
-            async getPatients() {
-                return this.request('/patients');
-            }
-
-            async getPatient(id) {
-                return this.request(`/patients/${id}`);
-            }
-
-            async createPatient(patient) {
-                return this.request('/patients', {
-                    method: 'POST',
-                    body: JSON.stringify(patient)
-                });
-            }
-
-            async updatePatient(id, patient) {
-                return this.request(`/patients/${id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(patient)
-                });
-            }
-
-            async deletePatient(id) {
-                return this.request(`/patients/${id}`, {
-                    method: 'DELETE'
-                });
-            }
-
-            // CRCs
-            async getCrcs() {
-                return this.request('/crcs');
-            }
-
-            async getCrc(id) {
-                return this.request(`/crcs/${id}`);
-            }
-
-            async createCrc(crc) {
-                return this.request('/crcs', {
-                    method: 'POST',
-                    body: JSON.stringify(crc)
-                });
-            }
-
-            async updateCrc(id, crc) {
-                return this.request(`/crcs/${id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(crc)
-                });
-            }
-
-            async deleteCrc(id) {
-                return this.request(`/crcs/${id}`, {
-                    method: 'DELETE'
-                });
-            }
-
-            // Events
-            async getEvents() {
-                return this.request('/events');
-            }
-
-            async getEvent(id) {
-                return this.request(`/events/${id}`);
-            }
-
-            async createEvent(event) {
-                return this.request('/events', {
-                    method: 'POST',
-                    body: JSON.stringify(event)
-                });
-            }
-
-            async updateEvent(id, event) {
-                return this.request(`/events/${id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(event)
-                });
-            }
-
-            async deleteEvent(id) {
-                return this.request(`/events/${id}`, {
-                    method: 'DELETE'
-                });
-            }
-
-            // Roles
-            async getRoles() {
-                return this.request('/roles');
-            }
-
-            async getRole(id) {
-                return this.request(`/roles/${id}`);
-            }
-
-            async createRole(role) {
-                return this.request('/roles', {
-                    method: 'POST',
-                    body: JSON.stringify(role)
-                });
-            }
-
-            async updateRole(id, role) {
-                return this.request(`/roles/${id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(role)
-                });
-            }
-
-            async deleteRole(id) {
-                return this.request(`/roles/${id}`, {
-                    method: 'DELETE'
-                });
-            }
-
-
-            // Schedules
-            async getSchedules() {
-                return this.request('/schedules');
-            }
-
-            async getSchedule(id) {
-                return this.request(`/schedules/${id}`);
-            }
-
-            async createSchedule(schedule) {
-                return this.request('/schedules', {
-                    method: 'POST',
-                    body: JSON.stringify(schedule)
-                });
-            }
-
-            async updateSchedule(id, schedule) {
-                return this.request(`/schedules/${id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(schedule)
-                });
-            }
-
-            async deleteSchedule(id) {
-                return this.request(`/schedules/${id}`, {
-                    method: 'DELETE'
-                });
-            }
-
-            // Surveys
-            async getSurveys() {
-                return this.request('/surveys');
-            }
-
-            async getSurvey(id) {
-                return this.request(`/surveys/${id}`);
-            }
-
-            async createSurvey(survey) {
-                return this.request('/surveys', {
-                    method: 'POST',
-                    body: JSON.stringify(survey)
-                });
-            }
-
-            async updateSurvey(id, survey) {
-                return this.request(`/surveys/${id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(survey)
-                });
-            }
-
-            async deleteSurvey(id) {
-                return this.request(`/surveys/${id}`, {
-                    method: 'DELETE'
-                });
-            }
+    // Check if this is CHAOS format (has name, color, requiredRoles, sites)
+    const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
+    
+    console.log('Is CHAOS format:', isChaosFormat);
+    
+    if (isChaosFormat) {
+        // CHAOS format validation
+        if (!data.name || typeof data.name !== 'string') {
+            errors.push('name is required and must be a string');
         }
-
-        // Initialize API service
-        const apiService = new ApiService();
-
-
-        // --- DOM Elements ---
-        const mainContentArea = document.getElementById('main-content-area');
-        const loadingIndicator = document.getElementById('loading-indicator');
-        const modalContainer = document.getElementById('modal-container');
-        const headerButtons = document.getElementById('header-buttons');
-
-        // --- Global State ---
-        let allStudies = [];
-        let allSites = [];
-        let allPatients = [];
-        let allCrcs = [];
-        let allSchedules = [];
-        let allSurveys = [];
-        let user = null;
-        let activeTab = 'dashboard'; // 'dashboard', 'studies', 'sites', or 'reporting'
-        let lastReportData = [];
-
-        // --- Utility Functions ---
-        const ensureArray = (value) => {
-            if (Array.isArray(value)) return value;
-            if (value === null || value === undefined) return [];
-            return [value];
-        };
-
-        const getAllWashoutPatients = (studies) => {
-            const washoutPatients = [];
-            
-            studies.forEach(study => {
-                const studyPatients = allPatients.filter(p => {
-                    const pastEnrollments = p.enrollments?.filter(e => e.status === 'past') || [];
-                    return pastEnrollments.some(e => e.studyId === study.id && e.exitedDate);
-                });
-                
-                studyPatients.forEach(patient => {
-                    const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
-                    const enrollment = pastEnrollments.find(e => e.studyId === study.id && e.exitedDate);
-                    
-                    if (enrollment) {
-                        const exitDate = new Date(enrollment.exitedDate);
-                        const washoutCompleteDate = new Date(exitDate);
-                        washoutCompleteDate.setDate(washoutCompleteDate.getDate() + (study.washoutDays || 30));
-                        
-                        const today = new Date();
-                        const diffMs = washoutCompleteDate.getTime() - today.getTime();
-                        const daysRemaining = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-                        
-                        // Include patients who are still in washout or recently became eligible (within last 7 days)
-                        if (daysRemaining > -7) {
-                            washoutPatients.push({
-                                ...patient,
-                                studyId: study.id,
-                                exitDate: enrollment.exitedDate,
-                                washoutCompleteDate: washoutCompleteDate.toISOString(),
-                                daysRemaining: Math.max(0, daysRemaining)
-                            });
-                        }
-                    }
-                });
-            });
-            
-            return washoutPatients;
+        
+        if (data.title && typeof data.title !== 'string') {
+            errors.push('title must be a string');
         }
-
-        // Only declare showNotification if it has not already been declared
-        if (typeof showNotification !== 'function') {
-            var showNotification = (message, type = 'info') => {
-                // Create a simple notification system
-                const notification = document.createElement('div');
-                notification.className = `fixed top-4 right-4 p-4 rounded-md shadow-lg z-50 ${
-                    type === 'success' ? 'bg-green-500 text-white' :
-                type === 'error' ? 'bg-red-500 text-white' :
-                type === 'info' ? 'bg-blue-500 text-white' :
-                'bg-gray-500 text-white'
-            }`;
-            notification.textContent = message;
-            document.body.appendChild(notification);
-            
-            // Remove notification after 3 seconds
-            setTimeout(() => {
-                if (notification.parentNode) {
-                    notification.parentNode.removeChild(notification);
-                }
-            }, 3000);
-        };
-        const indicationOptions = [...new Set([
-            "Allergy", "Blepharitis", "Dry Eye", "Glaucoma", "AMD (Wet/Dry)", "Anterior Uveitis", 
-            "Cataracts", "Cataract Surgical", "Choroideremia", "Contact Lenses", "Corneal Disorders", 
-            "Diabetic Macular Edema", "Diabetic Retinopathy", "Diagnostic Equipment", "Dry Eye Device", 
-            "Eyelid Disorders", "Eye Redness", "Food Allergy", "Geographic Atrophy", "Glaucoma Devices", 
-            "Glaucoma - IOP", "Glaucoma - Neuroprotection", "Infectious Conjunctivitis", "IRD", "IRD Devices", 
-            "Keratoconus", "Neuromuscular Eye Disorders", "Neurotrophic Keratitis", "Ocular Allergy", 
-            "Ocular Graft Versus Host Disease", "Ocular Melanoma", "Ocular PK", "Other Ocular Uveitis", 
-            "Other Ophthalmic Surgery", "Posterior Uveitis", "Refractive - Hyperopia/Myopia/Presbyopia", 
-            "Refractive Surgical", "Retina", "Retinal Vein Occlusion", "Retina Surgical", "Sjogren's Syndrome", 
-            "Stargardt's Disease", "Thyroid Eye Disease", "Allergic Rhinitis", "Anti-Infective"
-        ])].sort();
-        let enrollmentChart = null;
-        let siteDistributionChart = null;
-        let nasaWindow = window.opener; // Reference to the N.A.S.A. window
-
-        // --- Helper & Icon Functions ---
-        /**
-         * Icon cache for better performance
-         * @type {Object<string, string>}
-         */
-        const iconCache = {
-            edit: `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M17.414 2.586a2 2 0 00-2.828 0L7 10.172V13h2.828l7.586-7.586a2 2 0 000-2.828z" /><path fill-rule="evenodd" d="M2 6a2 2 0 012-2h4a1 1 0 010 2H4v10h10v-4a1 1 0 112 0v4a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" clip-rule="evenodd" /></svg>`,
-            trash: `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 012 0v6a1 1 0 11-2 0V8z" clip-rule="evenodd" /></svg>`,
-            building: `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 21h16.5M4.5 3h15M5.25 3v18m13.5-18v18M9 6.75h6.375M9 12h6.375m-6.375 5.25h6.375M5.25 3h13.5v18h-13.5z" /></svg>`,
-            exclamation: `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>`,
-            upload: `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>`,
-            sync: `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h5M20 20v-5h-5M4 4l1.5 1.5A9 9 0 0120.5 10.5M20 20l-1.5-1.5A9 9 0 003.5 13.5" /></svg>`
-        };
-
-        /**
-         * Get icon SVG by name with caching for better performance
-         * @param {string} name - Icon name
-         * @returns {string} SVG string or empty string if not found
-         */
-        const getIcon = (name) => iconCache[name] || '';
-
-
-        // --- N.A.S.A. Communication ---
-        /**
-         * Notifies N.A.S.A. window of study data updates
-         * @param {string} studyId - ID of the study to sync
-         * @returns {boolean} Success status of the sync operation
-         */
-        const notifyNasaOfUpdate = (studyId) => {
-            try {
-                if (!nasaWindow || nasaWindow.closed) {
-                    console.warn("N.A.S.A. window not available for sync.");
-                    return false;
-                }
-                
-                const study = allStudies.find(s => s.id === studyId);
-                if (!study) {
-                    console.warn(`Study with ID ${studyId} not found for sync.`);
-                    return false;
-                }
-
-                const studyPatients = allPatients.filter(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    return currentEnrollment?.studyId === study.id;
-                });
-
-                const enrolledCount = studyPatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-                const screenFailCount = studyPatients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
-
-                const payload = {
-                    studyId: study.id,
-                    enrolled: enrolledCount,
-                    screenFails: screenFailCount,
-                    timestamp: new Date().toISOString()
-                };
-                
-                nasaWindow.postMessage({ type: 'CTMS_DATA_UPDATE', payload }, '*');
-                console.log(`Successfully synced study ${study.title} with N.A.S.A.:`, payload);
-                return true;
-            } catch (error) {
-                console.error(`Failed to sync study ${studyId} with N.A.S.A.:`, error);
-                return false;
-            }
-        };
-
-        // --- THEME MANAGEMENT (Light/Dark Mode) ---
-        /**
-         * Applies theme to the application with logo color updates
-         * @param {string} theme - Theme name ('light' or 'dark')
-         */
-        const applyTheme = (theme) => {
-            try {
-                const logoElements = {
-                    bgCircle: document.getElementById('logo-bg-circle'),
-                    arc: document.getElementById('logo-arc'),
-                    centerCircle: document.getElementById('logo-center-circle'),
-                    innerDot: document.getElementById('logo-inner-dot')
-                };
-
-                if (theme === 'dark') {
-                    document.documentElement.classList.add('dark');
-                    // Invert logo colors for dark mode
-                    if (logoElements.bgCircle) logoElements.bgCircle.setAttribute('fill', '#FFFFFF');
-                    if (logoElements.arc) logoElements.arc.setAttribute('stroke', '#0B3D91');
-                    if (logoElements.centerCircle) logoElements.centerCircle.setAttribute('fill', '#0B3D91');
-                    if (logoElements.innerDot) logoElements.innerDot.setAttribute('fill', '#FFFFFF');
-                } else {
-                    document.documentElement.classList.remove('dark');
-                    // Set logo colors back to default for light mode
-                    if (logoElements.bgCircle) logoElements.bgCircle.setAttribute('fill', '#0B3D91');
-                    if (logoElements.arc) logoElements.arc.setAttribute('stroke', '#FFFFFF');
-                    if (logoElements.centerCircle) logoElements.centerCircle.setAttribute('fill', '#FFFFFF');
-                    if (logoElements.innerDot) logoElements.innerDot.setAttribute('fill', '#0B3D91');
-                }
-                updateChartDefaults(theme);
-            } catch (error) {
-                console.error('Error applying theme:', error);
-            }
-        };
-
-        /**
-         * Loads and applies the saved theme or system preference
-         */
-        const loadTheme = () => {
-            try {
-                // No localStorage - use system preference only
-                if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-                    applyTheme('dark');
-                } else {
-                    applyTheme('light');
-                }
-            } catch (error) {
-                console.error('Error loading theme:', error);
-                applyTheme('light'); // Fallback to light theme
-            }
-        };
-
-        /**
-         * Toggles between light and dark themes
-         */
-        const toggleTheme = () => {
-            try {
-                const currentTheme = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
-                const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
-                // No localStorage - theme only applies during session
-                applyTheme(newTheme);
-                render(); // Re-render to apply chart color changes
-            } catch (error) {
-                console.error('Error toggling theme:', error);
-            }
-        };
-
-        /**
-         * Updates Chart.js defaults based on theme
-         * @param {string} theme - Current theme ('light' or 'dark')
-         */
-        const updateChartDefaults = (theme) => {
-            try {
-                const isDark = theme === 'dark';
-                const textColor = isDark ? 'rgba(255, 255, 255, 0.85)' : 'rgba(0, 0, 0, 0.85)';
-                const gridColor = isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)';
-
-                if (typeof Chart !== 'undefined') {
-                    Chart.defaults.color = textColor;
-                    Chart.defaults.borderColor = gridColor;
-                }
-            } catch (error) {
-                console.error('Error updating chart defaults:', error);
-            }
-        };
-
-
-        // --- Render Functions ---
-        /**
-         * Main render function that updates the UI based on active tab
-         */
-        const render = () => {
-            try {
-                renderHeaderButtons();
-                
-                switch (activeTab) {
-                    case 'dashboard':
-                        mainContentArea.innerHTML = getDashboardHTML();
-                        renderDashboardCharts();
-                        break;
-                    case 'studies':
-                        mainContentArea.innerHTML = getStudiesHTML();
-                        renderAllStudies();
-                        break;
-                    case 'sites':
-                        mainContentArea.innerHTML = getSitesHTML();
-                        renderAllSites();
-                        break;
-                    case 'reporting':
-                        mainContentArea.innerHTML = getReportingHTML();
-                        renderReportTables();
-                        break;
-                    default:
-                        console.warn(`Unknown active tab: ${activeTab}`);
-                        activeTab = 'dashboard';
-                        render();
-                }
-            } catch (error) {
-                console.error('Error in render function:', error);
-                // Show error message to user
-                mainContentArea.innerHTML = `
-                    <div class="flex items-center justify-center h-64">
-                        <div class="text-center">
-                            <h3 class="text-lg font-semibold text-red-600 mb-2">Error Loading Content</h3>
-                            <p class="text-gray-600 dark:text-gray-400">Please refresh the page or contact support.</p>
-                        </div>
-                    </div>
-                `;
-            }
-        };
-
-        const renderHeaderButtons = () => {
-            const mobileMenuNav = document.getElementById('mobile-menu-nav');
-            const mobileActionsMenu = document.getElementById('mobile-actions-menu');
-            
-            const tabs = [
-                { id: 'dashboard', label: 'Dashboard' },
-                { id: 'studies', label: 'Studies' },
-                { id: 'sites', label: 'Sites' },
-                { id: 'reporting', label: 'Reporting' }
-            ];
-            
-            // Desktop header buttons
-            if (headerButtons) {
-                headerButtons.innerHTML = `
-                     <button id="dashboard-tab-btn" class="px-3 py-2 text-sm font-medium rounded-md ${activeTab === 'dashboard' ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200' : 'text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'}">Dashboard</button>
-                     <button id="studies-tab-btn" class="px-3 py-2 text-sm font-medium rounded-md ${activeTab === 'studies' ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200' : 'text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'}">Studies</button>
-                     <button id="sites-tab-btn" class="px-3 py-2 text-sm font-medium rounded-md ${activeTab === 'sites' ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200' : 'text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'}">Sites</button>
-                     <button id="reporting-tab-btn" class="px-3 py-2 text-sm font-medium rounded-md ${activeTab === 'reporting' ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200' : 'text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'}">Reporting</button>
-                     <button id="sync-all-btn" title="Sync All Studies with N.A.S.A." class="inline-flex items-center px-3 sm:px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md shadow-sm text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600">
-                         ${getIcon('sync')}
-                         <span class="hidden lg:inline ml-2">Sync All</span>
-                     </button>
-                     <button id="import-data-btn" class="inline-flex items-center px-3 sm:px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md shadow-sm text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600">
-                         ${getIcon('upload')}
-                         <span class="hidden lg:inline ml-2">Import</span>
-                     </button>
-                     <button id="add-study-btn" class="inline-flex items-center px-3 sm:px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
-                         <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" /></svg>
-                         <span class="hidden lg:inline ml-2">New Study</span>
-                     </button>
-                 `;
-            }
-            
-            // Mobile navigation
-            if (mobileMenuNav) {
-                mobileMenuNav.innerHTML = tabs.map(tab => `
-                    <button id="${tab.id}-tab-btn-mobile" class="mobile-menu-item ${activeTab === tab.id ? 'active' : ''}">
-                        ${tab.label}
-                    </button>
-                `).join('');
-            }
-            
-            // Mobile actions menu
-            if (mobileActionsMenu) {
-                mobileActionsMenu.innerHTML = `
-                    <div class="px-4 py-3 space-y-2">
-                        <button id="sync-all-btn-mobile" class="mobile-action-button bg-gray-600 text-white hover:bg-gray-700">
-                            ${getIcon('sync')} Sync All
-                        </button>
-                        <button id="import-data-btn-mobile" class="mobile-action-button bg-gray-600 text-white hover:bg-gray-700">
-                            ${getIcon('upload')} Import Data
-                        </button>
-                        <button id="add-study-btn-mobile" class="mobile-action-button bg-indigo-600 text-white hover:bg-indigo-700">
-                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" /></svg>
-                            New Study
-                        </button>
-                    </div>
-                `;
-            }
-        };
-
-        const getDashboardHTML = () => {
-            const totalStudies = allStudies.length;
-            const totalSites = allSites.length;
-            const totalEnrolled = allPatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-            const totalScreenFailed = allPatients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
-            const totalScreened = totalEnrolled + totalScreenFailed;
-            const screenFailRate = totalScreened > 0 ? Math.round((totalScreenFailed / totalScreened) * 100) : 0;
-
-            // Calculate therapeutic areas
-            const therapeuticAreas = allStudies.reduce((acc, study) => {
-                const area = study.indication || 'Other';
-                acc[area] = (acc[area] || 0) + 1;
-                return acc;
-            }, {});
-
-            // Calculate study status distribution
-            const studyStatuses = allStudies.reduce((acc, study) => {
-                const status = study.status || 'Unknown';
-                acc[status] = (acc[status] || 0) + 1;
-                return acc;
-            }, {});
-
-            return `
-                 <div class="px-4 py-6 sm:px-0 space-y-8">
-                      <div class="flex justify-between items-center">
-                          <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">R&D Clinical Operations Dashboard</h2>
-                          <div class="text-sm text-gray-500 dark:text-gray-400">
-                              Data updated: ${new Date().toLocaleDateString('en-US', { 
-                                  month: 'long', 
-                                  day: 'numeric', 
-                                  year: 'numeric',
-                                  hour: 'numeric',
-                                  minute: '2-digit'
-                              })} 
-                              <span class="inline-block w-2 h-2 bg-green-500 rounded-full ml-2"></span>
-                          </div>
-                      </div>
-
-                      <!-- Key Metrics Cards -->
-                      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6">
-                           <div class="bg-gradient-to-r from-blue-50 to-blue-100 dark:from-blue-900/20 dark:to-blue-800/20 p-4 sm:p-6 rounded-lg shadow-md text-center border border-blue-200 dark:border-blue-700">
-                               <p class="text-sm text-blue-600 dark:text-blue-400 font-medium">Total Studies</p>
-                               <p id="stat-total-studies" class="text-2xl sm:text-3xl font-bold text-blue-700 dark:text-blue-300">${totalStudies}</p>
-                           </div>
-                           <div class="bg-gradient-to-r from-green-50 to-green-100 dark:from-green-900/20 dark:to-green-800/20 p-4 sm:p-6 rounded-lg shadow-md text-center border border-green-200 dark:border-green-700">
-                               <p class="text-sm text-green-600 dark:text-green-400 font-medium">Total Sites</p>
-                               <p id="stat-total-sites" class="text-2xl sm:text-3xl font-bold text-green-700 dark:text-green-300">${totalSites}</p>
-                           </div>
-                           <div class="bg-gradient-to-r from-purple-50 to-purple-100 dark:from-purple-900/20 dark:to-purple-800/20 p-4 sm:p-6 rounded-lg shadow-md text-center border border-purple-200 dark:border-purple-700">
-                               <p class="text-sm text-purple-600 dark:text-purple-400 font-medium">Total Enrolled</p>
-                               <p id="stat-total-enrolled" class="text-2xl sm:text-3xl font-bold text-purple-700 dark:text-purple-300">${totalEnrolled}</p>
-                           </div>
-                           <div class="bg-gradient-to-r from-orange-50 to-orange-100 dark:from-orange-900/20 dark:to-orange-800/20 p-4 sm:p-6 rounded-lg shadow-md text-center border border-orange-200 dark:border-orange-700">
-                               <p class="text-sm text-orange-600 dark:text-orange-400 font-medium">Screen Fail Rate</p>
-                               <p id="stat-screen-fail-rate" class="text-2xl sm:text-3xl font-bold text-orange-700 dark:text-orange-300">${screenFailRate}%</p>
-                           </div>
-                      </div>
-
-                      <!-- Dashboard Filters -->
-                      <div id="dashboard-filters" class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-                           <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Dashboard Filters</h3>
-                           <div class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
-                                <div>
-                                    <label for="dash-study-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Filter by Study</label>
-                                    <select id="dash-study-filter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
-                                        <option value="all">All Studies</option>
-                                        ${allStudies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
-                                    </select>
-                                </div>
-                                 <div>
-                                    <label for="dash-site-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Filter by Site</label>
-                                    <select id="dash-site-filter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
-                                        <option value="all">All Sites</option>
-                                        ${allSites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}
-                                    </select>
-                                </div>
-                                 <div>
-                                    <label for="dash-indication-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Filter by Indication</label>
-                                    <select id="dash-indication-filter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
-                                        <option value="all">All Indications</option>
-                                        ${indicationOptions.map(ind => `<option value="${ind}">${ind}</option>`).join('')}
-                                    </select>
-                                </div>
-                               <div>
-                                    <button id="generate-dashboard-btn" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700">Apply Filters</button>
-                                </div>
-                           </div>
-                      </div>
-                      
-                      <!-- Main Charts Grid -->
-                      <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                           <!-- Studies by Therapeutic Area -->
-                           <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-                               <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Studies by Therapeutic Area</h3>
-                               <div class="relative h-80">
-                                   <canvas id="studies-by-therapeutic-area-chart"></canvas>
-                               </div>
-                           </div>
-                           
-                           <!-- Study Progress - Moved up and enlarged -->
-                           <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-                               <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Study Progress Overview</h3>
-                               <div class="relative h-80">
-                                   <canvas id="study-progress-chart"></canvas>
-                               </div>
-                           </div>
-                      </div>
-
-                      <!-- Second Row of Charts -->
-                      <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                           <!-- Study Status Funnel -->
-                           <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-                               <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Studies by Status</h3>
-                               <canvas id="study-status-chart"></canvas>
-                           </div>
-
-                           <!-- Enrollment by Site -->
-                           <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-                               <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Enrollments by Site</h3>
-                               <canvas id="enrollment-by-site-chart"></canvas>
-                           </div>
-                      </div>
-
-                      <!-- Third Row - Site Monitoring and Finances -->
-                      <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                           <!-- Site Monitoring -->
-                           <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-                               <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Site Monitoring</h3>
-                               <div class="relative h-64">
-                                   <canvas id="site-monitoring-chart"></canvas>
-                               </div>
-                           </div>
-
-                           <!-- Finances -->
-                           <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-                               <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Finances</h3>
-                               <div class="relative h-64">
-                                   <canvas id="finances-chart"></canvas>
-                               </div>
-                           </div>
-                      </div>
-
-                      <!-- Site and Study Map -->
-                      <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-                           <div class="flex justify-between items-center mb-6">
-                               <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Site Locations & Study Distribution</h3>
-                               <div class="flex items-center space-x-4">
-                                   <div class="flex items-center space-x-2">
-                                       <div class="w-4 h-4 bg-blue-500 rounded-full"></div>
-                                       <span class="text-sm text-gray-600 dark:text-gray-400">Active Sites</span>
-                                   </div>
-                                   <div class="flex items-center space-x-2">
-                                       <div class="w-4 h-4 bg-green-500 rounded-full"></div>
-                                       <span class="text-sm text-gray-600 dark:text-gray-400">Studies</span>
-                                   </div>
-                                   <div class="flex items-center space-x-2">
-                                       <div class="w-4 h-4 bg-purple-500 rounded-full"></div>
-                                       <span class="text-sm text-gray-600 dark:text-gray-400">Staffed</span>
-                                   </div>
-                               </div>
-                           </div>
-                           
-                           <!-- Map Controls -->
-                           <div class="mb-4 space-y-3">
-                               <div>
-                                   <input type="text" id="artemis-map-search" placeholder="Search sites, studies, or locations..." class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm" />
-                               </div>
-                               <div class="flex flex-wrap gap-4 items-center">
-                                   <div class="flex items-center space-x-2">
-                                       <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Indication:</label>
-                                       <select id="map-indication-filter" class="px-3 py-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
-                                           <option value="all">All Indications</option>
-                                       </select>
-                                   </div>
-                                   <div class="flex items-center space-x-2">
-                                       <label class="text-sm font-medium text-gray-700 dark:text-gray-300">CRC Level:</label>
-                                       <select id="map-crc-level-filter" class="px-3 py-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
-                                           <option value="all">All Levels</option>
-                                       </select>
-                                   </div>
-                                   <div class="flex items-center space-x-2">
-                                       <label class="text-sm font-medium text-gray-700 dark:text-gray-300">View:</label>
-                                       <select id="map-view-selector" class="px-3 py-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
-                                           <option value="sites">Site Locations</option>
-                                           <option value="studies">Study Distribution</option>
-                                           <option value="staffing">Staffing Levels</option>
-                                           <option value="combined">Combined View</option>
-                                       </select>
-                                   </div>
-                                   <button id="refresh-map-btn" class="px-3 py-1 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm">
-                                       Refresh Map
-                                   </button>
-                               </div>
-                           </div>
-                           
-                           <!-- Map Container -->
-                           <div id="site-study-map" class="w-full h-96 bg-gray-100 dark:bg-gray-700 rounded-lg border border-gray-300 dark:border-gray-600 relative overflow-hidden">
-                               <!-- Azure Maps will be loaded here -->
-                               <div id="azure-map" class="w-full h-full"></div>
-                           </div>
-                           
-                           <!-- Map Legend -->
-                           <div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-                               <div class="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-lg">
-                                   <h4 class="font-semibold text-blue-800 dark:text-blue-200 mb-2">Site Statistics</h4>
-                                   <div class="space-y-1 text-sm">
-                                       <div class="flex justify-between">
-                                           <span class="text-blue-700 dark:text-blue-300">Total Sites:</span>
-                                           <span class="font-medium text-blue-800 dark:text-blue-200">${totalSites}</span>
-                                       </div>
-                                       <div class="flex justify-between">
-                                           <span class="text-blue-700 dark:text-blue-300">Active Studies:</span>
-                                           <span class="font-medium text-blue-800 dark:text-blue-200">${totalStudies}</span>
-                                       </div>
-                                   </div>
-                               </div>
-                               
-                               <div class="bg-green-50 dark:bg-green-900/20 p-4 rounded-lg">
-                                   <h4 class="font-semibold text-green-800 dark:text-green-200 mb-2">Patient Metrics</h4>
-                                   <div class="space-y-1 text-sm">
-                                       <div class="flex justify-between">
-                                           <span class="text-green-700 dark:text-green-300">Total Enrolled:</span>
-                                           <span class="font-medium text-green-800 dark:text-green-200">${totalEnrolled}</span>
-                                       </div>
-                                       <div class="flex justify-between">
-                                           <span class="text-green-700 dark:text-green-300">Screen Fail Rate:</span>
-                                           <span class="font-medium text-green-800 dark:text-green-200">${screenFailRate}%</span>
-                                       </div>
-                                   </div>
-                               </div>
-                               
-                               <div class="bg-purple-50 dark:bg-purple-900/20 p-4 rounded-lg">
-                                   <h4 class="font-semibold text-purple-800 dark:text-purple-200 mb-2">Study Coverage</h4>
-                                   <div class="space-y-1 text-sm">
-                                       <div class="flex justify-between">
-                                           <span class="text-purple-700 dark:text-purple-300">Avg. Sites/Study:</span>
-                                           <span class="font-medium text-purple-800 dark:text-purple-200">${totalStudies > 0 ? Math.round(totalSites / totalStudies) : 0}</span>
-                                       </div>
-                                       <div class="flex justify-between">
-                                           <span class="text-purple-700 dark:text-purple-300">Enrollment/Study:</span>
-                                           <span class="font-medium text-purple-800 dark:text-purple-200">${totalStudies > 0 ? Math.round(totalEnrolled / totalStudies) : 0}</span>
-                                       </div>
-                                   </div>
-                               </div>
-                           </div>
-                      </div>
-                 </div>
-            `;
-        };
-
-        const updateDashboardStats = (studies, sites, patients) => {
-            const totalStudies = studies.length;
-            const totalSites = sites.length;
-            const totalEnrolled = patients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-            const totalScreenFailed = patients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
-            const totalScreened = totalEnrolled + totalScreenFailed;
-            const screenFailRate = totalScreened > 0 ? Math.round((totalScreenFailed / totalScreened) * 100) : 0;
-
-            const studiesEl = document.getElementById('stat-total-studies');
-            const sitesEl = document.getElementById('stat-total-sites');
-            const enrolledEl = document.getElementById('stat-total-enrolled');
-            const screenFailEl = document.getElementById('stat-screen-fail-rate');
-
-            if (studiesEl) studiesEl.textContent = totalStudies;
-            if (sitesEl) sitesEl.textContent = totalSites;
-            if (enrolledEl) enrolledEl.textContent = totalEnrolled;
-            if (screenFailEl) screenFailEl.textContent = `${screenFailRate}%`;
-        };
-
-        const getStudiesHTML = () => `
-            <div class="px-4 py-6 sm:px-0">
-                <div class="flex justify-between items-center mb-6">
-                    <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Studies</h2>
-                </div>
-                
-                <!-- Filters Section -->
-                <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-3 md:p-4 mb-4 md:mb-6">
-                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-3 md:mb-4">
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Status</label>
-                            <select id="study-status-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                <option value="all">All Statuses</option>
-                                <option value="active">Active Only</option>
-                                <option value="inactive">Inactive Only</option>
-                                <option value="Recruiting">Recruiting</option>
-                                <option value="Enrolling">Enrolling</option>
-                                <option value="Active">Active</option>
-                                <option value="Closed">Closed</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Indication</label>
-                            <select id="study-indication-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                <option value="all">All Indications</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Site</label>
-                            <select id="study-site-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                <option value="all">All Sites</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Sort By</label>
-                            <select id="study-sort-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                <option value="title">Title (A-Z)</option>
-                                <option value="startDate">Start Date</option>
-                                <option value="status">Status</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <!-- Quick Date Filters -->
-                    <div class="flex flex-wrap gap-2">
-                        <button data-action="filter-studies-this-year" class="px-2 md:px-3 py-1 md:py-1.5 text-xs md:text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 whitespace-nowrap">
-                            This Year
-                        </button>
-                        <button data-action="filter-studies-last-year" class="px-2 md:px-3 py-1 md:py-1.5 text-xs md:text-sm bg-indigo-600 text-white rounded-md hover:bg-indigo-700 whitespace-nowrap">
-                            Last Year
-                        </button>
-                        <button data-action="filter-studies-last-6-months" class="px-2 md:px-3 py-1 md:py-1.5 text-xs md:text-sm bg-purple-600 text-white rounded-md hover:bg-purple-700 whitespace-nowrap">
-                            Last 6 Months
-                        </button>
-                        <button data-action="filter-studies-reset" class="px-2 md:px-3 py-1 md:py-1.5 text-xs md:text-sm bg-gray-600 text-white rounded-md hover:bg-gray-700 whitespace-nowrap">
-                            Reset Filters
-                        </button>
-                    </div>
-                </div>
-                
-                <div id="studies-container" class="grid grid-cols-1 gap-8"></div>
-            </div>
-        `;
         
-        const getSitesHTML = () => `
-            <div class="px-4 py-6 sm:px-0 space-y-8">
-                 <div class="flex flex-col sm:flex-row justify-between items-center">
-                      <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-4 sm:mb-0">Site Management</h2>
-                      <div class="flex items-center space-x-2">
-                          <button id="sync-all-coordinates-btn" class="inline-flex items-center px-4 py-2 border border-green-300 text-sm font-medium rounded-md shadow-sm text-green-700 bg-green-100 hover:bg-green-200 dark:bg-green-900 dark:text-green-200 dark:border-green-700">
-                              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
-                                  <path fill-rule="evenodd" d="M5.05 4.05a7 7 0 119.9 9.9L10 18.9l-4.95-4.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z" clip-rule="evenodd" />
-                              </svg>
-                              <span class="ml-2">📍 Sync All Coordinates</span>
-                          </button>
-                          <button id="bulk-delete-site-btn" class="hidden inline-flex items-center px-4 py-2 border border-red-300 text-sm font-medium rounded-md shadow-sm text-red-700 bg-red-100 hover:bg-red-200">
-                              ${getIcon('trash')}
-                              <span class="ml-2">Delete Selected</span>
-                          </button>
-                          <button id="add-site-btn" class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700">
-                              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" /></svg>
-                              Add New Site
-                          </button>
-                      </div>
-                 </div>
-                 <div class="mb-4">
-                     <input type="text" id="site-search-input" placeholder="Search by site name..." class="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 bg-white dark:bg-gray-700 dark:text-gray-200">
-                 </div>
-                 <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-x-auto">
-                     <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                         <thead class="bg-gray-50 dark:bg-gray-700">
-                             <tr>
-                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase"><input type="checkbox" id="select-all-sites-checkbox" class="h-4 w-4 rounded border-gray-300 text-indigo-600"></th>
-                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
-                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Site Name</th>
-                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">PI</th>
-                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Indication</th>
-                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">SF Rate</th>
-                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th>
-                             </tr>
-                         </thead>
-                         <tbody id="sites-table-body" class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                             </tbody>
-                     </table>
-                 </div>
-            </div>
-        `;
-
-        const getReportingHTML = () => {
-            const totalStudies = allStudies.length;
-            const totalSites = allSites.length;
-            const totalEnrolled = allPatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-            const sources = ['Facebook', 'Instagram', 'Reddit', 'Site', 'Marketing', 'Email'];
-
-            return `
-                 <div class="px-4 py-6 sm:px-0 space-y-8">
-                     <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md text-center">
-                             <p class="text-sm text-gray-500 dark:text-gray-400">Total Studies</p>
-                             <p class="text-3xl font-bold text-indigo-600 dark:text-indigo-400">${totalStudies}</p>
-                         </div>
-                         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md text-center">
-                             <p class="text-sm text-gray-500 dark:text-gray-400">Total Sites</p>
-                             <p class="text-3xl font-bold text-indigo-600 dark:text-indigo-400">${totalSites}</p>
-                         </div>
-                         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md text-center">
-                             <p class="text-sm text-gray-500 dark:text-gray-400">Total Enrolled Patients</p>
-                             <p class="text-3xl font-bold text-indigo-600 dark:text-indigo-400">${totalEnrolled}</p>
-                         </div>
-                     </div>
-
-                     <!-- NASA-style Report Filters -->
-                     <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
-                         <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Advanced Report Filters</h3>
-                         <form id="report-filter-form" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 items-center">
-                             <select name="studyId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                 <option value="all">All Studies</option>
-                                 ${allStudies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
-                             </select>
-                             <select name="siteId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                 <option value="all">All Sites</option>
-                                 ${allSites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}
-                             </select>
-                             <select name="status" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                 <option value="all">All Statuses</option>
-                                 ${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail'].map(s => `<option value="${s}">${s}</option>`).join('')}
-                             </select>
-                             <select name="source" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                 <option value="all">All Sources</option>
-                                 ${sources.map(s => `<option value="${s}">${s}</option>`).join('')}
-                             </select>
-                             <select name="schedulingStatus" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                 <option value="all">All Scheduling Statuses</option>
-                                 <option value="scheduled">Scheduled</option>
-                                 <option value="not-scheduled">Not Scheduled</option>
-                             </select>
-                             <select name="surveyOutcome" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                 <option value="all">All Survey Outcomes</option>
-                                 <option value="Pass">Pass</option>
-                                 <option value="Fail">Fail</option>
-                             </select>
-                             <div class="flex items-center gap-2">
-                                 <input type="number" name="minAge" placeholder="Min Age" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
-                                 <span>-</span>
-                                 <input type="number" name="maxAge" placeholder="Max Age" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
-                             </div>
-                             <div class="flex items-center gap-2">
-                                 <input type="checkbox" name="surveyCompleted" id="surveyCompleted" class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
-                                 <label for="surveyCompleted" class="text-sm text-gray-700 dark:text-gray-300">Survey Completed</label>
-                             </div>
-                             <input type="date" name="startDate" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
-                             <input type="date" name="endDate" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
-                             <button type="submit" class="bg-blue-600 text-white rounded-md h-10 col-span-full lg:col-span-2">Generate Report</button>
-                         </form>
-                     </div>
-
-                     <!-- Report Metrics -->
-                     <div id="report-metrics" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8"></div>
-
-                     <!-- NASA-style Report Results -->
-                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden">
-                         <div class="flex justify-between items-center p-6">
-                             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Report Results</h3>
-                             <div class="flex gap-2">
-                                 <button id="export-csv-btn" data-action="export-csv" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 flex items-center disabled:bg-gray-400" disabled>
-                                     <i data-lucide="download" class="w-5 h-5 mr-2"></i> Export Report
-                                 </button>
-                                 <button id="export-surveys-btn" data-action="export-surveys-csv" class="bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 flex items-center disabled:bg-gray-400" disabled>
-                                     <i data-lucide="download" class="w-5 h-5 mr-2"></i> Export Survey Results
-                                 </button>
-                             </div>
-                         </div>
-                         <div class="overflow-x-auto">
-                             <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                                 <thead class="bg-gray-50 dark:bg-gray-700">
-                                     <tr>
-                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Name</th>
-                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Age</th>
-                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
-                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
-                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Site</th>
-                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Appointment</th>
-                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Survey Outcome</th>
-                                     </tr>
-                                 </thead>
-                                 <tbody id="report-results-body" class="dark:text-gray-300">
-                                     <tr><td colspan="7" class="text-center text-gray-500 dark:text-gray-400 py-8">Generate a report to see results.</td></tr>
-                                 </tbody>
-                             </table>
-                         </div>
-                     </div>
-
-                     <!-- Original ARTEMIS Reporting Sections -->
-                     <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md">
-                         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
-                             <div>
-                                 <label for="report-study-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Filter by Study</label>
-                                 <select id="report-study-filter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
-                                     <option value="all">All Studies</option>
-                                     ${allStudies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
-                                 </select>
-                             </div>
-                             <div>
-                                 <label for="report-site-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Filter by Site</label>
-                                 <select id="report-site-filter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
-                                     <option value="all">All Sites</option>
-                                     ${allSites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}
-                                 </select>
-                             </div>
-                             <div>
-                                 <label for="report-indication-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Filter by Indication</label>
-                                 <select id="report-indication-filter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
-                                     <option value="all">All Indications</option>
-                                     ${indicationOptions.map(ind => `<option value="${ind}">${ind}</option>`).join('')}
-                                 </select>
-                             </div>
-                             <div>
-                                 <button id="generate-report-btn" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700">Generate Report</button>
-                             </div>
-                         </div>
-                     </div>
-
-                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-x-auto">
-                         <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 p-6">Site Performance</h3>
-                         <div id="report-sites-table-container"></div>
-                     </div>
-
-                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-x-auto">
-                         <div class="flex flex-col sm:flex-row justify-between items-center p-6">
-                             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4 sm:mb-0">Study Progress</h3>
-                             <button id="export-study-stats-btn" class="text-sm bg-green-600 text-white px-3 py-1.5 rounded-md hover:bg-green-700 disabled:bg-gray-400" disabled>Export CSV</button>
-                         </div>
-                         <div id="report-studies-table-container"></div>
-                     </div>
-
-                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-x-auto">
-                         <div class="flex flex-col sm:flex-row justify-between items-center p-6">
-                             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4 sm:mb-0">Washout Patients</h3>
-                             <button id="export-washout-btn" class="text-sm bg-yellow-600 text-white px-3 py-1.5 rounded-md hover:bg-yellow-700 disabled:bg-gray-400" disabled>Export Washout CSV</button>
-                         </div>
-                         <div id="report-washout-table-container"></div>
-                     </div>
-
-                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-x-auto">
-                         <div class="flex flex-col sm:flex-row justify-between items-center p-6">
-                             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4 sm:mb-0">All Participants</h3>
-                             <button id="export-participants-btn" class="text-sm bg-blue-600 text-white px-3 py-1.5 rounded-md hover:bg-blue-700 disabled:bg-gray-400" disabled>Export Participants CSV</button>
-                         </div>
-                         <div id="report-participants-table-container"></div>
-                     </div>
-                 </div>
-            `;
-        };
-
-        const renderStudyCard = (study) => {
-            const studyPatients = allPatients.filter(p => {
-                const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                return currentEnrollment?.studyId === study.id;
-            });
-            const enrolledPatients = studyPatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-            const screenFailedPatients = studyPatients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
-            const totalScreened = enrolledPatients + screenFailedPatients;
-            const screenFailRate = totalScreened > 0 ? Math.round((screenFailedPatients / totalScreened) * 100) : 0;
-
-            const target = study.target || 0;
-            const enrollmentPercentage = target > 0 ? Math.round((enrolledPatients / target) * 100) : 0;
-            const sitesInStudy = allSites.filter(site => (study.siteIds || []).includes(site.id));
-            const statusColor = study.status === 'Recruiting' || study.status === 'Active' ? 'text-green-600' : 'text-yellow-600';
-            const startDate = study.startDate ? new Date(study.startDate).toLocaleDateString() : 'N/A';
-            const endDate = study.endDate ? new Date(study.endDate).toLocaleDateString() : 'N/A';
-
-            return `
-                <div class="study-card dark:bg-gray-800" data-study-id="${study.id}">
-                    <div class="p-3 md:p-6 bg-gradient-to-r from-gray-800 to-gray-700 text-white flex justify-between items-start md:items-center gap-2">
-                        <div class="flex-1">
-                            <h2 class="text-lg md:text-2xl font-bold">${study.title}</h2>
-                            <p class="text-xs md:text-sm opacity-80">Protocol #: ${study.protocolNumber || 'N/A'}</p>
-                            <div class="flex flex-wrap gap-1 mt-2">
-                                ${ensureArray(study.indication).map(ind => `<span class="text-xs bg-indigo-500 text-white px-2 py-0.5 rounded-full">${ind}</span>`).join('')}
-                            </div>
-                        </div>
-                        <div class="flex items-center space-x-2">
-                            <button data-action="edit" class="p-1.5 md:p-2 rounded-full hover:bg-gray-600 transition-colors">${getIcon('edit')}</button>
-                            <button data-action="delete" class="p-1.5 md:p-2 rounded-full hover:bg-red-500 transition-colors">${getIcon('trash')}</button>
-                        </div>
-                    </div>
-                    <div class="p-3 md:p-6">
-                        <div class="mb-3 md:mb-4 text-xs md:text-sm text-gray-600 dark:text-gray-400">
-                            <strong>Dates:</strong> ${startDate} - ${endDate}
-                        </div>
-                        <div class="mb-4 md:mb-6">
-                            <h3 class="text-base md:text-lg font-semibold text-gray-800 dark:text-gray-200">Overall Statistics</h3>
-                            <div class="mt-2 grid grid-cols-2 lg:grid-cols-4 gap-2 md:gap-4">
-                                <div class="bg-gray-100 dark:bg-gray-700 p-3 md:p-4 rounded-lg">
-                                    <p class="text-xs md:text-sm text-gray-500 dark:text-gray-400">Enrollment</p>
-                                    <p class="text-xl md:text-2xl font-bold text-indigo-600 dark:text-indigo-400">${enrolledPatients} / ${target}</p>
-                                    <div class="mt-2 h-2 w-full progress-bar">
-                                        <div class="progress-bar-fill" style="width: ${enrollmentPercentage}%;"></div>
-                                    </div>
-                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${enrollmentPercentage}% of Goal</p>
-                                </div>
-                                <div class="bg-gray-100 dark:bg-gray-700 p-3 md:p-4 rounded-lg flex flex-col justify-center">
-                                    <p class="text-xs md:text-sm text-gray-500 dark:text-gray-400">Number of Sites</p>
-                                    <p class="text-xl md:text-2xl font-bold text-indigo-600 dark:text-indigo-400">${sitesInStudy.length}</p>
-                                </div>
-                                <div class="bg-gray-100 dark:bg-gray-700 p-3 md:p-4 rounded-lg flex flex-col justify-center">
-                                    <p class="text-xs md:text-sm text-gray-500 dark:text-gray-400">Status</p>
-                                    <p class="text-xl md:text-2xl font-bold ${statusColor}">${study.status}</p>
-                                </div>
-                                <div class="bg-gray-100 dark:bg-gray-700 p-3 md:p-4 rounded-lg flex flex-col justify-center">
-                                    <p class="text-xs md:text-sm text-gray-500 dark:text-gray-400">Screen Fail Rate</p>
-                                    <p class="text-xl md:text-2xl font-bold text-red-600 dark:text-red-400">${screenFailRate}%</p>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="mb-6">
-                            <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-2 flex items-center">
-                                ${getIcon('clock')}
-                                <span class="ml-2">Washout Statistics</span>
-                            </h3>
-                            <div class="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4">
-                                <div id="washout-stats-${study.id}" class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                                    <!-- Washout statistics will be populated here -->
-                                </div>
-                            </div>
-                        </div>
-                        <div>
-                            <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-2 flex items-center">
-                                ${getIcon('building')}
-                                <span class="ml-2">Participating Sites</span>
-                            </h3>
-                            <div class="space-y-4">
-                                ${sitesInStudy.length > 0 ? sitesInStudy.map(site => {
-                                    const siteStudyPatients = allPatients.filter(p => {
-                                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                                        return currentEnrollment?.siteId === site.id && currentEnrollment?.studyId === study.id;
-                                    });
-                                    const siteEnrolled = siteStudyPatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-                                    const siteScreenFailed = siteStudyPatients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
-                                    const siteTotalScreened = siteEnrolled + siteScreenFailed;
-                                    const siteScreenFailRate = siteTotalScreened > 0 ? Math.round((siteScreenFailed / siteTotalScreened) * 100) : 0;
-
-                                    return `
-                                    <div class="p-4 border dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700/50">
-                                        <div class="flex flex-col sm:flex-row flex-wrap justify-between items-start">
-                                            <div class="mb-2 md:mb-0">
-                                                <p class="font-bold text-gray-900 dark:text-gray-100">${site.name}</p>
-                                                <div class="flex flex-wrap gap-1 mt-1">
-                                                    ${ensureArray(site.indication).map(ind => `<span class="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">${ind}</span>`).join('')}
-                                                </div>
-                                            </div>
-                                            <div class="flex space-x-4 text-right">
-                                                <div>
-                                                    <p class="text-sm text-gray-600 dark:text-gray-400">Enrollment</p>
-                                                    <p class="font-semibold text-lg text-indigo-600 dark:text-indigo-400">${siteEnrolled}</p>
-                                                </div>
-                                                <div>
-                                                    <p class="text-sm text-gray-600 dark:text-gray-400">SF Rate</p>
-                                                    <p class="font-semibold text-lg text-red-600 dark:text-red-400">${siteScreenFailRate}%</p>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                `}).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400 italic mt-3">No sites are assigned to this study yet. Edit the study to add sites.</p>'}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            `;
-        };
-
-        const calculateWashoutInfo = (studyId) => {
-            const study = allStudies.find(s => s.id === studyId);
-            if (!study) return;
-
-            const washoutDays = study.washoutDays || 30;
-            
-            // Get patients who have completed this study and are in washout
-            const washoutPatients = allPatients.filter(p => {
-                const pastEnrollments = p.enrollments?.filter(e => e.status === 'past') || [];
-                const studyEnrollment = pastEnrollments.find(e => e.studyId === studyId);
-                return studyEnrollment && studyEnrollment.exitedDate;
-            });
-
-            const washoutStatsContainer = document.getElementById(`washout-stats-${studyId}`);
-            if (!washoutStatsContainer) return;
-
-            if (washoutPatients.length === 0) {
-                washoutStatsContainer.innerHTML = `
-                    <div class="col-span-full text-center text-gray-500 dark:text-gray-400">
-                        <p>No patients in washout period</p>
-                    </div>
-                `;
-                return;
-            }
-
-            // Calculate statistics
-            const today = new Date();
-            let inWashout = 0;
-            let eligible = 0;
-            let avgDaysRemaining = 0;
-            let totalDaysRemaining = 0;
-
-            washoutPatients.forEach(patient => {
-                const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
-                const studyEnrollment = pastEnrollments.find(e => e.studyId === studyId);
-                
-                if (studyEnrollment && studyEnrollment.exitedDate) {
-                    const exitDate = new Date(studyEnrollment.exitedDate);
-                    const washoutCompleteDate = new Date(exitDate);
-                    washoutCompleteDate.setDate(washoutCompleteDate.getDate() + washoutDays);
-                    
-                    const diffMs = washoutCompleteDate.getTime() - today.getTime();
-                    const daysRemaining = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-                    
-                    if (daysRemaining > 0) {
-                        inWashout++;
-                        totalDaysRemaining += daysRemaining;
-                    } else {
-                        eligible++;
-                    }
-                }
-            });
-
-            avgDaysRemaining = inWashout > 0 ? Math.round(totalDaysRemaining / inWashout) : 0;
-
-            washoutStatsContainer.innerHTML = `
-                <div class="text-center">
-                    <p class="text-lg font-bold text-yellow-600 dark:text-yellow-400">${inWashout}</p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400">In Washout</p>
-                </div>
-                <div class="text-center">
-                    <p class="text-lg font-bold text-green-600 dark:text-green-400">${eligible}</p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400">Eligible</p>
-                </div>
-                <div class="text-center">
-                    <p class="text-lg font-bold text-blue-600 dark:text-blue-400">${avgDaysRemaining}</p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400">Avg Days Left</p>
-                </div>
-                <div class="text-center">
-                    <p class="text-lg font-bold text-purple-600 dark:text-purple-400">${washoutDays}</p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400">Washout Period</p>
-                </div>
-            `;
-        };
-
-        const updateAllWashoutInfo = () => {
-            allStudies.forEach(study => {
-                calculateWashoutInfo(study.id);
-            });
-        };
-
-
-        // Function to check if a patient is eligible for a study based on washout status
-        const isPatientEligibleForStudy = (patientId, studyId) => {
-            const patient = allPatients.find(p => p.id === patientId);
-            const study = allStudies.find(s => s.id === studyId);
-            
-            if (!patient || !study) return false;
-            
-            const washoutDays = study.washoutDays || 30;
-            const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
-            
-            // Check if patient has any past enrollments that are still in washout
-            for (const enrollment of pastEnrollments) {
-                if (enrollment.exitedDate) {
-                    const exitDate = new Date(enrollment.exitedDate);
-                    const washoutCompleteDate = new Date(exitDate);
-                    washoutCompleteDate.setDate(washoutCompleteDate.getDate() + washoutDays);
-                    
-                    const today = new Date();
-                    if (today < washoutCompleteDate) {
-                        return false; // Patient is still in washout
-                    }
-                }
-            }
-            
-            return true; // Patient is eligible
-        };
+        if (data.color && typeof data.color !== 'string') {
+            errors.push('color must be a string');
+        }
         
-        const renderAllSites = (sitesToRender = allSites) => {
-            const sitesTableBody = document.getElementById('sites-table-body');
-            if(sitesTableBody) {
-                if (sitesToRender.length === 0) {
-                    sitesTableBody.innerHTML = `<tr><td colspan="7" class="text-center py-8 text-gray-500 dark:text-gray-400">No sites found.</td></tr>`;
-                    return;
-                }
-                sitesTableBody.innerHTML = sitesToRender.map(site => {
-                    const sitePatients = allPatients.filter(p => {
-                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                        return currentEnrollment?.siteId === site.id;
-                    });
-                    const enrolled = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-                    const screenFailed = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
-                    const totalScreened = enrolled + screenFailed;
-                    const screenFailRate = totalScreened > 0 ? Math.round((screenFailed / totalScreened) * 100) : 0;
-
-                    return `
-                        <tr>
-                            <td class="px-6 py-4 whitespace-nowrap"><input type="checkbox" data-id="${site.id}" class="h-4 w-4 rounded border-gray-300 text-indigo-600 site-checkbox"></td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${site.status || 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${site.name}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${site.pi || 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                <div class="flex flex-wrap gap-1">
-                                    ${ensureArray(site.indication).map(ind => `<span class="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">${ind}</span>`).join('')}
-                                </div>
-                            </td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${screenFailRate}%</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-4">
-                                <button data-action="edit-site" data-id="${site.id}" class="text-indigo-600 hover:text-indigo-900 dark:text-indigo-400 dark:hover:text-indigo-300">Edit</button>
-                                <button data-action="delete-site" data-id="${site.id}" class="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300">Delete</button>
-                            </td>
-                        </tr>
-                    `;
-                }).join('');
-            }
-        };
-
-        const renderAllStudies = () => {
-            const studiesContainer = document.getElementById('studies-container');
-            if (!studiesContainer) return;
-            
-            // Populate filter dropdowns
-            populateStudyFilters();
-            
-            // Apply filters
-            let filteredStudies = [...allStudies];
-            
-            // Status filter
-            const statusFilter = document.getElementById('study-status-filter')?.value || 'all';
-            if (statusFilter === 'active') {
-                filteredStudies = filteredStudies.filter(s => ['Recruiting', 'Enrolling', 'Active'].includes(s.status));
-            } else if (statusFilter === 'inactive') {
-                filteredStudies = filteredStudies.filter(s => s.status === 'Closed');
-            } else if (statusFilter !== 'all') {
-                filteredStudies = filteredStudies.filter(s => s.status === statusFilter);
-            }
-            
-            // Indication filter
-            const indicationFilter = document.getElementById('study-indication-filter')?.value || 'all';
-            if (indicationFilter !== 'all') {
-                filteredStudies = filteredStudies.filter(s => {
-                    const indications = ensureArray(s.indication);
-                    return indications.includes(indicationFilter);
-                });
-            }
-            
-            // Site filter
-            const siteFilter = document.getElementById('study-site-filter')?.value || 'all';
-            if (siteFilter !== 'all') {
-                filteredStudies = filteredStudies.filter(s => {
-                    const siteIds = s.siteIds || [];
-                    return siteIds.includes(siteFilter);
-                });
-            }
-            
-            // Date range filter (if applied)
-            const dateRangeFilter = window.studyDateRangeFilter || null;
-            if (dateRangeFilter) {
-                filteredStudies = filteredStudies.filter(s => {
-                    if (!s.startDate) return false;
-                    const studyStart = new Date(s.startDate);
-                    return studyStart >= dateRangeFilter.start && studyStart <= dateRangeFilter.end;
-                });
-            }
-            
-            // Sort
-            const sortBy = document.getElementById('study-sort-filter')?.value || 'title';
-            if (sortBy === 'title') {
-                filteredStudies.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
-            } else if (sortBy === 'startDate') {
-                filteredStudies.sort((a, b) => {
-                    const dateA = a.startDate ? new Date(a.startDate) : new Date(0);
-                    const dateB = b.startDate ? new Date(b.startDate) : new Date(0);
-                    return dateB - dateA; // Most recent first
-                });
-            } else if (sortBy === 'status') {
-                filteredStudies.sort((a, b) => (a.status || '').localeCompare(b.status || ''));
-            }
-            
-            if (filteredStudies.length > 0) {
-                studiesContainer.innerHTML = filteredStudies.map(renderStudyCard).join('');
-                // Update washout information after rendering
-                setTimeout(() => {
-                    updateAllWashoutInfo();
-                }, 100);
-            } else {
-                studiesContainer.innerHTML = `
-                    <div class="text-center py-12 bg-white dark:bg-gray-800 rounded-lg shadow">
-                        <h3 class="text-lg font-medium text-gray-700 dark:text-gray-300">No studies match your filters.</h3>
-                        <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">Try adjusting your filters or reset them.</p>
-                    </div>
-                `;
-            }
-        };
+        if (data.requiredRoles && !Array.isArray(data.requiredRoles)) {
+            errors.push('requiredRoles must be an array');
+        }
         
-        const populateStudyFilters = () => {
-            // Populate indication filter
-            const indicationFilter = document.getElementById('study-indication-filter');
-            if (indicationFilter) {
-                const allIndications = new Set();
-                allStudies.forEach(study => {
-                    const indications = ensureArray(study.indication);
-                    indications.forEach(ind => allIndications.add(ind));
-                });
-                
-                const currentValue = indicationFilter.value;
-                indicationFilter.innerHTML = '<option value="all">All Indications</option>' +
-                    Array.from(allIndications).sort().map(ind => 
-                        `<option value="${ind}">${ind}</option>`
-                    ).join('');
-                if (currentValue && Array.from(allIndications).includes(currentValue)) {
-                    indicationFilter.value = currentValue;
-                }
-            }
-            
-            // Populate site filter
-            const siteFilter = document.getElementById('study-site-filter');
-            if (siteFilter) {
-                const currentValue = siteFilter.value;
-                siteFilter.innerHTML = '<option value="all">All Sites</option>' +
-                    allSites.map(site => 
-                        `<option value="${site.id}">${site.name}</option>`
-                    ).join('');
-                if (currentValue && allSites.some(s => s.id === currentValue)) {
-                    siteFilter.value = currentValue;
-                }
-            }
-        };
+        if (data.sites && !Array.isArray(data.sites)) {
+            errors.push('sites must be an array');
+        }
         
-        // --- Dashboard Chart Functions ---
-        let studiesByTherapeuticAreaChart = null;
-        let studyStatusChart = null;
-        let enrollmentBySiteChart = null;
-        let studyProgressChart = null;
-        let siteMonitoringChart = null;
-        let financesChart = null;
-
-        const renderDashboardCharts = () => {
-            const studyFilterId = document.getElementById('dash-study-filter')?.value;
-            const siteFilterId = document.getElementById('dash-site-filter')?.value;
-            const indicationFilter = document.getElementById('dash-indication-filter')?.value;
-
-            if (!studyFilterId) return; // Exit if filters are not on the page
-
-            // --- Filter Data ---
-            let relevantStudies = allStudies;
-            if (studyFilterId !== 'all') {
-                relevantStudies = relevantStudies.filter(s => s.id === studyFilterId);
-            }
-            if (siteFilterId !== 'all') {
-                 relevantStudies = relevantStudies.filter(s => (s.siteIds || []).includes(siteFilterId));
-            }
-             if (indicationFilter !== 'all') {
-                const sitesWithIndication = new Set(allSites.filter(s => ensureArray(s.indication).includes(indicationFilter)).map(s => s.id));
-                relevantStudies = relevantStudies.filter(s => 
-                    ensureArray(s.indication).includes(indicationFilter) || 
-                    (s.siteIds || []).some(siteId => sitesWithIndication.has(siteId))
-                );
-            }
-            
-            const relevantStudyIds = new Set(relevantStudies.map(s => s.id));
-            
-            let relevantSites = allSites;
-             if (studyFilterId !== 'all') {
-                const study = allStudies.find(s => s.id === studyFilterId);
-                if(study) {
-                    relevantSites = relevantSites.filter(s => (study.siteIds || []).includes(s.id));
-                }
-            }
-            
-            const relevantSiteIds = new Set(relevantSites.map(s => s.id));
-            
-            let patientsForCharts = allPatients.filter(p => {
-                const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                return currentEnrollment && relevantStudyIds.has(currentEnrollment.studyId);
-            });
-            if(siteFilterId !== 'all'){
-                 patientsForCharts = patientsForCharts.filter(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    return currentEnrollment?.siteId === siteFilterId;
-                });
-            }
-
-
-            updateDashboardStats(relevantStudies, relevantSites, patientsForCharts);
-
-            // --- 1. Studies by Therapeutic Area Chart (Doughnut) ---
-            const studiesByTherapeuticAreaCtx = document.getElementById('studies-by-therapeutic-area-chart')?.getContext('2d');
-            if (studiesByTherapeuticAreaCtx) {
-                if (studiesByTherapeuticAreaChart) studiesByTherapeuticAreaChart.destroy();
-                
-                const therapeuticAreaData = relevantStudies.reduce((acc, study) => {
-                    const areas = ensureArray(study.indication);
-                    areas.forEach(area => {
-                        acc[area] = (acc[area] || 0) + 1;
-                    });
-                    return acc;
-                }, {});
-                
-                studiesByTherapeuticAreaChart = new Chart(studiesByTherapeuticAreaCtx, {
-                    type: 'doughnut',
-                    data: {
-                        labels: Object.keys(therapeuticAreaData),
-                        datasets: [{
-                            data: Object.values(therapeuticAreaData),
-                            backgroundColor: [
-                                'rgba(239, 68, 68, 0.8)',
-                                'rgba(59, 130, 246, 0.8)',
-                                'rgba(16, 185, 129, 0.8)',
-                                'rgba(245, 158, 11, 0.8)',
-                                'rgba(139, 92, 246, 0.8)',
-                                'rgba(236, 72, 153, 0.8)'
-                            ]
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: true,
-                        plugins: {
-                            legend: {
-                                position: 'bottom'
-                            }
-                        }
-                    }
-                });
-            }
-
-            // --- 3. Study Status Chart (Bar) ---
-            const studyStatusCtx = document.getElementById('study-status-chart')?.getContext('2d');
-            if (studyStatusCtx) {
-                if (studyStatusChart) studyStatusChart.destroy();
-                
-                const statusData = relevantStudies.reduce((acc, study) => {
-                    const status = study.status || 'Unknown';
-                    acc[status] = (acc[status] || 0) + 1;
-                    return acc;
-                }, {});
-                
-                studyStatusChart = new Chart(studyStatusCtx, {
-                    type: 'bar',
-                    data: {
-                        labels: Object.keys(statusData),
-                        datasets: [{
-                            label: 'Number of Studies',
-                            data: Object.values(statusData),
-                            backgroundColor: 'rgba(59, 130, 246, 0.8)'
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        scales: {
-                            y: {
-                                beginAtZero: true
-                            }
-                        }
-                    }
-                });
-            }
-
-            // --- 4. Enrollment by Site Chart (Bar) ---
-            const enrollmentBySiteCtx = document.getElementById('enrollment-by-site-chart')?.getContext('2d');
-            if (enrollmentBySiteCtx) {
-                if (enrollmentBySiteChart) enrollmentBySiteChart.destroy();
-                
-                const siteEnrollmentData = relevantSites.map(site => {
-                    return patientsForCharts.filter(p => {
-                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                        return currentEnrollment?.siteId === site.id && p.status && p.status.toLowerCase() === 'enrolled';
-                    }).length;
-                });
-                
-                enrollmentBySiteChart = new Chart(enrollmentBySiteCtx, {
-                    type: 'bar',
-                    data: {
-                        labels: relevantSites.map(s => s.name),
-                        datasets: [{
-                            label: 'Enrolled Patients',
-                            data: siteEnrollmentData,
-                            backgroundColor: 'rgba(16, 185, 129, 0.8)'
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        scales: {
-                            y: {
-                                beginAtZero: true
-                            }
-                        }
-                    }
-                });
-            }
-
-            // --- 5. Study Progress Chart (Horizontal Bar) ---
-            const studyProgressCtx = document.getElementById('study-progress-chart')?.getContext('2d');
-            if (studyProgressCtx) {
-                if (studyProgressChart) studyProgressChart.destroy();
-                
-                const studyProgressData = relevantStudies.map(study => {
-                    const enrolled = patientsForCharts.filter(p => {
-                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                        return currentEnrollment?.studyId === study.id && p.status && p.status.toLowerCase() === 'enrolled';
-                    }).length;
-                    const target = study.target || 100;
-                    return Math.min((enrolled / target) * 100, 100);
-                });
-                
-                studyProgressChart = new Chart(studyProgressCtx, {
-                    type: 'bar',
-                    data: {
-                        labels: relevantStudies.map(s => s.title),
-                        datasets: [{
-                            label: 'Progress (%)',
-                            data: studyProgressData,
-                            backgroundColor: 'rgba(139, 92, 246, 0.8)'
-                        }]
-                    },
-                    options: {
-                        indexAxis: 'y',
-                        responsive: true,
-                        scales: {
-                            x: {
-                                beginAtZero: true,
-                                max: 100
-                            }
-                        }
-                    }
-                });
-            }
-
-            // --- 6. Site Monitoring Chart (Doughnut) ---
-            const siteMonitoringCtx = document.getElementById('site-monitoring-chart')?.getContext('2d');
-            if (siteMonitoringCtx) {
-                if (siteMonitoringChart) siteMonitoringChart.destroy();
-                
-                const activeSites = relevantSites.filter(s => s.status === 'Active').length;
-                const inactiveSites = relevantSites.filter(s => s.status === 'Inactive').length;
-                
-                siteMonitoringChart = new Chart(siteMonitoringCtx, {
-                    type: 'doughnut',
-                    data: {
-                        labels: ['Active Sites', 'Inactive Sites'],
-                        datasets: [{
-                            data: [activeSites, inactiveSites],
-                            backgroundColor: [
-                                'rgba(16, 185, 129, 0.8)',
-                                'rgba(107, 114, 128, 0.8)'
-                            ]
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: true,
-                        plugins: {
-                            legend: {
-                                position: 'bottom'
-                            }
-                        }
-                    }
-                });
-            }
-
-            // --- 7. Finances Chart (Bar) ---
-            const financesCtx = document.getElementById('finances-chart')?.getContext('2d');
-            if (financesCtx) {
-                if (financesChart) financesChart.destroy();
-                
-                // Placeholder data - you can replace with actual financial data
-                const budgetData = relevantStudies.map(study => study.budget || 0);
-                const spentData = relevantStudies.map(study => study.spent || 0);
-                
-                financesChart = new Chart(financesCtx, {
-                    type: 'bar',
-                    data: {
-                        labels: relevantStudies.map(s => s.title),
-                        datasets: [
-                            {
-                                label: 'Budget',
-                                data: budgetData,
-                                backgroundColor: 'rgba(59, 130, 246, 0.8)'
-                            },
-                            {
-                                label: 'Spent',
-                                data: spentData,
-                                backgroundColor: 'rgba(239, 68, 68, 0.8)'
-                            }
-                        ]
-                    },
-                    options: {
-                        responsive: true,
-                        scales: {
-                            y: {
-                                beginAtZero: true
-                            }
-                        }
-                    }
-                });
-            }
-            
-            // Initialize map when dashboard is rendered
-            setTimeout(() => {
-                initializeMap();
-                // setupMapEventHandlers will be called after map is ready
-            }, 100);
-        };
-
-        // --- Map Functionality ---
-        let azureMap = null;
-        let azureMapDataSource = null;
-        let azureMapMarkers = [];
-        let azureMapAnimation = null;
-        let currentMapType = 'azure';
-        let currentMapView = 'sites';
-        let currentIndicationFilter = 'all';
-        let currentCrcLevelFilter = 'all';
-
-        const initializeMap = () => {
-            const mapView = document.getElementById('map-view-selector')?.value || 'sites';
-            
-            currentMapType = 'azure';
-            currentMapView = mapView;
-            
-            // Always use Azure Maps
-            initializeAzureMap();
-        };
-
-        const initializeAzureMap = () => {
-            const azureMapContainer = document.getElementById('azure-map');
-            if (!azureMapContainer) {
-                console.log('Azure map container not found');
-                return;
-            }
-            
-            // Wait for Azure Maps key to be loaded
-            if (!AZURE_MAPS_KEY) {
-                console.log('Azure Maps key not loaded yet, waiting...');
-                setTimeout(() => {
-                    if (AZURE_MAPS_KEY) {
-                        initializeAzureMap();
-                    }
-                }, 500);
-                return;
-            }
-            
-            // Check if atlas is loaded
-            if (typeof atlas === 'undefined') {
-                console.error('Azure Maps SDK not loaded');
-                return;
-            }
-            
-            // Clear existing map if it exists
-            if (azureMap) {
-                azureMap.dispose();
-                azureMap = null;
-            }
-            
-            try {
-                // Initialize Azure Maps
-                azureMap = new atlas.Map('azure-map', {
-                    center: [-98.5795, 39.8283], // [longitude, latitude] - Center of USA
-                    zoom: 4,
-                    authOptions: {
-                        authType: 'subscriptionKey',
-                        subscriptionKey: AZURE_MAPS_KEY
-                    },
-                    style: document.documentElement.classList.contains('dark') ? 'dark' : 'road'
-                });
-                
-                // Wait for map to be ready
-                azureMap.events.add('ready', () => {
-                    console.log('Azure Maps ready');
-                    // Setup event handlers after map is ready
-                    setupMapEventHandlers();
-                    // Only load markers if data is already available
-                    // Otherwise, loadMapMarkers will be called after data loads in performInitialLoad
-                    if (allSites.length > 0 || allCrcs.length > 0) {
-                        console.log('Data already available, loading markers...');
-                        loadMapMarkers();
-                    } else {
-                        console.log('Waiting for data to load before adding markers...');
-                    }
-                });
-                
-                azureMap.events.add('error', (error) => {
-                    console.error('Azure Maps error:', error);
-                });
-            } catch (error) {
-                console.error('Error initializing Azure Maps:', error);
-            }
-        };
-
-        // Removed Google Maps and Bing Maps initialization - using Azure Maps only
+        if (data.siteRoleRequirements && typeof data.siteRoleRequirements !== 'object') {
+            errors.push('siteRoleRequirements must be an object');
+        }
         
-        // Geocode address using Azure Maps Search API (via proxy to avoid CORS)
-        const geocodeAddress = async (address) => {
-            if (!address) return null;
-            
-            try {
-                // Use backend proxy to avoid CORS issues
-                const response = await fetch(
-                    `/api/geocode?api-version=1.0&query=${encodeURIComponent(address)}`
-                );
-                const data = await response.json();
-                if (data && data.results && data.results.length > 0) {
-                    const result = data.results[0];
-                    const position = result.position;
-                    if (position && position.lat && position.lon) {
-                        return {
-                            lat: position.lat,
-                            lng: position.lon
-                        };
-                    }
-                }
-            } catch (error) {
-                console.error('Error geocoding address:', address, error);
-            }
-            return null;
-        };
+        if (data.description && typeof data.description !== 'string') {
+            errors.push('description must be a string');
+        }
+        
+        if (data.status && !['active', 'inactive', 'completed', 'suspended'].includes(data.status.toLowerCase())) {
+            errors.push('status must be one of: active, inactive, completed, suspended');
+        }
+        
+        if (data.phase && typeof data.phase !== 'string') {
+            errors.push('phase must be a string');
+        }
+        
+        if (data.lastUpdated && typeof data.lastUpdated !== 'string') {
+            errors.push('lastUpdated must be a string');
+        }
+    } else {
+        // ARTEMIS/NASA format validation
+        if (!data.title || typeof data.title !== 'string') {
+            errors.push('title is required and must be a string');
+        }
+        
+        if (data.protocolNumber && typeof data.protocolNumber !== 'string') {
+            errors.push('protocolNumber must be a string');
+        }
+        
+        if (data.target !== undefined && (typeof data.target !== 'number' || data.target < 0)) {
+            errors.push('target must be a non-negative number');
+        }
+        
+        if (data.status && !['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended'].includes(data.status)) {
+            errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended');
+        }
+        
+        if (data.indication && !Array.isArray(data.indication)) {
+            errors.push('indication must be an array');
+        }
+        
+        if (data.siteIds && !Array.isArray(data.siteIds)) {
+            errors.push('siteIds must be an array');
+        }
+        
+        if (data.washoutDays !== undefined && (typeof data.washoutDays !== 'number' || data.washoutDays < 0)) {
+            errors.push('washoutDays must be a non-negative number');
+        }
+        
+        if (data.siteEnrollmentGoals && typeof data.siteEnrollmentGoals !== 'object') {
+            errors.push('siteEnrollmentGoals must be an object');
+        }
+        
+        if (data.startDate && typeof data.startDate !== 'string') {
+            errors.push('startDate must be a string');
+        }
+        
+        if (data.endDate && typeof data.endDate !== 'string') {
+            errors.push('endDate must be a string');
+        }
+        
+        if (data.fpfv && typeof data.fpfv !== 'string') {
+            errors.push('fpfv must be a string');
+        }
+        
+        if (data.lplv && typeof data.lplv !== 'string') {
+            errors.push('lplv must be a string');
+        }
+    }
+    
+    if (errors.length > 0) {
+        console.error('Study validation errors:', errors);
+        throw new Error(`VALIDATION_ERROR: Studies validation failed: ${errors.join(', ')}`);
+    }
+    
+    console.log('Study validation passed');
+    return true;
+};
 
-        const loadMapMarkers = async () => {
-            if (!azureMap) {
-                console.log('Azure map not initialized yet');
-                return;
-            }
-            
-            // Ensure map is fully ready and markers collection exists
-            if (!azureMap.markers) {
-                console.warn('Azure Map markers collection not available yet, waiting...');
-                // Wait a bit and try again
-                setTimeout(() => {
-                    if (azureMap && azureMap.markers) {
-                        loadMapMarkers();
-                    } else {
-                        console.error('Azure Map markers collection still not available after wait');
-                    }
-                }, 500);
-                return;
-            }
-            
-            // Check if data is available
-            if (!allSites || !Array.isArray(allSites)) {
-                console.warn('No sites data available yet');
-                allSites = [];
-            }
-            if (!allCrcs || !Array.isArray(allCrcs)) {
-                console.warn('No CRCs data available yet');
-                allCrcs = [];
-            }
-            
-            console.log('Loading map markers. Sites:', allSites.length, 'CRCs:', allCrcs.length);
-            
-            // Get filter values
-            const indicationFilter = document.getElementById('map-indication-filter')?.value || 'all';
-            const crcLevelFilter = document.getElementById('map-crc-level-filter')?.value || 'all';
-            currentIndicationFilter = indicationFilter;
-            currentCrcLevelFilter = crcLevelFilter;
-            
-            console.log('Filters - Indication:', indicationFilter, 'CRC Level:', crcLevelFilter);
-            
-            // Clear existing markers and animation
-            if (azureMapAnimation) {
-                azureMapAnimation.reset();
-                azureMapAnimation = null;
-            }
-            if (azureMap.markers) {
-                azureMap.markers.clear();
-            }
-            if (azureMap.layers && azureMap.layers.length > 0) {
-                azureMap.layers.clear();
-            }
-            if (azureMap.sources && azureMap.sources.length > 0) {
-                azureMap.sources.clear();
-            }
-            
-            // Create data source for animated markers
-            azureMapDataSource = new atlas.source.DataSource();
-            azureMap.sources.add(azureMapDataSource);
-            
-            // Filter sites - check for coordinates first, then address
-            let sitesWithCoords = allSites.filter(site => site && site.latitude && site.longitude);
-            const sitesWithAddress = allSites.filter(site => site && !site.latitude && !site.longitude && (site.address1 || site.city || site.state));
-            
-            // Filter CRCs - check for coordinates first, then address
-            let crcsWithCoords = allCrcs.filter(crc => crc && crc.coordinates && crc.coordinates.lat && crc.coordinates.lng);
-            const crcsWithAddress = allCrcs.filter(crc => crc && (!crc.coordinates || !crc.coordinates.lat) && crc.homeLocation);
-            
-            // Helper function to check if site matches indication filter
-            const siteMatchesIndication = (site, indicationFilter) => {
-                if (indicationFilter === 'all') return true;
-                const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
-                const getStudyIndications = (ind) => {
-                    if (!ind) return [];
-                    if (Array.isArray(ind)) return ind.filter(i => i && typeof i === 'string').map(i => i.trim());
-                    if (typeof ind === 'string') return [ind.trim()];
-                    return [];
-                };
-                
-                return studiesAtSite.some(study => {
-                    const studyIndications = [
-                        ...getStudyIndications(study.indication),
-                        ...getStudyIndications(study.therapeuticArea)
-                    ];
-                    return studyIndications.includes(indicationFilter);
-                });
+const validateSitesSchema = (data) => {
+    const errors = [];
+    
+    if (!data.name || typeof data.name !== 'string') {
+        errors.push('name is required and must be a string');
+    }
+    
+    if (data.siteNameAbbreviation && typeof data.siteNameAbbreviation !== 'string') {
+        errors.push('siteNameAbbreviation must be a string');
+    }
+    
+    if (data.address1 && typeof data.address1 !== 'string') {
+        errors.push('address1 must be a string');
+    }
+    
+    if (data.address2 && typeof data.address2 !== 'string') {
+        errors.push('address2 must be a string');
+    }
+    
+    if (data.city && typeof data.city !== 'string') {
+        errors.push('city must be a string');
+    }
+    
+    if (data.state && typeof data.state !== 'string') {
+        errors.push('state must be a string');
+    }
+    
+    if (data.zipCode && typeof data.zipCode !== 'string') {
+        errors.push('zipCode must be a string');
+    }
+    
+    if (data.country && typeof data.country !== 'string') {
+        errors.push('country must be a string');
+    }
+    
+    if (data.pi && typeof data.pi !== 'string') {
+        errors.push('pi must be a string');
+    }
+    
+    if (data.piEmail && typeof data.piEmail !== 'string') {
+        errors.push('piEmail must be a string');
+    }
+    
+    if (data.siteCoordinator && typeof data.siteCoordinator !== 'string') {
+        errors.push('siteCoordinator must be a string');
+    }
+    
+    if (data.siteCoordinatorEmail && typeof data.siteCoordinatorEmail !== 'string') {
+        errors.push('siteCoordinatorEmail must be a string');
+    }
+    
+    if (data.indication && !Array.isArray(data.indication)) {
+        errors.push('indication must be an array');
+    }
+    
+    if (data.status && !['Active', 'Inactive', 'Suspended'].includes(data.status)) {
+        errors.push('status must be one of: Active, Inactive, Suspended');
+    }
+    
+    if (data.latitude !== undefined && (typeof data.latitude !== 'number' || data.latitude < -90 || data.latitude > 90)) {
+        errors.push('latitude must be a number between -90 and 90');
+    }
+    
+    if (data.longitude !== undefined && (typeof data.longitude !== 'number' || data.longitude < -180 || data.longitude > 180)) {
+        errors.push('longitude must be a number between -180 and 180');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Sites validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+const validatePatientsSchema = (data) => {
+    const errors = [];
+    
+    if (!data.firstName || typeof data.firstName !== 'string') {
+        errors.push('firstName is required and must be a string');
+    }
+    
+    if (!data.lastName || typeof data.lastName !== 'string') {
+        errors.push('lastName is required and must be a string');
+    }
+    
+    if (data.globalId && typeof data.globalId !== 'string') {
+        errors.push('globalId must be a string');
+    }
+    
+    if (data.phoneNumber && typeof data.phoneNumber !== 'string') {
+        errors.push('phoneNumber must be a string');
+    }
+    
+    if (data.email && typeof data.email !== 'string') {
+        errors.push('email must be a string');
+    }
+    
+    if (data.dob && typeof data.dob !== 'string') {
+        errors.push('dob must be a string');
+    }
+    
+    if (data.address && typeof data.address !== 'string') {
+        errors.push('address must be a string');
+    }
+    
+    if (data.city && typeof data.city !== 'string') {
+        errors.push('city must be a string');
+    }
+    
+    if (data.state && typeof data.state !== 'string') {
+        errors.push('state must be a string');
+    }
+    
+    if (data.zipCode && typeof data.zipCode !== 'string') {
+        errors.push('zipCode must be a string');
+    }
+    
+    if (data.age !== undefined && (typeof data.age !== 'number' || data.age < 0 || data.age > 150)) {
+        errors.push('age must be a number between 0 and 150');
+    }
+    
+    if (data.condition && typeof data.condition !== 'string') {
+        errors.push('condition must be a string');
+    }
+    
+    if (data.status && !['Candidate', 'Pre-Screening', 'Enrolled', 'Screen Fail', 'Completed'].includes(data.status)) {
+        errors.push('status must be one of: Candidate, Pre-Screening, Enrolled, Screen Fail, Completed');
+    }
+    
+    if (data.registryStatus && !['Active', 'Inactive'].includes(data.registryStatus)) {
+        errors.push('registryStatus must be one of: Active, Inactive');
+    }
+    
+    if (data.source && typeof data.source !== 'string') {
+        errors.push('source must be a string');
+    }
+    
+    if (data.therapeuticArea && typeof data.therapeuticArea !== 'string') {
+        errors.push('therapeuticArea must be a string');
+    }
+    
+    if (data.studyId && typeof data.studyId !== 'string') {
+        errors.push('studyId must be a string');
+    }
+    
+    if (data.siteId && typeof data.siteId !== 'string') {
+        errors.push('siteId must be a string');
+    }
+    
+    if (data.appointment && typeof data.appointment !== 'object') {
+        errors.push('appointment must be an object');
+    }
+    
+    if (data.surveyResults && !Array.isArray(data.surveyResults)) {
+        errors.push('surveyResults must be an array');
+    }
+    
+    if (data.contactLogs && !Array.isArray(data.contactLogs)) {
+        errors.push('contactLogs must be an array');
+    }
+    
+    if (data.studyHistory && !Array.isArray(data.studyHistory)) {
+        errors.push('studyHistory must be an array');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Patients validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+const validateCrcsSchema = (data) => {
+    const errors = [];
+    
+    if (!data.name || typeof data.name !== 'string') {
+        errors.push('name is required and must be a string');
+    }
+    
+    if (data.title && typeof data.title !== 'string') {
+        errors.push('title must be a string');
+    }
+    
+    if (data.region && typeof data.region !== 'string') {
+        errors.push('region must be a string');
+    }
+    
+    if (data.capabilities && !Array.isArray(data.capabilities)) {
+        errors.push('capabilities must be an array');
+    }
+    
+    if (data.trainingLevel && typeof data.trainingLevel !== 'string') {
+        errors.push('trainingLevel must be a string');
+    }
+    
+    if (data.coordinates && typeof data.coordinates !== 'object') {
+        errors.push('coordinates must be an object');
+    }
+    
+    if (data.employmentType && !['FTE', 'PTE', 'Contractor'].includes(data.employmentType)) {
+        errors.push('employmentType must be one of: FTE, PTE, Contractor');
+    }
+    
+    if (data.homeLocation && typeof data.homeLocation !== 'string') {
+        errors.push('homeLocation must be a string');
+    }
+    
+    if (data.trainings && !Array.isArray(data.trainings)) {
+        errors.push('trainings must be an array');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: CRCs validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+const validateEventsSchema = (data) => {
+    const errors = [];
+    
+    if (!data.name || typeof data.name !== 'string') {
+        errors.push('name is required and must be a string');
+    }
+    
+    if (data.title && typeof data.title !== 'string') {
+        errors.push('title must be a string');
+    }
+    
+    if (data.region && typeof data.region !== 'string') {
+        errors.push('region must be a string');
+    }
+    
+    if (data.capabilities && !Array.isArray(data.capabilities)) {
+        errors.push('capabilities must be an array');
+    }
+    
+    if (data.trainingLevel && typeof data.trainingLevel !== 'string') {
+        errors.push('trainingLevel must be a string');
+    }
+    
+    if (data.coordinates && typeof data.coordinates !== 'object') {
+        errors.push('coordinates must be an object');
+    }
+    
+    if (data.employmentType && !['FTE', 'PTE', 'Contractor'].includes(data.employmentType)) {
+        errors.push('employmentType must be one of: FTE, PTE, Contractor');
+    }
+    
+    if (data.homeLocation && typeof data.homeLocation !== 'string') {
+        errors.push('homeLocation must be a string');
+    }
+    
+    if (data.trainings && !Array.isArray(data.trainings)) {
+        errors.push('trainings must be an array');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Events validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+const validateRolesSchema = (data) => {
+    const errors = [];
+    
+    if (!data.name || typeof data.name !== 'string') {
+        errors.push('name is required and must be a string');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Roles validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+const validateUsersSchema = (data) => {
+    const errors = [];
+    
+    if (!data.username || typeof data.username !== 'string') {
+        errors.push('username is required and must be a string');
+    }
+    
+    if (data.password && typeof data.password !== 'string') {
+        errors.push('password must be a string');
+    }
+    
+    if (data.permissionLevel && !['Manager', 'Supervisor', 'CRC'].includes(data.permissionLevel)) {
+        errors.push('permissionLevel must be one of: Manager, Supervisor, CRC');
+    }
+    
+    if (data.entraId && typeof data.entraId !== 'string') {
+        errors.push('entraId must be a string');
+    }
+    
+    if (data.email && typeof data.email !== 'string') {
+        errors.push('email must be a string');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Users validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+// Simple password hashing (in production, use bcrypt or similar)
+const hashPassword = (password) => {
+    // Simple hash for now - in production use proper bcrypt
+    return Buffer.from(password).toString('base64');
+};
+
+const verifyPassword = (password, hash) => {
+    return hashPassword(password) === hash;
+};
+
+const validateSchedulesSchema = (data) => {
+    const errors = [];
+    
+    if (!data.siteId || typeof data.siteId !== 'string') {
+        errors.push('siteId is required and must be a string');
+    }
+    
+    if (!data.studyId || typeof data.studyId !== 'string') {
+        errors.push('studyId is required and must be a string');
+    }
+    
+    if (!data.visit || typeof data.visit !== 'string') {
+        errors.push('visit is required and must be a string');
+    }
+    
+    if (!data.slots || !Array.isArray(data.slots)) {
+        errors.push('slots is required and must be an array');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Schedules validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+const validateSurveysSchema = (data) => {
+    const errors = [];
+    
+    if (!data.title || typeof data.title !== 'string') {
+        errors.push('title is required and must be a string');
+    }
+    
+    if (!data.studyId || typeof data.studyId !== 'string') {
+        errors.push('studyId is required and must be a string');
+    }
+    
+    if (!data.questions || !Array.isArray(data.questions)) {
+        errors.push('questions is required and must be an array');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Surveys validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+const validateTimeOffRequestsSchema = (data) => {
+    const errors = [];
+    
+    if (!data.crcId || typeof data.crcId !== 'string') {
+        errors.push('crcId is required and must be a string');
+    }
+    
+    if (!data.date || typeof data.date !== 'string') {
+        errors.push('date is required and must be a string');
+    }
+    
+    if (!data.type || typeof data.type !== 'string') {
+        errors.push('type is required and must be a string');
+    }
+    
+    if (data.period && typeof data.period !== 'string') {
+        errors.push('period must be a string');
+    }
+    
+    if (data.hours !== undefined && (typeof data.hours !== 'number' || data.hours < 0)) {
+        errors.push('hours must be a non-negative number');
+    }
+    
+    if (data.status && !['pending', 'approved', 'rejected'].includes(data.status)) {
+        errors.push('status must be one of: pending, approved, rejected');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Time Off Requests validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+const validateTravelSchema = (data) => {
+    const errors = [];
+    
+    if (!data.crcId || typeof data.crcId !== 'string') {
+        errors.push('crcId is required and must be a string');
+    }
+    
+    if (!data.date || typeof data.date !== 'string') {
+        errors.push('date is required and must be a string');
+    }
+    
+    if (data.flightNumber && typeof data.flightNumber !== 'string') {
+        errors.push('flightNumber must be a string');
+    }
+    
+    if (data.origin && typeof data.origin !== 'string') {
+        errors.push('origin must be a string');
+    }
+    
+    if (data.destination && typeof data.destination !== 'string') {
+        errors.push('destination must be a string');
+    }
+    
+    // Convert empty strings to undefined for cost fields, then validate
+    const flightCost = data.flightCost === '' || data.flightCost === null ? undefined : data.flightCost;
+    const carRentalCost = data.carRentalCost === '' || data.carRentalCost === null ? undefined : data.carRentalCost;
+    const hotelCost = data.hotelCost === '' || data.hotelCost === null ? undefined : data.hotelCost;
+    
+    // Convert string numbers to numbers
+    if (flightCost !== undefined) {
+        const num = typeof flightCost === 'string' ? parseFloat(flightCost) : flightCost;
+        if (isNaN(num) || num < 0) {
+            errors.push('flightCost must be a non-negative number');
+        }
+    }
+    
+    if (carRentalCost !== undefined) {
+        const num = typeof carRentalCost === 'string' ? parseFloat(carRentalCost) : carRentalCost;
+        if (isNaN(num) || num < 0) {
+            errors.push('carRentalCost must be a non-negative number');
+        }
+    }
+    
+    if (hotelCost !== undefined) {
+        const num = typeof hotelCost === 'string' ? parseFloat(hotelCost) : hotelCost;
+        if (isNaN(num) || num < 0) {
+            errors.push('hotelCost must be a non-negative number');
+        }
+    }
+    
+    if (data.status && !['scheduled', 'delayed', 'departed', 'arrived', 'cancelled'].includes(data.status)) {
+        errors.push('status must be one of: scheduled, delayed, departed, arrived, cancelled');
+    }
+    
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Travel validation failed: ${errors.join(', ')}`);
+    }
+    
+    return true;
+};
+
+// =================================================================================
+// BUSINESS LOGIC FUNCTIONS
+// =================================================================================
+
+const calculateStudyEnrollment = async (studyId) => {
+    try {
+        const patientsContainer = getContainer('patients');
+        const { resources: patients } = await patientsContainer.items
+            .query({
+                query: "SELECT * FROM c WHERE c.studyId = @studyId",
+                parameters: [{ name: "@studyId", value: studyId }]
+            })
+            .fetchAll();
+        
+        return patients.length;
+    } catch (error) {
+        console.error('Error calculating study enrollment:', error);
+        return 0;
+    }
+};
+
+const validateSiteStudyRelationship = async (siteId, studyId) => {
+    try {
+        const studiesContainer = getContainer('studies');
+        const { resource: study } = await studiesContainer.item(studyId).read();
+        
+        if (!study) {
+            throw new Error('Study not found');
+        }
+        
+        if (!study.siteIds || !study.siteIds.includes(siteId)) {
+            throw new Error('Site is not assigned to this study');
+        }
+        
+        return true;
+    } catch (error) {
+        throw new Error(`Site-Study relationship validation failed: ${error.message}`);
+    }
+};
+
+// =================================================================================
+// ENHANCED CRUD HANDLERS
+// =================================================================================
+
+async function crudHandler(context, request, containerName) {
+    let container;
+    try {
+        container = getContainer(containerName);
+    } catch (error) {
+        // If we can't even get the container reference, return empty array for travel
+        if (containerName === 'travel' && request.method === 'GET') {
+            context.log.warn(`Error getting travel container reference, returning empty array. Error: ${error.message}`);
+            return { 
+                jsonBody: [],
+                headers: { 'Content-Type': 'application/json' }
             };
-            
-            // Apply indication filter to sites - filter sites that have studies with this indication
-            if (indicationFilter !== 'all') {
-                sitesWithCoords = sitesWithCoords.filter(site => siteMatchesIndication(site, indicationFilter));
-                sitesWithAddress = sitesWithAddress.filter(site => siteMatchesIndication(site, indicationFilter));
-                console.log(`Filtered sites by indication "${indicationFilter}":`, sitesWithCoords.length, 'sites with coords,', sitesWithAddress.length, 'sites with address only');
-            }
-            
-            // Apply CRC level filter
-            if (crcLevelFilter !== 'all') {
-                crcsWithCoords = crcsWithCoords.filter(crc => {
-                    // Check CRC level/role - adjust field name as needed
-                    return crc.level === crcLevelFilter || crc.role === crcLevelFilter || crc.permission === crcLevelFilter;
-                });
-            }
-            
-            console.log('Sites with coordinates:', sitesWithCoords.length, 'Sites with address only:', sitesWithAddress.length);
-            console.log('CRCs with coordinates:', crcsWithCoords.length, 'CRCs with address only:', crcsWithAddress.length);
-            console.log('Total sites to show:', sitesWithCoords.length, '+', sitesWithAddress.length, 'geocoded =', sitesWithCoords.length + sitesWithAddress.length);
-            console.log('Total CRCs to show:', crcsWithCoords.length, '+', crcsWithAddress.length, 'geocoded =', crcsWithCoords.length + crcsWithAddress.length);
-            
-            // Start with sites that have coordinates
-            const sites = sitesWithCoords;
-            const crcs = crcsWithCoords;
-            
-            const markers = [];
-            const sitePoints = [];
-            const crcPoints = [];
-            azureMapMarkers = []; // Reset marker data
-            
-            // Geocode sites with addresses only (async) - process after initial markers are added
-            const geocodeSitesWithAddress = async () => {
-                if (sitesWithAddress.length > 0 && AZURE_MAPS_KEY && azureMap) {
-                    console.log('Geocoding sites with addresses...');
-                    for (const site of sitesWithAddress) {
-                        try {
-                            // Check both zip and zipCode for compatibility
-                            const zip = site.zipCode || site.zip || '';
-                            const addressParts = [
-                                site.address1 || '', 
-                                site.city || '', 
-                                site.state || '', 
-                                zip
-                            ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
-                            
-                            if (addressParts.length > 0) {
-                                const fullAddress = addressParts.join(', ');
-                                const coords = await geocodeAddress(fullAddress);
-                                if (coords && azureMap && azureMap.markers) {
-                                    // Check indication filter if applied
-                                    if (indicationFilter !== 'all') {
-                                        const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
-                                        const getStudyIndications = (ind) => {
-                                            if (!ind) return [];
-                                            if (Array.isArray(ind)) return ind.filter(i => i && typeof i === 'string').map(i => i.trim());
-                                            if (typeof ind === 'string') return [ind.trim()];
-                                            return [];
-                                        };
-                                        const matchesFilter = studiesAtSite.some(study => {
-                                            const studyIndications = [
-                                                ...getStudyIndications(study.indication),
-                                                ...getStudyIndications(study.therapeuticArea)
-                                            ];
-                                            return studyIndications.includes(indicationFilter);
-                                        });
-                                        if (!matchesFilter) {
-                                            console.log(`Skipping geocoded site ${site.name} - doesn't match indication filter`);
-                                            continue;
-                                        }
-                                    }
-                                    
-                                    // Create marker for geocoded site
-                                    const siteWithCoords = { ...site, latitude: coords.lat, longitude: coords.lng };
-                                    const lat = parseFloat(coords.lat);
-                                    const lng = parseFloat(coords.lng);
-                                    
-                                    if (isNaN(lat) || isNaN(lng)) {
-                                        console.warn('Invalid coordinates for site:', site.name, coords);
-                                        continue;
-                                    }
-                                    
-                                    const sitePatients = allPatients.filter(p => {
-                                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                                        return currentEnrollment?.siteId === site.id;
-                                    });
-                                    const enrolledCount = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-                                    const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
-                                    
-                                    let color = '#3b82f6';
-                                    if (currentMapView === 'studies') {
-                                        color = studiesAtSite.length > 3 ? '#10b981' : studiesAtSite.length > 1 ? '#f59e0b' : '#ef4444';
-                                    } else if (currentMapView === 'staffing') {
-                                        color = enrolledCount > 20 ? '#10b981' : enrolledCount > 10 ? '#f59e0b' : '#ef4444';
-                                    } else if (currentMapView === 'combined') {
-                                        color = '#8b5cf6';
-                                    }
-                                    
-                                    const markerHtml = `<div style="background-color: ${color}; border: 2px solid white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); cursor: pointer;">${enrolledCount > 99 ? '99+' : enrolledCount}</div>`;
-                                    const marker = new atlas.HtmlMarker({ htmlContent: markerHtml, position: [lng, lat], pixelOffset: [0, -16] });
-                                    const popup = new atlas.Popup({ content: createInfoWindowContent(siteWithCoords, enrolledCount, studiesAtSite), pixelOffset: [0, -40] });
-                                    
-                                    if (marker && marker.events) {
-                                        marker.events.add('click', () => { popup.open(azureMap); popup.setPosition([lng, lat]); });
-                                    }
-                                    
-                                    if (azureMap.markers && azureMap.markers.add) {
-                                        azureMap.markers.add(marker);
-                                        markers.push({ position: [lng, lat], marker: marker });
-                                        azureMapMarkers.push({ marker: marker, popup: popup, data: { type: 'site', name: site.name, city: site.city || '', state: site.state || '', studies: studiesAtSite.map(s => s.title) } });
-                                    } else {
-                                        console.warn('Azure Map markers collection not available when adding geocoded site marker');
-                                    }
-                                }
-                            }
-                        } catch (error) {
-                            console.warn('Error geocoding site:', site.name || site.id, error);
-                        }
-                    }
-                }
-            };
-            
-            // Geocode CRCs with addresses only (async)
-            const geocodeCRCsWithAddress = async () => {
-                if (crcsWithAddress.length > 0 && AZURE_MAPS_KEY && azureMap) {
-                    console.log('Geocoding CRCs with addresses...');
-                    for (const crc of crcsWithAddress) {
-                        try {
-                            // Check CRC level filter if applied
-                            if (crcLevelFilter !== 'all') {
-                                const matchesFilter = crc.level === crcLevelFilter || crc.role === crcLevelFilter || crc.permission === crcLevelFilter;
-                                if (!matchesFilter) {
-                                    console.log(`Skipping geocoded CRC ${crc.name} - doesn't match CRC level filter`);
-                                    continue;
-                                }
-                            }
-                            
-                            if (crc.homeLocation && typeof crc.homeLocation === 'string' && crc.homeLocation.trim().length > 0) {
-                                const coords = await geocodeAddress(crc.homeLocation);
-                                if (coords && azureMap && azureMap.markers) {
-                                    const lat = parseFloat(coords.lat);
-                                    const lng = parseFloat(coords.lng);
-                                    
-                                    if (isNaN(lat) || isNaN(lng)) {
-                                        console.warn('Invalid coordinates for CRC:', crc.name, coords);
-                                        continue;
-                                    }
-                                    
-                                    const crcIconHtml = `<div style="background-color: #10b981; color: white; border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 14px; cursor: pointer;">👤</div>`;
-                                    const marker = new atlas.HtmlMarker({ htmlContent: crcIconHtml, position: [lng, lat], pixelOffset: [0, -14] });
-                                    const popupContent = `<div style="min-width: 200px;"><h3 style="font-weight: bold; font-size: 16px; margin-bottom: 8px; color: #10b981;">🏠 CRC Home Location</h3><p style="margin: 4px 0;"><strong>Name:</strong> ${crc.name || 'Unknown'}</p>${crc.title ? `<p style="margin: 4px 0;"><strong>Title:</strong> ${crc.title}</p>` : ''}<p style="margin: 4px 0;"><strong>Location:</strong> ${crc.homeLocation}</p>${crc.region ? `<p style="margin: 4px 0;"><strong>Region:</strong> ${crc.region}</p>` : ''}${crc.employmentType ? `<p style="margin: 4px 0;"><strong>Type:</strong> ${crc.employmentType}</p>` : ''}</div>`;
-                                    const popup = new atlas.Popup({ content: popupContent, pixelOffset: [0, -40] });
-                                    
-                                    if (marker && marker.events) {
-                                        marker.events.add('click', () => { popup.open(azureMap); popup.setPosition([lng, lat]); });
-                                    }
-                                    
-                                    if (azureMap.markers.add) {
-                                        azureMap.markers.add(marker);
-                                        markers.push({ position: [lng, lat], marker: marker });
-                                        azureMapMarkers.push({ marker: marker, popup: popup, data: { type: 'crc', name: crc.name || 'Unknown', location: crc.homeLocation, region: crc.region || '' } });
-                                    } else {
-                                        console.warn('Azure Map markers collection not available when adding geocoded CRC marker');
-                                    }
-                                }
-                            }
-                        } catch (error) {
-                            console.warn('Error geocoding CRC:', crc.name || crc.id, error);
-                        }
-                    }
-                }
-            };
-            
-            // Geocode addresses after initial markers are added
-            await Promise.all([geocodeSitesWithAddress(), geocodeCRCsWithAddress()]);
-            
-            // Update map bounds after all markers are added
-            if (markers.length > 0 && azureMap) {
-                try {
-                    const positions = markers.map(m => m.position);
-                    const bounds = atlas.data.BoundingBox.fromPositions(positions);
-                    azureMap.setCamera({ bounds: bounds, padding: 50 });
-                    console.log('Map bounds updated after geocoding. Total markers:', markers.length);
-                } catch (error) {
-                    console.error('Error updating map bounds:', error);
-                }
-            }
-            
-            // Collect site points for animation (always blue)
-            sites.forEach(site => {
-                const lat = parseFloat(site.latitude);
-                const lng = parseFloat(site.longitude);
-                
-                if (isNaN(lat) || isNaN(lng)) {
-                    console.warn('Site missing coordinates:', site.name, 'lat:', site.latitude, 'lng:', site.longitude);
-                    return;
-                }
-                
-                // Get site statistics
-                const sitePatients = allPatients.filter(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    return currentEnrollment?.siteId === site.id;
-                });
-                
-                const enrolledCount = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-                const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
-                
-                // Sites are always blue
-                const point = new atlas.Shape(new atlas.data.Point([lng, lat]), null, {
-                    name: site.name,
-                    city: site.city || '',
-                    state: site.state || '',
-                    enrolledCount: enrolledCount,
-                    studiesAtSite: studiesAtSite,
-                    type: 'site',
-                    siteData: site
-                });
-                
-                sitePoints.push(point);
-                markers.push({ position: [lng, lat], type: 'site', data: site });
-            });
-            
-            // Add site points to data source
-            if (sitePoints.length > 0) {
-                azureMapDataSource.add(sitePoints);
-            }
-            
-            // Collect CRC points for animation (always green)
-            crcs.forEach(crc => {
-                if (!crc.coordinates) {
-                    console.warn('CRC missing coordinates object:', crc.name);
-                    return;
-                }
-                
-                const lat = parseFloat(crc.coordinates.lat);
-                const lng = parseFloat(crc.coordinates.lng);
-                
-                if (isNaN(lat) || isNaN(lng)) {
-                    console.warn('CRC missing valid coordinates:', crc.name, 'lat:', crc.coordinates.lat, 'lng:', crc.coordinates.lng);
-                    return;
-                }
-                
-                // CRCs are always green
-                const point = new atlas.Shape(new atlas.data.Point([lng, lat]), null, {
-                    name: crc.name,
-                    homeLocation: crc.homeLocation,
-                    title: crc.title || '',
-                    region: crc.region || '',
-                    employmentType: crc.employmentType || '',
-                    type: 'crc',
-                    crcData: crc
-                });
-                
-                crcPoints.push(point);
-                markers.push({ position: [lng, lat], type: 'crc', data: crc });
-            });
-            
-            // Add CRC points to data source
-            if (crcPoints.length > 0) {
-                azureMapDataSource.add(crcPoints);
-            }
-            
-            // Note: We use HTML markers for display, the data source is just for animation
-            // The drop animation will work with the data source points
-            
-            // Animate dropping markers
-            if (typeof atlas !== 'undefined' && atlas.animations && (sitePoints.length > 0 || crcPoints.length > 0)) {
-                const allPoints = [...sitePoints, ...crcPoints];
-                if (allPoints.length > 0) {
-                    setTimeout(() => {
-                        azureMapAnimation = atlas.animations.drop(allPoints, azureMapDataSource, null, {
-                            easing: 'easeOutBounce',
-                            duration: 1000,
-                            autoPlay: true
-                        });
-                        console.log('Drop animation started for', allPoints.length, 'markers');
-                    }, 500);
-                }
-            }
-            
-            // Create HTML markers with popups for interaction (sites - always blue)
-            console.log('Creating HTML markers for', sites.length, 'sites');
-            sites.forEach((site, index) => {
-                const lat = parseFloat(site.latitude);
-                const lng = parseFloat(site.longitude);
-                
-                if (isNaN(lat) || isNaN(lng)) {
-                    console.warn(`Site ${site.name} (${index}) has invalid coordinates: lat=${site.latitude}, lng=${site.longitude}`);
-                    return;
-                }
-                
-                const sitePatients = allPatients.filter(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    return currentEnrollment?.siteId === site.id;
-                });
-                const enrolledCount = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-                const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
-                
-                // Sites are always blue
-                const markerHtml = `<div style="background-color: #3b82f6; border: 2px solid white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); cursor: pointer;">${enrolledCount > 99 ? '99+' : enrolledCount}</div>`;
-                const marker = new atlas.HtmlMarker({ htmlContent: markerHtml, position: [lng, lat], pixelOffset: [0, -16] });
-                const popup = new atlas.Popup({ content: createInfoWindowContent(site, enrolledCount, studiesAtSite), pixelOffset: [0, -40] });
-                marker.events.add('click', () => { popup.open(azureMap); popup.setPosition([lng, lat]); });
-                
-                // Ensure markers collection exists before adding
-                if (azureMap && azureMap.markers && typeof azureMap.markers.add === 'function') {
+        }
+        throw error;
+    }
+    
+    const { method } = request;
+    const id = getIdFromRequest(request);
+
+    try {
+        switch (method) {
+            case 'GET':
+                if (id) {
                     try {
-                        azureMap.markers.add(marker);
-                        azureMapMarkers.push({ marker: marker, popup: popup, data: { type: 'site', name: site.name, city: site.city || '', state: site.state || '', studies: studiesAtSite.map(s => s.title), indication: studiesAtSite.map(s => s.indication || s.therapeuticArea).filter(Boolean) } });
-                        markers.push({ position: [lng, lat], type: 'site', data: site });
-                        console.log(`Added site marker ${index + 1}/${sites.length}: ${site.name} at [${lng}, ${lat}]`);
+                        // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                        const { resource } = await container.item(id, id).read(); 
+                        if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
+                        return { jsonBody: resource };
                     } catch (error) {
-                        console.error('Error adding site marker:', error);
+                        // If container doesn't exist, return 404
+                        if (error.code === 404 || error.message.includes('NotFound')) {
+                            return { status: 404, jsonBody: { error: `${containerName} not found` } };
+                        }
+                        throw error;
                     }
                 } else {
-                    console.error('Azure Map markers collection not available when adding site marker', { 
-                        hasAzureMap: !!azureMap, 
-                        hasMarkers: !!azureMap?.markers, 
-                        markersType: typeof azureMap?.markers,
-                        markersAddType: typeof azureMap?.markers?.add 
-                    });
-                }
-            });
-            
-            // Create HTML markers with popups for interaction (CRCs - always green)
-            console.log('Creating HTML markers for', crcs.length, 'CRCs');
-            crcs.forEach((crc, index) => {
-                if (!crc.coordinates) {
-                    console.warn(`CRC ${crc.name} (${index}) has no coordinates object`);
-                    return;
-                }
-                
-                const lat = parseFloat(crc.coordinates.lat);
-                const lng = parseFloat(crc.coordinates.lng);
-                
-                if (isNaN(lat) || isNaN(lng)) {
-                    console.warn(`CRC ${crc.name} (${index}) has invalid coordinates: lat=${crc.coordinates.lat}, lng=${crc.coordinates.lng}`);
-                    return;
-                }
-                
-                // CRCs are always green
-                const crcIconHtml = `<div style="background-color: #10b981; color: white; border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 14px; cursor: pointer;">👤</div>`;
-                const marker = new atlas.HtmlMarker({ htmlContent: crcIconHtml, position: [lng, lat], pixelOffset: [0, -14] });
-                const popupContent = `<div style="min-width: 200px;"><h3 style="font-weight: bold; font-size: 16px; margin-bottom: 8px; color: #10b981;">🏠 CRC Home Location</h3><p style="margin: 4px 0;"><strong>Name:</strong> ${crc.name}</p>${crc.title ? `<p style="margin: 4px 0;"><strong>Title:</strong> ${crc.title}</p>` : ''}<p style="margin: 4px 0;"><strong>Location:</strong> ${crc.homeLocation || 'N/A'}</p>${crc.region ? `<p style="margin: 4px 0;"><strong>Region:</strong> ${crc.region}</p>` : ''}${crc.employmentType ? `<p style="margin: 4px 0;"><strong>Type:</strong> ${crc.employmentType}</p>` : ''}</div>`;
-                const popup = new atlas.Popup({ content: popupContent, pixelOffset: [0, -40] });
-                marker.events.add('click', () => { popup.open(azureMap); popup.setPosition([lng, lat]); });
-                
-                // Ensure markers collection exists before adding
-                if (azureMap && azureMap.markers && typeof azureMap.markers.add === 'function') {
                     try {
-                        azureMap.markers.add(marker);
-                        azureMapMarkers.push({ marker: marker, popup: popup, data: { type: 'crc', name: crc.name, location: crc.homeLocation || '', region: crc.region || '', level: crc.level || crc.role || crc.permission || '' } });
-                        markers.push({ position: [lng, lat], type: 'crc', data: crc });
-                        console.log(`Added CRC marker ${index + 1}/${crcs.length}: ${crc.name} at [${lng}, ${lat}]`);
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return { jsonBody: resources };
                     } catch (error) {
-                        console.error('Error adding CRC marker:', error);
-                    }
-                } else {
-                    console.error('Azure Map markers collection not available when adding CRC marker', { 
-                        hasAzureMap: !!azureMap, 
-                        hasMarkers: !!azureMap?.markers, 
-                        markersType: typeof azureMap?.markers,
-                        markersAddType: typeof azureMap?.markers?.add 
-                    });
-                }
-            });
-            
-            // Fit map to show all markers
-            console.log('Fitting map. Total HTML markers:', azureMapMarkers.length, 'Data points:', markers.length);
-            
-            if (azureMapMarkers.length > 0 && currentMapType === 'azure') {
-                try {
-                    // Use positions from HTML markers
-                    const positions = azureMapMarkers.map(m => {
-                        if (m.marker && m.marker.getOptions && m.marker.getOptions().position) {
-                            return m.marker.getOptions().position;
+                        // If container doesn't exist yet, return empty array
+                        // Cosmos DB errors can have different formats:
+                        // - error.code === 404
+                        // - error.statusCode === 404
+                        // - error.message includes 'NotFound', 'Container', or 'not found'
+                        const errorCode = error.code || error.statusCode;
+                        const errorMessage = (error.message || '').toLowerCase();
+                        
+                        // For travel container specifically, always return empty array on any error
+                        // This prevents launch failures
+                        if (containerName === 'travel') {
+                            context.log.warn(`Travel container does not exist yet or error occurred, returning empty array. Error: ${error.message}`);
+                            return { 
+                                jsonBody: [],
+                                headers: { 'Content-Type': 'application/json' }
+                            };
                         }
-                        return null;
-                    }).filter(p => p !== null);
+                        
+                        if (errorCode === 404 || 
+                            errorCode === 400 ||
+                            errorMessage.includes('notfound') || 
+                            errorMessage.includes('not found') ||
+                            errorMessage.includes('container') ||
+                            errorMessage.includes('does not exist') ||
+                            errorMessage.includes('bad request')) {
+                            context.log.warn(`Container '${containerName}' does not exist yet, returning empty array`);
+                            return { 
+                                jsonBody: [],
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                        
+                        // Log the actual error for debugging
+                        context.log.error(`Error reading from container '${containerName}':`, error);
+                        context.log.error(`Error code: ${errorCode}, message: ${errorMessage}`);
+                        throw error;
+                    }
+                }
+            
+            case 'POST':
+                const body = await request.json();
+                
+                // Normalize cost fields for travel - convert empty strings to undefined
+                if (containerName === 'travel') {
+                    if (body.flightCost === '' || body.flightCost === null) body.flightCost = undefined;
+                    if (body.carRentalCost === '' || body.carRentalCost === null) body.carRentalCost = undefined;
+                    if (body.hotelCost === '' || body.hotelCost === null) body.hotelCost = undefined;
                     
-                    if (positions.length > 0) {
-                        const bounds = atlas.data.BoundingBox.fromPositions(positions);
-                        azureMap.setCamera({
-                            bounds: bounds,
-                            padding: 50
-                        });
-                        console.log('Map bounds set to show', positions.length, 'markers');
-                    } else {
-                        // Fallback: use markers array
-                        if (markers.length > 0) {
-                            const positions = markers.map(m => m.position);
-                            const bounds = atlas.data.BoundingBox.fromPositions(positions);
-                            azureMap.setCamera({
-                                bounds: bounds,
-                                padding: 50
-                            });
-                            console.log('Map bounds set using markers array:', markers.length, 'markers');
-                        } else {
-                            // Fallback to center on first HTML marker
-                            const firstMarker = azureMapMarkers[0];
-                            if (firstMarker && firstMarker.marker && firstMarker.marker.getOptions) {
-                                const pos = firstMarker.marker.getOptions().position;
-                                azureMap.setCamera({
-                                    center: pos,
-                                    zoom: 10
-                                });
-                                console.log('Centered on first marker');
-                            }
-                        }
+                    // Convert string numbers to numbers
+                    if (body.flightCost !== undefined && typeof body.flightCost === 'string') {
+                        body.flightCost = parseFloat(body.flightCost) || undefined;
                     }
-                } catch (error) {
-                    console.error('Error setting map bounds:', error);
-                    // Fallback to center on first marker
-                    if (azureMapMarkers.length > 0) {
-                        const firstMarker = azureMapMarkers[0];
-                        if (firstMarker && firstMarker.marker && firstMarker.marker.getOptions) {
-                            const pos = firstMarker.marker.getOptions().position;
-                            azureMap.setCamera({
-                                center: pos,
-                                zoom: 10
-                            });
-                        }
+                    if (body.carRentalCost !== undefined && typeof body.carRentalCost === 'string') {
+                        body.carRentalCost = parseFloat(body.carRentalCost) || undefined;
                     }
-                }
-            } else {
-                console.log('No markers to display. Sites:', sites.length, 'CRCs:', crcs.length, 'HTML markers:', azureMapMarkers.length);
-                // If no markers, center on default location
-                azureMap.setCamera({
-                    center: [-98.5795, 39.8283],
-                    zoom: 4
-                });
-            }
-            
-            console.log('Map markers loaded. Total HTML markers:', azureMapMarkers.length, 'Sites:', sites.length, 'CRCs:', crcs.length);
-        };
-
-        const createLeafletIcon = (site, enrolledCount, studyCount) => {
-            // Return different colors based on current view
-            let color = '#3b82f6'; // Default blue
-            
-            if (currentMapView === 'studies') {
-                color = studyCount > 3 ? '#10b981' : studyCount > 1 ? '#f59e0b' : '#ef4444';
-            } else if (currentMapView === 'staffing') {
-                color = enrolledCount > 20 ? '#10b981' : enrolledCount > 10 ? '#f59e0b' : '#ef4444';
-            } else if (currentMapView === 'combined') {
-                color = '#8b5cf6'; // Purple for combined view
-            }
-            
-            return `
-                <div style="
-                    background-color: ${color};
-                    border: 2px solid white;
-                    border-radius: 50%;
-                    width: 32px;
-                    height: 32px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    color: white;
-                    font-weight: bold;
-                    font-size: 10px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.3);
-                ">
-                    ${enrolledCount > 99 ? '99+' : enrolledCount}
-                </div>
-            `;
-        };
-
-        const getMarkerIcon = (site, enrolledCount, studyCount) => {
-            // Return different icons based on current view
-            let color = '#3b82f6'; // Default blue
-            
-            if (currentMapView === 'studies') {
-                color = studyCount > 3 ? '#10b981' : studyCount > 1 ? '#f59e0b' : '#ef4444';
-            } else if (currentMapView === 'staffing') {
-                color = enrolledCount > 20 ? '#10b981' : enrolledCount > 10 ? '#f59e0b' : '#ef4444';
-            } else if (currentMapView === 'combined') {
-                color = '#8b5cf6'; // Purple for combined view
-            }
-            
-            // Return a data URL for a colored circle marker
-            return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`
-                <svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
-                    <circle cx="16" cy="16" r="12" fill="${color}" stroke="white" stroke-width="2"/>
-                    <text x="16" y="20" text-anchor="middle" fill="white" font-size="10" font-weight="bold">
-                        ${enrolledCount > 99 ? '99+' : enrolledCount}
-                    </text>
-                </svg>
-            `)}`;
-        };
-
-        const createInfoWindowContent = (site, enrolledCount, studies) => {
-            const studyNames = studies.map(s => s.title).join(', ');
-            return `
-                <div class="p-2 max-w-xs">
-                    <h3 class="font-semibold text-lg mb-2">${site.name}</h3>
-                    <p class="text-sm text-gray-600 mb-1"><strong>Location:</strong> ${site.city || 'N/A'}, ${site.state || 'N/A'}</p>
-                    <p class="text-sm text-gray-600 mb-1"><strong>Enrolled:</strong> ${enrolledCount}</p>
-                    <p class="text-sm text-gray-600 mb-1"><strong>Studies:</strong> ${studies.length}</p>
-                    ${studyNames ? `<p class="text-sm text-gray-600"><strong>Study Names:</strong> ${studyNames}</p>` : ''}
-                </div>
-            `;
-        };
-
-        // Map event handlers
-        const setupMapEventHandlers = () => {
-            const mapViewSelector = document.getElementById('map-view-selector');
-            const refreshMapBtn = document.getElementById('refresh-map-btn');
-            const searchInput = document.getElementById('artemis-map-search');
-            const indicationFilter = document.getElementById('map-indication-filter');
-            const crcLevelFilter = document.getElementById('map-crc-level-filter');
-            
-            // Populate indication filter - list each unique indication once
-            if (indicationFilter) {
-                // Clear existing options except "All Indications"
-                while (indicationFilter.children.length > 1) {
-                    indicationFilter.removeChild(indicationFilter.lastChild);
+                    if (body.hotelCost !== undefined && typeof body.hotelCost === 'string') {
+                        body.hotelCost = parseFloat(body.hotelCost) || undefined;
+                    }
                 }
                 
-                const indications = new Set();
-                allStudies.forEach(study => {
-                    // Helper function to ensure we get an array of indications
-                    const getIndications = (ind) => {
-                        if (!ind) return [];
-                        if (Array.isArray(ind)) return ind.filter(i => i && typeof i === 'string');
-                        if (typeof ind === 'string') return [ind];
-                        return [];
+                // Normalize zip code fields for sites - map zip, postalCode, postal_code to zipCode
+                if (containerName === 'sites') {
+                    if (body.zip && !body.zipCode) {
+                        body.zipCode = body.zip;
+                    }
+                    if (body.postalCode && !body.zipCode) {
+                        body.zipCode = body.postalCode;
+                    }
+                    if (body.postal_code && !body.zipCode) {
+                        body.zipCode = body.postal_code;
+                    }
+                }
+                
+                // Validate schema based on container
+                try {
+                    switch (containerName) {
+                        case 'studies':
+                            validateStudiesSchema(body);
+                            break;
+                        case 'sites':
+                            validateSitesSchema(body);
+                            break;
+                        case 'patients':
+                            validatePatientsSchema(body);
+                            break;
+                        case 'crcs':
+                            validateCrcsSchema(body);
+                            break;
+                        case 'events':
+                            validateEventsSchema(body);
+                            break;
+                        case 'roles':
+                            validateRolesSchema(body);
+                            break;
+                        case 'users':
+                            validateUsersSchema(body);
+                            // Hash password if provided
+                            if (body.password) {
+                                body.password = hashPassword(body.password);
+                            }
+                            break;
+                        case 'schedules':
+                            validateSchedulesSchema(body);
+                            // Validate site-study relationship
+                            await validateSiteStudyRelationship(body.siteId, body.studyId);
+                            break;
+                        case 'surveys':
+                            validateSurveysSchema(body);
+                            break;
+                        case 'time-off-requests':
+                            validateTimeOffRequestsSchema(body);
+                            break;
+                        case 'travel':
+                            validateTravelSchema(body);
+                            break;
+                    }
+                } catch (validationError) {
+                    console.error(`Validation error for ${containerName}:`, validationError.message);
+                    return {
+                        status: 400,
+                        jsonBody: { error: validationError.message },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                
+                const newItem = { ...body, id: generateId() };
+                const { resource: createdItem } = await container.items.create(newItem);
+                
+                // Calculate enrollment for studies
+                if (containerName === 'studies') {
+                    const enrollment = await calculateStudyEnrollment(createdItem.id);
+                    createdItem.enrolled = enrollment;
+                }
+                
+                return { status: 201, jsonBody: createdItem };
+            
+            case 'PUT':
+                const requestBody = await request.json();
+                const updateId = id || requestBody.id;
+                
+                // Normalize cost fields for travel - convert empty strings to undefined
+                if (containerName === 'travel') {
+                    if (requestBody.flightCost === '' || requestBody.flightCost === null) requestBody.flightCost = undefined;
+                    if (requestBody.carRentalCost === '' || requestBody.carRentalCost === null) requestBody.carRentalCost = undefined;
+                    if (requestBody.hotelCost === '' || requestBody.hotelCost === null) requestBody.hotelCost = undefined;
+                    
+                    // Convert string numbers to numbers
+                    if (requestBody.flightCost !== undefined && typeof requestBody.flightCost === 'string') {
+                        requestBody.flightCost = parseFloat(requestBody.flightCost) || undefined;
+                    }
+                    if (requestBody.carRentalCost !== undefined && typeof requestBody.carRentalCost === 'string') {
+                        requestBody.carRentalCost = parseFloat(requestBody.carRentalCost) || undefined;
+                    }
+                    if (requestBody.hotelCost !== undefined && typeof requestBody.hotelCost === 'string') {
+                        requestBody.hotelCost = parseFloat(requestBody.hotelCost) || undefined;
+                    }
+                }
+                
+                // Normalize zip code fields for sites - map zip, postalCode, postal_code to zipCode
+                if (containerName === 'sites') {
+                    if (requestBody.zip && !requestBody.zipCode) {
+                        requestBody.zipCode = requestBody.zip;
+                    }
+                    if (requestBody.postalCode && !requestBody.zipCode) {
+                        requestBody.zipCode = requestBody.postalCode;
+                    }
+                    if (requestBody.postal_code && !requestBody.zipCode) {
+                        requestBody.zipCode = requestBody.postal_code;
+                    }
+                }
+                
+                // Validate schema based on container
+                try {
+                    switch (containerName) {
+                        case 'studies':
+                            validateStudiesSchema(requestBody);
+                            break;
+                        case 'sites':
+                            validateSitesSchema(requestBody);
+                            break;
+                        case 'patients':
+                            validatePatientsSchema(requestBody);
+                            break;
+                        case 'crcs':
+                            validateCrcsSchema(requestBody);
+                            break;
+                        case 'events':
+                            validateEventsSchema(requestBody);
+                            break;
+                        case 'roles':
+                            validateRolesSchema(requestBody);
+                            break;
+                        case 'users':
+                            validateUsersSchema(requestBody);
+                            // Hash password if provided
+                            if (requestBody.password) {
+                                requestBody.password = hashPassword(requestBody.password);
+                            }
+                            break;
+                        case 'schedules':
+                            validateSchedulesSchema(requestBody);
+                            // Validate site-study relationship
+                            await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
+                            break;
+                        case 'surveys':
+                            validateSurveysSchema(requestBody);
+                            break;
+                        case 'time-off-requests':
+                            validateTimeOffRequestsSchema(requestBody);
+                            break;
+                        case 'travel':
+                            validateTravelSchema(requestBody);
+                            break;
+                    }
+                } catch (validationError) {
+                    console.error(`Validation error for ${containerName}:`, validationError.message);
+                    return {
+                        status: 400,
+                        jsonBody: { error: validationError.message },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                
+                const updatedItem = { ...requestBody, id: updateId };
+                const { resource: result } = await container.items.upsert(updatedItem);
+                
+                // Calculate enrollment for studies
+                if (containerName === 'studies') {
+                    const enrollment = await calculateStudyEnrollment(result.id);
+                    result.enrolled = enrollment;
+                }
+                
+                return { jsonBody: result };
+
+            case 'DELETE':
+                if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
+                try {
+                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                    const { resource } = await container.item(id, id).read();
+                    if (!resource) {
+                        // Treat missing as already deleted
+                        return { status: 204 };
+                    }
+                } catch (e) {
+                    // If read fails (e.g., not found), return 204 for idempotency
+                    return { status: 204 };
+                }
+                // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                await container.item(id, id).delete();
+                return { status: 204 };
+
+            case 'OPTIONS':
+                return { status: 200 };
+
+            default:
+                return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+        }
+    } catch (error) {
+        // Special handling for travel container - if it doesn't exist yet, return empty array for GET requests
+        // This is a new container that might not exist yet, so we're defensive about errors
+        if (containerName === 'travel' && method === 'GET') {
+            const errorCode = error.code || error.statusCode;
+            const errorMessage = (error.message || '').toLowerCase();
+            
+            // Log the error for debugging
+            context.log.warn(`Error accessing travel container (might not exist yet):`, error.message);
+            
+            // If it's any kind of not-found or container-related error, return empty array
+            // Also catch any other errors that might occur when container doesn't exist
+            if (errorCode === 404 || 
+                errorCode === 400 ||
+                errorMessage.includes('notfound') || 
+                errorMessage.includes('container') || 
+                errorMessage.includes('does not exist') ||
+                errorMessage.includes('not found') ||
+                errorMessage.includes('bad request')) {
+                context.log.warn(`Container '${containerName}' does not exist yet, returning empty array`);
+                return { 
+                    jsonBody: [],
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // For any other error on travel GET, also return empty array to prevent 500 errors
+            // This is safe because GET requests are idempotent and returning empty array is valid
+            context.log.warn(`Unexpected error accessing travel container, returning empty array:`, error.message);
+            return { 
+                jsonBody: [],
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+        
+        return handleError(context, error, `Database operation failed on ${containerName}`);
+    }
+}
+
+// =================================================================================
+// V4 FUNCTION REGISTRATION
+// =================================================================================
+
+app.http('studies', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'studies/{id?}', 
+    handler: (request, context) => crudHandler(context, request, 'studies'),
+});
+
+app.http('sites', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'sites/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'sites'),
+});
+
+app.http('patients', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'patients/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'patients'),
+});
+
+app.http('crcs', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'crcs/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'crcs'),
+});
+
+app.http('events', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'events/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'events'),
+});
+
+app.http('roles', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'roles/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'roles'),
+});
+
+app.http('training-types', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'training-types/{id?}',
+    handler: async (request, context) => {
+        try {
+            // Build training types dynamically from CRC embedded trainings
+            const container = getContainer('crcs');
+            const { resources: crcs } = await container.items.readAll().fetchAll();
+            const names = new Set();
+            (crcs || []).forEach(crc => {
+                (crc.trainings || []).forEach(t => {
+                    if (t && typeof t.name === 'string' && t.name.trim() !== '') {
+                        names.add(t.name.trim());
+                    }
+                });
+            });
+            const result = Array.from(names).sort().map(n => ({ id: n, name: n }));
+            return { jsonBody: result };
+        } catch (error) {
+            return handleError(context, error, 'Build training-types from CRCs');
+        }
+    },
+});
+
+app.http('schedules', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'schedules/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'schedules'),
+});
+
+app.http('surveys', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'surveys/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'surveys'),
+});
+
+app.http('travel', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'travel/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'travel'),
+});
+
+app.http('time-off-requests', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'time-off-requests/{id?}',
+    handler: async (request, context) => {
+        let container;
+        try {
+            container = getContainer('time-off-requests');
+        } catch (error) {
+            context.log.error('Error getting time-off-requests container:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Database container error. Please ensure the time-off-requests container exists.' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+        
+        const { method } = request;
+        const id = getIdFromRequest(request);
+
+        try {
+            switch (method) {
+                case 'GET':
+                    if (id) {
+                        // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                        const { resource } = await container.item(id, id).read(); 
+                        if (!resource) return { status: 404, jsonBody: { error: 'Time off request not found' } };
+                        return { jsonBody: resource };
+                    } else {
+                        const { resources } = await container.items.readAll().fetchAll();
+                        return { jsonBody: resources };
+                    }
+                
+                case 'POST':
+                    const body = await request.json();
+                    
+                    // Normalize date field - accept startDate if date is not provided
+                    if (!body.date && body.startDate) {
+                        body.date = body.startDate;
+                    }
+                    
+                    validateTimeOffRequestsSchema(body);
+                    
+                    // Set default status to pending if not provided
+                    const newRequest = { 
+                        ...body,
+                        date: body.date || body.startDate, // Ensure date is set
+                        startDate: body.startDate || body.date, // Also include startDate for compatibility
+                        endDate: body.endDate || body.date, // Use endDate if provided, otherwise use date
+                        id: generateId(),
+                        status: body.status || 'pending',
+                        createdAt: new Date().toISOString(),
+                        requestedBy: body.requestedBy || null,
+                        approvedBy: null,
+                        approvedAt: null
+                    };
+                    const { resource: createdRequest } = await container.items.create(newRequest);
+                    return { status: 201, jsonBody: createdRequest };
+                
+                case 'PUT':
+                    const requestBody = await request.json();
+                    const updateId = id || requestBody.id;
+                    validateTimeOffRequestsSchema(requestBody);
+                    
+                    // If status is being changed to approved, set approvedBy and approvedAt
+                    if (requestBody.status === 'approved' && !requestBody.approvedBy) {
+                        requestBody.approvedAt = new Date().toISOString();
+                    }
+                    
+                    const updatedRequest = { ...requestBody, id: updateId };
+                    const { resource: result } = await container.items.upsert(updatedRequest);
+                    return { jsonBody: result };
+
+                case 'DELETE':
+                    if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
+                    try {
+                        // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                        const { resource } = await container.item(id, id).read();
+                        if (!resource) {
+                            return { status: 204 };
+                        }
+                    } catch (e) {
+                        return { status: 204 };
+                    }
+                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                    await container.item(id, id).delete();
+                    return { status: 204 };
+
+                case 'OPTIONS':
+                    return { status: 200 };
+
+                default:
+                    return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+            }
+        } catch (error) {
+            return handleError(context, error, 'Time off requests operation failed');
+        }
+    },
+});
+
+// Register authenticate endpoint BEFORE users endpoint to ensure specific route matches first
+// Register authenticate route BEFORE users route to ensure proper matching
+// Register Entra ID authentication endpoint
+app.http('usersAuthenticateEntra', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/authenticate-entra',
+    handler: async (request, context) => {
+        try {
+            const { token } = await request.json();
+            
+            if (!token) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'Token is required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+
+            // Validate token with Microsoft
+            // For production, you should verify the JWT token signature
+            // For now, we'll decode and extract user info
+            try {
+                const tokenParts = token.split('.');
+                if (tokenParts.length !== 3) {
+                    throw new Error('Invalid token format');
+                }
+
+                // Decode JWT payload (base64url)
+                let base64 = tokenParts[1].replace(/-/g, '+').replace(/_/g, '/');
+                // Add padding if needed
+                while (base64.length % 4) {
+                    base64 += '=';
+                }
+                const payload = JSON.parse(Buffer.from(base64, 'base64').toString());
+                
+                const entraId = payload.oid || payload.sub; // Object ID or Subject
+                const email = payload.email || payload.upn || payload.preferred_username;
+                const name = payload.name || `${payload.given_name || ''} ${payload.family_name || ''}`.trim();
+                
+                if (!entraId) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Invalid token: missing user identifier' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+
+                let container;
+                try {
+                    container = getContainer('users');
+                } catch (error) {
+                    context.log.error('Error getting users container:', error);
+                    return {
+                        status: 500,
+                        jsonBody: { error: 'Database error. Please check if users container exists.' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+
+                // Look for existing user by Entra ID
+                let users;
+                try {
+                    const { resources } = await container.items
+                        .query({
+                            query: "SELECT * FROM c WHERE c.entraId = @entraId",
+                            parameters: [{ name: "@entraId", value: entraId }]
+                        })
+                        .fetchAll();
+                    users = resources || [];
+                } catch (error) {
+                    context.log.error('Error querying users:', error);
+                    return {
+                        status: 500,
+                        jsonBody: { error: 'Database error during authentication' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+
+                let user;
+                if (users.length > 0) {
+                    // Existing user
+                    user = users[0];
+                    // Update user info if needed
+                    const updates = {};
+                    if (email && user.email !== email) updates.email = email;
+                    if (name && user.name !== name) updates.name = name;
+                    
+                    if (Object.keys(updates).length > 0) {
+                        const updatedUser = { ...user, ...updates };
+                        const { resource } = await container.items.upsert(updatedUser);
+                        user = resource;
+                    }
+                } else {
+                    // Create new user from Entra ID
+                    // Default permission level - you may want to check group membership
+                    const newUser = {
+                        id: generateId(),
+                        entraId: entraId,
+                        username: email || entraId,
+                        email: email || '',
+                        name: name || email || 'User',
+                        permissionLevel: 'CRC', // Default permission level
+                        createdAt: new Date().toISOString()
                     };
                     
-                    // Get all indications from both fields
-                    const studyIndications = [
-                        ...getIndications(study.indication),
-                        ...getIndications(study.therapeuticArea)
-                    ];
-                    
-                    // Add each unique indication
-                    studyIndications.forEach(ind => {
-                        // Ensure ind is a string before calling trim
-                        if (ind && typeof ind === 'string') {
-                            const trimmed = ind.trim();
-                            if (trimmed) {
-                                indications.add(trimmed);
-                            }
-                        }
-                    });
-                });
+                    const { resource: createdUser } = await container.items.create(newUser);
+                    user = createdUser;
+                }
+
+                // Return user without sensitive data
+                const { password: _, ...userWithoutPassword } = user;
+                return { jsonBody: userWithoutPassword };
                 
-                // Sort and add unique indications
-                const indicationOptions = Array.from(indications).sort();
-                indicationOptions.forEach(ind => {
-                    const option = document.createElement('option');
-                    option.value = ind;
-                    option.textContent = ind;
-                    indicationFilter.appendChild(option);
-                });
-                
-                console.log('Populated indication filter with', indicationOptions.length, 'unique indications:', indicationOptions);
+            } catch (decodeError) {
+                context.log.error('Token decode error:', decodeError);
+                return {
+                    status: 400,
+                    jsonBody: { error: 'Invalid token format' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
             }
             
-            // Populate CRC level filter
-            if (crcLevelFilter) {
-                const levels = new Set();
-                allCrcs.forEach(crc => {
-                    if (crc.level) levels.add(crc.level);
-                    if (crc.role) levels.add(crc.role);
-                    if (crc.permission) levels.add(crc.permission);
-                });
-                const levelOptions = Array.from(levels).sort();
-                levelOptions.forEach(level => {
-                    const option = document.createElement('option');
-                    option.value = level;
-                    option.textContent = level;
-                    crcLevelFilter.appendChild(option);
-                });
+        } catch (error) {
+            context.log.error('Entra ID authentication error:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Authentication failed. Please try again.' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    },
+});
+
+app.http('usersAuthenticate', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'users/authenticate',
+    handler: async (request, context) => {
+        try {
+            const { username, password } = await request.json();
+            
+            if (!username || !password) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'Username and password are required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
             }
             
-            mapViewSelector?.addEventListener('change', () => {
-                currentMapView = mapViewSelector.value;
-                loadMapMarkers();
-            });
+            let container;
+            try {
+                container = getContainer('users');
+            } catch (error) {
+                context.log.error('Error getting users container:', error);
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Database error. Please check if users container exists.' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
             
-            indicationFilter?.addEventListener('change', () => {
-                loadMapMarkers();
-            });
+            let users;
+            try {
+                const { resources } = await container.items
+                    .query({
+                        query: "SELECT * FROM c WHERE c.username = @username",
+                        parameters: [{ name: "@username", value: username }]
+                    })
+                    .fetchAll();
+                users = resources || [];
+            } catch (error) {
+                context.log.error('Error querying users:', error);
+                context.log.error('Error details:', {
+                    message: error.message,
+                    code: error.code,
+                    statusCode: error.statusCode,
+                    stack: error.stack
+                });
+                // If users container doesn't exist, return 401 (not 500) to indicate auth failure
+                const errorMessage = (error.message || '').toLowerCase();
+                if (errorMessage.includes('notfound') || 
+                    errorMessage.includes('container') || 
+                    errorMessage.includes('does not exist') ||
+                    errorMessage.includes('not found')) {
+                    return {
+                        status: 401,
+                        jsonBody: { error: 'Invalid username or password' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                // Return more detailed error for debugging
+                return {
+                    status: 500,
+                    jsonBody: { 
+                        error: 'Database error during authentication',
+                        details: process.env.NODE_ENV === 'development' ? error.message : undefined
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
             
-            crcLevelFilter?.addEventListener('change', () => {
-                loadMapMarkers();
-            });
+            if (users.length === 0) {
+                return {
+                    status: 401,
+                    jsonBody: { error: 'Invalid username or password' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
             
-            refreshMapBtn?.addEventListener('click', () => {
-                initializeMap();
-            });
+            const user = users[0];
             
-            searchInput?.addEventListener('input', (e) => {
-                filterAzureMapMarkers(e.target.value);
-            });
-        };
+            if (!verifyPassword(password, user.password)) {
+                return {
+                    status: 401,
+                    jsonBody: { error: 'Invalid username or password' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Return user without password
+            const { password: _, ...userWithoutPassword } = user;
+            return { jsonBody: userWithoutPassword };
+            
+        } catch (error) {
+            context.log.error('Authentication error:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Authentication failed. Please try again.' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    },
+});
+
+// Register users list endpoint (no id parameter)
+app.http('usersList', {
+    methods: ['GET', 'POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users',
+    handler: async (request, context) => {
+        try {
+            const container = getContainer('users');
+            const { method } = request;
+            
+            if (method === 'GET') {
+                const { resources } = await container.items.readAll().fetchAll();
+                const usersWithoutPasswords = resources.map(({ password, ...user }) => user);
+                return { jsonBody: usersWithoutPasswords };
+            }
+            
+            if (method === 'POST') {
+                const body = await request.json();
+                validateUsersSchema(body);
+                
+                // Check if username already exists
+                const { resources: existingUsers } = await container.items
+                    .query({
+                        query: "SELECT * FROM c WHERE c.username = @username",
+                        parameters: [{ name: "@username", value: body.username }]
+                    })
+                    .fetchAll();
+                
+                if (existingUsers.length > 0) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Username already exists' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                
+                // Hash password
+                const hashedPassword = hashPassword(body.password);
+                const newUser = { 
+                    ...body, 
+                    id: generateId(),
+                    password: hashedPassword,
+                    createdAt: new Date().toISOString()
+                };
+                const { resource: createdUser } = await container.items.create(newUser);
+                const { password: _, ...userWithoutPassword } = createdUser;
+                return { status: 201, jsonBody: userWithoutPassword };
+            }
+            
+            return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+        } catch (error) {
+            return handleError(context, error, 'Users operation failed');
+        }
+    },
+});
+
+// Register users individual endpoint (with id parameter)
+app.http('users', {
+    methods: ['GET', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous', 
+    route: 'users/{id}',
+    handler: async (request, context) => {
+        const container = getContainer('users');
+        const { method } = request;
+        const id = getIdFromRequest(request);
         
-        const filterAzureMapMarkers = (searchTerm) => {
-            if (!azureMapMarkers || azureMapMarkers.length === 0) return;
+        // Explicitly exclude 'authenticate' from being handled by this route
+        if (id === 'authenticate') {
+            context.log.warn('Authenticate request matched users/{id} route - should use users/authenticate');
+            return {
+                status: 404,
+                jsonBody: { error: 'Route not found. Use POST /api/users/authenticate for authentication.' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+
+        try {
+            switch (method) {
+                case 'GET':
+                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                    const { resource } = await container.item(id, id).read(); 
+                    if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
+                    // Don't return password hash
+                    const { password: pwd, ...userWithoutPassword } = resource;
+                    return { jsonBody: userWithoutPassword };
+                
+                case 'PUT':
+                    const requestBody = await request.json();
+                    const updateId = id || requestBody.id;
+                    validateUsersSchema(requestBody);
+                    
+                    // If password is being updated, hash it
+                    if (requestBody.password) {
+                        requestBody.password = hashPassword(requestBody.password);
+                    }
+                    
+                    const updatedUser = { ...requestBody, id: updateId };
+                    const { resource: result } = await container.items.upsert(updatedUser);
+                    const { password: pwd2, ...resultWithoutPassword } = result;
+                    return { jsonBody: resultWithoutPassword };
+
+                case 'DELETE':
+                    if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
+                    try {
+                        const { resource } = await container.item(id).read();
+                        if (!resource) {
+                            return { status: 204 };
+                        }
+                    } catch (e) {
+                        return { status: 204 };
+                    }
+                    await container.item(id).delete();
+                    return { status: 204 };
+
+                case 'OPTIONS':
+                    return { status: 200 };
+
+                default:
+                    return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+            }
+        } catch (error) {
+            return handleError(context, error, 'Users operation failed');
+        }
+    },
+});
+
+// Initialize default admin user on first run
+const initializeDefaultAdmin = async () => {
+    try {
+        const container = getContainer('users');
+        const { resources: users } = await container.items
+            .query({
+                query: "SELECT * FROM c WHERE c.username = @username",
+                parameters: [{ name: "@username", value: 'admin' }]
+            })
+            .fetchAll();
+        
+        if (users.length === 0) {
+            const adminUser = {
+                id: generateId(),
+                username: 'admin',
+                password: hashPassword('Password1!'),
+                permissionLevel: 'Manager',
+                email: '',
+                entraId: '',
+                createdAt: new Date().toISOString()
+            };
+            await container.items.create(adminUser);
+            console.log('Default admin user created');
+        }
+    } catch (error) {
+        console.error('Error initializing default admin user:', error);
+    }
+};
+
+// Call initialization
+initializeDefaultAdmin();
+
+// Azure Maps key endpoint (for frontend to get key securely)
+app.http('azure-maps-config', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'azure-maps-config',
+    handler: async (request, context) => {
+        try {
+            const azureMapsKey = process.env.AZURE_MAPS_KEY || process.env.AZURE_MAPS_SUBSCRIPTION_KEY;
             
-            const term = searchTerm.toLowerCase();
+            if (!azureMapsKey) {
+                return {
+                    status: 200,
+                    jsonBody: {
+                        error: 'Azure Maps key not configured. Please set AZURE_MAPS_KEY in Azure environment variables.',
+                        key: null
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
             
-            // Filter markers based on search term
-            azureMapMarkers.forEach(markerData => {
-                const marker = markerData.marker;
-                const data = markerData.data;
-                
-                if (!data || !marker) return;
-                
-                const matches = !term || 
-                    (data.name && data.name.toLowerCase().includes(term)) ||
-                    (data.city && data.city.toLowerCase().includes(term)) ||
-                    (data.state && data.state.toLowerCase().includes(term)) ||
-                    (data.studies && data.studies.some(s => s.toLowerCase().includes(term))) ||
-                    (data.location && data.location.toLowerCase().includes(term)) ||
-                    (data.indication && data.indication.some(i => i.toLowerCase().includes(term))) ||
-                    (data.region && data.region.toLowerCase().includes(term)) ||
-                    (data.level && data.level.toLowerCase().includes(term));
-                
-                // Show/hide markers based on match
-                if (currentMapType === 'azure' && marker) {
-                    if (matches) {
-                        marker.setOptions({ visible: true });
-                    } else {
-                        marker.setOptions({ visible: false });
+            return {
+                status: 200,
+                jsonBody: {
+                    key: azureMapsKey
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        } catch (error) {
+            context.log.error('Error getting Azure Maps config:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Failed to get Azure Maps configuration' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    }
+});
+
+// Flight lookup proxy endpoint
+// This endpoint calls AviationStack API directly - it does NOT search the database
+// Flight data is only saved to the database when the user saves a travel record via /api/travel
+// All travel records (including flight data) are stored in the "travel" container, not a separate "flight-lookup" container
+app.http('flightLookup', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'flight-lookup',
+    handler: async (request, context) => {
+        let flightNumber = null;
+        
+        // Wrap everything in try-catch to ensure we always return 200 instead of 500
+        try {
+            // Get query parameters - try multiple methods for compatibility
+            if (request.query && request.query.flightNumber) {
+                flightNumber = request.query.flightNumber;
+            } else if (request.query && typeof request.query.get === 'function') {
+                flightNumber = request.query.get('flightNumber');
+            } else if (request.url) {
+                try {
+                    // Try to parse as full URL
+                    let urlString = request.url;
+                    if (!urlString.startsWith('http')) {
+                        // If relative, construct full URL
+                        urlString = `https://${request.headers?.['host'] || 'localhost'}${urlString}`;
+                    }
+                    const url = new URL(urlString);
+                    flightNumber = url.searchParams.get('flightNumber');
+                } catch (error) {
+                    context.log.warn('Error parsing URL:', error.message);
+                    // Try simple query string parsing
+                    const match = request.url.match(/[?&]flightNumber=([^&]+)/);
+                    if (match) {
+                        flightNumber = decodeURIComponent(match[1]);
                     }
                 }
-            });
-            
-            // Zoom to matching markers if search is active
-            if (term && azureMap && currentMapType === 'azure') {
-                const matchingMarkers = azureMapMarkers
-                    .filter(m => m.data && (
-                        (m.data.name && m.data.name.toLowerCase().includes(term)) ||
-                        (m.data.city && m.data.city.toLowerCase().includes(term)) ||
-                        (m.data.state && m.data.state.toLowerCase().includes(term)) ||
-                        (m.data.studies && m.data.studies.some(s => s.toLowerCase().includes(term))) ||
-                        (m.data.location && m.data.location.toLowerCase().includes(term))
-                    ))
-                    .map(m => m.marker)
-                    .filter(m => m);
-                
-                if (matchingMarkers.length > 0) {
-                    const positions = matchingMarkers.map(m => m.getOptions().position);
-                    const bounds = atlas.data.BoundingBox.fromPositions(positions);
-                    azureMap.setCamera({
-                        bounds: bounds,
-                        padding: 50
-                    });
-                }
-            }
-        };
-
-        // --- NASA-style Report Filter Handler ---
-        const handleNasaStyleReportFilter = (formData) => {
-            let filteredPatients = [...allPatients];
-            
-            // Apply filters
-            if (formData.studyId !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.enrollments?.some(e => e.studyId === formData.studyId));
-            }
-            if (formData.siteId !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.enrollments?.some(e => e.siteId === formData.siteId));
-            }
-            if (formData.status !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.status === formData.status);
-            }
-            if (formData.source !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.source === formData.source);
-            }
-            if (formData.minAge) {
-                filteredPatients = filteredPatients.filter(p => p.age >= parseInt(formData.minAge));
-            }
-            if (formData.maxAge) {
-                filteredPatients = filteredPatients.filter(p => p.age <= parseInt(formData.maxAge));
-            }
-            if (formData.schedulingStatus === 'scheduled') {
-                filteredPatients = filteredPatients.filter(p => p.appointment);
-            }
-            if (formData.schedulingStatus === 'not-scheduled') {
-                filteredPatients = filteredPatients.filter(p => !p.appointment);
-            }
-            if (formData.surveyCompleted) {
-                filteredPatients = filteredPatients.filter(p => p.surveyResults && p.surveyResults.length > 0);
-            }
-            if (formData.surveyOutcome !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.surveyResults?.some(sr => sr.outcome === formData.surveyOutcome));
-            }
-            if (formData.startDate) {
-                filteredPatients = filteredPatients.filter(p => p.appointment && new Date(p.appointment.time) >= new Date(formData.startDate));
-            }
-            if (formData.endDate) {
-                filteredPatients = filteredPatients.filter(p => p.appointment && new Date(p.appointment.time) <= new Date(formData.endDate));
             }
             
-            // Store filtered data for export
-            lastReportData = filteredPatients;
-            
-            // Update report results table
-            const resultsBody = document.getElementById('report-results-body');
-            const exportBtn = document.getElementById('export-csv-btn');
-            const exportSurveysBtn = document.getElementById('export-surveys-btn');
-            
-            if (filteredPatients.length > 0) {
-                resultsBody.innerHTML = filteredPatients.map(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    const lastSurvey = p.surveyResults && p.surveyResults.length > 0 ? p.surveyResults[p.surveyResults.length - 1] : null;
-                    const outcome = lastSurvey ? lastSurvey.outcome : 'N/A';
-                    const outcomeColor = outcome === 'Pass' ? 'text-green-500' : outcome === 'Fail' ? 'text-red-500' : '';
-                    return `
-                        <tr>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.firstName} ${p.lastName}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.age || 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.status || 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? allStudies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? allSites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.appointment ? new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : 'Not Scheduled'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap font-semibold ${outcomeColor}">${outcome}</td>
-                        </tr>
-                    `;
-                }).join('');
-                if (exportBtn) exportBtn.disabled = false;
-                if (exportSurveysBtn) exportSurveysBtn.disabled = false;
-            } else {
-                resultsBody.innerHTML = `<tr><td colspan="7" class="text-center text-gray-500 dark:text-gray-400 py-8">No patients match the selected criteria.</td></tr>`;
-                if (exportBtn) exportBtn.disabled = true;
-                if (exportSurveysBtn) exportSurveysBtn.disabled = true;
+            if (!flightNumber) {
+                context.log.error('Flight lookup: flightNumber parameter missing. URL:', request.url);
+                return {
+                    status: 400,
+                    jsonBody: { error: 'flightNumber parameter is required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
             }
             
-            // Calculate and display metrics
-            const metricsContainer = document.getElementById('report-metrics');
-            const total = filteredPatients.length;
-            const avgAge = total > 0 ? (filteredPatients.reduce((sum, p) => sum + (p.age || 0), 0) / filteredPatients.filter(p => p.age).length).toFixed(1) : 'N/A';
-            const scheduled = filteredPatients.filter(p => p.appointment).length;
-            metricsContainer.innerHTML = `
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Total Patients</p><p class="text-2xl font-bold dark:text-white">${total}</p></div>
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Average Age</p><p class="text-2xl font-bold dark:text-white">${avgAge}</p></div>
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Scheduled</p><p class="text-2xl font-bold dark:text-white">${scheduled}</p></div>
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Not Scheduled</p><p class="text-2xl font-bold dark:text-white">${total - scheduled}</p></div>
-            `;
-        };
-
-        // --- Reporting Functions ---
-        const renderReportTables = () => {
-            const studyFilterId = document.getElementById('report-study-filter')?.value;
-            const siteFilterId = document.getElementById('report-site-filter')?.value;
-            const indicationFilter = document.getElementById('report-indication-filter')?.value;
+            context.log.info(`Flight lookup request for: ${flightNumber}`);
+            context.log.info('Calling AviationStack API directly - NOT searching database');
             
-            if (!studyFilterId) { // Function might be called before reporting tab is rendered
-                return;
-            }
-
-            // Filter studies
-            let filteredStudies = allStudies;
-            if (studyFilterId !== 'all') {
-                filteredStudies = filteredStudies.filter(s => s.id === studyFilterId);
-            }
-            if (siteFilterId !== 'all') {
-                filteredStudies = filteredStudies.filter(s => (s.siteIds || []).includes(siteFilterId));
-            }
-             if (indicationFilter !== 'all') {
-                filteredStudies = filteredStudies.filter(s => ensureArray(s.indication).includes(indicationFilter));
+            // Try AviationStack API (available via Microsoft Connectors)
+            // Use environment variable if set, otherwise use provided key
+            const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY || 'f4d364ba3a06f3498403ff1958d6d608';
+            context.log.info(`AviationStack API check: Key exists=${!!AVIATIONSTACK_KEY}`);
+            
+            // If no API key, return basic info immediately
+            if (!AVIATIONSTACK_KEY) {
+                context.log.info('AviationStack API key not configured, returning basic info');
+                return {
+                    status: 200,
+                    jsonBody: {
+                        flightNumber: flightNumber,
+                        airline: null,
+                        origin: null,
+                        destination: null,
+                        departureTime: null,
+                        arrivalTime: null,
+                        status: 'scheduled',
+                        delay: null,
+                        gate: null,
+                        terminal: null,
+                        message: 'Flight API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
             }
             
-            // Filter sites
-            let filteredSites = allSites;
-            if (siteFilterId !== 'all') {
-                filteredSites = filteredSites.filter(s => s.id === siteFilterId);
-            }
-            if (indicationFilter !== 'all') {
-                filteredSites = filteredSites.filter(s => ensureArray(s.indication).includes(indicationFilter));
-            }
-            if (studyFilterId !== 'all') {
-                const study = allStudies.find(s => s.id === studyFilterId);
-                const siteIdsInStudy = study ? study.siteIds || [] : [];
-                filteredSites = filteredSites.filter(s => siteIdsInStudy.includes(s.id));
-            }
-
-            // Render Study Progress Table
-            const studiesTableContainer = document.getElementById('report-studies-table-container');
-            if (studiesTableContainer) {
-                if (filteredStudies.length > 0) {
-                    studiesTableContainer.innerHTML = `
-                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                            <thead class="bg-gray-50 dark:bg-gray-700">
-                                <tr>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Enrollment</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Progress</th>
-                                </tr>
-                            </thead>
-                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                ${filteredStudies.map(study => {
-                                    const enrolled = allPatients.filter(p => {
-                                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                                        return currentEnrollment?.studyId === study.id && p.status && p.status.toLowerCase() === 'enrolled';
-                                    }).length;
-                                    const target = study.target || 0;
-                                    const percentage = target > 0 ? Math.round((enrolled / target) * 100) : 0;
-                                    return `
-                                        <tr>
-                                            <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${study.title}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${study.status}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${enrolled} / ${target}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">
-                                                <div class="w-full progress-bar h-4">
-                                                    <div class="progress-bar-fill flex items-center justify-center text-xs text-white" style="width: ${percentage}%">${percentage}%</div>
-                                                </div>
-                                            </td>
-                                        </tr>
-                                    `;
-                                }).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                    lastReportData = filteredStudies; // Save for export
-                    document.getElementById('export-study-stats-btn').disabled = false;
-                } else {
-                    studiesTableContainer.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No study data matches the selected filters.</p>`;
-                    lastReportData = [];
-                    document.getElementById('export-study-stats-btn').disabled = true;
-                }
-            }
-            
-            // Render Site Performance Table
-            const sitesTableContainer = document.getElementById('report-sites-table-container');
-            if (sitesTableContainer) {
-                if (filteredSites.length > 0) {
-                    sitesTableContainer.innerHTML = `
-                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                            <thead class="bg-gray-50 dark:bg-gray-700">
-                                <tr>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Site</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Total Enrolled</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Active Studies</th>
-                                </tr>
-                            </thead>
-                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                ${filteredSites.map(site => {
-                                    const enrolled = allPatients.filter(p => {
-                                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                                        return currentEnrollment?.siteId === site.id && p.status && p.status.toLowerCase() === 'enrolled';
-                                    }).length;
-                                    const activeStudies = new Set(allPatients.filter(p => {
-                                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                                        return currentEnrollment?.siteId === site.id && currentEnrollment.studyId;
-                                    }).map(p => p.enrollments.find(e => e.status === 'current').studyId)).size;
-                                    return `
-                                        <tr>
-                                            <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${site.name}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${enrolled}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${activeStudies}</td>
-                                        </tr>
-                                    `;
-                                }).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                } else {
-                    sitesTableContainer.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No site data matches the selected filters.</p>`;
-                }
-            }
-
-            // Render Washout Patients Table
-            const washoutTableContainer = document.getElementById('report-washout-table-container');
-            if (washoutTableContainer) {
-                const washoutPatients = getAllWashoutPatients(filteredStudies);
-                if (washoutPatients.length > 0) {
-                    washoutTableContainer.innerHTML = `
-                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                            <thead class="bg-gray-50 dark:bg-gray-700">
-                                <tr>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Patient</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Exit Date</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Washout Complete</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Days Remaining</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
-                                </tr>
-                            </thead>
-                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                ${washoutPatients.map(patient => {
-                                    const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
-                                    const study = allStudies.find(s => s.id === patient.studyId);
-                                    const enrollment = pastEnrollments.find(e => e.studyId === patient.studyId);
-                                    
-                                    const exitDate = new Date(enrollment.exitedDate);
-                                    const washoutCompleteDate = new Date(exitDate);
-                                    washoutCompleteDate.setDate(washoutCompleteDate.getDate() + (study.washoutDays || 30));
-                                    
-                                    const today = new Date();
-                                    const diffMs = washoutCompleteDate.getTime() - today.getTime();
-                                    const daysRemaining = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-                                    
-                                    const isEligible = daysRemaining <= 0;
-                                    const statusColor = isEligible ? 'text-green-600 dark:text-green-400' : 'text-yellow-600 dark:text-yellow-400';
-                                    const statusText = isEligible ? 'Eligible' : `${daysRemaining} days`;
-                                    
-                                    return `
-                                        <tr>
-                                            <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${patient.firstName} ${patient.lastName}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${study?.title || 'N/A'}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${exitDate.toLocaleDateString()}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${washoutCompleteDate.toLocaleDateString()}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${Math.max(0, daysRemaining)}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap">
-                                                <span class="font-semibold ${statusColor}">${statusText}</span>
-                                            </td>
-                                        </tr>
-                                    `;
-                                }).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                    document.getElementById('export-washout-btn').disabled = false;
-                } else {
-                    washoutTableContainer.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No patients currently in washout period.</p>`;
-                    document.getElementById('export-washout-btn').disabled = true;
-                }
-            }
-
-            // Render All Participants Table
-            const participantsTableContainer = document.getElementById('report-participants-table-container');
-            if (participantsTableContainer) {
-                // Create a set of relevant study IDs from filtered studies
-                const relevantStudyIds = new Set(filteredStudies.map(s => s.id));
-                const allParticipants = allPatients.filter(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    return currentEnrollment && relevantStudyIds.has(currentEnrollment.studyId);
-                });
-
-                if (allParticipants.length > 0) {
-                    participantsTableContainer.innerHTML = `
-                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                            <thead class="bg-gray-50 dark:bg-gray-700">
-                                <tr>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Patient Name</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Site</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Enrolled Date</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Email</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Phone</th>
-                                </tr>
-                            </thead>
-                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                ${allParticipants.map(patient => {
-                                    const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
-                                    const study = allStudies.find(s => s.id === currentEnrollment?.studyId);
-                                    const site = allSites.find(s => s.id === currentEnrollment?.siteId);
-                                    
-                                    return `
-                                        <tr class="dark:text-gray-300">
-                                            <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${patient.firstName} ${patient.lastName}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${study?.title || 'N/A'}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${site?.name || 'N/A'}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${patient.status || 'N/A'}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${currentEnrollment?.enrolledDate ? new Date(currentEnrollment.enrolledDate).toLocaleDateString() : 'N/A'}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${patient.email || 'N/A'}</td>
-                                            <td class="px-6 py-4 whitespace-nowrap text-gray-500 dark:text-gray-400">${patient.phoneNumber || 'N/A'}</td>
-                                        </tr>
-                                    `;
-                                }).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                    document.getElementById('export-participants-btn').disabled = false;
-                } else {
-                    participantsTableContainer.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No participants found with the current filters.</p>`;
-                    document.getElementById('export-participants-btn').disabled = true;
-                }
-            }
-        };
-        
-        const exportReportToCSV = () => {
-            if (lastReportData.length === 0) {
-                console.log("No data to export.");
-                return;
-            }
-
-            let csvContent = "data:text/csv;charset=utf-8,";
-            const headers = ["Study Title", "Protocol Number", "Status", "Indications", "Start Date", "End Date", "Enrolled Patients", "Target Enrollment", "Enrollment Percentage"];
-            csvContent += headers.join(",") + "\r\n";
-
-            lastReportData.forEach(study => {
-                const enrolled = allPatients.filter(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    return currentEnrollment?.studyId === study.id && p.status && p.status.toLowerCase() === 'enrolled';
-                }).length;
-                const target = study.target || 0;
-                const percentage = target > 0 ? Math.round((enrolled / target) * 100) : 0;
-                const row = [
-                    `"${study.title}"`,
-                    `"${study.protocolNumber || 'N/A'}"`,
-                    study.status,
-                    `"${ensureArray(study.indication).join('|')}"`,
-                    study.startDate || 'N/A',
-                    study.endDate || 'N/A',
-                    enrolled,
-                    target,
-                    `${percentage}%`
-                ];
-                csvContent += row.join(",") + "\r\n";
-            });
-
-            const encodedUri = encodeURI(csvContent);
-            const link = document.createElement("a");
-            link.setAttribute("href", encodedUri);
-            link.setAttribute("download", "study_progress_report.csv");
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-        };
-
-        const exportWashoutToCSV = () => {
-            const washoutPatients = getAllWashoutPatients(allStudies);
-            if (washoutPatients.length === 0) {
-                console.log("No washout data to export.");
-                return;
-            }
-
-            let csvContent = "data:text/csv;charset=utf-8,";
-            const headers = ["Patient Name", "Study", "Exit Date", "Washout Complete Date", "Days Remaining", "Status", "Email", "Phone"];
-            csvContent += headers.join(",") + "\r\n";
-
-            washoutPatients.forEach(patient => {
-                const study = allStudies.find(s => s.id === patient.studyId);
-                const exitDate = new Date(patient.exitDate);
-                const washoutCompleteDate = new Date(patient.washoutCompleteDate);
-                const isEligible = patient.daysRemaining <= 0;
-                const status = isEligible ? 'Eligible' : `${patient.daysRemaining} days remaining`;
-                
-                const row = [
-                    `"${patient.firstName} ${patient.lastName}"`,
-                    `"${study?.title || 'N/A'}"`,
-                    exitDate.toLocaleDateString(),
-                    washoutCompleteDate.toLocaleDateString(),
-                    patient.daysRemaining,
-                    status,
-                    `"${patient.email || 'N/A'}"`,
-                    `"${patient.phoneNumber || 'N/A'}"`
-                ];
-                csvContent += row.join(",") + "\r\n";
-            });
-
-            const encodedUri = encodeURI(csvContent);
-            const link = document.createElement("a");
-            link.setAttribute("href", encodedUri);
-            link.setAttribute("download", "washout_patients_report.csv");
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-        };
-
-        const exportParticipantsToCSV = () => {
-            const allParticipants = allPatients.filter(p => {
-                const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                return currentEnrollment;
-            });
-
-            if (allParticipants.length === 0) {
-                console.log("No participants data to export.");
-                return;
-            }
-
-            let csvContent = "data:text/csv;charset=utf-8,";
-            const headers = ["Patient Name", "Study", "Site", "Status", "Enrolled Date", "Email", "Phone", "DOB", "Age"];
-            csvContent += headers.join(",") + "\r\n";
-
-            allParticipants.forEach(patient => {
-                const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
-                const study = allStudies.find(s => s.id === currentEnrollment?.studyId);
-                const site = allSites.find(s => s.id === currentEnrollment?.siteId);
-                
-                const row = [
-                    `"${patient.firstName} ${patient.lastName}"`,
-                    `"${study?.title || 'N/A'}"`,
-                    `"${site?.name || 'N/A'}"`,
-                    patient.status || 'N/A',
-                    currentEnrollment?.enrolledDate ? new Date(currentEnrollment.enrolledDate).toLocaleDateString() : 'N/A',
-                    `"${patient.email || 'N/A'}"`,
-                    `"${patient.phoneNumber || 'N/A'}"`,
-                    patient.dob || 'N/A',
-                    patient.age || 'N/A'
-                ];
-                csvContent += row.join(",") + "\r\n";
-            });
-
-            const encodedUri = encodeURI(csvContent);
-            const link = document.createElement("a");
-            link.setAttribute("href", encodedUri);
-            link.setAttribute("download", "participants_report.csv");
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-        };
-
-        // --- NASA-style Export Functions ---
-        const exportToCSV = () => {
-            try {
-                const patients = lastReportData;
-                if (!patients || patients.length === 0) {
-                    showNotification("Please generate a report before exporting.", "info");
-                    return;
-                }
-                
-                const headers = ["Name", "Age", "Status", "Study", "Site", "Appointment", "Survey Outcome"];
-                const csvRows = [headers.join(',')];
-                
-                for (const p of patients) {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    const lastSurvey = p.surveyResults && p.surveyResults.length > 0 ? p.surveyResults[p.surveyResults.length - 1] : null;
-                    const outcome = lastSurvey ? lastSurvey.outcome : 'N/A';
+            if (AVIATIONSTACK_KEY) {
+                try {
+                    context.log.info(`Calling AviationStack API for flight: ${flightNumber}`);
                     
-                    const row = [
-                        `"${p.firstName} ${p.lastName}"`,
-                        `"${p.age || 'N/A'}"`,
-                        `"${p.status || 'N/A'}"`,
-                        `"${currentEnrollment ? allStudies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A'}"`,
-                        `"${currentEnrollment ? allSites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A'}"`,
-                        `"${p.appointment ? new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : 'Not Scheduled'}"`,
-                        `"${outcome}"`
-                    ];
-                    csvRows.push(row.join(','));
-                }
-                
-                const csvString = csvRows.join('\n');
-                const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
-                const link = document.createElement("a");
-                const url = URL.createObjectURL(blob);
-                link.setAttribute("href", url);
-                const date = new Date().toISOString().split('T')[0];
-                link.setAttribute("download", `report_${date}.csv`);
-                link.style.visibility = 'hidden';
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-                URL.revokeObjectURL(url);
-                
-                showNotification("Report exported successfully!", "success");
-            } catch (error) {
-                console.error("Failed to export report CSV:", error);
-                showNotification("Failed to export report. See console for details.", "error");
-            }
-        };
-
-        const exportSurveysToCSV = () => {
-            try {
-                const patients = lastReportData;
-                if (!patients || patients.length === 0) {
-                    showNotification("Please generate a report before exporting survey results.", "info");
-                    return;
-                }
-                
-                const headers = ["PatientID", "PatientName", "SurveyTitle", "CompletionDate", "Outcome", "Question", "Answer"];
-                const csvRows = [headers.join(',')];
-                
-                for (const p of patients) {
-                    if (p.surveyResults && p.surveyResults.length > 0) {
-                        for (const result of p.surveyResults) {
-                            if (result.answers && result.answers.length > 0) {
-                                for (const answer of result.answers) {
-                                    csvRows.push([
-                                        `"${p.id}"`,
-                                        `"${p.firstName} ${p.lastName}"`,
-                                        `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
-                                        `"${new Date(result.completedAt).toISOString()}"`,
-                                        `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
-                                        `"${(answer.question || '').replace(/"/g, '""')}"`,
-                                        `"${(answer.answer || '').replace(/"/g, '""')}"`
-                                    ].join(','));
+                    // Try multiple API parameter formats based on AviationStack documentation
+                    // Format 1: flight_iata (full IATA code like DAL1478)
+                    let apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${encodeURIComponent(flightNumber.toUpperCase())}&limit=100`;
+                    let response;
+                    let apiData = null;
+                    
+                    try {
+                        response = await fetch(apiUrl, {
+                            method: 'GET'
+                        });
+                        context.log.info(`AviationStack API response status (flight_iata): ${response.status}`);
+                        
+                        // Get response text first to check for errors
+                        const responseText = await response.text();
+                        context.log.info(`AviationStack API raw response (first 500 chars): ${responseText.substring(0, 500)}`);
+                        
+                        try {
+                            apiData = JSON.parse(responseText);
+                            
+                            // Check for error in response (even if status is 200)
+                            // AviationStack returns errors in format: {error: {code: "...", message: "..."}}
+                            if (apiData.error) {
+                                const errorCode = apiData.error.code || 'unknown';
+                                const errorMessage = apiData.error.message || 'Unknown error';
+                                context.log.error(`AviationStack API error [${errorCode}]: ${errorMessage}`);
+                                
+                                // Handle specific error codes
+                                if (errorCode === 401) {
+                                    context.log.error('Invalid or missing API access key');
+                                } else if (errorCode === 403) {
+                                    context.log.error('Access restricted - check subscription plan limits');
+                                } else if (errorCode === 404) {
+                                    context.log.error('Invalid API endpoint or resource not found');
+                                } else if (errorCode === 429) {
+                                    context.log.error('Rate limit exceeded - too many requests');
+                                }
+                                
+                                apiData = null;
+                            } else if (apiData.data) {
+                                context.log.info(`AviationStack API response: ${apiData.data?.length || 0} flights found`);
+                                // AviationStack also includes pagination info
+                                if (apiData.pagination) {
+                                    context.log.info(`AviationStack pagination: limit=${apiData.pagination.limit}, offset=${apiData.pagination.offset}, count=${apiData.pagination.count}, total=${apiData.pagination.total}`);
                                 }
                             } else {
-                                csvRows.push([
-                                    `"${p.id}"`,
-                                    `"${p.firstName} ${p.lastName}"`,
-                                    `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
-                                    `"${new Date(result.completedAt).toISOString()}"`,
-                                    `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
-                                    `"N/A"`,
-                                    `"N/A"`
-                                ].join(','));
+                                context.log.warn('AviationStack API response missing data field:', responseText.substring(0, 200));
+                                apiData = null;
                             }
+                        } catch (jsonError) {
+                            context.log.error('AviationStack API JSON parse error:', jsonError.message);
+                            context.log.error('Response text:', responseText.substring(0, 500));
+                            // Fall through to try alternative method
+                            apiData = null;
                         }
-                    }
-                }
-                
-                if (csvRows.length <= 1) {
-                    showNotification("No survey results found for the patients in the current report.", "info");
-                    return;
-                }
-                
-                const csvString = csvRows.join('\n');
-                const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement("a");
-                link.setAttribute("href", url);
-                const date = new Date().toISOString().split('T')[0];
-                const filename = `survey_results_${date}.csv`;
-                link.setAttribute("download", filename);
-                link.style.visibility = 'hidden';
-                document.body.appendChild(link);
-                try {
-                    link.click();
-                    showNotification(`CSV generated. Download '${filename}' should begin.`, "success");
-                } catch (clickError) {
-                    console.error("Error triggering download link click:", clickError);
-                    showNotification("Could not trigger download. Please check browser console.", "error");
-                }
-                document.body.removeChild(link);
-                URL.revokeObjectURL(url);
-            } catch (error) {
-                console.error("Failed to export survey CSV:", error);
-                showNotification("Failed to export surveys. See console for details.", "error");
-            }
-        };
-
-
-
-        // --- Modal Functions ---
-        const showModal = (content) => {
-            modalContainer.innerHTML = content;
-            modalContainer.style.display = 'flex';
-            if (modalContainer.firstChild && modalContainer.firstChild.style) {
-                modalContainer.firstChild.style.display = 'flex';
-            }
-        };
-
-        const closeModal = () => {
-            // Clean up edit site map if it exists
-            if (editSiteMap) {
-                try {
-                    editSiteMap.dispose();
-                } catch (e) {
-                    console.warn('Error disposing edit site map:', e);
-                }
-                editSiteMap = null;
-                editSiteMarker = null;
-            }
-            modalContainer.innerHTML = '';
-        };
-
-        const geocodeAddressFromForm = async () => {
-            const address1 = document.getElementById('address1')?.value || '';
-            const city = document.getElementById('city')?.value || '';
-            const state = document.getElementById('state')?.value || '';
-            const zipCode = document.getElementById('zipCode')?.value || '';
-            const country = document.getElementById('country')?.value || 'USA';
-            
-            // Build the full address string
-            const fullAddress = [address1, city, state, zipCode, country].filter(Boolean).join(', ');
-            
-            if (!fullAddress) {
-                showNotification('Please fill in at least the address, city, or state fields first.', 'error');
-                return;
-            }
-            
-            const geocodeBtn = document.getElementById('geocode-address-btn');
-            const originalText = geocodeBtn.innerHTML;
-            geocodeBtn.innerHTML = '⏳ Getting coordinates...';
-            geocodeBtn.disabled = true;
-            
-            try {
-                // Use Nominatim (OpenStreetMap's free geocoding service)
-                const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(fullAddress)}&limit=1`, {
-                    headers: {
-                        'User-Agent': 'ARTEMIS Clinical Trial Management System'
-                    }
-                });
-                
-                if (!response.ok) {
-                    throw new Error('Geocoding service unavailable');
-                }
-                
-                const data = await response.json();
-                
-                if (data && data.length > 0) {
-                    const location = data[0];
-                    const lat = parseFloat(location.lat);
-                    const lng = parseFloat(location.lon);
-                    document.getElementById('latitude').value = lat.toFixed(6);
-                    document.getElementById('longitude').value = lng.toFixed(6);
-                    showNotification(`✅ Coordinates found! Lat: ${location.lat}, Lon: ${location.lon}`, 'success');
-                    
-                    // Update map marker if map exists
-                    if (editSiteMap && typeof updateEditSiteMarker === 'function') {
-                        updateEditSiteMarker({ latitude: lat, longitude: lng });
-                    }
-                } else {
-                    showNotification('Could not find coordinates for this address. Please enter them manually or try a different address format.', 'error');
-                }
-            } catch (error) {
-                console.error('Geocoding error:', error);
-                showNotification('Error getting coordinates. Please try again or enter them manually.', 'error');
-            } finally {
-                geocodeBtn.innerHTML = originalText;
-                geocodeBtn.disabled = false;
-            }
-        };
-
-        const syncAllSiteCoordinates = async () => {
-            // Find all sites that have addresses but missing coordinates
-            const sitesToSync = allSites.filter(site => {
-                const hasAddress = (site.address1 || site.city || site.state);
-                const missingCoords = !site.latitude || !site.longitude;
-                return hasAddress && missingCoords;
-            });
-            
-            if (sitesToSync.length === 0) {
-                showNotification('All sites already have coordinates! 🎉', 'success');
-                return;
-            }
-            
-            const confirmed = confirm(`Found ${sitesToSync.length} site(s) without coordinates.\n\nThis will automatically geocode all of them using their addresses.\n\nNote: There will be a 1-second delay between each request to respect the geocoding service limits.\n\nContinue?`);
-            
-            if (!confirmed) return;
-            
-            showNotification(`Starting bulk geocoding for ${sitesToSync.length} sites...`, 'info');
-            
-            let successCount = 0;
-            let failCount = 0;
-            const results = [];
-            
-            for (let i = 0; i < sitesToSync.length; i++) {
-                const site = sitesToSync[i];
-                
-                try {
-                    // Build address string
-                    const fullAddress = [
-                        site.address1,
-                        site.city,
-                        site.state,
-                        site.zipCode,
-                        site.country || 'USA'
-                    ].filter(Boolean).join(', ');
-                    
-                    showNotification(`Geocoding ${i + 1}/${sitesToSync.length}: ${site.name}...`, 'info');
-                    
-                    // Call geocoding service
-                    const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(fullAddress)}&limit=1`, {
-                        headers: {
-                            'User-Agent': 'ARTEMIS Clinical Trial Management System'
-                        }
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Geocoding service unavailable');
+                    } catch (fetchError) {
+                        context.log.error('AviationStack API fetch error:', fetchError.message);
+                        context.log.error('Stack:', fetchError.stack);
+                        // Fall through to return basic info
+                        response = null;
                     }
                     
-                    const data = await response.json();
-                    
-                    if (data && data.length > 0) {
-                        const location = data[0];
-                        const latitude = parseFloat(location.lat);
-                        const longitude = parseFloat(location.lon);
+                    if (apiData && apiData.data && apiData.data.length > 0) {
+                        const exactMatch = apiData.data.find(f => 
+                            f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
+                            f.flight?.number?.toString() === flightNumber.replace(/^[A-Z]{2,3}/i, '')
+                        );
                         
-                        // Update site in Firestore
-                        const siteRef = doc(db, 'sites', site.id);
-                        await setDoc(siteRef, {
-                            latitude: latitude,
-                            longitude: longitude
-                        }, { merge: true });
-                        
-                        successCount++;
-                        results.push({ site: site.name, status: 'success', lat: latitude, lon: longitude });
-                    } else {
-                        failCount++;
-                        results.push({ site: site.name, status: 'failed', reason: 'No coordinates found' });
-                    }
-                    
-                    // Wait 1 second between requests to respect rate limits
-                    if (i < sitesToSync.length - 1) {
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                    }
-                    
-                } catch (error) {
-                    console.error(`Error geocoding ${site.name}:`, error);
-                    failCount++;
-                    results.push({ site: site.name, status: 'failed', reason: error.message });
-                }
-            }
-            
-            // Show final results
-            const resultMessage = `
-Bulk Geocoding Complete!
-
-✅ Success: ${successCount} site(s)
-❌ Failed: ${failCount} site(s)
-
-${results.map(r => {
-    if (r.status === 'success') {
-        return `✓ ${r.site}: ${r.lat.toFixed(4)}, ${r.lon.toFixed(4)}`;
-    } else {
-        return `✗ ${r.site}: ${r.reason}`;
-    }
-}).join('\n')}
-            `.trim();
-            
-            if (successCount > 0) {
-                showNotification(`✅ Successfully geocoded ${successCount} site(s)! Check the map on the Dashboard.`, 'success');
-            }
-            
-            if (failCount > 0) {
-                showNotification(`⚠️ ${failCount} site(s) could not be geocoded. Check console for details.`, 'error');
-            }
-            
-            console.log('Bulk Geocoding Results:', resultMessage);
-            alert(resultMessage);
-        };
-
-        const renderSiteAssignmentList = (selectedIndications = [], assignedSiteIds = []) => {
-            const siteAssignmentContainer = document.getElementById('site-assignment-container');
-            if (!siteAssignmentContainer) return;
-            
-            // Debug logging
-            console.log('Rendering site assignment list with:', {
-                selectedIndications,
-                assignedSiteIds,
-                allSites: allSites.length
-            });
-
-            const suggestedSites = [];
-            const otherSites = [];
-
-            // If no indications are selected, all sites are "other sites"
-            if (selectedIndications.length === 0) {
-                otherSites.push(...allSites);
-            } else {
-                allSites.forEach(site => {
-                    const siteIndications = ensureArray(site.indication);
-                    const isSuggested = selectedIndications.some(ind => siteIndications.includes(ind));
-                    if (isSuggested) {
-                        suggestedSites.push(site);
-                    } else {
-                        otherSites.push(site);
-                    }
-                });
-            }
-
-            const createSiteCheckbox = (site) => {
-                const isChecked = assignedSiteIds.includes(site.id);
-                console.log(`Site ${site.name} (${site.id}): checked=${isChecked}, assignedSiteIds=`, assignedSiteIds);
-                return `
-                    <label class="flex items-center">
-                        <input type="checkbox" name="siteIds" value="${site.id}" class="site-checkbox h-4 w-4 rounded border-gray-300 dark:border-gray-600 text-indigo-600" ${isChecked ? 'checked' : ''}>
-                        <span class="ml-2 text-sm text-gray-600 dark:text-gray-300">${site.name}</span>
-                    </label>
-                `;
-            };
-
-            let html = '';
-            if (suggestedSites.length > 0) {
-                html += `<h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 mt-2">Suggested Sites</h4>`;
-                html += suggestedSites.map(createSiteCheckbox).join('');
-            }
-
-            if (otherSites.length > 0) {
-                html += `<h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 mt-2 ${suggestedSites.length > 0 ? 'pt-2 border-t dark:border-gray-600' : ''}">Other Sites</h4>`;
-                html += otherSites.map(createSiteCheckbox).join('');
-            }
-
-            if (allSites.length === 0) {
-                html = '<p class="text-xs text-gray-500 dark:text-gray-400">No sites available. Please add sites first.</p>';
-            }
-
-            siteAssignmentContainer.innerHTML = html;
-            
-            // Add event listeners for site checkboxes
-            const siteCheckboxes = siteAssignmentContainer.querySelectorAll('.site-checkbox');
-            siteCheckboxes.forEach(checkbox => {
-                checkbox.addEventListener('change', updateSiteEnrollmentGoals);
-            });
-            
-            // Update enrollment goals section
-            updateSiteEnrollmentGoals();
-        };
-
-        const updateSiteEnrollmentGoals = () => {
-            const siteEnrollmentSection = document.getElementById('site-enrollment-goals-section');
-            const siteEnrollmentContainer = document.getElementById('site-enrollment-goals-container');
-            const totalTargetInput = document.getElementById('target');
-            const totalAllocatedSpan = document.getElementById('total-allocated');
-            const totalTargetSpan = document.getElementById('total-target');
-            
-            if (!siteEnrollmentSection || !siteEnrollmentContainer || !totalTargetInput) return;
-            
-            // Get selected sites
-            const selectedSites = Array.from(document.querySelectorAll('.site-checkbox:checked'))
-                .map(checkbox => {
-                    const site = allSites.find(s => s.id === checkbox.value);
-                    return site;
-                })
-                .filter(Boolean);
-            
-            if (selectedSites.length === 0) {
-                siteEnrollmentSection.classList.add('hidden');
-                return;
-            }
-            
-            siteEnrollmentSection.classList.remove('hidden');
-            
-            // Update total target display
-            const totalTarget = parseInt(totalTargetInput.value) || 0;
-            totalTargetSpan.textContent = totalTarget;
-            
-            // Get existing study data if editing
-            const studyForm = document.getElementById('study-form');
-            const studyId = studyForm?.dataset.id;
-            const existingStudy = studyId ? allStudies.find(s => s.id === studyId) : null;
-            const existingSiteGoals = existingStudy?.siteEnrollmentGoals || {};
-            
-            // Create enrollment goal inputs for each selected site
-            const siteGoalsHTML = selectedSites.map(site => {
-                const existingGoal = existingSiteGoals[site.id] || 0;
-                return `
-                    <div class="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded-md">
-                        <div class="flex-1">
-                            <label class="text-sm font-medium text-gray-700 dark:text-gray-300">${site.name}</label>
-                        </div>
-                        <div class="flex items-center space-x-2">
-                            <input type="number" 
-                                   name="siteEnrollmentGoal_${site.id}" 
-                                   value="${existingGoal}"
-                                   min="0" 
-                                   max="${totalTarget}"
-                                   class="site-goal-input w-20 px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-gray-200"
-                                   data-site-id="${site.id}">
-                            <span class="text-xs text-gray-500 dark:text-gray-400">patients</span>
-                        </div>
-                    </div>
-                `;
-            }).join('');
-            
-            siteEnrollmentContainer.innerHTML = siteGoalsHTML;
-            
-            // Add event listeners for goal inputs
-            const goalInputs = siteEnrollmentContainer.querySelectorAll('.site-goal-input');
-            goalInputs.forEach(input => {
-                input.addEventListener('input', updateTotalAllocated);
-            });
-            
-            // Update total allocated
-            updateTotalAllocated();
-        };
-
-        const updateTotalAllocated = () => {
-            const totalAllocatedSpan = document.getElementById('total-allocated');
-            const totalTargetSpan = document.getElementById('total-target');
-            
-            if (!totalAllocatedSpan || !totalTargetSpan) return;
-            
-            const goalInputs = document.querySelectorAll('.site-goal-input');
-            const totalAllocated = Array.from(goalInputs)
-                .reduce((sum, input) => sum + (parseInt(input.value) || 0), 0);
-            
-            totalAllocatedSpan.textContent = totalAllocated;
-            
-            // Color code the total
-            const totalTarget = parseInt(totalTargetSpan.textContent) || 0;
-            if (totalAllocated > totalTarget) {
-                totalAllocatedSpan.className = 'text-red-600 dark:text-red-400 font-semibold';
-            } else if (totalAllocated === totalTarget) {
-                totalAllocatedSpan.className = 'text-green-600 dark:text-green-400 font-semibold';
-            } else {
-                totalAllocatedSpan.className = 'text-yellow-600 dark:text-yellow-400 font-semibold';
-            }
-        };
-
-        const createStudyModal = (study = null) => {
-            const isEdit = study !== null;
-            const title = isEdit ? 'Edit Study' : 'Add New Study';
-            const buttonText = isEdit ? 'Save Changes' : 'Create Study';
-            const statusOptions = ['Recruiting', 'Enrolling', 'Active', 'Closed'];
-            const studyIndications = ensureArray(study?.indication);
-            let assignedSiteIds = ensureArray(study?.siteIds);
-            
-            // If siteIds is empty but we have siteEnrollmentGoals, derive siteIds from that
-            if (assignedSiteIds.length === 0 && study?.siteEnrollmentGoals) {
-                assignedSiteIds = Object.keys(study.siteEnrollmentGoals);
-                console.log('Derived site IDs from enrollment goals:', assignedSiteIds);
-            }
-            
-            // Debug logging
-            if (isEdit) {
-                console.log('Editing study:', study);
-                console.log('Assigned site IDs:', assignedSiteIds);
-                console.log('Site enrollment goals:', study?.siteEnrollmentGoals);
-            }
-
-            const modalHTML = `
-                <div class="modal-backdrop">
-                    <div class="modal-content dark:bg-gray-800">
-                        <form id="study-form" data-id="${isEdit ? study.id : ''}">
-                            <div class="p-6">
-                                <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">${title}</h2>
-                                <div class="mt-4 grid grid-cols-1 gap-y-6">
-                                    <div>
-                                        <label for="title" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Study Title</label>
-                                        <input type="text" name="title" id="title" value="${study?.title || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm bg-white dark:bg-gray-700 dark:text-gray-200" required />
-                                    </div>
-                                    <div>
-                                        <label for="protocolNumber" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Protocol Number</label>
-                                        <input type="text" name="protocolNumber" id="protocolNumber" value="${study?.protocolNumber || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                    <div class="grid grid-cols-2 gap-4">
-                                        <div>
-                                            <label for="startDate" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Start Date</label>
-                                            <input type="date" name="startDate" id="startDate" value="${study?.startDate || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200"/>
-                                        </div>
-                                        <div>
-                                            <label for="endDate" class="block text-sm font-medium text-gray-700 dark:text-gray-300">End Date</label>
-                                            <input type="date" name="endDate" id="endDate" value="${study?.endDate || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200"/>
-                                        </div>
-                                    </div>
-                                    <div class="grid grid-cols-2 gap-4">
-                                        <div>
-                                            <label for="fpfv" class="block text-sm font-medium text-gray-700 dark:text-gray-300">FPFV (First Patient First Visit)</label>
-                                            <input type="date" name="fpfv" id="fpfv" value="${study?.fpfv || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200"/>
-                                        </div>
-                                        <div>
-                                            <label for="lplv" class="block text-sm font-medium text-gray-700 dark:text-gray-300">LPLV (Last Patient Last Visit)</label>
-                                            <input type="date" name="lplv" id="lplv" value="${study?.lplv || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200"/>
-                                        </div>
-                                    </div>
-                                    <div class="grid grid-cols-2 gap-4">
-                                        <div>
-                                            <label for="status" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Status</label>
-                                            <select name="status" id="status" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm bg-white dark:bg-gray-700 dark:text-gray-200">
-                                                ${statusOptions.map(s => `<option ${study?.status === s ? 'selected' : ''}>${s}</option>`).join('')}
-                                            </select>
-                                        </div>
-                                        <div>
-                                            <label for="target" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Total Enrollment Target</label>
-                                            <input type="number" name="target" id="target" value="${study?.target || 0}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm bg-white dark:bg-gray-700 dark:text-gray-200" required />
-                                        </div>
-                                    </div>
-                                    <div>
-                                        <label for="washoutDays" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Washout Period (Days)</label>
-                                        <input type="number" name="washoutDays" id="washoutDays" value="${study?.washoutDays || 30}" min="0" max="365" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Number of days patients must wait before enrolling in another study (default: 30 days)</p>
-                                    </div>
-                                    
-                                    <!-- Selected Sites Section -->
-                                    <div id="selected-sites-section" class="${assignedSiteIds.length > 0 ? '' : 'hidden'}">
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Selected Sites</label>
-                                        <div id="selected-sites-display" class="mt-2 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md">
-                                            <div id="selected-sites-list" class="flex flex-wrap gap-2">
-                                                <!-- Selected sites will be displayed here -->
-                                            </div>
-                                        </div>
-                                    </div>
-                                    
-                                    <!-- Site Assignment Section -->
-                                    <div>
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Assign Sites</label>
-                                        <div id="site-assignment-container" class="mt-2 max-h-40 overflow-y-auto border dark:border-gray-600 rounded-md p-2 space-y-2">
-                                            <!-- Sites will be populated here -->
-                                        </div>
-                                    </div>
-                                    
-                                    <!-- Indication Section -->
-                                    <div>
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Indication</label>
-                                        <div id="study-indication-checkboxes" class="mt-2 max-h-40 overflow-y-auto border dark:border-gray-600 rounded-md p-2 grid grid-cols-2 md:grid-cols-3 gap-2">
-                                            ${indicationOptions.map(ind => `
-                                                <label class="flex items-center">
-                                                    <input type="checkbox" name="indication" value="${ind}" class="h-4 w-4 rounded border-gray-300 dark:border-gray-600 text-indigo-600" ${studyIndications.includes(ind) ? 'checked' : ''}>
-                                                    <span class="ml-2 text-sm text-gray-600 dark:text-gray-300">${ind}</span>
-                                                </label>
-                                            `).join('')}
-                                        </div>
-                                    </div>
-                                    <div id="site-enrollment-goals-section" class="hidden">
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Per-Site Enrollment Goals</label>
-                                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Distribute the total enrollment target across selected sites</p>
-                                        <div id="site-enrollment-goals-container" class="mt-2 space-y-3">
-                                            <!-- Site enrollment goals will be populated here -->
-                                        </div>
-                                        <div class="mt-2 text-sm text-gray-600 dark:text-gray-400">
-                                            <span>Total allocated: </span>
-                                            <span id="total-allocated">0</span>
-                                            <span> / </span>
-                                            <span id="total-target">0</span>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
-                                <button type="submit" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 focus:outline-none sm:ml-3 sm:w-auto sm:text-sm">${buttonText}</button>
-                                <button type="button" data-action="cancel" class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-base font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none sm:mt-0 sm:w-auto sm:text-sm">Cancel</button>
-                            </div>
-                        </form>
-                    </div>
-                </div>
-            `;
-            showModal(modalHTML);
-            
-            // Wait for modal to be fully rendered before initializing
-            setTimeout(() => {
-                // Initial render of the site assignment list
-                renderSiteAssignmentList(studyIndications, assignedSiteIds);
-                
-                // Add event listener for total target changes
-                const totalTargetInput = document.getElementById('target');
-                if (totalTargetInput) {
-                    totalTargetInput.addEventListener('input', updateSiteEnrollmentGoals);
-                }
-                
-                // Update site enrollment goals after site assignment list is rendered
-                setTimeout(() => {
-                    updateSiteEnrollmentGoals();
-                }, 50);
-            }, 100);
-        };
-
-
-        const createSiteModal = (site = null) => {
-            const isEdit = site !== null;
-            const title = isEdit ? 'Edit Site' : 'Add New Site';
-            const buttonText = isEdit ? 'Save Changes' : 'Create Site';
-
-            const modalHTML = `
-                <div class="modal-backdrop">
-                    <div class="modal-content site-modal-content dark:bg-gray-800">
-                        <form id="site-form" data-id="${isEdit ? site.id : ''}">
-                            <div class="p-6">
-                                <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">${title}</h2>
-                                <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    <div class="md:col-span-2">
-                                        <label for="name" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site Name</label>
-                                        <input type="text" name="name" id="name" value="${site?.name || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" required />
-                                    </div>
-                                     <div>
-                                        <label for="siteNameAbbreviation" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site Name Abbreviation</label>
-                                        <input type="text" name="siteNameAbbreviation" id="siteNameAbbreviation" value="${site?.siteNameAbbreviation || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                    <div>
-                                        <label for="status" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Status</label>
-                                        <select name="status" id="status" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200">
-                                            <option value="Active" ${site?.status === 'Active' || !site ? 'selected' : ''}>Active</option>
-                                            <option value="Inactive" ${site?.status === 'Inactive' ? 'selected' : ''}>Inactive</option>
-                                        </select>
-                                    </div>
-                                    <div class="md:col-span-2">
-                                        <label for="address1" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Address Line 1</label>
-                                        <input type="text" name="address1" id="address1" value="${site?.address1 || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                     <div class="md:col-span-2">
-                                        <label for="address2" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Address Line 2</label>
-                                        <input type="text" name="address2" id="address2" value="${site?.address2 || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                    <div>
-                                        <label for="city" class="block text-sm font-medium text-gray-700 dark:text-gray-300">City</label>
-                                        <input type="text" name="city" id="city" value="${site?.city || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                    <div>
-                                        <label for="state" class="block text-sm font-medium text-gray-700 dark:text-gray-300">State</label>
-                                        <input type="text" name="state" id="state" value="${site?.state || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                     <div>
-                                        <label for="zipCode" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Zip Code</label>
-                                        <input type="text" name="zipCode" id="zipCode" value="${site?.zipCode || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                    <div>
-                                        <label for="country" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Country</label>
-                                        <input type="text" name="country" id="country" value="${site?.country || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                    <div>
-                                        <label for="latitude" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Latitude <span class="text-xs text-gray-500">(for map)</span></label>
-                                        <input type="number" step="any" name="latitude" id="latitude" value="${site?.latitude || ''}" placeholder="e.g., 40.7128" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                    <div>
-                                        <label for="longitude" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Longitude <span class="text-xs text-gray-500">(for map)</span></label>
-                                        <input type="number" step="any" name="longitude" id="longitude" value="${site?.longitude || ''}" placeholder="e.g., -74.0060" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                    <div class="md:col-span-2">
-                                        <button type="button" id="geocode-address-btn" class="w-full px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500">
-                                            📍 Auto-fill Coordinates from Address
-                                        </button>
-                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2 text-center">
-                                            Click to automatically get latitude/longitude from the address above
-                                        </p>
-                                    </div>
-                                    <div class="md:col-span-2">
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Site Location Map</label>
-                                        <div id="edit-site-map" style="width: 100%; height: 300px; border-radius: 8px; overflow: hidden; border: 1px solid #e5e7eb;"></div>
-                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
-                                            Map showing the site location. Click to update coordinates.
-                                        </p>
-                                    </div>
-                                     <div>
-                                        <label for="pi" class="block text-sm font-medium text-gray-700 dark:text-gray-300">PI</label>
-                                        <input type="text" name="pi" id="pi" value="${site?.pi || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                     <div>
-                                        <label for="piEmail" class="block text-sm font-medium text-gray-700 dark:text-gray-300">PI Email</label>
-                                        <input type="email" name="piEmail" id="piEmail" value="${site?.piEmail || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                     <div>
-                                        <label for="siteCoordinator" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site Coordinator</label>
-                                        <input type="text" name="siteCoordinator" id="siteCoordinator" value="${site?.siteCoordinator || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                     <div>
-                                        <label for="siteCoordinatorEmail" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site Coordinator Email</label>
-                                        <input type="email" name="siteCoordinatorEmail" id="siteCoordinatorEmail" value="${site?.siteCoordinatorEmail || ''}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200" />
-                                    </div>
-                                     <div class="md:col-span-2">
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Indication</label>
-                                        <div class="mt-2 max-h-40 overflow-y-auto border dark:border-gray-600 rounded-md p-2 grid grid-cols-2 md:grid-cols-3 gap-2">
-                                            ${indicationOptions.map(ind => `
-                                                <label class="flex items-center">
-                                                    <input type="checkbox" name="indication" value="${ind}" class="h-4 w-4 rounded border-gray-300 dark:border-gray-600 text-indigo-600" ${ensureArray(site?.indication).includes(ind) ? 'checked' : ''}>
-                                                    <span class="ml-2 text-sm text-gray-600 dark:text-gray-300">${ind}</span>
-                                                </label>
-                                            `).join('')}
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
-                                <button type="submit" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-blue-600 text-base font-medium text-white hover:bg-blue-700 sm:ml-3 sm:w-auto sm:text-sm">${buttonText}</button>
-                                <button type="button" data-action="cancel" class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-base font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 sm:mt-0 sm:w-auto sm:text-sm">Cancel</button>
-                            </div>
-                        </form>
-                    </div>
-                </div>
-            `;
-            showModal(modalHTML);
-            
-            // Initialize map after modal is shown - wait a bit longer for DOM to be ready
-            setTimeout(() => {
-                initializeEditSiteMap(site);
-            }, 300);
-        };
-        
-        // Initialize map in edit site modal
-        let editSiteMap = null;
-        let editSiteMarker = null;
-        
-        const initializeEditSiteMap = async (site) => {
-            const mapContainer = document.getElementById('edit-site-map');
-            if (!mapContainer || !AZURE_MAPS_KEY) {
-                console.warn('Edit site map container or Azure Maps key not available');
-                return;
-            }
-            
-            try {
-                // Clean up existing map if it exists
-                if (editSiteMap) {
-                    try {
-                        editSiteMap.dispose();
-                    } catch (e) {
-                        console.warn('Error disposing existing map:', e);
-                    }
-                    editSiteMap = null;
-                    editSiteMarker = null;
-                }
-                
-                // Clear the container
-                mapContainer.innerHTML = '';
-                
-                // Initialize new map
-                editSiteMap = new atlas.Map(mapContainer, {
-                    authOptions: {
-                        authType: 'subscriptionKey',
-                        subscriptionKey: AZURE_MAPS_KEY
-                    },
-                    center: site && site.latitude && site.longitude 
-                        ? [parseFloat(site.longitude), parseFloat(site.latitude)]
-                        : [-98.5795, 39.8283], // Default to center of USA
-                    zoom: site && site.latitude && site.longitude ? 12 : 4,
-                    style: 'road'
-                });
-                
-                // Wait for map to be ready
-                editSiteMap.events.add('ready', () => {
-                    console.log('Edit site map ready');
-                    updateEditSiteMarker(site);
-                    
-                    // Add click handler to update coordinates
-                    editSiteMap.events.add('click', (e) => {
-                        const position = e.position;
-                        const lat = position[1];
-                        const lng = position[0];
-                        
-                        // Update form fields
-                        const latInput = document.getElementById('latitude');
-                        const lngInput = document.getElementById('longitude');
-                        if (latInput) latInput.value = lat.toFixed(6);
-                        if (lngInput) lngInput.value = lng.toFixed(6);
-                        
-                        // Update marker
-                        updateEditSiteMarker({ latitude: lat, longitude: lng });
-                    });
-                });
-            } catch (error) {
-                console.error('Error initializing edit site map:', error);
-                // Show error message in container
-                if (mapContainer) {
-                    mapContainer.innerHTML = '<div class="text-red-500 text-sm p-4">Error loading map. Please check console for details.</div>';
-                }
-            }
-        };
-        
-        const updateEditSiteMarker = (site) => {
-            if (!editSiteMap || !site) return;
-            
-            const lat = parseFloat(site.latitude);
-            const lng = parseFloat(site.longitude);
-            
-            if (isNaN(lat) || isNaN(lng)) {
-                // Try to geocode from address if coordinates are missing
-                const form = document.getElementById('site-form');
-                if (form) {
-                    const address1 = form.address1?.value || '';
-                    const city = form.city?.value || '';
-                    const state = form.state?.value || '';
-                    const zipCode = form.zipCode?.value || '';
-                    
-                    if (address1 || city || state) {
-                        const address = [address1, city, state, zipCode].filter(p => p).join(', ');
-                        if (address) {
-                            geocodeAddressForEditMap(address);
-                        }
-                    }
-                }
-                return;
-            }
-            
-            // Remove existing marker
-            if (editSiteMarker && editSiteMap.markers) {
-                editSiteMap.markers.remove(editSiteMarker);
-            }
-            
-            // Create new marker
-            editSiteMarker = new atlas.HtmlMarker({
-                htmlContent: '<div style="background-color: #3b82f6; color: white; border-radius: 50%; width: 20px; height: 20px; border: 3px solid white; box-shadow: 0 2px 4px rgba(0,0,0,0.3);"></div>',
-                position: [lng, lat]
-            });
-            
-            if (editSiteMap.markers) {
-                editSiteMap.markers.add(editSiteMarker);
-                editSiteMap.setCamera({ center: [lng, lat], zoom: 12 });
-            }
-        };
-        
-        const geocodeAddressForEditMap = async (address) => {
-            try {
-                const coords = await geocodeAddress(address);
-                if (coords && editSiteMap) {
-                    const lat = parseFloat(coords.lat);
-                    const lng = parseFloat(coords.lng);
-                    
-                    // Update form fields
-                    const latInput = document.getElementById('latitude');
-                    const lngInput = document.getElementById('longitude');
-                    if (latInput) latInput.value = lat.toFixed(6);
-                    if (lngInput) lngInput.value = lng.toFixed(6);
-                    
-                    // Update marker
-                    updateEditSiteMarker({ latitude: lat, longitude: lng });
-                }
-            } catch (error) {
-                console.error('Error geocoding address for edit map:', error);
-            }
-        };
-
-        const createConfirmModal = (ids, type) => {
-            const isBulk = Array.isArray(ids);
-            const title = type === 'study' ? 'Delete Study' : `Delete ${isBulk ? ids.length : ''} Site(s)`;
-            const message = type === 'study' 
-                ? 'Are you sure you want to delete this study? This will also remove the study assignment from all associated patients. This action cannot be undone.'
-                : `Are you sure you want to delete ${isBulk ? 'these sites' : 'this site'}? This will remove the site(s) from all studies and unlink any patients assigned to them. This action cannot be undone.`;
-            
-            const buttonId = type === 'study' ? 'confirm-delete-study-btn' : 'confirm-delete-site-btn';
-
-            const modalHTML = `
-                <div class="modal-backdrop">
-                    <div class="modal-content confirm-modal-content dark:bg-gray-800">
-                        <div class="p-6">
-                            <div class="flex items-start">
-                                <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-red-100 sm:mx-0 sm:h-10 sm:w-10">${getIcon('exclamation')}</div>
-                                <div class="ml-4 text-left">
-                                    <h3 class="text-lg leading-6 font-medium text-gray-900 dark:text-gray-100">${title}</h3>
-                                    <div class="mt-2">
-                                        <p class="text-sm text-gray-500 dark:text-gray-400">${message}</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="bg-gray-50 dark:bg-gray-700 px-6 py-3 flex flex-row-reverse">
-                            <button id="${buttonId}" data-id='${JSON.stringify(ids)}' class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-red-600 text-base font-medium text-white hover:bg-red-700 focus:outline-none sm:ml-3 sm:w-auto sm:text-sm">Delete</button>
-                            <button data-action="cancel" class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-base font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none sm:mt-0 sm:w-auto sm:text-sm">Cancel</button>
-                        </div>
-                    </div>
-                </div>
-            `;
-            showModal(modalHTML);
-        };
-        
-        const createImportModal = () => {
-            const modalHTML = `
-                <div class="modal-backdrop">
-                    <div class="modal-content import-modal-content dark:bg-gray-800">
-                        <div class="p-6">
-                            <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">Import Data from CSV</h2>
-                            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Select the type of data to import and upload a CSV file with the correct format.</p>
+                        if (exactMatch) {
+                            const flight = exactMatch;
+                            context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
                             
-                            <div class="mt-4">
-                                <fieldset>
-                                    <legend class="text-base font-medium text-gray-900 dark:text-gray-100">Select Import Type</legend>
-                                    <div class="mt-4 space-y-4">
-                                        <div class="flex items-center">
-                                            <input id="import-type-studies" name="import-type" type="radio" value="studies" class="focus:ring-indigo-500 h-4 w-4 text-indigo-600 border-gray-300 dark:border-gray-600" checked>
-                                            <label for="import-type-studies" class="ml-3 block text-sm font-medium text-gray-700 dark:text-gray-300">Studies</label>
-                                        </div>
-                                        <div class="flex items-center">
-                                            <input id="import-type-sites" name="import-type" type="radio" value="sites" class="focus:ring-indigo-500 h-4 w-4 text-indigo-600 border-gray-300 dark:border-gray-600">
-                                            <label for="import-type-sites" class="ml-3 block text-sm font-medium text-gray-700 dark:text-gray-300">Sites</label>
-                                        </div>
-                                        <div class="flex items-center">
-                                            <input id="import-type-enrollment" name="import-type" type="radio" value="enrollment" class="focus:ring-indigo-500 h-4 w-4 text-indigo-600 border-gray-300 dark:border-gray-600">
-                                            <label for="import-type-enrollment" class="ml-3 block text-sm font-medium text-gray-700 dark:text-gray-300">Patient Enrollment (Ties Studies to Sites)</label>
-                                        </div>
-                                    </div>
-                                </fieldset>
-                            </div>
-
-                            <div id="import-instructions" class="mt-6 p-4 bg-gray-100 dark:bg-gray-700 rounded-lg"></div>
-                            
-                             <div class="mt-4">
-                                <label for="csv-file-input" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Upload CSV File</label>
-                                <input type="file" id="csv-file-input" accept=".csv" class="mt-1 block w-full text-sm text-gray-500 dark:text-gray-300 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 dark:file:bg-indigo-900 file:text-indigo-700 dark:file:text-indigo-200 hover:file:bg-indigo-100 dark:hover:file:bg-indigo-800"/>
-                            </div>
-                            <div id="import-feedback" class="mt-4 text-sm"></div>
-                        </div>
-                        <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
-                            <button id="start-import-btn" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 sm:ml-3 sm:w-auto sm:text-sm" disabled>Import</button>
-                            <button type="button" data-action="cancel" class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-base font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 sm:mt-0 sm:w-auto sm:text-sm">Cancel</button>
-                        </div>
-                    </div>
-                </div>
-            `;
-            showModal(modalHTML);
-            updateImportInstructions();
-        };
-
-        // --- Firebase Logic ---
-
-        const handleSaveSite = async (e) => {
-            e.preventDefault();
-            const form = e.target;
-            const siteId = form.dataset.id;
-            const selectedIndications = Array.from(form.querySelectorAll('input[name="indication"]:checked')).map(cb => cb.value);
-            
-            // Use querySelector to reliably get form elements
-            const getValue = (name) => {
-                const el = form.querySelector(`[name="${name}"], #${name}`);
-                return el ? el.value : '';
-            };
-            
-            const getNumberValue = (name) => {
-                const el = form.querySelector(`[name="${name}"], #${name}`);
-                const value = el ? el.value : '';
-                return value ? parseFloat(value) : null;
-            };
-            
-            const siteData = {
-                name: getValue('name'),
-                siteNameAbbreviation: getValue('siteNameAbbreviation'),
-                address1: getValue('address1'),
-                address2: getValue('address2'),
-                city: getValue('city'),
-                state: getValue('state'),
-                zipCode: getValue('zipCode'),
-                zip: getValue('zipCode'), // Also save as 'zip' for compatibility
-                country: getValue('country'),
-                siteCoordinator: getValue('siteCoordinator'),
-                piEmail: getValue('piEmail'),
-                siteCoordinatorEmail: getValue('siteCoordinatorEmail'),
-                pi: getValue('pi'),
-                indication: selectedIndications,
-                status: getValue('status'),
-                latitude: getNumberValue('latitude'),
-                longitude: getNumberValue('longitude')
-            };
-            
-            console.log('Saving site data:', siteData);
-            console.log('Site ID:', siteId);
-
-            try {
-                let result;
-                if (siteId) {
-                    // Update existing site
-                    console.log('Updating site:', siteId);
-                    result = await apiService.updateSite(siteId, siteData);
-                    console.log('Update result:', result);
-                } else {
-                    // Create new site
-                    console.log('Creating new site');
-                    result = await apiService.createSite(siteData);
-                    console.log('Create result:', result);
-                }
-                console.log('Site saved successfully:', result);
-                showNotification('Site saved successfully!', 'success');
-                
-                // Refresh data from API
-                try {
-                    allSites = await apiService.getSites();
-                    allStudies = await apiService.getStudies();
-                } catch (refreshError) {
-                    console.error('Error refreshing data after save:', refreshError);
-                }
-                
-                closeModal();
-                renderAllSites();
-                
-                // Refresh map if it exists
-                if (typeof loadMapMarkers === 'function') {
-                    loadMapMarkers();
-                }
-            } catch (error) {
-                console.error('Error saving site:', error);
-                console.error('Error details:', {
-                    message: error.message,
-                    stack: error.stack,
-                    siteId: siteId,
-                    siteData: siteData
-                });
-                showNotification(`Error saving site: ${error.message || 'Please try again.'}`, 'error');
-            }
-        };
-
-        const handleSaveCrc = async (e) => {
-            e.preventDefault();
-            const form = e.target;
-            const crcId = form.dataset.id;
-            
-            // Parse coordinates
-            const lat = form.latitude.value ? parseFloat(form.latitude.value) : null;
-            const lng = form.longitude.value ? parseFloat(form.longitude.value) : null;
-            
-            // Parse capabilities array
-            const capabilities = Array.from(form.querySelectorAll('input[name="capabilities"]:checked')).map(cb => cb.value);
-            
-            // Parse trainings array - this would need to be built from form data
-            const trainings = []; // This would need to be populated from form inputs
-            
-            const crcData = {
-                name: form.name.value,
-                title: form.title.value,
-                region: form.region.value || "",
-                capabilities: capabilities,
-                trainingLevel: form.trainingLevel.value || "",
-                coordinates: (lat && lng) ? { lat: lat, lng: lng } : null,
-                employmentType: form.employmentType.value || "FTE",
-                homeLocation: form.homeLocation.value || "",
-                trainings: trainings
-            };
-
-            try {
-                let result;
-                if (crcId) {
-                    // Update existing CRC
-                    result = await apiService.updateCrc(crcId, crcData);
-                } else {
-                    // Create new CRC
-                    result = await apiService.createCrc(crcData);
-                }
-                console.log('CRC saved successfully:', result);
-                showNotification('CRC saved successfully!', 'success');
-                closeModal();
-                // Refresh CRC list if it exists
-                if (typeof renderAllCrcs === 'function') {
-                    renderAllCrcs();
-                }
-            } catch (error) {
-                console.error('Error saving CRC: ', error);
-                showNotification('Error saving CRC. Please try again.', 'error');
-            }
-        };
-
-        const handleSaveRole = async (e) => {
-            e.preventDefault();
-            const form = e.target;
-            const roleId = form.dataset.id;
-            
-            const roleData = {
-                name: form.name.value
-            };
-
-            try {
-                let result;
-                if (roleId) {
-                    // Update existing role
-                    result = await apiService.updateRole(roleId, roleData);
-                } else {
-                    // Create new role
-                    result = await apiService.createRole(roleData);
-                }
-                console.log('Role saved successfully:', result);
-                showNotification('Role saved successfully!', 'success');
-                closeModal();
-                // Refresh role list if it exists
-                if (typeof renderAllRoles === 'function') {
-                    renderAllRoles();
-                }
-            } catch (error) {
-                console.error('Error saving role: ', error);
-                showNotification('Error saving role. Please try again.', 'error');
-            }
-        };
-
-        const handleSavePatient = async (e) => {
-            e.preventDefault();
-            const form = e.target;
-            const patientId = form.dataset.id;
-            
-            const patientData = {
-                firstName: form.firstName.value,
-                lastName: form.lastName.value,
-                globalId: form.globalId.value || "",
-                phoneNumber: form.phoneNumber.value || "",
-                email: form.email.value || "",
-                dob: form.dob.value,
-                address: form.address.value || "",
-                city: form.city.value || "",
-                state: form.state.value || "",
-                zipCode: form.zipCode.value || "",
-                age: form.age.value ? parseInt(form.age.value) : null,
-                condition: form.condition.value || "",
-                status: form.status.value || "Candidate",
-                registryStatus: form.registryStatus.value || "Active",
-                source: form.source.value || "",
-                therapeuticArea: form.therapeuticArea.value || "",
-                studyId: form.studyId.value || null,
-                siteId: form.siteId.value || null,
-                appointment: null, // This would be set separately
-                surveyResults: [], // This would be populated separately
-                contactLogs: [], // This would be populated separately
-                studyHistory: [] // This would be populated separately
-            };
-
-            try {
-                let result;
-                if (patientId) {
-                    // Update existing patient
-                    result = await apiService.updatePatient(patientId, patientData);
-                } else {
-                    // Create new patient
-                    result = await apiService.createPatient(patientData);
-                }
-                console.log('Patient saved successfully:', result);
-                showNotification('Patient saved successfully!', 'success');
-                closeModal();
-                // Refresh patient list if it exists
-                if (typeof renderAllPatients === 'function') {
-                    renderAllPatients();
-                }
-            } catch (error) {
-                console.error('Error saving patient: ', error);
-                showNotification('Error saving patient. Please try again.', 'error');
-            }
-        };
-
-        const handleSaveSchedule = async (e) => {
-            e.preventDefault();
-            const form = e.target;
-            const scheduleId = form.dataset.id;
-            
-            // Parse slots array from form data
-            const slots = []; // This would need to be built from form inputs
-            
-            const scheduleData = {
-                siteId: form.siteId.value,
-                studyId: form.studyId.value,
-                visit: form.visit.value,
-                slots: slots
-            };
-
-            try {
-                let result;
-                if (scheduleId) {
-                    // Update existing schedule
-                    result = await apiService.updateSchedule(scheduleId, scheduleData);
-                } else {
-                    // Create new schedule
-                    result = await apiService.createSchedule(scheduleData);
-                }
-                console.log('Schedule saved successfully:', result);
-                showNotification('Schedule saved successfully!', 'success');
-                closeModal();
-                // Refresh schedule list if it exists
-                if (typeof renderAllSchedules === 'function') {
-                    renderAllSchedules();
-                }
-            } catch (error) {
-                console.error('Error saving schedule: ', error);
-                showNotification('Error saving schedule. Please try again.', 'error');
-            }
-        };
-
-        const handleSaveSurvey = async (e) => {
-            e.preventDefault();
-            const form = e.target;
-            const surveyId = form.dataset.id;
-            
-            // Parse questions array from form data
-            const questions = []; // This would need to be built from form inputs
-            
-            const surveyData = {
-                title: form.title.value,
-                studyId: form.studyId.value,
-                questions: questions
-            };
-
-            try {
-                let result;
-                if (surveyId) {
-                    // Update existing survey
-                    result = await apiService.updateSurvey(surveyId, surveyData);
-                } else {
-                    // Create new survey
-                    result = await apiService.createSurvey(surveyData);
-                }
-                console.log('Survey saved successfully:', result);
-                showNotification('Survey saved successfully!', 'success');
-                closeModal();
-                // Refresh survey list if it exists
-                if (typeof renderAllSurveys === 'function') {
-                    renderAllSurveys();
-                }
-            } catch (error) {
-                console.error('Error saving survey: ', error);
-                showNotification('Error saving survey. Please try again.', 'error');
-            }
-        };
-
-        const handleDeleteStudy = async (studyId) => {
-            try {
-                console.log('ARTEMIS: Deleting study with ID:', studyId);
-                
-                // Delete the study using Azure API
-                await apiService.deleteStudy(studyId);
-                
-                // Update patients who were enrolled in this study
-                const patientsToUpdate = allPatients.filter(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    return currentEnrollment?.studyId === studyId;
-                });
-
-                // Update each patient's enrollment status
-                for (const patient of patientsToUpdate) {
-                    const updatedEnrollments = patient.enrollments.map(e => {
-                        if (e.studyId === studyId && e.status === 'current') {
-                            return { ...e, status: 'past', exitedDate: new Date().toISOString() };
+                            return {
+                                status: 200,
+                                jsonBody: {
+                                    flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
+                                    airline: flight.airline?.name || flight.airline?.iata || null,
+                                    origin: flight.departure?.iata || flight.departure?.airport || flight.departure?.airport_name || null,
+                                    destination: flight.arrival?.iata || flight.arrival?.airport || flight.arrival?.airport_name || null,
+                                    departureTime: flight.departure?.scheduled || flight.departure?.estimated || null,
+                                    arrivalTime: flight.arrival?.scheduled || flight.arrival?.estimated || null,
+                                    status: flight.flight_status || 'scheduled',
+                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : (flight.arrival?.delay ? `${flight.arrival.delay} minutes` : null),
+                                    gate: flight.departure?.gate || flight.arrival?.gate || null,
+                                    terminal: flight.departure?.terminal || flight.arrival?.terminal || null
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
                         }
-                        return e;
-                    });
-                    
-                    try {
-                        await apiService.updatePatient(patient.id, { enrollments: updatedEnrollments });
-                    } catch (patientError) {
-                        console.error(`Error updating patient ${patient.id}:`, patientError);
-                    }
-                }
-                
-                console.log('Study and associated patient links deleted successfully');
-                showNotification('Study deleted successfully!', 'success');
-                
-                // Refresh the studies list
-                renderAllStudies();
-            } catch (error) {
-                console.error('Error deleting study: ', error);
-                showNotification('Failed to delete study. Please try again.', 'error');
-            } finally {
-                closeModal();
-            }
-        };
-
-        const handleDeleteSite = async (siteIds) => {
-            const idsToDelete = Array.isArray(siteIds) ? siteIds : [siteIds];
-            try {
-                // Delete each site using the API service
-                for (const siteId of idsToDelete) {
-                    // 1. Unlink site from any studies
-                    const studiesWithSite = allStudies.filter(s => (s.siteIds || []).includes(siteId));
-                    for (const study of studiesWithSite) {
+                    } else if (response && !response.ok) {
                         try {
-                            const updatedSiteIds = (study.siteIds || []).filter(id => id !== siteId);
-                            await apiService.updateStudy(study.id, { siteIds: updatedSiteIds });
-                            console.log(`Unlinked site ${siteId} from study ${study.id}`);
+                            const errorText = await response.text();
+                            context.log.error(`AviationStack API HTTP error: ${response.status} - ${errorText.substring(0, 500)}`);
                         } catch (error) {
-                            console.error(`Error unlinking site from study ${study.id}:`, error);
+                            context.log.error(`AviationStack API HTTP error: ${response.status} - Could not read error response`);
                         }
                     }
-
-                    // 2. Unlink site from any patients
-                    const patientsAtSite = allPatients.filter(p => {
-                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                        return currentEnrollment?.siteId === siteId;
-                    });
-                    for (const patient of patientsAtSite) {
-                        try {
-                            const updatedEnrollments = patient.enrollments.map(e => {
-                                if (e.siteId === siteId && e.status === 'current') {
-                                    return { ...e, status: 'past', exitedDate: new Date().toISOString() };
+                    
+                    // If not found with flight_iata, try splitting into airline_iata + flight_number
+                    if (!apiData || !apiData.data || apiData.data.length === 0) {
+                        context.log.info('Trying airline_iata + flight_number parameter format');
+                        const flightMatch = flightNumber.match(/^([A-Z]{2,3})(\d+)$/i);
+                        if (flightMatch) {
+                            const [, airlineCode, flightNum] = flightMatch;
+                            apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&airline_iata=${airlineCode.toUpperCase()}&flight_number=${flightNum}&limit=100`;
+                            
+                            try {
+                                response = await fetch(apiUrl, {
+                                    method: 'GET'
+                                });
+                                context.log.info(`AviationStack API response status (airline_iata+flight_number): ${response.status}`);
+                                
+                                // Get response text first to check for errors
+                                const responseText = await response.text();
+                                context.log.info(`AviationStack API raw response (alternative, first 500 chars): ${responseText.substring(0, 500)}`);
+                                
+                                try {
+                                    apiData = JSON.parse(responseText);
+                                    
+                                    // Check for error in response (even if status is 200)
+                                    // AviationStack returns errors in format: {error: {code: "...", message: "..."}}
+                                    if (apiData.error) {
+                                        const errorCode = apiData.error.code || 'unknown';
+                                        const errorMessage = apiData.error.message || 'Unknown error';
+                                        context.log.error(`AviationStack API error (alternative) [${errorCode}]: ${errorMessage}`);
+                                        
+                                        // Handle specific error codes
+                                        if (errorCode === 401) {
+                                            context.log.error('Invalid or missing API access key');
+                                        } else if (errorCode === 403) {
+                                            context.log.error('Access restricted - check subscription plan limits');
+                                        } else if (errorCode === 404) {
+                                            context.log.error('Invalid API endpoint or resource not found');
+                                        } else if (errorCode === 429) {
+                                            context.log.error('Rate limit exceeded - too many requests');
+                                        }
+                                        
+                                        apiData = null;
+                                    } else if (apiData.data) {
+                                        context.log.info(`AviationStack API response (alternative): ${apiData.data?.length || 0} flights found`);
+                                        // AviationStack also includes pagination info
+                                        if (apiData.pagination) {
+                                            context.log.info(`AviationStack pagination (alternative): limit=${apiData.pagination.limit}, offset=${apiData.pagination.offset}, count=${apiData.pagination.count}, total=${apiData.pagination.total}`);
+                                        }
+                                    } else {
+                                        context.log.warn('AviationStack API response missing data field (alternative):', responseText.substring(0, 200));
+                                        apiData = null;
+                                    }
+                                } catch (jsonError) {
+                                    context.log.error('AviationStack API JSON parse error (alternative):', jsonError.message);
+                                    context.log.error('Response text:', responseText.substring(0, 500));
+                                    apiData = null;
                                 }
-                                return e;
-                            });
-                            await apiService.updatePatient(patient.id, { enrollments: updatedEnrollments });
-                            console.log(`Unlinked site ${siteId} from patient ${patient.id}`);
-                        } catch (error) {
-                            console.error(`Error unlinking site from patient ${patient.id}:`, error);
+                            } catch (fetchError) {
+                                context.log.error('AviationStack API fetch error (alternative):', fetchError.message);
+                                context.log.error('Stack:', fetchError.stack);
+                                response = null;
+                            }
+                            
+                            if (apiData && apiData.data && apiData.data.length > 0) {
+                                // Find the best match
+                                const bestMatch = apiData.data.find(f => 
+                                    f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
+                                    (f.airline?.iata?.toUpperCase() === airlineCode.toUpperCase() && 
+                                     f.flight?.number?.toString() === flightNum)
+                                ) || apiData.data[0];
+                                
+                                const flight = bestMatch;
+                                context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
+                                
+                                return {
+                                    status: 200,
+                                    jsonBody: {
+                                        flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
+                                        airline: flight.airline?.name || flight.airline?.iata || null,
+                                        origin: flight.departure?.iata || flight.departure?.airport || flight.departure?.airport_name || null,
+                                        destination: flight.arrival?.iata || flight.arrival?.airport || flight.arrival?.airport_name || null,
+                                        departureTime: flight.departure?.scheduled || flight.departure?.estimated || null,
+                                        arrivalTime: flight.arrival?.scheduled || flight.arrival?.estimated || null,
+                                        status: flight.flight_status || 'scheduled',
+                                        delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : (flight.arrival?.delay ? `${flight.arrival.delay} minutes` : null),
+                                        gate: flight.departure?.gate || flight.arrival?.gate || null,
+                                        terminal: flight.departure?.terminal || flight.arrival?.terminal || null
+                                    },
+                                    headers: { 'Content-Type': 'application/json' }
+                                };
+                            } else if (response && !response.ok) {
+                                try {
+                                    const errorText = await response.text();
+                                    context.log.error(`AviationStack API HTTP error (alternative): ${response.status} - ${errorText.substring(0, 500)}`);
+                                } catch (error) {
+                                    context.log.error(`AviationStack API HTTP error (alternative): ${response.status} - Could not read error response`);
+                                }
+                            }
                         }
-                    }
-                    
-                    // 3. Delete the site document
-                    await apiService.deleteSite(siteId);
-                    console.log(`Deleted site ${siteId}`);
-                }
-                
-                console.log(`${idsToDelete.length} site(s) and all associated links deleted successfully`);
-                showNotification(`${idsToDelete.length} site(s) deleted successfully!`, 'success');
-                
-                // Refresh data from API
-                try {
-                    allSites = await apiService.getSites();
-                    allStudies = await apiService.getStudies();
-                    allPatients = await apiService.getPatients();
-                    
-                    // Refresh the sites list
-                    renderAllSites();
-                    
-                    // Refresh map if it exists
-                    if (typeof loadMapMarkers === 'function') {
-                        loadMapMarkers();
                     }
                 } catch (error) {
-                    console.error('Error refreshing data after delete:', error);
+                    context.log.error('AviationStack API exception:', error.message);
+                    context.log.error('Stack:', error.stack);
+                    // Don't throw, fall through to return basic info
                 }
-            } catch (error) {
-                console.error('Error deleting site(s): ', error);
-                showNotification('Error deleting site(s). Please try again.', 'error');
-            } finally {
-                closeModal();
-            }
-        };
-        
-        // --- Import Logic ---
-        const updateImportInstructions = () => {
-            const importType = document.querySelector('input[name="import-type"]:checked').value;
-            const instructionsEl = document.getElementById('import-instructions');
-            let instructionsHTML = '';
-
-            if (importType === 'studies') {
-                instructionsHTML = `
-                    <p class="font-semibold">Required Columns for Studies:</p>
-                    <code class="text-xs bg-gray-200 dark:bg-gray-600 p-1 rounded">title,protocolNumber,status,target,startDate,endDate,indication</code>
-                    <p class="text-xs mt-1">For Indication, separate multiple values with a pipe (|).</p>
-                    <p class="text-xs mt-1">Example: <code class="text-xs">"Phase 3 Study","P3-XYZ-01","Recruiting",150,2025-01-01,2026-12-31,"Dry Eye|Glaucoma"</code></p>
-                `;
-            } else if (importType === 'sites') {
-                instructionsHTML = `
-                    <p class="font-semibold">Required Columns for Sites:</p>
-                    <code class="text-xs bg-gray-200 dark:bg-gray-600 p-1 rounded">Status,Site Name,Site Name Abbreviation,Address line 1,Address Line 2,City,State,Zip Code,Country,PI,PI Email,Site Coordinator,Site Coordinator Email,Indication</code>
-                    <p class="text-xs mt-1">For Indication, separate multiple values with a pipe (|).</p>
-                    <p class="text-xs mt-1">Example: <code class="text-xs">"Active","City Eye Center","CEC","123 Main St","Suite 100","Anytown","CA","12345","USA","Dr. Smith","dr.smith@email.com","John Doe","j.doe@email.com","Dry Eye|Glaucoma"</code></p>
-                `;
-            } else if (importType === 'enrollment') {
-                 instructionsHTML = `
-                    <p class="font-semibold">Required Columns for Patient Enrollment:</p>
-                    <code class="text-xs bg-gray-200 dark:bg-gray-600 p-1 rounded">patientId,studyTitle,siteName,status,enrollmentDate</code>
-                    <p class="text-xs mt-1">This will create or update patients to link them to existing studies and sites.</p>
-                    <p class="text-xs mt-1">Example: <code class="text-xs">"PAT-001","Phase 3 Study","Central Clinic","Enrolled",2025-02-15</code></p>
-                `;
-            }
-            instructionsEl.innerHTML = instructionsHTML;
-        };
-        
-        const parseCSV = (text) => {
-            const lines = text.split('\n').filter(line => line.trim() !== '');
-            const header = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
-            const data = [];
-            for (let i = 1; i < lines.length; i++) {
-                const values = lines[i].split(',');
-                const entry = {};
-                for (let j = 0; j < header.length; j++) {
-                    entry[header[j]] = values[j] ? values[j].trim().replace(/"/g, '') : '';
-                }
-                data.push(entry);
-            }
-            return data;
-        };
-        
-        const handleImport = async (file) => {
-            const feedbackEl = document.getElementById('import-feedback');
-            const startBtn = document.getElementById('start-import-btn');
-            if (!file) {
-                feedbackEl.innerHTML = `<p class="text-red-600">Please select a file to import.</p>`;
-                return;
+            } else {
+                context.log.info('AviationStack API key not configured');
             }
             
-            startBtn.disabled = true;
-            feedbackEl.innerHTML = `<p class="text-blue-600">Reading file...</p>`;
-
-            const reader = new FileReader();
-            reader.onload = async (event) => {
+            // Try OAG Flight Info API via Azure Marketplace (if configured, as fallback)
+            const OAG_API_KEY = process.env.OAG_API_KEY || process.env.OAG_FLIGHT_INFO_API_KEY;
+            const OAG_API_URL = process.env.OAG_API_URL || 'https://api.oag.com/flightinfo/v1';
+            if (OAG_API_KEY && !AVIATIONSTACK_KEY) {
                 try {
-                    const csvText = event.target.result;
-                    const data = parseCSV(csvText);
-                    const importType = document.querySelector('input[name="import-type"]:checked').value;
-                    
-                    feedbackEl.innerHTML = `<p class="text-blue-600">Processing ${data.length} records... Please wait.</p>`;
-                    
-                    const batch = writeBatch(db);
-                    let errors = [];
-                    let skippedCount = 0;
-                    let importedCount = 0;
-                    const affectedStudyIds = new Set(); // Keep track of studies to sync
-
-                    if (importType === 'studies') {
-                        data.forEach((row, index) => {
-                            if (!row.title || !row.target) {
-                                errors.push(`Row ${index + 2}: Missing required fields 'title' or 'target'.`);
-                                return;
-                            }
-                            const appId = 'crc-scheduler-app';
-                            const docRef = doc(collection(db, `artifacts/${appId}/public/data/studies`));
-                            batch.set(docRef, {
-                                title: row.title,
-                                protocolNumber: row.protocolNumber || '',
-                                status: row.status || 'Recruiting',
-                                target: parseInt(row.target, 10) || 0,
-                                startDate: row.startDate || '',
-                                endDate: row.endDate || '',
-                                siteIds: [],
-                                indication: row.indication ? row.indication.split('|').map(i => i.trim()) : []
-                            });
-                            importedCount++;
-                        });
-                    } else if (importType === 'sites') {
-                        const existingSiteNames = new Set(allSites.map(s => s.name.toLowerCase()));
-                        data.forEach((row, index) => {
-                            const siteName = row['Site Name'];
-                            if (!siteName) {
-                                errors.push(`Row ${index + 2}: Missing required field 'Site Name'.`);
-                                return;
-                            }
-                            if (existingSiteNames.has(siteName.toLowerCase())) {
-                                skippedCount++;
-                                return; // Skip duplicate
-                            }
-
-                            const appId = 'crc-scheduler-app';
-                            const docRef = doc(collection(db, `artifacts/${appId}/public/data/crc_sites`));
-                            batch.set(docRef, {
-                                status: row.Status || '',
-                                name: siteName,
-                                siteNameAbbreviation: row['Site Name Abbreviation'] || '',
-                                address1: row['Address line 1'] || '',
-                                address2: row['Address Line 2'] || '',
-                                city: row.City || '',
-                                state: row.State || '',
-                                zipCode: row['Zip Code'] || '',
-                                country: row.Country || '',
-                                pi: row.PI || '',
-                                piEmail: row['PI Email'] || '',
-                                siteCoordinator: row['Site Coordinator'] || '',
-                                siteCoordinatorEmail: row['Site Coordinator Email'] || '',
-                                indication: row.Indication ? row.Indication.split('|').map(i => i.trim()) : [],
-                            });
-                            importedCount++;
-                        });
-                    } else if (importType === 'enrollment') {
-                        data.forEach((row, index) => {
-                             if (!row.patientId || !row.studyTitle || !row.siteName) {
-                                errors.push(`Row ${index + 2}: Missing required fields 'patientId', 'studyTitle', or 'siteName'.`);
-                                return;
-                            }
-                            const study = allStudies.find(s => s.title === row.studyTitle);
-                            const site = allSites.find(s => s.name === row.siteName);
-                            const patient = allPatients.find(p => p.id === row.patientId);
-
-                            if (!study) { errors.push(`Row ${index + 2}: Study "${row.studyTitle}" not found.`); return; }
-                            if (!site) { errors.push(`Row ${index + 2}: Site "${row.siteName}" not found.`); return; }
-                            if (!patient) { errors.push(`Row ${index + 2}: Patient with ID "${row.patientId}" not found.`); return; }
-                            
-                            const docRef = doc(db, 'patients', row.patientId);
-                            const updatedEnrollments = (patient.enrollments || []).map(e => 
-                                e.status === 'current' ? { ...e, status: 'past', exitedDate: new Date().toISOString() } : e
-                            );
-
-                            updatedEnrollments.push({
-                                studyId: study.id,
-                                siteId: site.id,
-                                status: 'current',
-                                enrolledDate: row.enrollmentDate ? new Date(row.enrollmentDate).toISOString() : new Date().toISOString(),
-                                exitedDate: null
-                            });
-
-                             batch.update(docRef, {
-                                status: row.status || 'Enrolled',
-                                enrollments: updatedEnrollments
-                            });
-                            affectedStudyIds.add(study.id); // Add study ID for syncing
-                            importedCount++;
-                        });
-                    }
-                    
-                    if (errors.length > 0) {
-                        feedbackEl.innerHTML = `<p class="text-red-600 font-bold">Import failed with ${errors.length} errors:</p><ul class="list-disc list-inside text-red-500 text-xs">${errors.slice(0, 10).map(e => `<li>${e}</li>`).join('')}</ul>`;
-                    } else {
-                        await batch.commit();
-                        let successMessage = `<p class="text-green-600 font-bold">Successfully imported ${importedCount} records!</p>`;
-                        if (skippedCount > 0) {
-                            successMessage += `<p class="text-yellow-600">Skipped ${skippedCount} duplicate records.</p>`;
-                        }
-                        feedbackEl.innerHTML = successMessage;
-
-                        // After successful import, notify N.A.S.A. for each affected study
-                        if (affectedStudyIds.size > 0) {
-                            setTimeout(() => {
-                                affectedStudyIds.forEach(studyId => notifyNasaOfUpdate(studyId));
-                            }, 500); // Small delay to allow Firestore to propagate changes
-                        }
-
-                        setTimeout(closeModal, 3000);
-                    }
-
-                } catch (e) {
-                    console.error(e);
-                    feedbackEl.innerHTML = `<p class="text-red-600">An error occurred during import: ${e.message}</p>`;
-                } finally {
-                    startBtn.disabled = false;
-                }
-            };
-            reader.readAsText(file);
-        };
-
-
-        // --- Mobile Menu Handlers ---
-        const mobileMenuButton = document.getElementById('mobile-menu-button');
-        const mobileMenuClose = document.getElementById('mobile-menu-close');
-        const mobileMenu = document.getElementById('mobile-menu');
-        const mobileMenuOverlay = document.getElementById('mobile-menu-overlay');
-        
-        const openMobileMenu = () => {
-            if (mobileMenu) mobileMenu.classList.add('active');
-            if (mobileMenuOverlay) mobileMenuOverlay.classList.add('active');
-            document.body.style.overflow = 'hidden';
-        };
-        
-        const closeMobileMenu = () => {
-            if (mobileMenu) mobileMenu.classList.remove('active');
-            if (mobileMenuOverlay) mobileMenuOverlay.classList.remove('active');
-            document.body.style.overflow = '';
-        };
-        
-        if (mobileMenuButton) {
-            mobileMenuButton.addEventListener('click', openMobileMenu);
-        }
-        
-        if (mobileMenuClose) {
-            mobileMenuClose.addEventListener('click', closeMobileMenu);
-        }
-        
-        if (mobileMenuOverlay) {
-            mobileMenuOverlay.addEventListener('click', closeMobileMenu);
-        }
-        
-        // Handle mobile menu navigation clicks
-        document.addEventListener('click', (e) => {
-            const button = e.target.closest('button');
-            if (!button) return;
-            
-            // Handle mobile menu tab buttons
-            if (button.id === 'dashboard-tab-btn-mobile') {
-                activeTab = 'dashboard';
-                render();
-                setTimeout(closeMobileMenu, 300);
-            } else if (button.id === 'studies-tab-btn-mobile') {
-                activeTab = 'studies';
-                render();
-                setTimeout(closeMobileMenu, 300);
-            } else if (button.id === 'sites-tab-btn-mobile') {
-                activeTab = 'sites';
-                render();
-                setTimeout(closeMobileMenu, 300);
-            } else if (button.id === 'reporting-tab-btn-mobile') {
-                activeTab = 'reporting';
-                render();
-                setTimeout(closeMobileMenu, 300);
-            } else if (button.id === 'add-study-btn-mobile') {
-                createStudyModal();
-                setTimeout(closeMobileMenu, 300);
-            } else if (button.id === 'import-data-btn-mobile') {
-                createImportModal();
-                setTimeout(closeMobileMenu, 300);
-            } else if (button.id === 'sync-all-btn-mobile') {
-                allStudies.forEach(study => notifyNasaOfUpdate(study.id));
-                alert('Syncing all studies with N.A.S.A.');
-                setTimeout(closeMobileMenu, 300);
-            }
-        });
-        
-        // --- Event Listeners ---
-        if (headerButtons) {
-            headerButtons.addEventListener('click', (e) => {
-                const button = e.target.closest('button');
-                if (!button) return;
-
-                if (button.id === 'dashboard-tab-btn') {
-                    activeTab = 'dashboard';
-                    render();
-                } else if (button.id === 'studies-tab-btn') {
-                    activeTab = 'studies';
-                    render();
-                } else if (button.id === 'sites-tab-btn') {
-                    activeTab = 'sites';
-                    render();
-                } else if (button.id === 'reporting-tab-btn') {
-                    activeTab = 'reporting';
-                    render();
-                } else if (button.id === 'add-study-btn') {
-                    createStudyModal();
-                } else if (button.id === 'import-data-btn') {
-                    createImportModal();
-                } else if (button.id === 'sync-all-btn') {
-                    allStudies.forEach(study => notifyNasaOfUpdate(study.id));
-                    // You can add a visual confirmation here if you like
-                    alert('Syncing all studies with N.A.S.A.');
-                }
-            });
-        }
-
-        modalContainer.addEventListener('click', (e) => {
-            if (e.target.dataset.action === 'cancel') {
-                closeModal();
-            }
-            if (e.target.id === 'confirm-delete-study-btn') {
-                handleDeleteStudy(JSON.parse(e.target.dataset.id));
-            }
-            if (e.target.id === 'confirm-delete-site-btn') {
-                handleDeleteSite(JSON.parse(e.target.dataset.id));
-            }
-            if (e.target.id === 'start-import-btn') {
-                const fileInput = document.getElementById('csv-file-input');
-                handleImport(fileInput.files[0]);
-            }
-            if (e.target.id === 'geocode-address-btn') {
-                geocodeAddressFromForm();
-            }
-        });
-        
-        modalContainer.addEventListener('change', (e) => {
-            if (e.target.name === 'import-type') {
-                updateImportInstructions();
-            }
-            if (e.target.id === 'csv-file-input') {
-                document.getElementById('start-import-btn').disabled = e.target.files.length === 0;
-            }
-            // Add listener for study indication changes to update site suggestions
-            if (e.target.name === 'indication' && e.target.closest('#study-indication-checkboxes')) {
-                const form = e.target.closest('form');
-                const selectedIndications = Array.from(form.querySelectorAll('input[name="indication"]:checked')).map(cb => cb.value);
-                const assignedSiteIds = Array.from(form.querySelectorAll('input[name="siteIds"]:checked')).map(cb => cb.value);
-                renderSiteAssignmentList(selectedIndications, assignedSiteIds);
-            }
-        });
-
-        modalContainer.addEventListener('submit', (e) => {
-            if (e.target.id === 'study-form') {
-                handleSaveStudy(e);
-            }
-            if (e.target.id === 'site-form') {
-                handleSaveSite(e);
-            }
-            if (e.target.id === 'crc-form') {
-                handleSaveCrc(e);
-            }
-            if (e.target.id === 'role-form') {
-                handleSaveRole(e);
-            }
-            if (e.target.id === 'patient-form') {
-                handleSavePatient(e);
-            }
-            if (e.target.id === 'schedule-form') {
-                handleSaveSchedule(e);
-            }
-            if (e.target.id === 'survey-form') {
-                handleSaveSurvey(e);
-            }
-        });
-
-        // Add NASA-style report form handler to main content area
-        mainContentArea.addEventListener('submit', (e) => {
-            if (e.target.id === 'report-filter-form') {
-                e.preventDefault();
-                const formData = new FormData(e.target);
-                const data = Object.fromEntries(formData.entries());
-                handleNasaStyleReportFilter(data);
-            }
-        });
-
-        mainContentArea.addEventListener('click', (e) => {
-            const card = e.target.closest('.study-card');
-            if (card) {
-                const studyId = card.dataset.studyId;
-                const study = allStudies.find(s => s.id === studyId);
-                if (e.target.closest('[data-action="edit"]')) {
-                    createStudyModal(study);
-                }
-                if (e.target.closest('[data-action="delete"]')) {
-                    createConfirmModal(studyId, 'study');
-                }
-            }
-            
-            // Quick date filter buttons
-            const action = e.target.dataset.action;
-            if (action === 'filter-studies-this-year') {
-                const now = new Date();
-                window.studyDateRangeFilter = {
-                    start: new Date(now.getFullYear(), 0, 1),
-                    end: new Date(now.getFullYear(), 11, 31)
-                };
-                renderAllStudies();
-            }
-            if (action === 'filter-studies-last-year') {
-                const now = new Date();
-                window.studyDateRangeFilter = {
-                    start: new Date(now.getFullYear() - 1, 0, 1),
-                    end: new Date(now.getFullYear() - 1, 11, 31)
-                };
-                renderAllStudies();
-            }
-            if (action === 'filter-studies-last-6-months') {
-                const now = new Date();
-                const sixMonthsAgo = new Date(now);
-                sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-                window.studyDateRangeFilter = {
-                    start: sixMonthsAgo,
-                    end: now
-                };
-                renderAllStudies();
-            }
-            if (action === 'filter-studies-reset') {
-                window.studyDateRangeFilter = null;
-                // Reset all dropdowns
-                const statusFilter = document.getElementById('study-status-filter');
-                const indicationFilter = document.getElementById('study-indication-filter');
-                const siteFilter = document.getElementById('study-site-filter');
-                const sortFilter = document.getElementById('study-sort-filter');
-                if (statusFilter) statusFilter.value = 'all';
-                if (indicationFilter) indicationFilter.value = 'all';
-                if (siteFilter) siteFilter.value = 'all';
-                if (sortFilter) sortFilter.value = 'title';
-                renderAllStudies();
-            }
-            
-            if (e.target.id === 'add-site-btn') {
-                createSiteModal();
-            }
-            
-            if (e.target.id === 'sync-all-coordinates-btn') {
-                syncAllSiteCoordinates();
-            }
-            
-            const editSiteButton = e.target.closest('[data-action="edit-site"]');
-            if (editSiteButton) {
-                const siteId = editSiteButton.dataset.id;
-                const site = allSites.find(s => s.id === siteId);
-                createSiteModal(site);
-            }
-
-            const deleteSiteButton = e.target.closest('[data-action="delete-site"]');
-            if (deleteSiteButton) {
-                const siteId = deleteSiteButton.dataset.id;
-                createConfirmModal(siteId, 'site');
-            }
-
-            if (e.target.id === 'bulk-delete-site-btn') {
-                const selectedIds = Array.from(document.querySelectorAll('.site-checkbox:checked')).map(cb => cb.dataset.id);
-                if (selectedIds.length > 0) {
-                    createConfirmModal(selectedIds, 'site');
-                }
-            }
-
-             if (e.target.id === 'export-study-stats-btn') {
-                exportReportToCSV();
-            }
-            if (e.target.id === 'export-washout-btn') {
-                exportWashoutToCSV();
-            }
-            if (e.target.id === 'export-participants-btn') {
-                exportParticipantsToCSV();
-            }
-            if (e.target.id === 'generate-report-btn') {
-                renderReportTables();
-            }
-            // NASA-style export buttons
-            if (e.target.id === 'export-csv-btn') {
-                exportToCSV();
-            }
-            if (e.target.id === 'export-surveys-btn') {
-                exportSurveysToCSV();
-            }
-            if (e.target.id === 'generate-dashboard-btn') {
-                renderDashboardCharts();
-            }
-        });
-
-        mainContentArea.addEventListener('input', (e) => {
-            if (e.target.id === 'site-search-input') {
-                const searchTerm = e.target.value.toLowerCase();
-                const filteredSites = allSites.filter(site => 
-                    site.name.toLowerCase().includes(searchTerm)
-                );
-                renderAllSites(filteredSites);
-            }
-        });
-
-        mainContentArea.addEventListener('change', (e) => {
-             if (e.target.classList.contains('site-checkbox') || e.target.id === 'select-all-sites-checkbox') {
-                const checkboxes = document.querySelectorAll('.site-checkbox');
-                const selectAll = document.getElementById('select-all-sites-checkbox');
-                const bulkDeleteBtn = document.getElementById('bulk-delete-site-btn');
-
-                if (e.target.id === 'select-all-sites-checkbox') {
-                    checkboxes.forEach(cb => cb.checked = selectAll.checked);
-                }
-
-                const anyChecked = Array.from(checkboxes).some(cb => cb.checked);
-                if (anyChecked) {
-                    bulkDeleteBtn.classList.remove('hidden');
-                } else {
-                    bulkDeleteBtn.classList.add('hidden');
-                }
-                
-                selectAll.checked = checkboxes.length > 0 && Array.from(checkboxes).every(cb => cb.checked);
-            }
-            
-            // Study filters
-            if (e.target.id === 'study-status-filter' || 
-                e.target.id === 'study-indication-filter' || 
-                e.target.id === 'study-site-filter' || 
-                e.target.id === 'study-sort-filter') {
-                renderAllStudies();
-            }
-        });
-        
-        // --- API Health Check ---
-        const checkApiHealth = async () => {
-            try {
-                const response = await fetch('/api/studies', {
-                    method: 'GET',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    }
-                });
-                return response.ok;
-            } catch (error) {
-                console.warn('API health check failed:', error);
-                return false;
-            }
-        };
-
-        // --- Initialization ---
-        /**
-         * Initialize the application with error handling and user feedback
-         */
-        const init = async () => {
-            try {
-                loadTheme();
-                
-                const themeToggleBtn = document.getElementById('theme-toggle-logo-btn');
-                if (themeToggleBtn) {
-                    themeToggleBtn.addEventListener('click', toggleTheme);
-                }
-
-                // Check API health
-                const apiHealthy = await checkApiHealth();
-                if (!apiHealthy) {
-                    showNotification('API server is not responding. Data will be saved locally.', 'warning');
-                }
-
-                // Initialize data loading
-                await initializeDataLoaders();
-            } catch (error) {
-                console.error('Error during initialization:', error);
-                showErrorToUser('Failed to initialize application. Please refresh the page.');
-            }
-        };
-
-        /**
-         * Initialize Azure API data loading with error handling
-         */
-        const initializeDataLoaders = async () => {
-            try {
-                loadingIndicator.style.display = 'block';
-                
-                // Load all data in parallel
-                const [studies, sites, patients, crcs, events, roles, schedules, surveys] = await Promise.all([
-                    apiService.getStudies().catch(err => {
-                        console.error('Error loading studies:', err);
-                        return [];
-                    }),
-                    apiService.getSites().catch(err => {
-                        console.error('Error loading sites:', err);
-                        return [];
-                    }),
-                    apiService.getPatients().catch(err => {
-                        console.error('Error loading patients:', err);
-                        return [];
-                    }),
-                    apiService.getCrcs().catch(err => {
-                        console.error('Error loading CRCs:', err);
-                        return [];
-                    }),
-                    apiService.getEvents().catch(err => {
-                        console.error('Error loading events:', err);
-                        return [];
-                    }),
-                    apiService.getRoles().catch(err => {
-                        console.error('Error loading roles:', err);
-                        return [];
-                    }),
-                    apiService.getSchedules().catch(err => {
-                        console.error('Error loading schedules:', err);
-                        return [];
-                    }),
-                    apiService.getSurveys().catch(err => {
-                        console.error('Error loading surveys:', err);
-                        return [];
-                    })
-                ]);
-
-                // Update global state
-                allStudies = studies.sort((a,b) => (a.title > b.title) ? 1 : -1);
-                allSites = sites.sort((a,b) => (a.name > b.name) ? 1 : -1);
-                allPatients = patients;
-                allCrcs = crcs;
-                allSchedules = schedules;
-                allSurveys = surveys;
-
-                // Hide loading indicator and render
-                loadingIndicator.style.display = 'none';
-                
-                // Render header buttons first
-                if (headerButtons) {
-                    renderHeaderButtons();
-                }
-                
-                render();
-                
-                // Reload map markers if map is already initialized
-                // Wait for map to be fully ready before loading markers
-                if (azureMap) {
-                    console.log('Map exists, checking if ready...');
-                    // Check if map is ready, if not wait for ready event
-                    if (azureMap.getMapContainer() && azureMap.getMapContainer().style.display !== 'none') {
-                        setTimeout(() => {
-                            console.log('Loading map markers after data load. Sites:', allSites.length, 'CRCs:', allCrcs.length);
-                            loadMapMarkers();
-                        }, 1000); // Give map more time to be ready
-                    } else {
-                        // Map not ready yet, wait for ready event
-                        azureMap.events.add('ready', () => {
-                            console.log('Map ready after data load, loading markers. Sites:', allSites.length, 'CRCs:', allCrcs.length);
-                            loadMapMarkers();
-                        });
-                    }
-                } else {
-                    console.log('Map not initialized yet, will load markers when map is ready');
-                }
-
-                console.log('Data loaded successfully:', {
-                    studies: allStudies.length,
-                    sites: allSites.length,
-                    patients: allPatients.length,
-                    crcs: allCrcs.length,
-                    schedules: allSchedules.length,
-                    surveys: allSurveys.length
-                });
-
-            } catch (error) {
-                console.error('Error loading data:', error);
-                showErrorToUser('Failed to load application data. Please check your connection and refresh.');
-            }
-        };
-
-        /**
-         * Handle patient changes and sync with N.A.S.A.
-         * @param {Array} previousPatients - Previous patient data
-         * @param {Array} currentPatients - Current patient data
-         */
-        const handlePatientChanges = (previousPatients, currentPatients) => {
-            try {
-                const affectedStudyIds = new Set();
-                const currentPatientMap = new Map(currentPatients.map(p => [p.id, p]));
-                const previousPatientMap = new Map(previousPatients.map(p => [p.id, p]));
-
-                // Check for changed or new patients
-                currentPatientMap.forEach((currentPatient, patientId) => {
-                    const previousPatient = previousPatientMap.get(patientId);
-                    if (!previousPatient || 
-                        JSON.stringify(currentPatient.status) !== JSON.stringify(previousPatient.status) || 
-                        JSON.stringify(currentPatient.enrollments) !== JSON.stringify(previousPatient.enrollments)) {
-                        
-                        const currentEnrollment = currentPatient.enrollments?.find(e => e.status === 'current');
-                        if (currentEnrollment?.studyId) {
-                            affectedStudyIds.add(currentEnrollment.studyId);
-                        }
-                        
-                        if (previousPatient) {
-                            const previousEnrollment = previousPatient.enrollments?.find(e => e.status === 'current');
-                            if (previousEnrollment?.studyId) {
-                                affectedStudyIds.add(previousEnrollment.studyId);
-                            }
-                        }
-                    }
-                });
-
-                // Check for deleted patients
-                previousPatientMap.forEach((previousPatient, patientId) => {
-                    if (!currentPatientMap.has(patientId)) {
-                        const previousEnrollment = previousPatient.enrollments?.find(e => e.status === 'current');
-                        if (previousEnrollment?.studyId) {
-                            affectedStudyIds.add(previousEnrollment.studyId);
-                        }
-                    }
-                });
-
-                if (affectedStudyIds.size > 0) {
-                    console.log(`Detected changes affecting ${affectedStudyIds.size} studies. Syncing with N.A.S.A...`);
-                    affectedStudyIds.forEach(studyId => {
-                        if (studyId) {
-                            notifyNasaOfUpdate(studyId);
+                    // OAG API format - adjust based on their actual API documentation
+                    const response = await fetch(`${OAG_API_URL}/flights?flightNumber=${flightNumber}`, {
+                        headers: {
+                            'Authorization': `Bearer ${OAG_API_KEY}`,
+                            'Content-Type': 'application/json'
                         }
                     });
+                    if (response.ok) {
+                        const apiData = await response.json();
+                        // Adjust response parsing based on OAG API structure
+                        if (apiData.data && apiData.data.length > 0) {
+                            const flight = apiData.data[0];
+                            return {
+                                status: 200,
+                                jsonBody: {
+                                    flightNumber: flight.flightNumber || flightNumber,
+                                    airline: flight.airline?.name || null,
+                                    origin: flight.origin?.airport || flight.origin?.iata || null,
+                                    destination: flight.destination?.airport || flight.destination?.iata || null,
+                                    departureTime: flight.departure?.scheduled || null,
+                                    arrivalTime: flight.arrival?.scheduled || null,
+                                    status: flight.status || 'scheduled',
+                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : null,
+                                    gate: flight.departure?.gate || null,
+                                    terminal: flight.departure?.terminal || null
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                    }
+                } catch (error) {
+                    context.log.warn('OAG API failed:', error.message);
                 }
-            } catch (error) {
-                console.error('Error handling patient changes:', error);
             }
-        };
-
-        // No authentication needed for Azure API
-
-        /**
-         * Show error message to user
-         * @param {string} message - Error message to display
-         */
-        const showErrorToUser = (message) => {
-            loadingIndicator.innerHTML = `
-                <div class="text-center">
-                    <div class="text-xl font-semibold text-red-500 mb-2">Error</div>
-                    <div class="text-gray-600 dark:text-gray-400">${message}</div>
-                    <button onclick="location.reload()" class="mt-4 px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">
-                        Refresh Page
-                    </button>
-                </div>
-            `;
-        };
-
-        // --- Study Management Functions ---
-        const handleSaveStudy = async (e) => {
-            e.preventDefault();
-            const form = e.target;
-            const studyId = form.dataset.id;
             
-            // Get form data
-            const formData = new FormData(form);
-            const data = Object.fromEntries(formData.entries());
-            
-            // Get selected indications
-            const selectedIndications = Array.from(form.querySelectorAll('input[name="indication"]:checked')).map(cb => cb.value);
-            
-            // Get selected site IDs
-            const selectedSiteIds = Array.from(form.querySelectorAll('input[name="siteIds"]:checked')).map(cb => cb.value);
-            
-            // Build site enrollment goals
-            const siteEnrollmentGoals = {};
-            selectedSiteIds.forEach(siteId => {
-                const goalInput = document.getElementById(`site-goal-${siteId}`);
-                if (goalInput && goalInput.value) {
-                    siteEnrollmentGoals[siteId] = parseInt(goalInput.value) || 0;
-                }
-            });
-            
-            // Build study data matching Azure schema
-            const studyData = {
-                protocolNumber: data.protocolNumber || "",
-                title: data.title,
-                target: parseInt(data.target) || 0,
-                status: data.status || "Recruiting",
-                indication: selectedIndications,
-                siteIds: selectedSiteIds,
-                washoutDays: parseInt(data.washoutDays) || 30,
-                siteEnrollmentGoals: siteEnrollmentGoals,
-                endDate: data.endDate || "",
-                startDate: data.startDate || "",
-                fpfv: data.fpfv || "",
-                lplv: data.lplv || ""
+            // If no API key configured or API call failed, return basic info with 200 status
+            // This allows the frontend to handle it gracefully
+            return {
+                status: 200,
+                jsonBody: {
+                    flightNumber: flightNumber,
+                    airline: null,
+                    origin: null,
+                    destination: null,
+                    departureTime: null,
+                    arrivalTime: null,
+                    status: 'scheduled',
+                    delay: null,
+                    gate: null,
+                    terminal: null,
+                    message: AVIATIONSTACK_KEY 
+                        ? 'Flight information not available. The flight may not be in the system or the API returned no data.'
+                        : 'Flight API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
+                },
+                headers: { 'Content-Type': 'application/json' }
             };
+            
+        } catch (error) {
+            context.log.error('Flight lookup error:', error.message, error.stack);
+            // Return 200 with error info instead of 500 so frontend can handle it
+            return {
+                status: 200,
+                jsonBody: { 
+                    flightNumber: flightNumber || 'unknown',
+                    airline: null,
+                    origin: null,
+                    destination: null,
+                    departureTime: null,
+                    arrivalTime: null,
+                    status: 'scheduled',
+                    delay: null,
+                    gate: null,
+                    terminal: null,
+                    message: `Flight lookup failed: ${error.message}. Please enter flight details manually.`
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    },
+});
 
-            try {
-                console.log('Saving study with data:', studyData);
-                console.log('Study ID:', studyId);
-                
-                let result;
-                if (studyId) {
-                    // Update existing study
-                    console.log('Updating existing study...');
-                    result = await apiService.updateStudy(studyId, studyData);
-                    console.log('Study updated successfully:', result);
-                    showNotification('Study updated successfully!', 'success');
-                } else {
-                    // Create new study
-                    console.log('Creating new study...');
-                    result = await apiService.createStudy(studyData);
-                    console.log('Study created successfully:', result);
-                    showNotification('Study created successfully!', 'success');
-                }
-                
-                // Close modal and refresh data
-                closeModal();
-                await initializeDataLoaders();
-                
-            } catch (error) {
-                console.error('Error saving study:', error);
-                console.error('Error details:', {
-                    message: error.message,
-                    stack: error.stack,
-                    studyData: studyData,
-                    studyId: studyId
-                });
-                showNotification(`Error saving study: ${error.message}`, 'error');
+// Azure Maps Geocoding Proxy
+app.http('geocode', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'geocode',
+    handler: async (request, context) => {
+        try {
+            const azureMapsKey = process.env.AZURE_MAPS_KEY || process.env.AZURE_MAPS_SUBSCRIPTION_KEY;
+            if (!azureMapsKey) {
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Azure Maps key not configured' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
             }
-        };
+            
+            // Get query parameters from the original request
+            let queryParams = '';
+            if (request.url) {
+                try {
+                    // Extract query string from URL
+                    let urlString = request.url;
+                    if (!urlString.startsWith('http')) {
+                        // Construct full URL if relative
+                        const host = request.headers?.['host'] || request.headers?.['x-forwarded-host'] || 'localhost';
+                        urlString = `https://${host}${urlString}`;
+                    }
+                    const url = new URL(urlString);
+                    queryParams = url.search; // This includes the leading ?
+                } catch (error) {
+                    context.log.warn('Error parsing URL for geocode:', error.message);
+                    // Fallback: extract query string manually
+                    const match = request.url.match(/\?(.+)/);
+                    if (match) {
+                        queryParams = '?' + match[1];
+                    } else {
+                        queryParams = '';
+                    }
+                }
+            }
+            
+            // Build the Azure Maps API URL - pass all query params and add subscription-key
+            const apiUrl = `https://atlas.microsoft.com/search/address/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
+            
+            try {
+                const response = await fetch(apiUrl);
+                const data = await response.json();
+                return {
+                    status: 200,
+                    jsonBody: data,
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            } catch (error) {
+                context.log.error('Azure Maps geocoding error:', error.message);
+                return {
+                    status: 500,
+                    jsonBody: { error: error.message },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+        } catch (error) {
+            context.log.error('Geocode endpoint error:', error.message);
+            return {
+                status: 500,
+                jsonBody: { error: error.message },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    }
+});
 
-        // /Run the app
-        init();
-        };
-    </script>
-</body>
-</html>
+// Azure Maps Route Directions Proxy
+app.http('routeDirections', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'route/directions',
+    handler: async (request, context) => {
+        try {
+            const azureMapsKey = process.env.AZURE_MAPS_KEY || process.env.AZURE_MAPS_SUBSCRIPTION_KEY;
+            if (!azureMapsKey) {
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Azure Maps key not configured' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Get query parameters from the original request
+            let queryParams = '';
+            if (request.url) {
+                try {
+                    // Extract query string from URL
+                    let urlString = request.url;
+                    if (!urlString.startsWith('http')) {
+                        // Construct full URL if relative
+                        const host = request.headers?.['host'] || request.headers?.['x-forwarded-host'] || 'localhost';
+                        urlString = `https://${host}${urlString}`;
+                    }
+                    const url = new URL(urlString);
+                    queryParams = url.search; // This includes the leading ?
+                } catch (error) {
+                    context.log.warn('Error parsing URL for route directions:', error.message);
+                    // Fallback: extract query string manually
+                    const match = request.url.match(/\?(.+)/);
+                    if (match) {
+                        queryParams = '?' + match[1];
+                    } else {
+                        queryParams = '';
+                    }
+                }
+            }
+            
+            // Build the Azure Maps API URL - pass all query params and add subscription-key
+            const apiUrl = `https://atlas.microsoft.com/route/directions/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
+            
+            try {
+                const response = await fetch(apiUrl);
+                const data = await response.json();
+                return {
+                    status: 200,
+                    jsonBody: data,
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            } catch (error) {
+                context.log.error('Azure Maps route directions error:', error.message);
+                return {
+                    status: 500,
+                    jsonBody: { error: error.message },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+        } catch (error) {
+            context.log.error('Route directions endpoint error:', error.message);
+            return {
+                status: 500,
+                jsonBody: { error: error.message },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    }
+});
