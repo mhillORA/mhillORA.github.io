@@ -5830,25 +5830,27 @@
                 }
 
                 if (roleList) {
-                    // Show only roles that are linked to trainings on at least one CRC, and dedupe by role name
-                    const linkedRoleNames = new Set();
-                    (state.crcs || []).forEach(crc => (crc.trainings || []).forEach(t => t?.name && linkedRoleNames.add(t.name)));
+                    // Show all roles, dedupe by role name (case-insensitive)
                     const seenNames = new Set();
+                    const seenIds = new Set();
                     const filteredRoles = (state.roles || []).filter(role => {
                         const name = (role?.name || '').trim();
                         if (!name) return false;
-                        if (!linkedRoleNames.has(name)) return false;
                         const key = name.toLowerCase();
+                        // If we've seen this name before, skip it (keep first occurrence)
                         if (seenNames.has(key)) return false;
+                        // Also check for duplicate IDs
+                        if (role.id && seenIds.has(role.id)) return false;
                         seenNames.add(key);
+                        if (role.id) seenIds.add(role.id);
                         return true;
                     });
-                    roleList.innerHTML = filteredRoles.map(role => `
+                    roleList.innerHTML = filteredRoles.length > 0 ? filteredRoles.map(role => `
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
                             <button data-action="edit-role" data-id="${role.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${role.name}</button>
                             <button data-action="delete-role" data-id="${role.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
                         </div>
-                    `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No linked roles found from trainings.</p>';
+                    `).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No roles found. Add a role to get started.</p>';
                 }
             };
 
@@ -9788,15 +9790,27 @@
                                 </div>
                                 <div class="max-h-40 overflow-y-auto custom-scrollbar">
                                     <div id="role-checkboxes">
-                                        ${state.roles ? state.roles.map(role => {
-                                            const isSelected = study.requiredRoles && study.requiredRoles.includes(role.id);
-                                            return `
-                                                <label class="flex items-center p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded cursor-pointer">
-                                                    <input type="checkbox" name="selectedRoles" value="${role.id}" ${isSelected ? 'checked' : ''} class="mr-3 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded">
-                                                    <span class="text-sm dark:text-gray-300">${role.name}</span>
-                                                </label>
-                                            `;
-                                        }).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No roles available. Add roles first.</p>'}
+                                        ${state.roles ? (() => {
+                                            // Deduplicate roles by name (case-insensitive)
+                                            const seenNames = new Set();
+                                            const uniqueRoles = state.roles.filter(role => {
+                                                const name = (role?.name || '').trim();
+                                                if (!name) return false;
+                                                const key = name.toLowerCase();
+                                                if (seenNames.has(key)) return false;
+                                                seenNames.add(key);
+                                                return true;
+                                            });
+                                            return uniqueRoles.length > 0 ? uniqueRoles.map(role => {
+                                                const isSelected = study.requiredRoles && study.requiredRoles.includes(role.id);
+                                                return `
+                                                    <label class="flex items-center p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded cursor-pointer">
+                                                        <input type="checkbox" name="selectedRoles" value="${role.id}" ${isSelected ? 'checked' : ''} class="mr-3 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded">
+                                                        <span class="text-sm dark:text-gray-300">${role.name}</span>
+                                                    </label>
+                                                `;
+                                            }).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No roles available. Add roles first.</p>';
+                                        })() : '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No roles available. Add roles first.</p>'}
                                     </div>
                                 </div>
                             </div>
@@ -11397,7 +11411,37 @@
                     // Sites and studies can only be managed from ARTEMIS - removed handlers
                     // case 'delete-crc-site': await apiService.deleteSite(id); break;
                     // case 'delete-study': await apiService.deleteStudy(id); break;
-                    case 'delete-role': await apiService.deleteRole(id); break;
+                    case 'delete-role': {
+                        const role = state.roles.find(r => r.id === id);
+                        if (role) {
+                            openModal(`
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Delete Role</h3>
+                                <p class="dark:text-gray-300 mb-6">Are you sure you want to delete the role <strong>${role.name}</strong>? This action cannot be undone and may affect existing schedules and assignments.</p>
+                                <div class="flex justify-end gap-4">
+                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                    <button data-action="confirm-delete-role" data-role-id="${role.id}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Role</button>
+                                </div>
+                            `);
+                        }
+                        break;
+                    }
+                    case 'confirm-delete-role': {
+                        try {
+                            const roleId = actionButton.dataset.roleId || id;
+                            await apiService.deleteRole(roleId);
+                            setState({
+                                roles: state.roles.filter(r => r.id !== roleId)
+                            });
+                            showNotification('Role deleted successfully!', 'success');
+                            closeModal();
+                            // Re-render the role list
+                            renderCRCLists();
+                        } catch (error) {
+                            console.error('Error deleting role:', error);
+                            showNotification('Failed to delete role. See console for details.', 'error');
+                        }
+                        break;
+                    }
                     case 'delete-crc-event': {
                         if (groupId) {
                             openModal(`
@@ -12427,10 +12471,26 @@
                     }
                     case 'add-role-form': {
                         try {
+                            const roleName = (data.roleName || '').trim();
+                            if (!roleName) {
+                                showNotification('Role name is required.', 'error');
+                                break;
+                            }
+                            // Check for duplicate role names (case-insensitive)
+                            const existingRole = state.roles.find(r => r.name && r.name.trim().toLowerCase() === roleName.toLowerCase());
+                            if (existingRole) {
+                                showNotification(`A role with the name "${roleName}" already exists.`, 'error');
+                                break;
+                            }
                             const linkedTrainings = formData.getAll('linkedTrainings').filter(Boolean);
-                            await apiService.createRole({ name: data.roleName, linkedTrainings });
+                            const newRole = await apiService.createRole({ name: roleName, linkedTrainings });
+                            setState({
+                                roles: [...state.roles, newRole]
+                            });
                             showNotification('Role added successfully!', 'success');
                             form.reset();
+                            // Re-render the role list
+                            renderCRCLists();
                         } catch (error) {
                             console.error("Error adding role:", error);
                             showNotification('Failed to add role. See console for details.', 'error');
@@ -12792,8 +12852,19 @@
                                 siteRoleRequirements: siteRoleRequirements,
                                 lastUpdated: new Date().toISOString()
                             };
+                            
                             // Remove system fields if present
                             ['_rid','_self','_etag','_attachments','_ts'].forEach(k => { if (k in updateData) delete updateData[k]; });
+                            
+                            // When updating from CHAOS, we're adding CHAOS-specific fields (name, color, requiredRoles)
+                            // This makes the validation think it's CHAOS format, which expects CHAOS status values
+                            // But ARTEMIS studies have ARTEMIS status values (Recruiting, Enrolling, etc.)
+                            // Since status is controlled by ARTEMIS, remove it from the update to avoid validation errors
+                            // The status will remain as it was in ARTEMIS
+                            if (updateData.status && ['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended'].includes(updateData.status)) {
+                                // Remove ARTEMIS status field - status is controlled by ARTEMIS, not CHAOS
+                                delete updateData.status;
+                            }
                             
                             console.log('CHAOS: Study update data:', JSON.stringify(updateData, null, 2));
                             
@@ -12816,12 +12887,25 @@
                     case 'edit-role-form': {
                         try {
                             const roleId = form.dataset.id;
+                            const roleName = (data.roleName || '').trim();
+                            if (!roleName) {
+                                showNotification('Role name is required.', 'error');
+                                break;
+                            }
+                            
+                            // Check for duplicate role names (case-insensitive) - excluding the current role
+                            const existingRole = state.roles.find(r => r.id !== roleId && r.name && r.name.trim().toLowerCase() === roleName.toLowerCase());
+                            if (existingRole) {
+                                showNotification(`A role with the name "${roleName}" already exists.`, 'error');
+                                break;
+                            }
+                            
                             const linkedTrainingNames = formData.getAll('linkedTrainingNames').filter(Boolean);
                             
-                            console.log('Updating role:', { roleId, roleName: data.roleName, trainingNames: linkedTrainingNames });
+                            console.log('Updating role:', { roleId, roleName, trainingNames: linkedTrainingNames });
                             
                             const updateData = { 
-                                name: data.roleName, 
+                                name: roleName, 
                                 trainingNames: linkedTrainingNames 
                             };
                             
@@ -12839,6 +12923,8 @@
                             
                             showNotification('Role updated successfully!', 'success');
                             closeModal();
+                            // Re-render the role list
+                            renderCRCLists();
                         } catch (error) {
                             console.error('Error updating role:', error);
                             showNotification('Failed to update role. See console for details.', 'error');
