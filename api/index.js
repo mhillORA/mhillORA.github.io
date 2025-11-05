@@ -1,7 +1,7 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
-// Node.js 18+ has fetch built-in, no polyfill needed
+// Node.js 18+ has fetch built-in, no polyfill needed new build
 
 // Helper function to generate unique IDs
 function generateId() {
