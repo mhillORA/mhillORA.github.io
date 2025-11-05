@@ -835,7 +835,11 @@
         };
 
         const renderHeaderButtons = () => {
-             headerButtons.innerHTML = `
+            if (!headerButtons) {
+                console.error('Header buttons element not found');
+                return;
+            }
+            headerButtons.innerHTML = `
                  <div class="flex flex-wrap justify-center sm:justify-end items-center space-x-2">
                      <button id="dashboard-tab-btn" class="px-3 py-2 text-sm font-medium rounded-md ${activeTab === 'dashboard' ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200' : 'text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'}">Dashboard</button>
                      <button id="studies-tab-btn" class="px-3 py-2 text-sm font-medium rounded-md ${activeTab === 'studies' ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200' : 'text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'}">Studies</button>
@@ -2114,6 +2118,31 @@
         };
 
         // Removed Google Maps and Bing Maps initialization - using Azure Maps only
+        
+        // Geocode address using Azure Maps Search API
+        const geocodeAddress = async (address) => {
+            if (!AZURE_MAPS_KEY || !address) return null;
+            
+            try {
+                const response = await fetch(
+                    `https://atlas.microsoft.com/search/address/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}&query=${encodeURIComponent(address)}`
+                );
+                const data = await response.json();
+                if (data && data.results && data.results.length > 0) {
+                    const result = data.results[0];
+                    const position = result.position;
+                    if (position && position.lat && position.lon) {
+                        return {
+                            lat: position.lat,
+                            lng: position.lon
+                        };
+                    }
+                }
+            } catch (error) {
+                console.error('Error geocoding address:', address, error);
+            }
+            return null;
+        };
 
         const loadMapMarkers = () => {
             if (!azureMap) {
@@ -2134,13 +2163,115 @@
                 azureMap.sources.clear();
             }
             
-            const sites = allSites.filter(site => site.latitude && site.longitude);
-            const crcs = allCrcs.filter(crc => crc.coordinates && crc.coordinates.lat && crc.coordinates.lng);
+            // Filter sites - check for coordinates first, then address
+            const sitesWithCoords = allSites.filter(site => site.latitude && site.longitude);
+            const sitesWithAddress = allSites.filter(site => !site.latitude && !site.longitude && (site.address1 || site.city || site.state));
             
-            console.log('Filtered sites with coordinates:', sites.length, 'Filtered CRCs with coordinates:', crcs.length);
+            // Filter CRCs - check for coordinates first, then address
+            const crcsWithCoords = allCrcs.filter(crc => crc.coordinates && crc.coordinates.lat && crc.coordinates.lng);
+            const crcsWithAddress = allCrcs.filter(crc => (!crc.coordinates || !crc.coordinates.lat) && crc.homeLocation);
+            
+            console.log('Sites with coordinates:', sitesWithCoords.length, 'Sites with address only:', sitesWithAddress.length);
+            console.log('CRCs with coordinates:', crcsWithCoords.length, 'CRCs with address only:', crcsWithAddress.length);
+            
+            // Start with sites that have coordinates
+            const sites = sitesWithCoords;
+            const crcs = crcsWithCoords;
             
             const markers = [];
             azureMapMarkers = []; // Reset marker data
+            
+            // Geocode sites with addresses only (async) - process after initial markers are added
+            const geocodeSitesWithAddress = async () => {
+                if (sitesWithAddress.length > 0 && AZURE_MAPS_KEY) {
+                    console.log('Geocoding sites with addresses...');
+                    for (const site of sitesWithAddress) {
+                        try {
+                            const addressParts = [site.address1, site.city, site.state, site.zip].filter(p => p && p.trim());
+                            if (addressParts.length > 0) {
+                                const fullAddress = addressParts.join(', ');
+                                const coords = await geocodeAddress(fullAddress);
+                                if (coords && azureMap) {
+                                    // Create marker for geocoded site
+                                    const siteWithCoords = { ...site, latitude: coords.lat, longitude: coords.lng };
+                                    const lat = parseFloat(coords.lat);
+                                    const lng = parseFloat(coords.lng);
+                                    
+                                    const sitePatients = allPatients.filter(p => {
+                                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                                        return currentEnrollment?.siteId === site.id;
+                                    });
+                                    const enrolledCount = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
+                                    const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
+                                    
+                                    let color = '#3b82f6';
+                                    if (currentMapView === 'studies') {
+                                        color = studiesAtSite.length > 3 ? '#10b981' : studiesAtSite.length > 1 ? '#f59e0b' : '#ef4444';
+                                    } else if (currentMapView === 'staffing') {
+                                        color = enrolledCount > 20 ? '#10b981' : enrolledCount > 10 ? '#f59e0b' : '#ef4444';
+                                    } else if (currentMapView === 'combined') {
+                                        color = '#8b5cf6';
+                                    }
+                                    
+                                    const markerHtml = `<div style="background-color: ${color}; border: 2px solid white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); cursor: pointer;">${enrolledCount > 99 ? '99+' : enrolledCount}</div>`;
+                                    const marker = new atlas.HtmlMarker({ htmlContent: markerHtml, position: [lng, lat], pixelOffset: [0, -16] });
+                                    const popup = new atlas.Popup({ content: createInfoWindowContent(siteWithCoords, enrolledCount, studiesAtSite), pixelOffset: [0, -40] });
+                                    marker.events.add('click', () => { popup.open(azureMap); popup.setPosition([lng, lat]); });
+                                    azureMap.markers.add(marker);
+                                    markers.push({ position: [lng, lat], marker: marker });
+                                    azureMapMarkers.push({ marker: marker, popup: popup, data: { type: 'site', name: site.name, city: site.city || '', state: site.state || '', studies: studiesAtSite.map(s => s.title) } });
+                                }
+                            }
+                        } catch (error) {
+                            console.warn('Error geocoding site:', site.name, error);
+                        }
+                    }
+                }
+            };
+            
+            // Geocode CRCs with addresses only (async)
+            const geocodeCRCsWithAddress = async () => {
+                if (crcsWithAddress.length > 0 && AZURE_MAPS_KEY) {
+                    console.log('Geocoding CRCs with addresses...');
+                    for (const crc of crcsWithAddress) {
+                        try {
+                            if (crc.homeLocation) {
+                                const coords = await geocodeAddress(crc.homeLocation);
+                                if (coords && azureMap) {
+                                    const lat = parseFloat(coords.lat);
+                                    const lng = parseFloat(coords.lng);
+                                    
+                                    const crcIconHtml = `<div style="background-color: #10b981; color: white; border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 14px; cursor: pointer;">👤</div>`;
+                                    const marker = new atlas.HtmlMarker({ htmlContent: crcIconHtml, position: [lng, lat], pixelOffset: [0, -14] });
+                                    const popupContent = `<div style="min-width: 200px;"><h3 style="font-weight: bold; font-size: 16px; margin-bottom: 8px; color: #10b981;">🏠 CRC Home Location</h3><p style="margin: 4px 0;"><strong>Name:</strong> ${crc.name}</p>${crc.title ? `<p style="margin: 4px 0;"><strong>Title:</strong> ${crc.title}</p>` : ''}<p style="margin: 4px 0;"><strong>Location:</strong> ${crc.homeLocation}</p>${crc.region ? `<p style="margin: 4px 0;"><strong>Region:</strong> ${crc.region}</p>` : ''}${crc.employmentType ? `<p style="margin: 4px 0;"><strong>Type:</strong> ${crc.employmentType}</p>` : ''}</div>`;
+                                    const popup = new atlas.Popup({ content: popupContent, pixelOffset: [0, -40] });
+                                    marker.events.add('click', () => { popup.open(azureMap); popup.setPosition([lng, lat]); });
+                                    azureMap.markers.add(marker);
+                                    markers.push({ position: [lng, lat], marker: marker });
+                                    azureMapMarkers.push({ marker: marker, popup: popup, data: { type: 'crc', name: crc.name, location: crc.homeLocation, region: crc.region || '' } });
+                                }
+                            }
+                        } catch (error) {
+                            console.warn('Error geocoding CRC:', crc.name, error);
+                        }
+                    }
+                }
+            };
+            
+            // Geocode addresses after initial markers are added
+            Promise.all([geocodeSitesWithAddress(), geocodeCRCsWithAddress()]).then(() => {
+                // Update map bounds after all markers are added
+                if (markers.length > 0 && azureMap) {
+                    try {
+                        const positions = markers.map(m => m.position);
+                        const bounds = atlas.data.BoundingBox.fromPositions(positions);
+                        azureMap.setCamera({ bounds: bounds, padding: 50 });
+                        console.log('Map bounds updated after geocoding. Total markers:', markers.length);
+                    } catch (error) {
+                        console.error('Error updating map bounds:', error);
+                    }
+                }
+            });
             
             // Add site markers
             sites.forEach(site => {
@@ -3036,7 +3167,7 @@
             modalContainer.innerHTML = '';
         };
 
-        const geocodeAddress = async () => {
+        const geocodeAddressFromForm = async () => {
             const address1 = document.getElementById('address1')?.value || '';
             const city = document.getElementById('city')?.value || '';
             const state = document.getElementById('state')?.value || '';
@@ -4262,7 +4393,7 @@ ${results.map(r => {
                 handleImport(fileInput.files[0]);
             }
             if (e.target.id === 'geocode-address-btn') {
-                geocodeAddress();
+                geocodeAddressFromForm();
             }
         });
         
@@ -4558,6 +4689,12 @@ ${results.map(r => {
 
                 // Hide loading indicator and render
                 loadingIndicator.style.display = 'none';
+                
+                // Render header buttons first
+                if (headerButtons) {
+                    renderHeaderButtons();
+                }
+                
                 render();
                 
                 // Reload map markers if map is already initialized
