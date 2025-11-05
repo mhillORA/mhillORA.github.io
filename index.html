@@ -1206,6 +1206,119 @@
                 return null;
             };
             
+            // Initialize hotel-site map with animation
+            let hotelSiteMap = null;
+            let hotelSiteAnimation = null;
+            let hotelSitePoint = null;
+            let hotelSiteDataSource = null;
+            let currentHotelCoords = null;
+            let currentSiteCoords = null;
+            
+            // Show hotel location on map (without route)
+            const showHotelLocationOnly = async (hotelCoords) => {
+                if (!hotelCoords) return;
+                
+                const mapContainer = document.getElementById('hotel-site-map');
+                const mapContainerWrapper = document.getElementById('hotel-site-map-container');
+                
+                if (!mapContainer || !mapContainerWrapper) return;
+                
+                currentHotelCoords = hotelCoords;
+                
+                // Wait for Azure Maps key
+                if (!AZURE_MAPS_KEY) {
+                    setTimeout(() => showHotelLocationOnly(hotelCoords), 500);
+                    return;
+                }
+                
+                // Check if atlas is loaded
+                if (typeof atlas === 'undefined') {
+                    console.error('Azure Maps SDK not loaded');
+                    return;
+                }
+                
+                // Dispose existing map if it exists
+                if (hotelSiteMap) {
+                    hotelSiteMap.dispose();
+                    hotelSiteMap = null;
+                    hotelSiteAnimation = null;
+                    hotelSitePoint = null;
+                    hotelSiteDataSource = null;
+                }
+                
+                try {
+                    // Initialize map
+                    hotelSiteMap = new atlas.Map('hotel-site-map', {
+                        center: [hotelCoords.lng, hotelCoords.lat],
+                        zoom: 13,
+                        authOptions: {
+                            authType: 'subscriptionKey',
+                            subscriptionKey: AZURE_MAPS_KEY
+                        },
+                        style: document.documentElement.classList.contains('dark') ? 'dark' : 'road'
+                    });
+                    
+                    hotelSiteMap.events.add('ready', () => {
+                        // Create data source
+                        hotelSiteDataSource = new atlas.source.DataSource();
+                        hotelSiteMap.sources.add(hotelSiteDataSource);
+                        
+                        // Add hotel marker
+                        const hotelMarker = new atlas.HtmlMarker({
+                            htmlContent: `
+                                <div style="background-color: #10b981; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
+                                    🏨
+                                </div>
+                            `,
+                            position: [hotelCoords.lng, hotelCoords.lat],
+                            pixelOffset: [0, -16]
+                        });
+                        
+                        hotelSiteMap.markers.add(hotelMarker);
+                        
+                        // Center map on hotel
+                        hotelSiteMap.setCamera({
+                            center: [hotelCoords.lng, hotelCoords.lat],
+                            zoom: 13
+                        });
+                    });
+                } catch (error) {
+                    console.error('Error initializing hotel map:', error);
+                }
+            };
+            
+            // Calculate route and show on map
+            const calculateRoute = async (hotelCoords, siteCoords, siteName) => {
+                const distanceDisplay = document.getElementById('distance-display');
+                const distanceText = document.getElementById('distance-text');
+                const calculateBtn = document.getElementById('calculate-route-btn');
+                
+                if (!distanceDisplay || !distanceText) return;
+                
+                distanceDisplay.classList.remove('hidden');
+                distanceText.textContent = 'Calculating route...';
+                if (calculateBtn) calculateBtn.classList.add('hidden');
+                
+                try {
+                    // Calculate distance
+                    const distanceInfo = await calculateDistance(hotelCoords, siteCoords);
+                    if (distanceInfo && distanceInfo.path && distanceInfo.path.length > 0) {
+                        distanceText.textContent = `Distance to ${siteName}: ${distanceInfo.distance} miles (${distanceInfo.travelTime} minutes drive)`;
+                        if (calculateBtn) calculateBtn.classList.add('hidden');
+                        
+                        // Show route on map
+                        showHotelSiteMap(distanceInfo.path, hotelCoords, siteCoords, siteName);
+                    } else {
+                        distanceText.textContent = 'Unable to calculate route. Please check the address.';
+                        if (calculateBtn) calculateBtn.classList.remove('hidden');
+                    }
+                } catch (error) {
+                    console.error('Error calculating route:', error);
+                    distanceText.textContent = 'Error calculating route. Please try again.';
+                    if (calculateBtn) calculateBtn.classList.remove('hidden');
+                }
+            };
+            
             // Setup hotel distance calculation
             const setupHotelDistanceCalculation = () => {
                 const hotelAddressInput = document.getElementById('hotel-address-input');
@@ -1215,255 +1328,254 @@
                 const siteVisitingInput = document.getElementById('site-visiting-input');
                 const distanceDisplay = document.getElementById('distance-display');
                 const distanceText = document.getElementById('distance-text');
+                const calculateBtn = document.getElementById('calculate-route-btn');
                 
-                if (!hotelAddressInput || !siteVisitingInput || !distanceDisplay) return;
+                if (!hotelAddressInput) return;
                 
-                let debounceTimer;
-                const calculateAndDisplayDistance = async () => {
-                    const siteId = siteVisitingInput?.value;
+                let hotelDebounceTimer;
+                let routeDebounceTimer;
+                
+                // Function to show hotel location (called when address is typed)
+                const updateHotelLocation = async () => {
                     const address = hotelAddressInput?.value || '';
                     const city = hotelCityInput?.value || '';
                     const state = hotelStateInput?.value || '';
                     const zip = hotelZipInput?.value || '';
                     
-                    if (!siteId || (!address && !city && !state)) {
-                        distanceDisplay.classList.add('hidden');
-                        return;
-                    }
-                    
-                    if (!state.crc_sites || !Array.isArray(state.crc_sites)) {
-                        distanceDisplay.classList.add('hidden');
-                        return;
-                    }
-                    
-                    const site = state.crc_sites.find(s => s.id === siteId);
-                    if (!site || !site.latitude || !site.longitude) {
-                        distanceDisplay.classList.add('hidden');
-                        return;
-                    }
-                    
                     // Build full address string
                     const addressParts = [address, city, state, zip].filter(p => p && p.trim());
                     if (addressParts.length === 0) {
-                        distanceDisplay.classList.add('hidden');
                         return;
                     }
                     
                     const fullAddress = addressParts.join(', ');
                     
-                    distanceDisplay.classList.remove('hidden');
-                    distanceText.textContent = 'Calculating distance...';
-                    
                     try {
                         // Geocode hotel address
                         const hotelCoords = await geocodeLocation(fullAddress);
-                        if (!hotelCoords) {
-                            distanceText.textContent = 'Unable to find hotel location. Please check the address.';
-                            return;
-                        }
-                        
-                        // Get site coordinates
-                        const siteCoords = {
-                            lat: parseFloat(site.latitude),
-                            lng: parseFloat(site.longitude)
-                        };
-                        
-                        // Calculate distance
-                        const distanceInfo = await calculateDistance(hotelCoords, siteCoords);
-                        if (distanceInfo) {
-                            distanceText.textContent = `Distance to ${site.name}: ${distanceInfo.distance} miles (${distanceInfo.travelTime} minutes drive)`;
+                        if (hotelCoords) {
+                            // Show hotel location on map
+                            await showHotelLocationOnly(hotelCoords);
                             
-                            // Show map and animate route
-                            if (distanceInfo.path && distanceInfo.path.length > 0) {
-                                showHotelSiteMap(distanceInfo.path, hotelCoords, siteCoords, site.name);
+                            // If site is selected, calculate route
+                            const siteId = siteVisitingInput?.value;
+                            if (siteId && state.crc_sites && Array.isArray(state.crc_sites)) {
+                                const site = state.crc_sites.find(s => s.id === siteId);
+                                if (site && site.latitude && site.longitude) {
+                                    const siteCoords = {
+                                        lat: parseFloat(site.latitude),
+                                        lng: parseFloat(site.longitude)
+                                    };
+                                    currentSiteCoords = siteCoords;
+                                    await calculateRoute(hotelCoords, siteCoords, site.name);
+                                }
                             }
-                        } else {
-                            distanceText.textContent = 'Unable to calculate distance. Please check the address.';
-                            document.getElementById('hotel-site-map-container')?.classList.add('hidden');
                         }
                     } catch (error) {
-                        console.error('Error calculating distance:', error);
-                        distanceText.textContent = 'Error calculating distance. Please try again.';
+                        console.error('Error geocoding hotel address:', error);
                     }
                 };
                 
-                // Add event listeners with debounce
-                const inputs = [hotelAddressInput, hotelCityInput, hotelStateInput, hotelZipInput, siteVisitingInput];
-                inputs.forEach(input => {
+                // Function to calculate route when site is selected
+                const updateRoute = async () => {
+                    const siteId = siteVisitingInput?.value;
+                    if (!siteId || !currentHotelCoords) {
+                        if (distanceDisplay) distanceDisplay.classList.add('hidden');
+                        return;
+                    }
+                    
+                    if (!state.crc_sites || !Array.isArray(state.crc_sites)) {
+                        if (distanceDisplay) distanceDisplay.classList.add('hidden');
+                        return;
+                    }
+                    
+                    const site = state.crc_sites.find(s => s.id === siteId);
+                    if (!site || !site.latitude || !site.longitude) {
+                        if (distanceDisplay) distanceDisplay.classList.add('hidden');
+                        return;
+                    }
+                    
+                    const siteCoords = {
+                        lat: parseFloat(site.latitude),
+                        lng: parseFloat(site.longitude)
+                    };
+                    currentSiteCoords = siteCoords;
+                    
+                    // Calculate route
+                    await calculateRoute(currentHotelCoords, siteCoords, site.name);
+                };
+                
+                // Add event listeners for hotel address inputs (debounced)
+                const hotelInputs = [hotelAddressInput, hotelCityInput, hotelStateInput, hotelZipInput];
+                hotelInputs.forEach(input => {
                     if (input) {
                         input.addEventListener('input', () => {
-                            clearTimeout(debounceTimer);
-                            debounceTimer = setTimeout(calculateAndDisplayDistance, 500);
+                            clearTimeout(hotelDebounceTimer);
+                            hotelDebounceTimer = setTimeout(updateHotelLocation, 500);
                         });
-                        input.addEventListener('change', calculateAndDisplayDistance);
+                        input.addEventListener('change', updateHotelLocation);
                     }
                 });
                 
-                        // Calculate immediately if values are already present
-                        if (siteVisitingInput.value && (hotelAddressInput.value || hotelCityInput.value)) {
-                            calculateAndDisplayDistance();
+                // Add event listener for site selection (debounced)
+                if (siteVisitingInput) {
+                    siteVisitingInput.addEventListener('change', () => {
+                        clearTimeout(routeDebounceTimer);
+                        routeDebounceTimer = setTimeout(updateRoute, 300);
+                    });
+                }
+                
+                // Add event listener for Calculate Route button
+                if (calculateBtn) {
+                    calculateBtn.addEventListener('click', async () => {
+                        if (currentHotelCoords && currentSiteCoords && siteVisitingInput?.value) {
+                            const site = state.crc_sites.find(s => s.id === siteVisitingInput.value);
+                            if (site) {
+                                await calculateRoute(currentHotelCoords, currentSiteCoords, site.name);
+                            }
                         }
-                    };
+                    });
+                }
+                
+                // Initialize if values are already present
+                if (hotelAddressInput.value || hotelCityInput.value) {
+                    updateHotelLocation();
+                }
+            };
+            
+            const showHotelSiteMap = (path, hotelCoords, siteCoords, siteName) => {
+                console.log('showHotelSiteMap called', { path, hotelCoords, siteCoords, siteName });
+                
+                const mapContainer = document.getElementById('hotel-site-map');
+                const mapContainerWrapper = document.getElementById('hotel-site-map-container');
+                
+                if (!mapContainer || !mapContainerWrapper) {
+                    console.error('Hotel-site map container not found in DOM');
+                    return;
+                }
+                
+                // Map is already visible, just update it with route
+                // Wait for Azure Maps key
+                if (!AZURE_MAPS_KEY) {
+                    setTimeout(() => showHotelSiteMap(path, hotelCoords, siteCoords, siteName), 500);
+                    return;
+                }
+                
+                // Check if atlas is loaded
+                if (typeof atlas === 'undefined') {
+                    console.error('Azure Maps SDK not loaded');
+                    return;
+                }
+                
+                // Dispose existing map if it exists
+                if (hotelSiteMap) {
+                    hotelSiteMap.dispose();
+                    hotelSiteMap = null;
+                    hotelSiteAnimation = null;
+                    hotelSitePoint = null;
+                    hotelSiteDataSource = null;
+                }
+                
+                try {
+                    // Initialize map
+                    hotelSiteMap = new atlas.Map('hotel-site-map', {
+                        center: [hotelCoords.lng, hotelCoords.lat],
+                        zoom: 12,
+                        authOptions: {
+                            authType: 'subscriptionKey',
+                            subscriptionKey: AZURE_MAPS_KEY
+                        },
+                        style: document.documentElement.classList.contains('dark') ? 'dark' : 'road'
+                    });
                     
-                    // Initialize hotel-site map with animation
-                    let hotelSiteMap = null;
-                    let hotelSiteAnimation = null;
-                    let hotelSitePoint = null;
-                    let hotelSiteDataSource = null;
-                    
-                    const showHotelSiteMap = (path, hotelCoords, siteCoords, siteName) => {
-                        console.log('showHotelSiteMap called', { path, hotelCoords, siteCoords, siteName });
+                    hotelSiteMap.events.add('ready', () => {
+                        // Create data source
+                        hotelSiteDataSource = new atlas.source.DataSource();
+                        hotelSiteMap.sources.add(hotelSiteDataSource);
                         
-                        const mapContainer = document.getElementById('hotel-site-map');
-                        const mapContainerWrapper = document.getElementById('hotel-site-map-container');
+                        // Add route line
+                        hotelSiteDataSource.add(new atlas.data.LineString(path));
                         
-                        if (!mapContainer) {
-                            console.error('Hotel-site map container not found in DOM');
-                            return;
-                        }
-                        if (!mapContainerWrapper) {
-                            console.error('Hotel-site map container wrapper not found in DOM');
-                            return;
-                        }
+                        // Create point for animation
+                        hotelSitePoint = new atlas.Shape(new atlas.data.Point([hotelCoords.lng, hotelCoords.lat]));
+                        hotelSiteDataSource.add(hotelSitePoint);
                         
-                        console.log('Map containers found, showing map');
-                        mapContainerWrapper.classList.remove('hidden');
+                        // Add line layer
+                        hotelSiteMap.layers.add(new atlas.layer.LineLayer(hotelSiteDataSource, null, {
+                            strokeColor: '#3b82f6',
+                            strokeWidth: 4
+                        }));
                         
-                        // Wait for Azure Maps key
-                        if (!AZURE_MAPS_KEY) {
-                            console.log('Azure Maps key not loaded yet, waiting...');
-                            setTimeout(() => showHotelSiteMap(path, hotelCoords, siteCoords, siteName), 500);
-                            return;
-                        }
+                        // Add symbol layer for animated point
+                        hotelSiteMap.layers.add(new atlas.layer.SymbolLayer(hotelSiteDataSource, null, {
+                            iconOptions: {
+                                ignorePlacement: true,
+                                allowOverlap: true,
+                                rotation: ['get', 'heading'],
+                                rotationAlignment: 'map',
+                                image: 'marker-red',
+                                size: 0.5
+                            },
+                            filter: ['any', ['==', ['geometry-type'], 'Point'], ['==', ['geometry-type'], 'MultiPoint']]
+                        }));
                         
-                        // Check if atlas is loaded
-                        if (typeof atlas === 'undefined') {
-                            console.error('Azure Maps SDK not loaded');
-                            return;
-                        }
+                        // Add markers for hotel and site
+                        const hotelMarker = new atlas.HtmlMarker({
+                            htmlContent: `
+                                <div style="background-color: #10b981; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
+                                    🏨
+                                </div>
+                            `,
+                            position: [hotelCoords.lng, hotelCoords.lat],
+                            pixelOffset: [0, -16]
+                        });
                         
-                        console.log('Initializing Azure Map with key:', AZURE_MAPS_KEY ? 'Key present' : 'Key missing');
+                        const siteMarker = new atlas.HtmlMarker({
+                            htmlContent: `
+                                <div style="background-color: #3b82f6; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
+                                    📍
+                                </div>
+                            `,
+                            position: [siteCoords.lng, siteCoords.lat],
+                            pixelOffset: [0, -16]
+                        });
                         
-                        // Dispose existing map if it exists
-                        if (hotelSiteMap) {
-                            hotelSiteMap.dispose();
-                            hotelSiteMap = null;
-                            hotelSiteAnimation = null;
-                            hotelSitePoint = null;
-                            hotelSiteDataSource = null;
-                        }
+                        hotelSiteMap.markers.add([hotelMarker, siteMarker]);
                         
-                        try {
-                            console.log('Creating Azure Map instance...');
-                            
-                            // Initialize map
-                            hotelSiteMap = new atlas.Map('hotel-site-map', {
-                                center: [hotelCoords.lng, hotelCoords.lat],
-                                zoom: 12,
-                                authOptions: {
-                                    authType: 'subscriptionKey',
-                                    subscriptionKey: AZURE_MAPS_KEY
-                                },
-                                style: document.documentElement.classList.contains('dark') ? 'dark' : 'road'
-                            });
-                            
-                            console.log('Azure Map instance created, waiting for ready event...');
-                            
-                            hotelSiteMap.events.add('ready', () => {
-                                console.log('Azure Map ready event fired');
-                                // Create data source
-                                hotelSiteDataSource = new atlas.source.DataSource();
-                                hotelSiteMap.sources.add(hotelSiteDataSource);
-                                
-                                // Add route line
-                                hotelSiteDataSource.add(new atlas.data.LineString(path));
-                                
-                                // Create point for animation
-                                hotelSitePoint = new atlas.Shape(new atlas.data.Point([hotelCoords.lng, hotelCoords.lat]));
-                                hotelSiteDataSource.add(hotelSitePoint);
-                                
-                                // Add line layer
-                                hotelSiteMap.layers.add(new atlas.layer.LineLayer(hotelSiteDataSource, null, {
-                                    strokeColor: '#3b82f6',
-                                    strokeWidth: 4
-                                }));
-                                
-                                // Add symbol layer for animated point
-                                hotelSiteMap.layers.add(new atlas.layer.SymbolLayer(hotelSiteDataSource, null, {
-                                    iconOptions: {
-                                        ignorePlacement: true,
-                                        allowOverlap: true,
-                                        rotation: ['get', 'heading'],
-                                        rotationAlignment: 'map',
-                                        image: 'marker-red',
-                                        size: 0.5
-                                    },
-                                    filter: ['any', ['==', ['geometry-type'], 'Point'], ['==', ['geometry-type'], 'MultiPoint']]
-                                }));
-                                
-                                // Add markers for hotel and site
-                                const hotelMarker = new atlas.HtmlMarker({
-                                    htmlContent: `
-                                        <div style="background-color: #10b981; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
-                                            🏨
-                                        </div>
-                                    `,
-                                    position: [hotelCoords.lng, hotelCoords.lat],
-                                    pixelOffset: [0, -16]
-                                });
-                                
-                                const siteMarker = new atlas.HtmlMarker({
-                                    htmlContent: `
-                                        <div style="background-color: #3b82f6; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 18px;">
-                                            📍
-                                        </div>
-                                    `,
-                                    position: [siteCoords.lng, siteCoords.lat],
-                                    pixelOffset: [0, -16]
-                                });
-                                
-                                hotelSiteMap.markers.add([hotelMarker, siteMarker]);
-                                
-                                // Fit map to show both points
-                                const bounds = atlas.data.BoundingBox.fromPositions([
-                                    [hotelCoords.lng, hotelCoords.lat],
-                                    [siteCoords.lng, siteCoords.lat]
-                                ]);
-                                hotelSiteMap.setCamera({
-                                    bounds: bounds,
-                                    padding: 50
-                                });
-                                
-                                // Add click event to animate
-                                hotelSiteMap.events.add('click', () => {
-                                    if (hotelSiteAnimation) {
-                                        hotelSiteAnimation.reset();
-                                        hotelSiteAnimation.play();
-                                    } else if (typeof atlas !== 'undefined' && atlas.animations) {
-                                        hotelSiteAnimation = atlas.animations.moveAlongPath(
-                                            path,
-                                            hotelSitePoint,
-                                            {
-                                                duration: 3000,
-                                                captureMetadata: true,
-                                                autoPlay: true
-                                            }
-                                        );
-                                    } else {
-                                        console.warn('Azure Maps Animation library not loaded');
+                        // Fit map to show both points
+                        const bounds = atlas.data.BoundingBox.fromPositions([
+                            [hotelCoords.lng, hotelCoords.lat],
+                            [siteCoords.lng, siteCoords.lat]
+                        ]);
+                        hotelSiteMap.setCamera({
+                            bounds: bounds,
+                            padding: 50
+                        });
+                        
+                        // Add click event to animate
+                        hotelSiteMap.events.add('click', () => {
+                            if (hotelSiteAnimation) {
+                                hotelSiteAnimation.reset();
+                                hotelSiteAnimation.play();
+                            } else if (typeof atlas !== 'undefined' && atlas.animations) {
+                                hotelSiteAnimation = atlas.animations.moveAlongPath(
+                                    path,
+                                    hotelSitePoint,
+                                    {
+                                        duration: 3000,
+                                        captureMetadata: true,
+                                        autoPlay: true
                                     }
-                                });
-                            });
-                        } catch (error) {
-                            console.error('Error initializing hotel-site map:', error);
-                            console.error('Error details:', error.message, error.stack);
-                            // Show error message to user
-                            const errorDiv = document.createElement('div');
-                            errorDiv.className = 'mt-2 p-2 bg-red-50 dark:bg-red-900/20 rounded-md';
-                            errorDiv.textContent = `Error loading map: ${error.message}`;
-                            mapContainerWrapper.appendChild(errorDiv);
-                        }
-                    };
+                                );
+                            } else {
+                                console.warn('Azure Maps Animation library not loaded');
+                            }
+                        });
+                    });
+                } catch (error) {
+                    console.error('Error initializing hotel-site map:', error);
+                }
+            };
             
             const getDaySaturdayStart = (date) => {
                 const day = date.getDay();
@@ -2230,6 +2342,54 @@
                     closeModal();
                     showNotification('No new shifts found in the CSV file.', 'info');
                 }
+            };
+
+            const downloadTemplate = (templateType) => {
+                let headers, rows;
+                
+                if (templateType === 'shifts') {
+                    headers = ['Date', 'EventType', 'CRCName', 'SiteName', 'StudyName', 'Roles', 'Hours', 'Period', 'Notes', 'VisitNumber', 'PrincipalInvestigator', 'Mileage'];
+                    // Create a sample row with examples
+                    rows = [
+                        [
+                            '2025-01-15', // Date
+                            'Site Assignment', // EventType
+                            'John Doe', // CRCName (must match existing CRC)
+                            'Sample Site', // SiteName
+                            'Study A; Study B', // StudyName (semicolon separated)
+                            'Coordinator; Monitor', // Roles (semicolon separated)
+                            '8', // Hours
+                            'Full Day', // Period
+                            'Sample notes', // Notes
+                            '1', // VisitNumber
+                            'Dr. Smith', // PrincipalInvestigator
+                            '' // Mileage
+                        ]
+                    ];
+                } else if (templateType === 'crcs') {
+                    headers = ['CRCName', 'HomeLocation', 'Region', 'EmploymentType'];
+                    rows = [
+                        [
+                            'John Doe', // CRCName
+                            'New York, NY', // HomeLocation
+                            'East', // Region
+                            'FTE' // EmploymentType
+                        ]
+                    ];
+                } else {
+                    showNotification('Unknown template type.', 'error');
+                    return;
+                }
+                
+                const csvContent = "data:text/csv;charset=utf-8," + [headers.join(','), ...rows.map(row => row.map(val => `"${(val || '').toString().replace(/"/g, '""')}"`).join(','))].join('\n');
+                const encodedUri = encodeURI(csvContent);
+                const link = document.createElement("a");
+                link.setAttribute("href", encodedUri);
+                link.setAttribute("download", `${templateType}_template.csv`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                showNotification(`Template downloaded successfully!`, 'success');
             };
 
             const exportCurrentMonthToCSV = () => {
@@ -9887,6 +10047,11 @@
                         renderTrucksContent();
                         break;
                     }
+                    case 'download-template': {
+                        const templateType = e.target.dataset.template || 'shifts';
+                        downloadTemplate(templateType);
+                        break;
+                    }
                     case 'import-csv-btn': openModal(getImportCsvModalHTML()); break;
                     case 'trigger-csv-upload': 
                         document.getElementById('csv-upload-input').dataset.uploadType = 'shifts';
@@ -10165,8 +10330,9 @@
                         try {
                             if (operation === 'delete') {
                                 await apiService.deleteEvent(eventId);
-                                // Re-fetch from DB instead of optimistic update
-                                await performInitialLoad();
+                                // Re-fetch events from DB
+                                const updatedEvents = await apiService.getEvents();
+                                setState({ crc_events: updatedEvents });
                                 showNotification('Unavailability removed. Day is now available.', 'success');
                             } else {
                                 const eventData = { 
@@ -10207,8 +10373,9 @@
                             `);
                         } else {
                             await apiService.deleteEvent(eventId);
-                            // Re-fetch from DB instead of optimistic update
-                            await performInitialLoad();
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents });
                             closeModal();
                             // Refresh calendar views
                             renderCRCCalendar();
@@ -10220,8 +10387,9 @@
                     }
                     case 'delete-single-event': {
                         await apiService.deleteEvent(eventId);
-                        // Re-fetch from DB instead of optimistic update
-                        await performInitialLoad();
+                        // Re-fetch events from DB
+                        const updatedEvents = await apiService.getEvents();
+                        setState({ crc_events: updatedEvents });
                         closeModal();
                         // Refresh calendar views
                         renderCRCCalendar();
@@ -10237,8 +10405,9 @@
                         for (const event of eventsToDelete) {
                             await apiService.deleteEvent(event.id);
                         }
-                        // Re-fetch from DB instead of optimistic update
-                        await performInitialLoad();
+                        // Re-fetch events from DB
+                        const updatedEvents = await apiService.getEvents();
+                        setState({ crc_events: updatedEvents });
                         closeModal();
                         // Refresh calendar views
                         renderCRCCalendar();
@@ -10264,8 +10433,9 @@
                     case 'confirm-delete-individual-event': {
                         try {
                             await apiService.deleteEvent(eventId);
-                            // Re-fetch from DB instead of optimistic update
-                            await performInitialLoad();
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents });
                             showNotification('Event deleted successfully!', 'success');
                             closeModal();
                             // Refresh calendar views
@@ -10319,8 +10489,9 @@
                                 await apiService.deleteEvent(event.id);
                             }
                             
-                            // Re-fetch from DB instead of optimistic update
-                            await performInitialLoad();
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents });
                             
                             showNotification(`Deleted ${eventsToDelete.length} events from the shift!`, 'success');
                             closeModal();
@@ -10417,8 +10588,9 @@
                                 }
                             }
                             
-                            // Re-fetch from DB instead of optimistic update
-                            await performInitialLoad();
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents });
                             
                             closeModal();
                             
@@ -14687,15 +14859,16 @@
                                     <input type="text" name="hotelState" id="hotel-state-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="State">
                                     <input type="text" name="hotelZip" id="hotel-zip-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="ZIP Code">
                                 </div>
-                                <div id="distance-display" class="mt-2 p-2 bg-blue-50 dark:bg-blue-900/20 rounded-md hidden">
-                                    <p class="text-sm font-medium text-blue-800 dark:text-blue-200">
-                                        <span id="distance-text">Calculating distance...</span>
-                                    </p>
-                                </div>
-                                <div id="hotel-site-map-container" class="mt-4 hidden">
-                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Route from Hotel to Site</label>
+                                <div id="hotel-site-map-container" class="mt-4">
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hotel Location Map</label>
                                     <div id="hotel-site-map" class="w-full rounded-lg overflow-hidden border dark:border-gray-700" style="width: 100%; height: 256px; min-height: 256px;"></div>
-                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Click the map to animate the route</p>
+                                    <div id="distance-display" class="mt-2 p-2 bg-blue-50 dark:bg-blue-900/20 rounded-md hidden">
+                                        <p class="text-sm font-medium text-blue-800 dark:text-blue-200">
+                                            <span id="distance-text"></span>
+                                        </p>
+                                        <button type="button" id="calculate-route-btn" class="mt-2 bg-blue-600 text-white py-1 px-3 rounded-md hover:bg-blue-700 text-sm hidden">Calculate Route</button>
+                                    </div>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hotel location shown above. Select a site and the route will be calculated automatically, or click "Calculate Route" to calculate manually.</p>
                                 </div>
                             </div>
                             <div class="grid grid-cols-2 gap-4 mt-4">
@@ -14850,15 +15023,16 @@
                                     <input type="text" name="hotelState" id="hotel-state-input" value="${travel.hotelState || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="State">
                                     <input type="text" name="hotelZip" id="hotel-zip-input" value="${travel.hotelZip || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="ZIP Code">
                                 </div>
-                                <div id="distance-display" class="mt-2 p-2 bg-blue-50 dark:bg-blue-900/20 rounded-md hidden">
-                                    <p class="text-sm font-medium text-blue-800 dark:text-blue-200">
-                                        <span id="distance-text">Calculating distance...</span>
-                                    </p>
-                                </div>
-                                <div id="hotel-site-map-container" class="mt-4 hidden">
-                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Route from Hotel to Site</label>
+                                <div id="hotel-site-map-container" class="mt-4">
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hotel Location Map</label>
                                     <div id="hotel-site-map" class="w-full rounded-lg overflow-hidden border dark:border-gray-700" style="width: 100%; height: 256px; min-height: 256px;"></div>
-                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Click the map to animate the route</p>
+                                    <div id="distance-display" class="mt-2 p-2 bg-blue-50 dark:bg-blue-900/20 rounded-md hidden">
+                                        <p class="text-sm font-medium text-blue-800 dark:text-blue-200">
+                                            <span id="distance-text"></span>
+                                        </p>
+                                        <button type="button" id="calculate-route-btn" class="mt-2 bg-blue-600 text-white py-1 px-3 rounded-md hover:bg-blue-700 text-sm hidden">Calculate Route</button>
+                                    </div>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hotel location shown above. Select a site and the route will be calculated automatically, or click "Calculate Route" to calculate manually.</p>
                                 </div>
                             </div>
                             <div class="grid grid-cols-2 gap-4 mt-4">
