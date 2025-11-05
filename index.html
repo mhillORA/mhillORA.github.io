@@ -422,11 +422,8 @@
     <div id="modal-container" class="fixed inset-0 z-50 hidden bg-black bg-opacity-60 flex justify-center items-center p-4"></div>
     
     <script>
-        // This callback is required by the Google Maps script but we will initialize our autocompletes manually
-        function initAutocomplete() {}
+        // Azure Maps geocoding is used for address autocomplete
     </script>
-    <!-- Google Maps API - Replace YOUR_GOOGLE_MAPS_API_KEY with your actual API key -->
-    <!-- <script async defer src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY&libraries=places&callback=initAutocomplete"></script> -->
 
     <script type="module">
         // --- WRAP ENTIRE SCRIPT IN AN ASYNC IIFE TO ALLOW TOP-LEVEL AWAIT and RETURN ---
@@ -7419,19 +7416,9 @@
                 });
             };
             
+            // Removed Google Maps - using Azure Maps instead
             const updateCRCMap = () => {
-                const mapFrame = document.getElementById('mapFrame');
-                if (!mapFrame) return;
-                const apiKey = "YOUR_GOOGLE_MAPS_API_KEY";
-                if (apiKey === "YOUR_GOOGLE_MAPS_API_KEY") {
-                    mapFrame.src = "";
-                    return;
-                }
-                const locations = state.crcs.map(crc => `markers=color:blue%7Clabel:C%7C${encodeURIComponent(crc.homeLocation)}`).join('&');
-                const mapUrl = `https://www.google.com/maps/embed/v1/place?key=${apiKey}&q=United+States${locations ? '&' + locations : ''}`;
-                if (mapFrame.src !== mapUrl) {
-                    mapFrame.src = mapUrl;
-                }
+                // Azure Maps is handled in the scheduler map
             };
 
             const updateCrcDropdownAvailability = () => {
@@ -8464,6 +8451,19 @@
                                     } catch (error) {
                                         console.error('Error creating time off request for', day.date, error);
                                     }
+                                }
+                            }
+                            
+                            // Refresh time off requests immediately
+                            if (timeOffRequestsCreated > 0) {
+                                try {
+                                    const updatedRequests = await apiService.getTimeOffRequests();
+                                    state.timeOffRequests = updatedRequests;
+                                    if (state.activeTab === 'timeOffRequests') {
+                                        renderTimeOffRequestsContent();
+                                    }
+                                } catch (error) {
+                                    console.error('Error refreshing time off requests:', error);
                                 }
                             }
                             
@@ -10100,6 +10100,18 @@
                                                     };
                                                     
                                                     await apiService.createTimeOffRequest(timeOffRequest);
+                                                    
+                                                    // Refresh time off requests immediately
+                                                    try {
+                                                        const updatedRequests = await apiService.getTimeOffRequests();
+                                                        state.timeOffRequests = updatedRequests;
+                                                        if (state.activeTab === 'timeOffRequests') {
+                                                            renderTimeOffRequestsContent();
+                                                        }
+                                                    } catch (refreshError) {
+                                                        console.error('Error refreshing time off requests:', refreshError);
+                                                    }
+                                                    
                                                     showNotification(`${ptoType} set and time off request created for approval!`, 'success');
                                                 } catch (timeOffError) {
                                                     console.error('Error creating time off request:', timeOffError);
@@ -10281,6 +10293,14 @@
                         if (view) {
                             setState({ travelView: view });
                             renderTravelContent();
+                        }
+                        break;
+                    }
+                    case 'toggle-time-off-view': {
+                        const view = e.target.dataset.view || e.target.closest('[data-view]')?.dataset.view;
+                        if (view) {
+                            setState({ timeOffRequestsView: view });
+                            renderTimeOffRequestsContent();
                         }
                         break;
                     }
@@ -13417,88 +13437,259 @@
                     return;
                 }
 
-                // Get pending requests grouped by CRC
-                const pendingRequests = state.timeOffRequests.filter(req => req.status === 'pending');
-                const requestsByCRC = {};
+                // Get current view mode (default to list)
+                const currentView = state.timeOffRequestsView || 'list';
+                const currentEmployeeFilter = state.timeOffRequestsEmployeeFilter || 'all';
+                const currentStatusFilter = state.timeOffRequestsStatusFilter || 'all';
+
+                // Get all unique employee names for filter
+                const employeeNames = [...new Set(state.timeOffRequests.map(req => {
+                    const crc = state.crcs.find(c => c.id === req.crcId);
+                    return crc ? crc.name : 'Unknown';
+                }))].sort();
+
+                // Filter requests
+                let filteredRequests = [...state.timeOffRequests];
                 
-                pendingRequests.forEach(request => {
-                    if (!requestsByCRC[request.crcId]) {
-                        requestsByCRC[request.crcId] = [];
-                    }
-                    requestsByCRC[request.crcId].push(request);
+                if (currentEmployeeFilter !== 'all') {
+                    filteredRequests = filteredRequests.filter(req => {
+                        const crc = state.crcs.find(c => c.id === req.crcId);
+                        return crc && crc.name === currentEmployeeFilter;
+                    });
+                }
+                
+                if (currentStatusFilter !== 'all') {
+                    filteredRequests = filteredRequests.filter(req => req.status === currentStatusFilter);
+                }
+
+                // Sort by employee name
+                filteredRequests.sort((a, b) => {
+                    const crcA = state.crcs.find(c => c.id === a.crcId);
+                    const crcB = state.crcs.find(c => c.id === b.crcId);
+                    const nameA = crcA ? crcA.name : 'Unknown';
+                    const nameB = crcB ? crcB.name : 'Unknown';
+                    return nameA.localeCompare(nameB);
                 });
 
-                if (pendingRequests.length === 0) {
-                    container.innerHTML = `
-                        <div class="text-center py-8">
-                            <div class="text-gray-500 dark:text-gray-400 mb-4">
-                                <i data-lucide="check-circle" class="w-16 h-16 mx-auto mb-4"></i>
-                                <h3 class="text-lg font-medium">No Pending Requests</h3>
-                                <p class="text-sm">All time off requests have been reviewed.</p>
-                            </div>
-                        </div>
-                    `;
-                    lucide.createIcons();
-                    return;
-                }
+                // Group by employee for list view
+                const requestsByEmployee = {};
+                filteredRequests.forEach(request => {
+                    const crc = state.crcs.find(c => c.id === request.crcId);
+                    const employeeName = crc ? crc.name : 'Unknown';
+                    if (!requestsByEmployee[employeeName]) {
+                        requestsByEmployee[employeeName] = [];
+                    }
+                    requestsByEmployee[employeeName].push(request);
+                });
+
+                // Group by date for calendar view
+                const requestsByDate = {};
+                filteredRequests.forEach(request => {
+                    const dateKey = request.date || request.startDate;
+                    if (dateKey) {
+                        const dateStr = new Date(dateKey).toISOString().split('T')[0];
+                        if (!requestsByDate[dateStr]) {
+                            requestsByDate[dateStr] = [];
+                        }
+                        requestsByDate[dateStr].push(request);
+                    }
+                });
+
+                // Get current month/year for calendar
+                const now = new Date();
+                const currentMonth = now.getMonth();
+                const currentYear = now.getFullYear();
+                const firstDay = new Date(currentYear, currentMonth, 1);
+                const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+                const startingDayOfWeek = firstDay.getDay();
 
                 let html = `
                     <div class="flex justify-between items-center mb-6">
-                        <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Time Off Requests - Pending Approval</h2>
-                        <div class="text-sm text-gray-500 dark:text-gray-400">
-                            ${pendingRequests.length} pending request${pendingRequests.length !== 1 ? 's' : ''}
+                        <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Time Off Requests</h2>
+                        <div class="flex gap-2">
+                            <button data-action="toggle-time-off-view" data-view="list" class="${currentView === 'list' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300'} py-2 px-4 rounded-md hover:bg-blue-700 dark:hover:bg-gray-600 transition-colors flex items-center">
+                                <i data-lucide="list" class="w-4 h-4 mr-2"></i>List View
+                            </button>
+                            <button data-action="toggle-time-off-view" data-view="calendar" class="${currentView === 'calendar' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300'} py-2 px-4 rounded-md hover:bg-blue-700 dark:hover:bg-gray-600 transition-colors flex items-center">
+                                <i data-lucide="calendar" class="w-4 h-4 mr-2"></i>Calendar View
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4 mb-6">
+                        <div class="flex flex-wrap gap-4 items-center">
+                            <div class="flex items-center space-x-2">
+                                <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Employee:</label>
+                                <select id="time-off-employee-filter" class="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                    <option value="all">All Employees</option>
+                                    ${employeeNames.map(name => `<option value="${name}" ${currentEmployeeFilter === name ? 'selected' : ''}>${name}</option>`).join('')}
+                                </select>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Status:</label>
+                                <select id="time-off-status-filter" class="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                    <option value="all">All Status</option>
+                                    <option value="pending" ${currentStatusFilter === 'pending' ? 'selected' : ''}>Pending</option>
+                                    <option value="approved" ${currentStatusFilter === 'approved' ? 'selected' : ''}>Approved</option>
+                                    <option value="rejected" ${currentStatusFilter === 'rejected' ? 'selected' : ''}>Rejected</option>
+                                </select>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Search:</label>
+                                <input type="text" id="time-off-search" placeholder="Search employee name..." class="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm" />
+                            </div>
                         </div>
                     </div>
                 `;
 
-                // Group requests by CRC
-                Object.keys(requestsByCRC).forEach(crcId => {
-                    const crc = state.crcs.find(c => c.id === crcId);
-                    const requests = requestsByCRC[crcId];
-                    
+                if (currentView === 'calendar') {
+                    // Calendar view
                     html += `
-                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow mb-6">
-                            <div class="px-6 py-4 border-b dark:border-gray-700">
-                                <h3 class="text-lg font-semibold text-gray-900 dark:text-white">${crc ? crc.name : 'Unknown CRC'}</h3>
-                                <p class="text-sm text-gray-500 dark:text-gray-400">${requests.length} request${requests.length !== 1 ? 's' : ''} pending</p>
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                            <div class="p-4 border-b dark:border-gray-700 flex justify-between items-center">
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-white">
+                                    ${new Date(currentYear, currentMonth).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                                </h3>
                             </div>
-                            <div class="overflow-x-auto">
-                                <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                                    <thead class="bg-gray-50 dark:bg-gray-700">
-                                        <tr>
-                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Date</th>
-                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Period</th>
-                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Requested</th>
-                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Actions</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                        ${requests.map(request => `
-                                            <tr>
-                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
-                                                    ${new Date(request.date).toLocaleDateString()}
-                                                </td>
-                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                    ${request.period || 'Full Day'}
-                                                </td>
-                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                    ${request.createdAt ? new Date(request.createdAt).toLocaleDateString() : 'N/A'}
-                                                </td>
-                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                    <button data-action="approve-time-off-request" data-id="${request.id}" class="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 mr-2">Approve</button>
-                                                    <button data-action="reject-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700">Reject</button>
-                                                </td>
-                                            </tr>
-                                        `).join('')}
-                                    </tbody>
-                                </table>
+                            <div class="p-4">
+                                <div class="grid grid-cols-7 gap-1 mb-2">
+                                    ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => `
+                                        <div class="text-center text-xs font-medium text-gray-500 dark:text-gray-400 py-2">${day}</div>
+                                    `).join('')}
+                                </div>
+                                <div class="grid grid-cols-7 gap-1">
+                                    ${Array(startingDayOfWeek).fill(null).map(() => `<div class="aspect-square"></div>`).join('')}
+                                    ${Array.from({ length: daysInMonth }, (_, i) => {
+                                        const day = i + 1;
+                                        const dateStr = new Date(currentYear, currentMonth, day).toISOString().split('T')[0];
+                                        const dayRequests = requestsByDate[dateStr] || [];
+                                        const isToday = day === now.getDate() && currentMonth === now.getMonth() && currentYear === now.getFullYear();
+                                        
+                                        return `
+                                            <div class="aspect-square border border-gray-200 dark:border-gray-700 p-1 ${isToday ? 'bg-blue-50 dark:bg-blue-900/20' : ''}">
+                                                <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">${day}</div>
+                                                <div class="space-y-1">
+                                                    ${dayRequests.slice(0, 2).map(req => {
+                                                        const crc = state.crcs.find(c => c.id === req.crcId);
+                                                        const statusColor = req.status === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
+                                                                           req.status === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
+                                                                           'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200';
+                                                        return `<div class="text-xs px-1 py-0.5 rounded ${statusColor} truncate" title="${crc ? crc.name : 'Unknown'}: ${req.type || 'Time Off'}">${crc ? crc.name.substring(0, 5) : 'Unknown'}</div>`;
+                                                    }).join('')}
+                                                    ${dayRequests.length > 2 ? `<div class="text-xs text-gray-500 dark:text-gray-400">+${dayRequests.length - 2} more</div>` : ''}
+                                                </div>
+                                            </div>
+                                        `;
+                                    }).join('')}
+                                </div>
                             </div>
                         </div>
                     `;
-                });
+                } else {
+                    // List view
+                    if (filteredRequests.length === 0) {
+                        html += `
+                            <div class="text-center py-8">
+                                <div class="text-gray-500 dark:text-gray-400 mb-4">
+                                    <i data-lucide="calendar-x" class="w-16 h-16 mx-auto mb-4"></i>
+                                    <h3 class="text-lg font-medium">No Time Off Requests Found</h3>
+                                    <p class="text-sm">No time off requests match your current filters.</p>
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        Object.keys(requestsByEmployee).forEach(employeeName => {
+                            const requests = requestsByEmployee[employeeName];
+                            
+                            html += `
+                                <div class="bg-white dark:bg-gray-800 rounded-lg shadow mb-6">
+                                    <div class="px-6 py-4 border-b dark:border-gray-700">
+                                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">${employeeName}</h3>
+                                        <p class="text-sm text-gray-500 dark:text-gray-400">${requests.length} request${requests.length !== 1 ? 's' : ''}</p>
+                                    </div>
+                                    <div class="overflow-x-auto">
+                                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                            <thead class="bg-gray-50 dark:bg-gray-700">
+                                                <tr>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Date</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Type</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Period</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Status</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Requested</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Actions</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                                ${requests.map(request => {
+                                                    const statusColor = request.status === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
+                                                                     request.status === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
+                                                                     'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200';
+                                                    return `
+                                                        <tr>
+                                                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
+                                                                ${new Date(request.date || request.startDate).toLocaleDateString()}
+                                                            </td>
+                                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                                ${request.type || 'Time Off'}
+                                                            </td>
+                                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                                ${request.period || 'Full Day'}
+                                                            </td>
+                                                            <td class="px-6 py-4 whitespace-nowrap">
+                                                                <span class="px-2 py-1 text-xs font-medium rounded-full ${statusColor}">
+                                                                    ${request.status || 'pending'}
+                                                                </span>
+                                                            </td>
+                                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                                ${request.createdAt ? new Date(request.createdAt).toLocaleDateString() : 'N/A'}
+                                                            </td>
+                                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                                ${request.status === 'pending' ? `
+                                                                    <button data-action="approve-time-off-request" data-id="${request.id}" class="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 mr-2">Approve</button>
+                                                                    <button data-action="reject-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700">Reject</button>
+                                                                ` : '-'}
+                                                            </td>
+                                                        </tr>
+                                                    `;
+                                                }).join('')}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            `;
+                        });
+                    }
+                }
 
                 container.innerHTML = html;
                 lucide.createIcons();
+                
+                // Setup event listeners
+                document.getElementById('time-off-employee-filter')?.addEventListener('change', (e) => {
+                    state.timeOffRequestsEmployeeFilter = e.target.value;
+                    renderTimeOffRequestsContent();
+                });
+                
+                document.getElementById('time-off-status-filter')?.addEventListener('change', (e) => {
+                    state.timeOffRequestsStatusFilter = e.target.value;
+                    renderTimeOffRequestsContent();
+                });
+                
+                document.getElementById('time-off-search')?.addEventListener('input', (e) => {
+                    const searchTerm = e.target.value.toLowerCase();
+                    if (searchTerm) {
+                        const filter = employeeNames.find(name => name.toLowerCase().includes(searchTerm));
+                        if (filter) {
+                            state.timeOffRequestsEmployeeFilter = filter;
+                            document.getElementById('time-off-employee-filter').value = filter;
+                            renderTimeOffRequestsContent();
+                        }
+                    } else {
+                        state.timeOffRequestsEmployeeFilter = 'all';
+                        document.getElementById('time-off-employee-filter').value = 'all';
+                        renderTimeOffRequestsContent();
+                    }
+                });
             };
 
             // Travel Content Rendering
