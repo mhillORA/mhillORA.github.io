@@ -783,6 +783,19 @@ async function crudHandler(context, request, containerName) {
                     }
                 }
                 
+                // Normalize zip code fields for sites - map zip, postalCode, postal_code to zipCode
+                if (containerName === 'sites') {
+                    if (body.zip && !body.zipCode) {
+                        body.zipCode = body.zip;
+                    }
+                    if (body.postalCode && !body.zipCode) {
+                        body.zipCode = body.postalCode;
+                    }
+                    if (body.postal_code && !body.zipCode) {
+                        body.zipCode = body.postal_code;
+                    }
+                }
+                
                 // Validate schema based on container
                 try {
                     switch (containerName) {
@@ -865,6 +878,19 @@ async function crudHandler(context, request, containerName) {
                     }
                     if (requestBody.hotelCost !== undefined && typeof requestBody.hotelCost === 'string') {
                         requestBody.hotelCost = parseFloat(requestBody.hotelCost) || undefined;
+                    }
+                }
+                
+                // Normalize zip code fields for sites - map zip, postalCode, postal_code to zipCode
+                if (containerName === 'sites') {
+                    if (requestBody.zip && !requestBody.zipCode) {
+                        requestBody.zipCode = requestBody.zip;
+                    }
+                    if (requestBody.postalCode && !requestBody.zipCode) {
+                        requestBody.zipCode = requestBody.postalCode;
+                    }
+                    if (requestBody.postal_code && !requestBody.zipCode) {
+                        requestBody.zipCode = requestBody.postal_code;
                     }
                 }
                 
