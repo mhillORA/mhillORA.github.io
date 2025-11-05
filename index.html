@@ -2486,28 +2486,31 @@
             let crcsWithCoords = allCrcs.filter(crc => crc && crc.coordinates && crc.coordinates.lat && crc.coordinates.lng);
             const crcsWithAddress = allCrcs.filter(crc => crc && (!crc.coordinates || !crc.coordinates.lat) && crc.homeLocation);
             
+            // Helper function to check if site matches indication filter
+            const siteMatchesIndication = (site, indicationFilter) => {
+                if (indicationFilter === 'all') return true;
+                const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
+                const getStudyIndications = (ind) => {
+                    if (!ind) return [];
+                    if (Array.isArray(ind)) return ind.filter(i => i && typeof i === 'string').map(i => i.trim());
+                    if (typeof ind === 'string') return [ind.trim()];
+                    return [];
+                };
+                
+                return studiesAtSite.some(study => {
+                    const studyIndications = [
+                        ...getStudyIndications(study.indication),
+                        ...getStudyIndications(study.therapeuticArea)
+                    ];
+                    return studyIndications.includes(indicationFilter);
+                });
+            };
+            
             // Apply indication filter to sites - filter sites that have studies with this indication
             if (indicationFilter !== 'all') {
-                sitesWithCoords = sitesWithCoords.filter(site => {
-                    const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
-                    return studiesAtSite.some(study => {
-                        // Helper function to get all indications from a study
-                        const getStudyIndications = (ind) => {
-                            if (!ind) return [];
-                            if (Array.isArray(ind)) return ind.filter(i => i && typeof i === 'string').map(i => i.trim());
-                            if (typeof ind === 'string') return [ind.trim()];
-                            return [];
-                        };
-                        
-                        const studyIndications = [
-                            ...getStudyIndications(study.indication),
-                            ...getStudyIndications(study.therapeuticArea)
-                        ];
-                        
-                        return studyIndications.includes(indicationFilter);
-                    });
-                });
-                console.log(`Filtered sites by indication "${indicationFilter}":`, sitesWithCoords.length, 'sites');
+                sitesWithCoords = sitesWithCoords.filter(site => siteMatchesIndication(site, indicationFilter));
+                sitesWithAddress = sitesWithAddress.filter(site => siteMatchesIndication(site, indicationFilter));
+                console.log(`Filtered sites by indication "${indicationFilter}":`, sitesWithCoords.length, 'sites with coords,', sitesWithAddress.length, 'sites with address only');
             }
             
             // Apply CRC level filter
@@ -2520,6 +2523,8 @@
             
             console.log('Sites with coordinates:', sitesWithCoords.length, 'Sites with address only:', sitesWithAddress.length);
             console.log('CRCs with coordinates:', crcsWithCoords.length, 'CRCs with address only:', crcsWithAddress.length);
+            console.log('Total sites to show:', sitesWithCoords.length, '+', sitesWithAddress.length, 'geocoded =', sitesWithCoords.length + sitesWithAddress.length);
+            console.log('Total CRCs to show:', crcsWithCoords.length, '+', crcsWithAddress.length, 'geocoded =', crcsWithCoords.length + crcsWithAddress.length);
             
             // Start with sites that have coordinates
             const sites = sitesWithCoords;
@@ -2549,6 +2554,28 @@
                                 const fullAddress = addressParts.join(', ');
                                 const coords = await geocodeAddress(fullAddress);
                                 if (coords && azureMap && azureMap.markers) {
+                                    // Check indication filter if applied
+                                    if (indicationFilter !== 'all') {
+                                        const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
+                                        const getStudyIndications = (ind) => {
+                                            if (!ind) return [];
+                                            if (Array.isArray(ind)) return ind.filter(i => i && typeof i === 'string').map(i => i.trim());
+                                            if (typeof ind === 'string') return [ind.trim()];
+                                            return [];
+                                        };
+                                        const matchesFilter = studiesAtSite.some(study => {
+                                            const studyIndications = [
+                                                ...getStudyIndications(study.indication),
+                                                ...getStudyIndications(study.therapeuticArea)
+                                            ];
+                                            return studyIndications.includes(indicationFilter);
+                                        });
+                                        if (!matchesFilter) {
+                                            console.log(`Skipping geocoded site ${site.name} - doesn't match indication filter`);
+                                            continue;
+                                        }
+                                    }
+                                    
                                     // Create marker for geocoded site
                                     const siteWithCoords = { ...site, latitude: coords.lat, longitude: coords.lng };
                                     const lat = parseFloat(coords.lat);
@@ -2605,6 +2632,15 @@
                     console.log('Geocoding CRCs with addresses...');
                     for (const crc of crcsWithAddress) {
                         try {
+                            // Check CRC level filter if applied
+                            if (crcLevelFilter !== 'all') {
+                                const matchesFilter = crc.level === crcLevelFilter || crc.role === crcLevelFilter || crc.permission === crcLevelFilter;
+                                if (!matchesFilter) {
+                                    console.log(`Skipping geocoded CRC ${crc.name} - doesn't match CRC level filter`);
+                                    continue;
+                                }
+                            }
+                            
                             if (crc.homeLocation && typeof crc.homeLocation === 'string' && crc.homeLocation.trim().length > 0) {
                                 const coords = await geocodeAddress(crc.homeLocation);
                                 if (coords && azureMap && azureMap.markers) {
@@ -3699,6 +3735,16 @@
         };
 
         const closeModal = () => {
+            // Clean up edit site map if it exists
+            if (editSiteMap) {
+                try {
+                    editSiteMap.dispose();
+                } catch (e) {
+                    console.warn('Error disposing edit site map:', e);
+                }
+                editSiteMap = null;
+                editSiteMarker = null;
+            }
             modalContainer.innerHTML = '';
         };
 
@@ -4289,10 +4335,10 @@ ${results.map(r => {
             `;
             showModal(modalHTML);
             
-            // Initialize map after modal is shown
+            // Initialize map after modal is shown - wait a bit longer for DOM to be ready
             setTimeout(() => {
                 initializeEditSiteMap(site);
-            }, 100);
+            }, 300);
         };
         
         // Initialize map in edit site modal
@@ -4301,49 +4347,66 @@ ${results.map(r => {
         
         const initializeEditSiteMap = async (site) => {
             const mapContainer = document.getElementById('edit-site-map');
-            if (!mapContainer || !AZURE_MAPS_KEY) return;
+            if (!mapContainer || !AZURE_MAPS_KEY) {
+                console.warn('Edit site map container or Azure Maps key not available');
+                return;
+            }
             
             try {
-                // Initialize map if not already created
-                if (!editSiteMap) {
-                    editSiteMap = new atlas.Map(mapContainer, {
-                        authOptions: {
-                            authType: 'subscriptionKey',
-                            subscriptionKey: AZURE_MAPS_KEY
-                        },
-                        center: site && site.latitude && site.longitude 
-                            ? [parseFloat(site.longitude), parseFloat(site.latitude)]
-                            : [-98.5795, 39.8283], // Default to center of USA
-                        zoom: site && site.latitude && site.longitude ? 12 : 4,
-                        style: 'road'
-                    });
-                    
-                    // Wait for map to be ready
-                    editSiteMap.events.add('ready', () => {
-                        updateEditSiteMarker(site);
-                        
-                        // Add click handler to update coordinates
-                        editSiteMap.events.add('click', (e) => {
-                            const position = e.position;
-                            const lat = position[1];
-                            const lng = position[0];
-                            
-                            // Update form fields
-                            const latInput = document.getElementById('latitude');
-                            const lngInput = document.getElementById('longitude');
-                            if (latInput) latInput.value = lat.toFixed(6);
-                            if (lngInput) lngInput.value = lng.toFixed(6);
-                            
-                            // Update marker
-                            updateEditSiteMarker({ latitude: lat, longitude: lng });
-                        });
-                    });
-                } else {
-                    // Map already exists, just update the marker
-                    updateEditSiteMarker(site);
+                // Clean up existing map if it exists
+                if (editSiteMap) {
+                    try {
+                        editSiteMap.dispose();
+                    } catch (e) {
+                        console.warn('Error disposing existing map:', e);
+                    }
+                    editSiteMap = null;
+                    editSiteMarker = null;
                 }
+                
+                // Clear the container
+                mapContainer.innerHTML = '';
+                
+                // Initialize new map
+                editSiteMap = new atlas.Map(mapContainer, {
+                    authOptions: {
+                        authType: 'subscriptionKey',
+                        subscriptionKey: AZURE_MAPS_KEY
+                    },
+                    center: site && site.latitude && site.longitude 
+                        ? [parseFloat(site.longitude), parseFloat(site.latitude)]
+                        : [-98.5795, 39.8283], // Default to center of USA
+                    zoom: site && site.latitude && site.longitude ? 12 : 4,
+                    style: 'road'
+                });
+                
+                // Wait for map to be ready
+                editSiteMap.events.add('ready', () => {
+                    console.log('Edit site map ready');
+                    updateEditSiteMarker(site);
+                    
+                    // Add click handler to update coordinates
+                    editSiteMap.events.add('click', (e) => {
+                        const position = e.position;
+                        const lat = position[1];
+                        const lng = position[0];
+                        
+                        // Update form fields
+                        const latInput = document.getElementById('latitude');
+                        const lngInput = document.getElementById('longitude');
+                        if (latInput) latInput.value = lat.toFixed(6);
+                        if (lngInput) lngInput.value = lng.toFixed(6);
+                        
+                        // Update marker
+                        updateEditSiteMarker({ latitude: lat, longitude: lng });
+                    });
+                });
             } catch (error) {
                 console.error('Error initializing edit site map:', error);
+                // Show error message in container
+                if (mapContainer) {
+                    mapContainer.innerHTML = '<div class="text-red-500 text-sm p-4">Error loading map. Please check console for details.</div>';
+                }
             }
         };
         
@@ -4498,42 +4561,81 @@ ${results.map(r => {
             const siteId = form.dataset.id;
             const selectedIndications = Array.from(form.querySelectorAll('input[name="indication"]:checked')).map(cb => cb.value);
             
-            const siteData = {
-                name: form.name.value,
-                siteNameAbbreviation: form.siteNameAbbreviation.value,
-                address1: form.address1.value,
-                address2: form.address2.value,
-                city: form.city.value,
-                state: form.state.value,
-                zipCode: form.zipCode.value,
-                zip: form.zipCode.value, // Also save as 'zip' for compatibility
-                country: form.country.value,
-                siteCoordinator: form.siteCoordinator.value,
-                piEmail: form.piEmail.value,
-                siteCoordinatorEmail: form.siteCoordinatorEmail.value,
-                pi: form.pi.value,
-                indication: selectedIndications,
-                status: form.status.value,
-                latitude: form.latitude.value ? parseFloat(form.latitude.value) : null,
-                longitude: form.longitude.value ? parseFloat(form.longitude.value) : null
+            // Use querySelector to reliably get form elements
+            const getValue = (name) => {
+                const el = form.querySelector(`[name="${name}"], #${name}`);
+                return el ? el.value : '';
             };
+            
+            const getNumberValue = (name) => {
+                const el = form.querySelector(`[name="${name}"], #${name}`);
+                const value = el ? el.value : '';
+                return value ? parseFloat(value) : null;
+            };
+            
+            const siteData = {
+                name: getValue('name'),
+                siteNameAbbreviation: getValue('siteNameAbbreviation'),
+                address1: getValue('address1'),
+                address2: getValue('address2'),
+                city: getValue('city'),
+                state: getValue('state'),
+                zipCode: getValue('zipCode'),
+                zip: getValue('zipCode'), // Also save as 'zip' for compatibility
+                country: getValue('country'),
+                siteCoordinator: getValue('siteCoordinator'),
+                piEmail: getValue('piEmail'),
+                siteCoordinatorEmail: getValue('siteCoordinatorEmail'),
+                pi: getValue('pi'),
+                indication: selectedIndications,
+                status: getValue('status'),
+                latitude: getNumberValue('latitude'),
+                longitude: getNumberValue('longitude')
+            };
+            
+            console.log('Saving site data:', siteData);
+            console.log('Site ID:', siteId);
 
             try {
                 let result;
                 if (siteId) {
                     // Update existing site
+                    console.log('Updating site:', siteId);
                     result = await apiService.updateSite(siteId, siteData);
+                    console.log('Update result:', result);
                 } else {
                     // Create new site
+                    console.log('Creating new site');
                     result = await apiService.createSite(siteData);
+                    console.log('Create result:', result);
                 }
                 console.log('Site saved successfully:', result);
                 showNotification('Site saved successfully!', 'success');
+                
+                // Refresh data from API
+                try {
+                    allSites = await apiService.getSites();
+                    allStudies = await apiService.getStudies();
+                } catch (refreshError) {
+                    console.error('Error refreshing data after save:', refreshError);
+                }
+                
                 closeModal();
                 renderAllSites();
+                
+                // Refresh map if it exists
+                if (typeof loadMapMarkers === 'function') {
+                    loadMapMarkers();
+                }
             } catch (error) {
-                console.error('Error saving site: ', error);
-                showNotification('Error saving site. Please try again.', 'error');
+                console.error('Error saving site:', error);
+                console.error('Error details:', {
+                    message: error.message,
+                    stack: error.stack,
+                    siteId: siteId,
+                    siteData: siteData
+                });
+                showNotification(`Error saving site: ${error.message || 'Please try again.'}`, 'error');
             }
         };
 
@@ -4787,42 +4889,67 @@ ${results.map(r => {
         const handleDeleteSite = async (siteIds) => {
             const idsToDelete = Array.isArray(siteIds) ? siteIds : [siteIds];
             try {
-                const appId = 'crc-scheduler-app';
-                const batch = writeBatch(db);
-                
-                idsToDelete.forEach(siteId => {
-                    // 1. Delete the site document
-                    const siteRef = doc(db, `artifacts/${appId}/public/data/crc_sites`, siteId);
-                    batch.delete(siteRef);
-
-                    // 2. Unlink site from any studies
+                // Delete each site using the API service
+                for (const siteId of idsToDelete) {
+                    // 1. Unlink site from any studies
                     const studiesWithSite = allStudies.filter(s => (s.siteIds || []).includes(siteId));
-                    studiesWithSite.forEach(study => {
-                        const studyRef = doc(db, `artifacts/${appId}/public/data/studies`, study.id);
-                        batch.update(studyRef, { siteIds: arrayRemove(siteId) });
-                    });
+                    for (const study of studiesWithSite) {
+                        try {
+                            const updatedSiteIds = (study.siteIds || []).filter(id => id !== siteId);
+                            await apiService.updateStudy(study.id, { siteIds: updatedSiteIds });
+                            console.log(`Unlinked site ${siteId} from study ${study.id}`);
+                        } catch (error) {
+                            console.error(`Error unlinking site from study ${study.id}:`, error);
+                        }
+                    }
 
-                    // 3. Unlink site from any patients
+                    // 2. Unlink site from any patients
                     const patientsAtSite = allPatients.filter(p => {
                         const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
                         return currentEnrollment?.siteId === siteId;
                     });
-                    patientsAtSite.forEach(patient => {
-                        const patientRef = doc(db, 'patients', patient.id);
-                        const updatedEnrollments = patient.enrollments.map(e => {
-                            if (e.siteId === siteId && e.status === 'current') {
-                                return { ...e, status: 'past', exitedDate: new Date().toISOString() };
-                            }
-                            return e;
-                        });
-                        batch.update(patientRef, { enrollments: updatedEnrollments });
-                    });
-                });
+                    for (const patient of patientsAtSite) {
+                        try {
+                            const updatedEnrollments = patient.enrollments.map(e => {
+                                if (e.siteId === siteId && e.status === 'current') {
+                                    return { ...e, status: 'past', exitedDate: new Date().toISOString() };
+                                }
+                                return e;
+                            });
+                            await apiService.updatePatient(patient.id, { enrollments: updatedEnrollments });
+                            console.log(`Unlinked site ${siteId} from patient ${patient.id}`);
+                        } catch (error) {
+                            console.error(`Error unlinking site from patient ${patient.id}:`, error);
+                        }
+                    }
+                    
+                    // 3. Delete the site document
+                    await apiService.deleteSite(siteId);
+                    console.log(`Deleted site ${siteId}`);
+                }
                 
-                await batch.commit();
                 console.log(`${idsToDelete.length} site(s) and all associated links deleted successfully`);
+                showNotification(`${idsToDelete.length} site(s) deleted successfully!`, 'success');
+                
+                // Refresh data from API
+                try {
+                    allSites = await apiService.getSites();
+                    allStudies = await apiService.getStudies();
+                    allPatients = await apiService.getPatients();
+                    
+                    // Refresh the sites list
+                    renderAllSites();
+                    
+                    // Refresh map if it exists
+                    if (typeof loadMapMarkers === 'function') {
+                        loadMapMarkers();
+                    }
+                } catch (error) {
+                    console.error('Error refreshing data after delete:', error);
+                }
             } catch (error) {
                 console.error('Error deleting site(s): ', error);
+                showNotification('Error deleting site(s). Please try again.', 'error');
             } finally {
                 closeModal();
             }
