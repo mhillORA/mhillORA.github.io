@@ -1153,13 +1153,29 @@
             // Calculate distance between two coordinates using Azure Maps Route API
             const calculateDistance = async (hotelCoords, siteCoords) => {
                 try {
-                    if (!hotelCoords || !siteCoords) return null;
+                    if (!hotelCoords || !siteCoords) {
+                        console.error('calculateDistance: Missing coordinates', { hotelCoords, siteCoords });
+                        return null;
+                    }
+                    
+                    console.log('calculateDistance: Calculating route from', hotelCoords, 'to', siteCoords);
                     
                     // Use backend proxy to avoid CORS issues
-                    const response = await fetch(
-                        `/api/route/directions?api-version=1.0&query=${hotelCoords.lng},${hotelCoords.lat}:${siteCoords.lng},${siteCoords.lat}&travelMode=car`
-                    );
+                    const url = `/api/route/directions?api-version=1.0&query=${hotelCoords.lng},${hotelCoords.lat}:${siteCoords.lng},${siteCoords.lat}&travelMode=car`;
+                    console.log('calculateDistance: Calling route API:', url);
+                    
+                    const response = await fetch(url);
+                    console.log('calculateDistance: Response status:', response.status);
+                    
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        console.error('calculateDistance: API error response:', response.status, errorText);
+                        return null;
+                    }
+                    
                     const data = await response.json();
+                    console.log('calculateDistance: Response data:', data);
+                    
                     if (data && data.routes && data.routes.length > 0) {
                         const route = data.routes[0];
                         const distanceInMeters = route.summary.lengthInMeters;
@@ -1316,12 +1332,14 @@
                         // Show route on map
                         showHotelSiteMap(distanceInfo.path, hotelCoords, siteCoords, siteName);
                     } else {
+                        console.warn('calculateRoute: No route data returned', distanceInfo);
                         distanceText.textContent = 'Unable to calculate route. Please check the address.';
                         if (calculateBtn) calculateBtn.classList.remove('hidden');
                     }
                 } catch (error) {
                     console.error('Error calculating route:', error);
-                    distanceText.textContent = 'Error calculating route. Please try again.';
+                    console.error('Error stack:', error.stack);
+                    distanceText.textContent = `Error calculating route: ${error.message || 'Unknown error'}. Please try again.`;
                     if (calculateBtn) calculateBtn.classList.remove('hidden');
                 }
             };
@@ -1816,12 +1834,18 @@
                 // Get role requirements for this specific Study-Site combination
                 const studySiteRoleRequirements = {};
                 event.studyIds.forEach(studyId => {
-                    const study = state.studies.find(s => s.id === studyId);
-                    if (study && study.siteRoleRequirements && study.siteRoleRequirements[event.siteId]) {
-                        Object.keys(study.siteRoleRequirements[event.siteId]).forEach(roleId => {
-                            const requiredCount = study.siteRoleRequirements[event.siteId][roleId];
-                            studySiteRoleRequirements[roleId] = (studySiteRoleRequirements[roleId] || 0) + requiredCount;
-                        });
+                    try {
+                        const study = state.studies?.find(s => s.id === studyId);
+                        // Fallback: If study not found, continue without it - don't block deletion
+                        if (study && study.siteRoleRequirements && study.siteRoleRequirements[event.siteId]) {
+                            Object.keys(study.siteRoleRequirements[event.siteId]).forEach(roleId => {
+                                const requiredCount = study.siteRoleRequirements[event.siteId][roleId];
+                                studySiteRoleRequirements[roleId] = (studySiteRoleRequirements[roleId] || 0) + requiredCount;
+                            });
+                        }
+                    } catch (error) {
+                        console.warn('Study lookup failed for studyId:', studyId, 'but continuing...', error);
+                        // Continue without this study - don't block deletion
                     }
                 });
                 
@@ -2010,7 +2034,10 @@
                     renderSupervisorFilters();
                     renderCRCCalendar();
                     renderSidebarTabs();
-                    renderCRCLists();
+                    // Only refresh the sidebar lists if they currently exist in the DOM
+                    if (typeof renderCRCLists === 'function' && document.getElementById('studyList')) {
+                        renderCRCLists();
+                    }
                     renderUtilization();
                     renderSidebarAvailability();
                 } else if (state.activeTab === 'allSchedule') {
@@ -2508,7 +2535,16 @@
                 const rows = eventsThisMonth.map(event => {
                     const crc = state.crcs.find(c => c.id === event.crcId);
                     const site = state.crc_sites.find(s => s.id === event.siteId);
-                    const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)?.name).filter(Boolean).join('; ');
+                    const studies = (event.studyIds || []).map(id => {
+                        try {
+                            const study = state.studies?.find(s => s.id === id);
+                            // Fallback: If study not found, show studyId or skip
+                            return study?.name || `Study ${id} (Not Found)`;
+                        } catch (error) {
+                            console.warn('Study lookup failed for studyId:', id, error);
+                            return `Study ${id} (Error)`;
+                        }
+                    }).filter(Boolean).join('; ');
                     return [
                         event.date,
                         event.type,
@@ -2819,8 +2855,14 @@
                             const crc = state.crcs.find(c => c.id === event.crcId);
                             const site = state.crc_sites.find(s => s.id === event.siteId);
                             const studies = event.studyIds ? event.studyIds.map(studyId => {
-                                const study = state.studies.find(s => s.id === studyId);
-                                return study ? (study.title || study.name) : studyId;
+                                try {
+                                    const study = state.studies?.find(s => s.id === studyId);
+                                    // Fallback: If study not found, show studyId or "Unknown Study"
+                                    return study ? (study.title || study.name) : `Study ${studyId} (Not Found)`;
+                                } catch (error) {
+                                    console.warn('Study lookup failed for studyId:', studyId, error);
+                                    return `Study ${studyId} (Error)`;
+                                }
                             }).join(', ') : 'None';
                             const roles = getEventRoles(event);
                             
@@ -3528,6 +3570,10 @@
                 let filteredEvents = state.crc_events;
                 console.log('All events:', state.crc_events.length);
                 console.log('Travel Day events in state:', state.crc_events.filter(e => e.type === 'Travel Day'));
+                
+                // Filter out PTO/Unavailable events - they should only appear in the time off calendar, not the main scheduler
+                filteredEvents = filteredEvents.filter(e => e.type !== 'Unavailable' && e.type !== 'Paid Time Off');
+                console.log('After filtering out PTO/Unavailable:', filteredEvents.length);
                 
                 if (state.selectedCrcFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
@@ -4998,7 +5044,7 @@
                             ${ tabIs('studies') ? `
                                 <div class="space-y-4">
                                     <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Manage Studies</h3>
-                                    <button data-action="open-add-study-modal" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Study</button>
+                                    <!-- Studies can only be added from ARTEMIS - removed Add Study button -->
                                     <div id="studyList" class="space-y-2 max-h-60 overflow-y-auto custom-scrollbar pr-2"></div>
                                 </div>` : '' }
                             ${ tabIs('roles') ? `
@@ -5041,9 +5087,9 @@
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
                             <div class="flex items-center gap-2">
                                 <span class="w-4 h-4 rounded-full" style="background-color: ${site.color || '#cccccc'};"></span>
-                                <button data-action="edit-crc-site" data-id="${site.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${site.name}</button>
+                                <button data-action="view-crc-site" data-id="${site.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${site.name}</button>
                             </div>
-                            <button data-action="delete-crc-site" data-id="${site.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            <span class="text-xs text-gray-500 dark:text-gray-400">From ARTEMIS</span>
                         </div>
                     `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No sites added yet.</p>';
                 }
@@ -5056,9 +5102,9 @@
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
                             <div class="flex items-center gap-2">
                                 <span class="w-4 h-4 rounded-full" style="background-color: ${study.color || '#cccccc'};"></span>
-                                <button data-action="edit-study" data-id="${study.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${study.title || study.name || 'Untitled Study'}</button>
+                                <button data-action="view-study" data-id="${study.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${study.title || study.name || 'Untitled Study'}</button>
                             </div>
-                            <button data-action="delete-study" data-id="${study.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            <span class="text-xs text-gray-500 dark:text-gray-400">From ARTEMIS</span>
                         </div>
                     `).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No ARTEMIS studies available.</p>';
                     console.log('CHAOS: Generated studies HTML:', studiesHTML);
@@ -10168,7 +10214,8 @@
                             handleShiftStudySiteSelection();
                         }, 300);
                         break;
-                    case 'open-add-study-modal': openModal(getAddStudyModalHTML()); break;
+                    // Sites and studies can only be managed from ARTEMIS - removed handler
+                    // case 'open-add-study-modal': openModal(getAddStudyModalHTML()); break;
                     case 'view-day-events': {
                         if (copiedShiftData) {
                             openModal(getCRCEventModalHTML(date, { ...copiedShiftData }), '4xl');
@@ -10454,8 +10501,9 @@
                         break;
                     }
                     case 'delete-crc': await apiService.deleteCrc(id); break;
-                    case 'delete-crc-site': await apiService.deleteSite(id); break;
-                    case 'delete-study': await apiService.deleteStudy(id); break;
+                    // Sites and studies can only be managed from ARTEMIS - removed handlers
+                    // case 'delete-crc-site': await apiService.deleteSite(id); break;
+                    // case 'delete-study': await apiService.deleteStudy(id); break;
                     case 'delete-role': await apiService.deleteRole(id); break;
                     case 'delete-crc-event': {
                         if (groupId) {
@@ -10478,7 +10526,8 @@
                             closeModal();
                                 // Refresh calendar views
                                 renderCRCCalendar();
-                                if (typeof renderCRCLists === 'function') {
+                                // Only refresh the sidebar lists if they currently exist in the DOM
+                                if (typeof renderCRCLists === 'function' && document.getElementById('studyList')) {
                                     renderCRCLists();
                                 }
                             } catch (error) {
@@ -10498,7 +10547,8 @@
                         closeModal();
                             // Refresh calendar views
                             renderCRCCalendar();
-                            if (typeof renderCRCLists === 'function') {
+                            // Only refresh the sidebar lists if they currently exist in the DOM
+                            if (typeof renderCRCLists === 'function' && document.getElementById('studyList')) {
                                 renderCRCLists();
                             }
                         } catch (error) {
@@ -10522,7 +10572,8 @@
                         closeModal();
                             // Refresh calendar views
                             renderCRCCalendar();
-                            if (typeof renderCRCLists === 'function') {
+                            // Only refresh the sidebar lists if they currently exist in the DOM
+                            if (typeof renderCRCLists === 'function' && document.getElementById('studyList')) {
                                 renderCRCLists();
                             }
                         } catch (error) {
@@ -10555,7 +10606,8 @@
                             closeModal();
                             // Refresh calendar views
                             renderCRCCalendar();
-                            if (typeof renderCRCLists === 'function') {
+                            // Only refresh the sidebar lists if they currently exist in the DOM
+                            if (typeof renderCRCLists === 'function' && document.getElementById('studyList')) {
                                 renderCRCLists();
                             }
                         } catch (error) {
@@ -10612,7 +10664,8 @@
                             closeModal();
                             // Refresh calendar views
                             renderCRCCalendar();
-                            if (typeof renderCRCLists === 'function') {
+                            // Only refresh the sidebar lists if they currently exist in the DOM
+                            if (typeof renderCRCLists === 'function' && document.getElementById('studyList')) {
                                 renderCRCLists();
                             }
                         } catch (error) {
@@ -10717,7 +10770,8 @@
                             
                             // Refresh calendar views
                             renderCRCCalendar();
-                            if (typeof renderCRCLists === 'function') {
+                            // Only refresh the sidebar lists if they currently exist in the DOM
+                            if (typeof renderCRCLists === 'function' && document.getElementById('studyList')) {
                                 renderCRCLists();
                             }
                         } catch (error) {
@@ -11332,23 +11386,24 @@
                         }
                         break;
                     }
-                    case 'edit-crc-site': {
-                        const site = state.crc_sites.find(s => s.id === id);
-                        if (site) openModal(getEditSiteModalHTML(site), 'lg');
-                        break;
-                    }
-                    case 'edit-study': {
-                        const study = state.studies.find(s => s.id === id);
-                        if (study) {
-                            openModal(getEditStudyModalHTML(study), 'lg');
-                            // Populate selected roles display and site quantities after modal opens
-                            setTimeout(() => {
-                                handleRoleSelection();
-                                populateEditStudySiteQuantities(study);
-                            }, 100);
-                        }
-                        break;
-                    }
+                    // Sites and studies can only be managed from ARTEMIS - removed handlers
+                    // case 'edit-crc-site': {
+                    //     const site = state.crc_sites.find(s => s.id === id);
+                    //     if (site) openModal(getEditSiteModalHTML(site), 'lg');
+                    //     break;
+                    // }
+                    // case 'edit-study': {
+                    //     const study = state.studies.find(s => s.id === id);
+                    //     if (study) {
+                    //         openModal(getEditStudyModalHTML(study), 'lg');
+                    //         // Populate selected roles display and site quantities after modal opens
+                    //         setTimeout(() => {
+                    //             handleRoleSelection();
+                    //             populateEditStudySiteQuantities(study);
+                    //         }, 100);
+                    //     }
+                    //     break;
+                    // }
                     case 'edit-role': {
                         const role = state.roles.find(r => r.id === id);
                         if (role) openModal(getEditRoleModalHTML(role), 'lg');
