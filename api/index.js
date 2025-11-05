@@ -1694,7 +1694,9 @@ app.http('flightLookup', {
             context.log.info('Calling AviationStack API directly - NOT searching database');
             
             // Try AviationStack API (available via Microsoft Connectors)
+            // API Endpoint: https://api.aviationstack.com/v1/flights
             // Use environment variable if set, otherwise use provided key
+            // API Key: f4d364ba3a06f3498403ff1958d6d608
             const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY || 'f4d364ba3a06f3498403ff1958d6d608';
             context.log.info(`AviationStack API check: Key exists=${!!AVIATIONSTACK_KEY}`);
             
@@ -1813,12 +1815,9 @@ app.http('flightLookup', {
                             };
                         }
                     } else if (response && !response.ok) {
-                        try {
-                            const errorText = await response.text();
-                            context.log.error(`AviationStack API HTTP error: ${response.status} - ${errorText.substring(0, 500)}`);
-                        } catch (error) {
-                            context.log.error(`AviationStack API HTTP error: ${response.status} - Could not read error response`);
-                        }
+                        // We already read the response text into the 'responseText' variable earlier.
+                        // We just log that we received a non-OK response. The text was logged earlier.
+                        context.log.error(`AviationStack API HTTP error: ${response.status}. See raw response above.`);
                     }
                     
                     // If not found with flight_iata, try splitting into airline_iata + flight_number
@@ -1910,12 +1909,8 @@ app.http('flightLookup', {
                                     headers: { 'Content-Type': 'application/json' }
                                 };
                             } else if (response && !response.ok) {
-                                try {
-                                    const errorText = await response.text();
-                                    context.log.error(`AviationStack API HTTP error (alternative): ${response.status} - ${errorText.substring(0, 500)}`);
-                                } catch (error) {
-                                    context.log.error(`AviationStack API HTTP error (alternative): ${response.status} - Could not read error response`);
-                                }
+                                // We already read the response text into the 'responseText' variable earlier.
+                                context.log.error(`AviationStack API HTTP error (alternative): ${response.status}. See raw response above.`);
                             }
                         }
                     }
