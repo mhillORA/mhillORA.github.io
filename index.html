@@ -14,8 +14,10 @@
     </script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <!-- Azure Maps CSS and JS -->
-    <link rel="stylesheet" href="https://atlas.microsoft.com/sdk/javascript/mapcontrol/2/atlas.min.css" type="text/css" />
-    <script src="https://atlas.microsoft.com/sdk/javascript/mapcontrol/2/atlas.min.js"></script>
+    <link rel="stylesheet" href="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.css" type="text/css" />
+    <script src="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.js"></script>
+    <!-- Azure Maps Animation Library -->
+    <script src="https://cdn.jsdelivr.net/gh/Azure-Samples/azure-maps-animations@main/dist/azure-maps-animations.min.js"></script>
     <script>
         // Azure Maps key will be loaded from backend
         let AZURE_MAPS_KEY = null;
@@ -1029,6 +1031,18 @@
                                    <input type="text" id="artemis-map-search" placeholder="Search sites, studies, or locations..." class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm" />
                                </div>
                                <div class="flex flex-wrap gap-4 items-center">
+                                   <div class="flex items-center space-x-2">
+                                       <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Indication:</label>
+                                       <select id="map-indication-filter" class="px-3 py-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                           <option value="all">All Indications</option>
+                                       </select>
+                                   </div>
+                                   <div class="flex items-center space-x-2">
+                                       <label class="text-sm font-medium text-gray-700 dark:text-gray-300">CRC Level:</label>
+                                       <select id="map-crc-level-filter" class="px-3 py-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                           <option value="all">All Levels</option>
+                                       </select>
+                                   </div>
                                    <div class="flex items-center space-x-2">
                                        <label class="text-sm font-medium text-gray-700 dark:text-gray-300">View:</label>
                                        <select id="map-view-selector" class="px-3 py-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
@@ -2047,9 +2061,13 @@
 
         // --- Map Functionality ---
         let azureMap = null;
+        let azureMapDataSource = null;
         let azureMapMarkers = [];
+        let azureMapAnimation = null;
         let currentMapType = 'azure';
         let currentMapView = 'sites';
+        let currentIndicationFilter = 'all';
+        let currentCrcLevelFilter = 'all';
 
         const initializeMap = () => {
             const mapView = document.getElementById('map-view-selector')?.value || 'sites';
@@ -2106,6 +2124,8 @@
                 // Wait for map to be ready
                 azureMap.events.add('ready', () => {
                     console.log('Azure Maps ready');
+                    // Setup event handlers after map is ready
+                    setupMapEventHandlers();
                     loadMapMarkers();
                 });
                 
@@ -2152,7 +2172,19 @@
             
             console.log('Loading map markers. Sites:', allSites.length, 'CRCs:', allCrcs.length);
             
-            // Clear existing markers
+            // Get filter values
+            const indicationFilter = document.getElementById('map-indication-filter')?.value || 'all';
+            const crcLevelFilter = document.getElementById('map-crc-level-filter')?.value || 'all';
+            currentIndicationFilter = indicationFilter;
+            currentCrcLevelFilter = crcLevelFilter;
+            
+            console.log('Filters - Indication:', indicationFilter, 'CRC Level:', crcLevelFilter);
+            
+            // Clear existing markers and animation
+            if (azureMapAnimation) {
+                azureMapAnimation.reset();
+                azureMapAnimation = null;
+            }
             if (azureMap.markers) {
                 azureMap.markers.clear();
             }
@@ -2163,13 +2195,33 @@
                 azureMap.sources.clear();
             }
             
+            // Create data source for animated markers
+            azureMapDataSource = new atlas.source.DataSource();
+            azureMap.sources.add(azureMapDataSource);
+            
             // Filter sites - check for coordinates first, then address
-            const sitesWithCoords = allSites.filter(site => site.latitude && site.longitude);
+            let sitesWithCoords = allSites.filter(site => site.latitude && site.longitude);
             const sitesWithAddress = allSites.filter(site => !site.latitude && !site.longitude && (site.address1 || site.city || site.state));
             
             // Filter CRCs - check for coordinates first, then address
-            const crcsWithCoords = allCrcs.filter(crc => crc.coordinates && crc.coordinates.lat && crc.coordinates.lng);
+            let crcsWithCoords = allCrcs.filter(crc => crc.coordinates && crc.coordinates.lat && crc.coordinates.lng);
             const crcsWithAddress = allCrcs.filter(crc => (!crc.coordinates || !crc.coordinates.lat) && crc.homeLocation);
+            
+            // Apply indication filter to sites
+            if (indicationFilter !== 'all') {
+                sitesWithCoords = sitesWithCoords.filter(site => {
+                    const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
+                    return studiesAtSite.some(study => study.indication === indicationFilter || study.therapeuticArea === indicationFilter);
+                });
+            }
+            
+            // Apply CRC level filter
+            if (crcLevelFilter !== 'all') {
+                crcsWithCoords = crcsWithCoords.filter(crc => {
+                    // Check CRC level/role - adjust field name as needed
+                    return crc.level === crcLevelFilter || crc.role === crcLevelFilter || crc.permission === crcLevelFilter;
+                });
+            }
             
             console.log('Sites with coordinates:', sitesWithCoords.length, 'Sites with address only:', sitesWithAddress.length);
             console.log('CRCs with coordinates:', crcsWithCoords.length, 'CRCs with address only:', crcsWithAddress.length);
@@ -2179,6 +2231,8 @@
             const crcs = crcsWithCoords;
             
             const markers = [];
+            const sitePoints = [];
+            const crcPoints = [];
             azureMapMarkers = []; // Reset marker data
             
             // Geocode sites with addresses only (async) - process after initial markers are added
@@ -2273,7 +2327,7 @@
                 }
             });
             
-            // Add site markers
+            // Collect site points for animation (always blue)
             sites.forEach(site => {
                 const lat = parseFloat(site.latitude);
                 const lng = parseFloat(site.longitude);
@@ -2292,62 +2346,27 @@
                 const enrolledCount = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
                 const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
                 
-                // Create Azure Maps marker
-                if (currentMapType === 'azure') {
-                    // Determine marker color based on view
-                    let color = '#3b82f6'; // Default blue
-                    if (currentMapView === 'studies') {
-                        color = studiesAtSite.length > 3 ? '#10b981' : studiesAtSite.length > 1 ? '#f59e0b' : '#ef4444';
-                    } else if (currentMapView === 'staffing') {
-                        color = enrolledCount > 20 ? '#10b981' : enrolledCount > 10 ? '#f59e0b' : '#ef4444';
-                    } else if (currentMapView === 'combined') {
-                        color = '#8b5cf6'; // Purple for combined view
-                    }
-                    
-                    // Create HTML marker
-                    const markerHtml = `
-                        <div style="background-color: ${color}; border: 2px solid white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); cursor: pointer;">
-                            ${enrolledCount > 99 ? '99+' : enrolledCount}
-                        </div>
-                    `;
-                    
-                    const marker = new atlas.HtmlMarker({
-                        htmlContent: markerHtml,
-                        position: [lng, lat], // Azure Maps uses [longitude, latitude]
-                        pixelOffset: [0, -16]
-                    });
-                    
-                    // Create popup
-                    const popup = new atlas.Popup({
-                        content: createInfoWindowContent(site, enrolledCount, studiesAtSite),
-                        pixelOffset: [0, -40]
-                    });
-                    
-                    // Add click event
-                    marker.events.add('click', () => {
-                        popup.open(azureMap);
-                        popup.setPosition([lng, lat]);
-                    });
-                    
-                    azureMap.markers.add(marker);
-                    markers.push({ position: [lng, lat], marker: marker });
-                    
-                    // Store marker data for search filtering
-                    azureMapMarkers.push({
-                        marker: marker,
-                        popup: popup,
-                        data: {
-                            type: 'site',
-                            name: site.name,
-                            city: site.city || '',
-                            state: site.state || '',
-                            studies: studiesAtSite.map(s => s.title)
-                        }
-                    });
-                }
+                // Sites are always blue
+                const point = new atlas.Shape(new atlas.data.Point([lng, lat]), null, {
+                    name: site.name,
+                    city: site.city || '',
+                    state: site.state || '',
+                    enrolledCount: enrolledCount,
+                    studiesAtSite: studiesAtSite,
+                    type: 'site',
+                    siteData: site
+                });
+                
+                sitePoints.push(point);
+                markers.push({ position: [lng, lat], type: 'site', data: site });
             });
             
-            // Add CRC home location markers
+            // Add site points to data source
+            if (sitePoints.length > 0) {
+                azureMapDataSource.add(sitePoints);
+            }
+            
+            // Collect CRC points for animation (always green)
             crcs.forEach(crc => {
                 if (!crc.coordinates) {
                     console.warn('CRC missing coordinates object:', crc.name);
@@ -2362,56 +2381,82 @@
                     return;
                 }
                 
-                // Create Azure Maps marker for CRC
-                if (currentMapType === 'azure') {
-                    const crcIconHtml = `
-                        <div style="background-color: #10b981; color: white; border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 14px; cursor: pointer;">
-                            👤
-                        </div>
-                    `;
-                    
-                    const marker = new atlas.HtmlMarker({
-                        htmlContent: crcIconHtml,
-                        position: [lng, lat],
-                        pixelOffset: [0, -14]
-                    });
-                    
-                    const popupContent = `
-                        <div style="min-width: 200px;">
-                            <h3 style="font-weight: bold; font-size: 16px; margin-bottom: 8px; color: #10b981;">🏠 CRC Home Location</h3>
-                            <p style="margin: 4px 0;"><strong>Name:</strong> ${crc.name}</p>
-                            ${crc.title ? `<p style="margin: 4px 0;"><strong>Title:</strong> ${crc.title}</p>` : ''}
-                            <p style="margin: 4px 0;"><strong>Location:</strong> ${crc.homeLocation}</p>
-                            ${crc.region ? `<p style="margin: 4px 0;"><strong>Region:</strong> ${crc.region}</p>` : ''}
-                            ${crc.employmentType ? `<p style="margin: 4px 0;"><strong>Type:</strong> ${crc.employmentType}</p>` : ''}
-                        </div>
-                    `;
-                    
-                    const popup = new atlas.Popup({
-                        content: popupContent,
-                        pixelOffset: [0, -40]
-                    });
-                    
-                    marker.events.add('click', () => {
-                        popup.open(azureMap);
-                        popup.setPosition([lng, lat]);
-                    });
-                    
-                    azureMap.markers.add(marker);
-                    markers.push({ position: [lng, lat], marker: marker });
-                    
-                    // Store marker data for search filtering
-                    azureMapMarkers.push({
-                        marker: marker,
-                        popup: popup,
-                        data: {
-                            type: 'crc',
-                            name: crc.name,
-                            location: crc.homeLocation,
-                            region: crc.region || ''
-                        }
-                    });
+                // CRCs are always green
+                const point = new atlas.Shape(new atlas.data.Point([lng, lat]), null, {
+                    name: crc.name,
+                    homeLocation: crc.homeLocation,
+                    title: crc.title || '',
+                    region: crc.region || '',
+                    employmentType: crc.employmentType || '',
+                    type: 'crc',
+                    crcData: crc
+                });
+                
+                crcPoints.push(point);
+                markers.push({ position: [lng, lat], type: 'crc', data: crc });
+            });
+            
+            // Add CRC points to data source
+            if (crcPoints.length > 0) {
+                azureMapDataSource.add(crcPoints);
+            }
+            
+            // Note: We use HTML markers for display, the data source is just for animation
+            // The drop animation will work with the data source points
+            
+            // Animate dropping markers
+            if (typeof atlas !== 'undefined' && atlas.animations && (sitePoints.length > 0 || crcPoints.length > 0)) {
+                const allPoints = [...sitePoints, ...crcPoints];
+                if (allPoints.length > 0) {
+                    setTimeout(() => {
+                        azureMapAnimation = atlas.animations.drop(allPoints, azureMapDataSource, null, {
+                            easing: 'easeOutBounce',
+                            duration: 1000,
+                            autoPlay: true
+                        });
+                        console.log('Drop animation started for', allPoints.length, 'markers');
+                    }, 500);
                 }
+            }
+            
+            // Create HTML markers with popups for interaction (sites - always blue)
+            sites.forEach(site => {
+                const lat = parseFloat(site.latitude);
+                const lng = parseFloat(site.longitude);
+                
+                if (isNaN(lat) || isNaN(lng)) return;
+                
+                const sitePatients = allPatients.filter(p => {
+                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                    return currentEnrollment?.siteId === site.id;
+                });
+                const enrolledCount = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
+                const studiesAtSite = allStudies.filter(s => (s.siteIds || []).includes(site.id));
+                
+                // Sites are always blue
+                const markerHtml = `<div style="background-color: #3b82f6; border: 2px solid white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); cursor: pointer;">${enrolledCount > 99 ? '99+' : enrolledCount}</div>`;
+                const marker = new atlas.HtmlMarker({ htmlContent: markerHtml, position: [lng, lat], pixelOffset: [0, -16] });
+                const popup = new atlas.Popup({ content: createInfoWindowContent(site, enrolledCount, studiesAtSite), pixelOffset: [0, -40] });
+                marker.events.add('click', () => { popup.open(azureMap); popup.setPosition([lng, lat]); });
+                azureMap.markers.add(marker);
+                azureMapMarkers.push({ marker: marker, popup: popup, data: { type: 'site', name: site.name, city: site.city || '', state: site.state || '', studies: studiesAtSite.map(s => s.title), indication: studiesAtSite.map(s => s.indication || s.therapeuticArea).filter(Boolean) } });
+            });
+            
+            // Create HTML markers with popups for interaction (CRCs - always green)
+            crcs.forEach(crc => {
+                if (!crc.coordinates) return;
+                const lat = parseFloat(crc.coordinates.lat);
+                const lng = parseFloat(crc.coordinates.lng);
+                if (isNaN(lat) || isNaN(lng)) return;
+                
+                // CRCs are always green
+                const crcIconHtml = `<div style="background-color: #10b981; color: white; border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-weight: bold; font-size: 14px; cursor: pointer;">👤</div>`;
+                const marker = new atlas.HtmlMarker({ htmlContent: crcIconHtml, position: [lng, lat], pixelOffset: [0, -14] });
+                const popupContent = `<div style="min-width: 200px;"><h3 style="font-weight: bold; font-size: 16px; margin-bottom: 8px; color: #10b981;">🏠 CRC Home Location</h3><p style="margin: 4px 0;"><strong>Name:</strong> ${crc.name}</p>${crc.title ? `<p style="margin: 4px 0;"><strong>Title:</strong> ${crc.title}</p>` : ''}<p style="margin: 4px 0;"><strong>Location:</strong> ${crc.homeLocation || 'N/A'}</p>${crc.region ? `<p style="margin: 4px 0;"><strong>Region:</strong> ${crc.region}</p>` : ''}${crc.employmentType ? `<p style="margin: 4px 0;"><strong>Type:</strong> ${crc.employmentType}</p>` : ''}</div>`;
+                const popup = new atlas.Popup({ content: popupContent, pixelOffset: [0, -40] });
+                marker.events.add('click', () => { popup.open(azureMap); popup.setPosition([lng, lat]); });
+                azureMap.markers.add(marker);
+                azureMapMarkers.push({ marker: marker, popup: popup, data: { type: 'crc', name: crc.name, location: crc.homeLocation || '', region: crc.region || '', level: crc.level || crc.role || crc.permission || '' } });
             });
             
             // Fit map to show all markers
@@ -2519,9 +2564,52 @@
             const mapViewSelector = document.getElementById('map-view-selector');
             const refreshMapBtn = document.getElementById('refresh-map-btn');
             const searchInput = document.getElementById('artemis-map-search');
+            const indicationFilter = document.getElementById('map-indication-filter');
+            const crcLevelFilter = document.getElementById('map-crc-level-filter');
+            
+            // Populate indication filter
+            if (indicationFilter) {
+                const indications = new Set();
+                allStudies.forEach(study => {
+                    if (study.indication) indications.add(study.indication);
+                    if (study.therapeuticArea) indications.add(study.therapeuticArea);
+                });
+                const indicationOptions = Array.from(indications).sort();
+                indicationOptions.forEach(ind => {
+                    const option = document.createElement('option');
+                    option.value = ind;
+                    option.textContent = ind;
+                    indicationFilter.appendChild(option);
+                });
+            }
+            
+            // Populate CRC level filter
+            if (crcLevelFilter) {
+                const levels = new Set();
+                allCrcs.forEach(crc => {
+                    if (crc.level) levels.add(crc.level);
+                    if (crc.role) levels.add(crc.role);
+                    if (crc.permission) levels.add(crc.permission);
+                });
+                const levelOptions = Array.from(levels).sort();
+                levelOptions.forEach(level => {
+                    const option = document.createElement('option');
+                    option.value = level;
+                    option.textContent = level;
+                    crcLevelFilter.appendChild(option);
+                });
+            }
             
             mapViewSelector?.addEventListener('change', () => {
                 currentMapView = mapViewSelector.value;
+                loadMapMarkers();
+            });
+            
+            indicationFilter?.addEventListener('change', () => {
+                loadMapMarkers();
+            });
+            
+            crcLevelFilter?.addEventListener('change', () => {
                 loadMapMarkers();
             });
             
@@ -2551,7 +2639,10 @@
                     (data.city && data.city.toLowerCase().includes(term)) ||
                     (data.state && data.state.toLowerCase().includes(term)) ||
                     (data.studies && data.studies.some(s => s.toLowerCase().includes(term))) ||
-                    (data.location && data.location.toLowerCase().includes(term));
+                    (data.location && data.location.toLowerCase().includes(term)) ||
+                    (data.indication && data.indication.some(i => i.toLowerCase().includes(term))) ||
+                    (data.region && data.region.toLowerCase().includes(term)) ||
+                    (data.level && data.level.toLowerCase().includes(term));
                 
                 // Show/hide markers based on match
                 if (currentMapType === 'azure' && marker) {
