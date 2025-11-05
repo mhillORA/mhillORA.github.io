@@ -1129,8 +1129,9 @@
                 try {
                     if (!locationString || !locationString.trim()) return null;
                     
+                    // Use backend proxy to avoid CORS issues
                     const response = await fetch(
-                        `https://atlas.microsoft.com/search/address/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}&query=${encodeURIComponent(locationString)}&limit=1`
+                        `/api/geocode?api-version=1.0&query=${encodeURIComponent(locationString)}&limit=1`
                     );
                     const data = await response.json();
                     if (data && data.results && data.results.length > 0) {
@@ -1153,8 +1154,9 @@
                 try {
                     if (!hotelCoords || !siteCoords) return null;
                     
+                    // Use backend proxy to avoid CORS issues
                     const response = await fetch(
-                        `https://atlas.microsoft.com/route/directions/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}&query=${hotelCoords.lng},${hotelCoords.lat}:${siteCoords.lng},${siteCoords.lat}&travelMode=car`
+                        `/api/route/directions?api-version=1.0&query=${hotelCoords.lng},${hotelCoords.lat}:${siteCoords.lng},${siteCoords.lat}&travelMode=car`
                     );
                     const data = await response.json();
                     if (data && data.routes && data.routes.length > 0) {
@@ -10550,6 +10552,62 @@
                         }
                         break;
                     }
+                    case 'delete-time-off-request': {
+                        try {
+                            const request = state.timeOffRequests.find(r => r.id === id);
+                            if (!request) {
+                                showNotification('Time off request not found.', 'error');
+                                return;
+                            }
+                            
+                            // Confirm deletion
+                            const crc = state.crcs.find(c => c.id === request.crcId);
+                            const employeeName = crc ? crc.name : 'Unknown';
+                            const confirmMessage = `Are you sure you want to delete this ${request.status} time off request for ${employeeName}?`;
+                            
+                            if (confirm(confirmMessage)) {
+                                await apiService.deleteTimeOffRequest(id);
+                                
+                                // Remove from state
+                                state.timeOffRequests = state.timeOffRequests.filter(r => r.id !== id);
+                                
+                                // Remove associated unavailability event if it exists
+                                const date = request.date || request.startDate;
+                                const associatedEvent = state.crc_events.find(e => 
+                                    e.crcId === request.crcId && 
+                                    e.date === date && 
+                                    e.type === 'Unavailable' &&
+                                    e.timeOffRequestId === request.id
+                                );
+                                
+                                if (associatedEvent) {
+                                    try {
+                                        await apiService.deleteEvent(associatedEvent.id);
+                                        state.crc_events = state.crc_events.filter(e => e.id !== associatedEvent.id);
+                                    } catch (eventError) {
+                                        console.error('Error deleting associated unavailability event:', eventError);
+                                    }
+                                }
+                                
+                                showNotification('Time off request deleted successfully!', 'success');
+                                renderTimeOffRequestsContent();
+                                
+                                // Refresh calendar views
+                                if (state.activeTab === 'unavailability') {
+                                    renderUnavailabilityCalendar();
+                                }
+                                
+                                // Refresh main calendar if it's showing
+                                if (typeof renderCRCLists === 'function') {
+                                    renderCRCLists();
+                                }
+                            }
+                        } catch (error) {
+                            console.error('Error deleting time off request:', error);
+                            showNotification('Failed to delete time off request. See console for details.', 'error');
+                        }
+                        break;
+                    }
                     case 'lookup-flight': {
                         e.preventDefault();
                         e.stopPropagation();
@@ -13612,7 +13670,12 @@
                                                         const statusColor = req.status === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
                                                                            req.status === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
                                                                            'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200';
-                                                        return `<div class="text-xs px-1 py-0.5 rounded ${statusColor} truncate" title="${crc ? crc.name : 'Unknown'}: ${req.type || 'Time Off'}">${crc ? crc.name.substring(0, 5) : 'Unknown'}</div>`;
+                                                        // Get full first name
+                                                        const firstName = crc ? (crc.name.split(' ')[0] || crc.name) : 'Unknown';
+                                                        return `<div class="text-xs px-1 py-0.5 rounded ${statusColor} truncate flex items-center justify-between" title="${crc ? crc.name : 'Unknown'}: ${req.type || 'Time Off'}">
+                                                            <span class="truncate flex-1">${firstName}</span>
+                                                            ${(req.status === 'approved' || req.status === 'rejected') ? `<button data-action="delete-time-off-request" data-id="${req.id}" class="ml-1 text-gray-600 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400" title="Delete">×</button>` : ''}
+                                                        </div>`;
                                                     }).join('')}
                                                     ${dayRequests.length > 2 ? `<div class="text-xs text-gray-500 dark:text-gray-400">+${dayRequests.length - 2} more</div>` : ''}
                                                 </div>
@@ -13685,7 +13748,9 @@
                                                                 ${request.status === 'pending' ? `
                                                                     <button data-action="approve-time-off-request" data-id="${request.id}" class="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 mr-2">Approve</button>
                                                                     <button data-action="reject-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700">Reject</button>
-                                                                ` : '-'}
+                                                                ` : `
+                                                                    <button data-action="delete-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700" title="Delete ${request.status} request">Delete</button>
+                                                                `}
                                                             </td>
                                                         </tr>
                                                     `;
