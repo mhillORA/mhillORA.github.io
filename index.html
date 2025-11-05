@@ -1400,40 +1400,24 @@
                 }
             };
             
-            // Calculate distance between two coordinates using Azure Maps Route API
-            const calculateDistance = async (hotelCoords, siteCoords) => {
+            // Calculate distance between two addresses using Azure Maps Route API (address-to-address routing)
+            const calculateDistance = async (hotelAddress, siteAddress) => {
                 try {
-                    if (!hotelCoords || !siteCoords) {
-                        console.error('calculateDistance: Missing coordinates', { hotelCoords, siteCoords });
+                    if (!hotelAddress || !siteAddress) {
+                        console.error('calculateDistance: Missing addresses', { hotelAddress, siteAddress });
                         return null;
                     }
                     
-                    console.log('calculateDistance: Calculating route from', hotelCoords, 'to', siteCoords);
-                    
-                    // Validate coordinates before making API call
-                    const lat1 = parseFloat(hotelCoords.lat);
-                    const lng1 = parseFloat(hotelCoords.lng);
-                    const lat2 = parseFloat(siteCoords.lat);
-                    const lng2 = parseFloat(siteCoords.lng);
-                    
-                    if (isNaN(lat1) || isNaN(lng1) || isNaN(lat2) || isNaN(lng2)) {
-                        console.error('calculateDistance: Invalid coordinates', { hotelCoords, siteCoords });
-                        return null;
-                    }
-                    
-                    // Check if coordinates are within valid ranges
-                    if (lat1 < -90 || lat1 > 90 || lng1 < -180 || lng1 > 180 ||
-                        lat2 < -90 || lat2 > 90 || lng2 < -180 || lng2 > 180) {
-                        console.error('calculateDistance: Coordinates out of valid range', { lat1, lng1, lat2, lng2 });
-                        return null;
-                    }
+                    console.log('calculateDistance: Calculating route from address to address');
+                    console.log('Hotel address:', hotelAddress);
+                    console.log('Site address:', siteAddress);
                     
                     // Use backend proxy to avoid CORS issues
-                    // Try with routeType=shortest first to avoid map matching failures
-                    // Format: lng,lat:lng,lat (Azure Maps expects longitude first)
-                    let url = `/api/route/directions?api-version=1.0&query=${lng1},${lat1}:${lng2},${lat2}&travelMode=car&routeType=shortest`;
-                    console.log('calculateDistance: Calling route API:', url);
-                    console.log('calculateDistance: Coordinates - Hotel:', { lat: lat1, lng: lng1 }, 'Site:', { lat: lat2, lng: lng2 });
+                    // Azure Maps Route API supports address-to-address routing
+                    // Format: query=address1:address2 (URL encoded)
+                    const queryParam = `${encodeURIComponent(hotelAddress)}:${encodeURIComponent(siteAddress)}`;
+                    let url = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=shortest`;
+                    console.log('calculateDistance: Calling route API with addresses');
                     
                     const response = await fetch(url);
                     console.log('calculateDistance: Response status:', response.status);
@@ -1487,10 +1471,24 @@
                             });
                         }
                         
-                        // If no points, create simple path from start to end
-                        if (path.length === 0) {
-                            path.push([hotelCoords.lng, hotelCoords.lat]);
-                            path.push([siteCoords.lng, siteCoords.lat]);
+                        // Extract coordinates from route for map display
+                        let hotelCoords = null;
+                        let siteCoords = null;
+                        if (route.legs && route.legs.length > 0) {
+                            const firstLeg = route.legs[0];
+                            const lastLeg = route.legs[route.legs.length - 1];
+                            if (firstLeg.points && firstLeg.points.length > 0) {
+                                const firstPoint = firstLeg.points[0];
+                                if (firstPoint.longitude !== undefined && firstPoint.latitude !== undefined) {
+                                    hotelCoords = { lat: firstPoint.latitude, lng: firstPoint.longitude };
+                                }
+                            }
+                            if (lastLeg.points && lastLeg.points.length > 0) {
+                                const lastPoint = lastLeg.points[lastLeg.points.length - 1];
+                                if (lastPoint.longitude !== undefined && lastPoint.latitude !== undefined) {
+                                    siteCoords = { lat: lastPoint.latitude, lng: lastPoint.longitude };
+                                }
+                            }
                         }
                         
                         return {
@@ -1598,7 +1596,8 @@
             };
             
             // Calculate route and show on map
-            const calculateRoute = async (hotelCoords, siteCoords, siteName) => {
+            // Function to calculate route using addresses (address-to-address routing)
+            const calculateRoute = async (hotelAddress, siteAddress, siteName) => {
                 const distanceDisplay = document.getElementById('distance-display');
                 const distanceText = document.getElementById('distance-text');
                 const calculateBtn = document.getElementById('calculate-route-btn');
@@ -1610,17 +1609,17 @@
                 if (calculateBtn) calculateBtn.classList.add('hidden');
                 
                 try {
-                    // Calculate distance
-                    const distanceInfo = await calculateDistance(hotelCoords, siteCoords);
+                    // Calculate distance using address-to-address routing
+                    const distanceInfo = await calculateDistance(hotelAddress, siteAddress);
                     if (distanceInfo && distanceInfo.path && distanceInfo.path.length > 0) {
                         distanceText.textContent = `Distance to ${siteName}: ${distanceInfo.distance} miles (${distanceInfo.travelTime} minutes drive)`;
                         if (calculateBtn) calculateBtn.classList.add('hidden');
                         
-                        // Show route on map
-                        showHotelSiteMap(distanceInfo.path, hotelCoords, siteCoords, siteName);
+                        // Show route on map (use coordinates from route response)
+                        showHotelSiteMap(distanceInfo.path, distanceInfo.hotelCoords, distanceInfo.siteCoords, siteName);
                     } else {
                         console.warn('calculateRoute: No route data returned', distanceInfo);
-                        distanceText.textContent = 'Unable to calculate route. Please check the address.';
+                        distanceText.textContent = 'Unable to calculate route. Please check the addresses.';
                         if (calculateBtn) calculateBtn.classList.remove('hidden');
                     }
                 } catch (error) {
@@ -1663,50 +1662,29 @@
                     const fullAddress = addressParts.join(', ');
                     
                     try {
-                        // Geocode hotel address
+                        // Geocode hotel address for map display only
                         const hotelCoords = await geocodeLocation(fullAddress);
                         if (hotelCoords) {
                             // Show hotel location on map
                             await showHotelLocationOnly(hotelCoords);
+                            currentHotelCoords = hotelCoords;
                             
-                            // If site is selected, show button and calculate route
+                            // If site is selected, show button and calculate route using addresses
                             const siteId = siteVisitingInput?.value;
                             if (siteId && state.crc_sites && Array.isArray(state.crc_sites)) {
                                 const site = state.crc_sites.find(s => s.id === siteId);
                                 if (site) {
-                                    // ALWAYS use addresses from ARTEMIS - geocode from address (ignore lat/long)
-                                    let siteCoords = null;
-                                    try {
-                                        // Build site address from site properties (always geocode from address)
-                                        const siteAddressParts = [
-                                            site.address1 || '', 
-                                            site.city || '', 
-                                            site.state || '', 
-                                            site.zipCode || site.zip || ''
-                                        ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
-                                        
-                                        if (siteAddressParts.length > 0) {
-                                            const siteAddress = siteAddressParts.join(', ');
-                                            console.log('Geocoding site address from ARTEMIS:', siteAddress);
-                                            const coords = await geocodeLocation(siteAddress);
-                                            if (coords) {
-                                                siteCoords = {
-                                                    lat: parseFloat(coords.lat),
-                                                    lng: parseFloat(coords.lng)
-                                                };
-                                                console.log('Site geocoded successfully:', siteCoords);
-                                            } else {
-                                                console.warn('Could not geocode site address:', siteAddress);
-                                            }
-                                        } else {
-                                            console.warn('Site has no address information to geocode:', site.name || site.id);
-                                        }
-                                    } catch (error) {
-                                        console.error('Error geocoding site address:', error);
-                                    }
+                                    // Build site address from ARTEMIS (always use addresses for routing)
+                                    const siteAddressParts = [
+                                        site.address1 || '', 
+                                        site.city || '', 
+                                        site.state || '', 
+                                        site.zipCode || site.zip || ''
+                                    ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
                                     
-                                    if (siteCoords) {
-                                        currentSiteCoords = siteCoords;
+                                    if (siteAddressParts.length > 0) {
+                                        const siteAddress = siteAddressParts.join(', ');
+                                        console.log('Calculating route using addresses - Hotel:', fullAddress, 'Site:', siteAddress);
                                         
                                         // Show button and distance display
                                         if (calculateBtn && distanceDisplay) {
@@ -1714,12 +1692,13 @@
                                             calculateBtn.classList.remove('hidden');
                                         }
                                         
-                                        await calculateRoute(hotelCoords, siteCoords, site.name);
+                                        // Use address-to-address routing (no geocoding needed for routing)
+                                        await calculateRoute(fullAddress, siteAddress, site.name);
                                     } else if (distanceDisplay && calculateBtn) {
-                                        // Site selected but no coordinates and geocoding failed - show button for manual calculation
+                                        // Site has no address - show button for manual calculation
                                         distanceDisplay.classList.remove('hidden');
                                         calculateBtn.classList.remove('hidden');
-                                        distanceText.textContent = 'Site coordinates not found. Please check the site address or add coordinates. Click "Calculate Route" to try again.';
+                                        distanceText.textContent = 'Site address not found. Please check the site address in ARTEMIS.';
                                     }
                                 }
                             }
@@ -1729,10 +1708,19 @@
                     }
                 };
                 
-                // Function to calculate route when site is selected
+                // Function to calculate route when site is selected (using addresses)
                 const updateRoute = async () => {
                     const siteId = siteVisitingInput?.value;
-                    if (!siteId || !currentHotelCoords) {
+                    
+                    // Get hotel address from inputs
+                    const hotelAddress = hotelAddressInput?.value || '';
+                    const hotelCity = hotelCityInput?.value || '';
+                    const hotelState = hotelStateInput?.value || '';
+                    const hotelZip = hotelZipInput?.value || '';
+                    const hotelAddressParts = [hotelAddress, hotelCity, hotelState, hotelZip].filter(p => p && p.trim());
+                    const fullHotelAddress = hotelAddressParts.length > 0 ? hotelAddressParts.join(', ') : null;
+                    
+                    if (!siteId || !fullHotelAddress) {
                         if (distanceDisplay) distanceDisplay.classList.add('hidden');
                         if (calculateBtn) calculateBtn.classList.add('hidden');
                         return;
@@ -1751,41 +1739,18 @@
                         return;
                     }
                     
-                    // ALWAYS use addresses from ARTEMIS - geocode from address (ignore lat/long)
-                    let siteCoords = null;
-                    try {
-                        // Build site address from site properties (always geocode from address)
-                        const siteAddressParts = [
-                            site.address1 || '', 
-                            site.city || '', 
-                            site.state || '', 
-                            site.zipCode || site.zip || ''
-                        ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
-                        
-                        if (siteAddressParts.length > 0) {
-                            const siteAddress = siteAddressParts.join(', ');
-                            console.log('Geocoding site address from ARTEMIS:', siteAddress);
-                            const coords = await geocodeLocation(siteAddress);
-                            if (coords) {
-                                siteCoords = {
-                                    lat: parseFloat(coords.lat),
-                                    lng: parseFloat(coords.lng)
-                                };
-                                console.log('Site geocoded successfully:', siteCoords);
-                            } else {
-                                console.warn('Could not geocode site address:', siteAddress);
-                            }
-                        } else {
-                            console.warn('Site has no address information to geocode:', site.name || site.id);
-                        }
-                    } catch (error) {
-                        console.error('Error geocoding site address:', error);
-                    }
+                    // Build site address from ARTEMIS (always use addresses for routing)
+                    const siteAddressParts = [
+                        site.address1 || '', 
+                        site.city || '', 
+                        site.state || '', 
+                        site.zipCode || site.zip || ''
+                    ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
                     
-                    if (!siteCoords) {
+                    if (siteAddressParts.length === 0) {
                         if (distanceDisplay) {
                             distanceDisplay.classList.remove('hidden');
-                            distanceText.textContent = 'Site coordinates not found. Please check the site address or add coordinates.';
+                            distanceText.textContent = 'Site address not found. Please check the site address in ARTEMIS.';
                         }
                         if (calculateBtn) {
                             calculateBtn.classList.remove('hidden');
@@ -1793,7 +1758,7 @@
                         return;
                     }
                     
-                    currentSiteCoords = siteCoords;
+                    const siteAddress = siteAddressParts.join(', ');
                     
                     // Show button and calculate route
                     if (calculateBtn && distanceDisplay) {
@@ -1801,8 +1766,8 @@
                         calculateBtn.classList.remove('hidden');
                     }
                     
-                    // Calculate route
-                    await calculateRoute(currentHotelCoords, siteCoords, site.name);
+                    // Use address-to-address routing (no geocoding needed)
+                    await calculateRoute(fullHotelAddress, siteAddress, site.name);
                 };
                 
                 // Add event listeners for hotel address inputs (debounced)
