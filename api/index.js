@@ -1609,6 +1609,9 @@ app.http('azure-maps-config', {
 });
 
 // Flight lookup proxy endpoint
+// This endpoint calls AviationStack API directly - it does NOT search the database
+// Flight data is only saved to the database when the user saves a travel record via /api/travel
+// All travel records (including flight data) are stored in the "travel" container, not a separate "flight-lookup" container
 app.http('flightLookup', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
@@ -1642,6 +1645,7 @@ app.http('flightLookup', {
             }
             
             context.log.info(`Flight lookup request for: ${flightNumber}`);
+            context.log.info('Calling AviationStack API directly - NOT searching database');
             
             // Try AviationStack API (available via Microsoft Connectors)
             const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY;
