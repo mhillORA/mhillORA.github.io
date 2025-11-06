@@ -1851,10 +1851,17 @@ app.http('navanLookup', {
                                     bookingData = { data: [uuidBookingData.data[0]] };
                                     context.log.info('Full booking details retrieved using UUID');
                                     break;
+                                } else {
+                                    // UUID lookup returned empty data, use booking from list
+                                    context.log.warn('UUID lookup returned empty data, using booking from list');
+                                    bookingData = { data: [foundBooking] };
+                                    break;
                                 }
                             } else {
-                                // Fallback to the booking we found in the list
-                                context.log.warn('UUID lookup failed, using booking from list');
+                                // UUID lookup failed, use booking from list
+                                const errorText = await uuidResponse.text();
+                                context.log.warn(`UUID lookup failed with status ${uuidResponse.status}: ${errorText}`);
+                                context.log.warn('Falling back to booking from list');
                                 bookingData = { data: [foundBooking] };
                                 break;
                             }
@@ -1955,16 +1962,15 @@ app.http('navanLookup', {
                 
                 // Get passenger/traveler info and find matching CRC ID
                 // Staff member should be pulled from passengers[0].person.name
+                // Only use name for lookup (no email lookup)
                 let crcId = null;
-                let travelerEmail = null;
                 let travelerName = null;
                 
                 if (booking.passengers && booking.passengers.length > 0 && booking.passengers[0].person) {
                     const person = booking.passengers[0].person;
-                    travelerName = person.name || null; // Primary: use name from passengers[0].person.name
-                    travelerEmail = person.email || null; // Secondary: use email as fallback
+                    travelerName = person.name || null; // Use name from passengers[0].person.name
                     
-                    // Try to find CRC by name first (from passengers[0].person.name)
+                    // Try to find CRC by name only (from passengers[0].person.name)
                     if (travelerName) {
                         try {
                             context.log.info(`Looking up CRC by name: ${travelerName}`);
@@ -1980,44 +1986,12 @@ app.http('navanLookup', {
                                 crcId = nameMatches[0].id;
                                 context.log.info(`Found matching CRC: ${crcId} for name ${travelerName}`);
                             } else {
-                                // Try to find by email if name doesn't match
-                                if (travelerEmail) {
-                                    context.log.info(`Looking up CRC by email: ${travelerEmail}`);
-                                    const { resources: emailMatches } = await crcsContainer.items
-                                        .query({
-                                            query: "SELECT * FROM c WHERE c.email = @email",
-                                            parameters: [{ name: "@email", value: travelerEmail }]
-                                        })
-                                        .fetchAll();
-                                    
-                                    if (emailMatches && emailMatches.length > 0) {
-                                        crcId = emailMatches[0].id;
-                                        context.log.info(`Found matching CRC: ${crcId} for email ${travelerEmail}`);
-                                    }
-                                }
+                                context.log.warn(`No CRC found with name: ${travelerName}`);
                             }
                         } catch (crcLookupError) {
-                            context.log.warn('Error looking up CRC:', crcLookupError.message);
+                            context.log.warn('Error looking up CRC by name:', crcLookupError.message);
+                            context.log.warn('CRC lookup error stack:', crcLookupError.stack);
                             // Continue without crcId - will need to be set manually
-                        }
-                    } else if (travelerEmail) {
-                        // If no name, try email only
-                        try {
-                            context.log.info(`Looking up CRC by email (no name available): ${travelerEmail}`);
-                            const crcsContainer = getContainer('crcs');
-                            const { resources: emailMatches } = await crcsContainer.items
-                                .query({
-                                    query: "SELECT * FROM c WHERE c.email = @email",
-                                    parameters: [{ name: "@email", value: travelerEmail }]
-                                })
-                                .fetchAll();
-                            
-                            if (emailMatches && emailMatches.length > 0) {
-                                crcId = emailMatches[0].id;
-                                context.log.info(`Found matching CRC: ${crcId} for email ${travelerEmail}`);
-                            }
-                        } catch (crcLookupError) {
-                            context.log.warn('Error looking up CRC by email:', crcLookupError.message);
                         }
                     }
                 }
@@ -2026,9 +2000,6 @@ app.http('navanLookup', {
                 if (!crcId && travelerName) {
                     crcId = travelerName; // Temporary fallback
                     context.log.warn(`No CRC found for ${travelerName}, using name as crcId (will need manual update)`);
-                } else if (!crcId && travelerEmail) {
-                    crcId = travelerEmail; // Last resort fallback
-                    context.log.warn(`No CRC found for ${travelerEmail}, using email as crcId (will need manual update)`);
                 }
                 
                 // Get date (required field: date) - format as YYYY-MM-DD string
