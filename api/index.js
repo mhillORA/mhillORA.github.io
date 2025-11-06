@@ -2762,3 +2762,35 @@ app.http('routeDirections', {
         }
     }
 });
+// ADD THIS NEW ENDPOINT TO THE END OF api/index.js
+app.http('debugEnv', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'debug-env',
+    handler: async (request, context) => {
+        try {
+            const navanClientId = process.env.NAVAN_CLIENT_ID;
+            const navanSecretKey = process.env.NAVAN_SECRET_KEY;
+            const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
+            const cosmosKey = process.env.COSMOS_KEY;
+            const databaseId = process.env.DATABASE_ID;
+            const mapsKey = process.env.AZURE_MAPS_KEY;
+
+            return {
+                status: 200,
+                jsonBody: {
+                    navanClientId_isSet: !!navanClientId,
+                    navanClientId_length: navanClientId ? navanClientId.length : 0,
+                    navanSecretKey_isSet: !!navanSecretKey,
+                    navanSecretKey_length: navanSecretKey ? navanSecretKey.length : 0,
+                    cosmosEndpoint_isSet: !!cosmosEndpoint,
+                    cosmosKey_isSet: !!cosmosKey,
+                    databaseId_isSet: !!databaseId,
+                    mapsKey_isSet: !!mapsKey
+                }
+            };
+        } catch (error) {
+            return handleError(context, error, 'Debug-env failed');
+        }
+    }
+});
