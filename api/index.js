@@ -1,7 +1,17 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
-// Node.js 18+ has fetch built-in, no polyfill needed
+// Use node-fetch instead of native fetch for Azure Functions compatibility
+// Native fetch is broken in Azure Functions environment
+// Import node-fetch dynamically - this will be initialized on first use
+let fetch;
+const getFetch = async () => {
+    if (!fetch) {
+        const nodeFetch = await import('node-fetch');
+        fetch = nodeFetch.default;
+    }
+    return fetch;
+};
 
 // Helper function to generate unique IDs
 function generateId() {
@@ -1732,7 +1742,8 @@ app.http('navanLookup', {
             }
             
             context.log.info('Requesting OAuth token from Navan...');
-            const tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
+            const fetchFn = await getFetch();
+            const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
                 method: 'POST',
                 headers: {
                     'content-type': 'application/x-www-form-urlencoded'
@@ -1798,7 +1809,8 @@ app.http('navanLookup', {
                 while (!foundBooking && page < 10) { // Limit to 10 pages (1000 bookings max)
                     context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
                     
-                    bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
+                    const fetchFn = await getFetch();
+                    bookingResponse = await fetchFn(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
                         method: 'GET',
                         headers: {
                             'Authorization': `Bearer ${accessToken}`,
@@ -1836,7 +1848,8 @@ app.http('navanLookup', {
                             // Now use the UUID to fetch the full booking details directly
                             // This is more efficient and ensures we get all details
                             context.log.info(`Fetching full booking details using UUID: ${bookingUuid}`);
-                            const uuidResponse = await fetch(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+                            const fetchFn = await getFetch();
+                            const uuidResponse = await fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                                 method: 'GET',
                                 headers: {
                                     'Authorization': `Bearer ${accessToken}`,
@@ -2400,7 +2413,8 @@ app.http('navanTest', {
             context.log.info('Testing OAuth token generation...');
             let tokenResponse;
             try {
-                tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
+                const fetchFn = await getFetch();
+                tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
                     method: 'POST',
                     headers: {
                         'content-type': 'application/x-www-form-urlencoded'
@@ -2476,7 +2490,8 @@ app.http('navanTest', {
             context.log.info('Testing API call with token...');
             let testApiResponse;
             try {
-                testApiResponse = await fetch(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
+                const fetchFn = await getFetch();
+                testApiResponse = await fetchFn(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
                     method: 'GET',
                     headers: {
                         'Authorization': `Bearer ${accessToken}`,
@@ -2666,7 +2681,8 @@ app.http('geocode', {
             const apiUrl = `https://atlas.microsoft.com/search/address/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const response = await fetch(apiUrl);
+                const fetchFn = await getFetch();
+                const response = await fetchFn(apiUrl);
                 const data = await response.json();
                 return {
                     status: 200,
@@ -2737,7 +2753,8 @@ app.http('routeDirections', {
             const apiUrl = `https://atlas.microsoft.com/route/directions/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const response = await fetch(apiUrl);
+                const fetchFn = await getFetch();
+                const response = await fetchFn(apiUrl);
                 const data = await response.json();
                 return {
                     status: 200,
@@ -2759,38 +2776,6 @@ app.http('routeDirections', {
                 jsonBody: { error: error.message },
                 headers: { 'Content-Type': 'application/json' }
             };
-        }
-    }
-});
-// ADD THIS NEW ENDPOINT TO THE END OF api/index.js
-app.http('debugEnv', {
-    methods: ['GET', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'debug-env',
-    handler: async (request, context) => {
-        try {
-            const navanClientId = process.env.NAVAN_CLIENT_ID;
-            const navanSecretKey = process.env.NAVAN_SECRET_KEY;
-            const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
-            const cosmosKey = process.env.COSMOS_KEY;
-            const databaseId = process.env.DATABASE_ID;
-            const mapsKey = process.env.AZURE_MAPS_KEY;
-
-            return {
-                status: 200,
-                jsonBody: {
-                    navanClientId_isSet: !!navanClientId,
-                    navanClientId_length: navanClientId ? navanClientId.length : 0,
-                    navanSecretKey_isSet: !!navanSecretKey,
-                    navanSecretKey_length: navanSecretKey ? navanSecretKey.length : 0,
-                    cosmosEndpoint_isSet: !!cosmosEndpoint,
-                    cosmosKey_isSet: !!cosmosKey,
-                    databaseId_isSet: !!databaseId,
-                    mapsKey_isSet: !!mapsKey
-                }
-            };
-        } catch (error) {
-            return handleError(context, error, 'Debug-env failed');
         }
     }
 });
