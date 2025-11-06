@@ -2328,41 +2328,43 @@ app.http('navanTest', {
     authLevel: 'anonymous',
     route: 'navan-test',
     handler: async (request, context) => {
-        // Default error response
-        const errorResponse = (error, detail) => ({
-            status: 200, // Always return 200 so frontend can see error details
-            jsonBody: {
-                connected: false,
-                error: error || 'Connection test failed',
-                detail: detail || 'Unknown error occurred',
-                message: 'Failed to test Navan API connection'
-            },
-            headers: { 
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            }
-        });
-        
-        // Handle OPTIONS request for CORS
-        if (request.method === 'OPTIONS') {
-            return {
-                status: 200,
-                headers: {
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type'
-                }
-            };
-        }
-        
+        // Wrap everything in a try-catch to ensure we always return a response
         try {
-            context.log.info('Navan API connection test requested');
+            // Default error response
+            const errorResponse = (error, detail) => ({
+                status: 200, // Always return 200 so frontend can see error details
+                jsonBody: {
+                    connected: false,
+                    error: error || 'Connection test failed',
+                    detail: detail || 'Unknown error occurred',
+                    message: 'Failed to test Navan API connection'
+                },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            });
             
-            // Check if fetch is available
-            if (typeof fetch === 'undefined') {
-                context.log.error('fetch is not available in this runtime');
-                return errorResponse('Runtime error', 'fetch API is not available. This may be a Node.js version issue.');
+            // Handle OPTIONS request for CORS
+            if (request.method === 'OPTIONS') {
+                return {
+                    status: 200,
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+                        'Access-Control-Allow-Headers': 'Content-Type'
+                    }
+                };
             }
+            
+            try {
+                context.log.info('Navan API connection test requested');
+                
+                // Check if fetch is available
+                if (typeof fetch === 'undefined') {
+                    context.log.error('fetch is not available in this runtime');
+                    return errorResponse('Runtime error', 'fetch API is not available. This may be a Node.js version issue.');
+                }
             
             // Get Navan API credentials from environment variables
             let clientId, clientSecret;
@@ -2536,41 +2538,24 @@ app.http('navanTest', {
                 }
             };
             
-        } catch (error) {
-            context.log.error('Navan connection test error:', error.message);
-            context.log.error('Error stack:', error.stack);
-            try {
-                context.log.error('Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
-            } catch (stringifyError) {
-                context.log.error('Could not stringify error object:', stringifyError);
-            }
-            
-            // Ensure we always return a valid response, even if there's an error
-            try {
-                return {
-                    status: 200, // Return 200 so frontend can see the error details
-                    jsonBody: {
-                        connected: false,
-                        error: 'Connection test failed',
-                        detail: error?.message || error?.toString() || 'Unknown error occurred',
-                        stack: error?.stack || 'No stack trace available',
-                        message: 'Failed to test Navan API connection'
-                    },
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': '*'
-                    }
-                };
-            } catch (responseError) {
-                // If even creating the response fails, log it and return minimal response
-                context.log.error('Error creating error response:', responseError);
+            } catch (error) {
+                context.log.error('Navan connection test error:', error.message);
+                context.log.error('Error stack:', error.stack);
+                try {
+                    context.log.error('Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+                } catch (stringifyError) {
+                    context.log.error('Could not stringify error object:', stringifyError);
+                }
+                
+                // Ensure we always return a valid response, even if there's an error
                 try {
                     return {
-                        status: 200,
+                        status: 200, // Return 200 so frontend can see the error details
                         jsonBody: {
                             connected: false,
-                            error: 'Critical error',
-                            detail: 'An unexpected error occurred while processing the request',
+                            error: 'Connection test failed',
+                            detail: error?.message || error?.toString() || 'Unknown error occurred',
+                            stack: error?.stack || 'No stack trace available',
                             message: 'Failed to test Navan API connection'
                         },
                         headers: { 
@@ -2578,15 +2563,59 @@ app.http('navanTest', {
                             'Access-Control-Allow-Origin': '*'
                         }
                     };
-                } catch (finalError) {
-                    // Last resort - return a simple response
-                    context.log.error('Final error in error handler:', finalError);
-                    return {
-                        status: 200,
-                        jsonBody: { connected: false, error: 'Critical error', message: 'Failed to test Navan API connection' },
-                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                    };
+                } catch (responseError) {
+                    // If even creating the response fails, log it and return minimal response
+                    context.log.error('Error creating error response:', responseError);
+                    try {
+                        return {
+                            status: 200,
+                            jsonBody: {
+                                connected: false,
+                                error: 'Critical error',
+                                detail: 'An unexpected error occurred while processing the request',
+                                message: 'Failed to test Navan API connection'
+                            },
+                            headers: { 
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*'
+                            }
+                        };
+                    } catch (finalError) {
+                        // Last resort - return a simple response
+                        context.log.error('Final error in error handler:', finalError);
+                        return {
+                            status: 200,
+                            jsonBody: { connected: false, error: 'Critical error', message: 'Failed to test Navan API connection' },
+                            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                        };
+                    }
                 }
+            }
+        } catch (outerError) {
+            // Catch any errors that occur outside the main try-catch (e.g., in errorResponse function)
+            try {
+                context.log.error('Outer error in navanTest handler:', outerError);
+                return {
+                    status: 200,
+                    jsonBody: {
+                        connected: false,
+                        error: 'Handler initialization error',
+                        detail: outerError?.message || outerError?.toString() || 'Unknown error',
+                        message: 'Failed to initialize Navan API connection test'
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            } catch (lastError) {
+                // Absolute last resort
+                context.log.error('Complete failure in navanTest handler:', lastError);
+                return {
+                    status: 200,
+                    jsonBody: { connected: false, error: 'Complete failure', message: 'Failed to test Navan API connection' },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
             }
         }
     },
