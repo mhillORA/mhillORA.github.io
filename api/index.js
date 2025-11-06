@@ -1653,12 +1653,13 @@ app.http('azure-maps-config', {
 });
 
 // Navan booking lookup endpoint
-// This endpoint calls Navan API to get booking information by UUID
+// This endpoint calls Navan API to get booking information by bookingId
 // Step 1: Get OAuth token from https://api.navan.com/ta-auth/oauth/token
-// Step 2: Call Navan Bookings API: https://api.navan.com/v1/bookings?uuid={bookingId}
+// Step 2: Call Navan Bookings API: https://api.navan.com/v1/bookings?createdFrom={timestamp}&createdTo={timestamp}
+//        Then filter results by bookingId client-side
 // Configure API credentials in Azure Static Web App environment variables:
-// - NAVAN_CLIENT_ID: b3d5d542-9a69-4793-8b24-1b26485f2891
-// - NAVAN_SECRET_KEY: 2387ef4c4a184a96a3ee109ab5dbf61a
+// - NAVAN_CLIENT_ID: Set in Azure environment variables
+// - NAVAN_SECRET_KEY: Set in Azure environment variables
 app.http('navanLookup', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
@@ -1704,16 +1705,15 @@ app.http('navanLookup', {
             context.log.info(`Navan booking lookup request for: ${bookingId}`);
             
             // Step 1: Get OAuth token from Navan
-            // TEMPORARY: Hardcoded credentials for testing - REMOVE AFTER TESTING
-            const clientId = 'b3d5d542-9a69-4793-8b24-1b26485f2891'; // process.env.NAVAN_CLIENT_ID;
-            const clientSecret = '2387ef4c4a184a96a3ee109ab5dbf61a'; // process.env.NAVAN_SECRET_KEY;
+            // Get Navan API credentials from environment variables (same pattern as Cosmos DB)
+            const clientId = process.env.NAVAN_CLIENT_ID;
+            const clientSecret = process.env.NAVAN_SECRET_KEY;
             
             // Log credential status (without exposing values)
             context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
-            context.log.info('WARNING: Using hardcoded credentials for testing - this should be removed after testing!');
             
             if (!clientId || !clientSecret) {
-                context.log.error('Navan credentials not configured');
+                context.log.error('Navan credentials not configured in environment variables');
                 context.log.error(`Environment variables: NAVAN_CLIENT_ID=${!!clientId}, NAVAN_SECRET_KEY=${!!clientSecret}`);
                 return {
                     status: 500,
@@ -1768,7 +1768,7 @@ app.http('navanLookup', {
             context.log.info('OAuth token obtained successfully');
             
             // Step 2: Get booking data from Navan
-            // Navan API doesn't support direct UUID lookup - need to fetch recent bookings and filter
+            // Navan API doesn't support direct bookingId lookup - need to fetch recent bookings and filter
             context.log.info(`Fetching booking ${bookingId} from Navan...`);
             
             let bookingData = null;
@@ -1776,7 +1776,7 @@ app.http('navanLookup', {
             
             try {
                 // Navan API requires createdFrom/createdTo parameters - fetch recent bookings (last 90 days)
-                // and filter by UUID client-side
+                // and filter by bookingId client-side
                 const now = Date.now();
                 const ninetyDaysAgo = now - (90 * 24 * 60 * 60 * 1000);
                 const createdFrom = Math.floor(ninetyDaysAgo / 1000);
@@ -1819,9 +1819,9 @@ app.http('navanLookup', {
                     const allBookings = await bookingResponse.json();
                     context.log.info(`Received ${allBookings.data?.length || 0} bookings on page ${page}`);
                     
-                    // Find the booking by UUID in the results
+                    // Find the booking by bookingId in the results
                     if (allBookings.data && Array.isArray(allBookings.data)) {
-                        foundBooking = allBookings.data.find(b => b.uuid === bookingId);
+                        foundBooking = allBookings.data.find(b => b.bookingId === bookingId);
                         if (foundBooking) {
                             bookingData = { data: [foundBooking] };
                             context.log.info(`Booking found on page ${page}`);
@@ -1844,7 +1844,7 @@ app.http('navanLookup', {
                         jsonBody: { 
                             error: 'Booking not found',
                             bookingId: bookingId,
-                            message: 'Booking not found in recent bookings (last 90 days). The booking may be older or the UUID may be incorrect.'
+                            message: 'Booking not found in recent bookings (last 90 days). The booking may be older or the bookingId may be incorrect.'
                         },
                         headers: { 'Content-Type': 'application/json' }
                     };
