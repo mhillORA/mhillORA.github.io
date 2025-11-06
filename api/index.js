@@ -2338,15 +2338,20 @@ app.http('navanTest', {
             // Check if credentials are available
             if (!clientId || !clientSecret) {
                 context.log.error('Navan credentials not configured');
+                context.log.error(`NAVAN_CLIENT_ID: ${clientId ? 'set (length: ' + clientId.length + ')' : 'missing'}`);
+                context.log.error(`NAVAN_SECRET_KEY: ${clientSecret ? 'set (length: ' + clientSecret.length + ')' : 'missing'}`);
                 return {
-                    status: 500,
+                    status: 200, // Return 200 so frontend can see the error details
                     jsonBody: {
                         connected: false,
                         error: 'Navan API credentials not configured',
-                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set' : 'missing'}`,
+                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set (length: ' + clientId.length + ')' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set (length: ' + clientSecret.length + ')' : 'missing'}`,
                         message: 'Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables'
                     },
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
                 };
             }
             
@@ -2392,7 +2397,10 @@ app.http('navanTest', {
                         detail: 'OAuth token response did not contain access_token',
                         message: 'Navan API returned invalid token response'
                     },
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
                 };
             }
             
@@ -2420,7 +2428,10 @@ app.http('navanTest', {
                         detail: `API call failed with status ${testApiResponse.status}: ${errorText}`,
                         message: 'Connected to Navan OAuth but API call failed. This may be normal if there are no recent bookings.'
                     },
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
                 };
             }
             
@@ -2433,14 +2444,18 @@ app.http('navanTest', {
                     apiCall: true,
                     message: 'Successfully connected to Navan API'
                 },
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
             };
             
         } catch (error) {
             context.log.error('Navan connection test error:', error.message);
             context.log.error('Error stack:', error.stack);
+            context.log.error('Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
             return {
-                status: 500,
+                status: 200, // Return 200 so frontend can see the error details
                 jsonBody: {
                     connected: false,
                     error: 'Connection test failed',
@@ -2448,7 +2463,10 @@ app.http('navanTest', {
                     stack: error.stack || 'No stack trace available',
                     message: 'Failed to test Navan API connection'
                 },
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
             };
         }
     },
