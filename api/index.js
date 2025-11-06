@@ -1,7 +1,7 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
-// Node.js 18+ has fetch built-in, no polyfill needed new build
+// Node.js 18+ has fetch built-in, no polyfill needed
 
 // Helper function to generate unique IDs
 function generateId() {
@@ -1643,24 +1643,26 @@ app.http('azure-maps-config', {
     }
 });
 
-// Flight lookup proxy endpoint
-// This endpoint calls AviationStack API directly - it does NOT search the database
-// Flight data is only saved to the database when the user saves a travel record via /api/travel
-// All travel records (including flight data) are stored in the "travel" container, not a separate "flight-lookup" container
-app.http('flightLookup', {
+// Navan booking lookup endpoint
+// This endpoint calls Navan API to get booking information by UUID
+// Step 1: Get OAuth token from https://api.navan.com/ta-auth/oauth/token
+// Step 2: Call Navan Bookings API: https://api.navan.com/v1/bookings?uuid={bookingId}
+// Configure API credentials in Azure Static Web App environment variables:
+// - NAVAN_CLIENT_ID: b3d5d542-9a69-4793-8b24-1b26485f2891
+// - NAVAN_SECRET_KEY: 2387ef4c4a184a96a3ee109ab5dbf61a
+app.http('navanLookup', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
-    route: 'flight-lookup',
+    route: 'navan-lookup',
     handler: async (request, context) => {
-        let flightNumber = null;
+        let bookingId = null;
         
-        // Wrap everything in try-catch to ensure we always return 200 instead of 500
         try {
             // Get query parameters - try multiple methods for compatibility
-            if (request.query && request.query.flightNumber) {
-                flightNumber = request.query.flightNumber;
+            if (request.query && request.query.bookingId) {
+                bookingId = request.query.bookingId;
             } else if (request.query && typeof request.query.get === 'function') {
-                flightNumber = request.query.get('flightNumber');
+                bookingId = request.query.get('bookingId');
             } else if (request.url) {
                 try {
                     // Try to parse as full URL
@@ -1670,341 +1672,206 @@ app.http('flightLookup', {
                         urlString = `https://${request.headers?.['host'] || 'localhost'}${urlString}`;
                     }
                     const url = new URL(urlString);
-                    flightNumber = url.searchParams.get('flightNumber');
+                    bookingId = url.searchParams.get('bookingId');
                 } catch (error) {
                     context.log.warn('Error parsing URL:', error.message);
                     // Try simple query string parsing
-                    const match = request.url.match(/[?&]flightNumber=([^&]+)/);
+                    const match = request.url.match(/[?&]bookingId=([^&]+)/);
                     if (match) {
-                        flightNumber = decodeURIComponent(match[1]);
+                        bookingId = decodeURIComponent(match[1]);
                     }
                 }
             }
             
-            if (!flightNumber) {
-                context.log.error('Flight lookup: flightNumber parameter missing. URL:', request.url);
+            if (!bookingId) {
+                context.log.error('Navan lookup: bookingId parameter missing. URL:', request.url);
                 return {
                     status: 400,
-                    jsonBody: { error: 'flightNumber parameter is required' },
+                    jsonBody: { error: 'bookingId parameter is required' },
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
             
-            context.log.info(`Flight lookup request for: ${flightNumber}`);
-            context.log.info('Calling AviationStack API directly - NOT searching database');
+            context.log.info(`Navan booking lookup request for: ${bookingId}`);
             
-            // Try AviationStack API (available via Microsoft Connectors)
-            // Use environment variable if set, otherwise use provided key
-            const AVIATIONSTACK_KEY = process.env.AVIATIONSTACK_API_KEY || 'f4d364ba3a06f3498403ff1958d6d608';
-            context.log.info(`AviationStack API check: Key exists=${!!AVIATIONSTACK_KEY}`);
+            // Step 1: Get OAuth token from Navan
+            const clientId = process.env.NAVAN_CLIENT_ID;
+            const clientSecret = process.env.NAVAN_SECRET_KEY;
             
-            // If no API key, return basic info immediately
-            if (!AVIATIONSTACK_KEY) {
-                context.log.info('AviationStack API key not configured, returning basic info');
+            if (!clientId || !clientSecret) {
+                context.log.error('Navan credentials not configured');
                 return {
-                    status: 200,
-                    jsonBody: {
-                        flightNumber: flightNumber,
-                        airline: null,
-                        origin: null,
-                        destination: null,
-                        departureTime: null,
-                        arrivalTime: null,
-                        status: 'scheduled',
-                        delay: null,
-                        gate: null,
-                        terminal: null,
-                        message: 'Flight API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
-                    },
+                    status: 500,
+                    jsonBody: { error: 'Navan API credentials not configured. Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables.' },
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
             
-            if (AVIATIONSTACK_KEY) {
-                try {
-                    context.log.info(`Calling AviationStack API for flight: ${flightNumber}`);
-                    
-                    // Try multiple API parameter formats based on AviationStack documentation
-                    // Format 1: flight_iata (full IATA code like DAL1478)
-                    let apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&flight_iata=${encodeURIComponent(flightNumber.toUpperCase())}&limit=100`;
-                    let response;
-                    let apiData = null;
-                    let responseText = ''; // <-- Store response text
-                    
-                    try {
-                        response = await fetch(apiUrl, {
-                            method: 'GET'
-                        });
-                        context.log.info(`AviationStack API response status (flight_iata): ${response.status}`);
-                        
-                        // Get response text first to check for errors
-                        responseText = await response.text(); // <-- Read text ONCE
-                        context.log.info(`AviationStack API raw response (first 500 chars): ${responseText.substring(0, 500)}`);
-                        
-                        try {
-                            apiData = JSON.parse(responseText);
-                            
-                            // Check for error in response (even if status is 200)
-                            // AviationStack returns errors in format: {error: {code: "...", message: "..."}}
-                            if (apiData.error) {
-                                const errorCode = apiData.error.code || 'unknown';
-                                const errorMessage = apiData.error.message || 'Unknown error';
-                                context.log.error(`AviationStack API error [${errorCode}]: ${errorMessage}`);
-                                
-                                // Handle specific error codes
-                                if (errorCode === 401) {
-                                    context.log.error('Invalid or missing API access key');
-                                } else if (errorCode === 403) {
-                                    context.log.error('Access restricted - check subscription plan limits');
-                                } else if (errorCode === 404) {
-                                    context.log.error('Invalid API endpoint or resource not found');
-                                } else if (errorCode === 429) {
-                                    context.log.error('Rate limit exceeded - too many requests');
-                                }
-                                
-                                apiData = null;
-                            } else if (apiData.data) {
-                                context.log.info(`AviationStack API response: ${apiData.data?.length || 0} flights found`);
-                                // AviationStack also includes pagination info
-                                if (apiData.pagination) {
-                                    context.log.info(`AviationStack pagination: limit=${apiData.pagination.limit}, offset=${apiData.pagination.offset}, count=${apiData.pagination.count}, total=${apiData.pagination.total}`);
-                                }
-                            } else {
-                                context.log.warn('AviationStack API response missing data field:', responseText.substring(0, 200));
-                                apiData = null;
-                            }
-                        } catch (jsonError) {
-                            context.log.error('AviationStack API JSON parse error:', jsonError.message);
-                            context.log.error('Response text:', responseText.substring(0, 500));
-                            // Fall through to try alternative method
-                            apiData = null;
-                        }
-                    } catch (fetchError) {
-                        context.log.error('AviationStack API fetch error:', fetchError.message);
-                        context.log.error('Stack:', fetchError.stack);
-                        // Fall through to return basic info
-                        response = null;
-                    }
-                    
-                    if (apiData && apiData.data && apiData.data.length > 0) {
-                        const exactMatch = apiData.data.find(f => 
-                            f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
-                            f.flight?.number?.toString() === flightNumber.replace(/^[A-Z]{2,3}/i, '')
-                        );
-                        
-                        if (exactMatch) {
-                            const flight = exactMatch;
-                            context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
-                            
-                            return {
-                                status: 200,
-                                jsonBody: {
-                                    flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
-                                    airline: flight.airline?.name || flight.airline?.iata || null,
-                                    origin: flight.departure?.iata || flight.departure?.airport || flight.departure?.airport_name || null,
-                                    destination: flight.arrival?.iata || flight.arrival?.airport || flight.arrival?.airport_name || null,
-                                    departureTime: flight.departure?.scheduled || flight.departure?.estimated || null,
-                                    arrivalTime: flight.arrival?.scheduled || flight.arrival?.estimated || null,
-                                    status: flight.flight_status || 'scheduled',
-                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : (flight.arrival?.delay ? `${flight.arrival.delay} minutes` : null),
-                                    gate: flight.departure?.gate || flight.arrival?.gate || null,
-                                    terminal: flight.departure?.terminal || flight.arrival?.terminal || null
-                                },
-                                headers: { 'Content-Type': 'application/json' }
-                            };
-                        }
-                    // ============ START: CORRECTED CODE ============
-                    } else if (response && !response.ok) {
-                        // We already read the response text into the 'responseText' variable earlier.
-                        // We just log that we received a non-OK response. The text was logged earlier.
-                        context.log.error(`AviationStack API HTTP error: ${response.status}. See raw response above.`);
-                    }
-                    // ============ END: CORRECTED CODE ============
-                    
-                    // If not found with flight_iata, try splitting into airline_iata + flight_number
-                    if (!apiData || !apiData.data || apiData.data.length === 0) {
-                        context.log.info('Trying airline_iata + flight_number parameter format');
-                        const flightMatch = flightNumber.match(/^([A-Z]{2,3})(\d+)$/i);
-                        if (flightMatch) {
-                            const [, airlineCode, flightNum] = flightMatch;
-                            apiUrl = `https://api.aviationstack.com/v1/flights?access_key=${AVIATIONSTACK_KEY}&airline_iata=${airlineCode.toUpperCase()}&flight_number=${flightNum}&limit=100`;
-                            
-                            try {
-                                response = await fetch(apiUrl, {
-                                    method: 'GET'
-                                });
-                                context.log.info(`AviationStack API response status (airline_iata+flight_number): ${response.status}`);
-                                
-                                // Get response text first to check for errors
-                                responseText = await response.text(); // <-- Read text ONCE
-                                context.log.info(`AviationStack API raw response (alternative, first 500 chars): ${responseText.substring(0, 500)}`);
-                                
-                                try {
-                                    apiData = JSON.parse(responseText);
-                                    
-                                    // Check for error in response (even if status is 200)
-                                    // AviationStack returns errors in format: {error: {code: "...", message: "..."}}
-                                    if (apiData.error) {
-                                        const errorCode = apiData.error.code || 'unknown';
-                                        const errorMessage = apiData.error.message || 'Unknown error';
-                                        context.log.error(`AviationStack API error (alternative) [${errorCode}]: ${errorMessage}`);
-                                        
-                                        // Handle specific error codes
-                                        if (errorCode === 401) {
-                                            context.log.error('Invalid or missing API access key');
-                                        } else if (errorCode === 403) {
-                                            context.log.error('Access restricted - check subscription plan limits');
-                                        } else if (errorCode === 404) {
-                                            context.log.error('Invalid API endpoint or resource not found');
-                                        } else if (errorCode === 429) {
-                                            context.log.error('Rate limit exceeded - too many requests');
-                                        }
-                                        
-                                        apiData = null;
-                                    } else if (apiData.data) {
-                                        context.log.info(`AviationStack API response (alternative): ${apiData.data?.length || 0} flights found`);
-                                        // AviationStack also includes pagination info
-                                        if (apiData.pagination) {
-                                            context.log.info(`AviationStack pagination (alternative): limit=${apiData.pagination.limit}, offset=${apiData.pagination.offset}, count=${apiData.pagination.count}, total=${apiData.pagination.total}`);
-                                        }
-                                    } else {
-                                        context.log.warn('AviationStack API response missing data field (alternative):', responseText.substring(0, 200));
-                                        apiData = null;
-                                    }
-                                } catch (jsonError) {
-                                    context.log.error('AviationStack API JSON parse error (alternative):', jsonError.message);
-                                    context.log.error('Response text:', responseText.substring(0, 500));
-                                    apiData = null;
-                                }
-                            } catch (fetchError) {
-                                context.log.error('AviationStack API fetch error (alternative):', fetchError.message);
-                                context.log.error('Stack:', fetchError.stack);
-                                response = null;
-                            }
-                            
-                            if (apiData && apiData.data && apiData.data.length > 0) {
-                                // Find the best match
-                                const bestMatch = apiData.data.find(f => 
-                                    f.flight?.iata?.toUpperCase() === flightNumber.toUpperCase() ||
-                                    (f.airline?.iata?.toUpperCase() === airlineCode.toUpperCase() && 
-                                     f.flight?.number?.toString() === flightNum)
-                                ) || apiData.data[0];
-                                
-                                const flight = bestMatch;
-                                context.log.info(`Flight found: ${flight.flight?.iata || flight.flight?.number}, Origin: ${flight.departure?.iata || flight.departure?.airport}, Dest: ${flight.arrival?.iata || flight.arrival?.airport}`);
-                                
-                                return {
-                                    status: 200,
-                                    jsonBody: {
-                                        flightNumber: flight.flight?.iata || flight.flight?.number || flightNumber,
-                                        airline: flight.airline?.name || flight.airline?.iata || null,
-                                        origin: flight.departure?.iata || flight.departure?.airport || flight.departure?.airport_name || null,
-                                        destination: flight.arrival?.iata || flight.arrival?.airport || flight.arrival?.airport_name || null,
-                                        departureTime: flight.departure?.scheduled || flight.departure?.estimated || null,
-                                        arrivalTime: flight.arrival?.scheduled || flight.arrival?.estimated || null,
-                                        status: flight.flight_status || 'scheduled',
-                                        delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : (flight.arrival?.delay ? `${flight.arrival.delay} minutes` : null),
-                                        gate: flight.departure?.gate || flight.arrival?.gate || null,
-                                        terminal: flight.departure?.terminal || flight.arrival?.terminal || null
-                                    },
-                                    headers: { 'Content-Type': 'application/json' }
-                                };
-                            // ============ START: CORRECTED CODE ============
-                            } else if (response && !response.ok) {
-                                // We already read the response text into the 'responseText' variable earlier.
-                                context.log.error(`AviationStack API HTTP error (alternative): ${response.status}. See raw response above.`);
-                            }
-                            // ============ END: CORRECTED CODE ============
-                        }
-                    }
-                } catch (error) {
-                    context.log.error('AviationStack API exception:', error.message);
-                    context.log.error('Stack:', error.stack);
-                    // Don't throw, fall through to return basic info
-                }
-            } else {
-                context.log.info('AviationStack API key not configured');
+            context.log.info('Requesting OAuth token from Navan...');
+            const tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/x-www-form-urlencoded'
+                },
+                body: new URLSearchParams({
+                    grant_type: 'client_credentials',
+                    client_id: clientId,
+                    client_secret: clientSecret
+                })
+            });
+            
+            if (!tokenResponse.ok) {
+                const errorText = await tokenResponse.text();
+                context.log.error(`Token request failed: ${tokenResponse.status} - ${errorText}`);
+                return {
+                    status: tokenResponse.status,
+                    jsonBody: { error: `Failed to get OAuth token: ${errorText}` },
+                    headers: { 'Content-Type': 'application/json' }
+                };
             }
             
-            // Try OAG Flight Info API via Azure Marketplace (if configured, as fallback)
-            const OAG_API_KEY = process.env.OAG_API_KEY || process.env.OAG_FLIGHT_INFO_API_KEY;
-            const OAG_API_URL = process.env.OAG_API_URL || 'https://api.oag.com/flightinfo/v1';
-            if (OAG_API_KEY && !AVIATIONSTACK_KEY) {
-                try {
-                    // OAG API format - adjust based on their actual API documentation
-                    const response = await fetch(`${OAG_API_URL}/flights?flightNumber=${flightNumber}`, {
-                        headers: {
-                            'Authorization': `Bearer ${OAG_API_KEY}`,
-                            'Content-Type': 'application/json'
-                        }
-                    });
-                    if (response.ok) {
-                        const apiData = await response.json();
-                        // Adjust response parsing based on OAG API structure
-                        if (apiData.data && apiData.data.length > 0) {
-                            const flight = apiData.data[0];
-                            return {
-                                status: 200,
-                                jsonBody: {
-                                    flightNumber: flight.flightNumber || flightNumber,
-                                    airline: flight.airline?.name || null,
-                                    origin: flight.origin?.airport || flight.origin?.iata || null,
-                                    destination: flight.destination?.airport || flight.destination?.iata || null,
-                                    departureTime: flight.departure?.scheduled || null,
-                                    arrivalTime: flight.arrival?.scheduled || null,
-                                    status: flight.status || 'scheduled',
-                                    delay: flight.departure?.delay ? `${flight.departure.delay} minutes` : null,
-                                    gate: flight.departure?.gate || null,
-                                    terminal: flight.departure?.terminal || null
-                                },
-                                headers: { 'Content-Type': 'application/json' }
-                            };
-                        }
-                    }
-                } catch (error) {
-                    context.log.warn('OAG API failed:', error.message);
+            const tokenData = await tokenResponse.json();
+            const accessToken = tokenData.access_token;
+            
+            if (!accessToken) {
+                context.log.error('No access token in response:', tokenData);
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Failed to get access token from Navan' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            context.log.info('OAuth token obtained successfully');
+            
+            // Step 2: Get booking data from Navan
+            context.log.info(`Fetching booking ${bookingId} from Navan...`);
+            const bookingResponse = await fetch(`https://api.navan.com/v1/bookings?uuid=${encodeURIComponent(bookingId)}`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+            
+            if (!bookingResponse.ok) {
+                const errorText = await bookingResponse.text();
+                context.log.error(`Booking request failed: ${bookingResponse.status} - ${errorText}`);
+                
+                if (bookingResponse.status === 404) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'Booking not found', bookingId: bookingId },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                } else {
+                    return {
+                        status: bookingResponse.status,
+                        jsonBody: { error: `Failed to get booking: ${errorText}` },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
                 }
             }
             
-            // If no API key configured or API call failed, return basic info with 200 status
-            // This allows the frontend to handle it gracefully
+            const bookingData = await bookingResponse.json();
+            context.log.info('Booking data retrieved successfully');
+            
+            // Step 3: Store booking data in travel container for reporting
+            try {
+                const travelContainer = getContainer('travel');
+                
+                // Check if a travel record already exists for this booking ID
+                let existingTravel = null;
+                try {
+                    const { resources: existingRecords } = await travelContainer.items
+                        .query({
+                            query: "SELECT * FROM c WHERE c.navanBookingId = @bookingId",
+                            parameters: [{ name: "@bookingId", value: bookingId }]
+                        })
+                        .fetchAll();
+                    
+                    if (existingRecords && existingRecords.length > 0) {
+                        existingTravel = existingRecords[0];
+                    }
+                } catch (queryError) {
+                    context.log.warn('Error querying for existing travel record:', queryError.message);
+                    // Continue to create new record if query fails
+                }
+                
+                // Prepare travel record data from Navan booking
+                const booking = bookingData.data && bookingData.data.length > 0 ? bookingData.data[0] : bookingData;
+                const bookingType = booking.bookingType || 'FLIGHT';
+                
+                // Map Navan booking to travel record format
+                const travelRecord = {
+                    navanBookingId: bookingId,
+                    bookingType: bookingType,
+                    confirmationNumber: booking.confirmationNumber || booking.bookingId || null,
+                    startDate: booking.startDate || null,
+                    endDate: booking.endDate || null,
+                    vendor: booking.vendor || null,
+                    status: booking.bookingStatus || booking.approvalStatus || 'scheduled',
+                    grandTotal: booking.grandTotal || booking.usdGrandTotal || null,
+                    currency: booking.currency || 'USD',
+                    // Store full Navan data for reference
+                    navanData: booking,
+                    // Store lookup timestamp
+                    lookedUpAt: new Date().toISOString()
+                };
+                
+                // Add booking-type specific fields
+                if (bookingType === 'FLIGHT' && booking.flight) {
+                    travelRecord.flightNumber = booking.flight.flightNumber || null;
+                    travelRecord.origin = booking.flight.origin || null;
+                    travelRecord.destination = booking.flight.destination || null;
+                    travelRecord.departureTime = booking.flight.departureTime || null;
+                    travelRecord.arrivalTime = booking.flight.arrivalTime || null;
+                    travelRecord.airline = booking.flight.airline || null;
+                } else if (bookingType === 'HOTEL' && booking.hotel) {
+                    travelRecord.hotelName = booking.hotel.name || null;
+                    travelRecord.hotelAddress = booking.hotel.address || null;
+                    travelRecord.checkIn = booking.hotel.checkIn || null;
+                    travelRecord.checkOut = booking.hotel.checkOut || null;
+                } else if (bookingType === 'CAR' && booking.car) {
+                    travelRecord.carRentalCompany = booking.car.company || null;
+                    travelRecord.pickupLocation = booking.car.pickupLocation || null;
+                    travelRecord.dropoffLocation = booking.car.dropoffLocation || null;
+                    travelRecord.pickupDate = booking.car.pickupDate || null;
+                    travelRecord.dropoffDate = booking.car.dropoffDate || null;
+                }
+                
+                if (existingTravel) {
+                    // Update existing travel record
+                    const updatedTravel = { ...existingTravel, ...travelRecord, id: existingTravel.id };
+                    const { resource: savedTravel } = await travelContainer.items.upsert(updatedTravel);
+                    context.log.info(`Updated existing travel record for Navan booking ${bookingId}`);
+                } else {
+                    // Create new travel record
+                    const newTravel = { ...travelRecord, id: generateId() };
+                    const { resource: savedTravel } = await travelContainer.items.create(newTravel);
+                    context.log.info(`Created new travel record for Navan booking ${bookingId}`);
+                }
+            } catch (storageError) {
+                context.log.warn('Error storing booking data in travel container:', storageError.message);
+                // Continue to return booking data even if storage fails
+            }
+            
+            // Return the booking data
             return {
                 status: 200,
-                jsonBody: {
-                    flightNumber: flightNumber,
-                    airline: null,
-                    origin: null,
-                    destination: null,
-                    departureTime: null,
-                    arrivalTime: null,
-                    status: 'scheduled',
-                    delay: null,
-                    gate: null,
-                    terminal: null,
-                    message: AVIATIONSTACK_KEY 
-                        ? 'Flight information not available. The flight may not be in the system or the API returned no data.'
-                        : 'Flight API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables for full flight information.'
+                headers: {
+                    'Content-Type': 'application/json'
                 },
-                headers: { 'Content-Type': 'application/json' }
+                jsonBody: bookingData
             };
             
         } catch (error) {
-            context.log.error('Flight lookup error:', error.message, error.stack);
-            // Return 200 with error info instead of 500 so frontend can handle it
+            context.log.error('Navan lookup error:', error.message, error.stack);
             return {
-                status: 200,
+                status: 500,
                 jsonBody: { 
-                    flightNumber: flightNumber || 'unknown',
-                    airline: null,
-                    origin: null,
-                    destination: null,
-                    departureTime: null,
-                    arrivalTime: null,
-                    status: 'scheduled',
-                    delay: null,
-                    gate: null,
-                    terminal: null,
-                    message: `Flight lookup failed: ${error.message}. Please enter flight details manually.`
+                    error: 'Navan lookup failed',
+                    message: error.message
                 },
                 headers: { 'Content-Type': 'application/json' }
             };
