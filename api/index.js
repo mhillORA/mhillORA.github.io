@@ -1707,11 +1707,19 @@ app.http('navanLookup', {
             const clientId = process.env.NAVAN_CLIENT_ID;
             const clientSecret = process.env.NAVAN_SECRET_KEY;
             
+            // Log credential status (without exposing values)
+            context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
+            
             if (!clientId || !clientSecret) {
                 context.log.error('Navan credentials not configured');
+                context.log.error(`Environment variables: NAVAN_CLIENT_ID=${!!clientId}, NAVAN_SECRET_KEY=${!!clientSecret}`);
                 return {
                     status: 500,
-                    jsonBody: { error: 'Navan API credentials not configured. Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables.' },
+                    jsonBody: { 
+                        error: 'Navan API credentials not configured. Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables.',
+                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set' : 'missing'}`,
+                        originalMessage: 'Navan credentials check failed'
+                    },
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
@@ -1734,7 +1742,11 @@ app.http('navanLookup', {
                 context.log.error(`Token request failed: ${tokenResponse.status} - ${errorText}`);
                 return {
                     status: tokenResponse.status,
-                    jsonBody: { error: `Failed to get OAuth token: ${errorText}` },
+                    jsonBody: { 
+                        error: `Failed to get OAuth token: ${errorText}`,
+                        detail: `OAuth token request failed with status ${tokenResponse.status}. This usually means the CLIENT_ID or SECRET_KEY are incorrect, or the Azure app's outbound IP addresses need to be added to Navan API settings.`,
+                        originalMessage: 'OAuth token request failed'
+                    },
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
@@ -1998,8 +2010,9 @@ app.http('navanLookup', {
                 status: 500,
                 jsonBody: { 
                     error: 'Navan lookup failed',
-                    message: error.message,
-                    details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+                    detail: error.message || 'Unknown error occurred',
+                    stack: error.stack || 'No stack trace available',
+                    originalMessage: 'Navan lookup exception'
                 },
                 headers: { 'Content-Type': 'application/json' }
             };
