@@ -1902,44 +1902,45 @@ app.http('navanLookup', {
                 const bookingType = booking.bookingType || 'FLIGHT';
                 
                 // Get passenger/traveler info and find matching CRC ID
+                // Staff member should be pulled from passengers[0].person.name
                 let crcId = null;
                 let travelerEmail = null;
                 let travelerName = null;
                 
                 if (booking.passengers && booking.passengers.length > 0 && booking.passengers[0].person) {
                     const person = booking.passengers[0].person;
-                    travelerEmail = person.email || null;
-                    travelerName = person.name || null;
+                    travelerName = person.name || null; // Primary: use name from passengers[0].person.name
+                    travelerEmail = person.email || null; // Secondary: use email as fallback
                     
-                    // Try to find CRC by email in CRCs container
-                    if (travelerEmail) {
+                    // Try to find CRC by name first (from passengers[0].person.name)
+                    if (travelerName) {
                         try {
-                            context.log.info(`Looking up CRC by email: ${travelerEmail}`);
+                            context.log.info(`Looking up CRC by name: ${travelerName}`);
                             const crcsContainer = getContainer('crcs');
-                            const { resources: matchingCrcs } = await crcsContainer.items
+                            const { resources: nameMatches } = await crcsContainer.items
                                 .query({
-                                    query: "SELECT * FROM c WHERE c.email = @email",
-                                    parameters: [{ name: "@email", value: travelerEmail }]
+                                    query: "SELECT * FROM c WHERE c.name = @name",
+                                    parameters: [{ name: "@name", value: travelerName }]
                                 })
                                 .fetchAll();
                             
-                            if (matchingCrcs && matchingCrcs.length > 0) {
-                                crcId = matchingCrcs[0].id;
-                                context.log.info(`Found matching CRC: ${crcId} for email ${travelerEmail}`);
+                            if (nameMatches && nameMatches.length > 0) {
+                                crcId = nameMatches[0].id;
+                                context.log.info(`Found matching CRC: ${crcId} for name ${travelerName}`);
                             } else {
-                                // Try to find by name if email doesn't match
-                                if (travelerName) {
-                                    context.log.info(`Looking up CRC by name: ${travelerName}`);
-                                    const { resources: nameMatches } = await crcsContainer.items
+                                // Try to find by email if name doesn't match
+                                if (travelerEmail) {
+                                    context.log.info(`Looking up CRC by email: ${travelerEmail}`);
+                                    const { resources: emailMatches } = await crcsContainer.items
                                         .query({
-                                            query: "SELECT * FROM c WHERE c.name = @name",
-                                            parameters: [{ name: "@name", value: travelerName }]
+                                            query: "SELECT * FROM c WHERE c.email = @email",
+                                            parameters: [{ name: "@email", value: travelerEmail }]
                                         })
                                         .fetchAll();
                                     
-                                    if (nameMatches && nameMatches.length > 0) {
-                                        crcId = nameMatches[0].id;
-                                        context.log.info(`Found matching CRC: ${crcId} for name ${travelerName}`);
+                                    if (emailMatches && emailMatches.length > 0) {
+                                        crcId = emailMatches[0].id;
+                                        context.log.info(`Found matching CRC: ${crcId} for email ${travelerEmail}`);
                                     }
                                 }
                             }
@@ -1947,16 +1948,35 @@ app.http('navanLookup', {
                             context.log.warn('Error looking up CRC:', crcLookupError.message);
                             // Continue without crcId - will need to be set manually
                         }
+                    } else if (travelerEmail) {
+                        // If no name, try email only
+                        try {
+                            context.log.info(`Looking up CRC by email (no name available): ${travelerEmail}`);
+                            const crcsContainer = getContainer('crcs');
+                            const { resources: emailMatches } = await crcsContainer.items
+                                .query({
+                                    query: "SELECT * FROM c WHERE c.email = @email",
+                                    parameters: [{ name: "@email", value: travelerEmail }]
+                                })
+                                .fetchAll();
+                            
+                            if (emailMatches && emailMatches.length > 0) {
+                                crcId = emailMatches[0].id;
+                                context.log.info(`Found matching CRC: ${crcId} for email ${travelerEmail}`);
+                            }
+                        } catch (crcLookupError) {
+                            context.log.warn('Error looking up CRC by email:', crcLookupError.message);
+                        }
                     }
                 }
                 
-                // If no CRC found, use email or name as fallback (but this won't pass validation)
-                if (!crcId && travelerEmail) {
-                    crcId = travelerEmail; // Temporary fallback
-                    context.log.warn(`No CRC found for ${travelerEmail}, using email as crcId (will need manual update)`);
-                } else if (!crcId && travelerName) {
+                // If no CRC found, use name as fallback (from passengers[0].person.name)
+                if (!crcId && travelerName) {
                     crcId = travelerName; // Temporary fallback
                     context.log.warn(`No CRC found for ${travelerName}, using name as crcId (will need manual update)`);
+                } else if (!crcId && travelerEmail) {
+                    crcId = travelerEmail; // Last resort fallback
+                    context.log.warn(`No CRC found for ${travelerEmail}, using email as crcId (will need manual update)`);
                 }
                 
                 // Get date (required field: date) - format as YYYY-MM-DD string
@@ -1994,7 +2014,10 @@ app.http('navanLookup', {
                     navanBookingId: bookingId,
                     
                     // Status (must be one of: scheduled, delayed, departed, arrived, cancelled)
-                    status: status
+                    status: status,
+                    
+                    // Confirmation number (common across all booking types)
+                    confirmationNumber: booking.confirmationNumber || booking.bookingId || null
                 };
                 
                 // Add booking-type specific fields based on actual Navan API structure
@@ -2017,30 +2040,56 @@ app.http('navanLookup', {
                     }
                 } else if (bookingType === 'HOTEL') {
                     // Hotel-specific fields - map to existing travel schema
+                    // Based on actual Navan API structure:
+                    // - segments[0].departure.address = "15520 Nw Gateway Ct" (hotel address)
+                    // - segments[0].departure.city = "Beaverton" (hotel city)
+                    // - segments[0].departure.state = "OR" (hotel state)
+                    // - segments[0].departure.postalCode = "97006" (hotel postal code)
+                    // - segments[0].departure.country = "US" (hotel country)
+                    // - destination.city/state/country = fallback if segment data missing
                     const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
                     if (booking.vendor) {
                         travelRecord.hotelName = String(booking.vendor);
                     }
+                    // Hotel address from segment departure
                     if (segment?.departure?.address) {
                         travelRecord.hotelAddress = String(segment.departure.address);
                     }
-                    if (segment?.departure?.city || booking.destination?.city) {
-                        travelRecord.hotelCity = String(segment?.departure?.city || booking.destination?.city);
+                    // Hotel city - prefer segment.departure.city (from Navan data)
+                    if (segment?.departure?.city) {
+                        travelRecord.hotelCity = String(segment.departure.city);
+                    } else if (booking.destination?.city) {
+                        travelRecord.hotelCity = String(booking.destination.city);
                     }
-                    if (segment?.departure?.state || booking.destination?.state) {
-                        travelRecord.hotelState = String(segment?.departure?.state || booking.destination?.state);
+                    // Hotel state - prefer segment.departure.state
+                    if (segment?.departure?.state) {
+                        travelRecord.hotelState = String(segment.departure.state);
+                    } else if (booking.destination?.state) {
+                        travelRecord.hotelState = String(booking.destination.state);
                     }
+                    // Hotel postal code
                     if (segment?.departure?.postalCode) {
                         travelRecord.hotelPostalCode = String(segment.departure.postalCode);
                     }
-                    if (segment?.departure?.country || booking.destination?.country) {
-                        travelRecord.hotelCountry = String(segment?.departure?.country || booking.destination?.country);
+                    // Hotel country - prefer segment.departure.country
+                    if (segment?.departure?.country) {
+                        travelRecord.hotelCountry = String(segment.departure.country);
+                    } else if (booking.destination?.country) {
+                        travelRecord.hotelCountry = String(booking.destination.country);
                     }
-                    if (segment?.startLocalDateTime || booking.startDate) {
-                        travelRecord.checkIn = String(segment?.startLocalDateTime || booking.startDate);
+                    // Check-in date - extract date from ISO datetime or use startDate
+                    if (segment?.startLocalDateTime) {
+                        const checkInDateTime = new Date(segment.startLocalDateTime);
+                        travelRecord.checkIn = checkInDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
+                    } else if (booking.startDate) {
+                        travelRecord.checkIn = String(booking.startDate);
                     }
-                    if (segment?.endLocalDateTime || booking.endDate) {
-                        travelRecord.checkOut = String(segment?.endLocalDateTime || booking.endDate);
+                    // Check-out date - extract date from ISO datetime or use endDate
+                    if (segment?.endLocalDateTime) {
+                        const checkOutDateTime = new Date(segment.endLocalDateTime);
+                        travelRecord.checkOut = checkOutDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
+                    } else if (booking.endDate) {
+                        travelRecord.checkOut = String(booking.endDate);
                     }
                     // Map to hotelCost if available (must be a number)
                     if (booking.grandTotal || booking.usdGrandTotal) {
@@ -2049,6 +2098,11 @@ app.http('navanLookup', {
                     }
                 } else if (bookingType === 'CAR') {
                     // Car rental-specific fields - map to existing travel schema
+                    // Based on actual Navan API structure:
+                    // - segments[0].departure.address = "BNA-NASHVILLE" (pickup location)
+                    // - segments[0].departure.airportCode = "BNA" (pickup airport)
+                    // - origin.city/state = "Nashville", "Tennessee" (pickup city/state)
+                    // - destination.city/state = same as origin for round-trip (dropoff city/state)
                     const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
                     if (booking.vendor) {
                         travelRecord.carRentalCompany = String(booking.vendor);
@@ -2056,35 +2110,76 @@ app.http('navanLookup', {
                     if (booking.carType) {
                         travelRecord.carType = String(booking.carType);
                     }
+                    // Pickup location - use segment address (e.g., "BNA-NASHVILLE") or airport code
                     if (segment?.departure?.address) {
                         travelRecord.pickupLocation = String(segment.departure.address);
+                    } else if (segment?.departure?.airportCode) {
+                        travelRecord.pickupLocation = String(segment.departure.airportCode);
                     }
-                    if (segment?.departure?.city || booking.origin?.city) {
-                        travelRecord.pickupCity = String(segment?.departure?.city || booking.origin?.city);
+                    // Pickup city - prefer origin.city (from Navan data) since segment.departure.city is often null
+                    if (booking.origin?.city) {
+                        travelRecord.pickupCity = String(booking.origin.city);
+                    } else if (segment?.departure?.city) {
+                        travelRecord.pickupCity = String(segment.departure.city);
                     }
-                    if (segment?.departure?.state || booking.origin?.state) {
-                        travelRecord.pickupState = String(segment?.departure?.state || booking.origin?.state);
+                    // Pickup state - prefer origin.state
+                    if (booking.origin?.state) {
+                        travelRecord.pickupState = String(booking.origin.state);
+                    } else if (segment?.departure?.state) {
+                        travelRecord.pickupState = String(segment.departure.state);
                     }
+                    // Pickup airport code
                     if (segment?.departure?.airportCode) {
                         travelRecord.pickupAirportCode = String(segment.departure.airportCode);
                     }
-                    if (segment?.arrival?.address || segment?.departure?.address) {
-                        travelRecord.dropoffLocation = String(segment?.arrival?.address || segment?.departure?.address);
+                    // Dropoff location - use arrival address or same as departure for round-trip
+                    if (segment?.arrival?.address) {
+                        travelRecord.dropoffLocation = String(segment.arrival.address);
+                    } else if (segment?.arrival?.airportCode) {
+                        travelRecord.dropoffLocation = String(segment.arrival.airportCode);
+                    } else if (segment?.departure?.address) {
+                        travelRecord.dropoffLocation = String(segment.departure.address);
+                    } else if (segment?.departure?.airportCode) {
+                        travelRecord.dropoffLocation = String(segment.departure.airportCode);
                     }
-                    if (segment?.arrival?.city || booking.destination?.city) {
-                        travelRecord.dropoffCity = String(segment?.arrival?.city || booking.destination?.city);
+                    // Dropoff city - prefer destination.city
+                    if (booking.destination?.city) {
+                        travelRecord.dropoffCity = String(booking.destination.city);
+                    } else if (segment?.arrival?.city) {
+                        travelRecord.dropoffCity = String(segment.arrival.city);
+                    } else if (booking.origin?.city) {
+                        // Round-trip: use origin city as fallback
+                        travelRecord.dropoffCity = String(booking.origin.city);
                     }
-                    if (segment?.arrival?.state || booking.destination?.state) {
-                        travelRecord.dropoffState = String(segment?.arrival?.state || booking.destination?.state);
+                    // Dropoff state - prefer destination.state
+                    if (booking.destination?.state) {
+                        travelRecord.dropoffState = String(booking.destination.state);
+                    } else if (segment?.arrival?.state) {
+                        travelRecord.dropoffState = String(segment.arrival.state);
+                    } else if (booking.origin?.state) {
+                        // Round-trip: use origin state as fallback
+                        travelRecord.dropoffState = String(booking.origin.state);
                     }
-                    if (segment?.arrival?.airportCode || segment?.departure?.airportCode) {
-                        travelRecord.dropoffAirportCode = String(segment?.arrival?.airportCode || segment?.departure?.airportCode);
+                    // Dropoff airport code
+                    if (segment?.arrival?.airportCode) {
+                        travelRecord.dropoffAirportCode = String(segment.arrival.airportCode);
+                    } else if (segment?.departure?.airportCode) {
+                        // Round-trip: use departure airport code
+                        travelRecord.dropoffAirportCode = String(segment.departure.airportCode);
                     }
-                    if (segment?.startLocalDateTime || booking.startDate) {
-                        travelRecord.pickupDate = String(segment?.startLocalDateTime || booking.startDate);
+                    // Pickup date - extract date from ISO datetime or use startDate
+                    if (segment?.startLocalDateTime) {
+                        const pickupDateTime = new Date(segment.startLocalDateTime);
+                        travelRecord.pickupDate = pickupDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
+                    } else if (booking.startDate) {
+                        travelRecord.pickupDate = String(booking.startDate);
                     }
-                    if (segment?.endLocalDateTime || booking.endDate) {
-                        travelRecord.dropoffDate = String(segment?.endLocalDateTime || booking.endDate);
+                    // Dropoff date - extract date from ISO datetime or use endDate
+                    if (segment?.endLocalDateTime) {
+                        const dropoffDateTime = new Date(segment.endLocalDateTime);
+                        travelRecord.dropoffDate = dropoffDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
+                    } else if (booking.endDate) {
+                        travelRecord.dropoffDate = String(booking.endDate);
                     }
                     // Map to carRentalCost if available (must be a number)
                     if (booking.grandTotal || booking.usdGrandTotal) {
@@ -2099,7 +2194,12 @@ app.http('navanLookup', {
                 }
                 
                 // Remove null/undefined/empty values to keep record clean
+                // But keep confirmationNumber even if null (it's a common field)
                 Object.keys(travelRecord).forEach(key => {
+                    if (key === 'confirmationNumber') {
+                        // Keep confirmationNumber even if null - it's a common field
+                        return;
+                    }
                     if (travelRecord[key] === null || travelRecord[key] === undefined || travelRecord[key] === '') {
                         delete travelRecord[key];
                     }
@@ -2331,29 +2431,6 @@ app.http('routeDirections', {
                 jsonBody: { error: error.message },
                 headers: { 'Content-Type': 'application/json' }
             };
-        }
-    }
-});
-
-// ADD THIS NEW ENDPOINT TO THE END OF api/index.js
-app.http('health', {
-    methods: ['GET', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'health',
-    handler: async (request, context) => {
-        try {
-            // This will crash if COSMOS_ keys are wrong
-            const container = getContainer('travel');
-            
-            // This will test the connection
-            await container.read(); 
-            
-            return { 
-                jsonBody: { status: "ok", message: "Successfully connected to Cosmos DB 'travel' container." } 
-            };
-        } catch (error) {
-            // This will be caught by our new handleError
-            return handleError(context, error, 'Health check failed');
         }
     }
 });
