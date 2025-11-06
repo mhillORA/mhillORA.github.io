@@ -1704,11 +1704,13 @@ app.http('navanLookup', {
             context.log.info(`Navan booking lookup request for: ${bookingId}`);
             
             // Step 1: Get OAuth token from Navan
-            const clientId = process.env.NAVAN_CLIENT_ID;
-            const clientSecret = process.env.NAVAN_SECRET_KEY;
+            // TEMPORARY: Hardcoded credentials for testing - REMOVE AFTER TESTING
+            const clientId = 'b3d5d542-9a69-4793-8b24-1b26485f2891'; // process.env.NAVAN_CLIENT_ID;
+            const clientSecret = '2387ef4c4a184a96a3ee109ab5dbf61a'; // process.env.NAVAN_SECRET_KEY;
             
             // Log credential status (without exposing values)
             context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
+            context.log.info('WARNING: Using hardcoded credentials for testing - this should be removed after testing!');
             
             if (!clientId || !clientSecret) {
                 context.log.error('Navan credentials not configured');
