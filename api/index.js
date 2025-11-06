@@ -40,6 +40,9 @@ const handleError = (context, error, message) => {
     context.log.error(`Stack:`, error.stack);
 
     let errorMessage;
+    let errorDetail = error.message || "Unknown error";
+    let errorStack = error.stack || "No stack trace";
+
     if (error.message.includes('COSMOS_DB_CONFIG_MISSING')) {
         errorMessage = "API Configuration Error: Database secrets not set in Azure Configuration.";
     } else if (error.message.includes('VALIDATION_ERROR')) {
@@ -50,7 +53,13 @@ const handleError = (context, error, message) => {
 
     return {
         status: 500,
-        jsonBody: { error: errorMessage },
+        jsonBody: { 
+            error: errorMessage,
+            // Add detailed error information for debugging
+            detail: errorDetail,
+            stack: errorStack,
+            originalMessage: message
+        },
         headers: {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*'
