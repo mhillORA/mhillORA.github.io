@@ -1745,93 +1745,91 @@ app.http('navanLookup', {
             context.log.info('OAuth token obtained successfully');
             
             // Step 2: Get booking data from Navan
-            // Note: Navan API might require filtering by UUID in the query parameters
-            // Try multiple endpoint formats based on Navan API documentation
+            // Navan API doesn't support direct UUID lookup - need to fetch recent bookings and filter
             context.log.info(`Fetching booking ${bookingId} from Navan...`);
             
             let bookingData = null;
             let bookingResponse = null;
-            let errorText = null;
             
-            // Try endpoint with uuid query parameter
             try {
-                bookingResponse = await fetch(`https://api.navan.com/v1/bookings?uuid=${encodeURIComponent(bookingId)}`, {
-                    method: 'GET',
-                    headers: {
-                        'Authorization': `Bearer ${accessToken}`,
-                        'Content-Type': 'application/json'
-                    }
-                });
+                // Navan API requires createdFrom/createdTo parameters - fetch recent bookings (last 90 days)
+                // and filter by UUID client-side
+                const now = Date.now();
+                const ninetyDaysAgo = now - (90 * 24 * 60 * 60 * 1000);
+                const createdFrom = Math.floor(ninetyDaysAgo / 1000);
+                const createdTo = Math.floor(now / 1000);
                 
-                context.log.info(`Navan API response status: ${bookingResponse.status}`);
+                context.log.info(`Fetching bookings from ${new Date(ninetyDaysAgo).toISOString()} to ${new Date(now).toISOString()}`);
                 
-                if (bookingResponse.ok) {
-                    bookingData = await bookingResponse.json();
-                    context.log.info('Booking data retrieved successfully');
-                } else {
-                    errorText = await bookingResponse.text();
-                    context.log.warn(`Booking request failed with uuid parameter: ${bookingResponse.status} - ${errorText}`);
+                // Fetch bookings with pagination - start with first page
+                let page = 0;
+                const pageSize = 100;
+                let foundBooking = null;
+                
+                while (!foundBooking && page < 10) { // Limit to 10 pages (1000 bookings max)
+                    context.log.info(`Fetching page ${page} of bookings...`);
                     
-                    // If 404 or empty result, try alternative endpoint format
-                    if (bookingResponse.status === 404 || bookingResponse.status === 200) {
-                        context.log.info('Trying alternative endpoint format with filters...');
-                        // Try with createdFrom/createdTo to get recent bookings and filter client-side
-                        // This is a fallback - ideally Navan supports uuid parameter
-                        const now = Date.now();
-                        const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
-                        const createdFrom = Math.floor(thirtyDaysAgo / 1000);
-                        const createdTo = Math.floor(now / 1000);
-                        
-                        bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=0&size=100`, {
-                            method: 'GET',
-                            headers: {
-                                'Authorization': `Bearer ${accessToken}`,
-                                'Content-Type': 'application/json'
-                            }
-                        });
-                        
-                        if (bookingResponse.ok) {
-                            const allBookings = await bookingResponse.json();
-                            // Find the booking by UUID in the results
-                            if (allBookings.data && Array.isArray(allBookings.data)) {
-                                const foundBooking = allBookings.data.find(b => b.uuid === bookingId);
-                                if (foundBooking) {
-                                    bookingData = { data: [foundBooking] };
-                                    context.log.info('Booking found using alternative endpoint format');
-                                } else {
-                                    context.log.warn(`Booking ${bookingId} not found in recent bookings`);
-                                }
-                            }
+                    bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}`, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${accessToken}`,
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    context.log.info(`Navan API response status: ${bookingResponse.status}`);
+                    
+                    if (!bookingResponse.ok) {
+                        const errorText = await bookingResponse.text();
+                        context.log.error(`Booking request failed: ${bookingResponse.status} - ${errorText}`);
+                        return {
+                            status: bookingResponse.status,
+                            jsonBody: { 
+                                error: 'Failed to fetch bookings from Navan',
+                                bookingId: bookingId,
+                                details: errorText
+                            },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                    
+                    const allBookings = await bookingResponse.json();
+                    context.log.info(`Received ${allBookings.data?.length || 0} bookings on page ${page}`);
+                    
+                    // Find the booking by UUID in the results
+                    if (allBookings.data && Array.isArray(allBookings.data)) {
+                        foundBooking = allBookings.data.find(b => b.uuid === bookingId);
+                        if (foundBooking) {
+                            bookingData = { data: [foundBooking] };
+                            context.log.info(`Booking found on page ${page}`);
+                            break;
                         }
                     }
+                    
+                    // Check if there are more pages
+                    if (allBookings.page && allBookings.page.totalPages && page < allBookings.page.totalPages - 1) {
+                        page++;
+                    } else {
+                        break; // No more pages
+                    }
+                }
+                
+                if (!foundBooking) {
+                    context.log.warn(`Booking ${bookingId} not found in recent bookings (searched ${page + 1} pages)`);
+                    return {
+                        status: 404,
+                        jsonBody: { 
+                            error: 'Booking not found',
+                            bookingId: bookingId,
+                            message: 'Booking not found in recent bookings (last 90 days). The booking may be older or the UUID may be incorrect.'
+                        },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
                 }
             } catch (fetchError) {
                 context.log.error('Error fetching booking from Navan:', fetchError.message);
                 context.log.error('Fetch error stack:', fetchError.stack);
                 throw fetchError;
-            }
-            
-            if (!bookingData || !bookingData.data || bookingData.data.length === 0) {
-                if (bookingResponse && !bookingResponse.ok) {
-                    return {
-                        status: bookingResponse.status,
-                        jsonBody: { 
-                            error: 'Booking not found or API error',
-                            bookingId: bookingId,
-                            details: errorText || 'No booking data returned'
-                        },
-                        headers: { 'Content-Type': 'application/json' }
-                    };
-                } else {
-                    return {
-                        status: 404,
-                        jsonBody: { 
-                            error: 'Booking not found',
-                            bookingId: bookingId
-                        },
-                        headers: { 'Content-Type': 'application/json' }
-                    };
-                }
             }
             
             // Step 3: Store booking data in travel container for reporting
