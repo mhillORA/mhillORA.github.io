@@ -1035,15 +1035,20 @@
                     });
                 }
 
-                // Flight lookup - using backend proxy endpoint
-                // The backend will call AviationStack API
-                // Configure API key in Azure environment variables:
-                // - AVIATIONSTACK_API_KEY for AviationStack
-                // Free tier available at: https://aviationstack.com/
-                async lookupFlight(flightNumber) {
+                // Navan booking lookup - using backend proxy endpoint
+                // The backend will:
+                // 1. Get OAuth token from https://api.navan.com/ta-auth/oauth/token
+                //    POST with grant_type=client_credentials, client_id, client_secret
+                // 2. Call Navan Bookings API: https://api.navan.com/v1/bookings?uuid={bookingId}
+                //    GET with Authorization: Bearer {token}
+                // Configure API credentials in Azure Static Web App environment variables:
+                // - NAVAN_CLIENT_ID: b3d5d542-9a69-4793-8b24-1b26485f2891
+                // - NAVAN_SECRET_KEY: 2387ef4c4a184a96a3ee109ab5dbf61a
+                async lookupNavanBooking(bookingId) {
                     try {
-                        // Call backend proxy endpoint (avoids CORS issues)
-                        const response = await fetch(`/api/flight-lookup?flightNumber=${encodeURIComponent(flightNumber)}`, {
+                        // Call backend proxy endpoint (avoids CORS issues and keeps credentials secure)
+                        // Backend will handle OAuth token generation and API calls
+                        const response = await fetch(`/api/navan-lookup?bookingId=${encodeURIComponent(bookingId)}`, {
                             method: 'GET',
                             headers: {
                                 'Content-Type': 'application/json'
@@ -1051,32 +1056,110 @@
                         });
                         
                         if (response.ok) {
-                            const flightData = await response.json();
-                            return {
-                                flightNumber: flightData.flightNumber || flightNumber,
-                                airline: flightData.airline || this.extractAirline(flightNumber),
-                                origin: flightData.origin || null,
-                                destination: flightData.destination || null,
-                                departureTime: flightData.departureTime || null,
-                                arrivalTime: flightData.arrivalTime || null,
-                                status: this.mapFlightStatus(flightData.status),
-                                delay: flightData.delay || null,
-                                gate: flightData.gate || null,
-                                terminal: flightData.terminal || null
+                            const navanData = await response.json();
+                            
+                            // Check if we have data
+                            if (!navanData.data || navanData.data.length === 0) {
+                                return {
+                                    error: 'No booking found with this ID',
+                                    bookingId: bookingId
+                                };
+                            }
+                            
+                            const booking = navanData.data[0];
+                            const bookingType = booking.bookingType || 'FLIGHT';
+                            
+                            // Map Navan data based on booking type
+                            const mappedData = {
+                                bookingId: booking.uuid || bookingId,
+                                bookingType: bookingType,
+                                confirmationNumber: booking.confirmationNumber || booking.bookingId || null,
+                                startDate: booking.startDate || null,
+                                endDate: booking.endDate || null,
+                                vendor: booking.vendor || null,
+                                status: this.mapNavanStatus(booking.bookingStatus || booking.approvalStatus),
+                                grandTotal: booking.grandTotal || booking.usdGrandTotal || null,
+                                currency: booking.currency || 'USD'
                             };
+                            
+                            // Map booking type specific data
+                            if (bookingType === 'FLIGHT') {
+                                mappedData.flight = {
+                                    flightNumber: booking.segments && booking.segments.length > 0 
+                                        ? `${booking.segments[0].providerCode || ''}${booking.segments[0].flightNumber || ''}` 
+                                        : null,
+                                    airline: booking.vendor || (booking.segments && booking.segments[0]?.providerName) || null,
+                                    origin: booking.origin?.airportCode || (booking.segments && booking.segments[0]?.departure?.airportCode) || null,
+                                    destination: booking.destination?.airportCode || (booking.segments && booking.segments[0]?.arrival?.airportCode) || null,
+                                    departureTime: booking.segments && booking.segments[0]?.startLocalDateTime 
+                                        ? new Date(booking.segments[0].startLocalDateTime).toISOString()
+                                        : null,
+                                    arrivalTime: booking.segments && booking.segments[0]?.endLocalDateTime 
+                                        ? new Date(booking.segments[0].endLocalDateTime).toISOString()
+                                        : null,
+                                    cabin: booking.cabin || booking.cabinPurchased || null,
+                                    route: booking.airlineRoute || null,
+                                    routeType: booking.routeType || booking.flight || null
+                                };
+                            } else if (bookingType === 'HOTEL') {
+                                mappedData.hotel = {
+                                    hotelName: booking.vendor || null,
+                                    hotelCode: booking.hotelCode || null,
+                                    hotelChain: booking.hotelChain || null,
+                                    checkIn: booking.startDate || null,
+                                    checkOut: booking.endDate || null,
+                                    address: booking.destination?.address || null,
+                                    city: booking.destination?.city || null,
+                                    state: booking.destination?.state || null,
+                                    country: booking.destination?.country || null,
+                                    latitude: booking.hotelLatitude || null,
+                                    longitude: booking.hotelLongitude || null
+                                };
+                            } else if (bookingType === 'CAR' || bookingType === 'RENTAL_CAR') {
+                                mappedData.car = {
+                                    vendor: booking.vendor || null,
+                                    carType: booking.carType || null,
+                                    pickupDate: booking.startDate || null,
+                                    returnDate: booking.endDate || null,
+                                    pickupLocation: booking.origin?.address || booking.origin?.city || null,
+                                    returnLocation: booking.destination?.address || booking.destination?.city || null
+                                };
+                            }
+                            
+                            // Add passenger/traveler information
+                            if (booking.passengers && booking.passengers.length > 0) {
+                                mappedData.traveler = {
+                                    name: booking.passengers[0].person?.name || null,
+                                    email: booking.passengers[0].person?.email || null,
+                                    employeeId: booking.passengers[0].person?.employeedId || null
+                                };
+                            }
+                            
+                            // Add trip information
+                            if (booking.tripName) {
+                                mappedData.tripName = booking.tripName;
+                            }
+                            if (booking.purpose) {
+                                mappedData.purpose = booking.purpose;
+                            }
+                            if (booking.reason) {
+                                mappedData.reason = booking.reason;
+                            }
+                            
+                            return mappedData;
                         }
                         
                         // Handle specific error statuses
-                        let errorMessage = 'Flight lookup unavailable';
+                        let errorMessage = 'Navan booking lookup unavailable';
                         if (response.status === 500) {
-                            errorMessage = 'Flight lookup service temporarily unavailable (server error)';
-                            console.error(`Flight lookup API returned 500 error for flight ${flightNumber}`);
+                            errorMessage = 'Navan booking lookup service temporarily unavailable (server error)';
+                            console.error(`Navan API returned 500 error for booking ${bookingId}`);
                         } else if (response.status === 404) {
-                            errorMessage = 'Flight not found';
-                            console.warn(`Flight ${flightNumber} not found in database`);
+                            errorMessage = 'Booking not found';
+                            console.warn(`Booking ${bookingId} not found in Navan`);
                         } else {
-                            errorMessage = `Flight lookup failed (status: ${response.status})`;
-                            console.error(`Flight lookup API returned ${response.status} for flight ${flightNumber}`);
+                            errorMessage = `Navan booking lookup failed (status: ${response.status})`;
+                            console.error(`Navan API returned ${response.status} for booking ${bookingId}`);
                         }
                         
                         // Try to get error details from response
@@ -1086,58 +1169,64 @@
                                 try {
                                     const errorData = JSON.parse(errorText);
                                     if (errorData && errorData.error) {
-                                        console.error('Flight lookup error details:', errorData.error);
+                                        console.error('Navan lookup error details:', errorData.error);
                                     }
                                 } catch (e) {
                                     // If not JSON, log as text
-                                    console.error('Flight lookup error response:', errorText);
+                                    console.error('Navan lookup error response:', errorText);
                                 }
                             }
                         } catch (e) {
                             // Ignore errors reading response
                         }
                         
-                        // If API call fails, return basic info with error message
+                        // If API call fails, return error
                         return {
-                            flightNumber: flightNumber,
-                            airline: this.extractAirline(flightNumber),
-                            origin: null,
-                            destination: null,
-                            departureTime: null,
-                            arrivalTime: null,
-                            status: 'scheduled',
-                            delay: null,
-                            gate: null,
-                            terminal: null,
-                            error: errorMessage
+                            error: errorMessage,
+                            bookingId: bookingId
                         };
                         
                     } catch (error) {
-                        console.error('Error looking up flight:', error);
+                        console.error('Error looking up Navan booking:', error);
                         console.error('Error details:', {
                             message: error.message,
                             stack: error.stack,
-                            flightNumber: flightNumber
+                            bookingId: bookingId
                         });
                         
-                        // Return basic info extracted from flight number
+                        // Return error
                         return {
-                            flightNumber: flightNumber,
-                            airline: this.extractAirline(flightNumber),
-                            origin: null,
-                            destination: null,
-                            departureTime: null,
-                            arrivalTime: null,
-                            status: 'scheduled',
-                            delay: null,
-                            gate: null,
-                            terminal: null,
-                            error: 'Network error: Unable to reach flight lookup service'
+                            error: 'Network error: Unable to reach Navan booking lookup service',
+                            bookingId: bookingId
                         };
                     }
                 }
                 
-                // Map flight status from API format to our format
+                // Map Navan booking status to our format
+                mapNavanStatus(status) {
+                    if (!status) return 'scheduled';
+                    
+                    const statusMap = {
+                        'TICKETED': 'scheduled',
+                        'CONFIRMED': 'scheduled',
+                        'APPROVED': 'scheduled',
+                        'PENDING': 'pending',
+                        'CANCELLED': 'cancelled',
+                        'CANCELED': 'cancelled',
+                        'CANCELLATION': 'cancelled',
+                        'REFUNDED': 'cancelled',
+                        'COMPLETED': 'arrived',
+                        'ACTIVE': 'departed',
+                        'DEPARTED': 'departed',
+                        'ARRIVED': 'arrived',
+                        'DELAYED': 'delayed',
+                        'REJECTED': 'cancelled',
+                        'UNKNOWN': 'scheduled'
+                    };
+                    return statusMap[status.toUpperCase()] || 'scheduled';
+                }
+                
+                // Map flight status from API format to our format (legacy)
                 mapFlightStatus(status) {
                     const statusMap = {
                         'scheduled': 'scheduled',
@@ -1367,6 +1456,64 @@
                     Math.sin(dLon / 2) * Math.sin(dLon / 2);
                 const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
                 return R * c;
+            };
+
+            // Get CRC address from CRC data
+            const getCrcAddress = (crc) => {
+                if (!crc) return null;
+                // Try various possible address fields
+                const addressParts = [
+                    crc.address || crc.address1 || '',
+                    crc.city || '',
+                    crc.state || '',
+                    crc.zipCode || crc.zip || ''
+                ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
+                
+                if (addressParts.length === 0) return null;
+                return addressParts.join(', ');
+            };
+
+            // Get site address from site data
+            const getSiteAddress = (site) => {
+                if (!site) return null;
+                const addressParts = [
+                    site.address1 || site.address || '',
+                    site.city || '',
+                    site.state || '',
+                    site.zipCode || site.zip || ''
+                ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
+                
+                if (addressParts.length === 0) return null;
+                return addressParts.join(', ');
+            };
+
+            // Calculate distance between CRC and site (using geocoding and Haversine)
+            const calculateCrcToSiteDistance = async (crc, site) => {
+                try {
+                    const crcAddress = getCrcAddress(crc);
+                    const siteAddress = getSiteAddress(site);
+                    
+                    if (!crcAddress || !siteAddress) return null;
+                    
+                    // Geocode both addresses
+                    const crcGeocode = await geocodeLocation(crcAddress);
+                    const siteGeocode = await geocodeLocation(siteAddress);
+                    
+                    if (!crcGeocode || !siteGeocode) return null;
+                    
+                    // Calculate distance using Haversine formula
+                    const distance = calculateHaversineDistance(
+                        crcGeocode.lat,
+                        crcGeocode.lng,
+                        siteGeocode.lat,
+                        siteGeocode.lng
+                    );
+                    
+                    return Math.round(distance * 10) / 10; // Round to 1 decimal place
+                } catch (error) {
+                    console.error('Error calculating CRC to site distance:', error);
+                    return null;
+                }
             };
 
             // Get distance from hotel to site (deprecated - using calculateDistance instead)
@@ -2391,9 +2538,31 @@
 
             const getUnavailabilityPeriod = (crcId, date) => {
                 if (!crcId || !date) return null;
+                // Check for Unavailable events first
                 const ev = (state.crc_events || []).find(e => e.crcId === crcId && e.type === 'Unavailable' && e.date === date);
-                if (!ev) return null;
-                return ev.period || 'Full Day';
+                if (ev) return ev.period || 'Full Day';
+                
+                // Check for Paid Time Off events
+                const ptoEv = (state.crc_events || []).find(e => e.crcId === crcId && e.type === 'Paid Time Off' && e.date === date);
+                if (ptoEv) return ptoEv.period || 'Full Day';
+                
+                // Check for approved time off requests
+                const approvedTimeOffRequest = state.timeOffRequests.find(req => {
+                    if (req.crcId !== crcId || req.status !== 'approved') return false;
+                    const reqDate = req.date || req.startDate;
+                    const reqEndDate = req.endDate;
+                    
+                    // Check if date falls within approved request range
+                    if (reqDate === date) return true;
+                    if (reqEndDate && reqDate && date >= reqDate && date <= reqEndDate) return true;
+                    return false;
+                });
+                
+                if (approvedTimeOffRequest) {
+                    return approvedTimeOffRequest.period || 'Full Day';
+                }
+                
+                return null;
             };
 
             const isCRCUnavailable = (crcId, date, period) => {
@@ -8609,14 +8778,34 @@
                             availabilityText = '(PM Scheduled)';
                         }
                         
-                        const isMarkedUnavailable = scheduledEvents.some(e => ['Unavailable', 'Paid Time Off'].includes(e.type));
-                        if(isMarkedUnavailable) {
-                            option.classList.add('text-red-500', 'font-bold');
-                            availabilityText = '(Unavailable)';
+                        // Check for time off (both events and time off requests) for each date in the range
+                        let hasTimeOff = false;
+                        let timeOffPeriod = null;
+                        for (const dateStr of dateRange) {
+                            const isUnavailable = isCRCUnavailable(crcId, dateStr, selectedPeriod);
+                            if (isUnavailable) {
+                                hasTimeOff = true;
+                                timeOffPeriod = getUnavailabilityPeriod(crcId, dateStr);
+                                break;
+                            }
                         }
                         
+                        if (hasTimeOff) {
+                            option.classList.add('text-red-500', 'font-bold');
+                            const periodText = timeOffPeriod === 'Full Day' ? 'Full Day' : timeOffPeriod;
+                            availabilityText = `(Time Off - ${periodText})`;
+                        } else {
+                            // Also check for marked unavailable events (legacy)
+                            const isMarkedUnavailable = scheduledEvents.some(e => ['Unavailable', 'Paid Time Off'].includes(e.type));
+                            if(isMarkedUnavailable) {
+                                option.classList.add('text-red-500', 'font-bold');
+                                availabilityText = '(Unavailable)';
+                            }
+                        }
+                        
+                        // Disable if already scheduled, but allow selection if only time off (override will be handled)
                         option.disabled = !isAvailable;
-                        if (!isAvailable || isMarkedUnavailable) {
+                        if (!isAvailable || hasTimeOff) {
                             option.textContent += ` ${availabilityText}`;
                         }
                     }
@@ -12123,33 +12312,27 @@
                         }
                         break;
                     }
-                    case 'lookup-flight': {
+                    case 'lookup-navan-booking': {
                         e.preventDefault();
                         e.stopPropagation();
                         
-                        console.log('Flight lookup button clicked');
+                        console.log('Navan booking lookup button clicked');
                         
-                        const flightNumberInput = document.getElementById('flight-number-input');
-                        if (!flightNumberInput) {
-                            console.error('Flight number input not found');
-                            showNotification('Flight number input not found. Please try again.', 'error');
+                        const navanIdInput = document.getElementById('navan-booking-id-input');
+                        if (!navanIdInput) {
+                            console.error('Navan booking ID input not found');
+                            showNotification('Navan booking ID input not found. Please try again.', 'error');
                             return;
                         }
                         
-                        const flightNumber = flightNumberInput.value.trim().toUpperCase();
-                        if (!flightNumber) {
-                            showNotification('Please enter a flight number', 'error');
-                            return;
-                        }
-                        
-                        // Validate flight number format (e.g., AA1234, DL456)
-                        if (!/^[A-Z]{2,3}\d{1,4}$/.test(flightNumber)) {
-                            showNotification('Invalid flight number format. Please use format like AA1234 or DL456', 'error');
+                        const bookingId = navanIdInput.value.trim();
+                        if (!bookingId) {
+                            showNotification('Please enter a Navan booking ID (UUID)', 'error');
                             return;
                         }
                         
                         try {
-                            showNotification('Looking up flight information from AviationStack API...', 'info');
+                            showNotification('Looking up booking information from Navan API...', 'info');
                             
                             // Disable lookup button during request
                             const lookupButton = e.target;
@@ -12157,80 +12340,148 @@
                             lookupButton.disabled = true;
                             lookupButton.textContent = 'Looking up...';
                             
-                            console.log('Calling AviationStack API for flight:', flightNumber);
-                            const flightData = await apiService.lookupFlight(flightNumber);
-                            console.log('Flight data received from AviationStack:', flightData);
+                            console.log('Calling Navan API for booking:', bookingId);
+                            const bookingData = await apiService.lookupNavanBooking(bookingId);
+                            console.log('Booking data received from Navan:', bookingData);
                             
-                            // Check if we got valid data from AviationStack
-                            if (flightData.message && flightData.message.includes('not configured')) {
-                                showNotification('AviationStack API key not configured. Please configure AVIATIONSTACK_API_KEY in Azure environment variables.', 'error');
+                            // Check for errors
+                            if (bookingData.error) {
+                                showNotification(bookingData.error, 'error');
                                 lookupButton.disabled = false;
                                 lookupButton.textContent = originalText;
                                 return;
                             }
                             
-                            if (flightData.message && flightData.message.includes('not available')) {
-                                showNotification('Flight information not available from AviationStack. The flight may not be in the system.', 'warning');
+                            // Determine booking type and fill appropriate fields
+                            const bookingType = bookingData.bookingType || 'FLIGHT';
+                            
+                            // Show/hide booking type specific fields
+                            const flightFields = document.getElementById('flight-fields-group');
+                            const hotelFields = document.getElementById('hotel-fields-group');
+                            const carFields = document.getElementById('car-fields-group');
+                            
+                            // Hide all groups first
+                            if (flightFields) flightFields.classList.add('hidden');
+                            if (hotelFields) hotelFields.classList.add('hidden');
+                            if (carFields) carFields.classList.add('hidden');
+                            
+                            // Show and fill appropriate group based on booking type
+                            if (bookingType === 'FLIGHT' && bookingData.flight) {
+                                if (flightFields) flightFields.classList.remove('hidden');
+                                
+                                // Fill flight fields
+                                if (bookingData.flight.flightNumber) {
+                                    const flightNumberInput = document.getElementById('flight-number-input');
+                                    if (flightNumberInput) flightNumberInput.value = bookingData.flight.flightNumber;
+                                }
+                                if (bookingData.flight.origin) {
+                                    const originInput = document.getElementById('origin-input');
+                                    if (originInput) originInput.value = bookingData.flight.origin;
+                                }
+                                if (bookingData.flight.destination) {
+                                    const destinationInput = document.getElementById('destination-input');
+                                    if (destinationInput) destinationInput.value = bookingData.flight.destination;
+                                }
+                                if (bookingData.flight.departureTime) {
+                                    const departureInput = document.getElementById('departure-time-input');
+                                    if (departureInput) {
+                                        const depDate = new Date(bookingData.flight.departureTime);
+                                        departureInput.value = depDate.toISOString().slice(0, 16);
+                                    }
+                                }
+                                if (bookingData.flight.arrivalTime) {
+                                    const arrivalInput = document.getElementById('arrival-time-input');
+                                    if (arrivalInput) {
+                                        const arrDate = new Date(bookingData.flight.arrivalTime);
+                                        arrivalInput.value = arrDate.toISOString().slice(0, 16);
+                                    }
+                                }
+                                if (bookingData.flight.airline) {
+                                    const airlineInput = document.getElementById('airline-input');
+                                    if (airlineInput) airlineInput.value = bookingData.flight.airline;
+                                }
+                            } else if (bookingType === 'HOTEL' && bookingData.hotel) {
+                                if (hotelFields) hotelFields.classList.remove('hidden');
+                                
+                                // Fill hotel fields
+                                if (bookingData.hotel.hotelName) {
+                                    const hotelNameInput = document.getElementById('hotel-name-input');
+                                    if (hotelNameInput) hotelNameInput.value = bookingData.hotel.hotelName;
+                                }
+                                if (bookingData.hotel.address) {
+                                    const addressInput = document.getElementById('hotel-address-input');
+                                    if (addressInput) addressInput.value = bookingData.hotel.address;
+                                }
+                                if (bookingData.hotel.city) {
+                                    const cityInput = document.getElementById('hotel-city-input');
+                                    if (cityInput) cityInput.value = bookingData.hotel.city;
+                                }
+                                if (bookingData.hotel.checkIn) {
+                                    const checkInInput = document.getElementById('check-in-input');
+                                    if (checkInInput) checkInInput.value = bookingData.hotel.checkIn;
+                                }
+                                if (bookingData.hotel.checkOut) {
+                                    const checkOutInput = document.getElementById('check-out-input');
+                                    if (checkOutInput) checkOutInput.value = bookingData.hotel.checkOut;
+                                }
+                            } else if ((bookingType === 'CAR' || bookingType === 'RENTAL_CAR') && bookingData.car) {
+                                if (carFields) carFields.classList.remove('hidden');
+                                
+                                // Fill car fields
+                                if (bookingData.car.vendor) {
+                                    const vendorInput = document.getElementById('car-vendor-input');
+                                    if (vendorInput) vendorInput.value = bookingData.car.vendor;
+                                }
+                                if (bookingData.car.pickupLocation) {
+                                    const pickupInput = document.getElementById('pickup-location-input');
+                                    if (pickupInput) pickupInput.value = bookingData.car.pickupLocation;
+                                }
+                                if (bookingData.car.returnLocation) {
+                                    const returnInput = document.getElementById('return-location-input');
+                                    if (returnInput) returnInput.value = bookingData.car.returnLocation;
+                                }
+                                if (bookingData.car.pickupDate) {
+                                    const pickupDateInput = document.getElementById('pickup-date-input');
+                                    if (pickupDateInput) pickupDateInput.value = bookingData.car.pickupDate;
+                                }
+                                if (bookingData.car.returnDate) {
+                                    const returnDateInput = document.getElementById('return-date-input');
+                                    if (returnDateInput) returnDateInput.value = bookingData.car.returnDate;
+                                }
                             }
                             
-                            // Fill in the form fields
-                            if (flightData.origin) {
-                                const originInput = document.getElementById('origin-input');
-                                if (originInput) originInput.value = flightData.origin;
+                            // Fill common fields
+                            if (bookingData.confirmationNumber) {
+                                const confirmationInput = document.getElementById('confirmation-number-input');
+                                if (confirmationInput) confirmationInput.value = bookingData.confirmationNumber;
                             }
-                            if (flightData.destination) {
-                                const destinationInput = document.getElementById('destination-input');
-                                if (destinationInput) destinationInput.value = flightData.destination;
+                            if (bookingData.startDate) {
+                                const startDateInput = document.getElementById('start-date-input');
+                                if (startDateInput) startDateInput.value = bookingData.startDate;
                             }
-                            if (flightData.departureTime) {
-                                const departureInput = document.getElementById('departure-time-input');
-                                if (departureInput) {
-                                    const depDate = new Date(flightData.departureTime);
-                                    departureInput.value = depDate.toISOString().slice(0, 16);
-                                }
+                            if (bookingData.endDate) {
+                                const endDateInput = document.getElementById('end-date-input');
+                                if (endDateInput) endDateInput.value = bookingData.endDate;
                             }
-                            if (flightData.arrivalTime) {
-                                const arrivalInput = document.getElementById('arrival-time-input');
-                                if (arrivalInput) {
-                                    const arrDate = new Date(flightData.arrivalTime);
-                                    arrivalInput.value = arrDate.toISOString().slice(0, 16);
-                                }
-                            }
-                            if (flightData.gate) {
-                                const gateInput = document.getElementById('gate-input');
-                                if (gateInput) gateInput.value = flightData.gate;
-                            }
-                            if (flightData.terminal) {
-                                const terminalInput = document.getElementById('terminal-input');
-                                if (terminalInput) terminalInput.value = flightData.terminal;
-                            }
-                            if (flightData.status) {
+                            if (bookingData.status) {
                                 const statusInput = document.getElementById('status-input');
-                                if (statusInput) statusInput.value = flightData.status;
-                            }
-                            if (flightData.delay) {
-                                const delayInput = document.getElementById('delay-input');
-                                if (delayInput) delayInput.value = flightData.delay;
+                                if (statusInput) statusInput.value = bookingData.status;
                             }
                             
                             // Re-enable button
                             lookupButton.disabled = false;
                             lookupButton.textContent = originalText;
                             
-                            if (flightData.origin || flightData.destination) {
-                                showNotification('Flight information loaded successfully!', 'success');
-                            } else {
-                                showNotification('Flight information partially loaded. Some details may need to be entered manually.', 'warning');
-                            }
+                            showNotification(`${bookingType} booking information loaded successfully!`, 'success');
                         } catch (error) {
-                            console.error('Error looking up flight:', error);
+                            console.error('Error looking up Navan booking:', error);
                             
                             // Re-enable button
                             const lookupButton = e.target;
                             lookupButton.disabled = false;
                             lookupButton.textContent = 'Lookup';
                             
-                            showNotification('Failed to lookup flight information. Please enter details manually.', 'error');
+                            showNotification('Failed to lookup booking information. Please enter details manually.', 'error');
                         }
                         break;
                     }
@@ -12660,17 +12911,48 @@
                             return;
                         }
 
-                        // Compute overrides needed: unavailability and double-booking within this shift
+                        // Compute overrides needed: unavailability (time off) and conflicts with different sites/studies
                         const startDateStr = data.startDate;
+                        const period = data.period || 'Full Day';
+                        const selectedSiteId = data.siteId;
+                        const selectedStudyIds = studyIds || [];
                         const unavailabilityConflicts = [];
-                        const counts = new Map();
-                        crcIds.forEach(id => counts.set(id, (counts.get(id) || 0) + 1));
-                        const duplicateCrcs = Array.from(counts.entries()).filter(([, c]) => c > 1).map(([id]) => id);
-                        crcIds.forEach(crcId => {
-                            const p = getUnavailabilityPeriod(crcId, startDateStr);
-                            if (p) unavailabilityConflicts.push({ crcId, period: p });
+                        const siteStudyConflicts = [];
+                        
+                        // Collect all CRC IDs from both regular selection and role assignments
+                        const allCrcIds = new Set(crcIds);
+                        const roleAssignmentInputs = form.querySelectorAll('select[name^="role-"]');
+                        roleAssignmentInputs.forEach(input => {
+                            if (input.value) allCrcIds.add(input.value);
                         });
-                        const needsOverride = unavailabilityConflicts.length > 0 || duplicateCrcs.length > 0;
+                        
+                        // Check for time off conflicts (both events and time off requests)
+                        allCrcIds.forEach(crcId => {
+                            const isUnavailable = isCRCUnavailable(crcId, startDateStr, period);
+                            if (isUnavailable) {
+                                const p = getUnavailabilityPeriod(crcId, startDateStr);
+                                unavailabilityConflicts.push({ crcId, period: p || 'Full Day' });
+                            }
+                            
+                            // Check if this CRC is already scheduled for a different site/study on this date
+                            if (selectedSiteId && selectedStudyIds.length > 0) {
+                                const conflictingEvents = state.crc_events.filter(event => 
+                                    event.crcId === crcId &&
+                                    event.date === startDateStr &&
+                                    event.type === 'Site Assignment' &&
+                                    (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)))
+                                );
+                                
+                                if (conflictingEvents.length > 0) {
+                                    const conflictEvent = conflictingEvents[0];
+                                    const conflictSite = state.crc_sites.find(s => s.id === conflictEvent.siteId);
+                                    const conflictSiteName = conflictSite ? conflictSite.name : 'another site';
+                                    siteStudyConflicts.push({ crcId, siteName: conflictSiteName });
+                                }
+                            }
+                        });
+                        
+                        const needsOverride = unavailabilityConflicts.length > 0 || siteStudyConflicts.length > 0;
 
                         const processSubmit = async (confirmedOverride = false) => {
                             try {
@@ -12840,10 +13122,17 @@
                             openModal(`
                                 <h3 class="text-xl font-bold text-yellow-500 mb-4">Override Required</h3>
                                 <div class="space-y-2 dark:text-gray-300 mb-4">
-                                    ${unavailabilityConflicts.length ? `<div><strong>Unavailable:</strong> ${unavailabilityConflicts.map(c => (state.crcs.find(x=>x.id===c.crcId)?.name || c.crcId)+` (${c.period})`).join(', ')}</div>` : ''}
-                                    ${duplicateCrcs.length ? `<div><strong>Double-booked this shift:</strong> ${duplicateCrcs.map(id => state.crcs.find(c=>c.id===id)?.name || id).join(', ')}</div>` : ''}
+                                    ${unavailabilityConflicts.length ? `<div><strong>Time Off Conflicts:</strong> ${unavailabilityConflicts.map(c => {
+                                        const crcName = state.crcs.find(x=>x.id===c.crcId)?.name || c.crcId;
+                                        const periodText = c.period === 'Full Day' ? 'Full Day' : c.period;
+                                        return `${crcName} (${periodText})`;
+                                    }).join(', ')}</div>` : ''}
+                                    ${siteStudyConflicts.length ? `<div><strong>Site/Study Conflicts:</strong> ${siteStudyConflicts.map(c => {
+                                        const crcName = state.crcs.find(x=>x.id===c.crcId)?.name || c.crcId;
+                                        return `${crcName} (already at ${c.siteName})`;
+                                    }).join(', ')}</div>` : ''}
                                 </div>
-                                <p class="dark:text-gray-300 mb-6">Proceed and override these conflicts?</p>
+                                <p class="dark:text-gray-300 mb-6">These staff members have conflicts. Proceed and override these conflicts?</p>
                                 <div class="flex justify-end gap-4">
                                     <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Cancel</button>
                                     <button id="confirm-override-btn" class="py-2 px-4 rounded-md bg-yellow-600 text-white hover:bg-yellow-700">Confirm & Schedule</button>
@@ -13565,18 +13854,52 @@
                     const selectedCrcId = target.value;
                     if (!selectedCrcId) return;
                     const dateInput = form.querySelector('input[name="startDate"]');
+                    const periodSelect = form.querySelector('select[name="period"]');
+                    const siteSelect = form.querySelector('select[name="siteId"]');
+                    const studySelect = form.querySelector('select[name="studyIds"]');
                     const date = dateInput ? dateInput.value : new Date().toISOString().split('T')[0];
-                    const unavail = getUnavailabilityPeriod(selectedCrcId, date);
-                    // Check duplicates within this shift across all role selects
+                    const period = periodSelect ? periodSelect.value : 'Full Day';
+                    const selectedSiteId = siteSelect ? siteSelect.value : null;
+                    const selectedStudyIds = studySelect ? Array.from(studySelect.selectedOptions).map(opt => opt.value).filter(Boolean) : [];
+                    
+                    // Check for time off (using isCRCUnavailable which checks both events and time off requests)
+                    const isUnavailable = isCRCUnavailable(selectedCrcId, date, period);
+                    const unavailPeriod = getUnavailabilityPeriod(selectedCrcId, date);
+                    
+                    // Check for conflicts: same CRC can be in multiple roles for same shift, but not different sites/studies on same day
                     const allRoleSelects = Array.from(form.querySelectorAll('select[name^="role-"]'));
-                    const numSelectedSame = allRoleSelects.filter(s => s !== target && s.value === selectedCrcId).length;
-                    const hasDuplicate = numSelectedSame > 0;
-                    if (unavail || hasDuplicate) {
+                    let hasConflict = false;
+                    let conflictReason = '';
+                    
+                    // Check if this CRC is already scheduled for a different site/study on this date
+                    if (selectedSiteId && selectedStudyIds.length > 0) {
+                        const conflictingEvents = state.crc_events.filter(event => 
+                            event.crcId === selectedCrcId &&
+                            event.date === date &&
+                            event.type === 'Site Assignment' &&
+                            (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)))
+                        );
+                        
+                        if (conflictingEvents.length > 0) {
+                            hasConflict = true;
+                            const conflictEvent = conflictingEvents[0];
+                            const conflictSite = state.crc_sites.find(s => s.id === conflictEvent.siteId);
+                            const conflictSiteName = conflictSite ? conflictSite.name : 'another site';
+                            conflictReason = `already scheduled at ${conflictSiteName} on this date`;
+                        }
+                    }
+                    
+                    if (isUnavailable || hasConflict) {
                         const crcName = (state.crcs.find(c => c.id === selectedCrcId)?.name) || 'This CRC';
                         const reasons = [];
-                        if (unavail) reasons.push(`unavailable ${unavail === 'Full Day' ? 'Full Day' : unavail}`);
-                        if (hasDuplicate) reasons.push('already selected in another role for this shift');
-                        const message = `${crcName} is ${reasons.join(' and ')}. Proceed with override?`;
+                        if (isUnavailable) {
+                            const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
+                            reasons.push(`has time off (${periodText})`);
+                        }
+                        if (hasConflict) {
+                            reasons.push(conflictReason);
+                        }
+                        const message = `${crcName} ${reasons.join(' and ')}. Proceed with override?`;
                         const previousValue = target.getAttribute('data-prev') || '';
                         const ok = window.confirm(message);
                         if (!ok) {
@@ -13705,7 +14028,7 @@
             };
 
             // New function to handle study/site selection for shift creation
-            const handleShiftStudySiteSelection = () => {
+            const handleShiftStudySiteSelection = async () => {
                 console.log('handleShiftStudySiteSelection called');
                 const studySelect = document.querySelector('select[name="studyIds"]');
                 const siteSelect = document.querySelector('select[name="siteId"]');
@@ -13833,9 +14156,17 @@
                                                         <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
                                                         <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                             <option value="">Select Staff</option>
-                                                            ${qualifiedCrcs.map(c => 
-                                                                `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''}>${c.name}</option>`
-                                                            ).join('')}
+                                                            ${qualifiedCrcs.map(c => {
+                                                                const isUnavailable = isCRCUnavailable(c.id, date, period);
+                                                                const unavailPeriod = getUnavailabilityPeriod(c.id, date);
+                                                                let statusText = '';
+                                                                if (isUnavailable) {
+                                                                    const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
+                                                                    statusText = ` (Time Off - ${periodText})`;
+                                                                }
+                                                                const styleClass = isUnavailable && c.id !== crcId ? 'text-red-600 dark:text-red-400' : '';
+                                                                return `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''} class="${styleClass}">${c.name}${statusText}</option>`;
+                                                            }).join('')}
                                                             ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
                                                         </select>
                                                     </div>
@@ -13879,9 +14210,17 @@
                                                 <label class="text-sm text-gray-600 dark:text-gray-400 w-16">1:</label>
                                                 <select name="role-legacy-0" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                     <option value="">Select Staff</option>
-                                                    ${qualifiedCrcs.map(c => 
-                                                        `<option value="${c.id}" ${c.id === existingEvent.crcId ? 'selected' : ''}>${c.name}</option>`
-                                                    ).join('')}
+                                                    ${qualifiedCrcs.map(c => {
+                                                        const isUnavailable = isCRCUnavailable(c.id, date, period);
+                                                        const unavailPeriod = getUnavailabilityPeriod(c.id, date);
+                                                        let statusText = '';
+                                                        if (isUnavailable) {
+                                                            const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
+                                                            statusText = ` (Time Off - ${periodText})`;
+                                                        }
+                                                        const styleClass = isUnavailable && c.id !== existingEvent.crcId ? 'text-red-600 dark:text-red-400' : '';
+                                                        return `<option value="${c.id}" ${c.id === existingEvent.crcId ? 'selected' : ''} class="${styleClass}">${c.name}${statusText}</option>`;
+                                                    }).join('')}
                                                     ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
                                                 </select>
                                             </div>
@@ -13979,11 +14318,12 @@
                         </div>
                     `;
                     
-                    state.roles.forEach(role => {
+                    // Process roles sequentially to handle async distance calculations
+                    for (const role of state.roles) {
                         const roleName = (role?.name || '').trim();
-                        if (!roleName) return;
+                        if (!roleName) continue;
                         const roleKey = roleName.toLowerCase();
-                        if (seenRoleNames.has(roleKey)) return;
+                        if (seenRoleNames.has(roleKey)) continue;
                         // Get existing assignments for this role if editing
                         const existingAssignments = existingEvent && existingEvent.roleAssignments && existingEvent.roleAssignments[role.id] 
                             ? existingEvent.roleAssignments[role.id].filter(Boolean) 
@@ -13992,13 +14332,69 @@
                         
                         // Only show CRCs who have valid training for this role
                         const qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, roleName));
-                        if (qualifiedCrcs.length === 0) return; // skip roles with no trained CRCs
+                        if (qualifiedCrcs.length === 0) continue; // skip roles with no trained CRCs
                         seenRoleNames.add(roleKey);
-                        let crcOptions = qualifiedCrcs.map(crc => {
+                        
+                        // Get site for distance calculation
+                        const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
+                        
+                        // Calculate availability and distance for each CRC, then sort
+                        const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
                             const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                            const unavailableText = isUnavailable ? ' (Unavailable)' : '';
-                            // Disable option if unavailable (unless already selected)
-                            return `<option value="${crc.id}" ${crc.id === existingCrcId ? 'selected' : ''} ${isUnavailable && crc.id !== existingCrcId ? 'disabled' : ''}>${crc.name}${unavailableText}</option>`;
+                            const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
+                            let distance = null;
+                            
+                            // Calculate distance if site is available
+                            if (site) {
+                                distance = await calculateCrcToSiteDistance(crc, site);
+                            }
+                            
+                            return {
+                                crc,
+                                isUnavailable,
+                                unavailPeriod,
+                                distance,
+                                isSelected: crc.id === existingCrcId
+                            };
+                        }));
+                        
+                        // Sort: available first (by distance), then unavailable (by distance)
+                        crcsWithInfo.sort((a, b) => {
+                            // Selected items always come first
+                            if (a.isSelected !== b.isSelected) {
+                                return a.isSelected ? -1 : 1;
+                            }
+                            // Available before unavailable
+                            if (a.isUnavailable !== b.isUnavailable) {
+                                return a.isUnavailable ? 1 : -1;
+                            }
+                            // Within same availability, sort by distance (closest first)
+                            if (a.distance !== null && b.distance !== null) {
+                                return a.distance - b.distance;
+                            }
+                            // If one has distance and other doesn't, prefer the one with distance
+                            if (a.distance !== null && b.distance === null) return -1;
+                            if (a.distance === null && b.distance !== null) return 1;
+                            // Otherwise sort by name
+                            return a.crc.name.localeCompare(b.crc.name);
+                        });
+                        
+                        let crcOptions = crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, isSelected }) => {
+                            let unavailableText = '';
+                            if (isUnavailable) {
+                                const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
+                                unavailableText = ` (Time Off - ${periodText})`;
+                            }
+                            
+                            // Add distance if available
+                            let distanceText = '';
+                            if (distance !== null) {
+                                distanceText = ` - ${distance} mi`;
+                            }
+                            
+                            // Show unavailable CRCs but allow selection (override will be handled on selection)
+                            const styleClass = isUnavailable && !isSelected ? 'text-red-600 dark:text-red-400' : '';
+                            return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} class="${styleClass}">${crc.name}${distanceText}${unavailableText}</option>`;
                         }).join('');
                         
                         if (qualifiedCrcs.length === 0) {
@@ -14019,7 +14415,7 @@
                                 </div>
                             </div>
                         `;
-                    });
+                    }
                     
                     roleAssignmentHTML += '</div>';
                     roleAssignmentContainer.innerHTML = roleAssignmentHTML;
@@ -14031,11 +14427,12 @@
                 let roleAssignmentHTML = '<div class="space-y-4">';
                 console.log('Generating role assignment interface for', requiredRoles.size, 'roles');
                 
-                requiredRoles.forEach((quantity, roleId) => {
+                // Process roles sequentially to handle async distance calculations
+                for (const [roleId, quantity] of requiredRoles.entries()) {
                     const role = state.roles.find(r => r.id === roleId);
                     if (!role) {
                         console.log('Role not found for ID:', roleId);
-                        return;
+                        continue;
                     }
                     
                     console.log(`Processing role: ${role.name} (${quantity} needed)`);
@@ -14048,15 +14445,67 @@
                     
                     // Get CRCs who can fill this role (only show those with valid training)
                     const qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, role.name));
-                    let crcOptions = qualifiedCrcs.map(crc => {
-                        const isSelected = existingAssignments.includes(crc.id);
+                    
+                    // Get site for distance calculation
+                    const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
+                    
+                    // Calculate availability and distance for each CRC, then sort
+                    const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
                         const isUnavailable = isCRCUnavailable(crc.id, date, period);
+                        const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
+                        let distance = null;
                         
+                        // Calculate distance if site is available
+                        if (site) {
+                            distance = await calculateCrcToSiteDistance(crc, site);
+                        }
+                        
+                        return {
+                            crc,
+                            isUnavailable,
+                            unavailPeriod,
+                            distance,
+                            isSelected: existingAssignments.includes(crc.id)
+                        };
+                    }));
+                    
+                    // Sort: available first (by distance), then unavailable (by distance)
+                    crcsWithInfo.sort((a, b) => {
+                        // Selected items always come first
+                        if (a.isSelected !== b.isSelected) {
+                            return a.isSelected ? -1 : 1;
+                        }
+                        // Available before unavailable
+                        if (a.isUnavailable !== b.isUnavailable) {
+                            return a.isUnavailable ? 1 : -1;
+                        }
+                        // Within same availability, sort by distance (closest first)
+                        if (a.distance !== null && b.distance !== null) {
+                            return a.distance - b.distance;
+                        }
+                        // If one has distance and other doesn't, prefer the one with distance
+                        if (a.distance !== null && b.distance === null) return -1;
+                        if (a.distance === null && b.distance !== null) return 1;
+                        // Otherwise sort by name
+                        return a.crc.name.localeCompare(b.crc.name);
+                    });
+                    
+                    let crcOptions = crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, isSelected }) => {
                         let statusText = '';
-                        if (isUnavailable) statusText = ' (Unavailable)';
+                        if (isUnavailable) {
+                            const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
+                            statusText = ` (Time Off - ${periodText})`;
+                        }
                         
-                        // Disable option if unavailable (unless already selected)
-                        return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} ${isUnavailable && !isSelected ? 'disabled' : ''}>${crc.name}${statusText}</option>`;
+                        // Add distance if available
+                        let distanceText = '';
+                        if (distance !== null) {
+                            distanceText = ` - ${distance} mi`;
+                        }
+                        
+                        // Show unavailable CRCs but allow selection (override will be handled on selection)
+                        const styleClass = isUnavailable && !isSelected ? 'text-red-600 dark:text-red-400' : '';
+                        return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} class="${styleClass}">${crc.name}${distanceText}${statusText}</option>`;
                     }).join('');
                     
                     if (qualifiedCrcs.length === 0) {
@@ -14076,17 +14525,7 @@
                                             <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
                                             <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                 <option value="">Select Staff</option>
-                                                ${state.crcs.filter(crc => hasValidTraining(crc, role.name)).map(crc => {
-                                                    const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                                                    const isCurrentlySelected = crc.id === existingCrcId;
-                                                    
-                                                    let statusText = '';
-                                                    if (isUnavailable) statusText = ' (Unavailable)';
-                                                    
-                                                    // Disable option if unavailable (unless already selected)
-                                                    return `<option value="${crc.id}" ${isCurrentlySelected ? 'selected' : ''} ${isUnavailable && !isCurrentlySelected ? 'disabled' : ''}>${crc.name}${statusText}</option>`;
-                                                }).join('')}
-                                                ${state.crcs.filter(crc => hasValidTraining(crc, role.name)).length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
+                                                ${crcOptions}
                                             </select>
                                         </div>
                                     `;
@@ -14094,7 +14533,7 @@
                             </div>
                         </div>
                     `;
-                });
+                }
                 
                 roleAssignmentHTML += '</div>';
                 roleAssignmentContainer.innerHTML = roleAssignmentHTML;
@@ -16069,12 +16508,16 @@
                             <input type="date" name="date" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                         </div>
                         <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Flight Number</label>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Navan Booking ID</label>
                             <div class="flex gap-2">
-                                <input type="text" name="flightNumber" id="flight-number-input" class="flex-1 p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., AA1234">
-                                <button type="button" data-action="lookup-flight" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Lookup</button>
+                                <input type="text" name="navanBookingId" id="navan-booking-id-input" class="flex-1 p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., efd6d9e3-b756-4846-87b7-90c1963ad11c">
+                                <button type="button" data-action="lookup-navan-booking" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Lookup</button>
                             </div>
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Enter flight number and click "Lookup" to automatically fill flight information (optional)</p>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Enter Navan booking UUID and click "Lookup" to automatically fill booking information (FLIGHT, HOTEL, or CAR)</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Flight Number (if applicable)</label>
+                            <input type="text" name="flightNumber" id="flight-number-input" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., AA1234">
                         </div>
                         <div class="grid grid-cols-2 gap-4">
                             <div>
@@ -16233,12 +16676,16 @@
                             <input type="date" name="date" value="${travel.date}" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                         </div>
                         <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Flight Number</label>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Navan Booking ID</label>
                             <div class="flex gap-2">
-                                <input type="text" name="flightNumber" id="flight-number-input" value="${travel.flightNumber || ''}" required class="flex-1 p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., AA1234">
-                                <button type="button" data-action="lookup-flight" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Lookup</button>
+                                <input type="text" name="navanBookingId" id="navan-booking-id-input" value="${travel.navanBookingId || ''}" class="flex-1 p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., efd6d9e3-b756-4846-87b7-90c1963ad11c">
+                                <button type="button" data-action="lookup-navan-booking" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Lookup</button>
                             </div>
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Enter flight number and click "Lookup" to automatically fill flight information</p>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Enter Navan booking UUID and click "Lookup" to automatically fill booking information (FLIGHT, HOTEL, or CAR)</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Flight Number (if applicable)</label>
+                            <input type="text" name="flightNumber" id="flight-number-input" value="${travel.flightNumber || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., AA1234">
                         </div>
                         <div class="grid grid-cols-2 gap-4">
                             <div>
