@@ -1832,6 +1832,19 @@ app.http('navanLookup', {
                 throw fetchError;
             }
             
+            // Verify bookingData is set
+            if (!bookingData || !bookingData.data || bookingData.data.length === 0) {
+                context.log.error('Booking data is null or empty after fetch');
+                return {
+                    status: 500,
+                    jsonBody: { 
+                        error: 'Booking data not found after fetch',
+                        bookingId: bookingId
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
             // Step 3: Store booking data in travel container for reporting
             try {
                 const travelContainer = getContainer('travel');
@@ -1855,7 +1868,7 @@ app.http('navanLookup', {
                 }
                 
                 // Prepare travel record data from Navan booking
-                const booking = bookingData.data && bookingData.data.length > 0 ? bookingData.data[0] : bookingData;
+                const booking = bookingData.data[0];
                 const bookingType = booking.bookingType || 'FLIGHT';
                 
                 // Map Navan booking to travel record format
