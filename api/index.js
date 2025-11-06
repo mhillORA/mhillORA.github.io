@@ -1702,7 +1702,12 @@ app.http('navanLookup', {
                 };
             }
             
-            context.log.info(`Navan booking lookup request for: ${bookingId}`);
+            // Check if this is a read-only request (no database write)
+            const readOnly = request.query?.readOnly === 'true' || 
+                           (request.query && typeof request.query.get === 'function' && request.query.get('readOnly') === 'true') ||
+                           (request.url && request.url.includes('readOnly=true'));
+            
+            context.log.info(`Navan booking lookup request for: ${bookingId} (readOnly: ${readOnly})`);
             
             // Step 1: Get OAuth token from Navan
             // Get Navan API credentials from environment variables (same pattern as Cosmos DB)
@@ -1868,7 +1873,21 @@ app.http('navanLookup', {
                 };
             }
             
-            // Step 3: Store booking data in travel container for reporting
+            // Step 3: Store booking data in travel container for reporting (skip if readOnly)
+            if (readOnly) {
+                context.log.info('Read-only mode: Skipping database write');
+                // Return the booking data without storing it
+                return {
+                    status: 200,
+                    jsonBody: {
+                        data: bookingData.data,
+                        readOnly: true,
+                        message: 'Booking data retrieved successfully (read-only mode - not saved to database)'
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
             try {
                 context.log.info('Attempting to get travel container...');
                 const travelContainer = getContainer('travel');
