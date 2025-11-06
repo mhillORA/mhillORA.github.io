@@ -2334,3 +2334,26 @@ app.http('routeDirections', {
         }
     }
 });
+
+// ADD THIS NEW ENDPOINT TO THE END OF api/index.js
+app.http('health', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'health',
+    handler: async (request, context) => {
+        try {
+            // This will crash if COSMOS_ keys are wrong
+            const container = getContainer('travel');
+            
+            // This will test the connection
+            await container.read(); 
+            
+            return { 
+                jsonBody: { status: "ok", message: "Successfully connected to Cosmos DB 'travel' container." } 
+            };
+        } catch (error) {
+            // This will be caught by our new handleError
+            return handleError(context, error, 'Health check failed');
+        }
+    }
+});
