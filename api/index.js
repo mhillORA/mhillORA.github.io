@@ -1773,35 +1773,37 @@ app.http('navanLookup', {
             context.log.info('OAuth token obtained successfully');
             
             // Step 2: Get booking data from Navan
-            // Navan API doesn't support direct bookingId lookup - need to fetch recent bookings and filter
+            // Strategy: First try to find booking by bookingId, then use its UUID for direct lookup
             context.log.info(`Fetching booking ${bookingId} from Navan...`);
             
             let bookingData = null;
             let bookingResponse = null;
             
             try {
+                // First, fetch recent bookings to find the UUID for this bookingId
                 // Navan API requires createdFrom/createdTo parameters - fetch recent bookings (last 90 days)
-                // and filter by bookingId client-side
                 const now = Date.now();
                 const ninetyDaysAgo = now - (90 * 24 * 60 * 60 * 1000);
                 const createdFrom = Math.floor(ninetyDaysAgo / 1000);
                 const createdTo = Math.floor(now / 1000);
                 
-                context.log.info(`Fetching bookings from ${new Date(ninetyDaysAgo).toISOString()} to ${new Date(now).toISOString()}`);
+                context.log.info(`Searching for bookingId ${bookingId} in bookings from ${new Date(ninetyDaysAgo).toISOString()} to ${new Date(now).toISOString()}`);
                 
                 // Fetch bookings with pagination - start with first page
                 let page = 0;
                 const pageSize = 100;
                 let foundBooking = null;
+                let bookingUuid = null;
                 
                 while (!foundBooking && page < 10) { // Limit to 10 pages (1000 bookings max)
-                    context.log.info(`Fetching page ${page} of bookings...`);
+                    context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
                     
-                    bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}`, {
+                    bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
                         method: 'GET',
                         headers: {
                             'Authorization': `Bearer ${accessToken}`,
-                            'Content-Type': 'application/json'
+                            'Content-Type': 'application/json',
+                            'accept': 'application/json'
                         }
                     });
                     
@@ -1828,9 +1830,34 @@ app.http('navanLookup', {
                     if (allBookings.data && Array.isArray(allBookings.data)) {
                         foundBooking = allBookings.data.find(b => b.bookingId === bookingId);
                         if (foundBooking) {
-                            bookingData = { data: [foundBooking] };
-                            context.log.info(`Booking found on page ${page}`);
-                            break;
+                            bookingUuid = foundBooking.uuid;
+                            context.log.info(`Booking found on page ${page} with UUID: ${bookingUuid}`);
+                            
+                            // Now use the UUID to fetch the full booking details directly
+                            // This is more efficient and ensures we get all details
+                            context.log.info(`Fetching full booking details using UUID: ${bookingUuid}`);
+                            const uuidResponse = await fetch(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+                                method: 'GET',
+                                headers: {
+                                    'Authorization': `Bearer ${accessToken}`,
+                                    'Content-Type': 'application/json',
+                                    'accept': 'application/json'
+                                }
+                            });
+                            
+                            if (uuidResponse.ok) {
+                                const uuidBookingData = await uuidResponse.json();
+                                if (uuidBookingData.data && uuidBookingData.data.length > 0) {
+                                    bookingData = { data: [uuidBookingData.data[0]] };
+                                    context.log.info('Full booking details retrieved using UUID');
+                                    break;
+                                }
+                            } else {
+                                // Fallback to the booking we found in the list
+                                context.log.warn('UUID lookup failed, using booking from list');
+                                bookingData = { data: [foundBooking] };
+                                break;
+                            }
                         }
                     }
                     
