@@ -1819,26 +1819,72 @@ app.http('navanLookup', {
                     lookedUpAt: new Date().toISOString()
                 };
                 
-                // Add booking-type specific fields
+                // Add booking-type specific fields based on actual Navan API structure
                 if (bookingType === 'FLIGHT' && booking.flight) {
+                    // Flight-specific fields (if flight object exists)
                     travelRecord.flightNumber = booking.flight.flightNumber || null;
                     travelRecord.origin = booking.flight.origin || null;
                     travelRecord.destination = booking.flight.destination || null;
                     travelRecord.departureTime = booking.flight.departureTime || null;
                     travelRecord.arrivalTime = booking.flight.arrivalTime || null;
                     travelRecord.airline = booking.flight.airline || null;
-                } else if (bookingType === 'HOTEL' && booking.hotel) {
-                    travelRecord.hotelName = booking.hotel.name || null;
-                    travelRecord.hotelAddress = booking.hotel.address || null;
-                    travelRecord.checkIn = booking.hotel.checkIn || null;
-                    travelRecord.checkOut = booking.hotel.checkOut || null;
-                } else if (bookingType === 'CAR' && booking.car) {
-                    travelRecord.carRentalCompany = booking.car.company || null;
-                    travelRecord.pickupLocation = booking.car.pickupLocation || null;
-                    travelRecord.dropoffLocation = booking.car.dropoffLocation || null;
-                    travelRecord.pickupDate = booking.car.pickupDate || null;
-                    travelRecord.dropoffDate = booking.car.dropoffDate || null;
+                } else if (bookingType === 'HOTEL') {
+                    // Hotel-specific fields from segments and hotel properties
+                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
+                    travelRecord.hotelName = booking.vendor || null;
+                    travelRecord.hotelAddress = segment?.departure?.address || null;
+                    travelRecord.hotelCity = segment?.departure?.city || booking.destination?.city || null;
+                    travelRecord.hotelState = segment?.departure?.state || booking.destination?.state || null;
+                    travelRecord.hotelPostalCode = segment?.departure?.postalCode || null;
+                    travelRecord.hotelCountry = segment?.departure?.country || booking.destination?.country || null;
+                    travelRecord.checkIn = segment?.startLocalDateTime || booking.startDate || null;
+                    travelRecord.checkOut = segment?.endLocalDateTime || booking.endDate || null;
+                    travelRecord.hotelCode = booking.hotelCode || null;
+                    travelRecord.hotelChain = booking.hotelChain || segment?.hotelChain || null;
+                    travelRecord.hotelSuperChain = segment?.hotelSuperChain || null;
+                    travelRecord.hotelLatitude = booking.hotelLatitude || null;
+                    travelRecord.hotelLongitude = booking.hotelLongitude || null;
+                } else if (bookingType === 'CAR') {
+                    // Car rental-specific fields from segments and car properties
+                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
+                    travelRecord.carRentalCompany = booking.vendor || null;
+                    travelRecord.carType = booking.carType || null;
+                    travelRecord.pickupLocation = segment?.departure?.address || null;
+                    travelRecord.pickupCity = segment?.departure?.city || booking.origin?.city || null;
+                    travelRecord.pickupState = segment?.departure?.state || booking.origin?.state || null;
+                    travelRecord.pickupAirportCode = segment?.departure?.airportCode || null;
+                    travelRecord.dropoffLocation = segment?.arrival?.address || segment?.departure?.address || null;
+                    travelRecord.dropoffCity = segment?.arrival?.city || booking.destination?.city || null;
+                    travelRecord.dropoffState = segment?.arrival?.state || booking.destination?.state || null;
+                    travelRecord.dropoffAirportCode = segment?.arrival?.airportCode || segment?.departure?.airportCode || null;
+                    travelRecord.pickupDate = segment?.startLocalDateTime || booking.startDate || null;
+                    travelRecord.dropoffDate = segment?.endLocalDateTime || booking.endDate || null;
+                    travelRecord.bookingDuration = booking.bookingDuration || null;
                 }
+                
+                // Common fields for all booking types
+                if (booking.passengers && booking.passengers.length > 0) {
+                    const passenger = booking.passengers[0];
+                    if (passenger.person) {
+                        travelRecord.travelerName = passenger.person.name || null;
+                        travelRecord.travelerEmail = passenger.person.email || null;
+                        travelRecord.travelerDepartment = passenger.person.department || null;
+                        travelRecord.travelerCostCenter = passenger.person.costCenter || null;
+                    }
+                }
+                
+                if (booking.booker) {
+                    travelRecord.bookerName = booking.booker.name || null;
+                    travelRecord.bookerEmail = booking.booker.email || null;
+                }
+                
+                // Additional common fields
+                travelRecord.tripName = booking.tripName || null;
+                travelRecord.tripDescription = booking.tripDescription || null;
+                travelRecord.reason = booking.reason || null;
+                travelRecord.invoiceUrl = booking.invoice || null;
+                travelRecord.pdfUrl = booking.pdf || null;
+                travelRecord.invoiceNumber = booking.invoiceNumber || null;
                 
                 if (existingTravel) {
                     // Update existing travel record
