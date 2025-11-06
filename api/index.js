@@ -2321,6 +2321,139 @@ app.http('navanLookup', {
     },
 });
 
+// Navan API connection test endpoint
+// Tests OAuth token generation to verify Navan API connectivity
+app.http('navanTest', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'navan-test',
+    handler: async (request, context) => {
+        try {
+            context.log.info('Navan API connection test requested');
+            
+            // Get Navan API credentials from environment variables
+            const clientId = process.env.NAVAN_CLIENT_ID;
+            const clientSecret = process.env.NAVAN_SECRET_KEY;
+            
+            // Check if credentials are available
+            if (!clientId || !clientSecret) {
+                context.log.error('Navan credentials not configured');
+                return {
+                    status: 500,
+                    jsonBody: {
+                        connected: false,
+                        error: 'Navan API credentials not configured',
+                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set' : 'missing'}`,
+                        message: 'Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables'
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Test OAuth token generation
+            context.log.info('Testing OAuth token generation...');
+            const tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/x-www-form-urlencoded'
+                },
+                body: new URLSearchParams({
+                    grant_type: 'client_credentials',
+                    client_id: clientId,
+                    client_secret: clientSecret
+                })
+            });
+            
+            if (!tokenResponse.ok) {
+                const errorText = await tokenResponse.text();
+                context.log.error(`OAuth token test failed: ${tokenResponse.status} - ${errorText}`);
+                return {
+                    status: 200, // Return 200 so frontend can see the error details
+                    jsonBody: {
+                        connected: false,
+                        error: 'Failed to generate OAuth token',
+                        detail: `OAuth token request failed with status ${tokenResponse.status}: ${errorText}`,
+                        message: 'Unable to connect to Navan API. Check credentials and network connectivity.'
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            const tokenData = await tokenResponse.json();
+            const accessToken = tokenData.access_token;
+            
+            if (!accessToken) {
+                context.log.error('No access token in response:', tokenData);
+                return {
+                    status: 200,
+                    jsonBody: {
+                        connected: false,
+                        error: 'No access token received',
+                        detail: 'OAuth token response did not contain access_token',
+                        message: 'Navan API returned invalid token response'
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Test a simple API call to verify the token works
+            context.log.info('Testing API call with token...');
+            const testApiResponse = await fetch(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json',
+                    'accept': 'application/json'
+                }
+            });
+            
+            if (!testApiResponse.ok) {
+                const errorText = await testApiResponse.text();
+                context.log.warn(`API test call failed: ${testApiResponse.status} - ${errorText}`);
+                return {
+                    status: 200,
+                    jsonBody: {
+                        connected: true,
+                        oauthToken: true,
+                        apiCall: false,
+                        error: 'OAuth token generated but API call failed',
+                        detail: `API call failed with status ${testApiResponse.status}: ${errorText}`,
+                        message: 'Connected to Navan OAuth but API call failed. This may be normal if there are no recent bookings.'
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            context.log.info('Navan API connection test successful');
+            return {
+                status: 200,
+                jsonBody: {
+                    connected: true,
+                    oauthToken: true,
+                    apiCall: true,
+                    message: 'Successfully connected to Navan API'
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
+            
+        } catch (error) {
+            context.log.error('Navan connection test error:', error.message);
+            context.log.error('Error stack:', error.stack);
+            return {
+                status: 500,
+                jsonBody: {
+                    connected: false,
+                    error: 'Connection test failed',
+                    detail: error.message || 'Unknown error occurred',
+                    stack: error.stack || 'No stack trace available',
+                    message: 'Failed to test Navan API connection'
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    },
+});
+
 // Azure Maps Geocoding Proxy
 app.http('geocode', {
     methods: ['GET', 'OPTIONS'],
