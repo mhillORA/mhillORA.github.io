@@ -1675,6 +1675,18 @@ app.http('navanLookup', {
     authLevel: 'anonymous',
     route: 'navan-lookup',
     handler: async (request, context) => {
+        // Handle OPTIONS request for CORS
+        if (request.method === 'OPTIONS') {
+            return {
+                status: 200,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                }
+            };
+        }
+        
         let bookingId = null;
         
         try {
@@ -1731,13 +1743,17 @@ app.http('navanLookup', {
                 context.log.error('Navan credentials not configured in environment variables');
                 context.log.error(`Environment variables: NAVAN_CLIENT_ID=${!!clientId}, NAVAN_SECRET_KEY=${!!clientSecret}`);
                 return {
-                    status: 500,
+                    status: 200, // Return 200 so frontend can see error details
                     jsonBody: {
                         error: 'Navan API credentials not configured. Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables.',
                         detail: `NAVAN_CLIENT_ID is ${clientId ? 'set' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set' : 'missing'}`,
-                        originalMessage: 'Navan credentials check failed'
+                        originalMessage: 'Navan credentials check failed',
+                        bookingId: bookingId
                     },
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
                 };
             }
             
@@ -1775,9 +1791,16 @@ app.http('navanLookup', {
             if (!accessToken) {
                 context.log.error('No access token in response:', tokenData);
                 return {
-                    status: 500,
-                    jsonBody: { error: 'Failed to get access token from Navan' },
-                    headers: { 'Content-Type': 'application/json' }
+                    status: 200, // Return 200 so frontend can see error details
+                    jsonBody: { 
+                        error: 'Failed to get access token from Navan',
+                        detail: 'OAuth token response did not contain access_token',
+                        bookingId: bookingId
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
                 };
             }
             
@@ -1911,12 +1934,16 @@ app.http('navanLookup', {
             if (!bookingData || !bookingData.data || bookingData.data.length === 0) {
                 context.log.error('Booking data is null or empty after fetch');
                 return {
-                    status: 500,
+                    status: 200, // Return 200 so frontend can see error details
                     jsonBody: { 
-                        error: 'Booking data not found after fetch',
+                        error: 'Booking not found',
+                        detail: `No booking found with bookingId: ${bookingId}`,
                         bookingId: bookingId
                     },
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
                 };
             }
             
@@ -1931,7 +1958,10 @@ app.http('navanLookup', {
                         readOnly: true,
                         message: 'Booking data retrieved successfully (read-only mode - not saved to database)'
                     },
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
                 };
             }
             
@@ -2293,7 +2323,8 @@ app.http('navanLookup', {
                             return {
                                 status: 200,
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
                     },
                     jsonBody: {
                         ...bookingData,
@@ -2310,7 +2341,8 @@ app.http('navanLookup', {
             return {
                 status: 200,
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
                 },
                 jsonBody: bookingData
             };
@@ -2321,14 +2353,18 @@ app.http('navanLookup', {
             context.log.error('Error details:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
             
             return {
-                status: 500,
+                status: 200, // Return 200 so frontend can see error details
                 jsonBody: { 
                     error: 'Navan lookup failed',
                     detail: error.message || 'Unknown error occurred',
                     stack: error.stack || 'No stack trace available',
-                    originalMessage: 'Navan lookup exception'
+                    originalMessage: 'Navan lookup exception',
+                    bookingId: bookingId || null
                 },
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
             };
         }
     },
@@ -2372,12 +2408,6 @@ app.http('navanTest', {
             
             try {
                 context.log.info('Navan API connection test requested');
-                
-                // Check if fetch is available
-                if (typeof fetch === 'undefined') {
-                    context.log.error('fetch is not available in this runtime');
-                    return errorResponse('Runtime error', 'fetch API is not available. This may be a Node.js version issue.');
-                }
             
             // Get Navan API credentials from environment variables
             let clientId, clientSecret;
