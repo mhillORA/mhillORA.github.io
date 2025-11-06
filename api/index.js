@@ -1870,11 +1870,14 @@ app.http('navanLookup', {
             
             // Step 3: Store booking data in travel container for reporting
             try {
+                context.log.info('Attempting to get travel container...');
                 const travelContainer = getContainer('travel');
+                context.log.info('Travel container obtained successfully');
                 
                 // Check if a travel record already exists for this booking ID
                 let existingTravel = null;
                 try {
+                    context.log.info(`Querying for existing travel record with navanBookingId: ${bookingId}`);
                     const { resources: existingRecords } = await travelContainer.items
                         .query({
                             query: "SELECT * FROM c WHERE c.navanBookingId = @bookingId",
@@ -1882,116 +1885,284 @@ app.http('navanLookup', {
                         })
                         .fetchAll();
                     
+                    context.log.info(`Found ${existingRecords?.length || 0} existing travel records`);
                     if (existingRecords && existingRecords.length > 0) {
                         existingTravel = existingRecords[0];
+                        context.log.info('Existing travel record found, will update');
                     }
                 } catch (queryError) {
                     context.log.warn('Error querying for existing travel record:', queryError.message);
+                    context.log.warn('Query error stack:', queryError.stack);
                     // Continue to create new record if query fails
                 }
                 
                 // Prepare travel record data from Navan booking
+                // Transform Navan data to match existing travel container schema
                 const booking = bookingData.data[0];
                 const bookingType = booking.bookingType || 'FLIGHT';
                 
-                // Map Navan booking to travel record format
-                const travelRecord = {
-                    navanBookingId: bookingId,
-                    bookingType: bookingType,
-                    confirmationNumber: booking.confirmationNumber || booking.bookingId || null,
-                    startDate: booking.startDate || null,
-                    endDate: booking.endDate || null,
-                    vendor: booking.vendor || null,
-                    status: booking.bookingStatus || booking.approvalStatus || 'scheduled',
-                    grandTotal: booking.grandTotal || booking.usdGrandTotal || null,
-                    currency: booking.currency || 'USD',
-                    // Store full Navan data for reference
-                    navanData: booking,
-                    // Store lookup timestamp
-                    lookedUpAt: new Date().toISOString()
-                };
+                // Get passenger/traveler info and find matching CRC ID
+                let crcId = null;
+                let travelerEmail = null;
+                let travelerName = null;
                 
-                // Add booking-type specific fields based on actual Navan API structure
-                if (bookingType === 'FLIGHT' && booking.flight) {
-                    // Flight-specific fields (if flight object exists)
-                    travelRecord.flightNumber = booking.flight.flightNumber || null;
-                    travelRecord.origin = booking.flight.origin || null;
-                    travelRecord.destination = booking.flight.destination || null;
-                    travelRecord.departureTime = booking.flight.departureTime || null;
-                    travelRecord.arrivalTime = booking.flight.arrivalTime || null;
-                    travelRecord.airline = booking.flight.airline || null;
-                } else if (bookingType === 'HOTEL') {
-                    // Hotel-specific fields from segments and hotel properties
-                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
-                    travelRecord.hotelName = booking.vendor || null;
-                    travelRecord.hotelAddress = segment?.departure?.address || null;
-                    travelRecord.hotelCity = segment?.departure?.city || booking.destination?.city || null;
-                    travelRecord.hotelState = segment?.departure?.state || booking.destination?.state || null;
-                    travelRecord.hotelPostalCode = segment?.departure?.postalCode || null;
-                    travelRecord.hotelCountry = segment?.departure?.country || booking.destination?.country || null;
-                    travelRecord.checkIn = segment?.startLocalDateTime || booking.startDate || null;
-                    travelRecord.checkOut = segment?.endLocalDateTime || booking.endDate || null;
-                    travelRecord.hotelCode = booking.hotelCode || null;
-                    travelRecord.hotelChain = booking.hotelChain || segment?.hotelChain || null;
-                    travelRecord.hotelSuperChain = segment?.hotelSuperChain || null;
-                    travelRecord.hotelLatitude = booking.hotelLatitude || null;
-                    travelRecord.hotelLongitude = booking.hotelLongitude || null;
-                } else if (bookingType === 'CAR') {
-                    // Car rental-specific fields from segments and car properties
-                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
-                    travelRecord.carRentalCompany = booking.vendor || null;
-                    travelRecord.carType = booking.carType || null;
-                    travelRecord.pickupLocation = segment?.departure?.address || null;
-                    travelRecord.pickupCity = segment?.departure?.city || booking.origin?.city || null;
-                    travelRecord.pickupState = segment?.departure?.state || booking.origin?.state || null;
-                    travelRecord.pickupAirportCode = segment?.departure?.airportCode || null;
-                    travelRecord.dropoffLocation = segment?.arrival?.address || segment?.departure?.address || null;
-                    travelRecord.dropoffCity = segment?.arrival?.city || booking.destination?.city || null;
-                    travelRecord.dropoffState = segment?.arrival?.state || booking.destination?.state || null;
-                    travelRecord.dropoffAirportCode = segment?.arrival?.airportCode || segment?.departure?.airportCode || null;
-                    travelRecord.pickupDate = segment?.startLocalDateTime || booking.startDate || null;
-                    travelRecord.dropoffDate = segment?.endLocalDateTime || booking.endDate || null;
-                    travelRecord.bookingDuration = booking.bookingDuration || null;
-                }
-                
-                // Common fields for all booking types
-                if (booking.passengers && booking.passengers.length > 0) {
-                    const passenger = booking.passengers[0];
-                    if (passenger.person) {
-                        travelRecord.travelerName = passenger.person.name || null;
-                        travelRecord.travelerEmail = passenger.person.email || null;
-                        travelRecord.travelerDepartment = passenger.person.department || null;
-                        travelRecord.travelerCostCenter = passenger.person.costCenter || null;
+                if (booking.passengers && booking.passengers.length > 0 && booking.passengers[0].person) {
+                    const person = booking.passengers[0].person;
+                    travelerEmail = person.email || null;
+                    travelerName = person.name || null;
+                    
+                    // Try to find CRC by email in CRCs container
+                    if (travelerEmail) {
+                        try {
+                            context.log.info(`Looking up CRC by email: ${travelerEmail}`);
+                            const crcsContainer = getContainer('crcs');
+                            const { resources: matchingCrcs } = await crcsContainer.items
+                                .query({
+                                    query: "SELECT * FROM c WHERE c.email = @email",
+                                    parameters: [{ name: "@email", value: travelerEmail }]
+                                })
+                                .fetchAll();
+                            
+                            if (matchingCrcs && matchingCrcs.length > 0) {
+                                crcId = matchingCrcs[0].id;
+                                context.log.info(`Found matching CRC: ${crcId} for email ${travelerEmail}`);
+                            } else {
+                                // Try to find by name if email doesn't match
+                                if (travelerName) {
+                                    context.log.info(`Looking up CRC by name: ${travelerName}`);
+                                    const { resources: nameMatches } = await crcsContainer.items
+                                        .query({
+                                            query: "SELECT * FROM c WHERE c.name = @name",
+                                            parameters: [{ name: "@name", value: travelerName }]
+                                        })
+                                        .fetchAll();
+                                    
+                                    if (nameMatches && nameMatches.length > 0) {
+                                        crcId = nameMatches[0].id;
+                                        context.log.info(`Found matching CRC: ${crcId} for name ${travelerName}`);
+                                    }
+                                }
+                            }
+                        } catch (crcLookupError) {
+                            context.log.warn('Error looking up CRC:', crcLookupError.message);
+                            // Continue without crcId - will need to be set manually
+                        }
                     }
                 }
                 
-                if (booking.booker) {
-                    travelRecord.bookerName = booking.booker.name || null;
-                    travelRecord.bookerEmail = booking.booker.email || null;
+                // If no CRC found, use email or name as fallback (but this won't pass validation)
+                if (!crcId && travelerEmail) {
+                    crcId = travelerEmail; // Temporary fallback
+                    context.log.warn(`No CRC found for ${travelerEmail}, using email as crcId (will need manual update)`);
+                } else if (!crcId && travelerName) {
+                    crcId = travelerName; // Temporary fallback
+                    context.log.warn(`No CRC found for ${travelerName}, using name as crcId (will need manual update)`);
                 }
                 
-                // Additional common fields
-                travelRecord.tripName = booking.tripName || null;
-                travelRecord.tripDescription = booking.tripDescription || null;
-                travelRecord.reason = booking.reason || null;
-                travelRecord.invoiceUrl = booking.invoice || null;
-                travelRecord.pdfUrl = booking.pdf || null;
-                travelRecord.invoiceNumber = booking.invoiceNumber || null;
+                // Get date (required field: date) - format as YYYY-MM-DD string
+                let date = null;
+                if (booking.startDate) {
+                    date = booking.startDate; // Already in YYYY-MM-DD format
+                } else if (booking.segments && booking.segments.length > 0 && booking.segments[0].startLocalDateTime) {
+                    // Extract date from ISO datetime string
+                    const dateTime = new Date(booking.segments[0].startLocalDateTime);
+                    date = dateTime.toISOString().split('T')[0]; // Extract YYYY-MM-DD
+                }
+                
+                // Map Navan booking status to travel schema status
+                const navanStatus = (booking.bookingStatus || booking.approvalStatus || 'CONFIRMED').toLowerCase();
+                let status = 'scheduled'; // Default
+                if (navanStatus.includes('confirmed') || navanStatus.includes('approved')) {
+                    status = 'scheduled';
+                } else if (navanStatus.includes('cancelled') || navanStatus.includes('canceled')) {
+                    status = 'cancelled';
+                } else if (navanStatus.includes('delayed')) {
+                    status = 'delayed';
+                } else if (navanStatus.includes('departed')) {
+                    status = 'departed';
+                } else if (navanStatus.includes('arrived') || navanStatus.includes('completed')) {
+                    status = 'arrived';
+                }
+                
+                // Map Navan booking to travel record format - ONLY fields that exist in travel schema
+                const travelRecord = {
+                    // Required fields for travel schema
+                    crcId: crcId || 'unknown', // Required - use fallback if not found
+                    date: date || new Date().toISOString().split('T')[0], // Required - use today if not available
+                    
+                    // Navan booking reference (optional field)
+                    navanBookingId: bookingId,
+                    
+                    // Status (must be one of: scheduled, delayed, departed, arrived, cancelled)
+                    status: status
+                };
+                
+                // Add booking-type specific fields based on actual Navan API structure
+                if (bookingType === 'FLIGHT') {
+                    // Flight-specific fields - map to existing travel schema
+                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
+                    if (segment?.flightNumber) {
+                        travelRecord.flightNumber = String(segment.flightNumber);
+                    }
+                    if (segment?.departure?.airportCode) {
+                        travelRecord.origin = String(segment.departure.airportCode);
+                    }
+                    if (segment?.arrival?.airportCode) {
+                        travelRecord.destination = String(segment.arrival.airportCode);
+                    }
+                    // Map to flightCost if available (must be a number)
+                    if (booking.grandTotal || booking.usdGrandTotal) {
+                        const cost = booking.grandTotal || booking.usdGrandTotal;
+                        travelRecord.flightCost = typeof cost === 'number' ? cost : parseFloat(cost);
+                    }
+                } else if (bookingType === 'HOTEL') {
+                    // Hotel-specific fields - map to existing travel schema
+                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
+                    if (booking.vendor) {
+                        travelRecord.hotelName = String(booking.vendor);
+                    }
+                    if (segment?.departure?.address) {
+                        travelRecord.hotelAddress = String(segment.departure.address);
+                    }
+                    if (segment?.departure?.city || booking.destination?.city) {
+                        travelRecord.hotelCity = String(segment?.departure?.city || booking.destination?.city);
+                    }
+                    if (segment?.departure?.state || booking.destination?.state) {
+                        travelRecord.hotelState = String(segment?.departure?.state || booking.destination?.state);
+                    }
+                    if (segment?.departure?.postalCode) {
+                        travelRecord.hotelPostalCode = String(segment.departure.postalCode);
+                    }
+                    if (segment?.departure?.country || booking.destination?.country) {
+                        travelRecord.hotelCountry = String(segment?.departure?.country || booking.destination?.country);
+                    }
+                    if (segment?.startLocalDateTime || booking.startDate) {
+                        travelRecord.checkIn = String(segment?.startLocalDateTime || booking.startDate);
+                    }
+                    if (segment?.endLocalDateTime || booking.endDate) {
+                        travelRecord.checkOut = String(segment?.endLocalDateTime || booking.endDate);
+                    }
+                    // Map to hotelCost if available (must be a number)
+                    if (booking.grandTotal || booking.usdGrandTotal) {
+                        const cost = booking.grandTotal || booking.usdGrandTotal;
+                        travelRecord.hotelCost = typeof cost === 'number' ? cost : parseFloat(cost);
+                    }
+                } else if (bookingType === 'CAR') {
+                    // Car rental-specific fields - map to existing travel schema
+                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
+                    if (booking.vendor) {
+                        travelRecord.carRentalCompany = String(booking.vendor);
+                    }
+                    if (booking.carType) {
+                        travelRecord.carType = String(booking.carType);
+                    }
+                    if (segment?.departure?.address) {
+                        travelRecord.pickupLocation = String(segment.departure.address);
+                    }
+                    if (segment?.departure?.city || booking.origin?.city) {
+                        travelRecord.pickupCity = String(segment?.departure?.city || booking.origin?.city);
+                    }
+                    if (segment?.departure?.state || booking.origin?.state) {
+                        travelRecord.pickupState = String(segment?.departure?.state || booking.origin?.state);
+                    }
+                    if (segment?.departure?.airportCode) {
+                        travelRecord.pickupAirportCode = String(segment.departure.airportCode);
+                    }
+                    if (segment?.arrival?.address || segment?.departure?.address) {
+                        travelRecord.dropoffLocation = String(segment?.arrival?.address || segment?.departure?.address);
+                    }
+                    if (segment?.arrival?.city || booking.destination?.city) {
+                        travelRecord.dropoffCity = String(segment?.arrival?.city || booking.destination?.city);
+                    }
+                    if (segment?.arrival?.state || booking.destination?.state) {
+                        travelRecord.dropoffState = String(segment?.arrival?.state || booking.destination?.state);
+                    }
+                    if (segment?.arrival?.airportCode || segment?.departure?.airportCode) {
+                        travelRecord.dropoffAirportCode = String(segment?.arrival?.airportCode || segment?.departure?.airportCode);
+                    }
+                    if (segment?.startLocalDateTime || booking.startDate) {
+                        travelRecord.pickupDate = String(segment?.startLocalDateTime || booking.startDate);
+                    }
+                    if (segment?.endLocalDateTime || booking.endDate) {
+                        travelRecord.dropoffDate = String(segment?.endLocalDateTime || booking.endDate);
+                    }
+                    // Map to carRentalCost if available (must be a number)
+                    if (booking.grandTotal || booking.usdGrandTotal) {
+                        const cost = booking.grandTotal || booking.usdGrandTotal;
+                        travelRecord.carRentalCost = typeof cost === 'number' ? cost : parseFloat(cost);
+                    }
+                }
+                
+                // Additional optional fields that match existing schema
+                if (booking.reason) {
+                    travelRecord.reason = String(booking.reason);
+                }
+                
+                // Remove null/undefined/empty values to keep record clean
+                Object.keys(travelRecord).forEach(key => {
+                    if (travelRecord[key] === null || travelRecord[key] === undefined || travelRecord[key] === '') {
+                        delete travelRecord[key];
+                    }
+                });
+                
+                // Ensure required fields are present
+                if (!travelRecord.crcId || travelRecord.crcId === 'unknown') {
+                    context.log.warn(`Warning: crcId is missing or unknown for booking ${bookingId}`);
+                }
+                if (!travelRecord.date) {
+                    context.log.warn(`Warning: date is missing for booking ${bookingId}`);
+                }
                 
                 if (existingTravel) {
                     // Update existing travel record
+                    context.log.info('Updating existing travel record...');
                     const updatedTravel = { ...existingTravel, ...travelRecord, id: existingTravel.id };
-                    const { resource: savedTravel } = await travelContainer.items.upsert(updatedTravel);
-                    context.log.info(`Updated existing travel record for Navan booking ${bookingId}`);
+                    try {
+                        const { resource: savedTravel } = await travelContainer.items.upsert(updatedTravel);
+                        context.log.info(`Updated existing travel record for Navan booking ${bookingId}`);
+                    } catch (upsertError) {
+                        context.log.error('Error upserting travel record:', upsertError.message);
+                        context.log.error('Upsert error stack:', upsertError.stack);
+                        context.log.error('Upsert error details:', JSON.stringify(upsertError, Object.getOwnPropertyNames(upsertError)));
+                        throw upsertError; // Re-throw to be caught by outer catch
+                    }
                 } else {
                     // Create new travel record
+                    context.log.info('Creating new travel record...');
                     const newTravel = { ...travelRecord, id: generateId() };
-                    const { resource: savedTravel } = await travelContainer.items.create(newTravel);
-                    context.log.info(`Created new travel record for Navan booking ${bookingId}`);
+                    context.log.info('Travel record data prepared:', JSON.stringify(newTravel, null, 2));
+                    try {
+                        const { resource: savedTravel } = await travelContainer.items.create(newTravel);
+                        context.log.info(`Created new travel record for Navan booking ${bookingId}`);
+                    } catch (createError) {
+                        context.log.error('Error creating travel record:', createError.message);
+                        context.log.error('Create error stack:', createError.stack);
+                        context.log.error('Create error details:', JSON.stringify(createError, Object.getOwnPropertyNames(createError)));
+                        context.log.error('Travel record that failed to create:', JSON.stringify(newTravel, null, 2));
+                        throw createError; // Re-throw to be caught by outer catch
+                    }
                 }
             } catch (storageError) {
-                context.log.warn('Error storing booking data in travel container:', storageError.message);
-                // Continue to return booking data even if storage fails
+                context.log.error('Error storing booking data in travel container:', storageError.message);
+                context.log.error('Storage error stack:', storageError.stack);
+                context.log.error('Storage error details:', JSON.stringify(storageError, Object.getOwnPropertyNames(storageError)));
+                
+                // Return booking data even if storage fails, but include error details
+                // This allows the lookup to succeed even if storage fails
+                return {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    jsonBody: {
+                        ...bookingData,
+                        storageError: {
+                            message: storageError.message,
+                            detail: `Failed to store booking in travel container: ${storageError.message}`,
+                            stack: storageError.stack
+                        }
+                    }
+                };
             }
             
             // Return the booking data
