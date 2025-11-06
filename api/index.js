@@ -1878,10 +1878,16 @@ app.http('navanLookup', {
                 let existingTravel = null;
                 try {
                     context.log.info(`Querying for existing travel record with navanBookingId: ${bookingId}`);
+                    // Check for existing record by bookingId or UUID (in case it was previously stored with UUID)
+                    // Get the booking UUID from the bookingData we just fetched
+                    const bookingUuid = bookingData?.data?.[0]?.uuid || '';
                     const { resources: existingRecords } = await travelContainer.items
                         .query({
-                            query: "SELECT * FROM c WHERE c.navanBookingId = @bookingId",
-                            parameters: [{ name: "@bookingId", value: bookingId }]
+                            query: "SELECT * FROM c WHERE c.navanBookingId = @bookingId OR c.navanBookingUuid = @uuid",
+                            parameters: [
+                                { name: "@bookingId", value: bookingId },
+                                { name: "@uuid", value: bookingUuid }
+                            ]
                         })
                         .fetchAll();
                     
@@ -2011,7 +2017,9 @@ app.http('navanLookup', {
                     date: date || new Date().toISOString().split('T')[0], // Required - use today if not available
                     
                     // Navan booking reference (optional field)
-                    navanBookingId: bookingId,
+                    // Store the bookingId used for lookup, and also store UUID for reference
+                    navanBookingId: bookingId, // The bookingId used to find this booking (e.g., "AQ8M5Q")
+                    navanBookingUuid: booking.uuid || null, // The UUID from Navan (for reference)
                     
                     // Status (must be one of: scheduled, delayed, departed, arrived, cancelled)
                     status: status,
