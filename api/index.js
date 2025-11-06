@@ -1745,36 +1745,94 @@ app.http('navanLookup', {
             context.log.info('OAuth token obtained successfully');
             
             // Step 2: Get booking data from Navan
+            // Note: Navan API might require filtering by UUID in the query parameters
+            // Try multiple endpoint formats based on Navan API documentation
             context.log.info(`Fetching booking ${bookingId} from Navan...`);
-            const bookingResponse = await fetch(`https://api.navan.com/v1/bookings?uuid=${encodeURIComponent(bookingId)}`, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                }
-            });
             
-            if (!bookingResponse.ok) {
-                const errorText = await bookingResponse.text();
-                context.log.error(`Booking request failed: ${bookingResponse.status} - ${errorText}`);
+            let bookingData = null;
+            let bookingResponse = null;
+            let errorText = null;
+            
+            // Try endpoint with uuid query parameter
+            try {
+                bookingResponse = await fetch(`https://api.navan.com/v1/bookings?uuid=${encodeURIComponent(bookingId)}`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
                 
-                if (bookingResponse.status === 404) {
+                context.log.info(`Navan API response status: ${bookingResponse.status}`);
+                
+                if (bookingResponse.ok) {
+                    bookingData = await bookingResponse.json();
+                    context.log.info('Booking data retrieved successfully');
+                } else {
+                    errorText = await bookingResponse.text();
+                    context.log.warn(`Booking request failed with uuid parameter: ${bookingResponse.status} - ${errorText}`);
+                    
+                    // If 404 or empty result, try alternative endpoint format
+                    if (bookingResponse.status === 404 || bookingResponse.status === 200) {
+                        context.log.info('Trying alternative endpoint format with filters...');
+                        // Try with createdFrom/createdTo to get recent bookings and filter client-side
+                        // This is a fallback - ideally Navan supports uuid parameter
+                        const now = Date.now();
+                        const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
+                        const createdFrom = Math.floor(thirtyDaysAgo / 1000);
+                        const createdTo = Math.floor(now / 1000);
+                        
+                        bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=0&size=100`, {
+                            method: 'GET',
+                            headers: {
+                                'Authorization': `Bearer ${accessToken}`,
+                                'Content-Type': 'application/json'
+                            }
+                        });
+                        
+                        if (bookingResponse.ok) {
+                            const allBookings = await bookingResponse.json();
+                            // Find the booking by UUID in the results
+                            if (allBookings.data && Array.isArray(allBookings.data)) {
+                                const foundBooking = allBookings.data.find(b => b.uuid === bookingId);
+                                if (foundBooking) {
+                                    bookingData = { data: [foundBooking] };
+                                    context.log.info('Booking found using alternative endpoint format');
+                                } else {
+                                    context.log.warn(`Booking ${bookingId} not found in recent bookings`);
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (fetchError) {
+                context.log.error('Error fetching booking from Navan:', fetchError.message);
+                context.log.error('Fetch error stack:', fetchError.stack);
+                throw fetchError;
+            }
+            
+            if (!bookingData || !bookingData.data || bookingData.data.length === 0) {
+                if (bookingResponse && !bookingResponse.ok) {
                     return {
-                        status: 404,
-                        jsonBody: { error: 'Booking not found', bookingId: bookingId },
+                        status: bookingResponse.status,
+                        jsonBody: { 
+                            error: 'Booking not found or API error',
+                            bookingId: bookingId,
+                            details: errorText || 'No booking data returned'
+                        },
                         headers: { 'Content-Type': 'application/json' }
                     };
                 } else {
                     return {
-                        status: bookingResponse.status,
-                        jsonBody: { error: `Failed to get booking: ${errorText}` },
+                        status: 404,
+                        jsonBody: { 
+                            error: 'Booking not found',
+                            bookingId: bookingId
+                        },
                         headers: { 'Content-Type': 'application/json' }
                     };
                 }
             }
-            
-            const bookingData = await bookingResponse.json();
-            context.log.info('Booking data retrieved successfully');
             
             // Step 3: Store booking data in travel container for reporting
             try {
@@ -1912,12 +1970,16 @@ app.http('navanLookup', {
             };
             
         } catch (error) {
-            context.log.error('Navan lookup error:', error.message, error.stack);
+            context.log.error('Navan lookup error:', error.message);
+            context.log.error('Error stack:', error.stack);
+            context.log.error('Error details:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+            
             return {
                 status: 500,
                 jsonBody: { 
                     error: 'Navan lookup failed',
-                    message: error.message
+                    message: error.message,
+                    details: process.env.NODE_ENV === 'development' ? error.stack : undefined
                 },
                 headers: { 'Content-Type': 'application/json' }
             };
