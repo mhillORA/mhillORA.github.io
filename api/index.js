@@ -1722,7 +1722,7 @@ app.http('navanLookup', {
                 context.log.error(`Environment variables: NAVAN_CLIENT_ID=${!!clientId}, NAVAN_SECRET_KEY=${!!clientSecret}`);
                 return {
                     status: 500,
-                    jsonBody: { 
+                    jsonBody: {
                         error: 'Navan API credentials not configured. Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables.',
                         detail: `NAVAN_CLIENT_ID is ${clientId ? 'set' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set' : 'missing'}`,
                         originalMessage: 'Navan credentials check failed'
@@ -1878,16 +1878,16 @@ app.http('navanLookup', {
                 
                 if (!foundBooking) {
                     context.log.warn(`Booking ${bookingId} not found in recent bookings (searched ${page + 1} pages)`);
-                    return {
+                            return {
                         status: 404,
-                        jsonBody: { 
+                                jsonBody: {
                             error: 'Booking not found',
                             bookingId: bookingId,
                             message: 'Booking not found in recent bookings (last 90 days). The booking may be older or the bookingId may be incorrect.'
-                        },
-                        headers: { 'Content-Type': 'application/json' }
-                    };
-                }
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
             } catch (fetchError) {
                 context.log.error('Error fetching booking from Navan:', fetchError.message);
                 context.log.error('Fetch error stack:', fetchError.stack);
@@ -1934,9 +1934,12 @@ app.http('navanLookup', {
                     // Check for existing record by bookingId or UUID (in case it was previously stored with UUID)
                     // Get the booking UUID from the bookingData we just fetched
                     const bookingUuid = bookingData?.data?.[0]?.uuid || '';
+                    
+                    // Query for existing records - use IS_DEFINED to safely check if fields exist
+                    // This prevents errors if navanBookingId or navanBookingUuid fields don't exist in old records
                     const { resources: existingRecords } = await travelContainer.items
                         .query({
-                            query: "SELECT * FROM c WHERE c.navanBookingId = @bookingId OR c.navanBookingUuid = @uuid",
+                            query: "SELECT * FROM c WHERE (IS_DEFINED(c.navanBookingId) AND c.navanBookingId = @bookingId) OR (IS_DEFINED(c.navanBookingUuid) AND c.navanBookingUuid = @uuid)",
                             parameters: [
                                 { name: "@bookingId", value: bookingId },
                                 { name: "@uuid", value: bookingUuid }
@@ -1985,7 +1988,7 @@ app.http('navanLookup', {
                             if (nameMatches && nameMatches.length > 0) {
                                 crcId = nameMatches[0].id;
                                 context.log.info(`Found matching CRC: ${crcId} for name ${travelerName}`);
-                            } else {
+                                    } else {
                                 context.log.warn(`No CRC found with name: ${travelerName}`);
                             }
                         } catch (crcLookupError) {
@@ -2274,8 +2277,8 @@ app.http('navanLookup', {
                 
                 // Return booking data even if storage fails, but include error details
                 // This allows the lookup to succeed even if storage fails
-                return {
-                    status: 200,
+                            return {
+                                status: 200,
                     headers: {
                         'Content-Type': 'application/json'
                     },
