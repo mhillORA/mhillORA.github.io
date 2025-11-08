@@ -1530,6 +1530,9 @@
                 travelCalendarMonth: undefined, // Calendar month (0-11), undefined = current month
                 travelCalendarYear: undefined, // Calendar year, undefined = current year
                 crcStats: {},
+                timeOffSummaryRange: 'month',
+                timeOffSummaryCustomStart: null,
+                timeOffSummaryCustomEnd: null,
                 settings: {
                     'Site Assignment': 8,
                     'Travel Day': 8,
@@ -2637,6 +2640,236 @@
                 }
             };
 
+            const normalizeTimeOffStatus = (status) => {
+                const s = (status || 'pending').toString().toLowerCase();
+                if (s === 'approved') return 'approved';
+                if (s === 'rejected') return 'rejected';
+                return 'pending';
+            };
+
+            const formatTimeOffStatus = (status) => {
+                const normalized = normalizeTimeOffStatus(status);
+                if (normalized === 'pending') return 'Pending Review';
+                return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+            };
+
+            const hasPendingTimeOffOnDate = (crcId, dateStr) => {
+                if (!crcId || !dateStr) return false;
+                const standardizedDate = toDateOnlyString(parseDateFlexible(dateStr));
+                if (!standardizedDate) return false;
+                return (state.timeOffRequests || []).some(req => {
+                    if (req.crcId !== crcId) return false;
+                    const statusKey = normalizeTimeOffStatus(req.status);
+                    if (statusKey !== 'pending') return false;
+                    const start = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
+                    const end = toDateOnlyString(parseDateFlexible(req.endDate || req.date));
+                    if (!start || !end) return false;
+                    return standardizedDate >= start && standardizedDate <= end;
+                });
+            };
+
+            const timeOffRangeOptions = [
+                { value: 'month', label: 'This Month' },
+                { value: '3months', label: 'Next 3 Months' },
+                { value: '6months', label: 'Next 6 Months' },
+                { value: 'year', label: 'This Year' },
+                { value: 'custom', label: 'Custom Range' }
+            ];
+
+            const getTimeOffRangeBounds = (range, customStart, customEnd) => {
+                const now = new Date();
+                const startOfCurrentMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+                let startDate = new Date(startOfCurrentMonth);
+                let endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+
+                switch ((range || '').toString()) {
+                    case '3months': {
+                        endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 3, 0);
+                        break;
+                    }
+                    case '6months': {
+                        endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 6, 0);
+                        break;
+                    }
+                    case 'year': {
+                        startDate = new Date(now.getFullYear(), 0, 1);
+                        endDate = new Date(now.getFullYear(), 12, 0);
+                        break;
+                    }
+                    case 'custom': {
+                        const parsedStart = parseDateFlexible(customStart);
+                        const parsedEnd = parseDateFlexible(customEnd);
+                        if (parsedStart && parsedEnd && parsedStart <= parsedEnd) {
+                            startDate = new Date(parsedStart.getFullYear(), parsedStart.getMonth(), parsedStart.getDate());
+                            endDate = new Date(parsedEnd.getFullYear(), parsedEnd.getMonth(), parsedEnd.getDate());
+                        }
+                        break;
+                    }
+                    case 'month':
+                    default: {
+                        // Defaults already set
+                        break;
+                    }
+                }
+
+                // Ensure endDate is at least startDate
+                if (endDate < startDate) {
+                    endDate = new Date(startDate);
+                }
+
+                return {
+                    startDate,
+                    endDate,
+                    startDateStr: toDateOnlyString(startDate),
+                    endDateStr: toDateOnlyString(endDate)
+                };
+            };
+
+            const getHoursForPeriod = (period) => {
+                const value = (period || '').toLowerCase();
+                if (!value || value === 'full day') return 8;
+                if (['am', 'pm', 'before 2pm', 'half day'].includes(value)) return 4;
+                if (value.includes('-')) {
+                    // Custom time like "9:00 AM - 3:00 PM"
+                    try {
+                        const [startRaw, endRaw] = value.split('-').map(v => v.trim());
+                        const toMinutes = (timeStr) => {
+                            const match = timeStr.match(/(\d{1,2}):?(\d{2})?\s*(am|pm)?/i);
+                            if (!match) return null;
+                            let hour = parseInt(match[1], 10);
+                            const minute = match[2] ? parseInt(match[2], 10) : 0;
+                            const ampm = match[3] ? match[3].toLowerCase() : null;
+                            if (ampm === 'pm' && hour < 12) hour += 12;
+                            if (ampm === 'am' && hour === 12) hour = 0;
+                            return (hour * 60) + minute;
+                        };
+                        const startMinutes = toMinutes(startRaw);
+                        const endMinutes = toMinutes(endRaw);
+                        if (startMinutes !== null && endMinutes !== null && endMinutes > startMinutes) {
+                            const diffHours = (endMinutes - startMinutes) / 60;
+                            return Math.max(1, Math.min(diffHours, 12));
+                        }
+                    } catch (err) {
+                        console.warn('Failed to parse custom period for hours:', period, err);
+                    }
+                }
+                return 8;
+            };
+
+            const getMonthKey = (dateObj) => {
+                if (!(dateObj instanceof Date)) return '';
+                return `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
+            };
+
+            const getMonthLabel = (monthKey) => {
+                if (!monthKey) return '';
+                const [year, month] = monthKey.split('-').map(num => parseInt(num, 10));
+                if (!year || !month) return monthKey;
+                const date = new Date(year, month - 1, 1);
+                return date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+            };
+
+            const formatHours = (hours) => {
+                const value = Number(hours) || 0;
+                return value % 1 === 0 ? value.toString() : value.toFixed(1);
+            };
+
+            const formatDays = (days) => {
+                const value = Number(days) || 0;
+                return value % 1 === 0 ? value.toString() : value.toFixed(2);
+            };
+
+            const calculateTimeOffSummary = (range, customStart, customEnd) => {
+                const { startDate, endDate } = getTimeOffRangeBounds(range, customStart, customEnd);
+                const startTime = startDate.getTime();
+                const endTime = endDate.getTime();
+
+                const requests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
+                const summaries = new Map();
+                const monthKeysSet = new Set();
+
+                requests.forEach(request => {
+                    if (!request) return;
+                    const crcId = request.crcId;
+                    if (!crcId) return;
+
+                    const status = normalizeTimeOffStatus(request.status);
+                    const start = parseDateFlexible(request.startDate || request.date);
+                    const end = parseDateFlexible(request.endDate || request.date || request.startDate);
+                    if (!start || !end) return;
+
+                    const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+                    const limit = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+                    while (cursor <= limit) {
+                        const time = cursor.getTime();
+                        if (time >= startTime && time <= endTime) {
+                            const dateStr = toDateOnlyString(cursor);
+                            const monthKey = getMonthKey(cursor);
+                            monthKeysSet.add(monthKey);
+
+                            const hours = Number.isFinite(request.hours) ? Number(request.hours) : getHoursForPeriod(request.period);
+                            const normalizedHours = Number.isFinite(hours) && hours > 0 ? hours : 8;
+                            const dayFraction = Math.max(0.125, normalizedHours / 8);
+
+                            if (!summaries.has(crcId)) {
+                                const crc = state.crcs.find(c => c.id === crcId);
+                                summaries.set(crcId, {
+                                    crcId,
+                                    crcName: crc ? crc.name : `CRC ${crcId}`,
+                                    pendingHours: 0,
+                                    approvedHours: 0,
+                                    rejectedHours: 0,
+                                    pendingDays: 0,
+                                    approvedDays: 0,
+                                    rejectedDays: 0,
+                                    months: {}
+                                });
+                            }
+
+                            const summary = summaries.get(crcId);
+                            if (!summary.months[monthKey]) {
+                                summary.months[monthKey] = {
+                                    pendingHours: 0,
+                                    approvedHours: 0,
+                                    rejectedHours: 0,
+                                    pendingDays: 0,
+                                    approvedDays: 0,
+                                    rejectedDays: 0
+                                };
+                            }
+
+                            if (status === 'pending') {
+                                summary.pendingHours += normalizedHours;
+                                summary.pendingDays += dayFraction;
+                                summary.months[monthKey].pendingHours += normalizedHours;
+                                summary.months[monthKey].pendingDays += dayFraction;
+                            } else if (status === 'approved') {
+                                summary.approvedHours += normalizedHours;
+                                summary.approvedDays += dayFraction;
+                                summary.months[monthKey].approvedHours += normalizedHours;
+                                summary.months[monthKey].approvedDays += dayFraction;
+                            } else if (status === 'rejected') {
+                                summary.rejectedHours += normalizedHours;
+                                summary.rejectedDays += dayFraction;
+                                summary.months[monthKey].rejectedHours += normalizedHours;
+                                summary.months[monthKey].rejectedDays += dayFraction;
+                            }
+                        }
+                        cursor.setDate(cursor.getDate() + 1);
+                    }
+                });
+
+                const sortedMonthKeys = Array.from(monthKeysSet).sort();
+
+                return {
+                    summaries,
+                    monthKeys: sortedMonthKeys,
+                    startDate,
+                    endDate
+                };
+            };
+
+
             const getAllRoles = (events, rolesFromDB) => {
                 const rolesFromState = rolesFromDB.map(r => r.name);
                 const rolesFromEvents = new Set();
@@ -2972,15 +3205,10 @@
                     { id: 'reporting', label: 'Reporting' },
                     { id: 'training', label: 'Training' },
                     { id: 'jennysView', label: "Jenny's View" },
-                    { id: 'travel', label: 'Travel' }
+                    { id: 'travel', label: 'Travel' },
+                    { id: 'timeOff', label: 'Time Off' },
+                    { id: 'timeOffRequests', label: 'Time Off Requests' }
                 ];
-                
-                if (state.currentUser) {
-                    tabs.push({ id: 'timeOff', label: 'Time Off' });
-                }
-                if (state.currentUser && (state.currentUser.permissionLevel === 'Manager' || state.currentUser.permissionLevel === 'Supervisor')) {
-                    tabs.push({ id: 'timeOffRequests', label: 'Time Off Requests' });
-                }
                 if (state.currentUser && state.currentUser.permissionLevel === 'Manager') {
                     tabs.push({ id: 'users', label: 'Users' });
                 }
@@ -3268,6 +3496,10 @@
                 return { headers, data };
             };
 
+            const normalizeHeaderKey = (header) => {
+                return (header || '').toString().trim().toLowerCase().replace(/[\s_\-]/g, '');
+            };
+
             const handleCsvUpload = async (file, uploadType = 'shifts') => {
                 if (!file) return;
                 openModal(`
@@ -3286,8 +3518,20 @@
                 reader.onload = async (e) => {
                     const text = e.target.result;
                     const { headers, data } = parseCSV(text);
+                    const normalizedHeaders = headers.map(normalizeHeaderKey);
+                    const looksLikeTimeOffCSV = (() => {
+                        if (uploadType === 'timeOffRequests') return true;
+                        const hasEventType = normalizedHeaders.includes('eventtype');
+                        const hasTimeOffType = normalizedHeaders.includes('timeofftype') || normalizedHeaders.includes('ptoType'.toLowerCase()) || normalizedHeaders.includes('leavetype') || normalizedHeaders.includes('timeoff');
+                        const hasCrcName = normalizedHeaders.includes('crcname');
+                        const hasStartDate = normalizedHeaders.includes('startdate') || normalizedHeaders.includes('eventdate') || normalizedHeaders.includes('date');
+                        return hasCrcName && hasStartDate && (hasTimeOffType || !hasEventType);
+                    })();
+
                     if (uploadType === 'crcs') {
                         await importCRCs(headers, data);
+                    } else if (looksLikeTimeOffCSV) {
+                        await importTimeOffRequests(headers, data);
                     } else {
                         await importShifts(headers, data);
                     }
@@ -3390,10 +3634,15 @@
                 // Batch operations replaced with individual API calls
                 const errors = [];
                 let successCount = 0;
+                let timeOffRequestsCreated = 0;
 
                 const crcMap = new Map(state.crcs.map(c => [c.name.toLowerCase(), c.id]));
                 const siteMap = new Map(state.crc_sites.map(s => [s.name.toLowerCase(), s.id]));
                 const studyMap = new Map(state.studies.map(s => [s.name.toLowerCase(), s.id]));
+                const timeOffRequestKeys = new Set(
+                    (state.timeOffRequests || []).map(req => `${req.crcId}_${req.date || req.startDate}`)
+                );
+                const requestedBy = state.currentUser?.id || state.currentUser?.username || 'csv-import';
                 
                 for (const [index, row] of data.entries()) {
                     const rowNum = index + 2;
@@ -3404,6 +3653,85 @@
                     }
                     if (isNaN(new Date(date).getTime())) {
                         errors.push(`Row ${rowNum}: Invalid date format for "${date}". Please use YYYY-MM-DD.`);
+                        continue;
+                    }
+
+                    const rowNormalized = {};
+                    Object.entries(row).forEach(([key, value]) => {
+                        rowNormalized[normalizeHeaderKey(key)] = (value || '').trim();
+                    });
+
+                    const normalizedEventType = (EventType || '').toString().trim().toLowerCase();
+                    const normalizedEventTypeSimple = normalizedEventType.replace(/[\s-]/g, '');
+                    const isTimeOffImportRow = ['timeoffrequest', 'timeoff', 'pto', 'ptorequest', 'vacation', 'personal', 'sick', 'holiday', 'bereavement'].includes(normalizedEventTypeSimple);
+
+                    if (isTimeOffImportRow) {
+                        if (!CRCName) {
+                            errors.push(`Row ${rowNum}: CRCName is required for time off requests.`);
+                            continue;
+                        }
+                        const crcId = crcMap.get(CRCName.trim().toLowerCase());
+                        if (!crcId) {
+                            errors.push(`Row ${rowNum}: CRC "${CRCName}" not found.`);
+                            continue;
+                        }
+
+                        const startDateObj = parseDateFlexible(date);
+                        if (!startDateObj) {
+                            errors.push(`Row ${rowNum}: Invalid start date "${date}" for time off request.`);
+                            continue;
+                        }
+
+                        const endDateRaw = rowNormalized['enddate'] || (row.EndDate || '').trim();
+                        const endDateObj = endDateRaw ? parseDateFlexible(endDateRaw) : startDateObj;
+                        if (!endDateObj) {
+                            errors.push(`Row ${rowNum}: Invalid end date "${endDateRaw}" for time off request.`);
+                            continue;
+                        }
+                        if (endDateObj < startDateObj) {
+                            errors.push(`Row ${rowNum}: End date "${endDateRaw}" is before start date "${date}" for time off request.`);
+                            continue;
+                        }
+
+                        const typeValue = rowNormalized['timeofftype'] || rowNormalized['type'] || EventType || 'Time Off';
+                        const periodValue = rowNormalized['period'] || (Period || 'Full Day');
+                        let hoursValue = parseFloat(rowNormalized['hours'] || (Hours || ''));
+                        if (!Number.isFinite(hoursValue) || hoursValue <= 0) {
+                            hoursValue = getHoursForPeriod(periodValue);
+                        }
+                        const notesValue = rowNormalized['notes'] || (Notes || '');
+
+                        const cursor = new Date(startDateObj.getFullYear(), startDateObj.getMonth(), startDateObj.getDate());
+                        const limit = new Date(endDateObj.getFullYear(), endDateObj.getMonth(), endDateObj.getDate());
+
+                        while (cursor <= limit) {
+                            const dateStr = toDateOnlyString(cursor);
+                            const duplicateKey = `${crcId}_${dateStr}`;
+                            if (!timeOffRequestKeys.has(duplicateKey)) {
+                                const requestPayload = {
+                                    crcId,
+                                    requestedBy,
+                                    date: dateStr,
+                                    startDate: dateStr,
+                                    endDate: dateStr,
+                                    type: typeValue || 'Time Off',
+                                    hours: hoursValue,
+                                    period: periodValue,
+                                    notes: notesValue || undefined,
+                                    status: 'pending'
+                                };
+                                try {
+                                    await apiService.createTimeOffRequest(requestPayload);
+                                    timeOffRequestKeys.add(duplicateKey);
+                                    timeOffRequestsCreated++;
+                                } catch (error) {
+                                    console.error('Error creating time off request from shift import:', error);
+                                    errors.push(`Row ${rowNum}: Failed to create time off request for ${CRCName} on ${dateStr}. ${error?.message || error}`);
+                                }
+                            }
+                            cursor.setDate(cursor.getDate() + 1);
+                        }
+
                         continue;
                     }
 
@@ -3518,6 +3846,165 @@
                 }
             };
 
+            const importTimeOffRequests = async (headers, data) => {
+                const normalizedHeaders = headers.map(normalizeHeaderKey);
+                const hasCrcHeader = normalizedHeaders.includes('crcname');
+                const hasDateHeader = normalizedHeaders.includes('startdate') || normalizedHeaders.includes('eventdate') || normalizedHeaders.includes('date');
+
+                if (!hasCrcHeader || !hasDateHeader) {
+                    openModal(`<h3 class="text-xl font-bold dark:text-white">Import Error</h3><p class="dark:text-gray-300">Time Off CSV must include at least CRCName and Date (or StartDate/EventDate) columns.</p>`);
+                    return;
+                }
+
+                const headerLookup = {};
+                headers.forEach(header => {
+                    headerLookup[normalizeHeaderKey(header)] = header;
+                });
+
+                const errors = [];
+                let createdCount = 0;
+
+                const existingRequestKeys = new Set(
+                    (state.timeOffRequests || []).map(req => `${req.crcId}_${req.date || req.startDate}`)
+                );
+
+                const crcMap = new Map(
+                    state.crcs.map(crc => [crc.name ? crc.name.trim().toLowerCase() : '', crc.id])
+                );
+
+                const requestedBy = state.currentUser?.id || state.currentUser?.username || 'csv-import';
+
+                const getRowValue = (row, key) => {
+                    const normalizedKey = normalizeHeaderKey(key);
+                    if (row.hasOwnProperty(key)) return (row[key] || '').trim();
+                    if (headerLookup[normalizedKey] && row.hasOwnProperty(headerLookup[normalizedKey])) {
+                        return (row[headerLookup[normalizedKey]] || '').trim();
+                    }
+                    return (row[normalizedKey] || '').trim?.() || '';
+                };
+
+                for (const [index, row] of data.entries()) {
+                    const rowNum = index + 2;
+                    const rowNormalized = {};
+                    Object.entries(row).forEach(([key, value]) => {
+                        rowNormalized[normalizeHeaderKey(key)] = (value || '').trim();
+                    });
+
+                    const crcNameRaw = rowNormalized['crcname'] || getRowValue(row, 'CRCName');
+                    if (!crcNameRaw) {
+                        errors.push(`Row ${rowNum}: Missing CRCName.`);
+                        continue;
+                    }
+                    const crcId = crcMap.get(crcNameRaw.trim().toLowerCase());
+                    if (!crcId) {
+                        errors.push(`Row ${rowNum}: CRC "${crcNameRaw}" not found in CHAOS.`);
+                        continue;
+                    }
+
+                    const startDateRaw = rowNormalized['startdate'] || rowNormalized['date'] || rowNormalized['eventdate'] ||
+                        getRowValue(row, 'StartDate') || getRowValue(row, 'Date') || getRowValue(row, 'EventDate');
+                    if (!startDateRaw) {
+                        errors.push(`Row ${rowNum}: Missing Date/StartDate.`);
+                        continue;
+                    }
+
+                    const startDateObj = parseDateFlexible(startDateRaw);
+                    if (!startDateObj) {
+                        errors.push(`Row ${rowNum}: Invalid start date "${startDateRaw}".`);
+                        continue;
+                    }
+
+                    const endDateRaw = rowNormalized['enddate'] || getRowValue(row, 'EndDate') || startDateRaw;
+                    const endDateObj = parseDateFlexible(endDateRaw);
+                    if (!endDateObj) {
+                        errors.push(`Row ${rowNum}: Invalid end date "${endDateRaw}".`);
+                        continue;
+                    }
+
+                    if (endDateObj < startDateObj) {
+                        errors.push(`Row ${rowNum}: End date "${endDateRaw}" is before start date "${startDateRaw}".`);
+                        continue;
+                    }
+
+                    const type = rowNormalized['timeofftype'] || rowNormalized['type'] || getRowValue(row, 'TimeOffType') || getRowValue(row, 'Type') || 'Time Off';
+                    const period = rowNormalized['period'] || getRowValue(row, 'Period') || 'Full Day';
+                    let hours = parseFloat(rowNormalized['hours'] || getRowValue(row, 'Hours'));
+                    if (!Number.isFinite(hours) || hours <= 0) {
+                        hours = getHoursForPeriod(period);
+                    }
+                    const notes = rowNormalized['notes'] || getRowValue(row, 'Notes') || '';
+
+                    const cursor = new Date(startDateObj.getFullYear(), startDateObj.getMonth(), startDateObj.getDate());
+                    const limit = new Date(endDateObj.getFullYear(), endDateObj.getMonth(), endDateObj.getDate());
+
+                    while (cursor <= limit) {
+                        const dateStr = toDateOnlyString(cursor);
+                        const duplicateKey = `${crcId}_${dateStr}`;
+                        if (existingRequestKeys.has(duplicateKey)) {
+                            cursor.setDate(cursor.getDate() + 1);
+                            continue;
+                        }
+
+                        const requestPayload = {
+                            crcId,
+                            requestedBy,
+                            date: dateStr,
+                            startDate: dateStr,
+                            endDate: dateStr,
+                            type: type || 'Time Off',
+                            hours,
+                            period,
+                            notes: notes || undefined,
+                            status: 'pending'
+                        };
+
+                        try {
+                            await apiService.createTimeOffRequest(requestPayload);
+                            existingRequestKeys.add(duplicateKey);
+                            createdCount++;
+                        } catch (error) {
+                            console.error('Error creating time off request from CSV:', error);
+                            errors.push(`Row ${rowNum}: Failed to create time off request for ${crcNameRaw} on ${dateStr}. ${error?.message || error}`);
+                        }
+
+                        cursor.setDate(cursor.getDate() + 1);
+                    }
+                }
+
+                if (createdCount > 0) {
+                    try {
+                        const updatedRequests = await apiService.getTimeOffRequests();
+                        setState({ timeOffRequests: updatedRequests });
+                        if (state.activeTab === 'timeOffRequests') {
+                            renderTimeOffRequestsContent();
+                        }
+                    } catch (refreshError) {
+                        console.error('Error refreshing time off requests after import:', refreshError);
+                    }
+                }
+
+                if (errors.length > 0) {
+                    const errorList = errors.map(err => `<li>${err}</li>`).join('');
+                    openModal(`
+                        <h3 class="text-xl font-bold text-red-500">Import Complete with Errors</h3>
+                        <p class="my-2 dark:text-gray-300"><strong>${createdCount}</strong> time off request${createdCount === 1 ? '' : 's'} created successfully.</p>
+                        <p class="my-2 dark:text-gray-300">The following issues occurred:</p>
+                        <ul class="list-disc list-inside bg-red-100 dark:bg-red-900/60 p-4 rounded-md text-sm max-h-60 overflow-y-auto custom-scrollbar">
+                            ${errorList}
+                        </ul>
+                        <div class="mt-6 text-right">
+                            <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Close</button>
+                        </div>
+                    `, 'lg');
+                } else {
+                    closeModal();
+                    const message = createdCount > 0
+                        ? `${createdCount} time off request${createdCount === 1 ? '' : 's'} imported successfully!`
+                        : 'No new time off requests found in the CSV file.';
+                    showNotification(message, createdCount > 0 ? 'success' : 'info');
+                }
+            };
+
             const downloadTemplate = (templateType) => {
                 let headers, rows;
                 
@@ -3548,6 +4035,19 @@
                             'New York, NY', // HomeLocation
                             'East', // Region
                             'FTE' // EmploymentType
+                        ]
+                    ];
+                } else if (templateType === 'timeoff') {
+                    headers = ['CRCName', 'StartDate', 'EndDate', 'TimeOffType', 'Period', 'Hours', 'Notes'];
+                    rows = [
+                        [
+                            'John Doe', // CRCName
+                            '2025-02-10', // StartDate
+                            '2025-02-12', // EndDate
+                            'Vacation', // TimeOffType
+                            'Full Day', // Period
+                            '8', // Hours per day
+                            'Family trip' // Notes
                         ]
                     ];
                 } else {
@@ -3889,6 +4389,7 @@
                             <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                                 <thead class="bg-gray-50 dark:bg-gray-700">
                                     <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">CRC</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Date</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">CRC Name</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Position/Role</th>
@@ -9177,6 +9678,7 @@
                 const period = event ? (event.period || 'Full Day') : 'Full Day';
                 
                 // For Site Assignment events, filter CRCs by training when roles are known
+                const dateStr = toDateOnlyString(parseDateFlexible(date));
                 const crcOptions = state.crcs.map(crc => {
                     const isUnavailable = isCRCUnavailable(crc.id, date, period);
                     const unavailableText = isUnavailable ? ' (Unavailable)' : '';
@@ -9193,7 +9695,8 @@
                         }
                     }
                     
-                    return `<option value="${crc.id}" ${isSelected ? 'selected' : ''}>${crc.name}${unavailableText}${trainingNote}</option>`;
+                    const pendingText = hasPendingTimeOffOnDate(crc.id, dateStr) ? ' (Pending Review)' : '';
+                    return `<option value="${crc.id}" ${isSelected ? 'selected' : ''}>${crc.name}${pendingText}${unavailableText}${trainingNote}</option>`;
                 }).join('');
                 // Debug site loading for shift creation
                 console.log('CHAOS: Sites available for shift creation:', state.crc_sites.length);
@@ -9560,6 +10063,72 @@
                 const today = new Date();
 
                 const weeklyHours = calculateWeeklyUtilization(new Date())[crc.id]?.totalHours || 0;
+                const summaryRange = state.timeOffSummaryRange || 'month';
+                const allSummaryData = calculateTimeOffSummary(summaryRange, state.timeOffSummaryCustomStart, state.timeOffSummaryCustomEnd);
+                const crcSummary = allSummaryData.summaries.get(crc.id);
+                const crcSummaryRangeLabel = (timeOffRangeOptions.find(opt => opt.value === summaryRange)?.label) || 'This Month';
+                const crcSummaryDateLabel = `${formatDisplayDate(allSummaryData.startDate, { month: 'short', day: 'numeric', year: 'numeric' })} - ${formatDisplayDate(allSummaryData.endDate, { month: 'short', day: 'numeric', year: 'numeric' })}`;
+                const crcPendingHours = crcSummary ? crcSummary.pendingHours : 0;
+                const crcApprovedHours = crcSummary ? crcSummary.approvedHours : 0;
+                const crcRejectedHours = crcSummary ? crcSummary.rejectedHours : 0;
+                const crcPendingDays = crcSummary ? crcSummary.pendingDays : 0;
+                const crcApprovedDays = crcSummary ? crcSummary.approvedDays : 0;
+                const crcRejectedDays = crcSummary ? crcSummary.rejectedDays : 0;
+                const crcTotalHours = crcPendingHours + crcApprovedHours;
+                const crcTotalDays = crcPendingDays + crcApprovedDays;
+                const crcMonthKeys = crcSummary ? Object.keys(crcSummary.months || {}).filter(monthKey => {
+                    const monthData = crcSummary.months[monthKey];
+                    return monthData && (monthData.pendingHours || monthData.approvedHours || monthData.rejectedHours);
+                }).sort() : [];
+                const crcTimeOffSummaryHTML = crcSummary && (crcPendingHours || crcApprovedHours || crcRejectedHours) ? `
+                    <div class="mb-4 rounded-md border border-indigo-200 dark:border-indigo-700 bg-indigo-50 dark:bg-indigo-900/20 p-4">
+                        <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+                            <div>
+                                <h3 class="text-lg font-semibold text-indigo-900 dark:text-indigo-200">Upcoming Time Off (${crcSummaryRangeLabel})</h3>
+                                <p class="text-sm text-indigo-700/80 dark:text-indigo-300/80">${crcSummaryDateLabel}</p>
+                            </div>
+                            <div class="text-sm text-indigo-900 dark:text-indigo-100">
+                                <div class="font-semibold text-right">${formatHours(crcTotalHours)} hrs (${formatDays(crcTotalDays)} days)</div>
+                                <div class="text-xs text-yellow-700 dark:text-yellow-300 text-right">Pending: ${formatHours(crcPendingHours)} hrs (${formatDays(crcPendingDays)} days)</div>
+                                <div class="text-xs text-green-700 dark:text-green-300 text-right">Approved: ${formatHours(crcApprovedHours)} hrs (${formatDays(crcApprovedDays)} days)</div>
+                                ${crcRejectedHours ? `<div class="text-xs text-red-600 dark:text-red-300 text-right">Rejected: ${formatHours(crcRejectedHours)} hrs (${formatDays(crcRejectedDays)} days)</div>` : ''}
+                            </div>
+                        </div>
+                        ${crcMonthKeys.length ? `
+                            <div class="mt-4 overflow-x-auto">
+                                <table class="min-w-full text-sm divide-y divide-indigo-200 dark:divide-indigo-700">
+                                    <thead class="bg-indigo-100 dark:bg-indigo-900/40">
+                                        <tr>
+                                            <th class="px-4 py-2 text-left font-medium text-indigo-800 dark:text-indigo-200">Month</th>
+                                            <th class="px-4 py-2 text-right font-medium text-indigo-800 dark:text-indigo-200">Pending (hrs/days)</th>
+                                            <th class="px-4 py-2 text-right font-medium text-indigo-800 dark:text-indigo-200">Approved (hrs/days)</th>
+                                            ${crcRejectedHours ? `<th class="px-4 py-2 text-right font-medium text-indigo-800 dark:text-indigo-200">Rejected (hrs/days)</th>` : ''}
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-indigo-100 dark:divide-indigo-800">
+                                        ${crcMonthKeys.map(monthKey => {
+                                            const monthData = crcSummary.months[monthKey] || {};
+                                            return `
+                                                <tr>
+                                                    <td class="px-4 py-2 text-indigo-900 dark:text-indigo-100">${getMonthLabel(monthKey)}</td>
+                                                    <td class="px-4 py-2 text-right text-yellow-800 dark:text-yellow-200">${formatHours(monthData.pendingHours || 0)}h / ${formatDays(monthData.pendingDays || 0)}d</td>
+                                                    <td class="px-4 py-2 text-right text-green-800 dark:text-green-200">${formatHours(monthData.approvedHours || 0)}h / ${formatDays(monthData.approvedDays || 0)}d</td>
+                                                    ${crcRejectedHours ? `<td class="px-4 py-2 text-right text-red-700 dark:text-red-200">${formatHours(monthData.rejectedHours || 0)}h / ${formatDays(monthData.rejectedDays || 0)}d</td>` : ''}
+                                                </tr>
+                                            `;
+                                        }).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        ` : ''}
+                    </div>
+                ` : `
+                    <div class="mb-4 rounded-md border border-indigo-200 dark:border-indigo-700 bg-indigo-50 dark:bg-indigo-900/20 p-4">
+                        <h3 class="text-lg font-semibold text-indigo-900 dark:text-indigo-200 mb-1">Upcoming Time Off (${crcSummaryRangeLabel})</h3>
+                        <p class="text-sm text-indigo-700/80 dark:text-indigo-300/80 mb-2">${crcSummaryDateLabel}</p>
+                        <p class="text-sm text-indigo-800 dark:text-indigo-200">No pending or approved time off in this range.</p>
+                    </div>
+                `;
                 
                 // Get training names from training_types collection and existing CRC trainings
                 const allTrainings = new Set();
@@ -9664,6 +10233,7 @@
                         <span class="font-semibold">Current Week's Hours (Sat-Fri):</span>
                         <span class="font-bold text-lg">${weeklyHours}</span>
                     </div>
+                    ${crcTimeOffSummaryHTML}
                     <form id="edit-crc-form" data-id="${crc.id}" class="space-y-4">
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
@@ -9732,40 +10302,54 @@
 
             const getImportCsvModalHTML = () => {
                 return `
-                    <h2 class="text-2xl font-bold dark:text-white mb-4">Import Shifts from CSV</h2>
+                    <h2 class="text-2xl font-bold dark:text-white mb-4">Import Data from CSV</h2>
                     <div class="space-y-4 text-gray-700 dark:text-gray-300">
-                        <p>Please ensure your CSV file is formatted correctly before uploading.</p>
-                        <div>
-                            <h4 class="font-semibold text-gray-800 dark:text-gray-200">Required Columns:</h4>
+                        <p>CHAOS supports importing both shift schedules and time off requests. Format your CSV using the guidelines below.</p>
+                        <div class="bg-gray-50 dark:bg-gray-800/60 p-4 rounded-md">
+                            <h4 class="font-semibold text-gray-800 dark:text-gray-200">Shift Import (Default)</h4>
+                            <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Required columns:</p>
                             <ul class="list-disc list-inside mt-2 text-sm">
-                                <li><strong>Date</strong>: The date of the shift (format: YYYY-MM-DD).</li>
-                                <li><strong>EventType</strong>: The type of shift (e.g., 'Site Assignment', 'Travel Day').</li>
+                                <li><strong>Date</strong> &mdash; Shift date (YYYY-MM-DD)</li>
+                                <li><strong>EventType</strong> &mdash; e.g., Site Assignment, Travel Day</li>
+                            </ul>
+                            <p class="text-sm text-gray-600 dark:text-gray-400 mt-2">Optional columns:</p>
+                            <ul class="list-disc list-inside mt-2 text-sm">
+                                <li><strong>CRCName</strong> (required for most events)</li>
+                                <li><strong>SiteName</strong>, <strong>StudyName</strong>, <strong>Roles</strong></li>
+                                <li><strong>Hours</strong>, <strong>Period</strong>, <strong>Notes</strong></li>
+                                <li><strong>VisitNumber</strong>, <strong>PrincipalInvestigator</strong>, <strong>Mileage</strong></li>
                             </ul>
                         </div>
-                        <div>
-                            <h4 class="font-semibold text-gray-800 dark:text-gray-200">Optional Columns:</h4>
+                        <div class="bg-gray-50 dark:bg-gray-800/60 p-4 rounded-md">
+                            <h4 class="font-semibold text-gray-800 dark:text-gray-200">Time Off Request Import</h4>
+                            <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Required columns:</p>
                             <ul class="list-disc list-inside mt-2 text-sm">
-                                <li><strong>CRCName</strong>: The name of the CRC. Must match an existing CRC. (Required for most event types).</li>
-                                <li><strong>SiteName</strong>: The name of the Site. If the site doesn't exist, it will be created.</li>
-                                <li><strong>StudyName</strong>: Study names, separated by a semicolon (;). If a study doesn't exist, it will be created.</li>
-                                <li><strong>Roles</strong>: Roles for the assignment, separated by a semicolon (;).</li>
-                                <li><strong>Hours</strong>: Number of hours for the shift (defaults to 8).</li>
-                                <li><strong>Period</strong>: For Unavailable/PTO shifts ('Full Day', 'AM', 'PM').</li>
-                                <li><strong>Notes</strong>: Any additional notes for the shift.</li>
-                                <li><strong>VisitNumber</strong>: The visit number for the assignment.</li>
-                                <li><strong>PrincipalInvestigator</strong>: The PI for the visit.</li>
-                                <li><strong>Mileage</strong>: Mileage for travel days.</li>
+                                <li><strong>CRCName</strong> &mdash; Must match an existing CRC</li>
+                                <li><strong>StartDate</strong> (or Date/EventDate) &mdash; YYYY-MM-DD</li>
                             </ul>
+                            <p class="text-sm text-gray-600 dark:text-gray-400 mt-2">Optional columns:</p>
+                            <ul class="list-disc list-inside mt-2 text-sm">
+                                <li><strong>EndDate</strong> (defaults to StartDate)</li>
+                                <li><strong>TimeOffType</strong> &mdash; Vacation, Sick, etc.</li>
+                                <li><strong>Period</strong> &mdash; Full Day, AM, PM, custom</li>
+                                <li><strong>Hours</strong>, <strong>Notes</strong></li>
+                            </ul>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">CSV files containing time off columns are automatically imported as pending requests for approval.</p>
                         </div>
                         <p class="text-sm text-gray-500 dark:text-gray-400">
-                            <strong>Tip:</strong> You can use the "Export" button to download a template with the correct format and existing data.
+                            <strong>Tip:</strong> Use the template buttons below to start from a formatted example.
                         </p>
                     </div>
-                    <div class="mt-6 flex justify-between items-center">
-                        <button data-action="download-template" data-template="shifts" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 flex items-center">
-                            <i data-lucide="file-text" class="w-4 h-4 mr-2"></i>Download Template
-                        </button>
-                        <div class="flex gap-4">
+                    <div class="mt-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                        <div class="flex flex-wrap gap-3">
+                            <button data-action="download-template" data-template="shifts" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 flex items-center">
+                                <i data-lucide="file-text" class="w-4 h-4 mr-2"></i>Shift Template
+                            </button>
+                            <button data-action="download-template" data-template="timeoff" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 flex items-center">
+                                <i data-lucide="calendar" class="w-4 h-4 mr-2"></i>Time Off Template
+                            </button>
+                        </div>
+                        <div class="flex gap-3">
                             <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button data-action="trigger-csv-upload" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 flex items-center">
                                 <i data-lucide="upload" class="w-4 h-4 mr-2"></i>Choose File & Import
@@ -14939,12 +15523,15 @@
                                 distance = await calculateCrcToSiteDistance(crc, site);
                             }
                             
+                            const hasPending = hasPendingTimeOffOnDate(crc.id, date);
+                            
                             return {
                                 crc,
                                 isUnavailable,
                                 unavailPeriod,
                                 distance,
-                                isSelected: crc.id === existingCrcId
+                                isSelected: crc.id === existingCrcId,
+                                hasPending
                             };
                         }));
                         
@@ -14969,7 +15556,7 @@
                             return a.crc.name.localeCompare(b.crc.name);
                         });
                         
-                        let crcOptions = crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, isSelected }) => {
+                        let crcOptions = crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, isSelected, hasPending }) => {
                             let unavailableText = '';
                             if (isUnavailable) {
                                 const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
@@ -14983,8 +15570,12 @@
                             }
                             
                             // Show unavailable CRCs but allow selection (override will be handled on selection)
-                            const styleClass = isUnavailable && !isSelected ? 'text-red-600 dark:text-red-400' : '';
-                            return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} class="${styleClass}">${crc.name}${distanceText}${unavailableText}</option>`;
+                            const pendingText = hasPending ? ' (Pending Review)' : '';
+                            const styleClasses = [];
+                            if (isUnavailable && !isSelected) styleClasses.push('text-red-600 dark:text-red-400');
+                            if (hasPending && !isUnavailable) styleClasses.push('text-yellow-600 dark:text-yellow-400');
+                            const styleClass = styleClasses.join(' ');
+                            return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} class="${styleClass}">${crc.name}${pendingText}${distanceText}${unavailableText}</option>`;
                         }).join('');
                         
                         if (qualifiedCrcs.length === 0) {
@@ -15050,12 +15641,15 @@
                             distance = await calculateCrcToSiteDistance(crc, site);
                         }
                         
+                        const hasPending = hasPendingTimeOffOnDate(crc.id, date);
+                        
                         return {
                             crc,
                             isUnavailable,
                             unavailPeriod,
                             distance,
-                            isSelected: existingAssignments.includes(crc.id)
+                            isSelected: existingAssignments.includes(crc.id),
+                            hasPending
                         };
                     }));
                     
@@ -15080,7 +15674,7 @@
                         return a.crc.name.localeCompare(b.crc.name);
                     });
                     
-                    let crcOptions = crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, isSelected }) => {
+                    let crcOptions = crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, isSelected, hasPending }) => {
                         let statusText = '';
                         if (isUnavailable) {
                             const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
@@ -15094,8 +15688,12 @@
                         }
                         
                         // Show unavailable CRCs but allow selection (override will be handled on selection)
-                        const styleClass = isUnavailable && !isSelected ? 'text-red-600 dark:text-red-400' : '';
-                        return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} class="${styleClass}">${crc.name}${distanceText}${statusText}</option>`;
+                        const pendingText = hasPending ? ' (Pending Review)' : '';
+                        const styleClasses = [];
+                        if (isUnavailable && !isSelected) styleClasses.push('text-red-600 dark:text-red-400');
+                        if (hasPending && !isUnavailable) styleClasses.push('text-yellow-600 dark:text-yellow-400');
+                        const styleClass = styleClasses.join(' ');
+                        return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} class="${styleClass}">${crc.name}${pendingText}${distanceText}${statusText}</option>`;
                     }).join('');
                     
                     if (qualifiedCrcs.length === 0) {
@@ -16353,27 +16951,16 @@
             const renderTimeOffContent = () => {
                 const container = document.getElementById('time-off-content');
                 if (!container) return;
+                
+                const allRequests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
+                const viewingOwn = !!state.currentUser;
+                const requestsToShow = viewingOwn
+                    ? allRequests.filter(req => req.requestedBy === state.currentUser.id || req.crcId === state.currentUser.id)
+                    : allRequests;
 
-                // Check if user is logged in
-                if (!state.currentUser) {
-                    container.innerHTML = `
-                        <div class="text-center py-8">
-                            <div class="text-gray-500 dark:text-gray-400 mb-4">
-                                <i data-lucide="log-in" class="w-16 h-16 mx-auto mb-4"></i>
-                                <h3 class="text-lg font-medium">Please Log In</h3>
-                                <p class="text-sm">You must be logged in to view and submit time off requests.</p>
-                            </div>
-                        </div>
-                    `;
-                    lucide.createIcons();
-                    return;
-                }
-
-                // Get current user's time off requests
-                const userRequests = state.timeOffRequests.filter(req => req.requestedBy === state.currentUser.id || req.crcId === state.currentUser.id);
-                const pendingRequests = userRequests.filter(req => req.status === 'pending');
-                const approvedRequests = userRequests.filter(req => req.status === 'approved');
-                const rejectedRequests = userRequests.filter(req => req.status === 'rejected');
+                const pendingRequests = requestsToShow.filter(req => normalizeTimeOffStatus(req.status) === 'pending');
+                const approvedRequests = requestsToShow.filter(req => normalizeTimeOffStatus(req.status) === 'approved');
+                const rejectedRequests = requestsToShow.filter(req => normalizeTimeOffStatus(req.status) === 'rejected');
 
                 const statusColors = {
                     'pending': 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300',
@@ -16384,11 +16971,12 @@
                 let html = `
                     <div class="flex justify-between items-center mb-6">
                         <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Time Off Requests</h2>
+                        ${!viewingOwn ? '' : '<p class="text-sm text-gray-500 dark:text-gray-400 ml-4 hidden sm:block">Showing requests submitted by or for you.</p>'}
                     </div>
 
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                         <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
-                            <div class="text-sm text-gray-500 dark:text-gray-400 mb-1">Pending</div>
+                            <div class="text-sm text-gray-500 dark:text-gray-400 mb-1">Pending Review</div>
                             <div class="text-2xl font-bold text-yellow-600 dark:text-yellow-400">${pendingRequests.length}</div>
                         </div>
                         <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
@@ -16414,16 +17002,20 @@
                                     </tr>
                                 </thead>
                                 <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                    ${userRequests.length === 0 ? `
+                                    ${requestsToShow.length === 0 ? `
                                         <tr>
-                                            <td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500 dark:text-gray-400">
+                                            <td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500 dark:text-gray-400">
                                                 No time off requests. Use the "Time Off" button in the Time Off tab to mark yourself as unavailable.
                                             </td>
                                         </tr>
-                                    ` : userRequests.map(request => {
+                                    ` : requestsToShow.map(request => {
                                         const crc = state.crcs.find(c => c.id === request.crcId);
+                                        const statusKey = normalizeTimeOffStatus(request.status);
                                         return `
                                             <tr>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
+                                                    ${crc ? crc.name : 'Unknown'}
+                                                </td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
                                                     ${formatDisplayDate(request.date)}
                                                 </td>
@@ -16431,15 +17023,15 @@
                                                     ${request.period || 'Full Day'}
                                                 </td>
                                                 <td class="px-6 py-4 whitespace-nowrap">
-                                                    <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${statusColors[request.status] || 'bg-gray-100 text-gray-800'}">
-                                                        ${request.status || 'pending'}
+                                                    <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${statusColors[statusKey] || 'bg-gray-100 text-gray-800'}">
+                                                        ${formatTimeOffStatus(request.status)}
                                                     </span>
                                                 </td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                    ${request.createdAt ? new Date(request.createdAt).toLocaleDateString() : 'N/A'}
+                                                    ${request.createdAt ? formatDisplayDate(request.createdAt) : 'N/A'}
                                                 </td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                    ${request.status === 'pending' ? `<button data-action="cancel-time-off-request" data-id="${request.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Cancel</button>` : ''}
+                                                    ${statusKey === 'pending' && viewingOwn && (request.requestedBy === state.currentUser.id || request.crcId === state.currentUser.id) ? `<button data-action="cancel-time-off-request" data-id="${request.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Cancel</button>` : ''}
                                                 </td>
                                             </tr>
                                         `;
@@ -16467,34 +17059,20 @@
                 const container = document.getElementById('time-off-requests-content');
                 if (!container) return;
 
-                // Check if user has Manager or Supervisor permission
-                if (!state.currentUser || (state.currentUser.permissionLevel !== 'Manager' && state.currentUser.permissionLevel !== 'Supervisor')) {
-                    container.innerHTML = `
-                        <div class="text-center py-8">
-                            <div class="text-gray-500 dark:text-gray-400 mb-4">
-                                <i data-lucide="shield-alert" class="w-16 h-16 mx-auto mb-4"></i>
-                                <h3 class="text-lg font-medium">Access Denied</h3>
-                                <p class="text-sm">You must be a Manager or Supervisor to access the Time Off Requests section.</p>
-                            </div>
-                        </div>
-                    `;
-                    lucide.createIcons();
-                    return;
-                }
-
                 // Get current view mode (default to list)
+                const allRequests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
                 const currentView = state.timeOffRequestsView || 'list';
                 const currentEmployeeFilter = state.timeOffRequestsEmployeeFilter || 'all';
                 const currentStatusFilter = state.timeOffRequestsStatusFilter || 'all';
 
                 // Get all unique employee names for filter
-                const employeeNames = [...new Set(state.timeOffRequests.map(req => {
+                const employeeNames = [...new Set(allRequests.map(req => {
                     const crc = state.crcs.find(c => c.id === req.crcId);
                     return crc ? crc.name : 'Unknown';
                 }))].sort();
 
                 // Filter requests
-                let filteredRequests = [...state.timeOffRequests];
+                let filteredRequests = [...allRequests];
                 
                 if (currentEmployeeFilter !== 'all') {
                     filteredRequests = filteredRequests.filter(req => {
@@ -16590,6 +17168,126 @@
                     </div>
                 `;
 
+                const summaryRange = state.timeOffSummaryRange || 'month';
+                const summaryData = calculateTimeOffSummary(summaryRange, state.timeOffSummaryCustomStart, state.timeOffSummaryCustomEnd);
+                const summaryStartStr = summaryData.startDate ? toDateOnlyString(summaryData.startDate) : '';
+                const summaryEndStr = summaryData.endDate ? toDateOnlyString(summaryData.endDate) : '';
+                const customStartValue = state.timeOffSummaryCustomStart || summaryStartStr;
+                const customEndValue = state.timeOffSummaryCustomEnd || summaryEndStr;
+                const summaryEntries = Array.from(summaryData.summaries.values()).sort((a, b) => a.crcName.localeCompare(b.crcName));
+                const monthKeys = summaryData.monthKeys;
+                const summaryRangeLabel = (timeOffRangeOptions.find(opt => opt.value === summaryRange)?.label) || 'This Month';
+                const summaryDateLabel = `${formatDisplayDate(summaryData.startDate, { month: 'short', day: 'numeric', year: 'numeric' })} - ${formatDisplayDate(summaryData.endDate, { month: 'short', day: 'numeric', year: 'numeric' })}`;
+
+                html += `
+                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow mb-6">
+                        <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 px-6 py-4 border-b dark:border-gray-700">
+                            <div>
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Upcoming Time Off Summary</h3>
+                                <p class="text-sm text-gray-500 dark:text-gray-400">Range: ${summaryRangeLabel} (${summaryDateLabel})</p>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-3">
+                                <div class="flex items-center gap-2">
+                                    <label for="time-off-summary-range" class="text-sm font-medium text-gray-700 dark:text-gray-300">Range</label>
+                                    <select id="time-off-summary-range" class="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                        ${timeOffRangeOptions.map(opt => `<option value="${opt.value}" ${opt.value === summaryRange ? 'selected' : ''}>${opt.label}</option>`).join('')}
+                                    </select>
+                                </div>
+                                <div id="time-off-summary-custom-range" class="flex items-center gap-2 ${summaryRange === 'custom' ? '' : 'hidden'}">
+                                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Start</label>
+                                    <input type="date" id="time-off-summary-start" value="${customStartValue || ''}" class="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300">End</label>
+                                    <input type="date" id="time-off-summary-end" value="${customEndValue || ''}" class="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="px-6 py-4 space-y-6">
+                            ${summaryEntries.length === 0 ? `
+                                <p class="text-sm text-gray-500 dark:text-gray-400">No time off requests found within the selected range.</p>
+                            ` : `
+                                <div class="space-y-6">
+                                    <div>
+                                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Totals by CRC</h4>
+                                        <div class="overflow-x-auto">
+                                            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                                                <thead class="bg-gray-50 dark:bg-gray-700">
+                                                    <tr>
+                                                        <th class="px-4 py-2 text-left font-medium text-gray-600 dark:text-gray-300">CRC</th>
+                                                        <th class="px-4 py-2 text-right font-medium text-gray-600 dark:text-gray-300">Pending Days</th>
+                                                        <th class="px-4 py-2 text-right font-medium text-gray-600 dark:text-gray-300">Pending Hours</th>
+                                                        <th class="px-4 py-2 text-right font-medium text-gray-600 dark:text-gray-300">Approved Days</th>
+                                                        <th class="px-4 py-2 text-right font-medium text-gray-600 dark:text-gray-300">Approved Hours</th>
+                                                        <th class="px-4 py-2 text-right font-medium text-gray-600 dark:text-gray-300">Rejected Days</th>
+                                                        <th class="px-4 py-2 text-right font-medium text-gray-600 dark:text-gray-300">Rejected Hours</th>
+                                                        <th class="px-4 py-2 text-right font-medium text-gray-600 dark:text-gray-300">Total Days</th>
+                                                        <th class="px-4 py-2 text-right font-medium text-gray-600 dark:text-gray-300">Total Hours</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+                                                        ${summaryEntries.map(entry => {
+                                                        const totalDays = entry.pendingDays + entry.approvedDays;
+                                                        const totalHours = entry.pendingHours + entry.approvedHours;
+                                                        return `
+                                                            <tr>
+                                                                <td class="px-4 py-2 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${entry.crcName}</td>
+                                                                <td class="px-4 py-2 text-right text-gray-600 dark:text-gray-300">${formatDays(entry.pendingDays)}</td>
+                                                                <td class="px-4 py-2 text-right text-gray-600 dark:text-gray-300">${formatHours(entry.pendingHours)}</td>
+                                                                <td class="px-4 py-2 text-right text-green-600 dark:text-green-300">${formatDays(entry.approvedDays)}</td>
+                                                                <td class="px-4 py-2 text-right text-green-600 dark:text-green-300">${formatHours(entry.approvedHours)}</td>
+                                                                <td class="px-4 py-2 text-right text-red-500 dark:text-red-300">${formatDays(entry.rejectedDays)}</td>
+                                                                <td class="px-4 py-2 text-right text-red-500 dark:text-red-300">${formatHours(entry.rejectedHours)}</td>
+                                                                <td class="px-4 py-2 text-right font-semibold text-gray-900 dark:text-gray-100">${formatDays(totalDays)}</td>
+                                                                <td class="px-4 py-2 text-right font-semibold text-gray-900 dark:text-gray-100">${formatHours(totalHours)}</td>
+                                                            </tr>
+                                                        `;
+                                                    }).join('')}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                    ${monthKeys.length > 0 ? `
+                                        <div>
+                                            <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Monthly Breakdown</h4>
+                                            <div class="overflow-x-auto">
+                                                <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                                                    <thead class="bg-gray-50 dark:bg-gray-700">
+                                                        <tr>
+                                                            <th class="px-4 py-2 text-left font-medium text-gray-600 dark:text-gray-300">CRC</th>
+                                                            ${monthKeys.map(monthKey => `<th class="px-4 py-2 text-center font-medium text-gray-600 dark:text-gray-300">${getMonthLabel(monthKey)}</th>`).join('')}
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+                                                        ${summaryEntries.map(entry => `
+                                                            <tr>
+                                                                <td class="px-4 py-2 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">${entry.crcName}</td>
+                                                                ${monthKeys.map(monthKey => {
+                                                                    const monthData = entry.months[monthKey] || {};
+                                                                    const hasData = (monthData.pendingHours || monthData.approvedHours || monthData.rejectedHours);
+                                                                    return `
+                                                                        <td class="px-4 py-2 text-center ${hasData ? 'text-gray-700 dark:text-gray-200' : 'text-gray-400 dark:text-gray-500'}">
+                                                                            ${hasData ? `
+                                                                                <div class="leading-tight">
+                                                                                    <div class="text-xs text-yellow-700 dark:text-yellow-300">Pending: ${formatHours(monthData.pendingHours || 0)}h (${formatDays(monthData.pendingDays || 0)}d)</div>
+                                                                                    <div class="text-xs text-green-700 dark:text-green-300">Approved: ${formatHours(monthData.approvedHours || 0)}h (${formatDays(monthData.approvedDays || 0)}d)</div>
+                                                                                    ${monthData.rejectedHours ? `<div class="text-xs text-red-600 dark:text-red-300">Rejected: ${formatHours(monthData.rejectedHours)}h (${formatDays(monthData.rejectedDays || 0)}d)</div>` : ''}
+                                                                                </div>
+                                                                            ` : '—'}
+                                                                        </td>
+                                                                    `;
+                                                                }).join('')}
+                                                            </tr>
+                                                        `).join('')}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `}
+                        </div>
+                    </div>
+                `;
+
                 if (currentView === 'calendar') {
                     // Calendar view
                     html += `
@@ -16619,14 +17317,15 @@
                                                 <div class="space-y-1">
                                                     ${dayRequests.slice(0, 2).map(req => {
                                                         const crc = state.crcs.find(c => c.id === req.crcId);
-                                                        const statusColor = req.status === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
-                                                                           req.status === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
+                                                        const statusKey = normalizeTimeOffStatus(req.status);
+                                                        const statusColor = statusKey === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
+                                                                           statusKey === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
                                                                            'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200';
-                                                        // Get full first name
                                                         const firstName = crc ? (crc.name.split(' ')[0] || crc.name) : 'Unknown';
-                                                        return `<div class="text-xs px-1 py-0.5 rounded ${statusColor} truncate flex items-center justify-between" title="${crc ? crc.name : 'Unknown'}: ${req.type || 'Time Off'}">
-                                                            <span class="truncate flex-1">${firstName}</span>
-                                                            ${(req.status === 'approved' || req.status === 'rejected') ? `<button data-action="delete-time-off-request" data-id="${req.id}" class="ml-1 text-gray-600 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400" title="Delete">×</button>` : ''}
+                                                        const pendingSuffix = statusKey === 'pending' ? ' (Pending Review)' : '';
+                                                        return `<div class="text-xs px-1 py-0.5 rounded ${statusColor} truncate flex items-center justify-between" title="${crc ? crc.name : 'Unknown'}: ${req.type || 'Time Off'} (${formatTimeOffStatus(req.status)})">
+                                                            <span class="truncate flex-1">${firstName}${pendingSuffix}</span>
+                                                            ${(statusKey === 'approved' || statusKey === 'rejected') ? `<button data-action="delete-time-off-request" data-id="${req.id}" class="ml-1 text-gray-600 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400" title="Delete">×</button>` : ''}
                                                         </div>`;
                                                     }).join('')}
                                                     ${dayRequests.length > 2 ? `<div class="text-xs text-gray-500 dark:text-gray-400">+${dayRequests.length - 2} more</div>` : ''}
@@ -16677,8 +17376,9 @@
                                                 ${requests.map(request => {
                                                     const crc = state.crcs.find(c => c.id === request.crcId);
                                                     const employeeName = crc ? crc.name : 'Unknown';
-                                                    const statusColor = request.status === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
-                                                                     request.status === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
+                                                    const statusKey = normalizeTimeOffStatus(request.status);
+                                                    const statusColor = statusKey === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
+                                                                     statusKey === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
                                                                      'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200';
                                                     return `
                                             <tr>
@@ -16696,18 +17396,18 @@
                                                 </td>
                                                             <td class="px-6 py-4 whitespace-nowrap">
                                                                 <span class="px-2 py-1 text-xs font-medium rounded-full ${statusColor}">
-                                                                    ${request.status || 'pending'}
+                                                                    ${formatTimeOffStatus(request.status)}
                                                                 </span>
                                                             </td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                    ${request.createdAt ? new Date(request.createdAt).toLocaleDateString() : 'N/A'}
+                                                ${request.createdAt ? formatDisplayDate(request.createdAt) : 'N/A'}
                                                 </td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                                ${request.status === 'pending' ? `
+                                                                ${statusKey === 'pending' ? `
                                                     <button data-action="approve-time-off-request" data-id="${request.id}" class="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 mr-2">Approve</button>
                                                     <button data-action="reject-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700">Reject</button>
                                                                 ` : `
-                                                                    <button data-action="delete-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700" title="Delete ${request.status} request">Delete</button>
+                                                                    <button data-action="delete-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700" title="Delete ${formatTimeOffStatus(request.status)} request">Delete</button>
                                                                 `}
                                                 </td>
                                             </tr>
@@ -16751,6 +17451,36 @@
                         renderTimeOffRequestsContent();
                     }
                 });
+                
+                document.getElementById('time-off-summary-range')?.addEventListener('change', (e) => {
+                    const newRange = e.target.value || 'month';
+                    setState({ timeOffSummaryRange: newRange });
+                    if (newRange !== 'custom') {
+                        // Reset custom dates to align with preset range
+                        const { startDate, endDate } = getTimeOffRangeBounds(newRange);
+                        setState({
+                            timeOffSummaryCustomStart: toDateOnlyString(startDate),
+                            timeOffSummaryCustomEnd: toDateOnlyString(endDate)
+                        });
+                    }
+                    renderTimeOffRequestsContent();
+                });
+
+                const timeOffSummaryStartInput = document.getElementById('time-off-summary-start');
+                if (timeOffSummaryStartInput) {
+                    timeOffSummaryStartInput.addEventListener('change', (e) => {
+                        setState({ timeOffSummaryCustomStart: e.target.value || null });
+                        renderTimeOffRequestsContent();
+                    });
+                }
+
+                const timeOffSummaryEndInput = document.getElementById('time-off-summary-end');
+                if (timeOffSummaryEndInput) {
+                    timeOffSummaryEndInput.addEventListener('change', (e) => {
+                        setState({ timeOffSummaryCustomEnd: e.target.value || null });
+                        renderTimeOffRequestsContent();
+                    });
+                }
             };
 
             // Travel Content Rendering
@@ -17870,7 +18600,6 @@
                     
                     // Load users if current user is Manager
                     let users = [];
-                    let timeOffRequests = [];
                     if (state.currentUser && state.currentUser.permissionLevel === 'Manager') {
                         try {
                             users = await apiService.getUsers();
@@ -17880,28 +18609,13 @@
                         }
                     }
                     
-                    // Load time off requests if current user is Manager or Supervisor
-                    // Note: This endpoint may not be available yet, so we fail gracefully
-                    if (state.currentUser && (state.currentUser.permissionLevel === 'Manager' || state.currentUser.permissionLevel === 'Supervisor')) {
-                        try {
-                            timeOffRequests = await apiService.getTimeOffRequests();
-                            console.log('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
-                        } catch (error) {
-                            console.warn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
-                            // Continue without time off requests - they'll be created when needed
-                            timeOffRequests = [];
-                        }
-                    }
-                    
-                    // Also try to load time off requests for regular users (to see their own requests)
-                    if (state.currentUser && !timeOffRequests) {
-                        try {
-                            timeOffRequests = await apiService.getTimeOffRequests();
-                            console.log('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
-                        } catch (error) {
-                            // Fail silently - endpoint may not exist yet
-                            timeOffRequests = [];
-                        }
+                    let timeOffRequests = [];
+                    try {
+                        timeOffRequests = await apiService.getTimeOffRequests();
+                        console.log('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
+                    } catch (error) {
+                        console.warn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
+                        timeOffRequests = [];
                     }
                     
                     // Sync approved time off requests with unavailability events after events are loaded
