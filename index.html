@@ -1525,6 +1525,7 @@
                 truck_events: [],
                 users: [], // Users for authentication
                 timeOffRequests: [], // Time off requests awaiting approval
+                timeOffRequestsMonth: null,
                 timeOffRequestsExportStart: null,
                 timeOffRequestsExportEnd: null,
                 timeOffRequestsExportStatuses: ['pending', 'approved', 'rejected'],
@@ -2818,6 +2819,85 @@
                     }
                 }
                 return 8;
+            };
+
+            const getTimeOffRequestRange = (request) => {
+                if (!request) return null;
+                const startDate = parseDateFlexible(request.startDate || request.date);
+                const endDate = parseDateFlexible(request.endDate || request.date || request.startDate);
+                if (!startDate && !endDate) return null;
+
+                const start = startDate
+                    ? new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate())
+                    : null;
+                const endSource = endDate || startDate;
+                const end = endSource
+                    ? new Date(endSource.getFullYear(), endSource.getMonth(), endSource.getDate())
+                    : null;
+
+                if (!start && !end) return null;
+                if (!start) return { start: new Date(end), end: new Date(end) };
+                if (!end) return { start: new Date(start), end: new Date(start) };
+
+                if (end < start) {
+                    return { start: new Date(end), end: new Date(start) };
+                }
+
+                return { start, end };
+            };
+
+            const doesTimeOffRequestIntersectRange = (request, rangeStart, rangeEnd) => {
+                if (!rangeStart && !rangeEnd) return true;
+                const span = getTimeOffRequestRange(request);
+                if (!span) return false;
+                const start = rangeStart ? new Date(rangeStart.getFullYear(), rangeStart.getMonth(), rangeStart.getDate()) : null;
+                const end = rangeEnd ? new Date(rangeEnd.getFullYear(), rangeEnd.getMonth(), rangeEnd.getDate()) : null;
+                const rangeEndTime = end ? end.getTime() : Number.POSITIVE_INFINITY;
+                const rangeStartTime = start ? start.getTime() : Number.NEGATIVE_INFINITY;
+                return span.start.getTime() <= rangeEndTime && span.end.getTime() >= rangeStartTime;
+            };
+
+            const getDailyEntriesForTimeOffRequest = (request, rangeStart, rangeEnd) => {
+                const span = getTimeOffRequestRange(request);
+                if (!span) return [];
+
+                const startBoundary = rangeStart
+                    ? new Date(rangeStart.getFullYear(), rangeStart.getMonth(), rangeStart.getDate())
+                    : null;
+                const endBoundary = rangeEnd
+                    ? new Date(rangeEnd.getFullYear(), rangeEnd.getMonth(), rangeEnd.getDate())
+                    : null;
+
+                const normalizedHoursSource = Number.isFinite(request?.hours) ? Number(request.hours) : getHoursForPeriod(request?.period);
+                const normalizedHours = Number.isFinite(normalizedHoursSource) && normalizedHoursSource > 0
+                    ? normalizedHoursSource
+                    : 8;
+
+                const entries = [];
+                const cursor = new Date(span.start);
+                const limit = new Date(span.end);
+                while (cursor <= limit) {
+                    const withinLower = !startBoundary || cursor.getTime() >= startBoundary.getTime();
+                    const withinUpper = !endBoundary || cursor.getTime() <= endBoundary.getTime();
+                    if (withinLower && withinUpper) {
+                        const dateStr = toDateOnlyString(cursor);
+                        entries.push({
+                            date: new Date(cursor.getTime()),
+                            dateStr,
+                            status: normalizeTimeOffStatus(request?.status),
+                            statusLabel: formatTimeOffStatus(request?.status),
+                            period: request?.period || 'Full Day',
+                            hours: normalizedHours,
+                            type: request?.type || request?.category || 'Time Off',
+                            requestId: request?.id || '',
+                            crcId: request?.crcId,
+                            payload: request
+                        });
+                    }
+                    cursor.setDate(cursor.getDate() + 1);
+                }
+
+                return entries;
             };
 
             const getMonthKey = (dateObj) => {
@@ -5327,12 +5407,20 @@
                 ];
                 const activeStatuses = statusMeta.filter(meta => selectedStatuses.includes(meta.value));
 
+                const rangeStartDate = parseDateOnly(startDateStr);
+                const rangeEndDate = new Date(endDateObj.getFullYear(), endDateObj.getMonth(), endDateObj.getDate());
+                const selectedCrcMeta = selectedCrcs.map(crcId => {
+                    const crc = state.crcs.find(c => c.id === crcId);
+                    return {
+                        id: crcId,
+                        name: crc ? crc.name : `CRC ${crcId}`
+                    };
+                });
+
                 const summaryRows = [];
                 const monthlyRows = [];
 
-                selectedCrcs.forEach(crcId => {
-                    const crc = state.crcs.find(c => c.id === crcId);
-                    const crcName = crc ? crc.name : `CRC ${crcId}`;
+                selectedCrcMeta.forEach(({ id: crcId, name: crcName }) => {
                     const summary = summaryData.summaries.get(crcId);
                     const statusTotals = {
                         pendingHours: summary ? summary.pendingHours : 0,
@@ -5369,6 +5457,33 @@
                         row.totalHours = row.pendingHours + row.approvedHours + row.rejectedHours;
                         row.totalDays = row.pendingDays + row.approvedDays + row.rejectedDays;
                         monthlyRows.push(row);
+                    });
+                });
+
+                const normalizedSelectedStatuses = selectedStatuses.map(normalizeTimeOffStatus);
+                const dailyEntriesMap = new Map();
+                selectedCrcMeta.forEach(({ id }) => dailyEntriesMap.set(id, []));
+
+                (Array.isArray(state.timeOffRequests) ? state.timeOffRequests : []).forEach(request => {
+                    if (!request || !request.crcId || !selectedCrcs.includes(request.crcId)) {
+                        return;
+                    }
+                    const statusKey = normalizeTimeOffStatus(request.status);
+                    if (!normalizedSelectedStatuses.includes(statusKey)) {
+                        return;
+                    }
+                    const entries = getDailyEntriesForTimeOffRequest(request, rangeStartDate, rangeEndDate);
+                    if (!entries.length) return;
+                    const bucket = dailyEntriesMap.get(request.crcId) || [];
+                    entries.forEach(entry => bucket.push(entry));
+                    dailyEntriesMap.set(request.crcId, bucket);
+                });
+
+                dailyEntriesMap.forEach(entries => {
+                    entries.sort((a, b) => {
+                        const dateCompare = a.dateStr.localeCompare(b.dateStr);
+                        if (dateCompare !== 0) return dateCompare;
+                        return a.status.localeCompare(b.status);
                     });
                 });
 
@@ -5469,7 +5584,14 @@
                     rows: monthlyRows,
                     statuses: activeStatuses.map(s => s.value),
                     startMonth: startValue,
-                    endMonth: endValue
+                    endMonth: endValue,
+                    rangeStart: startDateStr,
+                    rangeEnd: endDateStr,
+                    dailyByCrc: selectedCrcMeta.map(meta => ({
+                        crcId: meta.id,
+                        crcName: meta.name,
+                        days: (dailyEntriesMap.get(meta.id) || []).slice()
+                    }))
                 };
 
                 exportBtn.classList.toggle('hidden', monthlyRows.length === 0);
@@ -5483,43 +5605,52 @@
                     return;
                 }
 
-                const statusMeta = [
-                    { value: 'pending', label: 'Pending Review' },
-                    { value: 'approved', label: 'Approved' },
-                    { value: 'rejected', label: 'Rejected' }
-                ];
-                const activeStatuses = statusMeta.filter(meta => reportState.statuses.includes(meta.value));
-
-                if (activeStatuses.length === 0) {
+                const detailGroups = Array.isArray(reportState.dailyByCrc) ? reportState.dailyByCrc : [];
+                if (detailGroups.length === 0) {
                     showNotification('Select at least one status before exporting.', 'info');
                     return;
                 }
 
-                const headers = ['CRC Name', 'Month', 'Year'];
-                activeStatuses.forEach(meta => {
-                    headers.push(`${meta.label} Hours`);
-                    headers.push(`${meta.label} Days`);
-                });
-                headers.push('Total Hours', 'Total Days');
+                const sortedGroups = [...detailGroups].sort((a, b) => (a.crcName || '').localeCompare(b.crcName || ''));
+                const csvLines = [];
 
-                const rows = reportState.rows.map(row => {
-                    const monthLabel = getMonthLabel(row.monthKey);
-                    const [monthName, yearLabel] = monthLabel.split(' ');
-                    const csvRow = [
-                        row.crcName,
-                        monthName || monthLabel,
-                        yearLabel || row.monthKey.split('-')[0]
-                    ];
-                    activeStatuses.forEach(meta => {
-                        csvRow.push(formatHours(row[`${meta.value}Hours`] || 0));
-                        csvRow.push(formatDays(row[`${meta.value}Days`] || 0));
-                    });
-                    csvRow.push(formatHours(row.totalHours || 0));
-                    csvRow.push(formatDays(row.totalDays || 0));
-                    return csvRow.map(val => `"${(val || '').toString().replace(/"/g, '""')}"`).join(',');
+                if (reportState.rangeStart && reportState.rangeEnd) {
+                    const rangeLabel = `${formatDisplayDate(reportState.rangeStart, { month: 'short', day: 'numeric', year: 'numeric' })} - ${formatDisplayDate(reportState.rangeEnd, { month: 'short', day: 'numeric', year: 'numeric' })}`;
+                    csvLines.push(`"Report Range","${rangeLabel.replace(/"/g, '""')}"`);
+                    csvLines.push('');
+                }
+
+                sortedGroups.forEach(group => {
+                    csvLines.push([
+                        group.crcName || 'Unknown CRC',
+                        'Date',
+                        'Status',
+                        'Period',
+                        'Hours',
+                        'Type',
+                        'Request ID'
+                    ].map(val => `"${(val || '').toString().replace(/"/g, '""')}"`).join(','));
+
+                    const days = Array.isArray(group.days) ? group.days : [];
+                    if (days.length === 0) {
+                        csvLines.push(`,"No time off days within selected range"`);
+                    } else {
+                        days.forEach(day => {
+                            csvLines.push([
+                                '',
+                                formatDisplayDate(day.dateStr, { month: 'short', day: 'numeric', year: 'numeric' }),
+                                day.statusLabel || formatTimeOffStatus(day.status),
+                                day.period || 'Full Day',
+                                formatHours(day.hours || 0),
+                                day.type || 'Time Off',
+                                day.requestId || ''
+                            ].map(val => `"${(val || '').toString().replace(/"/g, '""')}"`).join(','));
+                        });
+                    }
+                    csvLines.push('');
                 });
 
-                const csvContent = "data:text/csv;charset=utf-8," + [headers.join(','), ...rows].join('\n');
+                const csvContent = "data:text/csv;charset=utf-8," + csvLines.join('\n');
                 const encodedUri = encodeURI(csvContent);
                 const link = document.createElement("a");
                 link.setAttribute("href", encodedUri);
@@ -14990,6 +15121,54 @@
                             });
                             crcIds = Array.from(assignedCrcIds);
                             console.log('Collected CRC IDs from role assignments:', crcIds);
+                            
+                            // Build deduplicated assignments map based on selection order
+                            const assignmentsMap = new Map();
+                            roleAssignmentInputs.forEach(input => {
+                                const parts = input.name.split('-').slice(1);
+                                if (parts.length < 2) return;
+                                const [roleId, indexRaw] = parts;
+                                const index = parseInt(indexRaw, 10);
+                                if (!Number.isFinite(index)) return;
+                                if (!assignmentsMap.has(roleId)) {
+                                    assignmentsMap.set(roleId, []);
+                                }
+                                const arr = assignmentsMap.get(roleId);
+                                const crcValue = input.value || null;
+                                if (arr[index] !== crcValue) {
+                                    arr[index] = crcValue;
+                                }
+                            });
+                            assignmentsMap.forEach((arr, roleId) => {
+                                const filtered = arr.filter(Boolean);
+                                assignmentsMap.set(roleId, filtered);
+                            });
+                            
+                            // Detect duplicates selected in UI and record them for override warning
+                        const duplicateCountByRole = new Map();
+                        form._deduplicatedRoleAssignments.forEach((values, roleId) => {
+                            const role = state.roles.find(r => r.id === roleId);
+                            const roleName = role ? role.name : roleId;
+                            const seen = new Set();
+                            values.forEach(crcId => {
+                                if (!crcId) return;
+                                const key = `${roleName}::${crcId}`;
+                                duplicateCountByRole.set(key, (duplicateCountByRole.get(key) || 0) + 1);
+                                if (seen.has(crcId)) {
+                                    duplicateRoleAssignments.push({
+                                        crcId,
+                                        roles: [roleName],
+                                        count: duplicateCountByRole.get(key)
+                                    });
+                                }
+                                seen.add(crcId);
+                            });
+                        });
+                            
+                            // Update local assignments to the deduplicated map for saving
+                            form._deduplicatedRoleAssignments = assignmentsMap;
+                        } else {
+                            form._deduplicatedRoleAssignments = null;
                         }
                         
                         // Check for CRC selection based on event type
@@ -15280,15 +15459,23 @@
                             try {
                                 // Collect role assignments from the new interface
                                 const roleAssignments = {};
-                                roleAssignmentInputs.forEach(input => {
-                                    const [roleId, index] = input.name.split('-').slice(1);
-                                    if (input.value) {
-                                        if (!roleAssignments[roleId]) {
-                                            roleAssignments[roleId] = [];
+                                if (form._deduplicatedRoleAssignments) {
+                                    form._deduplicatedRoleAssignments.forEach((values, roleId) => {
+                                        if (values.length > 0) {
+                                            roleAssignments[roleId] = values.slice();
                                         }
-                                        roleAssignments[roleId][parseInt(index)] = input.value;
-                                    }
-                                });
+                                    });
+                                } else {
+                                    roleAssignmentInputs.forEach(input => {
+                                        const [roleId, index] = input.name.split('-').slice(1);
+                                        if (input.value) {
+                                            if (!roleAssignments[roleId]) {
+                                                roleAssignments[roleId] = [];
+                                            }
+                                            roleAssignments[roleId][parseInt(index)] = input.value;
+                                        }
+                                    });
+                                }
 
                                 const baseEventData = {
                                     siteId: data.siteId || null,
@@ -18356,6 +18543,17 @@
                 const currentView = state.timeOffRequestsView || 'list';
                 const currentEmployeeFilter = state.timeOffRequestsEmployeeFilter || 'all';
                 const currentStatusFilter = state.timeOffRequestsStatusFilter || 'all';
+                let selectedMonth = state.timeOffRequestsMonth;
+                const today = new Date();
+                if (!selectedMonth || !/^\d{4}-\d{2}$/.test(selectedMonth)) {
+                    selectedMonth = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+                    state.timeOffRequestsMonth = selectedMonth;
+                }
+                const [selectedYearRaw, selectedMonthRaw] = selectedMonth.split('-').map(Number);
+                const displayYear = Number.isFinite(selectedYearRaw) ? selectedYearRaw : today.getFullYear();
+                const displayMonthIndex = Number.isFinite(selectedMonthRaw) ? Math.min(Math.max(selectedMonthRaw - 1, 0), 11) : today.getMonth();
+                const monthStartDate = new Date(displayYear, displayMonthIndex, 1);
+                const monthEndDate = new Date(displayYear, displayMonthIndex + 1, 0);
 
                 // Get all unique employee names for filter
                 const employeeNames = [...new Set(allRequests.map(req => {
@@ -18376,6 +18574,8 @@
                 if (currentStatusFilter !== 'all') {
                     filteredRequests = filteredRequests.filter(req => req.status === currentStatusFilter);
                 }
+
+                filteredRequests = filteredRequests.filter(req => doesTimeOffRequestIntersectRange(req, monthStartDate, monthEndDate));
 
                 // Sort by employee name
                 filteredRequests.sort((a, b) => {
@@ -18400,25 +18600,32 @@
                 // Group by date for calendar view
                 const requestsByDate = {};
                 filteredRequests.forEach(request => {
-                    const dateKey = request.date || request.startDate;
-                    if (dateKey) {
-                        const parsedDate = typeof dateKey === 'string'
-                            ? parseDateOnly(dateKey)
-                            : (dateKey instanceof Date ? dateKey : null);
-                        const dateStr = parsedDate ? toDateOnlyString(parsedDate) : toDateOnlyString(new Date(dateKey));
-                        if (!requestsByDate[dateStr]) {
-                            requestsByDate[dateStr] = [];
+                    const entries = getDailyEntriesForTimeOffRequest(request, monthStartDate, monthEndDate);
+                    if (!entries.length) return;
+                    entries.forEach(entry => {
+                        if (!requestsByDate[entry.dateStr]) {
+                            requestsByDate[entry.dateStr] = [];
                         }
-                        requestsByDate[dateStr].push(request);
-                    }
+                        requestsByDate[entry.dateStr].push(entry);
+                    });
+                });
+                Object.values(requestsByDate).forEach(entries => {
+                    entries.sort((a, b) => {
+                        const crcA = state.crcs.find(c => c.id === a.crcId);
+                        const crcB = state.crcs.find(c => c.id === b.crcId);
+                        const nameA = crcA ? crcA.name : '';
+                        const nameB = crcB ? crcB.name : '';
+                        const nameCompare = nameA.localeCompare(nameB);
+                        if (nameCompare !== 0) return nameCompare;
+                        return a.status.localeCompare(b.status);
+                    });
                 });
 
-                // Get current month/year for calendar
-                const now = new Date();
-                const currentMonth = now.getMonth();
-                const currentYear = now.getFullYear();
-                const firstDay = new Date(currentYear, currentMonth, 1);
-                const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+                // Get current month/year for calendar display
+                const calendarYear = displayYear;
+                const calendarMonthIndex = displayMonthIndex;
+                const firstDay = new Date(calendarYear, calendarMonthIndex, 1);
+                const daysInMonth = new Date(calendarYear, calendarMonthIndex + 1, 0).getDate();
                 const startingDayOfWeek = firstDay.getDay();
 
                 let html = `
@@ -18451,6 +18658,10 @@
                                     <option value="approved" ${currentStatusFilter === 'approved' ? 'selected' : ''}>Approved</option>
                                     <option value="rejected" ${currentStatusFilter === 'rejected' ? 'selected' : ''}>Rejected</option>
                                 </select>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Month:</label>
+                                <input type="month" id="time-off-month-selector" value="${selectedMonth}" class="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm" />
                             </div>
                             <div class="flex items-center space-x-2">
                                 <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Search:</label>
@@ -18586,7 +18797,7 @@
                         <div class="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
                             <div class="p-4 border-b dark:border-gray-700 flex justify-between items-center">
                                 <h3 class="text-lg font-semibold text-gray-900 dark:text-white">
-                                    ${new Date(currentYear, currentMonth).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                                    ${new Date(calendarYear, calendarMonthIndex).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
                                 </h3>
                             </div>
                             <div class="p-4">
@@ -18599,25 +18810,29 @@
                                     ${Array(startingDayOfWeek).fill(null).map(() => `<div class="aspect-square"></div>`).join('')}
                                     ${Array.from({ length: daysInMonth }, (_, i) => {
                                         const day = i + 1;
-                                        const dateStr = toDateOnlyString(new Date(currentYear, currentMonth, day));
+                                        const dateStr = toDateOnlyString(new Date(calendarYear, calendarMonthIndex, day));
                                         const dayRequests = requestsByDate[dateStr] || [];
-                                        const isToday = day === now.getDate() && currentMonth === now.getMonth() && currentYear === now.getFullYear();
+                                        const isToday = day === today.getDate() && calendarMonthIndex === today.getMonth() && calendarYear === today.getFullYear();
                                         
                                         return `
                                             <div class="aspect-square border border-gray-200 dark:border-gray-700 p-1 ${isToday ? 'bg-blue-50 dark:bg-blue-900/20' : ''}">
                                                 <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">${day}</div>
                                                 <div class="space-y-1">
-                                                    ${dayRequests.slice(0, 2).map(req => {
-                                                        const crc = state.crcs.find(c => c.id === req.crcId);
-                                                        const statusKey = normalizeTimeOffStatus(req.status);
+                                                    ${dayRequests.slice(0, 2).map(entry => {
+                                                        const baseRequest = entry?.payload || {};
+                                                        const crcId = entry?.crcId || baseRequest.crcId;
+                                                        const crc = state.crcs.find(c => c.id === crcId);
+                                                        const statusKey = entry?.status || normalizeTimeOffStatus(baseRequest.status);
                                                         const statusColor = statusKey === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
                                                                            statusKey === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
                                                                            'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200';
                                                         const firstName = crc ? (crc.name.split(' ')[0] || crc.name) : 'Unknown';
                                                         const pendingSuffix = statusKey === 'pending' ? ' (Pending Review)' : '';
-                                                        return `<div class="text-xs px-1 py-0.5 rounded ${statusColor} truncate flex items-center justify-between" title="${crc ? crc.name : 'Unknown'}: ${req.type || 'Time Off'} (${formatTimeOffStatus(req.status)})">
+                                                        const typeLabel = entry?.type || baseRequest.type || 'Time Off';
+                                                        const requestId = entry?.requestId || baseRequest.id || '';
+                                                        return `<div class="text-xs px-1 py-0.5 rounded ${statusColor} truncate flex items-center justify-between" title="${crc ? crc.name : 'Unknown'}: ${typeLabel} (${formatTimeOffStatus(statusKey)})">
                                                             <span class="truncate flex-1">${firstName}${pendingSuffix}</span>
-                                                            ${(statusKey === 'approved' || statusKey === 'rejected') ? `<button data-action="delete-time-off-request" data-id="${req.id}" class="ml-1 text-gray-600 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400" title="Delete">×</button>` : ''}
+                                                            ${(statusKey === 'approved' || statusKey === 'rejected') ? `<button data-action="delete-time-off-request" data-id="${requestId}" class="ml-1 text-gray-600 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400" title="Delete">×</button>` : ''}
                                                         </div>`;
                                                     }).join('')}
                                                     ${dayRequests.length > 2 ? `<div class="text-xs text-gray-500 dark:text-gray-400">+${dayRequests.length - 2} more</div>` : ''}
@@ -18741,6 +18956,19 @@
                 
                 document.getElementById('time-off-status-filter')?.addEventListener('change', (e) => {
                     state.timeOffRequestsStatusFilter = e.target.value;
+                    renderTimeOffRequestsContent();
+                });
+                
+                document.getElementById('time-off-month-selector')?.addEventListener('change', (e) => {
+                    const value = (e.target.value || '').trim();
+                    if (value && /^\d{4}-\d{2}$/.test(value)) {
+                        state.timeOffRequestsMonth = value;
+                    } else {
+                        const now = new Date();
+                        const fallback = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                        state.timeOffRequestsMonth = fallback;
+                        e.target.value = fallback;
+                    }
                     renderTimeOffRequestsContent();
                 });
                 
