@@ -1,23 +1,14 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
-
+const fetch = require('node-fetch');
 // Use node-fetch instead of native fetch for Azure Functions compatibility
 // Native fetch is broken in Azure Functions environment
 // Import node-fetch dynamically - this will be initialized on first use
-let fetch;
-const getFetch = async () => {
-    if (!fetch) {
-        const nodeFetch = await import('node-fetch');
-        fetch = nodeFetch.default;
-    }
-    return fetch;
-};
 
 // Helper function to generate unique IDs
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
-
 // Helper function to get Cosmos DB client (lazy initialization)
 let cosmosClient = null;
 let database = null;
@@ -1758,7 +1749,7 @@ app.http('navanLookup', {
             }
             
             context.log.info('Requesting OAuth token from Navan...');
-            const fetchFn = await getFetch();
+            const fetchFN = fetch;
             const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
                 method: 'POST',
                 headers: {
@@ -1832,7 +1823,7 @@ app.http('navanLookup', {
                 while (!foundBooking && page < 10) { // Limit to 10 pages (1000 bookings max)
                     context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
                     
-                    const fetchFn = await getFetch();
+                    const fetchFN = fetch;
                     bookingResponse = await fetchFn(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
                         method: 'GET',
                         headers: {
@@ -1871,7 +1862,7 @@ app.http('navanLookup', {
                             // Now use the UUID to fetch the full booking details directly
                             // This is more efficient and ensures we get all details
                             context.log.info(`Fetching full booking details using UUID: ${bookingUuid}`);
-                            const fetchFn = await getFetch();
+                            const fetchFN = fetch;
                             const uuidResponse = await fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                                 method: 'GET',
                                 headers: {
@@ -2443,7 +2434,7 @@ app.http('navanTest', {
             context.log.info('Testing OAuth token generation...');
             let tokenResponse;
             try {
-                const fetchFn = await getFetch();
+                const fetchFN = fetch;
                 tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
                     method: 'POST',
                     headers: {
@@ -2520,7 +2511,7 @@ app.http('navanTest', {
             context.log.info('Testing API call with token...');
             let testApiResponse;
             try {
-                const fetchFn = await getFetch();
+                const fetchFN = fetch;
                 testApiResponse = await fetchFn(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
                     method: 'GET',
                     headers: {
@@ -2711,7 +2702,7 @@ app.http('geocode', {
             const apiUrl = `https://atlas.microsoft.com/search/address/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const fetchFn = await getFetch();
+                const fetchFN = fetch;
                 const response = await fetchFn(apiUrl);
                 const data = await response.json();
                 return {
@@ -2783,7 +2774,7 @@ app.http('routeDirections', {
             const apiUrl = `https://atlas.microsoft.com/route/directions/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const fetchFn = await getFetch();
+                const fetchFN = fetch;
                 const response = await fetchFn(apiUrl);
                 const data = await response.json();
                 return {
