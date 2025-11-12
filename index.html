@@ -10689,16 +10689,20 @@
                 const defaultDuplicateVisit = baseVisitNumber ? suggestNextVisitNumber(baseVisitNumber) : '';
                 const defaultDuplicateStartDate = (() => {
                     try {
-                        const ref = parseDateFlexible(endDateValue);
-                        if (!ref) return '';
-                        const next = new Date(ref);
-                        next.setDate(next.getDate() + 1);
-                        return toDateOnlyString(next);
+                        const ref = parseDateFlexible(startDateValue);
+                        return ref ? toDateOnlyString(ref) : '';
                     } catch {
                         return '';
                     }
                 })();
-                const defaultDuplicateEndDate = defaultDuplicateStartDate;
+                const defaultDuplicateEndDate = (() => {
+                    try {
+                        const ref = parseDateFlexible(endDateValue);
+                        return ref ? toDateOnlyString(ref) : defaultDuplicateStartDate;
+                    } catch {
+                        return defaultDuplicateStartDate;
+                    }
+                })();
                 
                 const show = {
                     crc: !['Open Shift'].includes(eventType),
@@ -15146,7 +15150,10 @@
                             
                             // Detect duplicates selected in UI and record them for override warning
                         const duplicateCountByRole = new Map();
-                        form._deduplicatedRoleAssignments.forEach((values, roleId) => {
+                        const deduplicatedAssignments = form._deduplicatedRoleAssignments instanceof Map
+                            ? form._deduplicatedRoleAssignments
+                            : assignmentsMap;
+                        deduplicatedAssignments.forEach((values, roleId) => {
                             const role = state.roles.find(r => r.id === roleId);
                             const roleName = role ? role.name : roleId;
                             const seen = new Set();
@@ -18534,6 +18541,110 @@
                 `;
             };
 
+            const exportDailyTimeOffRequests = () => {
+                const allRequests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
+                if (!allRequests.length) {
+                    showNotification('No time off requests available to export.', 'info');
+                    return;
+                }
+
+                const employeeFilter = state.timeOffRequestsEmployeeFilter || 'all';
+                const statusFilter = (state.timeOffRequestsStatusFilter || 'all').toLowerCase();
+                const monthValueRaw = state.timeOffRequestsMonth;
+                const today = new Date();
+
+                let rangeYear = today.getFullYear();
+                let rangeMonthIndex = today.getMonth();
+                if (typeof monthValueRaw === 'string' && /^\d{4}-\d{2}$/.test(monthValueRaw)) {
+                    const [yearStr, monthStr] = monthValueRaw.split('-');
+                    const parsedYear = Number(yearStr);
+                    const parsedMonth = Number(monthStr);
+                    if (Number.isFinite(parsedYear) && Number.isFinite(parsedMonth)) {
+                        rangeYear = parsedYear;
+                        rangeMonthIndex = Math.min(Math.max(parsedMonth - 1, 0), 11);
+                    }
+                }
+
+                const rangeStart = new Date(rangeYear, rangeMonthIndex, 1);
+                const rangeEnd = new Date(rangeYear, rangeMonthIndex + 1, 0);
+
+                const entries = [];
+
+                allRequests.forEach(request => {
+                    if (!request || !request.crcId) return;
+
+                    const crc = state.crcs.find(c => c.id === request.crcId);
+                    const crcName = crc ? crc.name : 'Unknown';
+                    if (employeeFilter !== 'all' && crcName !== employeeFilter) {
+                        return;
+                    }
+
+                    const normalizedStatus = normalizeTimeOffStatus(request.status);
+                    if (statusFilter !== 'all' && normalizedStatus !== statusFilter) {
+                        return;
+                    }
+
+                    const dailyEntries = getDailyEntriesForTimeOffRequest(request, rangeStart, rangeEnd);
+                    dailyEntries.forEach(entry => {
+                        entries.push({
+                            crcName,
+                            dateStr: entry.dateStr,
+                            status: entry.status,
+                            statusLabel: entry.statusLabel,
+                            period: entry.period,
+                            hours: entry.hours,
+                            type: entry.type,
+                            requestId: entry.requestId
+                        });
+                    });
+                });
+
+                if (entries.length === 0) {
+                    showNotification('No matching time off days found for the selected filters.', 'info');
+                    return;
+                }
+
+                entries.sort((a, b) => {
+                    const nameCompare = a.crcName.localeCompare(b.crcName);
+                    if (nameCompare !== 0) return nameCompare;
+                    const dateCompare = a.dateStr.localeCompare(b.dateStr);
+                    if (dateCompare !== 0) return dateCompare;
+                    return a.status.localeCompare(b.status);
+                });
+
+                const csvLines = [];
+                const rangeLabel = `${formatDisplayDate(rangeStart, { month: 'short', year: 'numeric' })}`;
+                csvLines.push(`"Selected Month","${rangeLabel.replace(/"/g, '""')}"`);
+                csvLines.push('');
+
+                csvLines.push(['CRC Name', 'Date', 'Status', 'Period', 'Hours', 'Type', 'Request ID']
+                    .map(val => `"${val.replace(/"/g, '""')}"`).join(','));
+
+                entries.forEach(entry => {
+                    csvLines.push([
+                        entry.crcName,
+                        formatDisplayDate(entry.dateStr, { month: 'short', day: 'numeric', year: 'numeric' }),
+                        entry.statusLabel || formatTimeOffStatus(entry.status),
+                        entry.period || 'Full Day',
+                        formatHours(entry.hours || 0),
+                        entry.type || 'Time Off',
+                        entry.requestId || ''
+                    ].map(val => `"${(val || '').toString().replace(/"/g, '""')}"`).join(','));
+                });
+
+                const csvContent = "data:text/csv;charset=utf-8," + csvLines.join('\n');
+                const encodedUri = encodeURI(csvContent);
+                const link = document.createElement('a');
+                link.setAttribute('href', encodedUri);
+                const now = new Date();
+                const filename = `time_off_daily_${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, '0')}_${String(now.getDate()).padStart(2, '0')}.csv`;
+                link.setAttribute('download', filename);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                showNotification('Time off days exported successfully.', 'success');
+            };
+
             const renderTimeOffRequestsContent = () => {
                 const container = document.getElementById('time-off-requests-content');
                 if (!container) return;
@@ -18667,6 +18778,10 @@
                                 <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Search:</label>
                                 <input type="text" id="time-off-search" placeholder="Search employee name..." class="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm" />
                             </div>
+                            <button id="export-timeoff-daily-btn" class="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors">
+                                <i data-lucide="download" class="w-4 h-4"></i>
+                                Export Daily CSV
+                            </button>
                         </div>
                     </div>
                 `;
@@ -18957,6 +19072,11 @@
                 document.getElementById('time-off-status-filter')?.addEventListener('change', (e) => {
                     state.timeOffRequestsStatusFilter = e.target.value;
                     renderTimeOffRequestsContent();
+                });
+                
+                document.getElementById('export-timeoff-daily-btn')?.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    exportDailyTimeOffRequests();
                 });
                 
                 document.getElementById('time-off-month-selector')?.addEventListener('change', (e) => {
