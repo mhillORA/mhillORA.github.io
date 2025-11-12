@@ -1,10 +1,38 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
+// Use node-fetch instead of native fetch for Azure Functions compatibility
+// Native fetch is broken in Azure Functions environment
+// Import node-fetch using require (v2 supports CommonJS)
+let fetch;
+let fetchError = null;
+const getFetch = async () => {
+    if (fetchError) {
+        throw fetchError;
+    }
+    if (!fetch) {
+        try {
+            // Try CommonJS require first (node-fetch v2)
+            try {
+                fetch = require('node-fetch');
+            } catch (requireError) {
+                // Fallback to ESM import (node-fetch v3)
+                const nodeFetch = await import('node-fetch');
+                fetch = nodeFetch.default;
+            }
+        } catch (importError) {
+            fetchError = importError;
+            throw new Error(`Failed to import node-fetch: ${importError.message}. Make sure node-fetch is installed in package.json.`);
+        }
+    }
+    return fetch;
+};
+
 // Helper function to generate unique IDs
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
+
 // Helper function to get Cosmos DB client (lazy initialization)
 let cosmosClient = null;
 let database = null;
@@ -404,48 +432,138 @@ const validateCrcsSchema = (data) => {
 };
 
 const validateEventsSchema = (data) => {
+    if (!data || typeof data !== 'object') {
+        throw new Error('VALIDATION_ERROR: Events validation failed: payload must be an object');
+    }
+
     const errors = [];
-    
-    if (!data.name || typeof data.name !== 'string') {
-        errors.push('name is required and must be a string');
+
+    const ensureStringField = (fieldName) => {
+        if (data[fieldName] === undefined || data[fieldName] === null) return;
+        if (typeof data[fieldName] !== 'string') {
+            errors.push(`${fieldName} must be a string`);
+        } else if (fieldName === 'type' && data[fieldName].trim() === '') {
+            errors.push('type is required and must be a non-empty string');
+        }
+    };
+
+    const ensureDateField = (fieldName) => {
+        if (data[fieldName] === undefined || data[fieldName] === null) return;
+        if (typeof data[fieldName] !== 'string' || data[fieldName].trim() === '') {
+            errors.push(`${fieldName} must be a non-empty string`);
+            return;
+        }
+        if (Number.isNaN(Date.parse(data[fieldName]))) {
+            errors.push(`${fieldName} must be a valid date string`);
+        }
+    };
+
+    const normalizeNumberField = (fieldName) => {
+        if (data[fieldName] === undefined || data[fieldName] === null || data[fieldName] === '') return;
+        if (typeof data[fieldName] === 'string') {
+            const parsed = Number(data[fieldName]);
+            if (Number.isNaN(parsed)) {
+                errors.push(`${fieldName} must be a number`);
+                return;
+            }
+            data[fieldName] = parsed;
+        } else if (typeof data[fieldName] !== 'number' || !Number.isFinite(data[fieldName])) {
+            errors.push(`${fieldName} must be a number`);
+        }
+    };
+
+    const ensureStringArray = (fieldName) => {
+        if (data[fieldName] === undefined || data[fieldName] === null) return;
+        if (Array.isArray(data[fieldName])) {
+            data[fieldName].forEach((value, index) => {
+                if (typeof value !== 'string' || value.trim() === '') {
+                    errors.push(`${fieldName}[${index}] must be a non-empty string`);
+                }
+            });
+        } else if (typeof data[fieldName] === 'string' && data[fieldName].trim() !== '') {
+            data[fieldName] = [data[fieldName]];
+        } else {
+            errors.push(`${fieldName} must be an array of strings`);
+        }
+    };
+
+    if (!data.type || typeof data.type !== 'string' || data.type.trim() === '') {
+        errors.push('type is required and must be a non-empty string');
     }
-    
-    if (data.title && typeof data.title !== 'string') {
-        errors.push('title must be a string');
+
+    const hasDate = Object.prototype.hasOwnProperty.call(data, 'date');
+    const hasStartDate = Object.prototype.hasOwnProperty.call(data, 'startDate');
+    const hasEndDate = Object.prototype.hasOwnProperty.call(data, 'endDate');
+
+    if (!hasDate && !hasStartDate && !hasEndDate) {
+        errors.push('an event must include date or startDate/endDate');
     }
-    
-    if (data.region && typeof data.region !== 'string') {
-        errors.push('region must be a string');
+
+    ensureDateField('date');
+    ensureDateField('startDate');
+    ensureDateField('endDate');
+
+    if ((hasStartDate && !hasEndDate) || (!hasStartDate && hasEndDate)) {
+        errors.push('startDate and endDate must both be provided together');
     }
-    
-    if (data.capabilities && !Array.isArray(data.capabilities)) {
-        errors.push('capabilities must be an array');
+
+    if (hasStartDate && hasEndDate && typeof data.startDate === 'string' && typeof data.endDate === 'string') {
+        const startTime = Date.parse(data.startDate);
+        const endTime = Date.parse(data.endDate);
+        if (!Number.isNaN(startTime) && !Number.isNaN(endTime) && startTime > endTime) {
+            errors.push('startDate cannot be after endDate');
+        }
     }
-    
-    if (data.trainingLevel && typeof data.trainingLevel !== 'string') {
-        errors.push('trainingLevel must be a string');
+
+    [
+        'name',
+        'crcId',
+        'siteId',
+        'studyId',
+        'groupId',
+        'groupNumber',
+        'period',
+        'notes',
+        'visitNumber',
+        'principalInvestigator',
+        'truckId',
+        'timeOffRequestId',
+        'status',
+        'createdAt'
+    ].forEach(ensureStringField);
+
+    normalizeNumberField('hours');
+    normalizeNumberField('mileage');
+
+    if (data.isOverridden !== undefined && typeof data.isOverridden !== 'boolean') {
+        errors.push('isOverridden must be a boolean');
     }
-    
-    if (data.coordinates && typeof data.coordinates !== 'object') {
-        errors.push('coordinates must be an object');
+
+    ensureStringArray('studyIds');
+    ensureStringArray('roles');
+
+    if (data.roleAssignments !== undefined && data.roleAssignments !== null) {
+        if (typeof data.roleAssignments !== 'object' || Array.isArray(data.roleAssignments)) {
+            errors.push('roleAssignments must be an object mapping role IDs to arrays of CRC IDs');
+        } else {
+            Object.entries(data.roleAssignments).forEach(([roleId, assignments]) => {
+                if (!Array.isArray(assignments)) {
+                    errors.push(`roleAssignments["${roleId}"] must be an array`);
+                    return;
+                }
+                assignments.forEach((value, index) => {
+                    if (value !== null && value !== undefined && typeof value !== 'string') {
+                        errors.push(`roleAssignments["${roleId}"][${index}] must be a string or null`);
+                    }
+                });
+            });
+        }
     }
-    
-    if (data.employmentType && !['FTE', 'PTE', 'Contractor'].includes(data.employmentType)) {
-        errors.push('employmentType must be one of: FTE, PTE, Contractor');
-    }
-    
-    if (data.homeLocation && typeof data.homeLocation !== 'string') {
-        errors.push('homeLocation must be a string');
-    }
-    
-    if (data.trainings && !Array.isArray(data.trainings)) {
-        errors.push('trainings must be an array');
-    }
-    
+
     if (errors.length > 0) {
         throw new Error(`VALIDATION_ERROR: Events validation failed: ${errors.join(', ')}`);
     }
-    
+
     return true;
 };
 
@@ -1745,7 +1863,8 @@ app.http('navanLookup', {
             }
             
             context.log.info('Requesting OAuth token from Navan...');
-            const tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
+            const fetchFn = await getFetch();
+            const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
                 method: 'POST',
                 headers: {
                     'content-type': 'application/x-www-form-urlencoded'
@@ -1818,7 +1937,8 @@ app.http('navanLookup', {
                 while (!foundBooking && page < 10) { // Limit to 10 pages (1000 bookings max)
                     context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
                     
-                    bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
+                    const fetchFn = await getFetch();
+                    bookingResponse = await fetchFn(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
                         method: 'GET',
                         headers: {
                             'Authorization': `Bearer ${accessToken}`,
@@ -1856,7 +1976,8 @@ app.http('navanLookup', {
                             // Now use the UUID to fetch the full booking details directly
                             // This is more efficient and ensures we get all details
                             context.log.info(`Fetching full booking details using UUID: ${bookingUuid}`);
-                            const uuidResponse = await fetch(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+                            const fetchFn = await getFetch();
+                            const uuidResponse = await fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                                 method: 'GET',
                                 headers: {
                                     'Authorization': `Bearer ${accessToken}`,
@@ -2427,7 +2548,8 @@ app.http('navanTest', {
             context.log.info('Testing OAuth token generation...');
             let tokenResponse;
             try {
-                tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
+                const fetchFn = await getFetch();
+                tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
                     method: 'POST',
                     headers: {
                         'content-type': 'application/x-www-form-urlencoded'
@@ -2503,7 +2625,8 @@ app.http('navanTest', {
             context.log.info('Testing API call with token...');
             let testApiResponse;
             try {
-                testApiResponse = await fetch(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
+                const fetchFn = await getFetch();
+                testApiResponse = await fetchFn(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
                     method: 'GET',
                     headers: {
                         'Authorization': `Bearer ${accessToken}`,
@@ -2693,7 +2816,8 @@ app.http('geocode', {
             const apiUrl = `https://atlas.microsoft.com/search/address/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const response = await fetch(apiUrl);
+                const fetchFn = await getFetch();
+                const response = await fetchFn(apiUrl);
                 const data = await response.json();
                 return {
                     status: 200,
@@ -2764,7 +2888,8 @@ app.http('routeDirections', {
             const apiUrl = `https://atlas.microsoft.com/route/directions/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const response = await fetch(apiUrl);
+                const fetchFn = await getFetch();
+                const response = await fetchFn(apiUrl);
                 const data = await response.json();
                 return {
                     status: 200,
