@@ -2929,14 +2929,39 @@
                 };
             };
 
+            const TRAINING_ROLE_NAME = 'Training';
+            const TRAINING_ROLE_ID = 'training-role';
+            const TRAINING_ROLE_KEY = TRAINING_ROLE_NAME.toLowerCase();
+            const isTrainingRoleName = (name) => (name || '').trim().toLowerCase() === TRAINING_ROLE_KEY;
+            
+            const ensureTrainingRole = (rolesArray = []) => {
+                if (!rolesArray.some(role => isTrainingRoleName(role?.name))) {
+                    rolesArray.push({ id: TRAINING_ROLE_ID, name: TRAINING_ROLE_NAME, trainingNames: [] });
+                }
+                return rolesArray;
+            };
             
             const getAllRoles = (events, rolesFromDB) => {
-                const rolesFromState = rolesFromDB.map(r => r.name);
+                const rolesFromState = (rolesFromDB || []).map(r => r?.name).filter(Boolean);
                 const rolesFromEvents = new Set();
                 (events || []).forEach(event => {
-                    (event.roles || []).forEach(role => rolesFromEvents.add(role));
+                    if (Array.isArray(event.roles)) {
+                        event.roles.filter(Boolean).forEach(role => rolesFromEvents.add(role));
+                    }
+                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                        Object.keys(event.roleAssignments).forEach(roleId => {
+                            const matchingRole = rolesFromDB.find(r => r.id === roleId);
+                            if (matchingRole?.name) {
+                                rolesFromEvents.add(matchingRole.name);
+                            }
+                        });
+                    }
                 });
-                return Array.from(new Set([...rolesFromState, ...rolesFromEvents])).sort();
+                const combinedRoles = new Set([...rolesFromState, ...rolesFromEvents]);
+                combinedRoles.add(TRAINING_ROLE_NAME);
+                return Array.from(combinedRoles)
+                    .filter(Boolean)
+                .sort((a, b) => a.localeCompare(b));
             };
             
             /**
@@ -2971,6 +2996,7 @@
             };
 
             const hasValidTraining = (crc, roleName) => {
+                if (isTrainingRoleName(roleName)) return true;
                 const requiredTrainingNames = getTrainingNamesForRole(roleName);
                 // If no training is required for this role, all CRCs are eligible
                 if (requiredTrainingNames.length === 0) return true;
@@ -3496,6 +3522,7 @@
                     crcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     sites.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     studies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
+                    ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
                     const updates = {
@@ -10171,8 +10198,12 @@
                         selectedRoles = new Set(event.roles || []);
                     }
                     
-                    // Only show roles that the CRC has valid training for
-                    const trainedRoles = allRoles.filter(r => hasValidTraining(crc, r));
+                    // Only show roles that the CRC has valid training for (Training role is always allowed)
+                    const trainedRoles = allRoles.filter(roleName => {
+                        if (!roleName) return false;
+                        if (isTrainingRoleName(roleName)) return true;
+                        return hasValidTraining(crc, roleName);
+                    });
                     const roleOptions = trainedRoles.map(r => {
                         const isSelected = selectedRoles.has(r);
                         return `<option value="${r}" ${isSelected ? 'selected' : ''}>${r}</option>`;
@@ -14565,6 +14596,10 @@
                                 showNotification('Role name is required.', 'error');
                                 break;
                             }
+                            if (isTrainingRoleName(roleName)) {
+                                showNotification('The Training role is already available and cannot be recreated.', 'error');
+                                break;
+                            }
                             // Check for duplicate role names (case-insensitive)
                             const existingRole = state.roles.find(r => r.name && r.name.trim().toLowerCase() === roleName.toLowerCase());
                             if (existingRole) {
@@ -15953,6 +15988,40 @@
                     console.log('Event crcId:', existingEvent.crcId);
                 }
                 
+                const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
+                const trainingTypeValues = state.roles
+                    .filter(r => r?.name && !isTrainingRoleName(r.name))
+                    .map(r => r.name)
+                    .filter((value, index, self) => self.findIndex(v => v.toLowerCase() === value.toLowerCase()) === index)
+                    .sort((a, b) => a.localeCompare(b));
+                
+                const buildTrainingTypeSelect = (roleId, index, selectedValue = '') => {
+                    if (trainingTypeValues.length === 0) {
+                        return `<div class="mt-2 text-xs text-yellow-600 dark:text-yellow-400">No training types available. Add roles first.</div>`;
+                    }
+                    const optionsHtml = ['<option value="">Select Training Type</option>']
+                        .concat(trainingTypeValues.map(name => `<option value="${name}" ${name === selectedValue ? 'selected' : ''}>${name}</option>`))
+                        .join('');
+                    return `
+                        <div class="mt-2">
+                            <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Training Type</label>
+                            <select name="trainingType-${roleId}-${index}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                ${optionsHtml}
+                            </select>
+                        </div>
+                    `;
+                };
+                
+                const getExistingTrainingType = (roleId, index) => {
+                    if (!existingEvent || !existingEvent.trainingAssignments || typeof existingEvent.trainingAssignments !== 'object') {
+                        return '';
+                    }
+                    const assignments = existingEvent.trainingAssignments[roleId];
+                    if (!Array.isArray(assignments)) return '';
+                    return assignments[index] || '';
+                };
+                
                 const selectedStudyIds = Array.from(studySelect.selectedOptions).map(option => option.value).filter(id => id);
                 const selectedSiteId = siteSelect.value;
                 
@@ -16039,6 +16108,8 @@
                                                 
                                                 // Only show CRCs who have valid training for this role
                                                 const qualifiedCrcs = state.crcs.filter(c => hasValidTraining(c, roleName));
+                                                const trainingTypeValue = getExistingTrainingType(roleId, index);
+                                                const trainingTypeBlock = isTrainingRoleName(roleName) ? buildTrainingTypeSelect(roleId, index, trainingTypeValue) : '';
                                                 
                                                 return `
                                                     <div class="flex items-center gap-2">
@@ -16059,6 +16130,7 @@
                                                             ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
                                                         </select>
                                                     </div>
+                                                    ${trainingTypeBlock}
                                                 `;
                                             }).join('')}
                                         </div>
@@ -16297,6 +16369,9 @@
                             crcOptions += '<option value="" disabled>No qualified staff available</option>';
                         }
                         
+                        const manualTrainingTypeValue = isTrainingRoleName(roleName) ? getExistingTrainingType(role.id, 0) : '';
+                        const manualTrainingTypeBlock = isTrainingRoleName(roleName) ? buildTrainingTypeSelect(role.id, 0, manualTrainingTypeValue) : '';
+
                         roleAssignmentHTML += `
                             <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
                                 <h4 class="font-medium dark:text-white mb-2">${role.name}</h4>
@@ -16308,6 +16383,7 @@
                                             ${crcOptions}
                                         </select>
                                     </div>
+                                    ${manualTrainingTypeBlock ? `<div class="pl-16">${manualTrainingTypeBlock}</div>` : ''}
                                 </div>
                             </div>
                         `;
@@ -19399,6 +19475,7 @@
                     crcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     sites.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     studies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
+                    ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     trucks.sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
 
