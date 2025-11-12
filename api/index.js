@@ -1,3 +1,18 @@
+const installGlobalFetch = () => {
+    if (typeof globalThis.fetch === 'function') {
+        return;
+    }
+    import('node-fetch')
+        .then(module => {
+            globalThis.fetch = module.default;
+        })
+        .catch(error => {
+            console.error('Failed to load node-fetch:', error);
+        });
+};
+
+installGlobalFetch();
+
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
@@ -45,28 +60,18 @@ const ensureContextLogger = (context) => {
 // Use node-fetch instead of native fetch for Azure Functions compatibility
 // Native fetch is broken in Azure Functions environment
 // Import node-fetch using require (v2 supports CommonJS)
-let fetch;
-let fetchError = null;
 const getFetch = async () => {
-    if (fetchError) {
-        throw fetchError;
-    }
-    if (!fetch) {
+    let fetchFn;
+    if (typeof globalThis.fetch === 'function') {
+        fetchFn = globalThis.fetch.bind(globalThis);
+    } else {
         try {
-            // Try CommonJS require first (node-fetch v2)
-            try {
-                fetch = require('node-fetch');
-            } catch (requireError) {
-                // Fallback to ESM import (node-fetch v3)
-                const nodeFetch = await import('node-fetch');
-                fetch = nodeFetch.default;
-            }
+            fetchFn = (await import('node-fetch')).default;
         } catch (importError) {
-            fetchError = importError;
-            throw new Error(`Failed to import node-fetch: ${importError.message}. Make sure node-fetch is installed in package.json.`);
+            throw new Error(`Failed to load fetch implementation: ${importError.message}`);
         }
     }
-    return fetch;
+    return fetchFn;
 };
 
 // Temporary Navan API credentials for local testing only.
