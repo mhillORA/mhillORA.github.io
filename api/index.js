@@ -5,37 +5,41 @@ const ensureContextLogger = (context) => {
     if (!context) {
         return;
     }
-    const log = context.log;
-    const hasStructuredLogger = log && typeof log === 'object' &&
-        typeof log.error === 'function' &&
-        typeof log.warn === 'function' &&
-        typeof log.info === 'function';
 
-    if (hasStructuredLogger) {
+    const currentLog = context.log;
+    const hasFullLogger = typeof currentLog === 'function' &&
+        typeof currentLog.error === 'function' &&
+        typeof currentLog.warn === 'function' &&
+        typeof currentLog.info === 'function';
+
+    if (hasFullLogger) {
         return;
     }
 
-    const baseLogger = typeof log === 'function'
-        ? log.bind(context)
-        : (...args) => console.log(...args);
-
-    const errorLogger = (log && typeof log.error === 'function')
-        ? log.error.bind(log)
-        : (...args) => (console.error ? console.error(...args) : baseLogger(...args));
-
-    const warnLogger = (log && typeof log.warn === 'function')
-        ? log.warn.bind(log)
-        : (...args) => (console.warn ? console.warn(...args) : baseLogger(...args));
-
-    const infoLogger = (log && typeof log.info === 'function')
-        ? log.info.bind(log)
-        : baseLogger;
-
-    context.log = {
-        error: errorLogger,
-        warn: warnLogger,
-        info: infoLogger
+    const fallbackBase = (...args) => {
+        if (typeof currentLog === 'function') {
+            currentLog(...args);
+        } else {
+            console.log(...args);
+        }
     };
+
+    const baseLogger = fallbackBase.bind(context);
+
+    const makeFallback = (level, fallbackConsoleFn) => {
+        if (currentLog && typeof currentLog[level] === 'function') {
+            return currentLog[level].bind(currentLog);
+        }
+        return fallbackConsoleFn
+            ? (...args) => fallbackConsoleFn(...args)
+            : baseLogger;
+    };
+
+    baseLogger.error = makeFallback('error', console.error ? console.error.bind(console) : null);
+    baseLogger.warn = makeFallback('warn', console.warn ? console.warn.bind(console) : null);
+    baseLogger.info = makeFallback('info', console.info ? console.info.bind(console) : null);
+
+    context.log = baseLogger;
 };
 
 // Use node-fetch instead of native fetch for Azure Functions compatibility
