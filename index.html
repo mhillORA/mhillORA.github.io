@@ -1564,6 +1564,7 @@
                     ttl: 5 * 60 * 1000 // 5 minutes cache
                 }
             };
+            let currentDuplicatePanelController = null;
 
             // --- Helpers ---
             // Calculate distance between two coordinates (Haversine formula - straight line distance)
@@ -2941,6 +2942,37 @@
                 return rolesArray;
             };
             
+            const incrementSequentialLabel = (value, defaultPrefix = '') => {
+                if (!value || typeof value !== 'string') {
+                    return '';
+                }
+                const trimmed = value.trim();
+                if (trimmed.length === 0) return '';
+                const match = trimmed.match(/^([A-Za-z]*)(\d+)$/);
+                if (match) {
+                    const prefix = match[1] || defaultPrefix;
+                    const number = parseInt(match[2], 10);
+                    if (Number.isFinite(number)) {
+                        return `${prefix}${number + 1}`;
+                    }
+                }
+                const numeric = parseInt(trimmed, 10);
+                if (Number.isFinite(numeric)) {
+                    return String(numeric + 1);
+                }
+                return trimmed;
+            };
+            
+            const suggestNextGroupNumber = (currentValue) => {
+                if (!currentValue) return '';
+                return incrementSequentialLabel(currentValue, 'G');
+            };
+            
+            const suggestNextVisitNumber = (currentValue) => {
+                if (!currentValue) return '';
+                return incrementSequentialLabel(currentValue, 'V');
+            };
+            
             const getAllRoles = (events, rolesFromDB) => {
                 const rolesFromState = (rolesFromDB || []).map(r => r?.name).filter(Boolean);
                 const rolesFromEvents = new Set();
@@ -3636,6 +3668,158 @@
                         handleShiftStudySiteSelection();
                     });
                     handleShiftStudySiteSelection();
+
+                    const duplicatePanel = form.querySelector('#duplicate-panel');
+                    const duplicateAssignmentsContainer = form.querySelector('#duplicate-assignments-container');
+                    const duplicateToggleButton = form.querySelector('#toggle-duplicate-panel');
+                    const duplicateApplyButton = form.querySelector('#apply-duplicate-selection');
+                    const duplicateClearButton = form.querySelector('#clear-duplicate-selection');
+                    const duplicateEnabledInput = form.querySelector('input[name="duplicateEnabled"]');
+                    const duplicateSummary = form.querySelector('#duplicate-summary');
+                    const duplicateGroupInput = form.querySelector('input[name="duplicateGroupNumber"]');
+                    const duplicateVisitInput = form.querySelector('input[name="duplicateVisitNumber"]');
+                    const duplicateStartDateInput = form.querySelector('input[name="duplicateStartDate"]');
+                    const duplicateEndDateInput = form.querySelector('input[name="duplicateEndDate"]');
+                    const duplicateStartTravelInput = form.querySelector('input[name="duplicateIncludeStartTravel"]');
+                    const duplicateEndTravelInput = form.querySelector('input[name="duplicateIncludeEndTravel"]');
+                    let duplicateSelectionApplied = false;
+
+                    const ensureDuplicateDefaults = () => {
+                        if (!duplicatePanel) return;
+                        const defaultStart = duplicatePanel.dataset.defaultStartDate || '';
+                        const defaultEnd = duplicatePanel.dataset.defaultEndDate || '';
+                        const defaultGroup = duplicatePanel.dataset.defaultGroup || '';
+                        const defaultVisit = duplicatePanel.dataset.defaultVisit || '';
+                        if (duplicateStartDateInput && !duplicateStartDateInput.value && defaultStart) {
+                            duplicateStartDateInput.value = defaultStart;
+                        }
+                        if (duplicateEndDateInput && !duplicateEndDateInput.value && defaultEnd) {
+                            duplicateEndDateInput.value = defaultEnd;
+                        }
+                        if (duplicateGroupInput && !duplicateGroupInput.value && defaultGroup) {
+                            duplicateGroupInput.value = defaultGroup;
+                        }
+                        if (duplicateVisitInput && !duplicateVisitInput.value && defaultVisit) {
+                            duplicateVisitInput.value = defaultVisit;
+                        }
+                        if (duplicateStartTravelInput && !duplicateStartTravelInput.hasAttribute('data-initialized')) {
+                            if (!isEditing) duplicateStartTravelInput.checked = true;
+                            duplicateStartTravelInput.setAttribute('data-initialized', 'true');
+                        }
+                        if (duplicateEndTravelInput && !duplicateEndTravelInput.hasAttribute('data-initialized')) {
+                            if (!isEditing) duplicateEndTravelInput.checked = true;
+                            duplicateEndTravelInput.setAttribute('data-initialized', 'true');
+                        }
+                    };
+
+                    const refreshDuplicateAssignments = () => {
+                        if (!duplicateAssignmentsContainer) return;
+                        const previousSelections = new Set();
+                        duplicateAssignmentsContainer.querySelectorAll('input[name="duplicateSelection"]:checked').forEach(cb => previousSelections.add(cb.value));
+                        const roleSelects = form.querySelectorAll('#role-assignment-container select[name^="role-"]');
+                        const assignmentsByRole = new Map();
+                        roleSelects.forEach(select => {
+                            const nameParts = select.name.split('-').slice(1);
+                            if (nameParts.length < 2) return;
+                            const [roleId] = nameParts;
+                            if (!assignmentsByRole.has(roleId)) {
+                                assignmentsByRole.set(roleId, new Set());
+                            }
+                            if (select.value) {
+                                assignmentsByRole.get(roleId).add(select.value);
+                            }
+                        });
+                        if (assignmentsByRole.size === 0) {
+                            duplicateAssignmentsContainer.innerHTML = `<p class="text-xs text-gray-500 dark:text-gray-400">Assign roles to staff first to enable duplication.</p>`;
+                            if (duplicateApplyButton) duplicateApplyButton.setAttribute('disabled', 'disabled');
+                            return;
+                        }
+                        const fragments = [];
+                        assignmentsByRole.forEach((crcIds, roleId) => {
+                            const role = state.roles.find(r => r.id === roleId);
+                            const roleName = role ? role.name : 'Role';
+                            const crcCheckboxes = Array.from(crcIds).map(crcId => {
+                                const crc = state.crcs.find(c => c.id === crcId);
+                                const crcName = crc ? crc.name : crcId;
+                                return `
+                                    <label class="flex items-center space-x-2 py-1">
+                                        <input type="checkbox" name="duplicateSelection" value="${roleId}::${crcId}" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                        <span>${crcName}</span>
+                                    </label>
+                                `;
+                            }).join('');
+                            fragments.push(`
+                                <div class="border dark:border-gray-700 rounded-md p-3 bg-white dark:bg-gray-900">
+                                    <p class="text-xs font-semibold text-gray-600 dark:text-gray-300 mb-2">${roleName}</p>
+                                    ${crcCheckboxes}
+                                </div>
+                            `);
+                        });
+                        duplicateAssignmentsContainer.innerHTML = fragments.join('');
+                        if (duplicateApplyButton) duplicateApplyButton.removeAttribute('disabled');
+                        const newCheckboxes = duplicateAssignmentsContainer.querySelectorAll('input[name="duplicateSelection"]');
+                        const defaultAllChecked = !duplicateSelectionApplied;
+                        newCheckboxes.forEach(cb => {
+                            if (previousSelections.size > 0) {
+                                cb.checked = previousSelections.has(cb.value) || defaultAllChecked;
+                            } else {
+                                cb.checked = true;
+                            }
+                        });
+                    };
+
+                    const resetDuplicateSelection = () => {
+                        if (duplicateEnabledInput) duplicateEnabledInput.value = 'false';
+                        if (duplicateSummary) duplicateSummary.textContent = '';
+                        duplicateSelectionApplied = false;
+                        if (duplicateAssignmentsContainer) {
+                            duplicateAssignmentsContainer.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                                cb.checked = true;
+                            });
+                        }
+                    };
+
+                    if (duplicateToggleButton && duplicatePanel) {
+                        duplicateToggleButton.addEventListener('click', () => {
+                            duplicatePanel.classList.toggle('hidden');
+                            if (!duplicatePanel.classList.contains('hidden')) {
+                                ensureDuplicateDefaults();
+                                refreshDuplicateAssignments();
+                            }
+                        });
+                    }
+                    if (duplicateApplyButton) {
+                        duplicateApplyButton.addEventListener('click', () => {
+                            if (!duplicateAssignmentsContainer) return;
+                            const selected = duplicateAssignmentsContainer.querySelectorAll('input[name="duplicateSelection"]:checked');
+                            if (selected.length === 0) {
+                                showNotification('Select at least one staff member to duplicate.', 'error');
+                                return;
+                            }
+                            if (duplicateEnabledInput) duplicateEnabledInput.value = 'true';
+                            duplicateSelectionApplied = true;
+                            const groupLabel = duplicateGroupInput && duplicateGroupInput.value ? duplicateGroupInput.value : 'next group';
+                            const visitLabel = duplicateVisitInput && duplicateVisitInput.value ? duplicateVisitInput.value : 'next visit';
+                            if (duplicateSummary) {
+                                duplicateSummary.textContent = `${selected.length} assignment${selected.length === 1 ? '' : 's'} ready for ${groupLabel} / ${visitLabel}.`;
+                            }
+                            showNotification('Duplicate configuration saved. Submit the shift to create the next schedule.', 'success');
+                        });
+                    }
+                    if (duplicateClearButton) {
+                        duplicateClearButton.addEventListener('click', () => {
+                            resetDuplicateSelection();
+                            ensureDuplicateDefaults();
+                            refreshDuplicateAssignments();
+                            showNotification('Duplicate configuration cleared.', 'info');
+                        });
+                    }
+
+                    currentDuplicatePanelController = {
+                        refresh: refreshDuplicateAssignments,
+                        clear: resetDuplicateSelection
+                    };
+                    refreshDuplicateAssignments();
                 }
                 if (modalContainer.querySelector('#unavailability-calendar-container')) {
                     renderUnavailabilityCalendar();
@@ -3662,6 +3846,7 @@
                     console.error('Modal container not found');
                     return;
                 }
+                currentDuplicatePanelController = null;
                 modalContainer.classList.add('hidden');
                 modalContainer.innerHTML = '';
             };
@@ -10337,6 +10522,24 @@
                     return `<option value="${study.id}" ${selectedStudyIds.has(study.id) ? 'selected' : ''} style="${study.color ? `background-color: ${study.color}; color: ${textColor};` : ''}">${study.color ? '● ' : ''}${study.title || study.name}</option>`;
                 }).join('');
                 const isFullDayEvent = isEditing && (!event.period || event.period === 'Full Day');
+                const startDateValue = seriesStartDate || event?.date || date;
+                const endDateValue = seriesEndDate || event?.endDate || event?.date || date;
+                const baseGroupNumber = event?.groupNumber || '';
+                const baseVisitNumber = event?.visitNumber || '';
+                const defaultDuplicateGroup = baseGroupNumber ? suggestNextGroupNumber(baseGroupNumber) : '';
+                const defaultDuplicateVisit = baseVisitNumber ? suggestNextVisitNumber(baseVisitNumber) : '';
+                const defaultDuplicateStartDate = (() => {
+                    try {
+                        const ref = parseDateFlexible(endDateValue);
+                        if (!ref) return '';
+                        const next = new Date(ref);
+                        next.setDate(next.getDate() + 1);
+                        return toDateOnlyString(next);
+                    } catch {
+                        return '';
+                    }
+                })();
+                const defaultDuplicateEndDate = defaultDuplicateStartDate;
                 
                 const show = {
                     crc: !['Open Shift'].includes(eventType),
@@ -10478,6 +10681,59 @@
                             <textarea name="notes" rows="3" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${event ? event.notes || '' : ''}</textarea>
                         </div>
                         <div id="form-error-message" class="text-red-500 text-sm h-4"></div>
+                        <div class="border-t dark:border-gray-700 pt-4">
+                            <div class="flex items-center justify-between">
+                                <p class="text-sm font-semibold text-gray-700 dark:text-gray-200">Schedule for next Group or Visit?</p>
+                                <button type="button" id="toggle-duplicate-panel" class="text-sm text-blue-600 dark:text-blue-400 hover:underline">Configure</button>
+                            </div>
+                            <input type="hidden" name="duplicateEnabled" value="false">
+                            <div id="duplicate-summary" class="mt-2 text-xs text-gray-600 dark:text-gray-400"></div>
+                            <div id="duplicate-panel" class="mt-4 hidden border dark:border-gray-700 rounded-md p-4 bg-gray-50 dark:bg-gray-800 space-y-4" data-default-start-date="${defaultDuplicateStartDate}" data-default-end-date="${defaultDuplicateEndDate}" data-default-group="${defaultDuplicateGroup}" data-default-visit="${defaultDuplicateVisit}">
+                                <p class="text-sm text-gray-600 dark:text-gray-300">
+                                    Select which roles and staff should carry forward to the next group or visit. Adjust dates if the follow-up schedule occurs on different days.
+                                </p>
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="block text-xs font-medium dark:text-gray-300 mb-1">Next Group Number</label>
+                                        <input type="text" name="duplicateGroupNumber" value="${defaultDuplicateGroup}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., G2">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium dark:text-gray-300 mb-1">Next Visit Number</label>
+                                        <input type="text" name="duplicateVisitNumber" value="${defaultDuplicateVisit}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., V2">
+                                    </div>
+                                </div>
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="block text-xs font-medium dark:text-gray-300 mb-1">Next Start Date</label>
+                                        <input type="date" name="duplicateStartDate" value="${defaultDuplicateStartDate}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium dark:text-gray-300 mb-1">Next End Date</label>
+                                        <input type="date" name="duplicateEndDate" value="${defaultDuplicateEndDate}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                    </div>
+                                </div>
+                                <div class="flex items-center gap-4">
+                                    <label class="flex items-center space-x-2 text-xs text-gray-600 dark:text-gray-300">
+                                        <input type="checkbox" name="duplicateIncludeStartTravel" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" ${!isEditing ? 'checked' : ''}>
+                                        <span>Include travel day before start</span>
+                                    </label>
+                                    <label class="flex items-center space-x-2 text-xs text-gray-600 dark:text-gray-300">
+                                        <input type="checkbox" name="duplicateIncludeEndTravel" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" ${!isEditing ? 'checked' : ''}>
+                                        <span>Include travel day after end</span>
+                                    </label>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-medium dark:text-gray-300 mb-2">Carry Over Assignments</label>
+                                    <div id="duplicate-assignments-container" class="space-y-3 text-sm text-gray-700 dark:text-gray-200">
+                                        <p class="text-xs text-gray-500 dark:text-gray-400">Assignments will appear after you select studies, sites, and roles.</p>
+                                    </div>
+                                </div>
+                                <div class="flex justify-end gap-3">
+                                    <button type="button" id="clear-duplicate-selection" class="text-xs text-gray-600 dark:text-gray-300 hover:underline">Clear</button>
+                                    <button type="button" id="apply-duplicate-selection" class="text-xs bg-blue-600 text-white px-3 py-2 rounded hover:bg-blue-700">Apply Selection</button>
+                                </div>
+                            </div>
+                        </div>
                         <div class="flex justify-between items-center pt-4">
                             <div class="flex items-center gap-4">
                                 ${isEditing ? `<button type="button" data-action="delete-crc-event" data-event-id="${event.id}" data-group-id="${event.groupId || ''}" class="text-red-600 hover:underline">Delete Event</button>` : '<div></div>'}
@@ -11504,6 +11760,8 @@
                         </label>
                     `;
                 }).join('');
+                const groupCountValue = study.groupCount !== undefined && study.groupCount !== null ? study.groupCount : '';
+                const visitCountValue = study.visitCount !== undefined && study.visitCount !== null ? study.visitCount : '';
 
                 return `
                     <h2 class="text-2xl font-bold dark:text-white mb-6">Edit Study</h2>
@@ -11515,6 +11773,18 @@
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Display Color</label>
                             <input type="color" name="color" value="${study.color || '#8b5cf6'}" class="w-full h-10 p-1 border dark:border-gray-600 rounded-md cursor-pointer">
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Amount of Groups</label>
+                                <input type="number" name="groupCount" min="0" value="${groupCountValue}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Total groups (e.g., 3)">
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Used to determine duplication limits for group progression.</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Amount of Visits</label>
+                                <input type="number" name="visitCount" min="0" value="${visitCountValue}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Total visits (e.g., 5)">
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Sets the maximum visit number available for scheduling.</p>
+                            </div>
                         </div>
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-3">Sites for this Study</label>
@@ -14635,6 +14905,39 @@
                         let crcIds = formData.getAll('crcId');
                         const studyIds = formData.getAll('studyIds');
                         const duplicateSelectedCrcs = [];
+                        const duplicateEnabled = data.duplicateEnabled === 'true';
+                        let duplicateConfig = null;
+                        if (!isEditing && duplicateEnabled) {
+                            const selectionValues = formData.getAll('duplicateSelection');
+                            const assignmentMap = new Map();
+                            selectionValues.forEach(value => {
+                                if (!value) return;
+                                const [roleId, crcId] = value.split('::');
+                                if (!roleId || !crcId) return;
+                                if (!assignmentMap.has(roleId)) assignmentMap.set(roleId, new Set());
+                                assignmentMap.get(roleId).add(crcId);
+                            });
+                            if (assignmentMap.size > 0) {
+                                duplicateConfig = {
+                                    groupNumber: (data.duplicateGroupNumber || '').trim(),
+                                    visitNumber: (data.duplicateVisitNumber || '').trim(),
+                                    startDate: data.duplicateStartDate || '',
+                                    endDate: data.duplicateEndDate || '',
+                                    includeStartTravel: data.duplicateIncludeStartTravel === 'on',
+                                    includeEndTravel: data.duplicateIncludeEndTravel === 'on',
+                                    assignments: {}
+                                };
+                                assignmentMap.forEach((set, roleId) => {
+                                    const uniqueIds = Array.from(set).filter(Boolean);
+                                    if (uniqueIds.length > 0) {
+                                        duplicateConfig.assignments[roleId] = uniqueIds;
+                                    }
+                                });
+                                if (Object.keys(duplicateConfig.assignments).length === 0) {
+                                    duplicateConfig = null;
+                                }
+                            }
+                        }
                         
                         if (crcIds && crcIds.length > 0) {
                             const selectionCounts = {};
@@ -14807,6 +15110,144 @@
                         
                         const needsOverride = unavailabilityConflicts.length > 0 || siteStudyConflicts.length > 0 || duplicateRoleAssignments.length > 0 || duplicateDayAssignments.length > 0 || duplicateSelectedCrcs.length > 0;
 
+                        const handleDuplicateSchedule = async (config, baseEventBlueprint) => {
+                            if (!config) return;
+                            const assignments = config.assignments || {};
+                            if (Object.keys(assignments).length === 0) {
+                                showNotification('Duplicate schedule skipped: no assignments selected.', 'warning');
+                                return;
+                            }
+                            const startDateDuplicate = parseDateOnly(config.startDate || '');
+                            if (!startDateDuplicate) {
+                                showNotification('Duplicate schedule skipped: choose a valid start date for the next group or visit.', 'warning');
+                                return;
+                            }
+                            let endDateDuplicate = config.endDate ? parseDateOnly(config.endDate) : null;
+                            if (!endDateDuplicate || endDateDuplicate < startDateDuplicate) {
+                                endDateDuplicate = new Date(startDateDuplicate);
+                            }
+                            const roleAssignmentsForDuplicate = {};
+                            Object.entries(assignments).forEach(([roleId, ids]) => {
+                                const filteredIds = (ids || []).filter(Boolean);
+                                if (filteredIds.length > 0) {
+                                    roleAssignmentsForDuplicate[roleId] = filteredIds;
+                                }
+                            });
+                            if (Object.keys(roleAssignmentsForDuplicate).length === 0) {
+                                showNotification('Duplicate schedule skipped: no assignments selected.', 'warning');
+                                return;
+                            }
+                            const duplicateBase = {
+                                ...baseEventBlueprint,
+                                groupNumber: config.groupNumber ? config.groupNumber : baseEventBlueprint.groupNumber || null,
+                                visitNumber: config.visitNumber ? config.visitNumber : baseEventBlueprint.visitNumber || null,
+                                roleAssignments: roleAssignmentsForDuplicate,
+                                isOverridden: true
+                            };
+                            const includeStartTravelDuplicate = !!config.includeStartTravel;
+                            const includeEndTravelDuplicate = !!config.includeEndTravel;
+                            const groupIdDuplicate = crypto.randomUUID();
+                            const assignedCrcs = new Set();
+                            Object.values(roleAssignmentsForDuplicate).forEach(list => list.forEach(crcId => {
+                                if (crcId) assignedCrcs.add(crcId);
+                            }));
+                            const createAndStoreEvent = async (payload) => {
+                                const created = await apiService.createEvent(payload);
+                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...payload };
+                                state.crc_events = [...state.crc_events, createdEvent];
+                            };
+                            if (eventType === 'Site Assignment') {
+                                if (assignedCrcs.size === 0) {
+                                    showNotification('Duplicate schedule skipped: no staff selected.', 'warning');
+                                    return;
+                                }
+                                for (const crcId of assignedCrcs) {
+                                    const rolesForCrc = [];
+                                    Object.entries(roleAssignmentsForDuplicate).forEach(([roleId, ids]) => {
+                                        if (ids.includes(crcId)) {
+                                            const roleObj = state.roles.find(r => r.id === roleId);
+                                            if (roleObj) rolesForCrc.push(roleObj.name);
+                                        }
+                                    });
+                                    if (includeStartTravelDuplicate) {
+                                        const startTravelDate = new Date(startDateDuplicate);
+                                        startTravelDate.setDate(startTravelDate.getDate() - 1);
+                                        const travelPayload = {
+                                            ...duplicateBase,
+                                            name: 'Travel Day',
+                                            crcId,
+                                            roles: [],
+                                            date: toDateOnlyString(startTravelDate),
+                                            groupId: groupIdDuplicate,
+                                            type: 'Travel Day'
+                                        };
+                                        await createAndStoreEvent(travelPayload);
+                                    }
+                                    const dayCursor = new Date(startDateDuplicate);
+                                    while (dayCursor <= endDateDuplicate) {
+                                        const dateStr = toDateOnlyString(dayCursor);
+                                        const assignmentPayload = {
+                                            ...duplicateBase,
+                                            name: 'Site Assignment',
+                                            crcId,
+                                            roles: rolesForCrc,
+                                            date: dateStr,
+                                            groupId: groupIdDuplicate,
+                                            type: 'Site Assignment'
+                                        };
+                                        await createAndStoreEvent(assignmentPayload);
+                                        dayCursor.setDate(dayCursor.getDate() + 1);
+                                    }
+                                    if (includeEndTravelDuplicate) {
+                                        const endTravelDate = new Date(endDateDuplicate);
+                                        endTravelDate.setDate(endTravelDate.getDate() + 1);
+                                        const travelPayload = {
+                                            ...duplicateBase,
+                                            name: 'Travel Day',
+                                            crcId,
+                                            roles: [],
+                                            date: toDateOnlyString(endTravelDate),
+                                            groupId: groupIdDuplicate,
+                                            type: 'Travel Day'
+                                        };
+                                        await createAndStoreEvent(travelPayload);
+                                    }
+                                }
+                                showNotification('Next group/visit scheduled successfully!', 'success');
+                            } else {
+                                const fallbackCrcs = assignedCrcs.size > 0 ? Array.from(assignedCrcs) : crcIds;
+                                const targetCrcs = eventType === 'Open Shift' ? [null] : fallbackCrcs;
+                                const dayCursor = new Date(startDateDuplicate);
+                                while (dayCursor <= endDateDuplicate) {
+                                    const dateStr = toDateOnlyString(dayCursor);
+                                    const targets = targetCrcs.length > 0 ? targetCrcs : [null];
+                                    for (const crcId of targets) {
+                                        const payload = {
+                                            ...duplicateBase,
+                                            name: eventType,
+                                            crcId,
+                                            roles: [],
+                                            date: dateStr,
+                                            groupId: groupIdDuplicate,
+                                            type: eventType
+                                        };
+                                        await createAndStoreEvent(payload);
+                                    }
+                                    dayCursor.setDate(dayCursor.getDate() + 1);
+                                }
+                                showNotification('Next schedule created.', 'success');
+                            }
+                            const duplicateEnabledField = form.querySelector('input[name="duplicateEnabled"]');
+                            if (duplicateEnabledField) duplicateEnabledField.value = 'false';
+                            if (currentDuplicatePanelController && typeof currentDuplicatePanelController.clear === 'function') {
+                                try {
+                                    currentDuplicatePanelController.clear();
+                                } catch (duplicateError) {
+                                    console.warn('Duplicate panel clear error:', duplicateError);
+                                }
+                            }
+                        };
+
                         const processSubmit = async (confirmedOverride = false) => {
                             try {
                                 // Collect role assignments from the new interface
@@ -14957,6 +15398,9 @@
                                         console.log('Travel Day events after creation:', travelDayEvents);
                                     }, 1000);
                                 }
+                                if (duplicateConfig) {
+                                    await handleDuplicateSchedule(duplicateConfig, baseEventData);
+                                }
                                 // Force UI refreshes so schedule and calendar reflect new events immediately
                                 try {
                                     setState({ crc_events: state.crc_events.slice() });
@@ -15087,6 +15531,14 @@
                         const color = data.color || data['color'];
                         const selectedRoles = formData.getAll('selectedRoles');
                         const selectedSites = formData.getAll('studySites');
+                        const normalizeCountInput = (value) => {
+                            if (value === undefined || value === null || value === '') return null;
+                            const numeric = Number(value);
+                            if (!Number.isFinite(numeric) || numeric < 0) return null;
+                            return Math.floor(numeric);
+                        };
+                        const parsedGroupCount = normalizeCountInput(data.groupCount);
+                        const parsedVisitCount = normalizeCountInput(data.visitCount);
                         
                         // Collect site-specific role quantities
                         // These quantities determine scheduling requirements - if 3 Doc Tech is set, exactly 3 must be scheduled
@@ -15117,7 +15569,9 @@
                                 color,
                                 selectedRoles,
                                 selectedSites,
-                                siteRoleRequirements: siteRoleRequirements
+                                siteRoleRequirements: siteRoleRequirements,
+                                groupCount: parsedGroupCount,
+                                visitCount: parsedVisitCount
                             });
                             
                             // Merge with existing study to satisfy API validation (e.g., title/name required)
@@ -15130,7 +15584,9 @@
                                 requiredRoles: selectedRoles,
                                 siteIds: selectedSites,
                                 siteRoleRequirements: siteRoleRequirements,
-                                lastUpdated: new Date().toISOString()
+                                lastUpdated: new Date().toISOString(),
+                                groupCount: parsedGroupCount !== null ? parsedGroupCount : (existingStudy.groupCount !== undefined ? existingStudy.groupCount : null),
+                                visitCount: parsedVisitCount !== null ? parsedVisitCount : (existingStudy.visitCount !== undefined ? existingStudy.visitCount : null)
                             };
                             
                             // Remove system fields if present
@@ -16517,6 +16973,13 @@
                 roleAssignmentHTML += '</div>';
                 roleAssignmentContainer.innerHTML = roleAssignmentHTML;
                 console.log('Role assignment HTML generated and inserted');
+                if (currentDuplicatePanelController && typeof currentDuplicatePanelController.refresh === 'function') {
+                    try {
+                        currentDuplicatePanelController.refresh();
+                    } catch (dupErr) {
+                        console.warn('Duplicate panel refresh error:', dupErr);
+                    }
+                }
             };
 
             const generateSiteRoleQuantities = (selectedRoles, selectedSites) => {
