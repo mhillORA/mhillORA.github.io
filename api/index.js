@@ -1,6 +1,63 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
+// Use node-fetch instead of native fetch for Azure Functions compatibility
+// Native fetch is broken in Azure Functions environment
+// Import node-fetch using require (v2 supports CommonJS)
+let fetch;
+let fetchError = null;
+const getFetch = async () => {
+    if (fetchError) {
+        throw fetchError;
+    }
+    if (!fetch) {
+        try {
+            // Try CommonJS require first (node-fetch v2)
+            try {
+                fetch = require('node-fetch');
+            } catch (requireError) {
+                // Fallback to ESM import (node-fetch v3)
+                const nodeFetch = await import('node-fetch');
+                fetch = nodeFetch.default;
+            }
+        } catch (importError) {
+            fetchError = importError;
+            throw new Error(`Failed to import node-fetch: ${importError.message}. Make sure node-fetch is installed in package.json.`);
+        }
+    }
+    return fetch;
+};
+
+// Temporary Navan API credentials for local testing only.
+// These should never be used in production deployments.
+const NAVAN_TEST_CLIENT_ID = 'b255eefb-978a-4a1b-a8b1-fb069d7f8b43';
+const NAVAN_TEST_SECRET_KEY = '8ef37280136f4e388cc499df9952e836';
+
+const resolveNavanCredentials = (context) => {
+    const envClientId = process.env.NAVAN_CLIENT_ID;
+    const envClientSecret = process.env.NAVAN_SECRET_KEY;
+
+    if (envClientId && envClientSecret) {
+        return {
+            clientId: envClientId,
+            clientSecret: envClientSecret,
+            source: 'environment'
+        };
+    }
+
+    if (envClientId || envClientSecret) {
+        context?.log?.warn?.('Incomplete Navan credentials found in environment variables. Falling back to hardcoded test credentials.');
+    } else {
+        context?.log?.warn?.('Navan credentials not found in environment. Using hardcoded test credentials. Do not use in production.');
+    }
+
+    return {
+        clientId: NAVAN_TEST_CLIENT_ID,
+        clientSecret: NAVAN_TEST_SECRET_KEY,
+        source: 'hardcoded-test'
+    };
+};
+
 // Helper function to generate unique IDs
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
@@ -1811,20 +1868,19 @@ app.http('navanLookup', {
             
             // Step 1: Get OAuth token from Navan
             // Get Navan API credentials from environment variables (same pattern as Cosmos DB)
-            const clientId = process.env.NAVAN_CLIENT_ID;
-            const clientSecret = process.env.NAVAN_SECRET_KEY;
+            const { clientId, clientSecret, source: navanCredentialSource } = resolveNavanCredentials(context);
             
             // Log credential status (without exposing values)
+            context.log.info(`Navan credentials source: ${navanCredentialSource}`);
             context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
             
             if (!clientId || !clientSecret) {
-                context.log.error('Navan credentials not configured in environment variables');
-                context.log.error(`Environment variables: NAVAN_CLIENT_ID=${!!clientId}, NAVAN_SECRET_KEY=${!!clientSecret}`);
+                context.log.error('Navan credentials could not be resolved.');
                 return {
                     status: 200, // Return 200 so frontend can see error details
                     jsonBody: {
-                        error: 'Navan API credentials not configured. Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables.',
-                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set' : 'missing'}`,
+                        error: 'Navan API credentials not configured.',
+                        detail: 'No Navan credentials available from environment or hardcoded test configuration.',
                         originalMessage: 'Navan credentials check failed',
                         bookingId: bookingId
                     },
@@ -1836,7 +1892,8 @@ app.http('navanLookup', {
             }
             
             context.log.info('Requesting OAuth token from Navan...');
-            const tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
+            const fetchFn = await getFetch();
+            const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
                 method: 'POST',
                 headers: {
                     'content-type': 'application/x-www-form-urlencoded'
@@ -1909,7 +1966,8 @@ app.http('navanLookup', {
                 while (!foundBooking && page < 10) { // Limit to 10 pages (1000 bookings max)
                     context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
                     
-                    bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
+                    const fetchFn = await getFetch();
+                    bookingResponse = await fetchFn(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
                         method: 'GET',
                         headers: {
                             'Authorization': `Bearer ${accessToken}`,
@@ -1947,7 +2005,8 @@ app.http('navanLookup', {
                             // Now use the UUID to fetch the full booking details directly
                             // This is more efficient and ensures we get all details
                             context.log.info(`Fetching full booking details using UUID: ${bookingUuid}`);
-                            const uuidResponse = await fetch(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+                            const fetchFn = await getFetch();
+                            const uuidResponse = await fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                                 method: 'GET',
                                 headers: {
                                     'Authorization': `Bearer ${accessToken}`,
@@ -2485,26 +2544,26 @@ app.http('navanTest', {
                 context.log.info('Navan API connection test requested');
             
             // Get Navan API credentials from environment variables
-            let clientId, clientSecret;
+            let clientId, clientSecret, navanCredentialSource;
             try {
-                clientId = process.env.NAVAN_CLIENT_ID;
-                clientSecret = process.env.NAVAN_SECRET_KEY;
+                ({ clientId, clientSecret, source: navanCredentialSource } = resolveNavanCredentials(context));
             } catch (envError) {
-                context.log.error('Error reading environment variables:', envError);
-                return errorResponse('Environment variable read error', envError.message);
+                context.log.error('Error resolving Navan credentials:', envError);
+                return errorResponse('Navan credential resolution error', envError.message);
             }
+            
+            context.log.info(`Navan credentials source: ${navanCredentialSource}`);
+            context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
             
             // Check if credentials are available
             if (!clientId || !clientSecret) {
                 context.log.error('Navan credentials not configured');
-                context.log.error(`NAVAN_CLIENT_ID: ${clientId ? 'set (length: ' + clientId.length + ')' : 'missing'}`);
-                context.log.error(`NAVAN_SECRET_KEY: ${clientSecret ? 'set (length: ' + clientSecret.length + ')' : 'missing'}`);
                 return {
                     status: 200, // Return 200 so frontend can see the error details
                     jsonBody: {
                         connected: false,
                         error: 'Navan API credentials not configured',
-                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set (length: ' + clientId.length + ')' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set (length: ' + clientSecret.length + ')' : 'missing'}`,
+                        detail: 'No Navan credentials available from environment or hardcoded test configuration.',
                         message: 'Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables'
                     },
                     headers: { 
@@ -2518,7 +2577,8 @@ app.http('navanTest', {
             context.log.info('Testing OAuth token generation...');
             let tokenResponse;
             try {
-                tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
+                const fetchFn = await getFetch();
+                tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
                     method: 'POST',
                     headers: {
                         'content-type': 'application/x-www-form-urlencoded'
@@ -2594,7 +2654,8 @@ app.http('navanTest', {
             context.log.info('Testing API call with token...');
             let testApiResponse;
             try {
-                testApiResponse = await fetch(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
+                const fetchFn = await getFetch();
+                testApiResponse = await fetchFn(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
                     method: 'GET',
                     headers: {
                         'Authorization': `Bearer ${accessToken}`,
@@ -2784,7 +2845,8 @@ app.http('geocode', {
             const apiUrl = `https://atlas.microsoft.com/search/address/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const response = await fetch(apiUrl);
+                const fetchFn = await getFetch();
+                const response = await fetchFn(apiUrl);
                 const data = await response.json();
                 return {
                     status: 200,
@@ -2855,7 +2917,8 @@ app.http('routeDirections', {
             const apiUrl = `https://atlas.microsoft.com/route/directions/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const response = await fetch(apiUrl);
+                const fetchFn = await getFetch();
+                const response = await fetchFn(apiUrl);
                 const data = await response.json();
                 return {
                     status: 200,
