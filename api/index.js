@@ -1,6 +1,43 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
+const ensureContextLogger = (context) => {
+    if (!context) {
+        return;
+    }
+    const log = context.log;
+    const hasStructuredLogger = log && typeof log === 'object' &&
+        typeof log.error === 'function' &&
+        typeof log.warn === 'function' &&
+        typeof log.info === 'function';
+
+    if (hasStructuredLogger) {
+        return;
+    }
+
+    const baseLogger = typeof log === 'function'
+        ? log.bind(context)
+        : (...args) => console.log(...args);
+
+    const errorLogger = (log && typeof log.error === 'function')
+        ? log.error.bind(log)
+        : (...args) => (console.error ? console.error(...args) : baseLogger(...args));
+
+    const warnLogger = (log && typeof log.warn === 'function')
+        ? log.warn.bind(log)
+        : (...args) => (console.warn ? console.warn(...args) : baseLogger(...args));
+
+    const infoLogger = (log && typeof log.info === 'function')
+        ? log.info.bind(log)
+        : baseLogger;
+
+    context.log = {
+        error: errorLogger,
+        warn: warnLogger,
+        info: infoLogger
+    };
+};
+
 // Use node-fetch instead of native fetch for Azure Functions compatibility
 // Native fetch is broken in Azure Functions environment
 // Import node-fetch using require (v2 supports CommonJS)
@@ -180,6 +217,7 @@ const getContainer = (containerName) => {
 
 // Helper function to handle errors
 const handleError = (context, error, message) => {
+    ensureContextLogger(context);
     context.log.error(`${message}:`, error.message);
     context.log.error(`Stack:`, error.stack);
 
@@ -1898,6 +1936,7 @@ app.http('navanLookup', {
     authLevel: 'anonymous',
     route: 'navan-lookup',
     handler: async (request, context) => {
+        ensureContextLogger(context);
         // Handle OPTIONS request for CORS
         if (request.method === 'OPTIONS') {
             return {
@@ -2501,6 +2540,7 @@ app.http('navanTest', {
     authLevel: 'anonymous',
     route: 'navan-test',
     handler: async (request, context) => {
+        ensureContextLogger(context);
         // Wrap everything in a try-catch to ensure we always return a response
         try {
             // Default error response
