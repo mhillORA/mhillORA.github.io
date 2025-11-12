@@ -1,216 +1,31 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
-const ensureContextLogger = (context) => {
-    if (!context) {
-        return;
-    }
-
-    const currentLog = context.log;
-    const hasFullLogger = typeof currentLog === 'function' &&
-        typeof currentLog.error === 'function' &&
-        typeof currentLog.warn === 'function' &&
-        typeof currentLog.info === 'function';
-
-    if (hasFullLogger) {
-        return;
-    }
-
-    const fallbackBase = (...args) => {
-        if (typeof currentLog === 'function') {
-            currentLog(...args);
-        } else {
-            console.log(...args);
-        }
-    };
-
-    const baseLogger = fallbackBase.bind(context);
-
-    const makeFallback = (level, fallbackConsoleFn) => {
-        if (currentLog && typeof currentLog[level] === 'function') {
-            return currentLog[level].bind(currentLog);
-        }
-        return fallbackConsoleFn
-            ? (...args) => fallbackConsoleFn(...args)
-            : baseLogger;
-    };
-
-    baseLogger.error = makeFallback('error', console.error ? console.error.bind(console) : null);
-    baseLogger.warn = makeFallback('warn', console.warn ? console.warn.bind(console) : null);
-    baseLogger.info = makeFallback('info', console.info ? console.info.bind(console) : null);
-
-    context.log = baseLogger;
-};
-
-// Use node-fetch only if native fetch is unavailable
+// Use node-fetch instead of native fetch for Azure Functions compatibility
+// Native fetch is broken in Azure Functions environment
+// Import node-fetch using require (v2 supports CommonJS)
+let fetch;
+let fetchError = null;
 const getFetch = async () => {
-    if (typeof globalThis.fetch === 'function') {
-        return globalThis.fetch.bind(globalThis);
+    if (fetchError) {
+        throw fetchError;
     }
-    try {
-        const { default: nodeFetch } = await import('node-fetch');
-        return nodeFetch;
-    } catch (importError) {
-        throw new Error(`Failed to load fetch implementation: ${importError.message}`);
-    }
-};
-
-// Temporary Navan API credentials for local testing only.
-// These should never be used in production deployments.
-const NAVAN_TEST_CLIENT_ID = 'b255eefb-978a-4a1b-a8b1-fb069d7f8b43';
-const NAVAN_TEST_SECRET_KEY = '8ef37280136f4e388cc499df9952e836';
-
-const NAVAN_DEFAULT_BASE_URL = 'https://app.navan.com/v1';
-const NAVAN_DEFAULT_AUTH_URL = 'https://api.navan.com/ta-auth/oauth/token';
-
-let navanTokenCache = {
-    token: null,
-    expiresAt: 0,
-    clientId: null
-};
-
-const resolveNavanCredentials = (context) => {
-    const envClientId = process.env.NAVAN_CLIENT_ID;
-    const envClientSecret = process.env.NAVAN_SECRET_KEY;
-
-    if (envClientId && envClientSecret) {
-        return {
-            clientId: envClientId,
-            clientSecret: envClientSecret,
-            source: 'environment'
-        };
-    }
-
-    if (envClientId || envClientSecret) {
-        context?.log?.warn?.('Incomplete Navan credentials found in environment variables. Falling back to hardcoded test credentials.');
-    } else {
-        context?.log?.warn?.('Navan credentials not found in environment. Using hardcoded test credentials. Do not use in production.');
-    }
-
-    return {
-        clientId: NAVAN_TEST_CLIENT_ID,
-        clientSecret: NAVAN_TEST_SECRET_KEY,
-        source: 'hardcoded-test'
-    };
-};
-
-const resolveNavanEndpoints = (context) => {
-    const baseUrlRaw = (process.env.NAVAN_BASE_URL || '').trim();
-    const authUrlRaw = (process.env.NAVAN_AUTH_URL || '').trim();
-    const baseUrl = baseUrlRaw || NAVAN_DEFAULT_BASE_URL;
-    let authUrl = authUrlRaw;
-
-    if (!authUrl) {
-        authUrl = `${baseUrl.replace(/\/$/, '')}/auth/token`;
-        context?.log?.info?.(`Navan auth URL derived from base URL: ${authUrl}`);
-    } else {
-        context?.log?.info?.(`Navan auth URL loaded from environment: ${authUrl}`);
-    }
-
-    return {
-        baseUrl,
-        authUrl
-    };
-};
-
-const getNavanAuthToken = async (context, fetchFn, clientId, clientSecret) => {
-    const now = Date.now();
-    if (navanTokenCache.token && navanTokenCache.clientId === clientId && navanTokenCache.expiresAt - now > 60_000) {
-        context?.log?.info?.('Using cached Navan access token');
-        return navanTokenCache.token;
-    }
-
-    const sanitizedClientId = (clientId || '').trim();
-    const sanitizedClientSecret = (clientSecret || '').trim();
-
-    const { authUrl } = resolveNavanEndpoints(context);
-    context?.log?.info?.(`Requesting new Navan OAuth token from ${authUrl}`);
-    const isJsonEndpoint = authUrl.toLowerCase().includes('/auth/token');
-
-    let response;
-    try {
-        const attempts = [];
-
-        if (isJsonEndpoint) {
-            attempts.push({
-                headers: {
-                    'content-type': 'application/json',
-                    'accept': 'application/json'
-                },
-                body: JSON.stringify({
-                    client_id: sanitizedClientId,
-                    client_secret: sanitizedClientSecret,
-                    grant_type: 'client_credentials'
-                }),
-                description: 'json'
-            });
-        }
-
-        attempts.push({
-            headers: {
-                'content-type': 'application/x-www-form-urlencoded',
-                'accept': 'application/json'
-            },
-            body: new URLSearchParams({
-                client_id: sanitizedClientId,
-                client_secret: sanitizedClientSecret,
-                grant_type: 'client_credentials'
-            }).toString(),
-            description: 'form'
-        });
-
-        let lastErrorText = '';
-        for (const attempt of attempts) {
-            context?.log?.info?.(`Navan token request attempt (${attempt.description})`);
-            response = await fetchFn(authUrl, {
-                method: 'POST',
-                headers: attempt.headers,
-                body: attempt.body
-            });
-
-            if (response.ok) {
-                break;
+    if (!fetch) {
+        try {
+            // Try CommonJS require first (node-fetch v2)
+            try {
+                fetch = require('node-fetch');
+            } catch (requireError) {
+                // Fallback to ESM import (node-fetch v3)
+                const nodeFetch = await import('node-fetch');
+                fetch = nodeFetch.default;
             }
-
-            lastErrorText = await response.text().catch(() => 'Unable to read response body');
-            context?.log?.warn?.(`Navan token request attempt (${attempt.description}) failed with status ${response.status}: ${lastErrorText}`);
+        } catch (importError) {
+            fetchError = importError;
+            throw new Error(`Failed to import node-fetch: ${importError.message}. Make sure node-fetch is installed in package.json.`);
         }
-
-        if (!response || !response.ok) {
-            const errorText = lastErrorText || await response.text().catch(() => 'Unable to read response body');
-            navanTokenCache = { token: null, expiresAt: 0, clientId: null };
-            throw new Error(`Navan token request failed with status ${response?.status ?? 'unknown'}: ${errorText}`);
-        }
-    } catch (error) {
-        navanTokenCache = { token: null, expiresAt: 0, clientId: null };
-        throw new Error(`Network error requesting Navan token: ${error.message}`);
     }
-
-    let data;
-    try {
-        data = await response.json();
-    } catch (error) {
-        navanTokenCache = { token: null, expiresAt: 0, clientId: null };
-        throw new Error(`Failed to parse Navan token response JSON: ${error.message}`);
-    }
-
-    const accessToken = data.access_token || data.token;
-    if (!accessToken) {
-        navanTokenCache = { token: null, expiresAt: 0, clientId: null };
-        throw new Error('Navan token response did not contain access_token');
-    }
-
-    const expiresInSeconds = Number(data.expires_in || data.expiresIn || 300);
-    const ttl = Number.isFinite(expiresInSeconds) ? Math.max(expiresInSeconds - 60, 120) * 1000 : 5 * 60 * 1000;
-    navanTokenCache = {
-        token: accessToken,
-        expiresAt: now + ttl,
-        clientId: sanitizedClientId
-    };
-
-    context?.log?.info?.(`Navan access token retrieved (${Math.round(ttl / 1000)}s cache window)`);
-
-    return accessToken;
+    return fetch;
 };
 
 // Helper function to generate unique IDs
@@ -246,7 +61,6 @@ const getContainer = (containerName) => {
 
 // Helper function to handle errors
 const handleError = (context, error, message) => {
-    ensureContextLogger(context);
     context.log.error(`${message}:`, error.message);
     context.log.error(`Stack:`, error.stack);
 
@@ -1954,9 +1768,10 @@ app.http('azure-maps-config', {
 });
 
 // Navan booking lookup endpoint
-// This endpoint calls Navan API to get booking information by booking UUID or confirmation number
+// This endpoint calls Navan API to get booking information by bookingId
 // Step 1: Get OAuth token from https://api.navan.com/ta-auth/oauth/token
-// Step 2: Call Navan Bookings API: https://app.navan.com/v1/bookings?bookingUuid={uuid}
+// Step 2: Call Navan Bookings API: https://api.navan.com/v1/bookings?createdFrom={timestamp}&createdTo={timestamp}
+//        Then filter results by bookingId client-side
 // Configure API credentials in Azure Static Web App environment variables:
 // - NAVAN_CLIENT_ID: Set in Azure environment variables
 // - NAVAN_SECRET_KEY: Set in Azure environment variables
@@ -1965,7 +1780,6 @@ app.http('navanLookup', {
     authLevel: 'anonymous',
     route: 'navan-lookup',
     handler: async (request, context) => {
-        ensureContextLogger(context);
         // Handle OPTIONS request for CORS
         if (request.method === 'OPTIONS') {
             return {
@@ -1978,18 +1792,14 @@ app.http('navanLookup', {
             };
         }
         
-        let bookingIdentifier = null;
+        let bookingId = null;
         
         try {
             // Get query parameters - try multiple methods for compatibility
             if (request.query && request.query.bookingId) {
-                bookingIdentifier = request.query.bookingId;
-            } else if (request.query && request.query.bookingUuid) {
-                bookingIdentifier = request.query.bookingUuid;
-            } else if (request.query && request.query.bookingConfirmation) {
-                bookingIdentifier = request.query.bookingConfirmation;
+                bookingId = request.query.bookingId;
             } else if (request.query && typeof request.query.get === 'function') {
-                bookingIdentifier = request.query.get('bookingId') || request.query.get('bookingUuid') || request.query.get('bookingConfirmation');
+                bookingId = request.query.get('bookingId');
             } else if (request.url) {
                 try {
                     // Try to parse as full URL
@@ -1999,25 +1809,22 @@ app.http('navanLookup', {
                         urlString = `https://${request.headers?.['host'] || 'localhost'}${urlString}`;
                     }
                     const url = new URL(urlString);
-                    bookingIdentifier = url.searchParams.get('bookingId') || url.searchParams.get('bookingUuid') || url.searchParams.get('bookingConfirmation');
+                    bookingId = url.searchParams.get('bookingId');
                 } catch (error) {
                     context.log.warn('Error parsing URL:', error.message);
                     // Try simple query string parsing
-                    const matchId = request.url.match(/[?&]bookingId=([^&]+)/);
-                    const matchUuid = request.url.match(/[?&]bookingUuid=([^&]+)/);
-                    const matchConf = request.url.match(/[?&]bookingConfirmation=([^&]+)/);
-                    const match = matchUuid || matchId || matchConf;
+                    const match = request.url.match(/[?&]bookingId=([^&]+)/);
                     if (match) {
-                        bookingIdentifier = decodeURIComponent(match[1]);
+                        bookingId = decodeURIComponent(match[1]);
                     }
                 }
             }
             
-            if (!bookingIdentifier) {
-                context.log.error('Navan lookup: booking identifier parameter missing. URL:', request.url);
+            if (!bookingId) {
+                context.log.error('Navan lookup: bookingId parameter missing. URL:', request.url);
                 return {
                     status: 400,
-                    jsonBody: { error: 'bookingUuid or bookingConfirmation parameter is required' },
+                    jsonBody: { error: 'bookingId parameter is required' },
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
@@ -2027,25 +1834,26 @@ app.http('navanLookup', {
                            (request.query && typeof request.query.get === 'function' && request.query.get('readOnly') === 'true') ||
                            (request.url && request.url.includes('readOnly=true'));
             
-            context.log.info(`Navan booking lookup request for identifier: ${bookingIdentifier} (readOnly: ${readOnly})`);
+            context.log.info(`Navan booking lookup request for: ${bookingId} (readOnly: ${readOnly})`);
             
             // Step 1: Get OAuth token from Navan
             // Get Navan API credentials from environment variables (same pattern as Cosmos DB)
-            const { clientId, clientSecret, source: navanCredentialSource } = resolveNavanCredentials(context);
+            const clientId = process.env.NAVAN_CLIENT_ID;
+            const clientSecret = process.env.NAVAN_SECRET_KEY;
             
             // Log credential status (without exposing values)
-            context.log.info(`Navan credentials source: ${navanCredentialSource}`);
             context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
             
             if (!clientId || !clientSecret) {
-                context.log.error('Navan credentials could not be resolved.');
+                context.log.error('Navan credentials not configured in environment variables');
+                context.log.error(`Environment variables: NAVAN_CLIENT_ID=${!!clientId}, NAVAN_SECRET_KEY=${!!clientSecret}`);
                 return {
                     status: 200, // Return 200 so frontend can see error details
                     jsonBody: {
-                        error: 'Navan API credentials not configured.',
-                        detail: 'No Navan credentials available from environment or hardcoded test configuration.',
+                        error: 'Navan API credentials not configured. Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables.',
+                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set' : 'missing'}`,
                         originalMessage: 'Navan credentials check failed',
-                        bookingId: bookingIdentifier
+                        bookingId: bookingId
                     },
                     headers: { 
                         'Content-Type': 'application/json',
@@ -2054,21 +1862,45 @@ app.http('navanLookup', {
                 };
             }
             
+            context.log.info('Requesting OAuth token from Navan...');
             const fetchFn = await getFetch();
-            const { baseUrl, authUrl } = resolveNavanEndpoints(context);
-            context.log.info(`Navan endpoints resolved. Base URL: ${baseUrl}, Auth URL: ${authUrl}`);
+            const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/x-www-form-urlencoded'
+                },
+                body: new URLSearchParams({
+                    grant_type: 'client_credentials',
+                    client_id: clientId,
+                    client_secret: clientSecret
+                })
+            });
             
-            let accessToken;
-            try {
-                accessToken = await getNavanAuthToken(context, fetchFn, clientId, clientSecret);
-            } catch (tokenError) {
-                context.log.error('Failed to obtain Navan OAuth token:', tokenError);
+            if (!tokenResponse.ok) {
+                const errorText = await tokenResponse.text();
+                context.log.error(`Token request failed: ${tokenResponse.status} - ${errorText}`);
+                return {
+                    status: tokenResponse.status,
+                    jsonBody: { 
+                        error: `Failed to get OAuth token: ${errorText}`,
+                        detail: `OAuth token request failed with status ${tokenResponse.status}. This usually means the CLIENT_ID or SECRET_KEY are incorrect, or the Azure app's outbound IP addresses need to be added to Navan API settings.`,
+                        originalMessage: 'OAuth token request failed'
+                    },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            const tokenData = await tokenResponse.json();
+            const accessToken = tokenData.access_token;
+            
+            if (!accessToken) {
+                context.log.error('No access token in response:', tokenData);
                 return {
                     status: 200, // Return 200 so frontend can see error details
-                    jsonBody: {
+                    jsonBody: { 
                         error: 'Failed to get access token from Navan',
-                        detail: tokenError.message || 'Unknown error requesting Navan token',
-                        bookingId: bookingIdentifier
+                        detail: 'OAuth token response did not contain access_token',
+                        bookingId: bookingId
                     },
                     headers: { 
                         'Content-Type': 'application/json',
@@ -2078,60 +1910,146 @@ app.http('navanLookup', {
             }
             
             context.log.info('OAuth token obtained successfully');
-            const sanitizedBaseUrl = baseUrl.replace(/\/$/, '');
             
             // Step 2: Get booking data from Navan
-            context.log.info(`Fetching booking ${bookingIdentifier} from Navan...`);
+            // Strategy: First try to find booking by bookingId, then use its UUID for direct lookup
+            context.log.info(`Fetching booking ${bookingId} from Navan...`);
             
-            const navanRequestHeaders = {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json',
-                'accept': 'application/json'
-            };
-            
-            context.log.info('Retrieving booking using bookingUuid parameter only');
             let bookingData = null;
+            let bookingResponse = null;
+            
             try {
-                const directLookupUrl = `${sanitizedBaseUrl}/bookings?bookingUuid=${encodeURIComponent(bookingIdentifier)}&includeTransactions=false`;
-                const directResponse = await fetchFn(directLookupUrl, {
-                    method: 'GET',
-                    headers: navanRequestHeaders
-                });
+                // First, fetch recent bookings to find the UUID for this bookingId
+                // Navan API requires createdFrom/createdTo parameters - fetch recent bookings (last 90 days)
+                const now = Date.now();
+                const ninetyDaysAgo = now - (90 * 24 * 60 * 60 * 1000);
+                const createdFrom = Math.floor(ninetyDaysAgo / 1000);
+                const createdTo = Math.floor(now / 1000);
                 
-                if (!directResponse.ok) {
-                    const errorText = await directResponse.text().catch(() => 'Unable to read response body');
-                    context.log.error(`Booking lookup failed (${directResponse.status}): ${errorText}`);
-                    return {
-                        status: directResponse.status,
-                        jsonBody: {
-                            error: `Failed to fetch booking ${bookingIdentifier}`,
-                            bookingId: bookingIdentifier,
-                            details: errorText
-                        },
-                        headers: { 'Content-Type': 'application/json' }
-                    };
+                context.log.info(`Searching for bookingId ${bookingId} in bookings from ${new Date(ninetyDaysAgo).toISOString()} to ${new Date(now).toISOString()}`);
+                
+                // Fetch bookings with pagination - start with first page
+                let page = 0;
+                const pageSize = 100;
+                let foundBooking = null;
+                let bookingUuid = null;
+                
+                while (!foundBooking && page < 10) { // Limit to 10 pages (1000 bookings max)
+                    context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
+                    
+                    const fetchFn = await getFetch();
+                    bookingResponse = await fetchFn(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${accessToken}`,
+                            'Content-Type': 'application/json',
+                            'accept': 'application/json'
+                        }
+                    });
+                    
+                    context.log.info(`Navan API response status: ${bookingResponse.status}`);
+                    
+                    if (!bookingResponse.ok) {
+                        const errorText = await bookingResponse.text();
+                        context.log.error(`Booking request failed: ${bookingResponse.status} - ${errorText}`);
+                        return {
+                            status: bookingResponse.status,
+                            jsonBody: { 
+                                error: 'Failed to fetch bookings from Navan',
+                                bookingId: bookingId,
+                                details: errorText
+                            },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                    
+                    const allBookings = await bookingResponse.json();
+                    context.log.info(`Received ${allBookings.data?.length || 0} bookings on page ${page}`);
+                    
+                    // Find the booking by bookingId in the results
+                    if (allBookings.data && Array.isArray(allBookings.data)) {
+                        foundBooking = allBookings.data.find(b => b.bookingId === bookingId);
+                        if (foundBooking) {
+                            bookingUuid = foundBooking.uuid;
+                            context.log.info(`Booking found on page ${page} with UUID: ${bookingUuid}`);
+                            
+                            // Now use the UUID to fetch the full booking details directly
+                            // This is more efficient and ensures we get all details
+                            context.log.info(`Fetching full booking details using UUID: ${bookingUuid}`);
+                            const fetchFn = await getFetch();
+                            const uuidResponse = await fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+                                method: 'GET',
+                                headers: {
+                                    'Authorization': `Bearer ${accessToken}`,
+                                    'Content-Type': 'application/json',
+                                    'accept': 'application/json'
+                                }
+                            });
+                            
+                            if (uuidResponse.ok) {
+                                const uuidBookingData = await uuidResponse.json();
+                                if (uuidBookingData.data && uuidBookingData.data.length > 0) {
+                                    bookingData = { data: [uuidBookingData.data[0]] };
+                                    context.log.info('Full booking details retrieved using UUID');
+                                    break;
+                                } else {
+                                    // UUID lookup returned empty data, use booking from list
+                                    context.log.warn('UUID lookup returned empty data, using booking from list');
+                                    bookingData = { data: [foundBooking] };
+                                    break;
+                                }
+                            } else {
+                                // UUID lookup failed, use booking from list
+                                const errorText = await uuidResponse.text();
+                                context.log.warn(`UUID lookup failed with status ${uuidResponse.status}: ${errorText}`);
+                                context.log.warn('Falling back to booking from list');
+                                bookingData = { data: [foundBooking] };
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Check if there are more pages
+                    if (allBookings.page && allBookings.page.totalPages && page < allBookings.page.totalPages - 1) {
+                        page++;
+                    } else {
+                        break; // No more pages
+                    }
                 }
                 
-                const directData = await directResponse.json();
-                if (directData && Array.isArray(directData.data) && directData.data.length > 0) {
-                    bookingData = { data: directData.data };
-                    context.log.info('Booking retrieved via direct bookingUuid lookup');
-                } else {
-                    context.log.warn(`Booking ${bookingIdentifier} not found via bookingUuid lookup`);
-                    return {
+                if (!foundBooking) {
+                    context.log.warn(`Booking ${bookingId} not found in recent bookings (searched ${page + 1} pages)`);
+                            return {
                         status: 404,
-                        jsonBody: {
+                                jsonBody: {
                             error: 'Booking not found',
-                            bookingId: bookingIdentifier,
-                            message: 'No booking returned for the supplied bookingUuid.'
-                        },
-                        headers: { 'Content-Type': 'application/json' }
-                    };
-                }
+                            bookingId: bookingId,
+                            message: 'Booking not found in recent bookings (last 90 days). The booking may be older or the bookingId may be incorrect.'
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
             } catch (fetchError) {
                 context.log.error('Error fetching booking from Navan:', fetchError.message);
                 context.log.error('Fetch error stack:', fetchError.stack);
                 throw fetchError;
+            }
+            
+            // Verify bookingData is set
+            if (!bookingData || !bookingData.data || bookingData.data.length === 0) {
+                context.log.error('Booking data is null or empty after fetch');
+                return {
+                    status: 200, // Return 200 so frontend can see error details
+                    jsonBody: { 
+                        error: 'Booking not found',
+                        detail: `No booking found with bookingId: ${bookingId}`,
+                        bookingId: bookingId
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
             }
             
             // Step 3: Store booking data in travel container for reporting (skip if readOnly)
@@ -2157,26 +2075,21 @@ app.http('navanLookup', {
                 const travelContainer = getContainer('travel');
                 context.log.info('Travel container obtained successfully');
                 
-                const booking = bookingData.data[0];
-                const bookingUuid = booking?.uuid || bookingIdentifier;
-                const bookingIdFromNavan = booking?.bookingId || null;
-                const bookingConfirmationNumber = booking?.confirmationNumber || bookingIdFromNavan || null;
-                const lookupIdentifier = bookingIdentifier;
-                
                 // Check if a travel record already exists for this booking ID
                 let existingTravel = null;
                 try {
-                    context.log.info(`Querying for existing travel record with identifier: ${lookupIdentifier}`);
-                    // Check for existing record by lookup identifier or UUID (in case it was previously stored with UUID)
-
+                    context.log.info(`Querying for existing travel record with navanBookingId: ${bookingId}`);
+                    // Check for existing record by bookingId or UUID (in case it was previously stored with UUID)
+                    // Get the booking UUID from the bookingData we just fetched
+                    const bookingUuid = bookingData?.data?.[0]?.uuid || '';
+                    
                     // Query for existing records - use IS_DEFINED to safely check if fields exist
                     // This prevents errors if navanBookingId or navanBookingUuid fields don't exist in old records
                     const { resources: existingRecords } = await travelContainer.items
                         .query({
-                            query: "SELECT * FROM c WHERE (IS_DEFINED(c.navanLookupIdentifier) AND c.navanLookupIdentifier = @lookup) OR (IS_DEFINED(c.navanBookingId) AND c.navanBookingId = @bookingId) OR (IS_DEFINED(c.navanBookingUuid) AND c.navanBookingUuid = @uuid)",
+                            query: "SELECT * FROM c WHERE (IS_DEFINED(c.navanBookingId) AND c.navanBookingId = @bookingId) OR (IS_DEFINED(c.navanBookingUuid) AND c.navanBookingUuid = @uuid)",
                             parameters: [
-                                { name: "@lookup", value: lookupIdentifier },
-                                { name: "@bookingId", value: bookingIdFromNavan || lookupIdentifier },
+                                { name: "@bookingId", value: bookingId },
                                 { name: "@uuid", value: bookingUuid }
                             ]
                         })
@@ -2195,6 +2108,7 @@ app.http('navanLookup', {
                 
                 // Prepare travel record data from Navan booking
                 // Transform Navan data to match existing travel container schema
+                const booking = bookingData.data[0];
                 const bookingType = booking.bookingType || 'FLIGHT';
                 
                 // Get passenger/traveler info and find matching CRC ID
@@ -2271,16 +2185,15 @@ app.http('navanLookup', {
                     date: date || new Date().toISOString().split('T')[0], // Required - use today if not available
                     
                     // Navan booking reference (optional field)
-                    // Store the lookup identifier, and the exact identifiers returned by Navan
-                    navanLookupIdentifier: lookupIdentifier,
-                    navanBookingId: bookingIdFromNavan,
-                    navanBookingUuid: bookingUuid,
+                    // Store the bookingId used for lookup, and also store UUID for reference
+                    navanBookingId: bookingId, // The bookingId used to find this booking (e.g., "AQ8M5Q")
+                    navanBookingUuid: booking.uuid || null, // The UUID from Navan (for reference)
                     
                     // Status (must be one of: scheduled, delayed, departed, arrived, cancelled)
                     status: status,
                     
                     // Confirmation number (common across all booking types)
-                    confirmationNumber: bookingConfirmationNumber
+                    confirmationNumber: booking.confirmationNumber || booking.bookingId || null
                 };
                 
                 // Add booking-type specific fields based on actual Navan API structure
@@ -2470,10 +2383,10 @@ app.http('navanLookup', {
                 
                 // Ensure required fields are present
                 if (!travelRecord.crcId || travelRecord.crcId === 'unknown') {
-                    context.log.warn(`Warning: crcId is missing or unknown for booking lookup ${lookupIdentifier}`);
+                    context.log.warn(`Warning: crcId is missing or unknown for booking ${bookingId}`);
                 }
                 if (!travelRecord.date) {
-                    context.log.warn(`Warning: date is missing for booking lookup ${lookupIdentifier}`);
+                    context.log.warn(`Warning: date is missing for booking ${bookingId}`);
                 }
                 
                 if (existingTravel) {
@@ -2482,7 +2395,7 @@ app.http('navanLookup', {
                     const updatedTravel = { ...existingTravel, ...travelRecord, id: existingTravel.id };
                     try {
                         const { resource: savedTravel } = await travelContainer.items.upsert(updatedTravel);
-                        context.log.info(`Updated existing travel record for Navan booking lookup ${lookupIdentifier}`);
+                        context.log.info(`Updated existing travel record for Navan booking ${bookingId}`);
                     } catch (upsertError) {
                         context.log.error('Error upserting travel record:', upsertError.message);
                         context.log.error('Upsert error stack:', upsertError.stack);
@@ -2496,7 +2409,7 @@ app.http('navanLookup', {
                     context.log.info('Travel record data prepared:', JSON.stringify(newTravel, null, 2));
                     try {
                         const { resource: savedTravel } = await travelContainer.items.create(newTravel);
-                        context.log.info(`Created new travel record for Navan booking lookup ${lookupIdentifier}`);
+                        context.log.info(`Created new travel record for Navan booking ${bookingId}`);
                     } catch (createError) {
                         context.log.error('Error creating travel record:', createError.message);
                         context.log.error('Create error stack:', createError.stack);
@@ -2551,7 +2464,7 @@ app.http('navanLookup', {
                     detail: error.message || 'Unknown error occurred',
                     stack: error.stack || 'No stack trace available',
                     originalMessage: 'Navan lookup exception',
-                    bookingId: bookingIdentifier || null
+                    bookingId: bookingId || null
                 },
                 headers: { 
                     'Content-Type': 'application/json',
@@ -2569,7 +2482,6 @@ app.http('navanTest', {
     authLevel: 'anonymous',
     route: 'navan-test',
     handler: async (request, context) => {
-        ensureContextLogger(context);
         // Wrap everything in a try-catch to ensure we always return a response
         try {
             // Default error response
@@ -2603,26 +2515,26 @@ app.http('navanTest', {
                 context.log.info('Navan API connection test requested');
             
             // Get Navan API credentials from environment variables
-            let clientId, clientSecret, navanCredentialSource;
+            let clientId, clientSecret;
             try {
-                ({ clientId, clientSecret, source: navanCredentialSource } = resolveNavanCredentials(context));
+                clientId = process.env.NAVAN_CLIENT_ID;
+                clientSecret = process.env.NAVAN_SECRET_KEY;
             } catch (envError) {
-                context.log.error('Error resolving Navan credentials:', envError);
-                return errorResponse('Navan credential resolution error', envError.message);
+                context.log.error('Error reading environment variables:', envError);
+                return errorResponse('Environment variable read error', envError.message);
             }
-            
-            context.log.info(`Navan credentials source: ${navanCredentialSource}`);
-            context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
             
             // Check if credentials are available
             if (!clientId || !clientSecret) {
                 context.log.error('Navan credentials not configured');
+                context.log.error(`NAVAN_CLIENT_ID: ${clientId ? 'set (length: ' + clientId.length + ')' : 'missing'}`);
+                context.log.error(`NAVAN_SECRET_KEY: ${clientSecret ? 'set (length: ' + clientSecret.length + ')' : 'missing'}`);
                 return {
                     status: 200, // Return 200 so frontend can see the error details
                     jsonBody: {
                         connected: false,
                         error: 'Navan API credentials not configured',
-                        detail: 'No Navan credentials available from environment or hardcoded test configuration.',
+                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set (length: ' + clientId.length + ')' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set (length: ' + clientSecret.length + ')' : 'missing'}`,
                         message: 'Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables'
                     },
                     headers: { 
@@ -2632,28 +2544,143 @@ app.http('navanTest', {
                 };
             }
             
-            const fetchFn = await getFetch();
-            const { baseUrl } = resolveNavanEndpoints(context);
-            const sanitizedBaseUrl = baseUrl.replace(/\/$/, '');
-            
-            let accessToken;
+            // Test OAuth token generation
+            context.log.info('Testing OAuth token generation...');
+            let tokenResponse;
             try {
-                accessToken = await getNavanAuthToken(context, fetchFn, clientId, clientSecret);
-                context.log.info('Navan OAuth token generated successfully for connectivity test');
-            } catch (tokenError) {
-                context.log.error('Navan OAuth token generation failed during test:', tokenError);
-                return errorResponse('Failed to generate OAuth token', tokenError.message);
+                const fetchFn = await getFetch();
+                tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/x-www-form-urlencoded'
+                    },
+                    body: new URLSearchParams({
+                        grant_type: 'client_credentials',
+                        client_id: clientId,
+                        client_secret: clientSecret
+                    })
+                });
+            } catch (fetchError) {
+                context.log.error('Fetch error during OAuth token request:', fetchError);
+                return errorResponse('Network error during OAuth request', fetchError.message);
             }
             
-            context.log.info('Navan OAuth token retrieval successful (no additional Navan API calls performed)');
+            if (!tokenResponse.ok) {
+                let errorText = 'Unknown error';
+                try {
+                    errorText = await tokenResponse.text();
+                } catch (textError) {
+                    context.log.error('Error reading error response text:', textError);
+                }
+                context.log.error(`OAuth token test failed: ${tokenResponse.status} - ${errorText}`);
+                return {
+                    status: 200, // Return 200 so frontend can see the error details
+                    jsonBody: {
+                        connected: false,
+                        error: 'Failed to generate OAuth token',
+                        detail: `OAuth token request failed with status ${tokenResponse.status}: ${errorText}`,
+                        message: 'Unable to connect to Navan API. Check credentials and network connectivity.'
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            let tokenData;
+            try {
+                tokenData = await tokenResponse.json();
+            } catch (jsonError) {
+                context.log.error('Error parsing token response JSON:', jsonError);
+                let responseText = 'Unable to read response';
+                try {
+                    responseText = await tokenResponse.text();
+                } catch (textError) {
+                    // Ignore
+                }
+                return errorResponse('Invalid token response format', `Failed to parse JSON: ${jsonError.message}. Response: ${responseText.substring(0, 200)}`);
+            }
+            
+            const accessToken = tokenData?.access_token;
+            
+            if (!accessToken) {
+                context.log.error('No access token in response:', tokenData);
+                return {
+                    status: 200,
+                    jsonBody: {
+                        connected: false,
+                        error: 'No access token received',
+                        detail: 'OAuth token response did not contain access_token',
+                        message: 'Navan API returned invalid token response'
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            // Test a simple API call to verify the token works
+            context.log.info('Testing API call with token...');
+            let testApiResponse;
+            try {
+                const fetchFn = await getFetch();
+                testApiResponse = await fetchFn(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json',
+                        'accept': 'application/json'
+                    }
+                });
+            } catch (fetchError) {
+                context.log.error('Fetch error during API test call:', fetchError);
+                return {
+                    status: 200,
+                    jsonBody: {
+                        connected: true,
+                        oauthToken: true,
+                        apiCall: false,
+                        error: 'Network error during API call',
+                        detail: fetchError.message,
+                        message: 'OAuth token generated but API call failed due to network error.'
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            if (!testApiResponse.ok) {
+                const errorText = await testApiResponse.text();
+                context.log.warn(`API test call failed: ${testApiResponse.status} - ${errorText}`);
+                return {
+                    status: 200,
+                    jsonBody: {
+                        connected: true,
+                        oauthToken: true,
+                        apiCall: false,
+                        error: 'OAuth token generated but API call failed',
+                        detail: `API call failed with status ${testApiResponse.status}: ${errorText}`,
+                        message: 'Connected to Navan OAuth but API call failed. This may be normal if there are no recent bookings.'
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            context.log.info('Navan API connection test successful');
             return {
                 status: 200,
                 jsonBody: {
                     connected: true,
                     oauthToken: true,
                     apiCall: true,
-                    message: 'Successfully retrieved Navan access token',
-                    accessToken
+                    message: 'Successfully connected to Navan API'
                 },
                 headers: { 
                     'Content-Type': 'application/json',
