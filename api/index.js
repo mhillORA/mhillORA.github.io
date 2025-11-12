@@ -1887,10 +1887,9 @@ app.http('azure-maps-config', {
 });
 
 // Navan booking lookup endpoint
-// This endpoint calls Navan API to get booking information by bookingId
+// This endpoint calls Navan API to get booking information by booking UUID or confirmation number
 // Step 1: Get OAuth token from https://api.navan.com/ta-auth/oauth/token
-// Step 2: Call Navan Bookings API: https://api.navan.com/v1/bookings?createdFrom={timestamp}&createdTo={timestamp}
-//        Then filter results by bookingId client-side
+// Step 2: Call Navan Bookings API: https://app.navan.com/v1/bookings?bookingUuid={uuid}
 // Configure API credentials in Azure Static Web App environment variables:
 // - NAVAN_CLIENT_ID: Set in Azure environment variables
 // - NAVAN_SECRET_KEY: Set in Azure environment variables
@@ -1911,14 +1910,18 @@ app.http('navanLookup', {
             };
         }
         
-        let bookingId = null;
+        let bookingIdentifier = null;
         
         try {
             // Get query parameters - try multiple methods for compatibility
             if (request.query && request.query.bookingId) {
-                bookingId = request.query.bookingId;
+                bookingIdentifier = request.query.bookingId;
+            } else if (request.query && request.query.bookingUuid) {
+                bookingIdentifier = request.query.bookingUuid;
+            } else if (request.query && request.query.bookingConfirmation) {
+                bookingIdentifier = request.query.bookingConfirmation;
             } else if (request.query && typeof request.query.get === 'function') {
-                bookingId = request.query.get('bookingId');
+                bookingIdentifier = request.query.get('bookingId') || request.query.get('bookingUuid') || request.query.get('bookingConfirmation');
             } else if (request.url) {
                 try {
                     // Try to parse as full URL
@@ -1928,22 +1931,25 @@ app.http('navanLookup', {
                         urlString = `https://${request.headers?.['host'] || 'localhost'}${urlString}`;
                     }
                     const url = new URL(urlString);
-                    bookingId = url.searchParams.get('bookingId');
+                    bookingIdentifier = url.searchParams.get('bookingId') || url.searchParams.get('bookingUuid') || url.searchParams.get('bookingConfirmation');
                 } catch (error) {
                     context.log.warn('Error parsing URL:', error.message);
                     // Try simple query string parsing
-                    const match = request.url.match(/[?&]bookingId=([^&]+)/);
+                    const matchId = request.url.match(/[?&]bookingId=([^&]+)/);
+                    const matchUuid = request.url.match(/[?&]bookingUuid=([^&]+)/);
+                    const matchConf = request.url.match(/[?&]bookingConfirmation=([^&]+)/);
+                    const match = matchUuid || matchId || matchConf;
                     if (match) {
-                        bookingId = decodeURIComponent(match[1]);
+                        bookingIdentifier = decodeURIComponent(match[1]);
                     }
                 }
             }
             
-            if (!bookingId) {
-                context.log.error('Navan lookup: bookingId parameter missing. URL:', request.url);
+            if (!bookingIdentifier) {
+                context.log.error('Navan lookup: booking identifier parameter missing. URL:', request.url);
                 return {
                     status: 400,
-                    jsonBody: { error: 'bookingId parameter is required' },
+                    jsonBody: { error: 'bookingUuid or bookingConfirmation parameter is required' },
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
@@ -1953,7 +1959,7 @@ app.http('navanLookup', {
                            (request.query && typeof request.query.get === 'function' && request.query.get('readOnly') === 'true') ||
                            (request.url && request.url.includes('readOnly=true'));
             
-            context.log.info(`Navan booking lookup request for: ${bookingId} (readOnly: ${readOnly})`);
+            context.log.info(`Navan booking lookup request for identifier: ${bookingIdentifier} (readOnly: ${readOnly})`);
             
             // Step 1: Get OAuth token from Navan
             // Get Navan API credentials from environment variables (same pattern as Cosmos DB)
@@ -1971,7 +1977,7 @@ app.http('navanLookup', {
                         error: 'Navan API credentials not configured.',
                         detail: 'No Navan credentials available from environment or hardcoded test configuration.',
                         originalMessage: 'Navan credentials check failed',
-                        bookingId: bookingId
+                        bookingId: bookingIdentifier
                     },
                     headers: { 
                         'Content-Type': 'application/json',
@@ -1994,7 +2000,7 @@ app.http('navanLookup', {
                     jsonBody: {
                         error: 'Failed to get access token from Navan',
                         detail: tokenError.message || 'Unknown error requesting Navan token',
-                        bookingId: bookingId
+                        bookingId: bookingIdentifier
                     },
                     headers: { 
                         'Content-Type': 'application/json',
@@ -2007,8 +2013,7 @@ app.http('navanLookup', {
             const sanitizedBaseUrl = baseUrl.replace(/\/$/, '');
             
             // Step 2: Get booking data from Navan
-            // Strategy: First try to find booking by bookingId, then use its UUID for direct lookup
-            context.log.info(`Fetching booking ${bookingId} from Navan...`);
+            context.log.info(`Fetching booking ${bookingIdentifier} from Navan...`);
             
             const navanRequestHeaders = {
                 'Authorization': `Bearer ${accessToken}`,
@@ -2019,7 +2024,7 @@ app.http('navanLookup', {
             context.log.info('Retrieving booking using bookingUuid parameter only');
             let bookingData = null;
             try {
-                const directLookupUrl = `${sanitizedBaseUrl}/bookings?bookingUuid=${encodeURIComponent(bookingId)}&includeTransactions=false`;
+                const directLookupUrl = `${sanitizedBaseUrl}/bookings?bookingUuid=${encodeURIComponent(bookingIdentifier)}&includeTransactions=false`;
                 const directResponse = await fetchFn(directLookupUrl, {
                     method: 'GET',
                     headers: navanRequestHeaders
@@ -2031,8 +2036,8 @@ app.http('navanLookup', {
                     return {
                         status: directResponse.status,
                         jsonBody: {
-                            error: `Failed to fetch booking ${bookingId}`,
-                            bookingId,
+                            error: `Failed to fetch booking ${bookingIdentifier}`,
+                            bookingId: bookingIdentifier,
                             details: errorText
                         },
                         headers: { 'Content-Type': 'application/json' }
@@ -2044,12 +2049,12 @@ app.http('navanLookup', {
                     bookingData = { data: directData.data };
                     context.log.info('Booking retrieved via direct bookingUuid lookup');
                 } else {
-                    context.log.warn(`Booking ${bookingId} not found via bookingUuid lookup`);
+                    context.log.warn(`Booking ${bookingIdentifier} not found via bookingUuid lookup`);
                     return {
                         status: 404,
                         jsonBody: {
                             error: 'Booking not found',
-                            bookingId,
+                            bookingId: bookingIdentifier,
                             message: 'No booking returned for the supplied bookingUuid.'
                         },
                         headers: { 'Content-Type': 'application/json' }
@@ -2084,21 +2089,26 @@ app.http('navanLookup', {
                 const travelContainer = getContainer('travel');
                 context.log.info('Travel container obtained successfully');
                 
+                const booking = bookingData.data[0];
+                const bookingUuid = booking?.uuid || bookingIdentifier;
+                const bookingIdFromNavan = booking?.bookingId || null;
+                const bookingConfirmationNumber = booking?.confirmationNumber || bookingIdFromNavan || null;
+                const lookupIdentifier = bookingIdentifier;
+                
                 // Check if a travel record already exists for this booking ID
                 let existingTravel = null;
                 try {
-                    context.log.info(`Querying for existing travel record with navanBookingId: ${bookingId}`);
-                    // Check for existing record by bookingId or UUID (in case it was previously stored with UUID)
-                    // Get the booking UUID from the bookingData we just fetched
-                    const bookingUuid = bookingData?.data?.[0]?.uuid || '';
-                    
+                    context.log.info(`Querying for existing travel record with identifier: ${lookupIdentifier}`);
+                    // Check for existing record by lookup identifier or UUID (in case it was previously stored with UUID)
+
                     // Query for existing records - use IS_DEFINED to safely check if fields exist
                     // This prevents errors if navanBookingId or navanBookingUuid fields don't exist in old records
                     const { resources: existingRecords } = await travelContainer.items
                         .query({
-                            query: "SELECT * FROM c WHERE (IS_DEFINED(c.navanBookingId) AND c.navanBookingId = @bookingId) OR (IS_DEFINED(c.navanBookingUuid) AND c.navanBookingUuid = @uuid)",
+                            query: "SELECT * FROM c WHERE (IS_DEFINED(c.navanLookupIdentifier) AND c.navanLookupIdentifier = @lookup) OR (IS_DEFINED(c.navanBookingId) AND c.navanBookingId = @bookingId) OR (IS_DEFINED(c.navanBookingUuid) AND c.navanBookingUuid = @uuid)",
                             parameters: [
-                                { name: "@bookingId", value: bookingId },
+                                { name: "@lookup", value: lookupIdentifier },
+                                { name: "@bookingId", value: bookingIdFromNavan || lookupIdentifier },
                                 { name: "@uuid", value: bookingUuid }
                             ]
                         })
@@ -2117,7 +2127,6 @@ app.http('navanLookup', {
                 
                 // Prepare travel record data from Navan booking
                 // Transform Navan data to match existing travel container schema
-                const booking = bookingData.data[0];
                 const bookingType = booking.bookingType || 'FLIGHT';
                 
                 // Get passenger/traveler info and find matching CRC ID
@@ -2194,15 +2203,16 @@ app.http('navanLookup', {
                     date: date || new Date().toISOString().split('T')[0], // Required - use today if not available
                     
                     // Navan booking reference (optional field)
-                    // Store the bookingId used for lookup, and also store UUID for reference
-                    navanBookingId: bookingId, // The bookingId used to find this booking (e.g., "AQ8M5Q")
-                    navanBookingUuid: booking.uuid || null, // The UUID from Navan (for reference)
+                    // Store the lookup identifier, and the exact identifiers returned by Navan
+                    navanLookupIdentifier: lookupIdentifier,
+                    navanBookingId: bookingIdFromNavan,
+                    navanBookingUuid: bookingUuid,
                     
                     // Status (must be one of: scheduled, delayed, departed, arrived, cancelled)
                     status: status,
                     
                     // Confirmation number (common across all booking types)
-                    confirmationNumber: booking.confirmationNumber || booking.bookingId || null
+                    confirmationNumber: bookingConfirmationNumber
                 };
                 
                 // Add booking-type specific fields based on actual Navan API structure
@@ -2392,10 +2402,10 @@ app.http('navanLookup', {
                 
                 // Ensure required fields are present
                 if (!travelRecord.crcId || travelRecord.crcId === 'unknown') {
-                    context.log.warn(`Warning: crcId is missing or unknown for booking ${bookingId}`);
+                    context.log.warn(`Warning: crcId is missing or unknown for booking lookup ${lookupIdentifier}`);
                 }
                 if (!travelRecord.date) {
-                    context.log.warn(`Warning: date is missing for booking ${bookingId}`);
+                    context.log.warn(`Warning: date is missing for booking lookup ${lookupIdentifier}`);
                 }
                 
                 if (existingTravel) {
@@ -2404,7 +2414,7 @@ app.http('navanLookup', {
                     const updatedTravel = { ...existingTravel, ...travelRecord, id: existingTravel.id };
                     try {
                         const { resource: savedTravel } = await travelContainer.items.upsert(updatedTravel);
-                        context.log.info(`Updated existing travel record for Navan booking ${bookingId}`);
+                        context.log.info(`Updated existing travel record for Navan booking lookup ${lookupIdentifier}`);
                     } catch (upsertError) {
                         context.log.error('Error upserting travel record:', upsertError.message);
                         context.log.error('Upsert error stack:', upsertError.stack);
@@ -2418,7 +2428,7 @@ app.http('navanLookup', {
                     context.log.info('Travel record data prepared:', JSON.stringify(newTravel, null, 2));
                     try {
                         const { resource: savedTravel } = await travelContainer.items.create(newTravel);
-                        context.log.info(`Created new travel record for Navan booking ${bookingId}`);
+                        context.log.info(`Created new travel record for Navan booking lookup ${lookupIdentifier}`);
                     } catch (createError) {
                         context.log.error('Error creating travel record:', createError.message);
                         context.log.error('Create error stack:', createError.stack);
@@ -2473,7 +2483,7 @@ app.http('navanLookup', {
                     detail: error.message || 'Unknown error occurred',
                     stack: error.stack || 'No stack trace available',
                     originalMessage: 'Navan lookup exception',
-                    bookingId: bookingId || null
+                    bookingId: bookingIdentifier || null
                 },
                 headers: { 
                     'Content-Type': 'application/json',
