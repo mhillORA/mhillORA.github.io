@@ -1,33 +1,6 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 
-// Use node-fetch instead of native fetch for Azure Functions compatibility
-// Native fetch is broken in Azure Functions environment
-// Import node-fetch using require (v2 supports CommonJS)
-let fetch;
-let fetchError = null;
-const getFetch = async () => {
-    if (fetchError) {
-        throw fetchError;
-    }
-    if (!fetch) {
-        try {
-            // Try CommonJS require first (node-fetch v2)
-            try {
-                fetch = require('node-fetch');
-            } catch (requireError) {
-                // Fallback to ESM import (node-fetch v3)
-                const nodeFetch = await import('node-fetch');
-                fetch = nodeFetch.default;
-            }
-        } catch (importError) {
-            fetchError = importError;
-            throw new Error(`Failed to import node-fetch: ${importError.message}. Make sure node-fetch is installed in package.json.`);
-        }
-    }
-    return fetch;
-};
-
 // Helper function to generate unique IDs
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
@@ -1863,8 +1836,7 @@ app.http('navanLookup', {
             }
             
             context.log.info('Requesting OAuth token from Navan...');
-            const fetchFn = await getFetch();
-            const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
+            const tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
                 method: 'POST',
                 headers: {
                     'content-type': 'application/x-www-form-urlencoded'
@@ -1937,8 +1909,7 @@ app.http('navanLookup', {
                 while (!foundBooking && page < 10) { // Limit to 10 pages (1000 bookings max)
                     context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
                     
-                    const fetchFn = await getFetch();
-                    bookingResponse = await fetchFn(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
+                    bookingResponse = await fetch(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
                         method: 'GET',
                         headers: {
                             'Authorization': `Bearer ${accessToken}`,
@@ -1976,8 +1947,7 @@ app.http('navanLookup', {
                             // Now use the UUID to fetch the full booking details directly
                             // This is more efficient and ensures we get all details
                             context.log.info(`Fetching full booking details using UUID: ${bookingUuid}`);
-                            const fetchFn = await getFetch();
-                            const uuidResponse = await fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+                            const uuidResponse = await fetch(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                                 method: 'GET',
                                 headers: {
                                     'Authorization': `Bearer ${accessToken}`,
@@ -2548,8 +2518,7 @@ app.http('navanTest', {
             context.log.info('Testing OAuth token generation...');
             let tokenResponse;
             try {
-                const fetchFn = await getFetch();
-                tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
+                tokenResponse = await fetch('https://api.navan.com/ta-auth/oauth/token', {
                     method: 'POST',
                     headers: {
                         'content-type': 'application/x-www-form-urlencoded'
@@ -2625,8 +2594,7 @@ app.http('navanTest', {
             context.log.info('Testing API call with token...');
             let testApiResponse;
             try {
-                const fetchFn = await getFetch();
-                testApiResponse = await fetchFn(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
+                testApiResponse = await fetch(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
                     method: 'GET',
                     headers: {
                         'Authorization': `Bearer ${accessToken}`,
@@ -2816,8 +2784,7 @@ app.http('geocode', {
             const apiUrl = `https://atlas.microsoft.com/search/address/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const fetchFn = await getFetch();
-                const response = await fetchFn(apiUrl);
+                const response = await fetch(apiUrl);
                 const data = await response.json();
                 return {
                     status: 200,
@@ -2888,8 +2855,7 @@ app.http('routeDirections', {
             const apiUrl = `https://atlas.microsoft.com/route/directions/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
             
             try {
-                const fetchFn = await getFetch();
-                const response = await fetchFn(apiUrl);
+                const response = await fetch(apiUrl);
                 const data = await response.json();
                 return {
                     status: 200,
