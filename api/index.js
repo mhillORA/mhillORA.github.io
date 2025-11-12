@@ -2730,7 +2730,8 @@ app.http('navanTest', {
                     connected: true,
                     oauthToken: true,
                     apiCall: true,
-                    message: 'Successfully connected to Navan API'
+                    message: 'Successfully connected to Navan API',
+                    accessToken
                 },
                 headers: { 
                     'Content-Type': 'application/json',
