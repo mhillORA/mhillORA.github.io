@@ -134,31 +134,70 @@ const getNavanAuthToken = async (context, fetchFn, clientId, clientSecret) => {
         return navanTokenCache.token;
     }
 
+    const sanitizedClientId = (clientId || '').trim();
+    const sanitizedClientSecret = (clientSecret || '').trim();
+
     const { authUrl } = resolveNavanEndpoints(context);
     context?.log?.info?.(`Requesting new Navan OAuth token from ${authUrl}`);
+    const isJsonEndpoint = authUrl.toLowerCase().includes('/auth/token');
 
     let response;
     try {
-        response = await fetchFn(authUrl, {
-            method: 'POST',
+        const attempts = [];
+
+        if (isJsonEndpoint) {
+            attempts.push({
+                headers: {
+                    'content-type': 'application/json',
+                    'accept': 'application/json'
+                },
+                body: JSON.stringify({
+                    client_id: sanitizedClientId,
+                    client_secret: sanitizedClientSecret,
+                    grant_type: 'client_credentials'
+                }),
+                description: 'json'
+            });
+        }
+
+        attempts.push({
             headers: {
-                'content-type': 'application/json'
+                'content-type': 'application/x-www-form-urlencoded',
+                'accept': 'application/json'
             },
-            body: JSON.stringify({
-                client_id: clientId,
-                client_secret: clientSecret,
+            body: new URLSearchParams({
+                client_id: sanitizedClientId,
+                client_secret: sanitizedClientSecret,
                 grant_type: 'client_credentials'
-            })
+            }).toString(),
+            description: 'form'
         });
+
+        let lastErrorText = '';
+        for (const attempt of attempts) {
+            context?.log?.info?.(`Navan token request attempt (${attempt.description})`);
+            response = await fetchFn(authUrl, {
+                method: 'POST',
+                headers: attempt.headers,
+                body: attempt.body
+            });
+
+            if (response.ok) {
+                break;
+            }
+
+            lastErrorText = await response.text().catch(() => 'Unable to read response body');
+            context?.log?.warn?.(`Navan token request attempt (${attempt.description}) failed with status ${response.status}: ${lastErrorText}`);
+        }
+
+        if (!response || !response.ok) {
+            const errorText = lastErrorText || await response.text().catch(() => 'Unable to read response body');
+            navanTokenCache = { token: null, expiresAt: 0, clientId: null };
+            throw new Error(`Navan token request failed with status ${response?.status ?? 'unknown'}: ${errorText}`);
+        }
     } catch (error) {
         navanTokenCache = { token: null, expiresAt: 0, clientId: null };
         throw new Error(`Network error requesting Navan token: ${error.message}`);
-    }
-
-    if (!response.ok) {
-        const errorText = await response.text().catch(() => 'Unable to read response body');
-        navanTokenCache = { token: null, expiresAt: 0, clientId: null };
-        throw new Error(`Navan token request failed with status ${response.status}: ${errorText}`);
     }
 
     let data;
@@ -180,7 +219,7 @@ const getNavanAuthToken = async (context, fetchFn, clientId, clientSecret) => {
     navanTokenCache = {
         token: accessToken,
         expiresAt: now + ttl,
-        clientId
+        clientId: sanitizedClientId
     };
 
     context?.log?.info?.(`Navan access token retrieved (${Math.round(ttl / 1000)}s cache window)`);
