@@ -641,9 +641,6 @@
                 <button data-action="manage-unavailability" class="bg-yellow-600 text-white py-2 px-3 sm:px-4 rounded-md hover:bg-yellow-700 transition-colors flex items-center text-sm">
                     <i data-lucide="calendar-off" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Time Off</span>
                 </button>
-                <button data-action="bulk-delete-events" class="bg-red-600 text-white py-2 px-3 sm:px-4 rounded-md hover:bg-red-700 transition-colors flex items-center text-sm">
-                    <i data-lucide="trash-2" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Bulk Delete</span>
-                </button>
                 <button data-action="view-availability" class="bg-teal-600 text-white py-2 px-3 sm:px-4 rounded-md hover:bg-teal-700 transition-colors flex items-center text-sm">
                     <i data-lucide="calendar-check" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Availability</span>
                 </button>
@@ -1034,6 +1031,20 @@
                 async deleteTravel(id) {
                     return this.request(`/travel/${id}`, {
                         method: 'DELETE'
+                    });
+                }
+
+                async importNavanBookingsRange(options = {}) {
+                    return this.request('/navan-import', {
+                        method: 'POST',
+                        body: JSON.stringify({ importType: 'range', ...options })
+                    });
+                }
+
+                async importNavanBookingsList(bookings = []) {
+                    return this.request('/navan-import', {
+                        method: 'POST',
+                        body: JSON.stringify({ importType: 'list', bookings })
                     });
                 }
 
@@ -1536,6 +1547,10 @@
                 travelView: 'list', // Current travel view: 'list' or 'calendar'
                 travelCalendarMonth: undefined, // Calendar month (0-11), undefined = current month
                 travelCalendarYear: undefined, // Calendar year, undefined = current year
+                navanConnectionStatus: null,
+                navanConnectionLastCheck: 0,
+                navanImportSummary: null,
+                navanImportLastRun: null,
                 crcStats: {},
                 timeOffSummaryRange: 'month',
                 timeOffSummaryCustomStart: null,
@@ -3468,9 +3483,6 @@
                             <button data-action="manage-unavailability" class="mobile-action-button bg-yellow-600 text-white hover:bg-yellow-700">
                                 <i data-lucide="calendar-off" class="w-4 h-4"></i> Time Off
                             </button>
-                            <button data-action="bulk-delete-events" class="mobile-action-button bg-red-600 text-white hover:bg-red-700">
-                                <i data-lucide="trash-2" class="w-4 h-4"></i> Bulk Delete
-                            </button>
                             <button data-action="view-availability" class="mobile-action-button bg-teal-600 text-white hover:bg-teal-700">
                                 <i data-lucide="calendar-check" class="w-4 h-4"></i> Availability
                             </button>
@@ -3594,7 +3606,10 @@
                 renderContent();
             };
 
-            const DATA_REFRESH_INTERVAL_MS = 4000;
+            const DATA_REFRESH_INTERVAL_MS = 30000;
+            const NAVAN_CONNECTION_CHECK_INTERVAL_MS = 120000;
+            const DEFAULT_NAVAN_PAST_DAYS = 30;
+            const DEFAULT_NAVAN_FUTURE_DAYS = 180;
             let dataRefreshTimerId = null;
             let isRefreshingData = false;
 
@@ -3675,6 +3690,142 @@
                     dataRefreshTimerId = setTimeout(loop, DATA_REFRESH_INTERVAL_MS);
                 };
                 dataRefreshTimerId = setTimeout(loop, DATA_REFRESH_INTERVAL_MS);
+            };
+
+            const setButtonLoading = (button, isLoading, loadingText = 'Processing...') => {
+                if (!button) return;
+                if (isLoading) {
+                    button.disabled = true;
+                    if (!button.dataset.originalContent) {
+                        button.dataset.originalContent = button.innerHTML;
+                    }
+                    button.innerHTML = `<span class="flex items-center gap-2"><i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i>${loadingText}</span>`;
+                    lucide.createIcons();
+                } else {
+                    button.disabled = false;
+                    if (button.dataset.originalContent) {
+                        button.innerHTML = button.dataset.originalContent;
+                        delete button.dataset.originalContent;
+                    }
+                    lucide.createIcons();
+                }
+            };
+
+            const parseAsUnixSeconds = (value) => {
+                if (!value) return null;
+                const date = new Date(value);
+                if (Number.isNaN(date.getTime())) {
+                    return null;
+                }
+                return Math.floor(date.getTime() / 1000);
+            };
+
+            const parseNavanBookingEntries = (raw) => {
+                const bookings = [];
+                const invalid = [];
+                if (!raw) {
+                    return { bookings, invalid };
+                }
+                const dedupe = new Set();
+                raw.split(/\r?\n/).forEach(line => {
+                    const trimmed = line.trim();
+                    if (!trimmed) return;
+                    const parts = trimmed.split(/[,|\s]+/).map(p => p.trim()).filter(Boolean);
+                    const bookingId = parts[0] || '';
+                    const bookingUuid = parts[1] || '';
+                    if (!bookingId && !bookingUuid) {
+                        invalid.push(trimmed);
+                        return;
+                    }
+                    const key = (bookingUuid || bookingId).toLowerCase();
+                    if (dedupe.has(key)) return;
+                    dedupe.add(key);
+                    bookings.push({
+                        bookingId: bookingId || undefined,
+                        bookingUuid: bookingUuid || undefined
+                    });
+                });
+                return { bookings, invalid };
+            };
+
+            const applyNavanImportSummary = (summary) => {
+                setState({
+                    navanImportSummary: summary || null,
+                    navanImportLastRun: Date.now()
+                }, { skipRender: true });
+                if (state.activeTab === 'travel') {
+                    renderTravelContent();
+                }
+            };
+
+            const handleNavanImportResponse = async (result, successMessage, { closeModal: shouldCloseModal } = {}) => {
+                if (!result) {
+                    showNotification('Navan import failed: No response from server.', 'error');
+                    return false;
+                }
+                if (result.success) {
+                    if (result.summary) {
+                        applyNavanImportSummary(result.summary);
+                    }
+                    showNotification(successMessage || 'Navan import completed successfully.', 'success');
+                    if (shouldCloseModal) {
+                        closeModal();
+                    }
+                    try {
+                        await refreshDataSilently();
+                    } catch (refreshError) {
+                        console.warn('Navan import refresh warning:', refreshError);
+                    }
+                    return true;
+                }
+                const detail = result.error || result.detail || 'Unknown error occurred.';
+                showNotification(`Navan import failed: ${detail}`, 'error');
+                if (result.summary) {
+                    applyNavanImportSummary(result.summary);
+                }
+                return false;
+            };
+
+            const runNavanImportRange = async (button, options = {}, extras = {}) => {
+                const payload = {
+                    pastDays: Number.isFinite(options.pastDays) ? Math.max(0, Math.floor(options.pastDays)) : DEFAULT_NAVAN_PAST_DAYS,
+                    futureDays: Number.isFinite(options.futureDays) ? Math.max(0, Math.floor(options.futureDays)) : DEFAULT_NAVAN_FUTURE_DAYS
+                };
+                if (options.createdFrom && Number.isFinite(options.createdFrom)) {
+                    payload.createdFrom = options.createdFrom;
+                }
+                if (options.createdTo && Number.isFinite(options.createdTo)) {
+                    payload.createdTo = options.createdTo;
+                }
+                setButtonLoading(button, true, 'Syncing...');
+                try {
+                    const result = await apiService.importNavanBookingsRange(payload);
+                    return await handleNavanImportResponse(result, 'Navan bookings synchronized successfully.', extras);
+                } catch (error) {
+                    console.error('Navan range import error:', error);
+                    showNotification(`Navan import failed: ${error.message || 'Unknown error'}`, 'error');
+                    return false;
+                } finally {
+                    setButtonLoading(button, false);
+                }
+            };
+
+            const runNavanImportList = async (button, bookings = [], extras = {}) => {
+                if (!bookings || bookings.length === 0) {
+                    showNotification('Please provide at least one booking to import.', 'error');
+                    return false;
+                }
+                setButtonLoading(button, true, 'Importing...');
+                try {
+                    const result = await apiService.importNavanBookingsList(bookings);
+                    return await handleNavanImportResponse(result, 'Selected Navan bookings imported successfully.', extras);
+                } catch (error) {
+                    console.error('Navan list import error:', error);
+                    showNotification(`Navan import failed: ${error.message || 'Unknown error'}`, 'error');
+                    return false;
+                } finally {
+                    setButtonLoading(button, false);
+                }
             };
 
 
@@ -5227,6 +5378,41 @@
                         const travelDaysSet = new Set(eventsForMonth.filter(e => e.type === 'Travel Day').map(e => e.date));
                         timeOffDaysSet.forEach(date => nonWorkDaysSet.add(date));
 
+                        const crcRecord = state.crcs.find(c => c.id === crcId);
+                        const crcName = crcRecord?.name || 'Unknown';
+                        const monthlyTravel = (state.travel || []).filter(travel => {
+                            if (!travel) return false;
+                            const travelCrcId = travel.crcId;
+                            const travelMatchesCrc = travelCrcId === crcId || (crcName && travelCrcId === crcName);
+                            if (!travelMatchesCrc) return false;
+                            const travelDate = parseDateFlexible(travel.date) || parseDateFlexible(travel.departureTime) || parseDateFlexible(travel.hotelCheckIn) || parseDateFlexible(travel.pickupDate);
+                            if (!travelDate) return false;
+                            return travelDate.getFullYear() == year && travelDate.getMonth() == month;
+                        });
+                        const travelRecords = monthlyTravel.length;
+                        let flightsCount = 0;
+                        let hotelsCount = 0;
+                        let carsCount = 0;
+                        let travelCost = 0;
+                        monthlyTravel.forEach(travel => {
+                            const type = (travel.bookingType || '').toUpperCase();
+                            if (type === 'FLIGHT') flightsCount += 1;
+                            else if (type === 'HOTEL') hotelsCount += 1;
+                            else if (type === 'CAR') carsCount += 1;
+                            const costFields = ['flightCost', 'hotelCost', 'carRentalCost', 'grandTotal', 'totalCost'];
+                            costFields.forEach(field => {
+                                const val = travel[field];
+                                if (typeof val === 'number' && !Number.isNaN(val)) {
+                                    travelCost += val;
+                                } else if (typeof val === 'string' && val.trim()) {
+                                    const parsed = parseFloat(val.replace(/[^0-9.\-]/g, ''));
+                                    if (!Number.isNaN(parsed)) {
+                                        travelCost += parsed;
+                                    }
+                                }
+                            });
+                        });
+
                         const productiveDays = productiveDaysSet.size;
                         const nonWorkDays = nonWorkDaysSet.size;
                         const travelDays = travelDaysSet.size;
@@ -5235,13 +5421,18 @@
                         const utilizationPercent = availableWorkDays > 0 ? Math.round((productiveDays / availableWorkDays) * 100) : 0;
                         
                         reportData.push({
-                            crcName: state.crcs.find(c => c.id === crcId)?.name || 'Unknown',
+                            crcName,
                             month: monthNames[month],
                             year: year,
                             productiveDays,
                             nonWorkDays,
                             timeOffDays,
                             travelDays,
+                            travelRecords,
+                            flightsCount,
+                            hotelsCount,
+                            carsCount,
+                            travelCost: Number.isFinite(travelCost) ? Math.round(travelCost * 100) / 100 : 0,
                             availableWorkDays,
                             utilizationPercent
                         });
@@ -5259,6 +5450,11 @@
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Month</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Productive Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Travel Days</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Travel Records</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Flights</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Hotels</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Cars</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Travel Cost</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Non-Working Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Time Off Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Total Working Days</th>
@@ -5272,6 +5468,11 @@
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.month}, ${row.year}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.productiveDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.travelDays}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.travelRecords}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.flightsCount}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.hotelsCount}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.carsCount}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">$${row.travelCost.toFixed(2)}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.nonWorkDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.timeOffDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.availableWorkDays}</td>
@@ -5301,13 +5502,18 @@
                     return;
                 }
 
-                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Travel Days', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Utilization %'];
+                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Travel Days', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Utilization %'];
                 const rows = data.map(row => [
                     row.crcName,
                     row.month,
                     row.year,
                     row.productiveDays,
                     row.travelDays,
+                    row.travelRecords,
+                    row.flightsCount,
+                    row.hotelsCount,
+                    row.carsCount,
+                    `$${row.travelCost.toFixed(2)}`,
                     row.nonWorkDays,
                     row.timeOffDays,
                     row.availableWorkDays,
@@ -11243,6 +11449,179 @@
                         <p class="text-sm text-indigo-800 dark:text-indigo-200">No pending or approved time off in this range.</p>
                     </div>
                 `;
+
+                const parseTravelDateValue = (value) => {
+                    if (!value) return null;
+                    const date = value.includes('T') ? new Date(value) : new Date(`${value}T00:00:00`);
+                    return Number.isNaN(date.getTime()) ? null : date;
+                };
+
+                const getTravelPrimaryDate = (travel) => {
+                    if (!travel) return null;
+                    const sources = [
+                        travel.departureTime,
+                        travel.hotelCheckIn,
+                        travel.pickupDate,
+                        travel.date,
+                        travel.arrivalTime,
+                        travel.hotelCheckOut,
+                        travel.dropoffDate
+                    ];
+                    for (const source of sources) {
+                        const parsed = parseTravelDateValue(source);
+                        if (parsed) return parsed;
+                    }
+                    return null;
+                };
+
+                const crcNameLower = (crc.name || '').toLowerCase();
+                const crcTravelRecords = (state.travel || []).filter(travel => {
+                    if (!travel) return false;
+                    const travelCrcId = travel.crcId;
+                    if (travelCrcId === crc.id) return true;
+                    if (typeof travelCrcId === 'string' && travelCrcId.toLowerCase() === crcNameLower) return true;
+                    if (travel.travelerName && travel.travelerName.toLowerCase() === crcNameLower) return true;
+                    return false;
+                });
+
+                let flightsCount = 0;
+                let hotelsCount = 0;
+                let carsCount = 0;
+                let totalTravelCost = 0;
+                crcTravelRecords.forEach(travel => {
+                    const type = (travel.bookingType || '').toUpperCase();
+                    if (type === 'FLIGHT') flightsCount += 1;
+                    else if (type === 'HOTEL') hotelsCount += 1;
+                    else if (type === 'CAR' || type === 'RENTAL_CAR') carsCount += 1;
+                    const costFields = ['flightCost', 'hotelCost', 'carRentalCost', 'grandTotal', 'totalCost'];
+                    costFields.forEach(field => {
+                        const val = travel[field];
+                        if (typeof val === 'number' && !Number.isNaN(val)) {
+                            totalTravelCost += val;
+                        } else if (typeof val === 'string' && val.trim()) {
+                            const parsed = parseFloat(val.replace(/[^0-9.\-]/g, ''));
+                            if (!Number.isNaN(parsed)) {
+                                totalTravelCost += parsed;
+                            }
+                        }
+                    });
+                });
+
+                const nowTime = Date.now();
+                const upcomingTravelRecords = crcTravelRecords
+                    .filter(travel => {
+                        const date = getTravelPrimaryDate(travel);
+                        return date ? date.getTime() >= nowTime - (24 * 60 * 60 * 1000) : true;
+                    })
+                    .sort((a, b) => {
+                        const dateA = getTravelPrimaryDate(a) || new Date(0);
+                        const dateB = getTravelPrimaryDate(b) || new Date(0);
+                        return dateA - dateB;
+                    })
+                    .slice(0, 5);
+
+                const recentPastTravelRecords = crcTravelRecords
+                    .filter(travel => {
+                        const date = getTravelPrimaryDate(travel);
+                        return date ? date.getTime() < nowTime : false;
+                    })
+                    .sort((a, b) => {
+                        const dateA = getTravelPrimaryDate(a) || new Date(0);
+                        const dateB = getTravelPrimaryDate(b) || new Date(0);
+                        return dateB - dateA;
+                    })
+                    .slice(0, 5);
+
+                const formatTravelListItems = (records) => {
+                    if (!records || records.length === 0) {
+                        return '<li class="text-sm text-gray-500 dark:text-gray-400">No entries.</li>';
+                    }
+                    return records.map(travel => {
+                        const date = getTravelPrimaryDate(travel);
+                        const dateLabel = date ? date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Date TBD';
+                        const type = (travel.bookingType || 'Travel').toUpperCase();
+                        const details = [];
+                        if (travel.flightNumber) {
+                            details.push(`Flight ${travel.flightNumber}`);
+                        }
+                        if (travel.origin && travel.destination) {
+                            details.push(`${travel.origin} → ${travel.destination}`);
+                        } else if (travel.hotelCity) {
+                            details.push(`${travel.hotelCity}${travel.hotelState ? ', ' + travel.hotelState : ''}`);
+                        } else if (travel.pickupLocation) {
+                            details.push(travel.pickupLocation);
+                        }
+                        const costFields = ['flightCost', 'hotelCost', 'carRentalCost', 'grandTotal', 'totalCost'];
+                        let costValue = 0;
+                        costFields.some(field => {
+                            const val = travel[field];
+                            if (typeof val === 'number' && !Number.isNaN(val)) {
+                                costValue = val;
+                                return true;
+                            }
+                            if (typeof val === 'string' && val.trim()) {
+                                const parsed = parseFloat(val.replace(/[^0-9.\-]/g, ''));
+                                if (!Number.isNaN(parsed)) {
+                                    costValue = parsed;
+                                    return true;
+                                }
+                            }
+                            return false;
+                        });
+                        const costLabel = costValue ? `$${costValue.toFixed(2)}` : '';
+                        return `
+                            <li class="flex justify-between items-start gap-4 text-sm border-b border-gray-200 dark:border-gray-700 py-1">
+                                <div>
+                                    <div class="font-medium text-gray-900 dark:text-gray-100">${dateLabel}</div>
+                                    <div class="text-xs text-gray-500 dark:text-gray-400">${type}${details.length ? ' • ' + details.join(' • ') : ''}${travel.confirmationNumber ? ` • Confirm: ${travel.confirmationNumber}` : ''}</div>
+                                </div>
+                                ${costLabel ? `<div class="text-xs font-semibold text-green-600 dark:text-green-400 whitespace-nowrap">${costLabel}</div>` : '<div></div>'}
+                            </li>
+                        `;
+                    }).join('');
+                };
+
+                const travelSummaryHTML = `
+                    <div class="mb-4 rounded-md border border-sky-200 dark:border-sky-700 bg-sky-50 dark:bg-sky-900/20 p-4">
+                        <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+                            <div>
+                                <h3 class="text-lg font-semibold text-sky-900 dark:text-sky-200 flex items-center gap-2">
+                                    <i data-lucide="plane" class="w-4 h-4"></i>
+                                    Travel Overview
+                                </h3>
+                                <p class="text-sm text-sky-800/80 dark:text-sky-200/80 mt-1">
+                                    ${crcTravelRecords.length ? `${crcTravelRecords.length} travel record${crcTravelRecords.length !== 1 ? 's' : ''} found.` : 'No travel has been recorded for this CRC yet.'}
+                                </p>
+                                ${crcTravelRecords.length ? `
+                                    <div class="mt-2 text-xs text-sky-700/80 dark:text-sky-300/80">
+                                        Flights: <strong>${flightsCount}</strong> • Hotels: <strong>${hotelsCount}</strong> • Cars: <strong>${carsCount}</strong> • Estimated Cost: <strong>$${totalTravelCost.toFixed(2)}</strong>
+                                    </div>
+                                ` : ''}
+                            </div>
+                            ${crcTravelRecords.length ? `
+                                <div class="text-xs text-sky-700/70 dark:text-sky-300/70">
+                                    Upcoming: <strong>${upcomingTravelRecords.length}</strong> • Recent Past: <strong>${recentPastTravelRecords.length}</strong>
+                                </div>
+                            ` : ''}
+                        </div>
+                        ${crcTravelRecords.length ? `
+                            <div class="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
+                                <div>
+                                    <h4 class="text-sm font-semibold text-sky-900 dark:text-sky-200 mb-2">Upcoming Travel</h4>
+                                    <ul class="divide-y divide-gray-200 dark:divide-gray-700 rounded-md border border-gray-200 dark:border-gray-700 bg-white/70 dark:bg-sky-900/30">
+                                        ${formatTravelListItems(upcomingTravelRecords)}
+                                    </ul>
+                                </div>
+                                <div>
+                                    <h4 class="text-sm font-semibold text-sky-900 dark:text-sky-200 mb-2">Recent Travel</h4>
+                                    <ul class="divide-y divide-gray-200 dark:divide-gray-700 rounded-md border border-gray-200 dark:border-gray-700 bg-white/70 dark:bg-sky-900/30">
+                                        ${formatTravelListItems(recentPastTravelRecords)}
+                                    </ul>
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
                 
                 // Get training names from training_types collection and existing CRC trainings
                 const allTrainings = new Set();
@@ -11348,6 +11727,7 @@
                         <span class="font-bold text-lg">${weeklyHours}</span>
                     </div>
                     ${crcTimeOffSummaryHTML}
+                    ${travelSummaryHTML}
                     <form id="edit-crc-form" data-id="${crc.id}" class="space-y-4">
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
@@ -14325,6 +14705,16 @@
                         }
                         break;
                     }
+                    case 'navan-import-range': {
+                        e.preventDefault();
+                        const button = e.target.closest('button');
+                        await runNavanImportRange(button);
+                        break;
+                    }
+                    case 'open-navan-import-modal': {
+                        openModal(getNavanImportModalHTML(), 'lg');
+                        break;
+                    }
                     case 'lookup-navan-booking': {
                         e.preventDefault();
                         e.stopPropagation();
@@ -14962,6 +15352,53 @@
                         } catch (error) {
                             console.error("Error adding CRC:", error);
                             showNotification('Failed to add CRC. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'navan-import-form': {
+                        try {
+                            const submitter = e.submitter || form.querySelector('button[type="submit"]');
+                            const mode = submitter?.dataset?.mode || 'range';
+                            if (mode === 'range') {
+                                let pastDays = parseInt(data.pastDays, 10);
+                                if (!Number.isFinite(pastDays) || pastDays < 0) {
+                                    pastDays = DEFAULT_NAVAN_PAST_DAYS;
+                                }
+                                let futureDays = parseInt(data.futureDays, 10);
+                                if (!Number.isFinite(futureDays) || futureDays < 0) {
+                                    futureDays = DEFAULT_NAVAN_FUTURE_DAYS;
+                                }
+                                const createdFrom = data.createdFrom ? parseAsUnixSeconds(data.createdFrom) : null;
+                                const createdTo = data.createdTo ? parseAsUnixSeconds(data.createdTo) : null;
+                                if (data.createdFrom && createdFrom === null) {
+                                    showNotification('Invalid "Created From" date/time. Please use a valid value.', 'error');
+                                    return;
+                                }
+                                if (data.createdTo && createdTo === null) {
+                                    showNotification('Invalid "Created To" date/time. Please use a valid value.', 'error');
+                                    return;
+                                }
+                                const result = await runNavanImportRange(submitter, { pastDays, futureDays, createdFrom, createdTo }, { closeModal: true });
+                                if (result) {
+                                    form.reset();
+                                }
+                            } else {
+                                const entries = parseNavanBookingEntries(data.bookingEntries || '');
+                                if (entries.invalid.length) {
+                                    showNotification(`Some entries were ignored: ${entries.invalid.slice(0, 3).join(', ')}${entries.invalid.length > 3 ? '…' : ''}`, 'warning');
+                                }
+                                if (!entries.bookings.length) {
+                                    showNotification('Please enter at least one valid booking ID or UUID.', 'error');
+                                    return;
+                                }
+                                const success = await runNavanImportList(submitter, entries.bookings, { closeModal: true });
+                                if (success) {
+                                    form.reset();
+                                }
+                            }
+                        } catch (error) {
+                            console.error('Navan import modal error:', error);
+                            showNotification('Navan import failed. See console for details.', 'error');
                         }
                         break;
                     }
@@ -19190,50 +19627,55 @@
                 const container = document.getElementById('travel-content');
                 if (!container) return;
 
-                // Test Navan API connection when travel tab is opened
-                try {
-                    console.log('Travel tab opened - testing Navan API connection...');
-                    const connectionTest = await apiService.testNavanConnection();
-                    
-                    // Display connection status
-                    let statusMessage = '';
-                    let statusClass = '';
-                    if (connectionTest.connected && connectionTest.oauthToken && connectionTest.apiCall) {
-                        statusMessage = '✓ Navan API: Connected';
-                        statusClass = 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 border-green-300 dark:border-green-700';
-                    } else if (connectionTest.connected && connectionTest.oauthToken) {
-                        statusMessage = '⚠ Navan API: OAuth connected, but API call failed';
-                        statusClass = 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200 border-yellow-300 dark:border-yellow-700';
-                    } else {
-                        statusMessage = '✗ Navan API: Connection failed';
-                        statusClass = 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200 border-red-300 dark:border-red-700';
-                    }
-                    
-                    // Log detailed error if connection failed
-                    if (!connectionTest.connected || !connectionTest.oauthToken || !connectionTest.apiCall) {
-                        console.error('Navan API connection test failed:', connectionTest);
-                        if (connectionTest.detail) {
-                            console.error('Error detail:', connectionTest.detail);
+                // Test Navan API connection when travel tab is opened (cached to reduce flashing)
+                const nowMs = Date.now();
+                const lastCheck = state.navanConnectionLastCheck || 0;
+                const cacheValid = state.navanConnectionStatus && (nowMs - lastCheck) < NAVAN_CONNECTION_CHECK_INTERVAL_MS;
+                if (!cacheValid) {
+                    try {
+                        console.log('Travel tab opened - testing Navan API connection...');
+                        const connectionTest = await apiService.testNavanConnection();
+                        
+                        let statusMessage = '';
+                        let statusClass = '';
+                        if (connectionTest.connected && connectionTest.oauthToken && connectionTest.apiCall) {
+                            statusMessage = '✓ Navan API: Connected';
+                            statusClass = 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 border-green-300 dark:border-green-700';
+                        } else if (connectionTest.connected && connectionTest.oauthToken) {
+                            statusMessage = '⚠ Navan API: OAuth connected, but API call failed';
+                            statusClass = 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200 border-yellow-300 dark:border-yellow-700';
+                        } else {
+                            statusMessage = '✗ Navan API: Connection failed';
+                            statusClass = 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200 border-red-300 dark:border-red-700';
                         }
-                        if (connectionTest.stack) {
-                            console.error('Error stack:', connectionTest.stack);
+                        
+                        if (!connectionTest.connected || !connectionTest.oauthToken || !connectionTest.apiCall) {
+                            console.error('Navan API connection test failed:', connectionTest);
+                            if (connectionTest.detail) {
+                                console.error('Error detail:', connectionTest.detail);
+                            }
+                            if (connectionTest.stack) {
+                                console.error('Error stack:', connectionTest.stack);
+                            }
                         }
+                        
+                        state.navanConnectionStatus = {
+                            message: statusMessage,
+                            class: statusClass,
+                            details: connectionTest
+                        };
+                        state.navanConnectionLastCheck = nowMs;
+                    } catch (error) {
+                        console.error('Error during Navan connection test:', error);
+                        state.navanConnectionStatus = {
+                            message: '✗ Navan API: Connection test error',
+                            class: 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200 border-red-300 dark:border-red-700',
+                            details: { error: error.message }
+                        };
+                        state.navanConnectionLastCheck = nowMs;
                     }
-                    
-                    // Store connection status for display
-                    window.navanConnectionStatus = {
-                        message: statusMessage,
-                        class: statusClass,
-                        details: connectionTest
-                    };
-                } catch (error) {
-                    console.error('Error during Navan connection test:', error);
-                    window.navanConnectionStatus = {
-                        message: '✗ Navan API: Connection test error',
-                        class: 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200 border-red-300 dark:border-red-700',
-                        details: { error: error.message }
-                    };
                 }
+                window.navanConnectionStatus = state.navanConnectionStatus;
 
                 // Group travel by CRC
                 const travelByCRC = {};
@@ -19274,16 +19716,24 @@
                 const currentView = state.travelView || 'list';
 
                 // Display Navan connection status if available
-                const navanStatus = window.navanConnectionStatus || null;
-                
+                const navanStatus = state.navanConnectionStatus || window.navanConnectionStatus || null;
+                const navanImportSummary = state.navanImportSummary || null;
+                const navanImportLastRun = state.navanImportLastRun ? new Date(state.navanImportLastRun) : null;
+                const navanImportLastRunText = navanImportLastRun ? navanImportLastRun.toLocaleString() : 'Not run yet';
+                const navanImportTotals = navanImportSummary?.totals || null;
+                const navanTokenValue = navanStatus?.details?.accessToken || navanStatus?.details?.token || null;
+                const navanTokenDisplay = navanTokenValue ? `${navanTokenValue.slice(0, 8)}…${navanTokenValue.slice(-6)}` : null;
+                const navanImportSkippedPreview = navanImportSummary?.skippedBookings ? navanImportSummary.skippedBookings.slice(0, 5) : [];
+                const navanImportErrorsPreview = navanImportSummary?.errors ? navanImportSummary.errors.slice(0, 5) : [];
+
                 let html = `
                     ${navanStatus ? `
                     <div class="mb-4 p-3 rounded-md border ${navanStatus.class}">
                         <div class="flex items-center justify-between">
                             <span class="font-medium">${navanStatus.message}</span>
-                            ${navanStatus.details && navanStatus.details.accessToken ? `
+                            ${navanTokenDisplay ? `
                                 <span class="ml-4 text-[10px] sm:text-xs font-mono select-all bg-black/5 dark:bg-white/10 px-2 py-1 rounded break-all">
-                                    Token: ${navanStatus.details.accessToken}
+                                    Token: ${navanTokenDisplay}
                                 </span>
                             ` : ''}
                             ${navanStatus.details && navanStatus.details.detail ? `
@@ -19296,6 +19746,90 @@
                         </div>
                     </div>
                     ` : ''}
+                    <div class="mb-6 p-4 rounded-md border border-blue-200 dark:border-blue-800 bg-blue-50/60 dark:bg-blue-900/20">
+                        <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+                            <div>
+                                <h3 class="text-lg font-semibold text-blue-900 dark:text-blue-200 flex items-center gap-2">
+                                    <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                                    Navan Booking Import
+                                </h3>
+                                <p class="text-sm text-blue-800/80 dark:text-blue-200/80 mt-1">
+                                    Sync past ${DEFAULT_NAVAN_PAST_DAYS} days and next ${DEFAULT_NAVAN_FUTURE_DAYS} days of bookings, or run an advanced import.
+                                </p>
+                                <p class="text-xs text-blue-700/70 dark:text-blue-300/70 mt-2">
+                                    Last run: ${navanImportLastRunText}
+                                </p>
+                                ${navanImportTotals ? `
+                                    <div class="mt-3 grid grid-cols-2 md:grid-cols-5 gap-3 text-xs sm:text-sm">
+                                        <div class="p-3 rounded bg-white/70 dark:bg-blue-900/40 border border-blue-200/60 dark:border-blue-800/60">
+                                            <div class="text-blue-700 dark:text-blue-200 uppercase tracking-wider text-[10px] font-semibold">Fetched</div>
+                                            <div class="text-blue-900 dark:text-blue-100 text-base font-bold">${navanImportTotals.fetched}</div>
+                                        </div>
+                                        <div class="p-3 rounded bg-white/70 dark:bg-blue-900/40 border border-blue-200/60 dark:border-blue-800/60">
+                                            <div class="text-blue-700 dark:text-blue-200 uppercase tracking-wider text-[10px] font-semibold">Processed</div>
+                                            <div class="text-blue-900 dark:text-blue-100 text-base font-bold">${navanImportTotals.processed}</div>
+                                        </div>
+                                        <div class="p-3 rounded bg-white/70 dark:bg-blue-900/40 border border-blue-200/60 dark:border-blue-800/60">
+                                            <div class="text-blue-700 dark:text-blue-200 uppercase tracking-wider text-[10px] font-semibold">Created</div>
+                                            <div class="text-blue-900 dark:text-blue-100 text-base font-bold">${navanImportTotals.created}</div>
+                                        </div>
+                                        <div class="p-3 rounded bg-white/70 dark:bg-blue-900/40 border border-blue-200/60 dark:border-blue-800/60">
+                                            <div class="text-blue-700 dark:text-blue-200 uppercase tracking-wider text-[10px] font-semibold">Updated</div>
+                                            <div class="text-blue-900 dark:text-blue-100 text-base font-bold">${navanImportTotals.updated}</div>
+                                        </div>
+                                        <div class="p-3 rounded bg-white/70 dark:bg-blue-900/40 border border-blue-200/60 dark:border-blue-800/60">
+                                            <div class="text-blue-700 dark:text-blue-200 uppercase tracking-wider text-[10px] font-semibold">Skipped</div>
+                                            <div class="text-blue-900 dark:text-blue-100 text-base font-bold">${navanImportTotals.skipped}</div>
+                                        </div>
+                                    </div>
+                                    ${(navanImportSkippedPreview.length || navanImportErrorsPreview.length) ? `
+                                        <div class="mt-3 space-y-2 text-xs sm:text-sm text-blue-800/80 dark:text-blue-200/80">
+                                            ${navanImportSkippedPreview.length ? `
+                                                <div>
+                                                    <div class="font-semibold flex items-center gap-1">
+                                                        <i data-lucide="circle-slash-2" class="w-3 h-3"></i>
+                                                        Skipped (${navanImportSummary.skippedBookings.length})
+                                                    </div>
+                                                    <ul class="list-disc list-inside mt-1 space-y-1">
+                                                        ${navanImportSkippedPreview.map(item => `
+                                                            <li>${item.bookingId || 'Booking'}${item.bookingUuid ? ` (${item.bookingUuid})` : ''}${item.reason ? ` – ${item.reason}` : ''}</li>
+                                                        `).join('')}
+                                                        ${navanImportSummary.skippedBookings.length > navanImportSkippedPreview.length ? `<li>…and ${navanImportSummary.skippedBookings.length - navanImportSkippedPreview.length} more</li>` : ''}
+                                                    </ul>
+                                                </div>
+                                            ` : ''}
+                                            ${navanImportErrorsPreview.length ? `
+                                                <div>
+                                                    <div class="font-semibold flex items-center gap-1 text-red-700 dark:text-red-300">
+                                                        <i data-lucide="alert-circle" class="w-3 h-3"></i>
+                                                        Errors (${navanImportSummary.errors.length})
+                                                    </div>
+                                                    <ul class="list-disc list-inside mt-1 space-y-1">
+                                                        ${navanImportErrorsPreview.map(item => `
+                                                            <li>${item.bookingId || item.bookingUuid || 'Booking'} – ${item.message || 'Unknown error'}</li>
+                                                        `).join('')}
+                                                        ${navanImportSummary.errors.length > navanImportErrorsPreview.length ? `<li>…and ${navanImportSummary.errors.length - navanImportErrorsPreview.length} more</li>` : ''}
+                                                    </ul>
+                                                </div>
+                                            ` : ''}
+                                        </div>
+                                    ` : ''}
+                                ` : `
+                                    <p class="text-xs text-blue-700/70 dark:text-blue-300/70 mt-3">
+                                        No imports have been run yet. Use the buttons to synchronize Navan bookings into travel records.
+                                    </p>
+                                `}
+                            </div>
+                            <div class="flex flex-col sm:flex-row gap-2">
+                                <button data-action="navan-import-range" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center justify-center">
+                                    <i data-lucide="cloud-download" class="w-4 h-4 mr-2"></i>Sync Recent Bookings
+                                </button>
+                                <button data-action="open-navan-import-modal" class="bg-white text-blue-700 border border-blue-300 py-2 px-4 rounded-md hover:bg-blue-100 transition-colors flex items-center justify-center dark:bg-blue-900/40 dark:text-blue-200 dark:border-blue-700 dark:hover:bg-blue-900/60">
+                                    <i data-lucide="settings-2" class="w-4 h-4 mr-2"></i>Advanced Import
+                                </button>
+                            </div>
+                        </div>
+                    </div>
                     <div class="flex justify-between items-center mb-6">
                         <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Travel & Flight Information</h2>
                         <div class="flex gap-2">
@@ -19741,6 +20275,68 @@
                         <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
                             <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Add Travel</button>
+                        </div>
+                    </form>
+                `;
+            };
+
+            const getNavanImportModalHTML = () => {
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">Advanced Navan Import</h2>
+                    <form id="navan-import-form" class="space-y-6">
+                        <div class="space-y-4">
+                            <div>
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-2">
+                                    <i data-lucide="calendar-range" class="w-4 h-4"></i>
+                                    Range Sync Options
+                                </h3>
+                                <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+                                    Customize the rolling window to pull bookings created within a specific range.
+                                    Leaving a field blank uses the default value.
+                                </p>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-1">Past Days</label>
+                                        <input type="number" min="0" name="pastDays" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="${DEFAULT_NAVAN_PAST_DAYS}">
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-1">Future Days</label>
+                                        <input type="number" min="0" name="futureDays" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="${DEFAULT_NAVAN_FUTURE_DAYS}">
+                                    </div>
+                                </div>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-1">Created From (optional)</label>
+                                        <input type="datetime-local" name="createdFrom" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">Overrides past days when provided.</p>
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-1">Created To (optional)</label>
+                                        <input type="datetime-local" name="createdTo" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    </div>
+                                </div>
+                            </div>
+                            <div>
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-2">
+                                    <i data-lucide="list-plus" class="w-4 h-4"></i>
+                                    Specific Booking IDs
+                                </h3>
+                                <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+                                    Import individual bookings by ID and optionally UUID. One entry per line, format: <code>BOOKINGID</code> or <code>BOOKINGID,BOOKINGUUID</code>.
+                                </p>
+                                <textarea name="bookingEntries" rows="6" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="AQ8M5Q&#10;AQ8M5Q,3c3d7b8c-1234-5678-90ab-1a2b3c4d5e6f"></textarea>
+                            </div>
+                        </div>
+                        <div class="flex flex-col sm:flex-row gap-3 justify-end">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
+                                Cancel
+                            </button>
+                            <button type="submit" data-mode="list" class="py-2 px-4 rounded-md bg-purple-600 text-white hover:bg-purple-700 transition-colors flex items-center justify-center">
+                                <i data-lucide="upload-cloud" class="w-4 h-4 mr-2"></i>Import Booking List
+                            </button>
+                            <button type="submit" data-mode="range" class="py-2 px-4 rounded-md bg-blue-600 text-white hover:bg-blue-700 transition-colors flex items-center justify-center">
+                                <i data-lucide="refresh-cw" class="w-4 h-4 mr-2"></i>Run Range Sync
+                            </button>
                         </div>
                     </form>
                 `;
