@@ -97,6 +97,33 @@ const getIdFromRequest = (request) => {
     return request.params.id;
 };
 
+// Ensure context.log has error/info/warn helpers in all environments
+const ensureContextLogMethods = (context) => {
+    if (!context || !context.log) {
+        return;
+    }
+    const baseLog = context.log;
+    const fallback = (...args) => {
+        try {
+            // context.log is callable like console.log
+            if (typeof baseLog === 'function') {
+                baseLog.apply(context, args);
+            } else if (typeof console.log === 'function') {
+                console.log(...args);
+            }
+        } catch (loggingError) {
+            if (typeof console.log === 'function') {
+                console.log(...args);
+            }
+        }
+    };
+    ['info', 'warn', 'error'].forEach((method) => {
+        if (typeof baseLog[method] !== 'function') {
+            baseLog[method] = fallback;
+        }
+    });
+};
+
 // Safely stringify objects (especially Error instances) for logging without throwing
 const safeStringify = (value, space = 2) => {
     try {
@@ -1796,6 +1823,7 @@ app.http('navanLookup', {
     authLevel: 'anonymous',
     route: 'navan-lookup',
     handler: async (request, context) => {
+        ensureContextLogMethods(context);
         // Handle OPTIONS request for CORS
         if (request.method === 'OPTIONS') {
             return {
@@ -2498,6 +2526,7 @@ app.http('navanTest', {
     authLevel: 'anonymous',
     route: 'navan-test',
     handler: async (request, context) => {
+        ensureContextLogMethods(context);
         // Wrap everything in a try-catch to ensure we always return a response
         try {
             // Default error response
