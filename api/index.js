@@ -2507,7 +2507,11 @@ app.http('navanTest', {
                     connected: false,
                     error: error || 'Connection test failed',
                     detail: detail || 'Unknown error occurred',
-                    message: 'Failed to test Navan API connection'
+                        message: 'Failed to test Navan API connection',
+                        diagnostic: {
+                            skipApiCall,
+                            includeFullToken
+                        }
                 },
                 headers: { 
                     'Content-Type': 'application/json',
@@ -2560,6 +2564,28 @@ app.http('navanTest', {
                 };
             }
             
+            const skipApiCall = (() => {
+                const querySkip = request.query?.skipApiCall || request.query?.get?.('skipApiCall');
+                if (typeof querySkip === 'string') {
+                    return querySkip.toLowerCase() !== 'false';
+                }
+                if (request.url && request.url.includes('skipApiCall=false')) {
+                    return false;
+                }
+                return true; // default: skip follow-up API call for diagnostics
+            })();
+
+            const includeFullToken = (() => {
+                const queryInclude = request.query?.includeToken || request.query?.get?.('includeToken');
+                if (typeof queryInclude === 'string') {
+                    return queryInclude.toLowerCase() === 'true';
+                }
+                if (request.url && request.url.includes('includeToken=true')) {
+                    return true;
+                }
+                return false;
+            })();
+
             // Test OAuth token generation
             context.log.info('Testing OAuth token generation...');
             let tokenResponse;
@@ -2637,6 +2663,25 @@ app.http('navanTest', {
                 };
             }
             
+            if (skipApiCall) {
+                context.log.info('OAuth token generated; skipping bookings API call (diagnostic mode).');
+                return {
+                    status: 200,
+                    jsonBody: {
+                        connected: true,
+                        oauthToken: true,
+                        apiCall: false,
+                        token: includeFullToken ? accessToken : `${accessToken.substring(0, 8)}...`,
+                        message: 'Successfully obtained OAuth token. Bookings API call skipped. Add skipApiCall=false to test API call.',
+                        note: includeFullToken ? 'Full token returned for diagnostics.' : 'Token truncated. Add includeToken=true to return full token (use with caution).'
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+
             // Test a simple API call to verify the token works
             context.log.info('Testing API call with token...');
             let testApiResponse;
