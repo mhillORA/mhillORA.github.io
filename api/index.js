@@ -2734,11 +2734,12 @@ app.http('navanTest', {
 
             // Test a simple API call to verify the token works
             context.log.info('Testing API call with token...');
-            const now = Math.floor(Date.now() / 1000);
-            const ninetyDaysAgo = now - (90 * 24 * 60 * 60);
-            const createdFromParam = request.query?.createdFrom || request.query?.get?.('createdFrom') || `${ninetyDaysAgo}`;
-            const createdToParam = request.query?.createdTo || request.query?.get?.('createdTo') || `${now}`;
-            context.log.info(`Using createdFrom=${createdFromParam}, createdTo=${createdToParam} for diagnostic bookings request`);
+                const now = Math.floor(Date.now() / 1000);
+                const midnightToday = Math.floor(new Date(new Date().toISOString().split('T')[0] + 'T23:59:59Z').getTime() / 1000);
+                const eightyNineDaysAgoMidnight = midnightToday - (89 * 24 * 60 * 60);
+                const createdFromParam = request.query?.createdFrom || request.query?.get?.('createdFrom') || `${eightyNineDaysAgoMidnight}`;
+                const createdToParam = request.query?.createdTo || request.query?.get?.('createdTo') || `${midnightToday}`;
+                context.log.info(`Using createdFrom=${createdFromParam}, createdTo=${createdToParam} for diagnostic bookings request`);
             let testApiResponse;
             try {
                 const fetchFn = await getFetch();
