@@ -97,6 +97,22 @@ const getIdFromRequest = (request) => {
     return request.params.id;
 };
 
+// Safely stringify objects (especially Error instances) for logging without throwing
+const safeStringify = (value, space = 2) => {
+    try {
+        if (value instanceof Error) {
+            const plainError = {};
+            Object.getOwnPropertyNames(value).forEach((key) => {
+                plainError[key] = value[key];
+            });
+            return JSON.stringify(plainError, null, space);
+        }
+        return JSON.stringify(value, null, space);
+    } catch (stringifyError) {
+        return `<<Unable to stringify value: ${stringifyError.message}>>`;
+    }
+};
+
 // =================================================================================
 // SCHEMA VALIDATION FUNCTIONS
 // =================================================================================
@@ -105,7 +121,7 @@ const validateStudiesSchema = (data) => {
     const errors = [];
     
     // Debug logging
-    console.log('Validating study data:', JSON.stringify(data, null, 2));
+    console.log('Validating study data:', safeStringify(data));
     
     // Check if this is CHAOS format (has name, color, requiredRoles, sites)
     const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
@@ -2399,29 +2415,29 @@ app.http('navanLookup', {
                     } catch (upsertError) {
                         context.log.error('Error upserting travel record:', upsertError.message);
                         context.log.error('Upsert error stack:', upsertError.stack);
-                        context.log.error('Upsert error details:', JSON.stringify(upsertError, Object.getOwnPropertyNames(upsertError)));
+                        context.log.error('Upsert error details:', safeStringify(upsertError));
                         throw upsertError; // Re-throw to be caught by outer catch
                     }
                 } else {
                     // Create new travel record
                     context.log.info('Creating new travel record...');
                     const newTravel = { ...travelRecord, id: generateId() };
-                    context.log.info('Travel record data prepared:', JSON.stringify(newTravel, null, 2));
+                    context.log.info('Travel record data prepared:', safeStringify(newTravel));
                     try {
                         const { resource: savedTravel } = await travelContainer.items.create(newTravel);
                         context.log.info(`Created new travel record for Navan booking ${bookingId}`);
                     } catch (createError) {
                         context.log.error('Error creating travel record:', createError.message);
                         context.log.error('Create error stack:', createError.stack);
-                        context.log.error('Create error details:', JSON.stringify(createError, Object.getOwnPropertyNames(createError)));
-                        context.log.error('Travel record that failed to create:', JSON.stringify(newTravel, null, 2));
+                        context.log.error('Create error details:', safeStringify(createError));
+                        context.log.error('Travel record that failed to create:', safeStringify(newTravel));
                         throw createError; // Re-throw to be caught by outer catch
                     }
                 }
             } catch (storageError) {
                 context.log.error('Error storing booking data in travel container:', storageError.message);
                 context.log.error('Storage error stack:', storageError.stack);
-                context.log.error('Storage error details:', JSON.stringify(storageError, Object.getOwnPropertyNames(storageError)));
+                context.log.error('Storage error details:', safeStringify(storageError));
                 
                 // Return booking data even if storage fails, but include error details
                 // This allows the lookup to succeed even if storage fails
@@ -2455,7 +2471,7 @@ app.http('navanLookup', {
         } catch (error) {
             context.log.error('Navan lookup error:', error.message);
             context.log.error('Error stack:', error.stack);
-            context.log.error('Error details:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+            context.log.error('Error details:', safeStringify(error));
             
             return {
                 status: 200, // Return 200 so frontend can see error details
@@ -2692,7 +2708,7 @@ app.http('navanTest', {
                 context.log.error('Navan connection test error:', error.message);
                 context.log.error('Error stack:', error.stack);
                 try {
-                    context.log.error('Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+                    context.log.error('Full error object:', safeStringify(error));
                 } catch (stringifyError) {
                     context.log.error('Could not stringify error object:', stringifyError);
                 }
