@@ -2056,7 +2056,7 @@ const resolveCrcIdForNavanBooking = async (booking, context, { allowFallbackName
     return { crcId, travelerName, matched };
 };
 
-const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crcId, context) => {
+const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crcId, travelerName, context) => {
     const bookingType = booking.bookingType || 'FLIGHT';
 
     let date = null;
@@ -2094,6 +2094,10 @@ const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crc
         vendor: booking.vendor || null,
         navanReason: booking.reason || booking.purpose || null
     };
+
+    if (travelerName) {
+        travelRecord.travelerName = travelerName;
+    }
 
     if (bookingType === 'FLIGHT') {
         const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
@@ -2254,7 +2258,7 @@ const upsertNavanBooking = async (context, booking, {
         return { skipped: true, reason: 'CRC not found', travelerName };
     }
 
-    const travelRecord = createTravelRecordFromNavanBooking(booking, bookingId || booking.bookingId, bookingUuid || booking.uuid, crcId, context);
+    const travelRecord = createTravelRecordFromNavanBooking(booking, bookingId || booking.bookingId, bookingUuid || booking.uuid, crcId, travelerName, context);
 
     if (!matched && allowFallbackCrc && crcId === travelerName) {
         context.log.warn(`Using traveler name as temporary CRC identifier for booking ${bookingId || bookingUuid}`);
