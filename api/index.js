@@ -12,14 +12,10 @@ const getFetch = async () => {
     }
     if (!fetch) {
         try {
-            // Try CommonJS require first (node-fetch v2)
-            try {
-                fetch = require('node-fetch');
-            } catch (requireError) {
-                // Fallback to ESM import (node-fetch v3)
-                const nodeFetch = await import('node-fetch');
-                fetch = nodeFetch.default;
-            }
+            // Remove the 'require' block and ONLY use import()
+            const nodeFetch = await import('node-fetch');
+            fetch = nodeFetch.default;
+
         } catch (importError) {
             fetchError = importError;
             throw new Error(`Failed to import node-fetch: ${importError.message}. Make sure node-fetch is installed in package.json.`);
