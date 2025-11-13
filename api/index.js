@@ -2734,10 +2734,16 @@ app.http('navanTest', {
 
             // Test a simple API call to verify the token works
             context.log.info('Testing API call with token...');
+            const now = Math.floor(Date.now() / 1000);
+            const ninetyDaysAgo = now - (90 * 24 * 60 * 60);
+            const createdFromParam = request.query?.createdFrom || request.query?.get?.('createdFrom') || `${ninetyDaysAgo}`;
+            const createdToParam = request.query?.createdTo || request.query?.get?.('createdTo') || `${now}`;
+            context.log.info(`Using createdFrom=${createdFromParam}, createdTo=${createdToParam} for diagnostic bookings request`);
             let testApiResponse;
             try {
                 const fetchFn = await getFetch();
-                testApiResponse = await fetchFn(`https://api.navan.com/v1/bookings?page=0&size=1&includeTransactions=false`, {
+                const diagnosticsUrl = `https://api.navan.com/v1/bookings?createdFrom=${createdFromParam}&createdTo=${createdToParam}&page=0&size=1&includeTransactions=false`;
+                testApiResponse = await fetchFn(diagnosticsUrl, {
                     method: 'GET',
                     headers: {
                         'Authorization': `Bearer ${accessToken}`,
