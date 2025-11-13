@@ -1829,6 +1829,493 @@ app.http('azure-maps-config', {
     }
 });
 
+// =================================================================================
+// NAVAN HELPER FUNCTIONS
+// =================================================================================
+
+const normalizeNavanDateRange = (pastDays = 30, futureDays = 180) => {
+    const now = new Date();
+    const endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    const startDate = new Date(endDate.getTime());
+    startDate.setDate(startDate.getDate() - pastDays);
+    const futureDate = new Date(endDate.getTime());
+    futureDate.setDate(futureDate.getDate() + futureDays);
+    return {
+        createdFrom: Math.floor(startDate.getTime() / 1000),
+        createdTo: Math.floor(futureDate.getTime() / 1000),
+        startDate,
+        endDate: futureDate
+    };
+};
+
+const getNavanCredentials = () => {
+    return {
+        clientId: process.env.NAVAN_CLIENT_ID,
+        clientSecret: process.env.NAVAN_SECRET_KEY
+    };
+};
+
+const fetchNavanAccessToken = async (context) => {
+    const { clientId, clientSecret } = getNavanCredentials();
+    context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
+
+    if (!clientId || !clientSecret) {
+        return {
+            success: false,
+            response: {
+                status: 200,
+                jsonBody: {
+                    connected: false,
+                    error: 'Navan API credentials not configured',
+                    detail: `NAVAN_CLIENT_ID is ${clientId ? 'set (length: ' + clientId.length + ')' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set (length: ' + clientSecret.length + ')' : 'missing'}`,
+                    message: 'Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables'
+                },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            }
+        };
+    }
+
+    try {
+        const fetchFn = await getFetch();
+        const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/x-www-form-urlencoded'
+            },
+            body: new URLSearchParams({
+                grant_type: 'client_credentials',
+                client_id: clientId,
+                client_secret: clientSecret
+            })
+        });
+
+        if (!tokenResponse.ok) {
+            const errorText = await tokenResponse.text();
+            context.log.error(`Navan OAuth request failed: ${tokenResponse.status} - ${errorText}`);
+            return {
+                success: false,
+                response: {
+                    status: tokenResponse.status,
+                    jsonBody: {
+                        connected: false,
+                        error: 'Failed to generate OAuth token',
+                        detail: `OAuth token request failed with status ${tokenResponse.status}: ${errorText}`,
+                        message: 'Unable to connect to Navan API. Check credentials and network connectivity.'
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                }
+            };
+        }
+
+        const tokenData = await tokenResponse.json();
+        const accessToken = tokenData?.access_token;
+
+        if (!accessToken) {
+            context.log.error('Navan OAuth response missing access_token:', tokenData);
+            return {
+                success: false,
+                response: {
+                    status: 200,
+                    jsonBody: {
+                        connected: false,
+                        error: 'No access token received',
+                        detail: 'OAuth token response did not contain access_token',
+                        message: 'Navan API returned invalid token response'
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                }
+            };
+        }
+
+        return { success: true, accessToken };
+    } catch (error) {
+        context.log.error('Error requesting Navan OAuth token:', error);
+        return {
+            success: false,
+            response: {
+                status: 200,
+                jsonBody: {
+                    connected: false,
+                    error: 'Network error during OAuth request',
+                    detail: error.message,
+                    message: 'Unable to connect to Navan OAuth endpoint.'
+                },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            }
+        };
+    }
+};
+
+const fetchNavanBookingsPage = async (accessToken, { createdFrom, createdTo, page = 0, size = 100 }) => {
+    const fetchFn = await getFetch();
+    return fetchFn(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${size}&includeTransactions=false`, {
+        method: 'GET',
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+            'accept': 'application/json'
+        }
+    });
+};
+
+const fetchNavanBookingByUuid = async (accessToken, bookingUuid) => {
+    const fetchFn = await getFetch();
+    return fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+        method: 'GET',
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+            'accept': 'application/json'
+        }
+    });
+};
+
+const buildCrcResolver = (crcList = []) => {
+    const byEmail = new Map();
+    const byName = new Map();
+    crcList.forEach(crc => {
+        if (crc.email) {
+            byEmail.set(crc.email.trim().toLowerCase(), crc);
+        }
+        if (crc.name) {
+            byName.set(crc.name.trim().toLowerCase(), crc);
+        }
+    });
+    return { byEmail, byName };
+};
+
+const resolveCrcIdForNavanBooking = async (booking, context, { allowFallbackName = true, crcResolver = null } = {}) => {
+    let travelerName = null;
+    let travelerEmail = null;
+    let crcId = null;
+    let matched = false;
+
+    if (booking.passengers && booking.passengers.length > 0 && booking.passengers[0].person) {
+        const person = booking.passengers[0].person;
+        travelerName = person.name || null;
+        travelerEmail = person.email ? person.email.trim().toLowerCase() : null;
+
+        if (crcResolver) {
+            if (travelerEmail && crcResolver.byEmail.has(travelerEmail)) {
+                crcId = crcResolver.byEmail.get(travelerEmail).id;
+                matched = true;
+                return { crcId, travelerName, matched };
+            }
+            if (travelerName) {
+                const lookup = travelerName.trim().toLowerCase();
+                if (crcResolver.byName.has(lookup)) {
+                    crcId = crcResolver.byName.get(lookup).id;
+                    matched = true;
+                    return { crcId, travelerName, matched };
+                }
+            }
+        }
+
+        if (!crcResolver && travelerName) {
+            try {
+                context.log.info(`Looking up CRC by name: ${travelerName}`);
+                const crcsContainer = getContainer('crcs');
+                const { resources: nameMatches } = await crcsContainer.items
+                    .query({
+                        query: "SELECT * FROM c WHERE c.name = @name",
+                        parameters: [{ name: "@name", value: travelerName }]
+                    })
+                    .fetchAll();
+                
+                if (nameMatches && nameMatches.length > 0) {
+                    crcId = nameMatches[0].id;
+                    matched = true;
+                    context.log.info(`Found matching CRC: ${crcId} for name ${travelerName}`);
+                    return { crcId, travelerName, matched };
+                } else {
+                    context.log.warn(`No CRC found with name: ${travelerName}`);
+                }
+            } catch (crcLookupError) {
+                context.log.warn('Error looking up CRC by name:', crcLookupError.message);
+                context.log.warn('CRC lookup error stack:', crcLookupError.stack);
+            }
+        }
+    }
+
+    if (!matched && allowFallbackName && travelerName) {
+        crcId = travelerName;
+    }
+
+    return { crcId, travelerName, matched };
+};
+
+const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crcId, context) => {
+    const bookingType = booking.bookingType || 'FLIGHT';
+
+    let date = null;
+    if (booking.startDate) {
+        date = booking.startDate;
+    } else if (booking.segments && booking.segments.length > 0 && booking.segments[0].startLocalDateTime) {
+        const dateTime = new Date(booking.segments[0].startLocalDateTime);
+        date = dateTime.toISOString().split('T')[0];
+    }
+
+    const navanStatus = (booking.bookingStatus || booking.approvalStatus || 'CONFIRMED').toLowerCase();
+    let status = 'scheduled';
+    if (navanStatus.includes('confirmed') || navanStatus.includes('approved') || navanStatus.includes('ticketed')) {
+        status = 'scheduled';
+    } else if (navanStatus.includes('cancelled') || navanStatus.includes('canceled')) {
+        status = 'cancelled';
+    } else if (navanStatus.includes('delayed')) {
+        status = 'delayed';
+    } else if (navanStatus.includes('departed')) {
+        status = 'departed';
+    } else if (navanStatus.includes('arrived') || navanStatus.includes('completed')) {
+        status = 'arrived';
+    }
+
+    const travelRecord = {
+        crcId: crcId || 'unknown',
+        date: date || new Date().toISOString().split('T')[0],
+        navanBookingId: bookingId,
+        navanBookingUuid: bookingUuid || booking.uuid || null,
+        navanInvoiceUrl: booking.invoice || null,
+        navanPdfUrl: booking.pdf || null,
+        bookingType: bookingType,
+        status: status,
+        confirmationNumber: booking.confirmationNumber || booking.bookingId || null,
+        vendor: booking.vendor || null,
+        navanReason: booking.reason || booking.purpose || null
+    };
+
+    if (bookingType === 'FLIGHT') {
+        const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
+        if (segment?.flightNumber) {
+            travelRecord.flightNumber = String(segment.flightNumber);
+        }
+        if (segment?.departure?.airportCode) {
+            travelRecord.origin = String(segment.departure.airportCode);
+        }
+        if (segment?.arrival?.airportCode) {
+            travelRecord.destination = String(segment.arrival.airportCode);
+        }
+        if (segment?.startLocalDateTime) {
+            travelRecord.departureTime = new Date(segment.startLocalDateTime).toISOString();
+        }
+        if (segment?.endLocalDateTime) {
+            travelRecord.arrivalTime = new Date(segment.endLocalDateTime).toISOString();
+        }
+        if (booking.grandTotal || booking.usdGrandTotal) {
+            const cost = booking.grandTotal || booking.usdGrandTotal;
+            travelRecord.flightCost = typeof cost === 'number' ? cost : parseFloat(cost);
+        }
+        if (segment?.providerCode) {
+            travelRecord.airlineCode = String(segment.providerCode);
+        }
+        if (segment?.providerName || booking.vendor) {
+            travelRecord.airline = String(segment?.providerName || booking.vendor);
+        }
+        if (booking.airlineRoute) {
+            travelRecord.airlineRoute = booking.airlineRoute;
+        }
+        if (booking.seats && booking.seats.length > 0) {
+            travelRecord.seatAssignments = booking.seats;
+        }
+        if (booking.tripName) {
+            travelRecord.tripName = booking.tripName;
+        }
+    } else if (bookingType === 'HOTEL') {
+        const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
+        if (booking.vendor) {
+            travelRecord.hotelName = String(booking.vendor);
+        }
+        if (segment?.departure?.address) {
+            travelRecord.hotelAddress = String(segment.departure.address);
+        }
+        if (segment?.departure?.city || booking.destination?.city) {
+            travelRecord.hotelCity = String(segment?.departure?.city || booking.destination?.city || '');
+        }
+        if (segment?.departure?.state || booking.destination?.state) {
+            travelRecord.hotelState = String(segment?.departure?.state || booking.destination?.state || '');
+        }
+        if (segment?.departure?.postalCode) {
+            travelRecord.hotelZip = String(segment.departure.postalCode);
+        }
+        if (segment?.departure?.country || booking.destination?.country) {
+            travelRecord.hotelCountry = String(segment?.departure?.country || booking.destination?.country || '');
+        }
+        if (segment?.startLocalDateTime || booking.startDate) {
+            const checkIn = segment?.startLocalDateTime ? new Date(segment.startLocalDateTime) : new Date(booking.startDate);
+            travelRecord.hotelCheckIn = checkIn.toISOString();
+        }
+        if (segment?.endLocalDateTime || booking.endDate) {
+            const checkOut = segment?.endLocalDateTime ? new Date(segment.endLocalDateTime) : new Date(booking.endDate);
+            travelRecord.hotelCheckOut = checkOut.toISOString();
+        }
+        if (booking.grandTotal || booking.usdGrandTotal) {
+            const cost = booking.grandTotal || booking.usdGrandTotal;
+            travelRecord.hotelCost = typeof cost === 'number' ? cost : parseFloat(cost);
+        }
+    } else if (bookingType === 'CAR') {
+        const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
+        if (booking.vendor) {
+            travelRecord.carRentalCompany = String(booking.vendor);
+        }
+        if (booking.carType) {
+            travelRecord.carType = String(booking.carType);
+        }
+        if (segment?.departure?.address) {
+            travelRecord.pickupLocation = String(segment.departure.address);
+        }
+        if (segment?.departure?.airportCode) {
+            travelRecord.pickupAirportCode = String(segment.departure.airportCode);
+        }
+        if (booking.origin?.city || segment?.departure?.city) {
+            travelRecord.pickupCity = String(booking.origin?.city || segment?.departure?.city || '');
+        }
+        if (booking.origin?.state || segment?.departure?.state) {
+            travelRecord.pickupState = String(booking.origin?.state || segment?.departure?.state || '');
+        }
+        if (segment?.arrival?.address) {
+            travelRecord.dropoffLocation = String(segment.arrival.address);
+        } else if (segment?.arrival?.airportCode) {
+            travelRecord.dropoffLocation = String(segment.arrival.airportCode);
+        } else if (segment?.departure?.address) {
+            travelRecord.dropoffLocation = String(segment.departure.address);
+        }
+        if (booking.destination?.city || segment?.arrival?.city || booking.origin?.city) {
+            travelRecord.dropoffCity = String(booking.destination?.city || segment?.arrival?.city || booking.origin?.city || '');
+        }
+        if (booking.destination?.state || segment?.arrival?.state || booking.origin?.state) {
+            travelRecord.dropoffState = String(booking.destination?.state || segment?.arrival?.state || booking.origin?.state || '');
+        }
+        if (segment?.arrival?.airportCode) {
+            travelRecord.dropoffAirportCode = String(segment.arrival.airportCode);
+        } else if (segment?.departure?.airportCode) {
+            travelRecord.dropoffAirportCode = String(segment.departure.airportCode);
+        }
+        if (segment?.startLocalDateTime || booking.startDate) {
+            const pickup = segment?.startLocalDateTime ? new Date(segment.startLocalDateTime) : new Date(booking.startDate);
+            travelRecord.pickupDate = pickup.toISOString();
+        }
+        if (segment?.endLocalDateTime || booking.endDate) {
+            const dropoff = segment?.endLocalDateTime ? new Date(segment.endLocalDateTime) : new Date(booking.endDate);
+            travelRecord.dropoffDate = dropoff.toISOString();
+        }
+        if (booking.grandTotal || booking.usdGrandTotal) {
+            const cost = booking.grandTotal || booking.usdGrandTotal;
+            travelRecord.carRentalCost = typeof cost === 'number' ? cost : parseFloat(cost);
+        }
+    }
+
+    if (booking.reason) {
+        travelRecord.reason = String(booking.reason);
+    }
+
+    if (booking.numberOfPassengers !== undefined) {
+        travelRecord.navanPassengerCount = booking.numberOfPassengers;
+    }
+
+    if (booking.segments && Array.isArray(booking.segments)) {
+        travelRecord.navanSegments = booking.segments;
+    }
+
+    Object.keys(travelRecord).forEach(key => {
+        if (key === 'confirmationNumber') {
+            return;
+        }
+        if (travelRecord[key] === null || travelRecord[key] === undefined || travelRecord[key] === '') {
+            delete travelRecord[key];
+        }
+    });
+
+    return travelRecord;
+};
+
+const upsertNavanBooking = async (context, booking, {
+    bookingId,
+    bookingUuid = null,
+    readOnly = false,
+    crcResolver = null,
+    allowFallbackCrc = true
+} = {}) => {
+    const travelContainer = readOnly ? null : getContainer('travel');
+    const { crcId, travelerName, matched } = await resolveCrcIdForNavanBooking(booking, context, { allowFallbackName: allowFallbackCrc, crcResolver });
+
+    if (!crcId) {
+        context.log.warn(`No CRC match found for booking ${bookingId || bookingUuid || booking.uuid}. Skipping import.`);
+        return { skipped: true, reason: 'CRC not found', travelerName };
+    }
+
+    const travelRecord = createTravelRecordFromNavanBooking(booking, bookingId || booking.bookingId, bookingUuid || booking.uuid, crcId, context);
+
+    if (!matched && allowFallbackCrc && crcId === travelerName) {
+        context.log.warn(`Using traveler name as temporary CRC identifier for booking ${bookingId || bookingUuid}`);
+    }
+
+    if (readOnly) {
+        return { travelRecord, action: 'readOnly', saved: false, matched };
+    }
+
+    const bookingIdentifier = bookingId || travelRecord.navanBookingId;
+    const bookingUuidIdentifier = bookingUuid || travelRecord.navanBookingUuid;
+
+    let existingTravel = null;
+    try {
+        const { resources: existingRecords } = await travelContainer.items
+            .query({
+                query: "SELECT * FROM c WHERE (IS_DEFINED(c.navanBookingId) AND c.navanBookingId = @bookingId) OR (IS_DEFINED(c.navanBookingUuid) AND c.navanBookingUuid = @uuid)",
+                parameters: [
+                    { name: "@bookingId", value: bookingIdentifier },
+                    { name: "@uuid", value: bookingUuidIdentifier || '' }
+                ]
+            })
+            .fetchAll();
+
+        if (existingRecords && existingRecords.length > 0) {
+            existingTravel = existingRecords[0];
+        }
+    } catch (queryError) {
+        context.log.warn('Error querying for existing travel record:', queryError.message);
+        context.log.warn('Query error stack:', queryError.stack);
+    }
+
+    if (existingTravel) {
+        const updatedTravel = { ...existingTravel, ...travelRecord, id: existingTravel.id };
+        try {
+            await travelContainer.items.upsert(updatedTravel);
+            context.log.info(`Updated existing travel record for Navan booking ${bookingIdentifier}`);
+            return { travelRecord: updatedTravel, action: 'updated', saved: true, matched };
+        } catch (upsertError) {
+            context.log.error('Error upserting travel record:', upsertError.message);
+            context.log.error('Upsert error stack:', upsertError.stack);
+            context.log.error('Upsert error details:', safeStringify(upsertError));
+            throw upsertError;
+        }
+    } else {
+        const newTravel = { ...travelRecord, id: generateId() };
+        context.log.info('Creating new travel record with data:', safeStringify(newTravel));
+        try {
+            await travelContainer.items.create(newTravel);
+            context.log.info(`Created new travel record for Navan booking ${bookingIdentifier}`);
+            return { travelRecord: newTravel, action: 'created', saved: true, matched };
+        } catch (createError) {
+            context.log.error('Error creating travel record:', createError.message);
+            context.log.error('Create error stack:', createError.stack);
+            context.log.error('Create error details:', safeStringify(createError));
+            context.log.error('Travel record that failed to create:', safeStringify(newTravel));
+            throw createError;
+        }
+    }
+};
+
 // Navan booking lookup endpoint
 // This endpoint calls Navan API to get booking information by bookingId
 // Step 1: Get OAuth token from https://api.navan.com/ta-auth/oauth/token
@@ -1911,78 +2398,11 @@ app.http('navanLookup', {
             context.log.info(`Navan booking lookup request for: ${bookingId || 'N/A'} uuid: ${bookingUuidParam || 'N/A'} (readOnly: ${readOnly})`);
             
             // Step 1: Get OAuth token from Navan
-            // Get Navan API credentials from environment variables (same pattern as Cosmos DB)
-            const clientId = process.env.NAVAN_CLIENT_ID;
-            const clientSecret = process.env.NAVAN_SECRET_KEY;
-            
-            // Log credential status (without exposing values)
-            context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
-            
-            if (!clientId || !clientSecret) {
-                context.log.error('Navan credentials not configured in environment variables');
-                context.log.error(`Environment variables: NAVAN_CLIENT_ID=${!!clientId}, NAVAN_SECRET_KEY=${!!clientSecret}`);
-                return {
-                    status: 200, // Return 200 so frontend can see error details
-                    jsonBody: {
-                        error: 'Navan API credentials not configured. Please set NAVAN_CLIENT_ID and NAVAN_SECRET_KEY in Azure environment variables.',
-                        detail: `NAVAN_CLIENT_ID is ${clientId ? 'set' : 'missing'}, NAVAN_SECRET_KEY is ${clientSecret ? 'set' : 'missing'}`,
-                        originalMessage: 'Navan credentials check failed',
-                        bookingId: bookingId
-                    },
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': '*'
-                    }
-                };
+            const tokenResult = await fetchNavanAccessToken(context);
+            if (!tokenResult.success) {
+                return tokenResult.response;
             }
-            
-            context.log.info('Requesting OAuth token from Navan...');
-            const fetchFn = await getFetch();
-            const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/x-www-form-urlencoded'
-                },
-                body: new URLSearchParams({
-                    grant_type: 'client_credentials',
-                    client_id: clientId,
-                    client_secret: clientSecret
-                })
-            });
-            
-            if (!tokenResponse.ok) {
-                const errorText = await tokenResponse.text();
-                context.log.error(`Token request failed: ${tokenResponse.status} - ${errorText}`);
-                return {
-                    status: tokenResponse.status,
-                    jsonBody: { 
-                        error: `Failed to get OAuth token: ${errorText}`,
-                        detail: `OAuth token request failed with status ${tokenResponse.status}. This usually means the CLIENT_ID or SECRET_KEY are incorrect, or the Azure app's outbound IP addresses need to be added to Navan API settings.`,
-                        originalMessage: 'OAuth token request failed'
-                    },
-                    headers: { 'Content-Type': 'application/json' }
-                };
-            }
-            
-            const tokenData = await tokenResponse.json();
-            const accessToken = tokenData.access_token;
-            
-            if (!accessToken) {
-                context.log.error('No access token in response:', tokenData);
-                return {
-                    status: 200, // Return 200 so frontend can see error details
-                    jsonBody: { 
-                        error: 'Failed to get access token from Navan',
-                        detail: 'OAuth token response did not contain access_token',
-                        bookingId: bookingId
-                    },
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': '*'
-                    }
-                };
-            }
-            
+            const accessToken = tokenResult.accessToken;
             context.log.info('OAuth token obtained successfully');
             
             // Step 2: Get booking data from Navan
@@ -2141,404 +2561,52 @@ app.http('navanLookup', {
                 };
             }
             
-            // Step 3: Store booking data in travel container for reporting (skip if readOnly)
-            if (readOnly) {
-                context.log.info('Read-only mode: Skipping database write');
-                // Return the booking data without storing it
+            const booking = bookingData.data[0];
+            const importResult = await upsertNavanBooking(context, booking, {
+                bookingId,
+                bookingUuid: bookingUuid || booking.uuid,
+                readOnly,
+                allowFallbackCrc: true
+            });
+
+            if (importResult.skipped) {
                 return {
                     status: 200,
-                    jsonBody: {
-                        data: bookingData.data,
-                        readOnly: true,
-                        message: 'Booking data retrieved successfully (read-only mode - not saved to database)'
-                    },
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': '*'
-                    }
-                };
-            }
-            
-            try {
-                context.log.info('Attempting to get travel container...');
-                const travelContainer = getContainer('travel');
-                context.log.info('Travel container obtained successfully');
-                
-                // Check if a travel record already exists for this booking ID
-                let existingTravel = null;
-                try {
-                    context.log.info(`Querying for existing travel record with navanBookingId: ${bookingId}`);
-                    // Check for existing record by bookingId or UUID (in case it was previously stored with UUID)
-                    // Get the booking UUID from the bookingData we just fetched
-                    const bookingUuid = bookingData?.data?.[0]?.uuid || '';
-                    
-                    // Query for existing records - use IS_DEFINED to safely check if fields exist
-                    // This prevents errors if navanBookingId or navanBookingUuid fields don't exist in old records
-                    const { resources: existingRecords } = await travelContainer.items
-                        .query({
-                            query: "SELECT * FROM c WHERE (IS_DEFINED(c.navanBookingId) AND c.navanBookingId = @bookingId) OR (IS_DEFINED(c.navanBookingUuid) AND c.navanBookingUuid = @uuid)",
-                            parameters: [
-                                { name: "@bookingId", value: bookingId },
-                                { name: "@uuid", value: bookingUuid }
-                            ]
-                        })
-                        .fetchAll();
-                    
-                    context.log.info(`Found ${existingRecords?.length || 0} existing travel records`);
-                    if (existingRecords && existingRecords.length > 0) {
-                        existingTravel = existingRecords[0];
-                        context.log.info('Existing travel record found, will update');
-                    }
-                } catch (queryError) {
-                    context.log.warn('Error querying for existing travel record:', queryError.message);
-                    context.log.warn('Query error stack:', queryError.stack);
-                    // Continue to create new record if query fails
-                }
-                
-                // Prepare travel record data from Navan booking
-                // Transform Navan data to match existing travel container schema
-                const booking = bookingData.data[0];
-                const bookingType = booking.bookingType || 'FLIGHT';
-                
-                // Get passenger/traveler info and find matching CRC ID
-                // Staff member should be pulled from passengers[0].person.name
-                // Only use name for lookup (no email lookup)
-                let crcId = null;
-                let travelerName = null;
-                
-                if (booking.passengers && booking.passengers.length > 0 && booking.passengers[0].person) {
-                    const person = booking.passengers[0].person;
-                    travelerName = person.name || null; // Use name from passengers[0].person.name
-                    
-                    // Try to find CRC by name only (from passengers[0].person.name)
-                    if (travelerName) {
-                        try {
-                            context.log.info(`Looking up CRC by name: ${travelerName}`);
-                            const crcsContainer = getContainer('crcs');
-                            const { resources: nameMatches } = await crcsContainer.items
-                                .query({
-                                    query: "SELECT * FROM c WHERE c.name = @name",
-                                    parameters: [{ name: "@name", value: travelerName }]
-                                })
-                                .fetchAll();
-                            
-                            if (nameMatches && nameMatches.length > 0) {
-                                crcId = nameMatches[0].id;
-                                context.log.info(`Found matching CRC: ${crcId} for name ${travelerName}`);
-                                    } else {
-                                context.log.warn(`No CRC found with name: ${travelerName}`);
-                            }
-                        } catch (crcLookupError) {
-                            context.log.warn('Error looking up CRC by name:', crcLookupError.message);
-                            context.log.warn('CRC lookup error stack:', crcLookupError.stack);
-                            // Continue without crcId - will need to be set manually
-                        }
-                    }
-                }
-                
-                // If no CRC found, use name as fallback (from passengers[0].person.name)
-                if (!crcId && travelerName) {
-                    crcId = travelerName; // Temporary fallback
-                    context.log.warn(`No CRC found for ${travelerName}, using name as crcId (will need manual update)`);
-                }
-                
-                // Get date (required field: date) - format as YYYY-MM-DD string
-                let date = null;
-                if (booking.startDate) {
-                    date = booking.startDate; // Already in YYYY-MM-DD format
-                } else if (booking.segments && booking.segments.length > 0 && booking.segments[0].startLocalDateTime) {
-                    // Extract date from ISO datetime string
-                    const dateTime = new Date(booking.segments[0].startLocalDateTime);
-                    date = dateTime.toISOString().split('T')[0]; // Extract YYYY-MM-DD
-                }
-                
-                // Map Navan booking status to travel schema status
-                const navanStatus = (booking.bookingStatus || booking.approvalStatus || 'CONFIRMED').toLowerCase();
-                let status = 'scheduled'; // Default
-                if (navanStatus.includes('confirmed') || navanStatus.includes('approved')) {
-                    status = 'scheduled';
-                } else if (navanStatus.includes('cancelled') || navanStatus.includes('canceled')) {
-                    status = 'cancelled';
-                } else if (navanStatus.includes('delayed')) {
-                    status = 'delayed';
-                } else if (navanStatus.includes('departed')) {
-                    status = 'departed';
-                } else if (navanStatus.includes('arrived') || navanStatus.includes('completed')) {
-                    status = 'arrived';
-                }
-                
-                // Map Navan booking to travel record format - ONLY fields that exist in travel schema
-                const travelRecord = {
-                    // Required fields for travel schema
-                    crcId: crcId || 'unknown', // Required - use fallback if not found
-                    date: date || new Date().toISOString().split('T')[0], // Required - use today if not available
-                    
-                    // Navan booking reference (optional field)
-                    // Store the bookingId used for lookup, and also store UUID for reference
-                    navanBookingId: bookingId, // The bookingId used to find this booking (e.g., "AQ8M5Q")
-                    navanBookingUuid: booking.uuid || null, // The UUID from Navan (for reference)
-                    
-                    // Status (must be one of: scheduled, delayed, departed, arrived, cancelled)
-                    status: status,
-                    
-                    // Confirmation number (common across all booking types)
-                    confirmationNumber: booking.confirmationNumber || booking.bookingId || null
-                };
-                
-                // Add booking-type specific fields based on actual Navan API structure
-                if (bookingType === 'FLIGHT') {
-                    // Flight-specific fields - map to existing travel schema
-                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
-                    if (segment?.flightNumber) {
-                        travelRecord.flightNumber = String(segment.flightNumber);
-                    }
-                    if (segment?.departure?.airportCode) {
-                        travelRecord.origin = String(segment.departure.airportCode);
-                    }
-                    if (segment?.arrival?.airportCode) {
-                        travelRecord.destination = String(segment.arrival.airportCode);
-                    }
-                    // Map to flightCost if available (must be a number)
-                    if (booking.grandTotal || booking.usdGrandTotal) {
-                        const cost = booking.grandTotal || booking.usdGrandTotal;
-                        travelRecord.flightCost = typeof cost === 'number' ? cost : parseFloat(cost);
-                    }
-                } else if (bookingType === 'HOTEL') {
-                    // Hotel-specific fields - map to existing travel schema
-                    // Based on actual Navan API structure:
-                    // - segments[0].departure.address = "15520 Nw Gateway Ct" (hotel address)
-                    // - segments[0].departure.city = "Beaverton" (hotel city)
-                    // - segments[0].departure.state = "OR" (hotel state)
-                    // - segments[0].departure.postalCode = "97006" (hotel postal code)
-                    // - segments[0].departure.country = "US" (hotel country)
-                    // - destination.city/state/country = fallback if segment data missing
-                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
-                    if (booking.vendor) {
-                        travelRecord.hotelName = String(booking.vendor);
-                    }
-                    // Hotel address from segment departure
-                    if (segment?.departure?.address) {
-                        travelRecord.hotelAddress = String(segment.departure.address);
-                    }
-                    // Hotel city - prefer segment.departure.city (from Navan data)
-                    if (segment?.departure?.city) {
-                        travelRecord.hotelCity = String(segment.departure.city);
-                    } else if (booking.destination?.city) {
-                        travelRecord.hotelCity = String(booking.destination.city);
-                    }
-                    // Hotel state - prefer segment.departure.state
-                    if (segment?.departure?.state) {
-                        travelRecord.hotelState = String(segment.departure.state);
-                    } else if (booking.destination?.state) {
-                        travelRecord.hotelState = String(booking.destination.state);
-                    }
-                    // Hotel postal code
-                    if (segment?.departure?.postalCode) {
-                        travelRecord.hotelPostalCode = String(segment.departure.postalCode);
-                    }
-                    // Hotel country - prefer segment.departure.country
-                    if (segment?.departure?.country) {
-                        travelRecord.hotelCountry = String(segment.departure.country);
-                    } else if (booking.destination?.country) {
-                        travelRecord.hotelCountry = String(booking.destination.country);
-                    }
-                    // Check-in date - extract date from ISO datetime or use startDate
-                    if (segment?.startLocalDateTime) {
-                        const checkInDateTime = new Date(segment.startLocalDateTime);
-                        travelRecord.checkIn = checkInDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
-                    } else if (booking.startDate) {
-                        travelRecord.checkIn = String(booking.startDate);
-                    }
-                    // Check-out date - extract date from ISO datetime or use endDate
-                    if (segment?.endLocalDateTime) {
-                        const checkOutDateTime = new Date(segment.endLocalDateTime);
-                        travelRecord.checkOut = checkOutDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
-                    } else if (booking.endDate) {
-                        travelRecord.checkOut = String(booking.endDate);
-                    }
-                    // Map to hotelCost if available (must be a number)
-                    if (booking.grandTotal || booking.usdGrandTotal) {
-                        const cost = booking.grandTotal || booking.usdGrandTotal;
-                        travelRecord.hotelCost = typeof cost === 'number' ? cost : parseFloat(cost);
-                    }
-                } else if (bookingType === 'CAR') {
-                    // Car rental-specific fields - map to existing travel schema
-                    // Based on actual Navan API structure:
-                    // - segments[0].departure.address = "BNA-NASHVILLE" (pickup location)
-                    // - segments[0].departure.airportCode = "BNA" (pickup airport)
-                    // - origin.city/state = "Nashville", "Tennessee" (pickup city/state)
-                    // - destination.city/state = same as origin for round-trip (dropoff city/state)
-                    const segment = booking.segments && booking.segments.length > 0 ? booking.segments[0] : null;
-                    if (booking.vendor) {
-                        travelRecord.carRentalCompany = String(booking.vendor);
-                    }
-                    if (booking.carType) {
-                        travelRecord.carType = String(booking.carType);
-                    }
-                    // Pickup location - use segment address (e.g., "BNA-NASHVILLE") or airport code
-                    if (segment?.departure?.address) {
-                        travelRecord.pickupLocation = String(segment.departure.address);
-                    } else if (segment?.departure?.airportCode) {
-                        travelRecord.pickupLocation = String(segment.departure.airportCode);
-                    }
-                    // Pickup city - prefer origin.city (from Navan data) since segment.departure.city is often null
-                    if (booking.origin?.city) {
-                        travelRecord.pickupCity = String(booking.origin.city);
-                    } else if (segment?.departure?.city) {
-                        travelRecord.pickupCity = String(segment.departure.city);
-                    }
-                    // Pickup state - prefer origin.state
-                    if (booking.origin?.state) {
-                        travelRecord.pickupState = String(booking.origin.state);
-                    } else if (segment?.departure?.state) {
-                        travelRecord.pickupState = String(segment.departure.state);
-                    }
-                    // Pickup airport code
-                    if (segment?.departure?.airportCode) {
-                        travelRecord.pickupAirportCode = String(segment.departure.airportCode);
-                    }
-                    // Dropoff location - use arrival address or same as departure for round-trip
-                    if (segment?.arrival?.address) {
-                        travelRecord.dropoffLocation = String(segment.arrival.address);
-                    } else if (segment?.arrival?.airportCode) {
-                        travelRecord.dropoffLocation = String(segment.arrival.airportCode);
-                    } else if (segment?.departure?.address) {
-                        travelRecord.dropoffLocation = String(segment.departure.address);
-                    } else if (segment?.departure?.airportCode) {
-                        travelRecord.dropoffLocation = String(segment.departure.airportCode);
-                    }
-                    // Dropoff city - prefer destination.city
-                    if (booking.destination?.city) {
-                        travelRecord.dropoffCity = String(booking.destination.city);
-                    } else if (segment?.arrival?.city) {
-                        travelRecord.dropoffCity = String(segment.arrival.city);
-                    } else if (booking.origin?.city) {
-                        // Round-trip: use origin city as fallback
-                        travelRecord.dropoffCity = String(booking.origin.city);
-                    }
-                    // Dropoff state - prefer destination.state
-                    if (booking.destination?.state) {
-                        travelRecord.dropoffState = String(booking.destination.state);
-                    } else if (segment?.arrival?.state) {
-                        travelRecord.dropoffState = String(segment.arrival.state);
-                    } else if (booking.origin?.state) {
-                        // Round-trip: use origin state as fallback
-                        travelRecord.dropoffState = String(booking.origin.state);
-                    }
-                    // Dropoff airport code
-                    if (segment?.arrival?.airportCode) {
-                        travelRecord.dropoffAirportCode = String(segment.arrival.airportCode);
-                    } else if (segment?.departure?.airportCode) {
-                        // Round-trip: use departure airport code
-                        travelRecord.dropoffAirportCode = String(segment.departure.airportCode);
-                    }
-                    // Pickup date - extract date from ISO datetime or use startDate
-                    if (segment?.startLocalDateTime) {
-                        const pickupDateTime = new Date(segment.startLocalDateTime);
-                        travelRecord.pickupDate = pickupDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
-                    } else if (booking.startDate) {
-                        travelRecord.pickupDate = String(booking.startDate);
-                    }
-                    // Dropoff date - extract date from ISO datetime or use endDate
-                    if (segment?.endLocalDateTime) {
-                        const dropoffDateTime = new Date(segment.endLocalDateTime);
-                        travelRecord.dropoffDate = dropoffDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
-                    } else if (booking.endDate) {
-                        travelRecord.dropoffDate = String(booking.endDate);
-                    }
-                    // Map to carRentalCost if available (must be a number)
-                    if (booking.grandTotal || booking.usdGrandTotal) {
-                        const cost = booking.grandTotal || booking.usdGrandTotal;
-                        travelRecord.carRentalCost = typeof cost === 'number' ? cost : parseFloat(cost);
-                    }
-                }
-                
-                // Additional optional fields that match existing schema
-                if (booking.reason) {
-                    travelRecord.reason = String(booking.reason);
-                }
-                
-                // Remove null/undefined/empty values to keep record clean
-                // But keep confirmationNumber even if null (it's a common field)
-                Object.keys(travelRecord).forEach(key => {
-                    if (key === 'confirmationNumber') {
-                        // Keep confirmationNumber even if null - it's a common field
-                        return;
-                    }
-                    if (travelRecord[key] === null || travelRecord[key] === undefined || travelRecord[key] === '') {
-                        delete travelRecord[key];
-                    }
-                });
-                
-                // Ensure required fields are present
-                if (!travelRecord.crcId || travelRecord.crcId === 'unknown') {
-                    context.log.warn(`Warning: crcId is missing or unknown for booking ${bookingId}`);
-                }
-                if (!travelRecord.date) {
-                    context.log.warn(`Warning: date is missing for booking ${bookingId}`);
-                }
-                
-                if (existingTravel) {
-                    // Update existing travel record
-                    context.log.info('Updating existing travel record...');
-                    const updatedTravel = { ...existingTravel, ...travelRecord, id: existingTravel.id };
-                    try {
-                        const { resource: savedTravel } = await travelContainer.items.upsert(updatedTravel);
-                        context.log.info(`Updated existing travel record for Navan booking ${bookingId}`);
-                    } catch (upsertError) {
-                        context.log.error('Error upserting travel record:', upsertError.message);
-                        context.log.error('Upsert error stack:', upsertError.stack);
-                        context.log.error('Upsert error details:', safeStringify(upsertError));
-                        throw upsertError; // Re-throw to be caught by outer catch
-                    }
-                } else {
-                    // Create new travel record
-                    context.log.info('Creating new travel record...');
-                    const newTravel = { ...travelRecord, id: generateId() };
-                    context.log.info('Travel record data prepared:', safeStringify(newTravel));
-                    try {
-                        const { resource: savedTravel } = await travelContainer.items.create(newTravel);
-                        context.log.info(`Created new travel record for Navan booking ${bookingId}`);
-                    } catch (createError) {
-                        context.log.error('Error creating travel record:', createError.message);
-                        context.log.error('Create error stack:', createError.stack);
-                        context.log.error('Create error details:', safeStringify(createError));
-                        context.log.error('Travel record that failed to create:', safeStringify(newTravel));
-                        throw createError; // Re-throw to be caught by outer catch
-                    }
-                }
-            } catch (storageError) {
-                context.log.error('Error storing booking data in travel container:', storageError.message);
-                context.log.error('Storage error stack:', storageError.stack);
-                context.log.error('Storage error details:', safeStringify(storageError));
-                
-                // Return booking data even if storage fails, but include error details
-                // This allows the lookup to succeed even if storage fails
-                            return {
-                                status: 200,
                     headers: {
                         'Content-Type': 'application/json',
                         'Access-Control-Allow-Origin': '*'
                     },
                     jsonBody: {
-                        ...bookingData,
-                        storageError: {
-                            message: storageError.message,
-                            detail: `Failed to store booking in travel container: ${storageError.message}`,
-                            stack: storageError.stack
-                        }
+                        error: 'Booking not linked',
+                        detail: 'No matching CRC was found for this booking.',
+                        bookingId,
+                        bookingUuid: bookingUuid || booking.uuid
                     }
                 };
             }
-            
-            // Return the booking data
+
+            const responseBody = {
+                data: bookingData.data,
+                navanImport: {
+                    action: importResult.action,
+                    saved: importResult.saved,
+                    matched: importResult.matched
+                }
+            };
+
+            if (readOnly) {
+                responseBody.readOnly = true;
+                responseBody.travelRecord = importResult.travelRecord;
+                responseBody.message = 'Booking data retrieved successfully (read-only mode - not saved to database)';
+            }
+
             return {
                 status: 200,
                 headers: {
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*'
                 },
-                jsonBody: bookingData
+                jsonBody: responseBody
             };
             
         } catch (error) {
@@ -2572,7 +2640,7 @@ app.http('navanTest', {
     route: 'navan-test',
     handler: async (request, context) => {
         ensureContextLogger(context);
-        let skipApiCall = true;
+        let skipApiCall = false;
         let includeFullToken = false;
         // Wrap everything in a try-catch to ensure we always return a response
         try {
@@ -2648,7 +2716,7 @@ app.http('navanTest', {
                 if (request.url && request.url.includes('skipApiCall=false')) {
                     return false;
                 }
-                return true; // default: skip follow-up API call for diagnostics
+                return false; // default: execute API call
             })();
 
             includeFullToken = (() => {
@@ -3056,5 +3124,342 @@ app.http('routeDirections', {
                 headers: { 'Content-Type': 'application/json' }
             };
         }
+    }
+});
+
+const fetchNavanBookingsInRange = async (context, accessToken, { createdFrom, createdTo, pageSize = 100, maxPages = 50 } = {}) => {
+    const bookings = [];
+    let page = 0;
+
+    while (page < maxPages) {
+        const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize });
+        if (!response.ok) {
+            const errorText = await response.text();
+            context.log.error(`Navan bookings range request failed (page ${page}): ${response.status} - ${errorText}`);
+            throw new Error(`Failed to fetch bookings page ${page}: ${errorText}`);
+        }
+
+        const data = await response.json();
+        if (Array.isArray(data?.data) && data.data.length > 0) {
+            bookings.push(...data.data);
+        }
+
+        if (!data?.page || data.page.totalPages === undefined || page >= data.page.totalPages - 1) {
+            break;
+        }
+
+        page += 1;
+    }
+
+    return bookings;
+};
+
+const fetchNavanBookingById = async (context, accessToken, bookingId, { createdFrom, createdTo, pageSize = 100, maxPages = 20 } = {}) => {
+    let page = 0;
+    while (page < maxPages) {
+        const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize });
+        if (!response.ok) {
+            const errorText = await response.text();
+            context.log.error(`Navan bookingId search failed (page ${page}): ${response.status} - ${errorText}`);
+            throw new Error(`Failed to fetch bookings for bookingId search: ${errorText}`);
+        }
+
+        const data = await response.json();
+        if (Array.isArray(data?.data)) {
+            const match = data.data.find(item => item.bookingId === bookingId || item.id === bookingId);
+            if (match) {
+                return match;
+            }
+        }
+
+        if (!data?.page || data.page.totalPages === undefined || page >= data.page.totalPages - 1) {
+            break;
+        }
+
+        page += 1;
+    }
+
+    return null;
+};
+
+const loadAllCrcs = async (context) => {
+    try {
+        const crcsContainer = getContainer('crcs');
+        const { resources } = await crcsContainer.items.readAll().fetchAll();
+        context.log.info(`Loaded ${resources?.length || 0} CRC records for Navan import matching.`);
+        return resources || [];
+    } catch (error) {
+        context.log.error('Failed to load CRC list for Navan import:', error.message);
+        context.log.error('CRC load error stack:', error.stack);
+        return [];
+    }
+};
+
+app.http('navanImport', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'navan-import',
+    handler: async (request, context) => {
+        ensureContextLogger(context);
+
+        if (request.method === 'OPTIONS') {
+            return {
+                status: 200,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                }
+            };
+        }
+
+        let body = {};
+        try {
+            body = await request.json();
+        } catch (parseError) {
+            context.log.warn('navanImport: No JSON body or failed to parse request body, using defaults.');
+            body = {};
+        }
+
+        const importType = (body.importType || 'range').toLowerCase();
+
+        const tokenResult = await fetchNavanAccessToken(context);
+        if (!tokenResult.success) {
+            return tokenResult.response;
+        }
+        const accessToken = tokenResult.accessToken;
+
+        const crcList = await loadAllCrcs(context);
+        const crcResolver = buildCrcResolver(crcList);
+
+        const summary = {
+            importType,
+            totals: {
+                fetched: 0,
+                processed: 0,
+                created: 0,
+                updated: 0,
+                skipped: 0
+            },
+            skippedBookings: [],
+            errors: []
+        };
+
+        const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
+
+        try {
+            if (importType === 'list') {
+                if (!Array.isArray(body.bookings) || body.bookings.length === 0) {
+                    return {
+                        status: 400,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Access-Control-Allow-Origin': '*'
+                        },
+                        jsonBody: {
+                            error: 'Invalid request',
+                            detail: 'Provide an array of bookings with bookingId and/or bookingUuid.'
+                        }
+                    };
+                }
+
+                const defaultRange = normalizeNavanDateRange(365, 365);
+                const processedKeys = new Set();
+
+                for (const entry of body.bookings) {
+                    const bookingIdCandidate = entry?.bookingId ? String(entry.bookingId).trim() : null;
+                    const bookingUuidCandidate = entry?.bookingUuid ? String(entry.bookingUuid).trim() : null;
+                    if (!bookingIdCandidate && !bookingUuidCandidate) {
+                        summary.errors.push({ message: 'Booking entry missing bookingId and bookingUuid', entry });
+                        continue;
+                    }
+
+                    const dedupeKey = bookingUuidCandidate || bookingIdCandidate;
+                    if (processedKeys.has(dedupeKey)) {
+                        continue;
+                    }
+                    processedKeys.add(dedupeKey);
+
+                    let bookingRecord = null;
+                    try {
+                        if (bookingUuidCandidate) {
+                            const uuidResponse = await fetchNavanBookingByUuid(accessToken, bookingUuidCandidate);
+                            if (uuidResponse.ok) {
+                                const uuidData = await uuidResponse.json();
+                                if (Array.isArray(uuidData?.data) && uuidData.data.length > 0) {
+                                    bookingRecord = uuidData.data[0];
+                                }
+                            } else {
+                                const text = await uuidResponse.text();
+                                throw new Error(`UUID lookup failed (${uuidResponse.status}): ${text}`);
+                            }
+                        } else {
+                            const createdFrom = entry?.createdFrom ? parseInt(entry.createdFrom, 10) : defaultRange.createdFrom;
+                            const createdTo = entry?.createdTo ? parseInt(entry.createdTo, 10) : defaultRange.createdTo;
+                            bookingRecord = await fetchNavanBookingById(context, accessToken, bookingIdCandidate, {
+                                createdFrom,
+                                createdTo
+                            });
+                        }
+                    } catch (lookupError) {
+                        summary.errors.push({
+                            bookingId: bookingIdCandidate,
+                            bookingUuid: bookingUuidCandidate,
+                            message: lookupError.message
+                        });
+                        continue;
+                    }
+
+                    if (!bookingRecord) {
+                        summary.skippedBookings.push({
+                            bookingId: bookingIdCandidate,
+                            bookingUuid: bookingUuidCandidate,
+                            reason: 'Booking not found in Navan or outside search window'
+                        });
+                        summary.totals.skipped += 1;
+                        continue;
+                    }
+
+                    summary.totals.fetched += 1;
+
+                    try {
+                        const importResult = await upsertNavanBooking(context, bookingRecord, {
+                            bookingId: bookingRecord.bookingId || bookingIdCandidate,
+                            bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
+                            readOnly: false,
+                            crcResolver,
+                            allowFallbackCrc: false
+                        });
+
+                        if (importResult.skipped) {
+                            summary.totals.skipped += 1;
+                            summary.skippedBookings.push({
+                                bookingId: bookingRecord.bookingId || bookingIdCandidate,
+                                bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
+                                reason: importResult.reason || 'CRC match not found'
+                            });
+                            continue;
+                        }
+
+                        summary.totals.processed += 1;
+                        if (importResult.action === 'created') {
+                            summary.totals.created += 1;
+                        } else if (importResult.action === 'updated') {
+                            summary.totals.updated += 1;
+                        }
+                    } catch (saveError) {
+                        summary.errors.push({
+                            bookingId: bookingRecord.bookingId || bookingIdCandidate,
+                            bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
+                            message: saveError.message
+                        });
+                    }
+                }
+            } else {
+                const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 30;
+                const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180;
+
+                let createdFrom = body.createdFrom ? parseInt(body.createdFrom, 10) : null;
+                let createdTo = body.createdTo ? parseInt(body.createdTo, 10) : null;
+
+                if (!createdFrom || !createdTo || Number.isNaN(createdFrom) || Number.isNaN(createdTo)) {
+                    const normalized = normalizeNavanDateRange(pastDays, futureDays);
+                    createdFrom = normalized.createdFrom;
+                    createdTo = normalized.createdTo;
+                    summary.range = {
+                        createdFrom,
+                        createdTo,
+                        pastDays,
+                        futureDays
+                    };
+                } else {
+                    summary.range = {
+                        createdFrom,
+                        createdTo,
+                        pastDays,
+                        futureDays
+                    };
+                }
+
+                context.log.info(`navanImport range: createdFrom=${new Date(createdFrom * 1000).toISOString()}, createdTo=${new Date(createdTo * 1000).toISOString()}`);
+
+                const bookings = await fetchNavanBookingsInRange(context, accessToken, { createdFrom, createdTo });
+                summary.totals.fetched = bookings.length;
+
+                const processedKeys = new Set();
+                for (const booking of bookings) {
+                    const key = booking.uuid || booking.bookingId;
+                    if (!key || processedKeys.has(key)) {
+                        continue;
+                    }
+                    processedKeys.add(key);
+
+                    try {
+                        const importResult = await upsertNavanBooking(context, booking, {
+                            bookingId: booking.bookingId,
+                            bookingUuid: booking.uuid,
+                            readOnly: false,
+                            crcResolver,
+                            allowFallbackCrc: false
+                        });
+
+                        if (importResult.skipped) {
+                            summary.totals.skipped += 1;
+                            summary.skippedBookings.push({
+                                bookingId: booking.bookingId,
+                                bookingUuid: booking.uuid,
+                                travelerName: booking?.passengers?.[0]?.person?.name || null,
+                                reason: importResult.reason || 'CRC match not found'
+                            });
+                            continue;
+                        }
+
+                        summary.totals.processed += 1;
+                        if (importResult.action === 'created') {
+                            summary.totals.created += 1;
+                        } else if (importResult.action === 'updated') {
+                            summary.totals.updated += 1;
+                        }
+                    } catch (saveError) {
+                        summary.errors.push({
+                            bookingId: booking.bookingId,
+                            bookingUuid: booking.uuid,
+                            message: saveError.message
+                        });
+                    }
+                }
+            }
+        } catch (importError) {
+            context.log.error('navanImport error:', importError.message);
+            context.log.error('navanImport stack:', importError.stack);
+            return {
+                status: 200,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                jsonBody: {
+                    success: false,
+                    error: 'Navan import failed',
+                    detail: importError.message,
+                    stack: importError.stack
+                }
+            };
+        }
+
+        summary.skippedBookings = limitArray(summary.skippedBookings);
+        summary.errors = limitArray(summary.errors);
+
+        return {
+            status: 200,
+            headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            jsonBody: {
+                success: true,
+                summary
+            }
+        };
     }
 });
