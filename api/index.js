@@ -6,6 +6,22 @@ const { CosmosClient } = require('@azure/cosmos');
 // Import node-fetch using require (v2 supports CommonJS)
 let fetch;
 let fetchError = null;
+const normalizeFetch = (module) => {
+    if (!module) {
+        return null;
+    }
+    if (typeof module === 'function') {
+        return module;
+    }
+    if (typeof module.default === 'function') {
+        return module.default;
+    }
+    if (typeof module.fetch === 'function') {
+        return module.fetch;
+    }
+    return null;
+};
+
 const getFetch = async () => {
     if (fetchError) {
         throw fetchError;
@@ -14,11 +30,15 @@ const getFetch = async () => {
         try {
             // Try CommonJS require first (node-fetch v2)
             try {
-                fetch = require('node-fetch');
+                const requiredFetch = require('node-fetch');
+                fetch = normalizeFetch(requiredFetch);
             } catch (requireError) {
                 // Fallback to ESM import (node-fetch v3)
                 const nodeFetch = await import('node-fetch');
-                fetch = nodeFetch.default;
+                fetch = normalizeFetch(nodeFetch);
+            }
+            if (!fetch) {
+                throw new Error('node-fetch module did not export a fetch function');
             }
         } catch (importError) {
             fetchError = importError;
