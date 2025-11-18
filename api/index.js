@@ -3508,90 +3508,100 @@ app.http('navanImport', {
                     }
                     summary.totals.fetched = bookings?.length || 0;
 
-                    // Limit processing to prevent timeout (process max 500 at a time)
-                    const MAX_BOOKINGS_TO_PROCESS = 500;
-                    const bookingsToProcess = bookings.slice(0, MAX_BOOKINGS_TO_PROCESS);
-                    if (bookings.length > MAX_BOOKINGS_TO_PROCESS) {
-                        context.log.warn(`navanImport: Limiting processing to ${MAX_BOOKINGS_TO_PROCESS} of ${bookings.length} bookings to prevent timeout`);
-                        summary.errors.push({
-                            message: `Processing limited to ${MAX_BOOKINGS_TO_PROCESS} bookings (${bookings.length} total fetched). Remaining bookings will be processed on next sync.`,
-                            type: 'Processing limit',
-                            bookingCount: bookings.length,
-                            processedCount: MAX_BOOKINGS_TO_PROCESS
-                        });
-                    }
-                    
-                    context.log.info(`navanImport: Processing ${bookingsToProcess.length} bookings (${bookings.length} total available)`);
+                    // Process in batches of 250 to prevent timeout
+                    const BATCH_SIZE = 250;
+                    const totalBookings = bookings.length;
+                    context.log.info(`navanImport: Processing ${totalBookings} bookings in batches of ${BATCH_SIZE}`);
 
                     const processedKeys = new Set();
                     let processedCount = 0;
-                    for (const booking of bookingsToProcess) {
-                        const key = booking.uuid || booking.bookingId;
-                        if (!key || processedKeys.has(key)) {
-                            continue;
-                        }
-                        processedKeys.add(key);
-                        processedCount++;
+                    let batchNumber = 0;
+                    let offset = 0;
+                    
+                    // Process bookings in batches
+                    while (offset < totalBookings) {
+                        batchNumber++;
+                        const batchEnd = Math.min(offset + BATCH_SIZE, totalBookings);
+                        const batch = bookings.slice(offset, batchEnd);
+                        const batchSize = batch.length;
                         
-                        // Log progress every 50 bookings
-                        if (processedCount % 50 === 0) {
-                            context.log.info(`navanImport: Processed ${processedCount}/${bookingsToProcess.length} bookings...`);
-                        }
-
-                        try {
-                            const importResult = await upsertNavanBooking(context, booking, {
-                                bookingId: booking.bookingId,
-                                bookingUuid: booking.uuid,
-                                readOnly: false,
-                                crcResolver,
-                                allowFallbackCrc: false
-                            });
-
-                            if (importResult.skipped) {
-                                summary.totals.skipped += 1;
-                                summary.skippedBookings.push({
-                                    bookingId: booking.bookingId,
-                                    bookingUuid: booking.uuid,
-                                    travelerName: booking?.passengers?.[0]?.person?.name || null,
-                                    reason: importResult.reason || 'CRC match not found'
-                                });
+                        context.log.info(`navanImport: Processing batch ${batchNumber} (bookings ${offset + 1}-${batchEnd} of ${totalBookings})`);
+                        
+                        for (const booking of batch) {
+                            const key = booking.uuid || booking.bookingId;
+                            if (!key || processedKeys.has(key)) {
                                 continue;
                             }
-
-                            summary.totals.processed += 1;
-                            if (importResult.action === 'created') {
-                                summary.totals.created += 1;
-                            } else if (importResult.action === 'updated') {
-                                summary.totals.updated += 1;
-                            }
-                        } catch (saveError) {
-                            const errorMsg = saveError.message;
-                            summary.errors.push({
-                                bookingId: booking.bookingId,
-                                bookingUuid: booking.uuid,
-                                message: errorMsg
-                            });
+                            processedKeys.add(key);
+                            processedCount++;
                             
-                            // Critical DB error - abort
-                            if (errorMsg.includes('container not found') || errorMsg.includes('DATABASE_ERROR')) {
-                                summary.skippedBookings = limitArray(summary.skippedBookings);
-                                summary.errors = limitArray(summary.errors);
-                                return {
-                                    status: 500,
-                                    headers: {
-                                        'Content-Type': 'application/json',
-                                        'Access-Control-Allow-Origin': '*'
-                                    },
-                                    jsonBody: {
-                                        success: false,
-                                        error: 'Database Configuration Error',
-                                        detail: errorMsg,
-                                        summary
-                                    }
-                                };
+                            // Log progress every 50 bookings
+                            if (processedCount % 50 === 0) {
+                                context.log.info(`navanImport: Processed ${processedCount}/${totalBookings} bookings...`);
+                            }
+
+                            try {
+                                const importResult = await upsertNavanBooking(context, booking, {
+                                    bookingId: booking.bookingId,
+                                    bookingUuid: booking.uuid,
+                                    readOnly: false,
+                                    crcResolver,
+                                    allowFallbackCrc: false
+                                });
+
+                                if (importResult.skipped) {
+                                    summary.totals.skipped += 1;
+                                    summary.skippedBookings.push({
+                                        bookingId: booking.bookingId,
+                                        bookingUuid: booking.uuid,
+                                        travelerName: booking?.passengers?.[0]?.person?.name || null,
+                                        reason: importResult.reason || 'CRC match not found'
+                                    });
+                                    continue;
+                                }
+
+                                summary.totals.processed += 1;
+                                if (importResult.action === 'created') {
+                                    summary.totals.created += 1;
+                                } else if (importResult.action === 'updated') {
+                                    summary.totals.updated += 1;
+                                }
+                            } catch (saveError) {
+                                const errorMsg = saveError.message;
+                                summary.errors.push({
+                                    bookingId: booking.bookingId,
+                                    bookingUuid: booking.uuid,
+                                    message: errorMsg
+                                });
+                                
+                                // Critical DB error - abort all processing
+                                if (errorMsg.includes('container not found') || errorMsg.includes('DATABASE_ERROR')) {
+                                    summary.skippedBookings = limitArray(summary.skippedBookings);
+                                    summary.errors = limitArray(summary.errors);
+                                    return {
+                                        status: 500,
+                                        headers: {
+                                            'Content-Type': 'application/json',
+                                            'Access-Control-Allow-Origin': '*'
+                                        },
+                                        jsonBody: {
+                                            success: false,
+                                            error: 'Database Configuration Error',
+                                            detail: errorMsg,
+                                            summary
+                                        }
+                                    };
+                                }
+                                // For non-critical errors, continue processing the batch
                             }
                         }
+                        
+                        // Batch completed successfully, move to next batch
+                        offset = batchEnd;
+                        context.log.info(`navanImport: Batch ${batchNumber} completed. Processed ${processedCount}/${totalBookings} bookings so far.`);
                     }
+                    
+                    context.log.info(`navanImport: All batches completed. Total processed: ${processedCount}/${totalBookings} bookings.`);
                 }
             } catch (importError) {
                 context.log.error('navanImport: Import error:', importError);
