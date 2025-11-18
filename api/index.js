@@ -3508,10 +3508,13 @@ app.http('navanImport', {
                     }
                     summary.totals.fetched = bookings?.length || 0;
 
-                    // Process in smaller batches to prevent timeout - use 100 to be safe
-                    const BATCH_SIZE = 100;
+                    // Process in smaller batches to prevent timeout - use 50 to be extra safe
+                    const BATCH_SIZE = 50;
                     const totalBookings = bookings.length;
                     context.log.info(`navanImport: Processing ${totalBookings} bookings in batches of ${BATCH_SIZE}`);
+                    
+                    // Log start time to track duration
+                    const startTime = Date.now();
 
                     const processedKeys = new Set();
                     let processedCount = 0;
@@ -3604,11 +3607,19 @@ app.http('navanImport', {
                         
                         // Small delay between batches to avoid overwhelming the system
                         if (offset < totalBookings) {
-                            await new Promise(resolve => setTimeout(resolve, 100));
+                            await new Promise(resolve => setTimeout(resolve, 200));
+                        }
+                        
+                        // Log progress every 5 batches to track long-running operations
+                        if (batchNumber % 5 === 0) {
+                            const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+                            context.log.info(`navanImport: Progress - ${batchNumber} batches completed, ${processedCount}/${totalBookings} bookings processed in ${elapsed} seconds`);
                         }
                     }
                     
-                    context.log.info(`navanImport: All batches completed. Total processed: ${processedCount}/${totalBookings} bookings.`);
+                    const endTime = Date.now();
+                    const durationSeconds = ((endTime - startTime) / 1000).toFixed(2);
+                    context.log.info(`navanImport: All batches completed. Total processed: ${processedCount}/${totalBookings} bookings in ${durationSeconds} seconds.`);
                 }
             } catch (importError) {
                 context.log.error('navanImport: Import error:', importError);
