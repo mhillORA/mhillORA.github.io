@@ -3515,9 +3515,13 @@ app.http('navanImport', {
                         context.log.warn(`navanImport: Limiting processing to ${MAX_BOOKINGS_TO_PROCESS} of ${bookings.length} bookings to prevent timeout`);
                         summary.errors.push({
                             message: `Processing limited to ${MAX_BOOKINGS_TO_PROCESS} bookings (${bookings.length} total fetched). Remaining bookings will be processed on next sync.`,
-                            type: 'Processing limit'
+                            type: 'Processing limit',
+                            bookingCount: bookings.length,
+                            processedCount: MAX_BOOKINGS_TO_PROCESS
                         });
                     }
+                    
+                    context.log.info(`navanImport: Processing ${bookingsToProcess.length} bookings (${bookings.length} total available)`);
 
                     const processedKeys = new Set();
                     let processedCount = 0;
