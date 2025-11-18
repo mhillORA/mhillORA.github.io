@@ -3633,8 +3633,8 @@
 
             const DATA_REFRESH_INTERVAL_MS = 30000;
             const NAVAN_CONNECTION_CHECK_INTERVAL_MS = 120000;
-            const DEFAULT_NAVAN_PAST_DAYS = 365;
-            const DEFAULT_NAVAN_FUTURE_DAYS = 180;
+            const DEFAULT_NAVAN_PAST_DAYS = 30;
+            const DEFAULT_NAVAN_FUTURE_DAYS = 30;
             let dataRefreshTimerId = null;
             let isRefreshingData = false;
 
@@ -3931,10 +3931,20 @@
             };
 
             const applyNavanImportSummary = (summary) => {
+                const lastRun = Date.now();
                 setState({
                     navanImportSummary: summary || null,
-                    navanImportLastRun: Date.now()
+                    navanImportLastRun: lastRun
                 }, { skipRender: true });
+                // Persist to localStorage
+                try {
+                    localStorage.setItem('chaos_navanImportLastRun', lastRun.toString());
+                    if (summary) {
+                        localStorage.setItem('chaos_navanImportSummary', JSON.stringify(summary));
+                    }
+                } catch (e) {
+                    console.warn('Failed to persist Navan import data to localStorage:', e);
+                }
                 if (state.activeTab === 'travel') {
                     renderTravelContent();
                 }
@@ -3969,41 +3979,146 @@
             };
 
             const runNavanImportRange = async (button, options = {}, extras = {}) => {
-                const payload = {
-                    pastDays: Number.isFinite(options.pastDays) ? Math.max(0, Math.floor(options.pastDays)) : DEFAULT_NAVAN_PAST_DAYS,
-                    futureDays: Number.isFinite(options.futureDays) ? Math.max(0, Math.floor(options.futureDays)) : DEFAULT_NAVAN_FUTURE_DAYS
-                };
-                if (options.createdFrom && Number.isFinite(options.createdFrom)) {
-                    payload.createdFrom = options.createdFrom;
-                }
-                if (options.createdTo && Number.isFinite(options.createdTo)) {
-                    payload.createdTo = options.createdTo;
-                }
-                
-                // Show syncing message in travel content area
+                // Show syncing message with progress bar in travel content area
                 const travelContainer = document.getElementById('travel-content');
-                if (travelContainer) {
-                    const syncingMessage = `
+                const updateProgress = (currentDays, status, error = null) => {
+                    if (!travelContainer) return;
+                    const progressHTML = `
                         <div class="mb-6 p-6 rounded-md border border-blue-300 dark:border-blue-700 bg-blue-100 dark:bg-blue-900/40">
-                            <div class="flex items-center justify-center gap-3">
-                                <div class="inline-block animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 dark:border-blue-400"></div>
-                                <span class="text-lg font-medium text-blue-900 dark:text-blue-200">Syncing Navan data, be right with you...</span>
+                            <div class="flex flex-col items-center gap-4">
+                                <div class="flex items-center gap-3">
+                                    <div class="inline-block animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 dark:border-blue-400"></div>
+                                    <span class="text-lg font-medium text-blue-900 dark:text-blue-200">Syncing Navan data, be right with you...</span>
+                                </div>
+                                <div class="w-full max-w-md">
+                                    <div class="flex justify-between text-sm text-blue-800 dark:text-blue-300 mb-2">
+                                        <span>${status}</span>
+                                        <span>${currentDays} days</span>
+                                    </div>
+                                    <div class="w-full bg-blue-200 dark:bg-blue-800 rounded-full h-3 overflow-hidden">
+                                        <div class="bg-blue-600 dark:bg-blue-400 h-full transition-all duration-300" style="width: ${Math.min(100, (currentDays / 365) * 100)}%"></div>
+                                    </div>
+                                    ${error ? `<div class="mt-2 text-sm text-red-600 dark:text-red-400">Error at ${currentDays} days: ${error}</div>` : ''}
+                                </div>
                             </div>
                         </div>
                     `;
-                    travelContainer.innerHTML = syncingMessage;
-                }
+                    travelContainer.innerHTML = progressHTML;
+                };
                 
                 setButtonLoading(button, true, 'Syncing...');
+                
+                // Incremental fetching: start with 30 days, then 60, 90, etc. until failure
+                const INCREMENT_DAYS = 30;
+                const MAX_DAYS = 365; // Maximum to try
+                let currentDays = INCREMENT_DAYS;
+                let allResults = {
+                    success: true,
+                    summary: {
+                        importType: 'range',
+                        totals: {
+                            fetched: 0,
+                            processed: 0,
+                            created: 0,
+                            updated: 0,
+                            skipped: 0
+                        },
+                        skippedBookings: [],
+                        errors: [],
+                        ranges: []
+                    }
+                };
+                let lastSuccessfulDays = 0;
+                let failedAtDays = null;
+                
                 try {
-                    const result = await apiService.importNavanBookingsRange(payload);
+                    while (currentDays <= MAX_DAYS) {
+                        updateProgress(currentDays, `Fetching ${currentDays} days back and forward...`);
+                        
+                        const payload = {
+                            pastDays: currentDays,
+                            futureDays: currentDays
+                        };
+                        
+                        try {
+                            const result = await apiService.importNavanBookingsRange(payload);
+                            
+                            if (result && result.success && result.summary) {
+                                // Merge results
+                                allResults.summary.totals.fetched += result.summary.totals.fetched || 0;
+                                allResults.summary.totals.processed += result.summary.totals.processed || 0;
+                                allResults.summary.totals.created += result.summary.totals.created || 0;
+                                allResults.summary.totals.updated += result.summary.totals.updated || 0;
+                                allResults.summary.totals.skipped += result.summary.totals.skipped || 0;
+                                
+                                // Merge skipped bookings and errors (limit to avoid huge arrays)
+                                if (result.summary.skippedBookings) {
+                                    allResults.summary.skippedBookings.push(...result.summary.skippedBookings.slice(0, 10));
+                                }
+                                if (result.summary.errors && result.summary.errors.length > 0) {
+                                    allResults.summary.errors.push(...result.summary.errors);
+                                }
+                                
+                                allResults.summary.ranges.push({
+                                    days: currentDays,
+                                    success: true,
+                                    fetched: result.summary.totals.fetched || 0,
+                                    processed: result.summary.totals.processed || 0
+                                });
+                                
+                                lastSuccessfulDays = currentDays;
+                                currentDays += INCREMENT_DAYS;
+                                
+                                // Small delay between requests to avoid overwhelming the API
+                                await new Promise(resolve => setTimeout(resolve, 500));
+                            } else {
+                                // Partial success or failure - stop here
+                                failedAtDays = currentDays;
+                                if (result && result.summary) {
+                                    allResults.summary.ranges.push({
+                                        days: currentDays,
+                                        success: false,
+                                        error: result.error || result.detail || 'Unknown error',
+                                        fetched: result.summary.totals.fetched || 0,
+                                        processed: result.summary.totals.processed || 0
+                                    });
+                                }
+                                break;
+                            }
+                        } catch (error) {
+                            // Error occurred - stop incremental fetching
+                            failedAtDays = currentDays;
+                            allResults.summary.errors.push({
+                                days: currentDays,
+                                message: error.message || 'Unknown error',
+                                type: 'Fetch error'
+                            });
+                            allResults.summary.ranges.push({
+                                days: currentDays,
+                                success: false,
+                                error: error.message || 'Unknown error'
+                            });
+                            updateProgress(currentDays, `Failed at ${currentDays} days`, error.message);
+                            break;
+                        }
+                    }
+                    
+                    // Final status message
+                    if (travelContainer) {
+                        const finalStatus = failedAtDays 
+                            ? `Completed up to ${lastSuccessfulDays} days. Failed at ${failedAtDays} days.`
+                            : `Successfully synced up to ${lastSuccessfulDays} days.`;
+                        updateProgress(lastSuccessfulDays, finalStatus, failedAtDays ? `Failed at ${failedAtDays} days` : null);
+                    }
                     
                     // Refresh travel data after sync
-                    if (result && result.summary) {
+                    try {
                         const travelData = await apiService.getTravel();
                         if (Array.isArray(travelData)) {
                             setState({ travel: travelData }, { skipRender: true });
                         }
+                    } catch (refreshError) {
+                        console.warn('Failed to refresh travel data:', refreshError);
                     }
                     
                     // Re-render travel content to show updated data
@@ -4011,7 +4126,12 @@
                         await renderTravelContent();
                     }
                     
-                    return await handleNavanImportResponse(result, 'Navan bookings synchronized successfully.', extras);
+                    // Prepare final message
+                    const successMessage = failedAtDays
+                        ? `Navan sync completed up to ${lastSuccessfulDays} days. Failed at ${failedAtDays} days.`
+                        : `Navan sync completed successfully up to ${lastSuccessfulDays} days.`;
+                    
+                    return await handleNavanImportResponse(allResults, successMessage, extras);
                 } catch (error) {
                     console.error('Navan range import error:', error);
                     showNotification(`Navan import failed: ${error.message || 'Unknown error'}`, 'error');
@@ -10722,6 +10842,16 @@
             };
 
             const renderDashboardCharts = () => {
+                // Define helper functions first
+                const artemisStudyIds = new Set(
+                    (state.studies || [])
+                        .filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0)
+                        .map(study => study.id)
+                );
+                const getValidStudyIdsForEvent = (event) => {
+                    if (!Array.isArray(event.studyIds) || event.studyIds.length === 0) return [];
+                    return event.studyIds.filter(studyId => artemisStudyIds.has(studyId));
+                };
                 const rolesCtx = document.getElementById('roles-chart');
                 const studiesCtx = document.getElementById('studies-chart');
                 if (!rolesCtx || !studiesCtx) return;
@@ -10876,15 +11006,6 @@
                 };
 
                 const crcNameMap = new Map(state.crcs.map(crc => [crc.id, crc.name || 'Unknown CRC']));
-                const artemisStudyIds = new Set(
-                    (state.studies || [])
-                        .filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0)
-                        .map(study => study.id)
-                );
-                const getValidStudyIdsForEvent = (event) => {
-                    if (!Array.isArray(event.studyIds) || event.studyIds.length === 0) return [];
-                    return event.studyIds.filter(studyId => artemisStudyIds.has(studyId));
-                };
 
                 const visitIdentifier = (event) => `${event.date}|${event.siteId || 'unassigned'}|${event.visitNumber || ''}`;
 
@@ -22280,6 +22401,19 @@
                         initialLoadComplete: true 
                     });
                     loadChangeLog(); // Load change log from localStorage
+                    // Load Navan import last run from localStorage
+                    try {
+                        const storedLastRun = localStorage.getItem('chaos_navanImportLastRun');
+                        const storedSummary = localStorage.getItem('chaos_navanImportSummary');
+                        if (storedLastRun) {
+                            setState({
+                                navanImportLastRun: parseInt(storedLastRun, 10),
+                                navanImportSummary: storedSummary ? JSON.parse(storedSummary) : null
+                            }, { skipRender: true });
+                        }
+                    } catch (e) {
+                        console.warn('Failed to load Navan import data from localStorage:', e);
+                    }
                     setupRealtimeListeners();
                     
                     // Sync approved time off requests with unavailability events after state is fully set
