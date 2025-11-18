@@ -3227,15 +3227,6 @@ app.http('navanImport', {
 
         const importType = (body.importType || 'range').toLowerCase();
 
-        const tokenResult = await fetchNavanAccessToken(context);
-        if (!tokenResult.success) {
-            return tokenResult.response;
-        }
-        const accessToken = tokenResult.accessToken;
-
-        const crcList = await loadAllCrcs(context);
-        const crcResolver = buildCrcResolver(crcList);
-
         const summary = {
             importType,
             totals: {
@@ -3252,6 +3243,14 @@ app.http('navanImport', {
         const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
 
         try {
+            const tokenResult = await fetchNavanAccessToken(context);
+            if (!tokenResult.success) {
+                return tokenResult.response;
+            }
+            const accessToken = tokenResult.accessToken;
+
+            const crcList = await loadAllCrcs(context);
+            const crcResolver = buildCrcResolver(crcList);
             if (importType === 'list') {
                 if (!Array.isArray(body.bookings) || body.bookings.length === 0) {
                     return {
@@ -3436,6 +3435,13 @@ app.http('navanImport', {
         } catch (importError) {
             context.log.error('navanImport error:', importError.message);
             context.log.error('navanImport stack:', importError.stack);
+            // Include any partial results in the error response
+            summary.errors.push({
+                message: importError.message,
+                type: 'Fatal error'
+            });
+            summary.skippedBookings = limitArray(summary.skippedBookings);
+            summary.errors = limitArray(summary.errors);
             return {
                 status: 200,
                 headers: {
@@ -3443,10 +3449,10 @@ app.http('navanImport', {
                     'Access-Control-Allow-Origin': '*'
                 },
                 jsonBody: {
-                    success: false,
-                    error: 'Navan import failed',
+                    success: summary.totals.processed > 0 || summary.totals.created > 0 || summary.totals.updated > 0,
+                    error: 'Navan import encountered an error',
                     detail: importError.message,
-                    stack: importError.stack
+                    summary
                 }
             };
         }
