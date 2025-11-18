@@ -3204,244 +3204,263 @@ app.http('navanImport', {
     authLevel: 'anonymous',
     route: 'navan-import',
     handler: async (request, context) => {
-        ensureContextLogger(context);
-
-        if (request.method === 'OPTIONS') {
-            return {
-                status: 200,
-                headers: {
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type'
-                }
-            };
-        }
-
-        let body = {};
         try {
-            body = await request.json();
-        } catch (parseError) {
-            context.log.warn('navanImport: No JSON body or failed to parse request body, using defaults.');
-            body = {};
-        }
+            ensureContextLogger(context);
 
-        const importType = (body.importType || 'range').toLowerCase();
-
-        const summary = {
-            importType,
-            totals: {
-                fetched: 0,
-                processed: 0,
-                created: 0,
-                updated: 0,
-                skipped: 0
-            },
-            skippedBookings: [],
-            errors: []
-        };
-
-        const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
-
-        try {
-            const tokenResult = await fetchNavanAccessToken(context);
-            if (!tokenResult.success) {
-                return tokenResult.response;
+            if (request.method === 'OPTIONS') {
+                return {
+                    status: 200,
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                        'Access-Control-Allow-Headers': 'Content-Type'
+                    }
+                };
             }
-            const accessToken = tokenResult.accessToken;
 
-            const crcList = await loadAllCrcs(context);
-            const crcResolver = buildCrcResolver(crcList);
-            if (importType === 'list') {
-                if (!Array.isArray(body.bookings) || body.bookings.length === 0) {
-                    return {
-                        status: 400,
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Access-Control-Allow-Origin': '*'
-                        },
-                        jsonBody: {
-                            error: 'Invalid request',
-                            detail: 'Provide an array of bookings with bookingId and/or bookingUuid.'
-                        }
-                    };
+            let body = {};
+            try {
+                body = await request.json();
+            } catch (parseError) {
+                context.log.warn('navanImport: No JSON body or failed to parse request body, using defaults.');
+                body = {};
+            }
+
+            const importType = (body.importType || 'range').toLowerCase();
+
+            const summary = {
+                importType,
+                totals: {
+                    fetched: 0,
+                    processed: 0,
+                    created: 0,
+                    updated: 0,
+                    skipped: 0
+                },
+                skippedBookings: [],
+                errors: []
+            };
+
+            const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
+
+            try {
+                const tokenResult = await fetchNavanAccessToken(context);
+                if (!tokenResult.success) {
+                    return tokenResult.response;
                 }
+                const accessToken = tokenResult.accessToken;
 
-                const defaultRange = normalizeNavanDateRange(365, 365);
-                const processedKeys = new Set();
-
-                for (const entry of body.bookings) {
-                    const bookingIdCandidate = entry?.bookingId ? String(entry.bookingId).trim() : null;
-                    const bookingUuidCandidate = entry?.bookingUuid ? String(entry.bookingUuid).trim() : null;
-                    if (!bookingIdCandidate && !bookingUuidCandidate) {
-                        summary.errors.push({ message: 'Booking entry missing bookingId and bookingUuid', entry });
-                        continue;
+                const crcList = await loadAllCrcs(context);
+                const crcResolver = buildCrcResolver(crcList);
+                if (importType === 'list') {
+                    if (!Array.isArray(body.bookings) || body.bookings.length === 0) {
+                        return {
+                            status: 400,
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*'
+                            },
+                            jsonBody: {
+                                error: 'Invalid request',
+                                detail: 'Provide an array of bookings with bookingId and/or bookingUuid.'
+                            }
+                        };
                     }
 
-                    const dedupeKey = bookingUuidCandidate || bookingIdCandidate;
-                    if (processedKeys.has(dedupeKey)) {
-                        continue;
-                    }
-                    processedKeys.add(dedupeKey);
+                    const defaultRange = normalizeNavanDateRange(365, 365);
+                    const processedKeys = new Set();
 
-                    let bookingRecord = null;
-                    try {
-                        if (bookingUuidCandidate) {
-                            const uuidResponse = await fetchNavanBookingByUuid(accessToken, bookingUuidCandidate);
-                            if (uuidResponse.ok) {
-                                const uuidData = await uuidResponse.json();
-                                if (Array.isArray(uuidData?.data) && uuidData.data.length > 0) {
-                                    bookingRecord = uuidData.data[0];
+                    for (const entry of body.bookings) {
+                        const bookingIdCandidate = entry?.bookingId ? String(entry.bookingId).trim() : null;
+                        const bookingUuidCandidate = entry?.bookingUuid ? String(entry.bookingUuid).trim() : null;
+                        if (!bookingIdCandidate && !bookingUuidCandidate) {
+                            summary.errors.push({ message: 'Booking entry missing bookingId and bookingUuid', entry });
+                            continue;
+                        }
+
+                        const dedupeKey = bookingUuidCandidate || bookingIdCandidate;
+                        if (processedKeys.has(dedupeKey)) {
+                            continue;
+                        }
+                        processedKeys.add(dedupeKey);
+
+                        let bookingRecord = null;
+                        try {
+                            if (bookingUuidCandidate) {
+                                const uuidResponse = await fetchNavanBookingByUuid(accessToken, bookingUuidCandidate);
+                                if (uuidResponse.ok) {
+                                    const uuidData = await uuidResponse.json();
+                                    if (Array.isArray(uuidData?.data) && uuidData.data.length > 0) {
+                                        bookingRecord = uuidData.data[0];
+                                    }
+                                } else {
+                                    const text = await uuidResponse.text();
+                                    throw new Error(`UUID lookup failed (${uuidResponse.status}): ${text}`);
                                 }
                             } else {
-                                const text = await uuidResponse.text();
-                                throw new Error(`UUID lookup failed (${uuidResponse.status}): ${text}`);
+                                const createdFrom = entry?.createdFrom ? parseInt(entry.createdFrom, 10) : defaultRange.createdFrom;
+                                const createdTo = entry?.createdTo ? parseInt(entry.createdTo, 10) : defaultRange.createdTo;
+                                bookingRecord = await fetchNavanBookingById(context, accessToken, bookingIdCandidate, {
+                                    createdFrom,
+                                    createdTo
+                                });
                             }
-                        } else {
-                            const createdFrom = entry?.createdFrom ? parseInt(entry.createdFrom, 10) : defaultRange.createdFrom;
-                            const createdTo = entry?.createdTo ? parseInt(entry.createdTo, 10) : defaultRange.createdTo;
-                            bookingRecord = await fetchNavanBookingById(context, accessToken, bookingIdCandidate, {
-                                createdFrom,
-                                createdTo
+                        } catch (lookupError) {
+                            summary.errors.push({
+                                bookingId: bookingIdCandidate,
+                                bookingUuid: bookingUuidCandidate,
+                                message: lookupError.message
                             });
+                            continue;
                         }
-                    } catch (lookupError) {
-                        summary.errors.push({
-                            bookingId: bookingIdCandidate,
-                            bookingUuid: bookingUuidCandidate,
-                            message: lookupError.message
-                        });
-                        continue;
-                    }
 
-                    if (!bookingRecord) {
-                        summary.skippedBookings.push({
-                            bookingId: bookingIdCandidate,
-                            bookingUuid: bookingUuidCandidate,
-                            reason: 'Booking not found in Navan or outside search window'
-                        });
-                        summary.totals.skipped += 1;
-                        continue;
-                    }
-
-                    summary.totals.fetched += 1;
-
-                    try {
-                        const importResult = await upsertNavanBooking(context, bookingRecord, {
-                            bookingId: bookingRecord.bookingId || bookingIdCandidate,
-                            bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
-                            readOnly: false,
-                            crcResolver,
-                            allowFallbackCrc: false
-                        });
-
-                        if (importResult.skipped) {
-                            summary.totals.skipped += 1;
+                        if (!bookingRecord) {
                             summary.skippedBookings.push({
+                                bookingId: bookingIdCandidate,
+                                bookingUuid: bookingUuidCandidate,
+                                reason: 'Booking not found in Navan or outside search window'
+                            });
+                            summary.totals.skipped += 1;
+                            continue;
+                        }
+
+                        summary.totals.fetched += 1;
+
+                        try {
+                            const importResult = await upsertNavanBooking(context, bookingRecord, {
                                 bookingId: bookingRecord.bookingId || bookingIdCandidate,
                                 bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
-                                reason: importResult.reason || 'CRC match not found'
+                                readOnly: false,
+                                crcResolver,
+                                allowFallbackCrc: false
                             });
+
+                            if (importResult.skipped) {
+                                summary.totals.skipped += 1;
+                                summary.skippedBookings.push({
+                                    bookingId: bookingRecord.bookingId || bookingIdCandidate,
+                                    bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
+                                    reason: importResult.reason || 'CRC match not found'
+                                });
+                                continue;
+                            }
+
+                            summary.totals.processed += 1;
+                            if (importResult.action === 'created') {
+                                summary.totals.created += 1;
+                            } else if (importResult.action === 'updated') {
+                                summary.totals.updated += 1;
+                            }
+                        } catch (saveError) {
+                            summary.errors.push({
+                                bookingId: bookingRecord.bookingId || bookingIdCandidate,
+                                bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
+                                message: saveError.message
+                            });
+                        }
+                    }
+                } else {
+                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 30;
+                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180;
+
+                    let createdFrom = body.createdFrom ? parseInt(body.createdFrom, 10) : null;
+                    let createdTo = body.createdTo ? parseInt(body.createdTo, 10) : null;
+
+                    if (!createdFrom || !createdTo || Number.isNaN(createdFrom) || Number.isNaN(createdTo)) {
+                        const normalized = normalizeNavanDateRange(pastDays, futureDays);
+                        createdFrom = normalized.createdFrom;
+                        createdTo = normalized.createdTo;
+                        summary.range = {
+                            createdFrom,
+                            createdTo,
+                            pastDays,
+                            futureDays
+                        };
+                    } else {
+                        summary.range = {
+                            createdFrom,
+                            createdTo,
+                            pastDays,
+                            futureDays
+                        };
+                    }
+
+                    context.log.info(`navanImport range: createdFrom=${new Date(createdFrom * 1000).toISOString()}, createdTo=${new Date(createdTo * 1000).toISOString()}`);
+
+                    const bookings = await fetchNavanBookingsInRange(context, accessToken, { createdFrom, createdTo });
+                    summary.totals.fetched = bookings.length;
+
+                    const processedKeys = new Set();
+                    for (const booking of bookings) {
+                        const key = booking.uuid || booking.bookingId;
+                        if (!key || processedKeys.has(key)) {
                             continue;
                         }
+                        processedKeys.add(key);
 
-                        summary.totals.processed += 1;
-                        if (importResult.action === 'created') {
-                            summary.totals.created += 1;
-                        } else if (importResult.action === 'updated') {
-                            summary.totals.updated += 1;
-                        }
-                    } catch (saveError) {
-                        summary.errors.push({
-                            bookingId: bookingRecord.bookingId || bookingIdCandidate,
-                            bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
-                            message: saveError.message
-                        });
-                    }
-                }
-            } else {
-                const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 30;
-                const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180;
-
-                let createdFrom = body.createdFrom ? parseInt(body.createdFrom, 10) : null;
-                let createdTo = body.createdTo ? parseInt(body.createdTo, 10) : null;
-
-                if (!createdFrom || !createdTo || Number.isNaN(createdFrom) || Number.isNaN(createdTo)) {
-                    const normalized = normalizeNavanDateRange(pastDays, futureDays);
-                    createdFrom = normalized.createdFrom;
-                    createdTo = normalized.createdTo;
-                    summary.range = {
-                        createdFrom,
-                        createdTo,
-                        pastDays,
-                        futureDays
-                    };
-                } else {
-                    summary.range = {
-                        createdFrom,
-                        createdTo,
-                        pastDays,
-                        futureDays
-                    };
-                }
-
-                context.log.info(`navanImport range: createdFrom=${new Date(createdFrom * 1000).toISOString()}, createdTo=${new Date(createdTo * 1000).toISOString()}`);
-
-                const bookings = await fetchNavanBookingsInRange(context, accessToken, { createdFrom, createdTo });
-                summary.totals.fetched = bookings.length;
-
-                const processedKeys = new Set();
-                for (const booking of bookings) {
-                    const key = booking.uuid || booking.bookingId;
-                    if (!key || processedKeys.has(key)) {
-                        continue;
-                    }
-                    processedKeys.add(key);
-
-                    try {
-                        const importResult = await upsertNavanBooking(context, booking, {
-                            bookingId: booking.bookingId,
-                            bookingUuid: booking.uuid,
-                            readOnly: false,
-                            crcResolver,
-                            allowFallbackCrc: false
-                        });
-
-                        if (importResult.skipped) {
-                            summary.totals.skipped += 1;
-                            summary.skippedBookings.push({
+                        try {
+                            const importResult = await upsertNavanBooking(context, booking, {
                                 bookingId: booking.bookingId,
                                 bookingUuid: booking.uuid,
-                                travelerName: booking?.passengers?.[0]?.person?.name || null,
-                                reason: importResult.reason || 'CRC match not found'
+                                readOnly: false,
+                                crcResolver,
+                                allowFallbackCrc: false
                             });
-                            continue;
-                        }
 
-                        summary.totals.processed += 1;
-                        if (importResult.action === 'created') {
-                            summary.totals.created += 1;
-                        } else if (importResult.action === 'updated') {
-                            summary.totals.updated += 1;
+                            if (importResult.skipped) {
+                                summary.totals.skipped += 1;
+                                summary.skippedBookings.push({
+                                    bookingId: booking.bookingId,
+                                    bookingUuid: booking.uuid,
+                                    travelerName: booking?.passengers?.[0]?.person?.name || null,
+                                    reason: importResult.reason || 'CRC match not found'
+                                });
+                                continue;
+                            }
+
+                            summary.totals.processed += 1;
+                            if (importResult.action === 'created') {
+                                summary.totals.created += 1;
+                            } else if (importResult.action === 'updated') {
+                                summary.totals.updated += 1;
+                            }
+                        } catch (saveError) {
+                            summary.errors.push({
+                                bookingId: booking.bookingId,
+                                bookingUuid: booking.uuid,
+                                message: saveError.message
+                            });
                         }
-                    } catch (saveError) {
-                        summary.errors.push({
-                            bookingId: booking.bookingId,
-                            bookingUuid: booking.uuid,
-                            message: saveError.message
-                        });
                     }
                 }
+            } catch (importError) {
+                context.log.error('navanImport error:', importError.message);
+                context.log.error('navanImport stack:', importError.stack);
+                // Include any partial results in the error response
+                summary.errors.push({
+                    message: importError.message,
+                    type: 'Fatal error'
+                });
+                summary.skippedBookings = limitArray(summary.skippedBookings);
+                summary.errors = limitArray(summary.errors);
+                return {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    jsonBody: {
+                        success: summary.totals.processed > 0 || summary.totals.created > 0 || summary.totals.updated > 0,
+                        error: 'Navan import encountered an error',
+                        detail: importError.message,
+                        summary
+                    }
+                };
             }
-        } catch (importError) {
-            context.log.error('navanImport error:', importError.message);
-            context.log.error('navanImport stack:', importError.stack);
-            // Include any partial results in the error response
-            summary.errors.push({
-                message: importError.message,
-                type: 'Fatal error'
-            });
+
             summary.skippedBookings = limitArray(summary.skippedBookings);
             summary.errors = limitArray(summary.errors);
+
             return {
                 status: 200,
                 headers: {
@@ -3449,27 +3468,40 @@ app.http('navanImport', {
                     'Access-Control-Allow-Origin': '*'
                 },
                 jsonBody: {
-                    success: summary.totals.processed > 0 || summary.totals.created > 0 || summary.totals.updated > 0,
-                    error: 'Navan import encountered an error',
-                    detail: importError.message,
+                    success: true,
                     summary
                 }
             };
+        } catch (outerError) {
+            context.log.error('navanImport outer error:', outerError.message);
+            context.log.error('navanImport outer stack:', outerError.stack);
+            return {
+                status: 200,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                jsonBody: {
+                    success: false,
+                    error: 'Navan import failed',
+                    detail: outerError.message,
+                    summary: {
+                        importType: 'range',
+                        totals: {
+                            fetched: 0,
+                            processed: 0,
+                            created: 0,
+                            updated: 0,
+                            skipped: 0
+                        },
+                        skippedBookings: [],
+                        errors: [{
+                            message: outerError.message,
+                            type: 'Fatal error'
+                        }]
+                    }
+                }
+            };
         }
-
-        summary.skippedBookings = limitArray(summary.skippedBookings);
-        summary.errors = limitArray(summary.errors);
-
-        return {
-            status: 200,
-            headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            jsonBody: {
-                success: true,
-                summary
-            }
-        };
     }
 });
