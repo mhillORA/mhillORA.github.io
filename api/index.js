@@ -3455,9 +3455,9 @@ app.http('navanImport', {
                         }
                     }
                 }
-            } else {
-                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 365;
-                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180;
+                } else {
+                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 30;
+                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 30;
 
                     let createdFrom = body.createdFrom ? parseInt(body.createdFrom, 10) : null;
                     let createdTo = body.createdTo ? parseInt(body.createdTo, 10) : null;
