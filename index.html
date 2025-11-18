@@ -15176,6 +15176,204 @@
                         }, 100);
                         break;
                     }
+                    case 'open-travel-costs-report': {
+                        const today = new Date();
+                        const firstDayOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+                        const lastDayOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+                        const defaultStartDate = toDateOnlyString(firstDayOfMonth);
+                        const defaultEndDate = toDateOnlyString(lastDayOfMonth);
+                        
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-4">Travel Costs Report</h3>
+                            <div class="mb-6">
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Start Date</label>
+                                        <input type="date" id="travel-costs-start-date" value="${defaultStartDate}" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">End Date</label>
+                                        <input type="date" id="travel-costs-end-date" value="${defaultEndDate}" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                                    </div>
+                                </div>
+                                <button data-action="generate-travel-costs-report" class="w-full bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 transition-colors flex items-center justify-center">
+                                    <i data-lucide="search" class="w-4 h-4 mr-2"></i>Generate Report
+                                </button>
+                            </div>
+                            <div id="travel-costs-report-results" class="mt-4">
+                                <p class="text-sm text-gray-500 dark:text-gray-400 text-center">Select a date range and click "Generate Report" to view travel costs.</p>
+                            </div>
+                        `, '6xl');
+                        setTimeout(() => lucide.createIcons(), 100);
+                        break;
+                    }
+                    case 'generate-travel-costs-report': {
+                        const startDateInput = document.getElementById('travel-costs-start-date');
+                        const endDateInput = document.getElementById('travel-costs-end-date');
+                        const resultsContainer = document.getElementById('travel-costs-report-results');
+                        
+                        if (!startDateInput || !endDateInput || !resultsContainer) {
+                            showNotification('Report form elements not found.', 'error');
+                            break;
+                        }
+                        
+                        const startDate = parseDateFlexible(startDateInput.value);
+                        const endDate = parseDateFlexible(endDateInput.value);
+                        
+                        if (!startDate || !endDate) {
+                            showNotification('Please select both start and end dates.', 'error');
+                            break;
+                        }
+                        
+                        if (startDate > endDate) {
+                            showNotification('Start date must be before end date.', 'error');
+                            break;
+                        }
+                        
+                        // Filter travel records by date range
+                        const filteredTravel = (state.travel || []).filter(travel => {
+                            if (!travel) return false;
+                            const travelDate = parseDateFlexible(travel.date) || 
+                                             parseDateFlexible(travel.departureTime) || 
+                                             parseDateFlexible(travel.hotelCheckIn) || 
+                                             parseDateFlexible(travel.pickupDate);
+                            if (!travelDate) return false;
+                            const travelDateOnly = new Date(travelDate.getFullYear(), travelDate.getMonth(), travelDate.getDate());
+                            const startDateOnly = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+                            const endDateOnly = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+                            return travelDateOnly >= startDateOnly && travelDateOnly <= endDateOnly;
+                        });
+                        
+                        // Group by CRC
+                        const travelByCRC = {};
+                        filteredTravel.forEach(travel => {
+                            const crcId = travel.crcId;
+                            if (!travelByCRC[crcId]) {
+                                travelByCRC[crcId] = [];
+                            }
+                            travelByCRC[crcId].push(travel);
+                        });
+                        
+                        // Calculate totals per CRC
+                        const reportData = Object.keys(travelByCRC).map(crcId => {
+                            const crc = state.crcs.find(c => c.id === crcId) || { name: crcId };
+                            const travelRecords = travelByCRC[crcId];
+                            let flightsCount = 0;
+                            let hotelsCount = 0;
+                            let carsCount = 0;
+                            let totalCost = 0;
+                            
+                            travelRecords.forEach(travel => {
+                                const type = (travel.bookingType || '').toUpperCase();
+                                if (type === 'FLIGHT') flightsCount += 1;
+                                else if (type === 'HOTEL') hotelsCount += 1;
+                                else if (type === 'CAR') carsCount += 1;
+                                
+                                const costFields = ['flightCost', 'hotelCost', 'carRentalCost', 'grandTotal', 'totalCost'];
+                                costFields.forEach(field => {
+                                    const val = travel[field];
+                                    if (typeof val === 'number' && !Number.isNaN(val)) {
+                                        totalCost += val;
+                                    } else if (typeof val === 'string' && val.trim()) {
+                                        const parsed = parseFloat(val.replace(/[^0-9.\-]/g, ''));
+                                        if (!Number.isNaN(parsed)) {
+                                            totalCost += parsed;
+                                        }
+                                    }
+                                });
+                            });
+                            
+                            return {
+                                crcName: crc.name || crcId,
+                                travelRecords: travelRecords.length,
+                                flightsCount,
+                                hotelsCount,
+                                carsCount,
+                                totalCost: Number.isFinite(totalCost) ? Math.round(totalCost * 100) / 100 : 0
+                            };
+                        }).sort((a, b) => a.crcName.localeCompare(b.crcName));
+                        
+                        // Calculate grand totals
+                        const grandTotal = reportData.reduce((sum, row) => sum + row.totalCost, 0);
+                        const totalFlights = reportData.reduce((sum, row) => sum + row.flightsCount, 0);
+                        const totalHotels = reportData.reduce((sum, row) => sum + row.hotelsCount, 0);
+                        const totalCars = reportData.reduce((sum, row) => sum + row.carsCount, 0);
+                        const totalRecords = reportData.reduce((sum, row) => sum + row.travelRecords, 0);
+                        
+                        if (reportData.length === 0) {
+                            resultsContainer.innerHTML = `
+                                <p class="text-center text-gray-500 dark:text-gray-400 py-4">
+                                    No travel records found for the selected date range.
+                                </p>
+                            `;
+                        } else {
+                            resultsContainer.innerHTML = `
+                                <div class="mb-4 p-4 bg-indigo-50 dark:bg-indigo-900/20 rounded-md border border-indigo-200 dark:border-indigo-800">
+                                    <h4 class="text-lg font-semibold text-indigo-900 dark:text-indigo-200 mb-2">Summary</h4>
+                                    <div class="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
+                                        <div>
+                                            <div class="text-indigo-700 dark:text-indigo-300 font-medium">Total Records</div>
+                                            <div class="text-indigo-900 dark:text-indigo-100 text-xl font-bold">${totalRecords}</div>
+                                        </div>
+                                        <div>
+                                            <div class="text-indigo-700 dark:text-indigo-300 font-medium">Flights</div>
+                                            <div class="text-indigo-900 dark:text-indigo-100 text-xl font-bold">${totalFlights}</div>
+                                        </div>
+                                        <div>
+                                            <div class="text-indigo-700 dark:text-indigo-300 font-medium">Hotels</div>
+                                            <div class="text-indigo-900 dark:text-indigo-100 text-xl font-bold">${totalHotels}</div>
+                                        </div>
+                                        <div>
+                                            <div class="text-indigo-700 dark:text-indigo-300 font-medium">Cars</div>
+                                            <div class="text-indigo-900 dark:text-indigo-100 text-xl font-bold">${totalCars}</div>
+                                        </div>
+                                        <div>
+                                            <div class="text-indigo-700 dark:text-indigo-300 font-medium">Total Cost</div>
+                                            <div class="text-indigo-900 dark:text-indigo-100 text-xl font-bold">$${grandTotal.toFixed(2)}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="overflow-x-auto custom-scrollbar">
+                                    <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                        <thead class="bg-gray-50 dark:bg-gray-800">
+                                            <tr>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">CRC Name</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Travel Records</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Flights</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Hotels</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Cars</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Total Cost</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody class="bg-white dark:bg-gray-900 divide-y divide-gray-200 dark:divide-gray-700">
+                                            ${reportData.map(row => `
+                                                <tr>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${sanitizeText(row.crcName)}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.travelRecords}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.flightsCount}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.hotelsCount}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.carsCount}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">$${row.totalCost.toFixed(2)}</td>
+                                                </tr>
+                                            `).join('')}
+                                        </tbody>
+                                        <tfoot class="bg-gray-50 dark:bg-gray-800">
+                                            <tr>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">Total</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">${totalRecords}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">${totalFlights}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">${totalHotels}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">${totalCars}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-indigo-600 dark:text-indigo-400">$${grandTotal.toFixed(2)}</td>
+                                            </tr>
+                                        </tfoot>
+                                    </table>
+                                </div>
+                            `;
+                        }
+                        setTimeout(() => lucide.createIcons(), 100);
+                        break;
+                    }
                     case 'edit-travel': {
                         const travel = state.travel.find(t => t.id === id);
                         if (travel) {
@@ -20709,6 +20907,9 @@
                     <div class="flex justify-between items-center mb-6">
                         <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Travel & Flight Information</h2>
                         <div class="flex gap-2">
+                            <button data-action="open-travel-costs-report" class="bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 transition-colors flex items-center">
+                                <i data-lucide="dollar-sign" class="w-4 h-4 mr-2"></i>View Travel Costs
+                            </button>
                             <button data-action="download-template" data-template="travel" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 transition-colors flex items-center">
                                 <i data-lucide="file-text" class="w-4 h-4 mr-2"></i>Download Template
                             </button>
