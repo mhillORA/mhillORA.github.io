@@ -3148,23 +3148,45 @@ const fetchNavanBookingsInRange = async (context, accessToken, { createdFrom, cr
     let page = 0;
 
     while (page < maxPages) {
-        const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize });
-        if (!response.ok) {
-            const errorText = await response.text();
-            context.log.error(`Navan bookings range request failed (page ${page}): ${response.status} - ${errorText}`);
-            throw new Error(`Failed to fetch bookings page ${page}: ${errorText}`);
-        }
+        try {
+            const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize });
+            if (!response.ok) {
+                const errorText = await response.text();
+                context.log.error(`Navan bookings range request failed (page ${page}): ${response.status} - ${errorText}`);
+                // If it's the first page, throw error. Otherwise, return what we have.
+                if (page === 0) {
+                    throw new Error(`Failed to fetch bookings page ${page}: ${errorText}`);
+                } else {
+                    context.log.warn(`Navan bookings fetch stopped at page ${page}. Returning ${bookings.length} bookings fetched so far.`);
+                    break;
+                }
+            }
 
-        const data = await response.json();
-        if (Array.isArray(data?.data) && data.data.length > 0) {
-            bookings.push(...data.data);
-        }
+            const data = await response.json();
+            if (Array.isArray(data?.data) && data.data.length > 0) {
+                bookings.push(...data.data);
+                context.log.info(`navanImport: Fetched page ${page + 1}, got ${data.data.length} bookings (total so far: ${bookings.length})`);
+            }
 
-        if (!data?.page || data.page.totalPages === undefined || page >= data.page.totalPages - 1) {
-            break;
-        }
+            if (!data?.page || data.page.totalPages === undefined || page >= data.page.totalPages - 1) {
+                break;
+            }
 
-        page += 1;
+            page += 1;
+            
+            // Small delay between page fetches to avoid overwhelming Navan API
+            if (page < maxPages) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        } catch (pageError) {
+            context.log.error(`Error fetching page ${page}:`, pageError);
+            // If we have some bookings, return them. Otherwise, throw.
+            if (bookings.length > 0) {
+                context.log.warn(`Returning partial results: ${bookings.length} bookings from ${page} pages`);
+                break;
+            }
+            throw pageError;
+        }
     }
 
     return bookings;
@@ -3486,7 +3508,13 @@ app.http('navanImport', {
 
                     let bookings = [];
                     try {
-                        bookings = await fetchNavanBookingsInRange(context, accessToken, { createdFrom, createdTo });
+                        // Use smaller page size and limit pages to prevent timeout during fetch
+                        bookings = await fetchNavanBookingsInRange(context, accessToken, { 
+                            createdFrom, 
+                            createdTo,
+                            pageSize: 50,  // Smaller page size
+                            maxPages: 100  // Limit total pages to prevent timeout
+                        });
                         context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings`);
                     } catch (fetchError) {
                         context.log.error('navanImport: Fetch error:', fetchError);
@@ -3515,6 +3543,8 @@ app.http('navanImport', {
                     
                     // Log start time to track duration
                     const startTime = Date.now();
+                    // Azure Functions timeout is typically 5-10 minutes, but we'll set a safety limit of 4 minutes
+                    const MAX_EXECUTION_TIME_MS = 4 * 60 * 1000; // 4 minutes
 
                     const processedKeys = new Set();
                     let processedCount = 0;
@@ -3523,6 +3553,19 @@ app.http('navanImport', {
                     
                     // Process bookings in batches
                     while (offset < totalBookings) {
+                        // Check if we're running out of time
+                        const elapsed = Date.now() - startTime;
+                        if (elapsed > MAX_EXECUTION_TIME_MS) {
+                            context.log.warn(`navanImport: Approaching timeout limit. Processed ${processedCount}/${totalBookings} bookings in ${(elapsed / 1000).toFixed(2)} seconds. Stopping to return partial results.`);
+                            summary.errors.push({
+                                message: `Processing stopped due to timeout limit. Processed ${processedCount} of ${totalBookings} bookings. Remaining bookings will be processed on next sync.`,
+                                type: 'Timeout warning',
+                                processed: processedCount,
+                                total: totalBookings
+                            });
+                            break;
+                        }
+                        
                         batchNumber++;
                         const batchEnd = Math.min(offset + BATCH_SIZE, totalBookings);
                         const batch = bookings.slice(offset, batchEnd);
