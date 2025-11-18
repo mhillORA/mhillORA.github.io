@@ -2287,6 +2287,10 @@ const upsertNavanBooking = async (context, booking, {
             existingTravel = existingRecords[0];
         }
     } catch (queryError) {
+        // Check if this is a container missing error
+        if (queryError.code === 404 || (queryError.message && queryError.message.includes('NotFound'))) {
+            throw new Error("DATABASE_ERROR: 'travel' container not found. Please create the 'travel' container in Cosmos DB with partition key '/id'.");
+        }
         context.log.warn('Error querying for existing travel record:', queryError.message);
         context.log.warn('Query error stack:', queryError.stack);
     }
@@ -2298,6 +2302,10 @@ const upsertNavanBooking = async (context, booking, {
             context.log.info(`Updated existing travel record for Navan booking ${bookingIdentifier}`);
             return { travelRecord: updatedTravel, action: 'updated', saved: true, matched };
         } catch (upsertError) {
+            // Check if this is a container missing error
+            if (upsertError.code === 404 || (upsertError.message && upsertError.message.includes('NotFound'))) {
+                throw new Error("DATABASE_ERROR: 'travel' container not found. Please create the 'travel' container in Cosmos DB with partition key '/id'.");
+            }
             context.log.error('Error upserting travel record:', upsertError.message);
             context.log.error('Upsert error stack:', upsertError.stack);
             context.log.error('Upsert error details:', safeStringify(upsertError));
@@ -2311,6 +2319,10 @@ const upsertNavanBooking = async (context, booking, {
             context.log.info(`Created new travel record for Navan booking ${bookingIdentifier}`);
             return { travelRecord: newTravel, action: 'created', saved: true, matched };
         } catch (createError) {
+            // Check if this is a container missing error (in case query didn't catch it)
+            if (createError.code === 404 || (createError.message && createError.message.includes('NotFound'))) {
+                throw new Error("DATABASE_ERROR: 'travel' container not found. Please create the 'travel' container in Cosmos DB with partition key '/id'.");
+            }
             context.log.error('Error creating travel record:', createError.message);
             context.log.error('Create error stack:', createError.stack);
             context.log.error('Create error details:', safeStringify(createError));
@@ -3242,191 +3254,208 @@ app.http('navanImport', {
             }
 
             const importType = (body.importType || 'range').toLowerCase();
+            summary.importType = importType;
 
-            summary = {
-                importType,
-                totals: {
-                    fetched: 0,
-                    processed: 0,
-                    created: 0,
-                    updated: 0,
-                    skipped: 0
-                },
-                skippedBookings: [],
-                errors: []
-            };
-
+            // 1. Authenticate with Navan
+            context.log.info('navanImport: Step 1 - Authenticating with Navan');
+            let tokenResult;
             try {
-                let tokenResult;
-                try {
-                    tokenResult = await fetchNavanAccessToken(context);
-                } catch (tokenError) {
-                    context.log.error('Error fetching Navan access token:', tokenError);
-                    summary.errors.push({
-                        message: `Failed to fetch Navan access token: ${tokenError.message}`,
-                        type: 'Token fetch error'
-                    });
-                    summary.skippedBookings = limitArray(summary.skippedBookings);
-                    summary.errors = limitArray(summary.errors);
-                    return {
-                        status: 200,
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Access-Control-Allow-Origin': '*'
-                        },
-                        jsonBody: {
-                            success: false,
-                            error: 'Failed to authenticate with Navan',
-                            detail: tokenError.message,
-                            summary
-                        }
-                    };
-                }
-                
-                if (!tokenResult.success) {
-                    summary.errors.push({
-                        message: tokenResult.response?.jsonBody?.detail || 'Failed to authenticate with Navan',
-                        type: 'Authentication error'
-                    });
-                    summary.skippedBookings = limitArray(summary.skippedBookings);
-                    summary.errors = limitArray(summary.errors);
-                    return {
-                        status: 200,
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Access-Control-Allow-Origin': '*'
-                        },
-                        jsonBody: {
-                            success: false,
-                            error: 'Navan authentication failed',
-                            detail: tokenResult.response?.jsonBody?.detail || 'Unknown authentication error',
-                            summary
-                        }
-                    };
-                }
-                const accessToken = tokenResult.accessToken;
+                tokenResult = await fetchNavanAccessToken(context);
+            } catch (tokenError) {
+                context.log.error('navanImport: Error fetching Navan access token:', tokenError);
+                summary.errors.push({
+                    message: `Failed to fetch Navan access token: ${tokenError.message}`,
+                    type: 'Token fetch error'
+                });
+                summary.skippedBookings = limitArray(summary.skippedBookings);
+                summary.errors = limitArray(summary.errors);
+                return {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    jsonBody: {
+                        success: false,
+                        error: 'Navan authentication exception',
+                        detail: tokenError.message,
+                        summary
+                    }
+                };
+            }
+            
+            if (!tokenResult.success) {
+                summary.errors.push({
+                    message: tokenResult.response?.jsonBody?.detail || 'Failed to authenticate with Navan',
+                    type: 'Authentication error'
+                });
+                summary.skippedBookings = limitArray(summary.skippedBookings);
+                summary.errors = limitArray(summary.errors);
+                return {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    jsonBody: {
+                        success: false,
+                        error: 'Navan authentication failed',
+                        detail: tokenResult.response?.jsonBody?.detail || 'Unknown authentication error',
+                        summary
+                    }
+                };
+            }
+            const accessToken = tokenResult.accessToken;
 
-                let crcList;
-                try {
-                    crcList = await loadAllCrcs(context);
-                } catch (crcError) {
-                    context.log.error('Error loading CRC list:', crcError);
-                    summary.errors.push({
-                        message: `Failed to load CRC list: ${crcError.message}`,
-                        type: 'CRC load error'
-                    });
-                    // Continue with empty CRC list - bookings will be skipped
-                    crcList = [];
-                }
-                const crcResolver = buildCrcResolver(crcList);
+            // 2. Load CRC list for matching
+            context.log.info('navanImport: Step 2 - Loading CRCs');
+            let crcList;
+            try {
+                crcList = await loadAllCrcs(context);
+                context.log.info(`navanImport: Loaded ${crcList?.length || 0} CRC records`);
+            } catch (crcError) {
+                context.log.error('navanImport: Error loading CRC list:', crcError);
+                summary.errors.push({
+                    message: `Failed to load CRC list: ${crcError.message}`,
+                    type: 'CRC load error'
+                });
+                // Continue with empty CRC list - bookings will be skipped
+                crcList = [];
+            }
+            const crcResolver = buildCrcResolver(crcList);
+
+            // 3. Fetch and Process Bookings
+            context.log.info(`navanImport: Step 3 - Processing import type: ${importType}`);
+            
+            try {
                 if (importType === 'list') {
                     if (!Array.isArray(body.bookings) || body.bookings.length === 0) {
                         return {
-                            status: 400,
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Access-Control-Allow-Origin': '*'
-                            },
-                            jsonBody: {
-                                error: 'Invalid request',
-                                detail: 'Provide an array of bookings with bookingId and/or bookingUuid.'
-                            }
-                        };
+                        status: 400,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Access-Control-Allow-Origin': '*'
+                        },
+                        jsonBody: {
+                            error: 'Invalid request',
+                            detail: 'Provide an array of bookings with bookingId and/or bookingUuid.'
+                        }
+                    };
+                }
+
+                const defaultRange = normalizeNavanDateRange(365, 180);
+                const processedKeys = new Set();
+
+                for (const entry of body.bookings) {
+                    const bookingIdCandidate = entry?.bookingId ? String(entry.bookingId).trim() : null;
+                    const bookingUuidCandidate = entry?.bookingUuid ? String(entry.bookingUuid).trim() : null;
+                    if (!bookingIdCandidate && !bookingUuidCandidate) {
+                        summary.errors.push({ message: 'Booking entry missing bookingId and bookingUuid', entry });
+                        continue;
                     }
 
-                    const defaultRange = normalizeNavanDateRange(365, 180);
-                    const processedKeys = new Set();
+                    const dedupeKey = bookingUuidCandidate || bookingIdCandidate;
+                    if (processedKeys.has(dedupeKey)) {
+                        continue;
+                    }
+                    processedKeys.add(dedupeKey);
 
-                    for (const entry of body.bookings) {
-                        const bookingIdCandidate = entry?.bookingId ? String(entry.bookingId).trim() : null;
-                        const bookingUuidCandidate = entry?.bookingUuid ? String(entry.bookingUuid).trim() : null;
-                        if (!bookingIdCandidate && !bookingUuidCandidate) {
-                            summary.errors.push({ message: 'Booking entry missing bookingId and bookingUuid', entry });
-                            continue;
-                        }
-
-                        const dedupeKey = bookingUuidCandidate || bookingIdCandidate;
-                        if (processedKeys.has(dedupeKey)) {
-                            continue;
-                        }
-                        processedKeys.add(dedupeKey);
-
-                        let bookingRecord = null;
-                        try {
-                            if (bookingUuidCandidate) {
-                                const uuidResponse = await fetchNavanBookingByUuid(accessToken, bookingUuidCandidate);
-                                if (uuidResponse.ok) {
-                                    const uuidData = await uuidResponse.json();
-                                    if (Array.isArray(uuidData?.data) && uuidData.data.length > 0) {
-                                        bookingRecord = uuidData.data[0];
-                                    }
-                                } else {
-                                    const text = await uuidResponse.text();
-                                    throw new Error(`UUID lookup failed (${uuidResponse.status}): ${text}`);
+                    let bookingRecord = null;
+                    try {
+                        if (bookingUuidCandidate) {
+                            const uuidResponse = await fetchNavanBookingByUuid(accessToken, bookingUuidCandidate);
+                            if (uuidResponse.ok) {
+                                const uuidData = await uuidResponse.json();
+                                if (Array.isArray(uuidData?.data) && uuidData.data.length > 0) {
+                                    bookingRecord = uuidData.data[0];
                                 }
                             } else {
-                                const createdFrom = entry?.createdFrom ? parseInt(entry.createdFrom, 10) : defaultRange.createdFrom;
-                                const createdTo = entry?.createdTo ? parseInt(entry.createdTo, 10) : defaultRange.createdTo;
-                                bookingRecord = await fetchNavanBookingById(context, accessToken, bookingIdCandidate, {
-                                    createdFrom,
-                                    createdTo
-                                });
+                                const text = await uuidResponse.text();
+                                throw new Error(`UUID lookup failed (${uuidResponse.status}): ${text}`);
                             }
-                        } catch (lookupError) {
-                            summary.errors.push({
-                                bookingId: bookingIdCandidate,
-                                bookingUuid: bookingUuidCandidate,
-                                message: lookupError.message
+                        } else {
+                            const createdFrom = entry?.createdFrom ? parseInt(entry.createdFrom, 10) : defaultRange.createdFrom;
+                            const createdTo = entry?.createdTo ? parseInt(entry.createdTo, 10) : defaultRange.createdTo;
+                            bookingRecord = await fetchNavanBookingById(context, accessToken, bookingIdCandidate, {
+                                createdFrom,
+                                createdTo
                             });
-                            continue;
                         }
+                    } catch (lookupError) {
+                        summary.errors.push({
+                            bookingId: bookingIdCandidate,
+                            bookingUuid: bookingUuidCandidate,
+                            message: lookupError.message
+                        });
+                        continue;
+                    }
 
-                        if (!bookingRecord) {
-                            summary.skippedBookings.push({
-                                bookingId: bookingIdCandidate,
-                                bookingUuid: bookingUuidCandidate,
-                                reason: 'Booking not found in Navan or outside search window'
-                            });
+                    if (!bookingRecord) {
+                        summary.skippedBookings.push({
+                            bookingId: bookingIdCandidate,
+                            bookingUuid: bookingUuidCandidate,
+                            reason: 'Booking not found in Navan or outside search window'
+                        });
+                        summary.totals.skipped += 1;
+                        continue;
+                    }
+
+                    summary.totals.fetched += 1;
+
+                    try {
+                        const importResult = await upsertNavanBooking(context, bookingRecord, {
+                            bookingId: bookingRecord.bookingId || bookingIdCandidate,
+                            bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
+                            readOnly: false,
+                            crcResolver,
+                            allowFallbackCrc: false
+                        });
+
+                        if (importResult.skipped) {
                             summary.totals.skipped += 1;
+                            summary.skippedBookings.push({
+                                bookingId: bookingRecord.bookingId || bookingIdCandidate,
+                                bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
+                                reason: importResult.reason || 'CRC match not found'
+                            });
                             continue;
                         }
 
-                        summary.totals.fetched += 1;
-
-                        try {
-                            const importResult = await upsertNavanBooking(context, bookingRecord, {
-                                bookingId: bookingRecord.bookingId || bookingIdCandidate,
-                                bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
-                                readOnly: false,
-                                crcResolver,
-                                allowFallbackCrc: false
-                            });
-
-                            if (importResult.skipped) {
-                                summary.totals.skipped += 1;
-                                summary.skippedBookings.push({
-                                    bookingId: bookingRecord.bookingId || bookingIdCandidate,
-                                    bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
-                                    reason: importResult.reason || 'CRC match not found'
-                                });
-                                continue;
-                            }
-
-                            summary.totals.processed += 1;
-                            if (importResult.action === 'created') {
-                                summary.totals.created += 1;
-                            } else if (importResult.action === 'updated') {
-                                summary.totals.updated += 1;
-                            }
-                        } catch (saveError) {
-                            summary.errors.push({
-                                bookingId: bookingRecord.bookingId || bookingIdCandidate,
-                                bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
-                                message: saveError.message
-                            });
+                        summary.totals.processed += 1;
+                        if (importResult.action === 'created') {
+                            summary.totals.created += 1;
+                        } else if (importResult.action === 'updated') {
+                            summary.totals.updated += 1;
+                        }
+                    } catch (saveError) {
+                        const errorMsg = saveError.message;
+                        summary.errors.push({
+                            bookingId: bookingRecord.bookingId || bookingIdCandidate,
+                            bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
+                            message: errorMsg
+                        });
+                        
+                        // If database container is missing, abort immediately
+                        if (errorMsg.includes('container not found') || errorMsg.includes('DATABASE_ERROR')) {
+                            summary.skippedBookings = limitArray(summary.skippedBookings);
+                            summary.errors = limitArray(summary.errors);
+                            return {
+                                status: 500,
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Access-Control-Allow-Origin': '*'
+                                },
+                                jsonBody: {
+                                    success: false,
+                                    error: 'Database Configuration Error',
+                                    detail: errorMsg,
+                                    summary
+                                }
+                            };
                         }
                     }
-                } else {
+                }
+            } else {
                     const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 365;
                     const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180;
 
@@ -3452,20 +3481,15 @@ app.http('navanImport', {
                         };
                     }
 
-                    context.log.info(`navanImport range: createdFrom=${new Date(createdFrom * 1000).toISOString()}, createdTo=${new Date(createdTo * 1000).toISOString()}`);
+                    summary.range = { createdFrom, createdTo, pastDays, futureDays };
+                    context.log.info(`navanImport: Fetching range ${new Date(createdFrom * 1000).toISOString()} to ${new Date(createdTo * 1000).toISOString()}`);
 
                     let bookings = [];
                     try {
                         bookings = await fetchNavanBookingsInRange(context, accessToken, { createdFrom, createdTo });
-                        context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings from Navan`);
+                        context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings`);
                     } catch (fetchError) {
-                        context.log.error('navanImport: Error fetching bookings from Navan:', fetchError.message);
-                        context.log.error('navanImport: Fetch error stack:', fetchError.stack);
-                        summary.errors.push({
-                            message: `Failed to fetch bookings from Navan: ${fetchError.message}`,
-                            type: 'Fetch error'
-                        });
-                        // Return partial results instead of failing completely
+                        context.log.error('navanImport: Fetch error:', fetchError);
                         summary.skippedBookings = limitArray(summary.skippedBookings);
                         summary.errors = limitArray(summary.errors);
                         return {
@@ -3484,13 +3508,31 @@ app.http('navanImport', {
                     }
                     summary.totals.fetched = bookings?.length || 0;
 
+                    // Limit processing to prevent timeout (process max 500 at a time)
+                    const MAX_BOOKINGS_TO_PROCESS = 500;
+                    const bookingsToProcess = bookings.slice(0, MAX_BOOKINGS_TO_PROCESS);
+                    if (bookings.length > MAX_BOOKINGS_TO_PROCESS) {
+                        context.log.warn(`navanImport: Limiting processing to ${MAX_BOOKINGS_TO_PROCESS} of ${bookings.length} bookings to prevent timeout`);
+                        summary.errors.push({
+                            message: `Processing limited to ${MAX_BOOKINGS_TO_PROCESS} bookings (${bookings.length} total fetched). Remaining bookings will be processed on next sync.`,
+                            type: 'Processing limit'
+                        });
+                    }
+
                     const processedKeys = new Set();
-                    for (const booking of bookings) {
+                    let processedCount = 0;
+                    for (const booking of bookingsToProcess) {
                         const key = booking.uuid || booking.bookingId;
                         if (!key || processedKeys.has(key)) {
                             continue;
                         }
                         processedKeys.add(key);
+                        processedCount++;
+                        
+                        // Log progress every 50 bookings
+                        if (processedCount % 50 === 0) {
+                            context.log.info(`navanImport: Processed ${processedCount}/${bookingsToProcess.length} bookings...`);
+                        }
 
                         try {
                             const importResult = await upsertNavanBooking(context, booking, {
@@ -3519,18 +3561,36 @@ app.http('navanImport', {
                                 summary.totals.updated += 1;
                             }
                         } catch (saveError) {
+                            const errorMsg = saveError.message;
                             summary.errors.push({
                                 bookingId: booking.bookingId,
                                 bookingUuid: booking.uuid,
-                                message: saveError.message
+                                message: errorMsg
                             });
+                            
+                            // Critical DB error - abort
+                            if (errorMsg.includes('container not found') || errorMsg.includes('DATABASE_ERROR')) {
+                                summary.skippedBookings = limitArray(summary.skippedBookings);
+                                summary.errors = limitArray(summary.errors);
+                                return {
+                                    status: 500,
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Access-Control-Allow-Origin': '*'
+                                    },
+                                    jsonBody: {
+                                        success: false,
+                                        error: 'Database Configuration Error',
+                                        detail: errorMsg,
+                                        summary
+                                    }
+                                };
+                            }
                         }
                     }
                 }
             } catch (importError) {
-                context.log.error('navanImport error:', importError.message);
-                context.log.error('navanImport stack:', importError.stack);
-                // Include any partial results in the error response
+                context.log.error('navanImport: Import error:', importError);
                 summary.errors.push({
                     message: importError.message,
                     type: 'Fatal error'
@@ -3552,6 +3612,7 @@ app.http('navanImport', {
                 };
             }
 
+            // Clean up summary for response
             summary.skippedBookings = limitArray(summary.skippedBookings);
             summary.errors = limitArray(summary.errors);
 
@@ -3567,23 +3628,32 @@ app.http('navanImport', {
                 }
             };
         } catch (outerError) {
+            // Catch-all for unexpected runtime errors
             try {
                 ensureContextLogger(context);
-                context.log.error('navanImport outer error:', outerError.message);
-                context.log.error('navanImport outer stack:', outerError.stack);
-            } catch (logError) {
-                // If logging fails, at least try to log to console
-                console.error('navanImport outer error:', outerError.message);
-                console.error('navanImport outer stack:', outerError.stack);
+                context.log.error('navanImport CRITICAL error:', outerError);
+            } catch (e) {
+                console.error('navanImport CRITICAL error (logging failed):', e);
             }
             
-            summary.errors.push({
-                message: outerError.message || 'Unknown error',
-                type: 'Fatal error',
-                stack: outerError.stack
-            });
-            summary.skippedBookings = limitArray(summary.skippedBookings);
-            summary.errors = limitArray(summary.errors);
+            // Ensure summary exists even if initialization failed
+            const safeSummary = summary || {
+                importType: 'range',
+                totals: { fetched: 0, processed: 0, created: 0, updated: 0, skipped: 0 },
+                skippedBookings: [],
+                errors: []
+            };
+            
+            if (safeSummary.errors) {
+                safeSummary.errors.push({
+                    message: outerError.message || 'Unknown error',
+                    type: 'Critical Handler Failure',
+                    stack: outerError.stack
+                });
+            }
+            
+            safeSummary.skippedBookings = limitArray(safeSummary.skippedBookings);
+            safeSummary.errors = limitArray(safeSummary.errors);
             
             return {
                 status: 200,
@@ -3593,9 +3663,10 @@ app.http('navanImport', {
                 },
                 jsonBody: {
                     success: false,
-                    error: 'Navan import failed',
-                    detail: outerError.message || 'Unknown error occurred',
-                    summary
+                    error: 'Navan import encountered a critical error',
+                    detail: outerError.message || 'Unknown system error',
+                    stack: outerError.stack,
+                    summary: safeSummary
                 }
             };
         }
