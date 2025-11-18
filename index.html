@@ -768,14 +768,44 @@
                         if (!response.ok) {
                             // Try to get error details from response
                             let errorDetails = '';
+                            let errorJson = null;
+                            let errorText = '';
                             try {
-                                const errorText = await response.text();
-                                errorDetails = errorText ? ` - ${errorText}` : '';
+                                errorText = await response.text();
+                                if (errorText && errorText.trim()) {
+                                    try {
+                                        errorJson = JSON.parse(errorText);
+                                        errorDetails = errorJson.detail || errorJson.error || errorJson.message || errorJson.summary?.errors?.[0]?.message || errorText;
+                                    } catch (e) {
+                                        // Not JSON, use as-is
+                                        errorDetails = errorText;
+                                    }
+                                } else {
+                                    // Empty response body - likely a timeout or crash
+                                    errorDetails = response.status === 500 
+                                        ? 'Server error: Function may have timed out or crashed. Check Azure Functions logs for details.'
+                                        : `HTTP ${response.status}: ${response.statusText}`;
+                                }
                             } catch (e) {
-                                // Ignore if we can't read error text
+                                // Can't read response - likely a network error or timeout
+                                errorDetails = `Unable to read error response: ${e.message || 'Unknown error'}`;
                             }
-                            console.error(`API Error Response: ${response.status} ${response.statusText}${errorDetails}`);
-                            throw new Error(`API request failed: ${response.status} ${response.statusText}${errorDetails}`);
+                            
+                            console.error(`API Error Response: ${response.status} ${response.statusText}`, {
+                                errorDetails,
+                                errorText,
+                                errorJson,
+                                url: url,
+                                method: config.method
+                            });
+                            
+                            const error = new Error(`API request failed: ${response.status} ${response.statusText}${errorDetails ? ` - ${errorDetails}` : ''}`);
+                            error.status = response.status;
+                            error.statusText = response.statusText;
+                            error.detail = errorDetails;
+                            error.jsonBody = errorJson;
+                            error.rawResponse = errorText;
+                            throw error;
                         }
                         
                         // Handle different response types
@@ -4053,10 +4083,24 @@
                                 
                                 // Merge skipped bookings and errors (limit to avoid huge arrays)
                                 if (result.summary.skippedBookings) {
-                                    allResults.summary.skippedBookings.push(...result.summary.skippedBookings.slice(0, 10));
+                                    // Only add unique skipped bookings
+                                    const existingKeys = new Set(allResults.summary.skippedBookings.map(b => b.bookingId || b.bookingUuid));
+                                    const newSkipped = result.summary.skippedBookings
+                                        .filter(b => !existingKeys.has(b.bookingId || b.bookingUuid))
+                                        .slice(0, 10);
+                                    allResults.summary.skippedBookings.push(...newSkipped);
                                 }
                                 if (result.summary.errors && result.summary.errors.length > 0) {
-                                    allResults.summary.errors.push(...result.summary.errors);
+                                    // Filter out processing limit errors (they're informational, not real errors)
+                                    const realErrors = result.summary.errors.filter(e => e.type !== 'Processing limit');
+                                    if (realErrors.length > 0) {
+                                        allResults.summary.errors.push(...realErrors);
+                                    }
+                                    // Keep processing limit as info in ranges
+                                    const processingLimit = result.summary.errors.find(e => e.type === 'Processing limit');
+                                    if (processingLimit) {
+                                        allResults.summary.ranges[allResults.summary.ranges.length - 1].processingLimit = processingLimit;
+                                    }
                                 }
                                 
                                 allResults.summary.ranges.push({
@@ -4088,17 +4132,34 @@
                         } catch (error) {
                             // Error occurred - stop incremental fetching
                             failedAtDays = currentDays;
+                            const errorMessage = error.message || 'Unknown error';
+                            const errorDetail = error.detail || error.jsonBody?.detail || error.jsonBody?.error || errorMessage;
+                            
+                            console.error(`Navan import failed at ${currentDays} days:`, {
+                                error,
+                                message: errorMessage,
+                                detail: errorDetail,
+                                status: error.status,
+                                jsonBody: error.jsonBody
+                            });
+                            
                             allResults.summary.errors.push({
                                 days: currentDays,
-                                message: error.message || 'Unknown error',
-                                type: 'Fetch error'
+                                message: errorDetail,
+                                type: 'Fetch error',
+                                status: error.status,
+                                fullError: error
                             });
                             allResults.summary.ranges.push({
                                 days: currentDays,
                                 success: false,
-                                error: error.message || 'Unknown error'
+                                error: errorDetail,
+                                status: error.status
                             });
-                            updateProgress(currentDays, `Failed at ${currentDays} days`, error.message);
+                            updateProgress(currentDays, `Failed at ${currentDays} days`, errorDetail);
+                            
+                            // Show notification with detailed error
+                            showNotification(`Navan import failed at ${currentDays} days: ${errorDetail}`, 'error');
                             break;
                         }
                     }
