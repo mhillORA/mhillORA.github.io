@@ -3456,8 +3456,8 @@ app.http('navanImport', {
                     }
                 }
                 } else {
-                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 30;
-                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 30;
+                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 365;
+                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180; // 6 months
 
                     let createdFrom = body.createdFrom ? parseInt(body.createdFrom, 10) : null;
                     let createdTo = body.createdTo ? parseInt(body.createdTo, 10) : null;
@@ -3508,8 +3508,8 @@ app.http('navanImport', {
                     }
                     summary.totals.fetched = bookings?.length || 0;
 
-                    // Process in batches of 250 to prevent timeout
-                    const BATCH_SIZE = 250;
+                    // Process in smaller batches to prevent timeout - use 100 to be safe
+                    const BATCH_SIZE = 100;
                     const totalBookings = bookings.length;
                     context.log.info(`navanImport: Processing ${totalBookings} bookings in batches of ${BATCH_SIZE}`);
 
@@ -3593,12 +3593,19 @@ app.http('navanImport', {
                                     };
                                 }
                                 // For non-critical errors, continue processing the batch
+                                // Don't let one bad booking stop the entire import
+                                context.log.warn(`navanImport: Failed to save booking ${booking.bookingId || booking.uuid}: ${errorMsg}. Continuing...`);
                             }
                         }
                         
                         // Batch completed successfully, move to next batch
                         offset = batchEnd;
                         context.log.info(`navanImport: Batch ${batchNumber} completed. Processed ${processedCount}/${totalBookings} bookings so far.`);
+                        
+                        // Small delay between batches to avoid overwhelming the system
+                        if (offset < totalBookings) {
+                            await new Promise(resolve => setTimeout(resolve, 100));
+                        }
                     }
                     
                     context.log.info(`navanImport: All batches completed. Total processed: ${processedCount}/${totalBookings} bookings.`);
