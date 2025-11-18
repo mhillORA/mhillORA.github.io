@@ -3454,8 +3454,35 @@ app.http('navanImport', {
 
                     context.log.info(`navanImport range: createdFrom=${new Date(createdFrom * 1000).toISOString()}, createdTo=${new Date(createdTo * 1000).toISOString()}`);
 
-                    const bookings = await fetchNavanBookingsInRange(context, accessToken, { createdFrom, createdTo });
-                    summary.totals.fetched = bookings.length;
+                    let bookings = [];
+                    try {
+                        bookings = await fetchNavanBookingsInRange(context, accessToken, { createdFrom, createdTo });
+                        context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings from Navan`);
+                    } catch (fetchError) {
+                        context.log.error('navanImport: Error fetching bookings from Navan:', fetchError.message);
+                        context.log.error('navanImport: Fetch error stack:', fetchError.stack);
+                        summary.errors.push({
+                            message: `Failed to fetch bookings from Navan: ${fetchError.message}`,
+                            type: 'Fetch error'
+                        });
+                        // Return partial results instead of failing completely
+                        summary.skippedBookings = limitArray(summary.skippedBookings);
+                        summary.errors = limitArray(summary.errors);
+                        return {
+                            status: 200,
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*'
+                            },
+                            jsonBody: {
+                                success: false,
+                                error: 'Failed to fetch bookings from Navan',
+                                detail: fetchError.message,
+                                summary
+                            }
+                        };
+                    }
+                    summary.totals.fetched = bookings?.length || 0;
 
                     const processedKeys = new Set();
                     for (const booking of bookings) {
