@@ -3204,6 +3204,21 @@ app.http('navanImport', {
     authLevel: 'anonymous',
     route: 'navan-import',
     handler: async (request, context) => {
+        let summary = {
+            importType: 'range',
+            totals: {
+                fetched: 0,
+                processed: 0,
+                created: 0,
+                updated: 0,
+                skipped: 0
+            },
+            skippedBookings: [],
+            errors: []
+        };
+        
+        const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
+        
         try {
             ensureContextLogger(context);
 
@@ -3228,7 +3243,7 @@ app.http('navanImport', {
 
             const importType = (body.importType || 'range').toLowerCase();
 
-            const summary = {
+            summary = {
                 importType,
                 totals: {
                     fetched: 0,
@@ -3241,16 +3256,68 @@ app.http('navanImport', {
                 errors: []
             };
 
-            const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
-
             try {
-                const tokenResult = await fetchNavanAccessToken(context);
+                let tokenResult;
+                try {
+                    tokenResult = await fetchNavanAccessToken(context);
+                } catch (tokenError) {
+                    context.log.error('Error fetching Navan access token:', tokenError);
+                    summary.errors.push({
+                        message: `Failed to fetch Navan access token: ${tokenError.message}`,
+                        type: 'Token fetch error'
+                    });
+                    summary.skippedBookings = limitArray(summary.skippedBookings);
+                    summary.errors = limitArray(summary.errors);
+                    return {
+                        status: 200,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Access-Control-Allow-Origin': '*'
+                        },
+                        jsonBody: {
+                            success: false,
+                            error: 'Failed to authenticate with Navan',
+                            detail: tokenError.message,
+                            summary
+                        }
+                    };
+                }
+                
                 if (!tokenResult.success) {
-                    return tokenResult.response;
+                    summary.errors.push({
+                        message: tokenResult.response?.jsonBody?.detail || 'Failed to authenticate with Navan',
+                        type: 'Authentication error'
+                    });
+                    summary.skippedBookings = limitArray(summary.skippedBookings);
+                    summary.errors = limitArray(summary.errors);
+                    return {
+                        status: 200,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Access-Control-Allow-Origin': '*'
+                        },
+                        jsonBody: {
+                            success: false,
+                            error: 'Navan authentication failed',
+                            detail: tokenResult.response?.jsonBody?.detail || 'Unknown authentication error',
+                            summary
+                        }
+                    };
                 }
                 const accessToken = tokenResult.accessToken;
 
-                const crcList = await loadAllCrcs(context);
+                let crcList;
+                try {
+                    crcList = await loadAllCrcs(context);
+                } catch (crcError) {
+                    context.log.error('Error loading CRC list:', crcError);
+                    summary.errors.push({
+                        message: `Failed to load CRC list: ${crcError.message}`,
+                        type: 'CRC load error'
+                    });
+                    // Continue with empty CRC list - bookings will be skipped
+                    crcList = [];
+                }
                 const crcResolver = buildCrcResolver(crcList);
                 if (importType === 'list') {
                     if (!Array.isArray(body.bookings) || body.bookings.length === 0) {
@@ -3360,8 +3427,8 @@ app.http('navanImport', {
                         }
                     }
                 } else {
-                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 30;
-                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180;
+                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 365;
+                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 365;
 
                     let createdFrom = body.createdFrom ? parseInt(body.createdFrom, 10) : null;
                     let createdTo = body.createdTo ? parseInt(body.createdTo, 10) : null;
@@ -3473,8 +3540,24 @@ app.http('navanImport', {
                 }
             };
         } catch (outerError) {
-            context.log.error('navanImport outer error:', outerError.message);
-            context.log.error('navanImport outer stack:', outerError.stack);
+            try {
+                ensureContextLogger(context);
+                context.log.error('navanImport outer error:', outerError.message);
+                context.log.error('navanImport outer stack:', outerError.stack);
+            } catch (logError) {
+                // If logging fails, at least try to log to console
+                console.error('navanImport outer error:', outerError.message);
+                console.error('navanImport outer stack:', outerError.stack);
+            }
+            
+            summary.errors.push({
+                message: outerError.message || 'Unknown error',
+                type: 'Fatal error',
+                stack: outerError.stack
+            });
+            summary.skippedBookings = limitArray(summary.skippedBookings);
+            summary.errors = limitArray(summary.errors);
+            
             return {
                 status: 200,
                 headers: {
@@ -3484,22 +3567,8 @@ app.http('navanImport', {
                 jsonBody: {
                     success: false,
                     error: 'Navan import failed',
-                    detail: outerError.message,
-                    summary: {
-                        importType: 'range',
-                        totals: {
-                            fetched: 0,
-                            processed: 0,
-                            created: 0,
-                            updated: 0,
-                            skipped: 0
-                        },
-                        skippedBookings: [],
-                        errors: [{
-                            message: outerError.message,
-                            type: 'Fatal error'
-                        }]
-                    }
+                    detail: outerError.message || 'Unknown error occurred',
+                    summary
                 }
             };
         }
