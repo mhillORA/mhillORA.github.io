@@ -3119,6 +3119,30 @@
                 return incrementSequentialLabel(currentValue, 'V');
             };
             
+            // Role order matching Excel template
+            const ROLE_ORDER = [
+                'ICF', 'MedHx', 'EyeCup', 'CAE', 'Schirmers', 'Doc Tech', 'Dispense', 
+                'Tear Collection', 'Skin Test', 'Allergy Doc Tech', 'CAC (Timed)', 
+                'CAC (Titration)', 'Allergen', 'QC', 'SV', 'oversight', 'Travel'
+            ];
+            
+            const getRoleSortOrder = (roleName) => {
+                if (!roleName) return 9999;
+                const index = ROLE_ORDER.findIndex(r => r.toLowerCase() === roleName.toLowerCase());
+                return index >= 0 ? index : 9999;
+            };
+            
+            const sortRolesByExcelOrder = (roles) => {
+                return [...roles].sort((a, b) => {
+                    const aName = typeof a === 'string' ? a : (a?.name || '');
+                    const bName = typeof b === 'string' ? b : (b?.name || '');
+                    const aOrder = getRoleSortOrder(aName);
+                    const bOrder = getRoleSortOrder(bName);
+                    if (aOrder !== bOrder) return aOrder - bOrder;
+                    return aName.localeCompare(bName);
+                });
+            };
+            
             const getAllRoles = (events, rolesFromDB) => {
                 const rolesFromState = (rolesFromDB || []).map(r => r?.name).filter(Boolean);
                 const rolesFromEvents = new Set();
@@ -3137,9 +3161,7 @@
                 });
                 const combinedRoles = new Set([...rolesFromState, ...rolesFromEvents]);
                 combinedRoles.add(TRAINING_ROLE_NAME);
-                return Array.from(combinedRoles)
-                    .filter(Boolean)
-                .sort((a, b) => a.localeCompare(b));
+                return sortRolesByExcelOrder(Array.from(combinedRoles).filter(Boolean));
             };
             
             /**
@@ -3846,7 +3868,21 @@
 
                     crcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     sites.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                    let sanitizedStudies = Array.isArray(studies) ? studies.filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0) : [];
+                    
+                    // Helper function to check if a study is active
+                    const isStudyActive = (study) => {
+                        const statusString = String(study.status || study.state || study.phase || '').toLowerCase();
+                        const hasActiveFlag = study.active === true || study.isActive === true;
+                        const isNotCompleted = !statusString.includes('completed') && !statusString.includes('closed') && !statusString.includes('inactive');
+                        return hasActiveFlag || (isNotCompleted && statusString !== '');
+                    };
+                    
+                    let sanitizedStudies = Array.isArray(studies) ? studies.filter(study => {
+                        // Must have siteIds from ARTEMIS
+                        if (!Array.isArray(study.siteIds) || study.siteIds.length === 0) return false;
+                        // Must be active
+                        return isStudyActive(study);
+                    }) : [];
                     sanitizedStudies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
                     ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
@@ -4114,14 +4150,15 @@
 
             
             // --- NOTIFICATION & MODAL HANDLING ---
-            const showNotification = (message, type = 'info') => {
+            const showNotification = (message, type = 'info', duration = 4000, isLarge = false) => {
                 const colors = {
                     info: 'bg-blue-500',
                     success: 'bg-green-500',
                     error: 'bg-red-500',
                 };
                 const notification = document.createElement('div');
-                notification.className = `fixed bottom-5 right-5 ${colors[type]} text-white py-3 px-5 rounded-lg shadow-lg transform translate-y-20 opacity-0 transition-all duration-300 z-[101]`;
+                const sizeClasses = isLarge ? 'py-4 px-6 text-lg font-semibold' : 'py-3 px-5';
+                notification.className = `fixed bottom-5 right-5 ${colors[type]} text-white ${sizeClasses} rounded-lg shadow-lg transform translate-y-20 opacity-0 transition-all duration-300 z-[101]`;
                 notification.textContent = message;
                 document.body.appendChild(notification);
                 setTimeout(() => {
@@ -4129,8 +4166,8 @@
                 }, 10);
                 setTimeout(() => {
                     notification.classList.add('translate-y-20', 'opacity-0');
-                    setTimeout(() => notification.remove(), 4000);
-                }, 4000);
+                    setTimeout(() => notification.remove(), duration);
+                }, duration);
             };
 
             const openModal = (content, size = 'lg') => {
@@ -4164,11 +4201,24 @@
                 if (modalContainer.querySelector('#crc-event-form')) {
                     const form = modalContainer.querySelector('#crc-event-form');
                     const startDateInput = form.querySelector('input[name="startDate"]');
+                    const endDateInput = form.querySelector('input[name="endDate"]');
                     const crcSelect = form.querySelector('select[name="crcId"]');
                     updateCrcDropdownAvailability();
                     if (form.dataset.eventId && crcSelect.value) {
                         updateCrcHoursDisplay(crcSelect.value, startDateInput.value);
                     }
+                    
+                    // Auto-advance end date to next available date when start date is selected
+                    if (startDateInput && endDateInput) {
+                        startDateInput.addEventListener('change', (e) => {
+                            if (e.target.value && !endDateInput.value) {
+                                const startDate = new Date(e.target.value + 'T00:00:00');
+                                startDate.setDate(startDate.getDate() + 1);
+                                endDateInput.value = toDateOnlyString(startDate);
+                            }
+                        });
+                    }
+                    
                     form.querySelectorAll('input[type="date"], select').forEach(el => {
                         el.addEventListener('change', updateCrcDropdownAvailability);
                     });
@@ -4222,12 +4272,13 @@
                         if (duplicateVisitInput && !duplicateVisitInput.value && defaultVisit) {
                             duplicateVisitInput.value = defaultVisit;
                         }
+                        // Travel checkboxes default to unchecked - only create travel days when explicitly selected
                         if (duplicateStartTravelInput && !duplicateStartTravelInput.hasAttribute('data-initialized')) {
-                            if (!editingMode) duplicateStartTravelInput.checked = true;
+                            duplicateStartTravelInput.checked = false;
                             duplicateStartTravelInput.setAttribute('data-initialized', 'true');
                         }
                         if (duplicateEndTravelInput && !duplicateEndTravelInput.hasAttribute('data-initialized')) {
-                            if (!editingMode) duplicateEndTravelInput.checked = true;
+                            duplicateEndTravelInput.checked = false;
                             duplicateEndTravelInput.setAttribute('data-initialized', 'true');
                         }
                     };
@@ -4724,7 +4775,20 @@
                     ]);
 
                     if (updatedSites.length > 0 && updatedSites[0].name) updatedSites.sort((a, b) => a.name.localeCompare(b.name));
-                    let sanitizedUpdatedStudies = Array.isArray(updatedStudies) ? updatedStudies.filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0) : [];
+                    // Helper function to check if a study is active
+                    const isStudyActive = (study) => {
+                        const statusString = String(study.status || study.state || study.phase || '').toLowerCase();
+                        const hasActiveFlag = study.active === true || study.isActive === true;
+                        const isNotCompleted = !statusString.includes('completed') && !statusString.includes('closed') && !statusString.includes('inactive');
+                        return hasActiveFlag || (isNotCompleted && statusString !== '');
+                    };
+                    
+                    let sanitizedUpdatedStudies = Array.isArray(updatedStudies) ? updatedStudies.filter(study => {
+                        // Must have siteIds from ARTEMIS
+                        if (!Array.isArray(study.siteIds) || study.siteIds.length === 0) return false;
+                        // Must be active
+                        return isStudyActive(study);
+                    }) : [];
                     if (sanitizedUpdatedStudies.length > 0 && sanitizedUpdatedStudies[0].name) {
                         sanitizedUpdatedStudies = sanitizedUpdatedStudies.slice().sort((a, b) => a.name.localeCompare(b.name));
                     }
@@ -5298,6 +5362,50 @@
                     return eventDate >= startDate && eventDate <= endDate;
                 });
 
+                // Add time off requests as events for display
+                const timeOffRequests = state.timeOffRequests || [];
+                timeOffRequests.forEach(request => {
+                    if (!request.crcId) return;
+                    
+                    const requestStart = parseDateFlexible(request.startDate || request.date);
+                    const requestEnd = parseDateFlexible(request.endDate || request.startDate || request.date);
+                    if (!requestStart) return;
+                    
+                    const filterStart = new Date(state.allScheduleFilters.startDate + 'T00:00:00');
+                    const filterEnd = new Date(state.allScheduleFilters.endDate + 'T23:59:59');
+                    
+                    // Create an event for each day in the time off request range
+                    const currentDate = new Date(requestStart);
+                    const endDateObj = requestEnd ? new Date(requestEnd) : new Date(requestStart);
+                    
+                    while (currentDate <= endDateObj) {
+                        const dateStr = toDateOnlyString(currentDate);
+                        const dateObj = new Date(dateStr + 'T00:00:00');
+                        
+                        // Check if this date is within the filter range
+                        if (dateObj >= filterStart && dateObj <= filterEnd) {
+                            // Create a pseudo-event for the time off request
+                            const ptoEvent = {
+                                id: `pto-${request.id}-${dateStr}`,
+                                crcId: request.crcId,
+                                date: dateStr,
+                                type: 'Paid Time Off',
+                                name: 'Paid Time Off',
+                                period: request.period || 'Full Day',
+                                hours: request.hours || 8,
+                                notes: request.reason || request.notes || '',
+                                ptoRequestId: request.id,
+                                ptoStatus: normalizeTimeOffStatus(request.status),
+                                ptoStatusLabel: formatTimeOffStatus(request.status),
+                                isPTORequest: true
+                            };
+                            filteredEvents.push(ptoEvent);
+                        }
+                        
+                        currentDate.setDate(currentDate.getDate() + 1);
+                    }
+                });
+
                 // Apply filters
                 if (state.allScheduleFilters.crc !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.crcId === state.allScheduleFilters.crc);
@@ -5436,13 +5544,21 @@
                             }).join(', ') : 'None';
                             const roles = getEventRoles(event);
                             
+                            // Handle Site Staff display
+                            let crcDisplayName = 'Open Shift';
+                            if (event.crcId === 'SITE_STAFF') {
+                                crcDisplayName = 'Site Staff';
+                            } else if (crc) {
+                                crcDisplayName = crc.name;
+                            }
+                            
                             scheduleHTML += `
                                 <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
                                     <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
                                         ${index === 0 ? formattedDate : ''}
                                     </td>
                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
-                                        ${crc ? crc.name : 'Open Shift'}
+                                        ${crcDisplayName}
                                     </td>
                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                         ${roles.length > 0 ? roles.join(', ') : 'N/A'}
@@ -8222,7 +8338,20 @@
                 }
 
                 if (studyList) {
-                    const artemisStudies = (state.studies || []).filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0);
+                    // Helper function to check if a study is active
+                    const isStudyActive = (study) => {
+                        const statusString = String(study.status || study.state || study.phase || '').toLowerCase();
+                        const hasActiveFlag = study.active === true || study.isActive === true;
+                        const isNotCompleted = !statusString.includes('completed') && !statusString.includes('closed') && !statusString.includes('inactive');
+                        return hasActiveFlag || (isNotCompleted && statusString !== '');
+                    };
+                    
+                    const artemisStudies = (state.studies || []).filter(study => {
+                        // Must have siteIds from ARTEMIS
+                        if (!Array.isArray(study.siteIds) || study.siteIds.length === 0) return false;
+                        // Must be active
+                        return isStudyActive(study);
+                    });
                     const studiesHTML = artemisStudies && artemisStudies.length > 0 ? artemisStudies.map(study => `
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
                             <div class="flex items-center gap-2">
@@ -10788,9 +10917,22 @@
 
             const renderDashboardCharts = () => {
                 // Define helper functions first
+                // Helper function to check if a study is active
+                const isStudyActive = (study) => {
+                    const statusString = String(study.status || study.state || study.phase || '').toLowerCase();
+                    const hasActiveFlag = study.active === true || study.isActive === true;
+                    const isNotCompleted = !statusString.includes('completed') && !statusString.includes('closed') && !statusString.includes('inactive');
+                    return hasActiveFlag || (isNotCompleted && statusString !== '');
+                };
+                
                 const artemisStudyIds = new Set(
                     (state.studies || [])
-                        .filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0)
+                        .filter(study => {
+                            // Must have siteIds from ARTEMIS
+                            if (!Array.isArray(study.siteIds) || study.siteIds.length === 0) return false;
+                            // Must be active
+                            return isStudyActive(study);
+                        })
                         .map(study => study.id)
                 );
                 const getValidStudyIdsForEvent = (event) => {
@@ -11744,10 +11886,10 @@
                             </div>
                         </div>
                         <div id="travel-day-group" class="${show.travel ? '' : 'hidden'} space-y-2 border-t dark:border-gray-700 pt-4">
-                            <label class="block text-sm font-medium dark:text-gray-300">Include Travel Days</label>
-                            <div class="flex items-center space-x-4">
-                                <label class="flex items-center"><input type="checkbox" name="includeStartTravel" ${!isEditing ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"> <span class="ml-2 text-sm">Travel Day at Start</span></label>
-                                <label class="flex items-center"><input type="checkbox" name="includeEndTravel" ${!isEditing ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"> <span class="ml-2 text-sm">Travel Day at End</span></label>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Travel Days</label>
+                            <p class="text-xs text-gray-600 dark:text-gray-400 mb-3">Select which staff members need travel days. Travel days will be created only for selected staff. Hours will be pulled from Navan flight data when available.</p>
+                            <div id="travel-selection-container" class="space-y-2">
+                                <p class="text-sm text-gray-500 dark:text-gray-400">Assign staff to roles first to see travel options.</p>
                             </div>
                         </div>
                         
@@ -11761,6 +11903,25 @@
                             <div id="site-group">
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Site</label>
                                 <select name="siteId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Site</option>${siteOptions}</select>
+                            </div>
+                        </div>
+                        
+                        <!-- Visit Information (shown after site selection) -->
+                        <div id="visit-group" class="${show.visit ? '' : 'hidden'} space-y-4 border-t dark:border-gray-700 pt-4">
+                            <h3 class="text-lg font-semibold dark:text-white">Visit Information</h3>
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Group Number</label>
+                                    <input type="text" name="groupNumber" value="${event ? event.groupNumber || '' : ''}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., G1">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit Number</label>
+                                    <input type="text" name="visitNumber" value="${event ? event.visitNumber || '' : ''}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Principal Investigator</label>
+                                    <input type="text" name="principalInvestigator" value="${event ? event.principalInvestigator || '' : ''}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Defaults to site PI">
+                                </div>
                             </div>
                         </div>
                         
@@ -11780,21 +11941,6 @@
                                 ${!isEditing ? crcOptions : `<option value="">Select CRC</option>${crcOptions}`}
                             </select>
                             <div id="crc-hours-info" class="text-sm mt-2 h-5 text-gray-600 dark:text-gray-400"></div>
-                        </div>
-                        
-                        <div id="visit-group" class="${show.visit ? '' : 'hidden'} grid grid-cols-1 sm:grid-cols-3 gap-4">
-                            <div>
-                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Group Number</label>
-                                <input type="text" name="groupNumber" value="${event ? event.groupNumber || '' : ''}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., G1">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit Number</label>
-                                <input type="text" name="visitNumber" value="${event ? event.visitNumber || '' : ''}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Principal Investigator</label>
-                                <input type="text" name="principalInvestigator" value="${event ? event.principalInvestigator || '' : ''}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Defaults to site PI">
-                            </div>
                         </div>
                         <div id="mileage-group" class="${show.mileage ? '' : 'hidden'}">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Mileage</label>
@@ -11838,11 +11984,11 @@
                                 </div>
                                 <div class="flex items-center gap-4">
                                     <label class="flex items-center space-x-2 text-xs text-gray-600 dark:text-gray-300">
-                                        <input type="checkbox" name="duplicateIncludeStartTravel" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" ${!isEditing ? 'checked' : ''}>
+                                        <input type="checkbox" name="duplicateIncludeStartTravel" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                                         <span>Include travel day before start</span>
                                     </label>
                                     <label class="flex items-center space-x-2 text-xs text-gray-600 dark:text-gray-300">
-                                        <input type="checkbox" name="duplicateIncludeEndTravel" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" ${!isEditing ? 'checked' : ''}>
+                                        <input type="checkbox" name="duplicateIncludeEndTravel" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                                         <span>Include travel day after end</span>
                                     </label>
                                 </div>
@@ -16913,6 +17059,35 @@
                                 const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...payload };
                                 state.crc_events = [...state.crc_events, createdEvent];
                             };
+                            
+                            // Helper to get travel hours from Navan data
+                            const getTravelHoursForCrc = (crcId, travelDate) => {
+                                if (!travelDate || !state.travel) return null;
+                                const crc = state.crcs.find(c => c.id === crcId);
+                                if (!crc) return null;
+                                
+                                const crcNameLower = (crc.name || '').toLowerCase();
+                                const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
+                                
+                                const travelRecord = (state.travel || []).find(travel => {
+                                    if (!travel) return false;
+                                    const travelCrcId = travel.crcId;
+                                    if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                        if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                    }
+                                    
+                                    const travelDate = getTravelPrimaryDate(travel);
+                                    if (!travelDate) return false;
+                                    const travelDateOnly = toDateOnlyString(travelDate);
+                                    return travelDateOnly === travelDateStr;
+                                });
+                                
+                                if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
+                                    return travelRecord.flightDuration || travelRecord.hours || 8;
+                                }
+                                return null;
+                            };
+                            
                             if (eventType === 'Site Assignment') {
                                 if (assignedCrcs.size === 0) {
                                     showNotification('Duplicate schedule skipped: no staff selected.', 'warning');
@@ -16926,19 +17101,36 @@
                                             if (roleObj) rolesForCrc.push(roleObj.name);
                                         }
                                     });
+                                    // Only create travel days if explicitly checked
                                     if (includeStartTravelDuplicate) {
                                         const startTravelDate = new Date(startDateDuplicate);
                                         startTravelDate.setDate(startTravelDate.getDate() - 1);
-                                        const travelPayload = {
-                                            ...duplicateBase,
-                                            name: 'Travel Day',
-                                            crcId,
-                                            roles: [],
-                                            date: toDateOnlyString(startTravelDate),
-                                            groupId: groupIdDuplicate,
-                                            type: 'Travel Day'
-                                        };
-                                        await createAndStoreEvent(travelPayload);
+                                        const startTravelDateStr = toDateOnlyString(startTravelDate);
+                                        
+                                        // Check if travel day already exists for this CRC on this date
+                                        const existingTravelDay = state.crc_events.find(e => 
+                                            e.crcId === crcId && 
+                                            e.date === startTravelDateStr && 
+                                            e.type === 'Travel Day'
+                                        );
+                                        
+                                        // Only create if it doesn't already exist
+                                        if (!existingTravelDay) {
+                                            const travelHours = getTravelHoursForCrc(crcId, startTravelDateStr) || 8;
+                                            const travelPayload = {
+                                                ...duplicateBase,
+                                                name: 'Travel Day',
+                                                crcId,
+                                                roles: [],
+                                                date: startTravelDateStr,
+                                                groupId: groupIdDuplicate,
+                                                type: 'Travel Day',
+                                                hours: travelHours
+                                            };
+                                            await createAndStoreEvent(travelPayload);
+                                        } else {
+                                            console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation in duplicate schedule');
+                                        }
                                     }
                                     const dayCursor = new Date(startDateDuplicate);
                                     while (dayCursor <= endDateDuplicate) {
@@ -16955,19 +17147,36 @@
                                         await createAndStoreEvent(assignmentPayload);
                                         dayCursor.setDate(dayCursor.getDate() + 1);
                                     }
+                                    // Only create travel days if explicitly checked
                                     if (includeEndTravelDuplicate) {
                                         const endTravelDate = new Date(endDateDuplicate);
                                         endTravelDate.setDate(endTravelDate.getDate() + 1);
-                                        const travelPayload = {
-                                            ...duplicateBase,
-                                            name: 'Travel Day',
-                                            crcId,
-                                            roles: [],
-                                            date: toDateOnlyString(endTravelDate),
-                                            groupId: groupIdDuplicate,
-                                            type: 'Travel Day'
-                                        };
-                                        await createAndStoreEvent(travelPayload);
+                                        const endTravelDateStr = toDateOnlyString(endTravelDate);
+                                        
+                                        // Check if travel day already exists for this CRC on this date
+                                        const existingTravelDay = state.crc_events.find(e => 
+                                            e.crcId === crcId && 
+                                            e.date === endTravelDateStr && 
+                                            e.type === 'Travel Day'
+                                        );
+                                        
+                                        // Only create if it doesn't already exist
+                                        if (!existingTravelDay) {
+                                            const travelHours = getTravelHoursForCrc(crcId, endTravelDateStr) || 8;
+                                            const travelPayload = {
+                                                ...duplicateBase,
+                                                name: 'Travel Day',
+                                                crcId,
+                                                roles: [],
+                                                date: endTravelDateStr,
+                                                groupId: groupIdDuplicate,
+                                                type: 'Travel Day',
+                                                hours: travelHours
+                                            };
+                                            await createAndStoreEvent(travelPayload);
+                                        } else {
+                                            console.log('Travel day already exists for CRC:', crcId, 'on date:', endTravelDateStr, '- skipping creation in duplicate schedule');
+                                        }
                                     }
                                 }
                                 showNotification('Next group/visit scheduled successfully!', 'success');
@@ -17025,6 +17234,31 @@
                                             roleAssignments[roleId][parseInt(index)] = input.value;
                                         }
                                     });
+                                }
+                                
+                                // Check for duplicate CRC assignments across all roles
+                                const crcAssignmentCount = new Map();
+                                const duplicateCrcs = new Set();
+                                Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                                    assignments.forEach(crcId => {
+                                        if (crcId) {
+                                            const count = (crcAssignmentCount.get(crcId) || 0) + 1;
+                                            crcAssignmentCount.set(crcId, count);
+                                            if (count > 1) {
+                                                duplicateCrcs.add(crcId);
+                                            }
+                                        }
+                                    });
+                                });
+                                
+                                // If duplicates found, show error and prevent submission
+                                if (duplicateCrcs.size > 0) {
+                                    const duplicateNames = Array.from(duplicateCrcs).map(crcId => {
+                                        const crc = state.crcs.find(c => c.id === crcId);
+                                        return crc ? crc.name : crcId;
+                                    });
+                                    showNotification(`Cannot assign the same person to multiple roles: ${duplicateNames.join(', ')}. Please remove duplicate assignments.`, 'error');
+                                    return;
                                 }
 
                                 const baseEventData = {
@@ -17086,9 +17320,6 @@
                                     // Batch operations replaced with individual API calls
                                     const startDate = new Date(startDateObj.getTime());
                                     const endDate = new Date(endDateObj.getTime());
-                                    const includeStartTravel = data.includeStartTravel === 'on';
-                                    const includeEndTravel = data.includeEndTravel === 'on';
-                                    console.log('Travel day settings:', { includeStartTravel, includeEndTravel, data: data.includeStartTravel, data2: data.includeEndTravel });
                                     
                                     // For Site Assignment with role assignments, create separate events for each assigned CRC
                                     if (eventType === 'Site Assignment' && Object.keys(roleAssignments).length > 0) {
@@ -17108,17 +17339,72 @@
                                                 }
                                             });
                                             
-                                            // Create start travel day if requested (day before start date)
-                                            if (includeStartTravel) {
+                                            // Check per-CRC travel checkboxes - only create travel days if explicitly checked
+                                            const includeStartTravelForCrc = form.querySelector(`input[name="travel-start-${crcId}"]`)?.checked === true;
+                                            const includeEndTravelForCrc = form.querySelector(`input[name="travel-end-${crcId}"]`)?.checked === true;
+                                            
+                                            // Create start travel day only if checkbox is checked for this CRC
+                                            if (includeStartTravelForCrc) {
                                                 const startTravelDate = new Date(startDate);
                                                 startTravelDate.setDate(startTravelDate.getDate() - 1);
                                                 const startTravelDateStr = toDateOnlyString(startTravelDate);
-                                                const startTravelEventRef = null;
-                                                const startTravelEventData = { ...baseEventData, name: 'Travel Day', crcId, roles: [], date: startTravelDateStr, groupId, type: 'Travel Day' };
-                                                console.log('Creating start travel day for:', startTravelDateStr, 'with data:', startTravelEventData);
-                                                const created = await apiService.createEvent(startTravelEventData);
-                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
-                                                state.crc_events = [...state.crc_events, createdEvent];
+                                                
+                                                // Check if travel day already exists for this CRC on this date
+                                                const existingTravelDay = state.crc_events.find(e => 
+                                                    e.crcId === crcId && 
+                                                    e.date === startTravelDateStr && 
+                                                    e.type === 'Travel Day'
+                                                );
+                                                
+                                                // Only create if it doesn't already exist
+                                                if (!existingTravelDay) {
+                                                    // Get travel hours from Navan data if available
+                                                    const getTravelHoursForCrc = (crcId, travelDate) => {
+                                                        if (!travelDate || !state.travel) return null;
+                                                        const crc = state.crcs.find(c => c.id === crcId);
+                                                        if (!crc) return null;
+                                                        
+                                                        const crcNameLower = (crc.name || '').toLowerCase();
+                                                        const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
+                                                        
+                                                        const travelRecord = (state.travel || []).find(travel => {
+                                                            if (!travel) return false;
+                                                            const travelCrcId = travel.crcId;
+                                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                                            }
+                                                            
+                                                            const travelDate = getTravelPrimaryDate(travel);
+                                                            if (!travelDate) return false;
+                                                            const travelDateOnly = toDateOnlyString(travelDate);
+                                                            return travelDateOnly === travelDateStr;
+                                                        });
+                                                        
+                                                        if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
+                                                            return travelRecord.flightDuration || travelRecord.hours || 8;
+                                                        }
+                                                        return null;
+                                                    };
+                                                    
+                                                    const travelHours = getTravelHoursForCrc(crcId, startTravelDateStr) || 8;
+                                                    
+                                                    const startTravelEventData = { 
+                                                        ...baseEventData, 
+                                                        name: 'Travel Day', 
+                                                        crcId, 
+                                                        roles: [], 
+                                                        date: startTravelDateStr, 
+                                                        groupId, 
+                                                        type: 'Travel Day',
+                                                        hours: travelHours
+                                                    };
+                                                    console.log('Creating start travel day for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours);
+                                                    const created = await apiService.createEvent(startTravelEventData);
+                                                    const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
+                                                    state.crc_events = [...state.crc_events, createdEvent];
+                                                } else {
+                                                    console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation');
+                                                }
                                             }
                                             
                                             // Create main assignment events
@@ -17131,17 +17417,68 @@
                                                 state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                             
-                                            // Create end travel day if requested (day after end date)
-                                            if (includeEndTravel) {
+                                            // Create end travel day only if checkbox is checked for this CRC
+                                            if (includeEndTravelForCrc) {
                                                 const endTravelDate = new Date(endDate);
                                                 endTravelDate.setDate(endTravelDate.getDate() + 1);
                                                 const endTravelDateStr = toDateOnlyString(endTravelDate);
-                                                const endTravelEventRef = null;
-                                                const endTravelEventData = { ...baseEventData, name: 'Travel Day', crcId, roles: [], date: endTravelDateStr, groupId, type: 'Travel Day' };
-                                                console.log('Creating end travel day for:', endTravelDateStr, 'with data:', endTravelEventData);
-                                                const created = await apiService.createEvent(endTravelEventData);
-                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
-                                                state.crc_events = [...state.crc_events, createdEvent];
+                                                
+                                                // Check if travel day already exists for this CRC on this date
+                                                const existingTravelDay = state.crc_events.find(e => 
+                                                    e.crcId === crcId && 
+                                                    e.date === endTravelDateStr && 
+                                                    e.type === 'Travel Day'
+                                                );
+                                                
+                                                // Only create if it doesn't already exist
+                                                if (!existingTravelDay) {
+                                                    // Get travel hours from Navan data if available
+                                                    const getTravelHoursForCrc = (crcId, travelDate) => {
+                                                        if (!travelDate || !state.travel) return null;
+                                                        const crc = state.crcs.find(c => c.id === crcId);
+                                                        if (!crc) return null;
+                                                        
+                                                        const crcNameLower = (crc.name || '').toLowerCase();
+                                                        const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
+                                                        
+                                                        const travelRecord = (state.travel || []).find(travel => {
+                                                            if (!travel) return false;
+                                                            const travelCrcId = travel.crcId;
+                                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                                            }
+                                                            
+                                                            const travelDate = getTravelPrimaryDate(travel);
+                                                            if (!travelDate) return false;
+                                                            const travelDateOnly = toDateOnlyString(travelDate);
+                                                            return travelDateOnly === travelDateStr;
+                                                        });
+                                                        
+                                                        if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
+                                                            return travelRecord.flightDuration || travelRecord.hours || 8;
+                                                        }
+                                                        return null;
+                                                    };
+                                                    
+                                                    const travelHours = getTravelHoursForCrc(crcId, endTravelDateStr) || 8;
+                                                    
+                                                    const endTravelEventData = { 
+                                                        ...baseEventData, 
+                                                        name: 'Travel Day', 
+                                                        crcId, 
+                                                        roles: [], 
+                                                        date: endTravelDateStr, 
+                                                        groupId, 
+                                                        type: 'Travel Day',
+                                                        hours: travelHours
+                                                    };
+                                                    console.log('Creating end travel day for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours);
+                                                    const created = await apiService.createEvent(endTravelEventData);
+                                                    const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
+                                                    state.crc_events = [...state.crc_events, createdEvent];
+                                                } else {
+                                                    console.log('Travel day already exists for CRC:', crcId, 'on date:', endTravelDateStr, '- skipping creation');
+                                                }
                                             }
                                         }
                                     } else {
@@ -17150,17 +17487,72 @@
                                         for (const crcId of targetCrcs) {
                                             const roles = crcId ? formData.getAll(`roles-${crcId}`) : [];
                                             
-                                            // Create start travel day if requested (day before start date)
-                                            if (eventType === 'Site Assignment' && includeStartTravel) {
+                                            // Check per-CRC travel checkboxes - only create travel days if explicitly checked
+                                            const includeStartTravelForCrc = crcId ? (form.querySelector(`input[name="travel-start-${crcId}"]`)?.checked === true) : false;
+                                            const includeEndTravelForCrc = crcId ? (form.querySelector(`input[name="travel-end-${crcId}"]`)?.checked === true) : false;
+                                            
+                                            // Create start travel day only if checkbox is checked for this CRC
+                                            if (eventType === 'Site Assignment' && includeStartTravelForCrc && crcId) {
                                                 const startTravelDate = new Date(startDate);
                                                 startTravelDate.setDate(startTravelDate.getDate() - 1);
                                                 const startTravelDateStr = toDateOnlyString(startTravelDate);
-                                                const startTravelEventRef = null;
-                                                const startTravelEventData = { ...baseEventData, name: 'Travel Day', crcId, roles: [], date: startTravelDateStr, groupId, type: 'Travel Day' };
-                                                console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'with data:', startTravelEventData);
-                                                const created = await apiService.createEvent(startTravelEventData);
-                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
-                                                state.crc_events = [...state.crc_events, createdEvent];
+                                                
+                                                // Check if travel day already exists for this CRC on this date
+                                                const existingTravelDay = state.crc_events.find(e => 
+                                                    e.crcId === crcId && 
+                                                    e.date === startTravelDateStr && 
+                                                    e.type === 'Travel Day'
+                                                );
+                                                
+                                                // Only create if it doesn't already exist
+                                                if (!existingTravelDay) {
+                                                    // Get travel hours from Navan data if available
+                                                    const getTravelHoursForCrc = (crcId, travelDate) => {
+                                                        if (!travelDate || !state.travel) return null;
+                                                        const crc = state.crcs.find(c => c.id === crcId);
+                                                        if (!crc) return null;
+                                                        
+                                                        const crcNameLower = (crc.name || '').toLowerCase();
+                                                        const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
+                                                        
+                                                        const travelRecord = (state.travel || []).find(travel => {
+                                                            if (!travel) return false;
+                                                            const travelCrcId = travel.crcId;
+                                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                                            }
+                                                            
+                                                            const travelDate = getTravelPrimaryDate(travel);
+                                                            if (!travelDate) return false;
+                                                            const travelDateOnly = toDateOnlyString(travelDate);
+                                                            return travelDateOnly === travelDateStr;
+                                                        });
+                                                        
+                                                        if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
+                                                            return travelRecord.flightDuration || travelRecord.hours || 8;
+                                                        }
+                                                        return null;
+                                                    };
+                                                    
+                                                    const travelHours = getTravelHoursForCrc(crcId, startTravelDateStr) || 8;
+                                                    
+                                                    const startTravelEventData = { 
+                                                        ...baseEventData, 
+                                                        name: 'Travel Day', 
+                                                        crcId, 
+                                                        roles: [], 
+                                                        date: startTravelDateStr, 
+                                                        groupId, 
+                                                        type: 'Travel Day',
+                                                        hours: travelHours
+                                                    };
+                                                    console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours);
+                                                    const created = await apiService.createEvent(startTravelEventData);
+                                                    const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
+                                                    state.crc_events = [...state.crc_events, createdEvent];
+                                                } else {
+                                                    console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation');
+                                                }
                                             }
                                             
                                             // Create main assignment events
@@ -17178,17 +17570,68 @@
                                                 state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                             
-                                            // Create end travel day if requested (day after end date)
-                                            if (eventType === 'Site Assignment' && includeEndTravel) {
+                                            // Create end travel day only if checkbox is checked for this CRC
+                                            if (eventType === 'Site Assignment' && includeEndTravelForCrc && crcId) {
                                                 const endTravelDate = new Date(endDate);
                                                 endTravelDate.setDate(endTravelDate.getDate() + 1);
                                                 const endTravelDateStr = toDateOnlyString(endTravelDate);
-                                                const endTravelEventRef = null;
-                                                const endTravelEventData = { ...baseEventData, name: 'Travel Day', crcId, roles: [], date: endTravelDateStr, groupId, type: 'Travel Day' };
-                                                console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'with data:', endTravelEventData);
-                                                const created = await apiService.createEvent(endTravelEventData);
-                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
-                                                state.crc_events = [...state.crc_events, createdEvent];
+                                                
+                                                // Check if travel day already exists for this CRC on this date
+                                                const existingTravelDay = state.crc_events.find(e => 
+                                                    e.crcId === crcId && 
+                                                    e.date === endTravelDateStr && 
+                                                    e.type === 'Travel Day'
+                                                );
+                                                
+                                                // Only create if it doesn't already exist
+                                                if (!existingTravelDay) {
+                                                    // Get travel hours from Navan data if available
+                                                    const getTravelHoursForCrc = (crcId, travelDate) => {
+                                                        if (!travelDate || !state.travel) return null;
+                                                        const crc = state.crcs.find(c => c.id === crcId);
+                                                        if (!crc) return null;
+                                                        
+                                                        const crcNameLower = (crc.name || '').toLowerCase();
+                                                        const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
+                                                        
+                                                        const travelRecord = (state.travel || []).find(travel => {
+                                                            if (!travel) return false;
+                                                            const travelCrcId = travel.crcId;
+                                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                                            }
+                                                            
+                                                            const travelDate = getTravelPrimaryDate(travel);
+                                                            if (!travelDate) return false;
+                                                            const travelDateOnly = toDateOnlyString(travelDate);
+                                                            return travelDateOnly === travelDateStr;
+                                                        });
+                                                        
+                                                        if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
+                                                            return travelRecord.flightDuration || travelRecord.hours || 8;
+                                                        }
+                                                        return null;
+                                                    };
+                                                    
+                                                    const travelHours = getTravelHoursForCrc(crcId, endTravelDateStr) || 8;
+                                                    
+                                                    const endTravelEventData = { 
+                                                        ...baseEventData, 
+                                                        name: 'Travel Day', 
+                                                        crcId, 
+                                                        roles: [], 
+                                                        date: endTravelDateStr, 
+                                                        groupId, 
+                                                        type: 'Travel Day',
+                                                        hours: travelHours
+                                                    };
+                                                    console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours);
+                                                    const created = await apiService.createEvent(endTravelEventData);
+                                                    const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
+                                                    state.crc_events = [...state.crc_events, createdEvent];
+                                                } else {
+                                                    console.log('Travel day already exists for CRC:', crcId, 'on date:', endTravelDateStr, '- skipping creation');
+                                                }
                                             }
                                         }
                                     }
@@ -17238,7 +17681,13 @@
                                         crcNames
                                     });
                                 }
-                                showNotification(isEditing ? 'Shift updated!' : 'Shift(s) created!', 'success');
+                                // Show bigger success message
+                                const successMessage = isEditing ? 'Shift updated successfully!' : 'Shift(s) created successfully!';
+                                showNotification(successMessage, 'success', 5000, true);
+                                // Auto-close modal after a short delay
+                                setTimeout(() => {
+                                    closeModal();
+                                }, 1500);
                             } catch (err) {
                                 console.error("Error submitting form:", err);
                                 showNotification('An error occurred.', 'error');
@@ -18450,6 +18899,7 @@
                                                         <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
                                                         <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                             <option value="">Select Staff</option>
+                                                            <option value="SITE_STAFF" ${crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
                                                             ${qualifiedCrcs.map(c => {
                                                                 const isUnavailable = isCRCUnavailable(c.id, date, period);
                                                                 const unavailPeriod = getUnavailabilityPeriod(c.id, date);
@@ -18505,6 +18955,7 @@
                                                 <label class="text-sm text-gray-600 dark:text-gray-400 w-16">1:</label>
                                                 <select name="role-legacy-0" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                     <option value="">Select Staff</option>
+                                                    <option value="SITE_STAFF" ${existingEvent.crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
                                                     ${qualifiedCrcs.map(c => {
                                                         const isUnavailable = isCRCUnavailable(c.id, date, period);
                                                         const unavailPeriod = getUnavailabilityPeriod(c.id, date);
@@ -18613,8 +19064,11 @@
                         </div>
                     `;
                     
+                    // Sort roles by Excel order before processing
+                    const sortedRoles = sortRolesByExcelOrder(state.roles);
+                    
                     // Process roles sequentially to handle async distance calculations
-                    for (const role of state.roles) {
+                    for (const role of sortedRoles) {
                         const roleName = (role?.name || '').trim();
                         if (!roleName) continue;
                         const roleKey = roleName.toLowerCase();
@@ -18679,7 +19133,12 @@
                         
                         const buildRoleOptions = (slotIndex) => {
                         const assignedCrcId = existingAssignments[slotIndex] || '';
-                        let optionsHtml = crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, hasPending }) => {
+                        // Add "Site Staff" option first
+                        const siteStaffSelected = assignedCrcId === 'SITE_STAFF' ? 'selected' : '';
+                        let optionsHtml = `<option value="SITE_STAFF" ${siteStaffSelected} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
+                        
+                        // Add CRC options
+                        optionsHtml += crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, hasPending }) => {
                             let statusText = '';
                             if (isUnavailable) {
                                 const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
@@ -18739,8 +19198,20 @@
                 let roleAssignmentHTML = '<div class="space-y-4">';
                 console.log('Generating role assignment interface for', requiredRoles.size, 'roles');
                 
+                // Sort roles by Excel order before processing
+                const sortedRoleEntries = Array.from(requiredRoles.entries()).sort(([roleIdA], [roleIdB]) => {
+                    const roleA = state.roles.find(r => r.id === roleIdA);
+                    const roleB = state.roles.find(r => r.id === roleIdB);
+                    const aName = roleA?.name || '';
+                    const bName = roleB?.name || '';
+                    const aOrder = getRoleSortOrder(aName);
+                    const bOrder = getRoleSortOrder(bName);
+                    if (aOrder !== bOrder) return aOrder - bOrder;
+                    return aName.localeCompare(bName);
+                });
+                
                 // Process roles sequentially to handle async distance calculations
-                for (const [roleId, quantity] of requiredRoles.entries()) {
+                for (const [roleId, quantity] of sortedRoleEntries) {
                     const role = state.roles.find(r => r.id === roleId);
                     if (!role) {
                         console.log('Role not found for ID:', roleId);
@@ -18807,7 +19278,12 @@
                     
                     const buildRoleOptions = (slotIndex) => {
                         const assignedCrcId = existingAssignments[slotIndex] || '';
-                        let optionsHtml = crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, hasPending }) => {
+                        // Add "Site Staff" option first
+                        const siteStaffSelected = assignedCrcId === 'SITE_STAFF' ? 'selected' : '';
+                        let optionsHtml = `<option value="SITE_STAFF" ${siteStaffSelected} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
+                        
+                        // Add CRC options
+                        optionsHtml += crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, hasPending }) => {
                             let statusText = '';
                             if (isUnavailable) {
                                 const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
@@ -18860,6 +19336,57 @@
                 roleAssignmentHTML += '</div>';
                 roleAssignmentContainer.innerHTML = roleAssignmentHTML;
                 console.log('Role assignment HTML generated and inserted');
+                
+                // Function to check for duplicate assignments and highlight them
+                const checkForDuplicateAssignments = () => {
+                    const form = document.getElementById('crc-event-form');
+                    if (!form) return;
+                    
+                    const roleSelects = form.querySelectorAll('select[name^="role-"]');
+                    const crcAssignmentCount = new Map();
+                    
+                    // Count assignments
+                    roleSelects.forEach(select => {
+                        if (select.value) {
+                            const count = (crcAssignmentCount.get(select.value) || 0) + 1;
+                            crcAssignmentCount.set(select.value, count);
+                        }
+                    });
+                    
+                    // Highlight duplicates
+                    roleSelects.forEach(select => {
+                        const crcId = select.value;
+                        if (crcId && crcAssignmentCount.get(crcId) > 1) {
+                            select.classList.add('border-red-500', 'border-2');
+                            select.classList.remove('border-gray-300', 'dark:border-gray-600');
+                            // Add error message if not already present
+                            let errorMsg = select.parentElement.querySelector('.duplicate-error');
+                            if (!errorMsg) {
+                                errorMsg = document.createElement('div');
+                                errorMsg.className = 'duplicate-error text-xs text-red-600 dark:text-red-400 mt-1';
+                                select.parentElement.appendChild(errorMsg);
+                            }
+                            const crc = state.crcs.find(c => c.id === crcId);
+                            errorMsg.textContent = `⚠️ ${crc ? crc.name : crcId} is assigned to multiple roles`;
+                        } else {
+                            select.classList.remove('border-red-500', 'border-2');
+                            select.classList.add('border-gray-300', 'dark:border-gray-600');
+                            const errorMsg = select.parentElement.querySelector('.duplicate-error');
+                            if (errorMsg) {
+                                errorMsg.remove();
+                            }
+                        }
+                    });
+                };
+                
+                // Add event listeners to role selects for duplicate checking
+                roleAssignmentContainer.querySelectorAll('select[name^="role-"]').forEach(select => {
+                    select.addEventListener('change', checkForDuplicateAssignments);
+                });
+                
+                // Initial duplicate check
+                setTimeout(checkForDuplicateAssignments, 100);
+                
                 if (currentDuplicatePanelController && typeof currentDuplicatePanelController.refresh === 'function') {
                     try {
                         currentDuplicatePanelController.refresh();
@@ -22309,7 +22836,21 @@
                     console.log('CHAOS: Sorting data...');
                     crcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     sites.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                    let sanitizedStudies = Array.isArray(studies) ? studies.filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0) : [];
+                    
+                    // Helper function to check if a study is active
+                    const isStudyActive = (study) => {
+                        const statusString = String(study.status || study.state || study.phase || '').toLowerCase();
+                        const hasActiveFlag = study.active === true || study.isActive === true;
+                        const isNotCompleted = !statusString.includes('completed') && !statusString.includes('closed') && !statusString.includes('inactive');
+                        return hasActiveFlag || (isNotCompleted && statusString !== '');
+                    };
+                    
+                    let sanitizedStudies = Array.isArray(studies) ? studies.filter(study => {
+                        // Must have siteIds from ARTEMIS
+                        if (!Array.isArray(study.siteIds) || study.siteIds.length === 0) return false;
+                        // Must be active
+                        return isStudyActive(study);
+                    }) : [];
                     sanitizedStudies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
                     ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
