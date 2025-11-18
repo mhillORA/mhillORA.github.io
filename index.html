@@ -3608,8 +3608,8 @@
 
             const DATA_REFRESH_INTERVAL_MS = 30000;
             const NAVAN_CONNECTION_CHECK_INTERVAL_MS = 120000;
-            const DEFAULT_NAVAN_PAST_DAYS = 30;
-            const DEFAULT_NAVAN_FUTURE_DAYS = 180;
+            const DEFAULT_NAVAN_PAST_DAYS = 365;
+            const DEFAULT_NAVAN_FUTURE_DAYS = 365;
             let dataRefreshTimerId = null;
             let isRefreshingData = false;
 
@@ -3654,15 +3654,35 @@
 
                     crcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     sites.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                    studies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
+                    let sanitizedStudies = Array.isArray(studies) ? studies.filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0) : [];
+                    sanitizedStudies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
                     ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+                    const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
+                    const sanitizedEvents = Array.isArray(events) ? events.reduce((acc, event) => {
+                        if (Array.isArray(event.studyIds) && event.studyIds.length > 0) {
+                            const filteredIds = event.studyIds.filter(studyId => artemisStudyIdsSet.has(studyId));
+                            if (filteredIds.length === 0) {
+                                if (event.type === 'Site Assignment') {
+                                    return acc;
+                                }
+                                acc.push({ ...event, studyIds: [] });
+                                return acc;
+                            }
+                            if (filteredIds.length !== event.studyIds.length) {
+                                acc.push({ ...event, studyIds: filteredIds });
+                                return acc;
+                            }
+                        }
+                        acc.push(event);
+                        return acc;
+                    }, []) : events;
 
                     const updates = {
                         crcs,
                         crc_sites: sites,
-                        studies,
-                        crc_events: events,
+                        studies: sanitizedStudies,
+                        crc_events: sanitizedEvents,
                         roles,
                         training_types,
                         timeOffRequests,
@@ -4442,12 +4462,15 @@
                     ]);
 
                     if (updatedSites.length > 0 && updatedSites[0].name) updatedSites.sort((a, b) => a.name.localeCompare(b.name));
-                    if (updatedStudies.length > 0 && updatedStudies[0].name) updatedStudies.sort((a, b) => a.name.localeCompare(b.name));
+                    let sanitizedUpdatedStudies = Array.isArray(updatedStudies) ? updatedStudies.filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0) : [];
+                    if (sanitizedUpdatedStudies.length > 0 && sanitizedUpdatedStudies[0].name) {
+                        sanitizedUpdatedStudies = sanitizedUpdatedStudies.slice().sort((a, b) => a.name.localeCompare(b.name));
+                    }
 
                     setState({
                         crc_events: updatedEvents,
                         crc_sites: updatedSites,
-                        studies: updatedStudies
+                        studies: sanitizedUpdatedStudies
                     });
                     // --- FIX END ---
                 } else if (errors.length === 0) {
@@ -7546,7 +7569,7 @@
                     tableHtml += `<tr class="border-t-2 dark:border-gray-600"><td colspan="${daysInMonth + 1}" class="global-view-study-header p-2" style="background-color: ${studyColor}; color: ${studyTextColor}; position: sticky; top: 6.7rem; z-index: 19;">${study.title || study.name}</td></tr>`;
 
                     const eventsBySite = studyEvents.reduce((acc, event) => {
-                        const siteId = event.siteId || 'unassigned';
+                            const siteId = event.siteId || 'unassigned';
                         if(!acc[siteId]) acc[siteId] = [];
                         acc[siteId].push(event);
                         return acc;
@@ -7739,8 +7762,8 @@
                 filteredEvents.forEach(event => {
                     if (!event.crcId) return;
                     const studyIds = (event.studyIds && event.studyIds.length > 0) ? event.studyIds : ['unassigned'];
-                    const siteId = event.siteId || 'unassigned';
-                    studyIds.forEach(studyId => {
+                        const siteId = event.siteId || 'unassigned';
+                        studyIds.forEach(studyId => {
                         if (!staffCount[studyId]) staffCount[studyId] = {};
                         if (!staffCount[studyId][siteId]) staffCount[studyId][siteId] = {};
                         if (!staffCount[studyId][siteId][event.date]) {
@@ -10552,12 +10575,14 @@
                             hoursByRole[role] = (hoursByRole[role] || 0) + hoursPerRole;
                         });
                     }
-                    const studyIds = (event.studyIds && event.studyIds.length > 0) ? event.studyIds : ['unassigned'];
-                    const hoursPerStudy = hours / studyIds.length;
-                    studyIds.forEach(studyId => {
-                        const studyName = state.studies.find(s => s.id === studyId)?.name || 'Unassigned';
-                        hoursByStudy[studyName] = (hoursByStudy[studyName] || 0) + hoursPerStudy;
-                    });
+                    const studyIds = getValidStudyIdsForEvent(event);
+                    if (studyIds.length > 0) {
+                        const hoursPerStudy = hours / studyIds.length;
+                            studyIds.forEach(studyId => {
+                            const studyName = getStudyName(studyId);
+                            hoursByStudy[studyName] = (hoursByStudy[studyName] || 0) + hoursPerStudy;
+                        });
+                    }
                 });
 
                 const chartOptions = {
@@ -10617,6 +10642,18 @@
                         .join(', ');
                 };
 
+                const formatRoleAssignments = (map, emptyLabel) => {
+                    if (!map || map.size === 0) {
+                        return `<span class="text-gray-400 dark:text-gray-500">${sanitizeText(emptyLabel)}</span>`;
+                    }
+                    return Array.from(map.entries()).map(([roleName, names]) => {
+                        const list = Array.isArray(names) ? names : Array.from(names || []);
+                        const displayNames = list.length > 0 ? list.map(sanitizeText).join(', ') : sanitizeText('Unassigned');
+                        return `<div><span class="font-medium">${sanitizeText(roleName)}:</span> ${displayNames}</div>`;
+                    }).join('');
+                };
+
+                
                 const formatMonthLabel = (monthKey) => {
                     if (!monthKey) return 'Unknown';
                     const [yearStr, monthStr] = monthKey.split('-');
@@ -10642,6 +10679,17 @@
                 const getRoleNameById = (roleId) => {
                     const role = state.roles.find(r => r.id === roleId);
                     return role ? role.name : roleId;
+                };
+
+                const crcNameMap = new Map(state.crcs.map(crc => [crc.id, crc.name || 'Unknown CRC']));
+                const artemisStudyIds = new Set(
+                    (state.studies || [])
+                        .filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0)
+                        .map(study => study.id)
+                );
+                const getValidStudyIdsForEvent = (event) => {
+                    if (!Array.isArray(event.studyIds) || event.studyIds.length === 0) return [];
+                    return event.studyIds.filter(studyId => artemisStudyIds.has(studyId));
                 };
 
                 const visitIdentifier = (event) => `${event.date}|${event.siteId || 'unassigned'}|${event.visitNumber || ''}`;
@@ -10704,8 +10752,11 @@
                 visitEvents.forEach(event => {
                     const monthKey = event.date.slice(0, 7);
                     const visitKey = visitIdentifier(event);
-                    const studyIds = Array.isArray(event.studyIds) && event.studyIds.length > 0 ? event.studyIds : ['unassigned'];
-                    studyIds.forEach(studyId => {
+                    const studyIds = getValidStudyIdsForEvent(event);
+                        if (studyIds.length === 0) {
+                        return;
+                    }
+                        studyIds.forEach(studyId => {
                         const key = `${studyId}|${monthKey}`;
                         if (!visitStudyMap.has(key)) {
                             visitStudyMap.set(key, new Set());
@@ -10760,7 +10811,7 @@
                 visitEvents.forEach(event => {
                     const monthKey = event.date.slice(0, 7);
                     const visitKey = visitIdentifier(event);
-                    const siteId = event.siteId || 'unassigned';
+                        const siteId = event.siteId || 'unassigned';
                     const key = `${siteId}|${monthKey}`;
                     if (!visitSiteMap.has(key)) {
                         visitSiteMap.set(key, new Set());
@@ -10866,26 +10917,43 @@
 
                 const roleNeedsMap = new Map();
                 visitEvents.forEach(event => {
-                    const studyIds = Array.isArray(event.studyIds) && event.studyIds.length > 0 ? event.studyIds : ['unassigned'];
                     const visitKey = visitIdentifier(event);
-                    const siteId = event.siteId || 'unassigned';
 
-                    const scheduledRoles = new Map();
+                    const scheduledRoleNames = new Map();
+                    const addAssignmentNames = (roleName, names) => {
+                        if (!scheduledRoleNames.has(roleName)) {
+                            scheduledRoleNames.set(roleName, new Set());
+                        }
+                        names.forEach(name => {
+                            const value = name && typeof name === 'string' ? name.trim() : '';
+                            scheduledRoleNames.get(roleName).add(value || 'Unassigned');
+                        });
+                    };
+
                     if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                         Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                            const validAssignments = (assignments || []).filter(Boolean).length;
-                            if (validAssignments > 0) {
-                                const roleName = getRoleNameById(roleId);
-                                scheduledRoles.set(roleName, (scheduledRoles.get(roleName) || 0) + validAssignments);
+                            const roleName = getRoleNameById(roleId);
+                            const validAssignments = (assignments || []).filter(Boolean);
+                            if (validAssignments.length > 0) {
+                                const names = validAssignments.map(crcId => crcNameMap.get(crcId) || 'Unknown CRC');
+                                addAssignmentNames(roleName, names);
                             }
                         });
                     } else if (Array.isArray(event.roles) && event.roles.length > 0) {
+                        const crcName = event.crcId ? (crcNameMap.get(event.crcId) || 'Unknown CRC') : 'Unassigned';
                         event.roles.filter(Boolean).forEach(roleName => {
-                            scheduledRoles.set(roleName, (scheduledRoles.get(roleName) || 0) + 1);
+                            addAssignmentNames(roleName, [crcName]);
                         });
                     } else if (event.crcId) {
-                        scheduledRoles.set('CRC Coverage', (scheduledRoles.get('CRC Coverage') || 0) + 1);
+                        const crcName = crcNameMap.get(event.crcId) || 'Unknown CRC';
+                        addAssignmentNames('CRC Coverage', [crcName]);
                     }
+
+                    const studyIds = getValidStudyIdsForEvent(event);
+                    if (studyIds.length === 0) {
+                        return;
+                    }
+                    const siteId = event.siteId || 'unassigned';
 
                     studyIds.forEach(studyId => {
                         const key = `${visitKey}|${studyId}`;
@@ -10896,17 +10964,20 @@
                                 visitNumber: event.visitNumber || '',
                                 studyId,
                                 rolesRequired: new Map(),
-                                rolesScheduled: new Map(),
+                                roleAssignments: new Map(),
                                 appliedStudies: new Set()
                             });
                         }
                         const entry = roleNeedsMap.get(key);
 
-                        scheduledRoles.forEach((qty, roleName) => {
-                            entry.rolesScheduled.set(roleName, (entry.rolesScheduled.get(roleName) || 0) + qty);
+                        scheduledRoleNames.forEach((nameSet, roleName) => {
+                            if (!entry.roleAssignments.has(roleName)) {
+                                entry.roleAssignments.set(roleName, new Set());
+                            }
+                            nameSet.forEach(name => entry.roleAssignments.get(roleName).add(name));
                         });
 
-                        if (studyId && studyId !== 'unassigned' && !entry.appliedStudies.has(studyId)) {
+                        if (!entry.appliedStudies.has(studyId)) {
                             const requirements = getRoleRequirementsFor(studyId, siteId === 'unassigned' ? null : siteId);
                             requirements.forEach((qty, roleId) => {
                                 const roleName = getRoleNameById(roleId);
@@ -10924,7 +10995,9 @@
                     studyName: getStudyName(entry.studyId),
                     visitNumber: entry.visitNumber || 'N/A',
                     rolesRequired: entry.rolesRequired,
-                    rolesScheduled: entry.rolesScheduled
+                    roleAssignments: new Map(
+                        Array.from((entry.roleAssignments || new Map()).entries()).map(([roleName, names]) => [roleName, Array.from(names)])
+                    )
                 })).sort((a, b) => {
                     if (a.siteName !== b.siteName) return a.siteName.localeCompare(b.siteName);
                     if (a.studyName !== b.studyName) return a.studyName.localeCompare(b.studyName);
@@ -10957,7 +11030,7 @@
                                             <td class="px-3 py-2 text-gray-700 dark:text-gray-300">${sanitizeText(row.siteName)}</td>
                                             <td class="px-3 py-2 text-gray-700 dark:text-gray-300">${sanitizeText(row.visitNumber)}</td>
                                             <td class="px-3 py-2 text-gray-700 dark:text-gray-300">${formatRoleSummary(row.rolesRequired, 'Not configured')}</td>
-                                            <td class="px-3 py-2 text-gray-700 dark:text-gray-300">${formatRoleSummary(row.rolesScheduled, 'No assignments')}</td>
+                                            <td class="px-3 py-2 text-gray-700 dark:text-gray-300">${formatRoleAssignments(row.roleAssignments, 'No assignments')}</td>
                                         </tr>
                                     `).join('')}
                                 </tbody>
@@ -19358,11 +19431,92 @@
                     'rejected': 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300'
                 };
 
+                const crcNameMap = new Map(state.crcs.map(crc => [crc.id, crc.name || 'Unknown CRC']));
+                const startOfToday = (() => {
+                    const now = new Date();
+                    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                })();
+                const next30End = new Date(startOfToday);
+                next30End.setDate(next30End.getDate() + 30);
+                const nextMonthStart = new Date(startOfToday.getFullYear(), startOfToday.getMonth() + 1, 1);
+                const nextMonthEnd = new Date(nextMonthStart.getFullYear(), nextMonthStart.getMonth() + 1, 0);
+
+                const buildEntriesForRange = (rangeStart, rangeEnd) => {
+                    const entries = approvedRequests.flatMap(request => getDailyEntriesForTimeOffRequest(request, rangeStart, rangeEnd));
+                    return entries
+                        .map(entry => ({
+                            ...entry,
+                            crcName: crcNameMap.get(entry.crcId) || 'Unknown CRC'
+                        }))
+                        .sort((a, b) => {
+                            const timeDiff = (a.date?.getTime?.() || new Date(a.dateStr).getTime()) - (b.date?.getTime?.() || new Date(b.dateStr).getTime());
+                            if (timeDiff !== 0) return timeDiff;
+                            return (a.crcName || '').localeCompare(b.crcName || '');
+                        });
+                };
+
+                const upcoming30Entries = buildEntriesForRange(startOfToday, next30End);
+                const nextMonthEntries = buildEntriesForRange(nextMonthStart, nextMonthEnd);
+
+                const buildUpcomingSection = (title, subtitle, entries) => {
+                    const maxRows = 10;
+                    const limitedEntries = entries.slice(0, maxRows);
+                    const extraCount = Math.max(entries.length - maxRows, 0);
+
+                    return `
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
+                            <div class="flex items-start justify-between gap-3 mb-3">
+                                <div>
+                                    <h3 class="text-lg font-semibold text-gray-900 dark:text-white">${title}</h3>
+                                    ${subtitle ? `<p class="text-sm text-gray-500 dark:text-gray-400">${subtitle}</p>` : ''}
+                                </div>
+                                ${extraCount > 0 ? `<span class="text-xs font-medium text-gray-500 dark:text-gray-400">+${extraCount} more days</span>` : ''}
+                            </div>
+                            ${limitedEntries.length === 0 ? `
+                                <p class="text-sm text-gray-500 dark:text-gray-400">No approved time off in this window.</p>
+                            ` : `
+                                <ul class="divide-y divide-gray-200 dark:divide-gray-700 -mx-4">
+                                    ${limitedEntries.map(entry => {
+                                        const statusKey = entry.status;
+                                        const badgeClass = statusColors[statusKey] || 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200';
+                                        const displayDate = formatDisplayDate(entry.date || entry.dateStr, { weekday: 'short', month: 'short', day: 'numeric' });
+                                        const detailLine = [entry.crcName, entry.period || 'Full Day', entry.type || 'Time Off'].filter(Boolean).join(' • ');
+                                        return `
+                                            <li class="px-4 py-3 flex items-center justify-between gap-3">
+                                                <div>
+                                                    <p class="text-sm font-medium text-gray-900 dark:text-gray-100">${displayDate}</p>
+                                                    <p class="text-xs text-gray-500 dark:text-gray-400">${detailLine}</p>
+                                                </div>
+                                                <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${badgeClass}">
+                                                    ${entry.statusLabel || formatTimeOffStatus(entry.status)}
+                                                </span>
+                                            </li>
+                                        `;
+                                    }).join('')}
+                                </ul>
+                            `}
+                        </div>
+                    `;
+                };
+
+                const formatRangeLabel = (start, end) => `${formatDisplayDate(start, { month: 'short', day: 'numeric' })} - ${formatDisplayDate(end, { month: 'short', day: 'numeric' })}`;
+                const upcoming30Section = buildUpcomingSection('Next 30 Days', formatRangeLabel(startOfToday, next30End), upcoming30Entries);
+                const nextMonthSection = buildUpcomingSection('Next Month', formatRangeLabel(nextMonthStart, nextMonthEnd), nextMonthEntries);
+
+                const upcomingSectionsHTML = `
+                    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-6">
+                        ${upcoming30Section}
+                        ${nextMonthSection}
+                    </div>
+                `;
+
                 let html = `
                     <div class="flex justify-between items-center mb-6">
                         <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Time Off Requests</h2>
                         ${!viewingOwn ? '' : '<p class="text-sm text-gray-500 dark:text-gray-400 ml-4 hidden sm:block">Showing requests submitted by or for you.</p>'}
                     </div>
+
+                    ${upcomingSectionsHTML}
 
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                         <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
@@ -21468,18 +21622,38 @@
                     console.log('CHAOS: Sorting data...');
                     crcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     sites.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                    studies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
+                    let sanitizedStudies = Array.isArray(studies) ? studies.filter(study => Array.isArray(study.siteIds) && study.siteIds.length > 0) : [];
+                    sanitizedStudies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
                     ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     trucks.sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
+                    const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
+                    const sanitizedEvents = Array.isArray(events) ? events.reduce((acc, event) => {
+                        if (Array.isArray(event.studyIds) && event.studyIds.length > 0) {
+                            const filteredIds = event.studyIds.filter(studyId => artemisStudyIdsSet.has(studyId));
+                            if (filteredIds.length === 0) {
+                                if (event.type === 'Site Assignment') {
+                                    return acc;
+                                }
+                                acc.push({ ...event, studyIds: [] });
+                                return acc;
+                            }
+                            if (filteredIds.length !== event.studyIds.length) {
+                                acc.push({ ...event, studyIds: filteredIds });
+                                return acc;
+                            }
+                        }
+                        acc.push(event);
+                        return acc;
+                    }, []) : events;
 
                     console.log('CHAOS: Setting state with initialLoadComplete=true');
                     console.log('CHAOS: authReady=', state.authReady, 'initialLoadComplete will be=', true);
                     setState({ 
                         crcs, 
                         crc_sites: sites, 
-                        studies, 
-                        crc_events: events, 
+                        studies: sanitizedStudies, 
+                        crc_events: sanitizedEvents, 
                         roles, 
                         training_types,
                         trucks, 
