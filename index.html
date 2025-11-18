@@ -3663,8 +3663,8 @@
 
             const DATA_REFRESH_INTERVAL_MS = 30000;
             const NAVAN_CONNECTION_CHECK_INTERVAL_MS = 120000;
-            const DEFAULT_NAVAN_PAST_DAYS = 30;
-            const DEFAULT_NAVAN_FUTURE_DAYS = 30;
+            const DEFAULT_NAVAN_PAST_DAYS = 365;
+            const DEFAULT_NAVAN_FUTURE_DAYS = 180; // 6 months
             let dataRefreshTimerId = null;
             let isRefreshingData = false;
 
@@ -4038,148 +4038,37 @@
                 
                 setButtonLoading(button, true, 'Syncing...');
                 
-                // Incremental fetching: start with 30 days, then 60, 90, etc. until failure
-                const INCREMENT_DAYS = 30;
-                const MAX_DAYS = 365; // Maximum to try
-                let currentDays = INCREMENT_DAYS;
-                let allResults = {
-                    success: true,
-                    summary: {
-                        importType: 'range',
-                        totals: {
-                            fetched: 0,
-                            processed: 0,
-                            created: 0,
-                            updated: 0,
-                            skipped: 0
-                        },
-                        skippedBookings: [],
-                        errors: [],
-                        ranges: []
-                    }
+                // Fetch full range: 365 days back, 180 days forward
+                const pastDays = Number.isFinite(options.pastDays) ? Math.max(0, Math.floor(options.pastDays)) : DEFAULT_NAVAN_PAST_DAYS;
+                const futureDays = Number.isFinite(options.futureDays) ? Math.max(0, Math.floor(options.futureDays)) : DEFAULT_NAVAN_FUTURE_DAYS;
+                
+                const payload = {
+                    pastDays: pastDays,
+                    futureDays: futureDays
                 };
-                let lastSuccessfulDays = 0;
-                let failedAtDays = null;
+                if (options.createdFrom && Number.isFinite(options.createdFrom)) {
+                    payload.createdFrom = options.createdFrom;
+                }
+                if (options.createdTo && Number.isFinite(options.createdTo)) {
+                    payload.createdTo = options.createdTo;
+                }
+                
+                // Update progress to show we're fetching the full range
+                updateProgress(pastDays, `Fetching ${pastDays} days back and ${futureDays} days forward...`);
                 
                 try {
-                    while (currentDays <= MAX_DAYS) {
-                        updateProgress(currentDays, `Fetching ${currentDays} days back and forward...`);
-                        
-                        const payload = {
-                            pastDays: currentDays,
-                            futureDays: currentDays
-                        };
-                        
-                        try {
-                            const result = await apiService.importNavanBookingsRange(payload);
-                            
-                            if (result && result.success && result.summary) {
-                                // Merge results
-                                allResults.summary.totals.fetched += result.summary.totals.fetched || 0;
-                                allResults.summary.totals.processed += result.summary.totals.processed || 0;
-                                allResults.summary.totals.created += result.summary.totals.created || 0;
-                                allResults.summary.totals.updated += result.summary.totals.updated || 0;
-                                allResults.summary.totals.skipped += result.summary.totals.skipped || 0;
-                                
-                                // Merge skipped bookings and errors (limit to avoid huge arrays)
-                                if (result.summary.skippedBookings) {
-                                    // Only add unique skipped bookings
-                                    const existingKeys = new Set(allResults.summary.skippedBookings.map(b => b.bookingId || b.bookingUuid));
-                                    const newSkipped = result.summary.skippedBookings
-                                        .filter(b => !existingKeys.has(b.bookingId || b.bookingUuid))
-                                        .slice(0, 10);
-                                    allResults.summary.skippedBookings.push(...newSkipped);
-                                }
-                                if (result.summary.errors && result.summary.errors.length > 0) {
-                                    // Filter out processing limit errors (they're informational, not real errors)
-                                    const realErrors = result.summary.errors.filter(e => e.type !== 'Processing limit');
-                                    if (realErrors.length > 0) {
-                                        allResults.summary.errors.push(...realErrors);
-                                    }
-                                    // Keep processing limit as info in ranges
-                                    const processingLimit = result.summary.errors.find(e => e.type === 'Processing limit');
-                                    if (processingLimit) {
-                                        allResults.summary.ranges[allResults.summary.ranges.length - 1].processingLimit = processingLimit;
-                                    }
-                                }
-                                
-                                allResults.summary.ranges.push({
-                                    days: currentDays,
-                                    success: true,
-                                    fetched: result.summary.totals.fetched || 0,
-                                    processed: result.summary.totals.processed || 0
-                                });
-                                
-                                lastSuccessfulDays = currentDays;
-                                currentDays += INCREMENT_DAYS;
-                                
-                                // Small delay between requests to avoid overwhelming the API
-                                await new Promise(resolve => setTimeout(resolve, 500));
-                            } else {
-                                // Partial success or failure - stop here
-                                failedAtDays = currentDays;
-                                if (result && result.summary) {
-                                    allResults.summary.ranges.push({
-                                        days: currentDays,
-                                        success: false,
-                                        error: result.error || result.detail || 'Unknown error',
-                                        fetched: result.summary.totals.fetched || 0,
-                                        processed: result.summary.totals.processed || 0
-                                    });
-                                }
-                                break;
-                            }
-                        } catch (error) {
-                            // Error occurred - stop incremental fetching
-                            failedAtDays = currentDays;
-                            const errorMessage = error.message || 'Unknown error';
-                            const errorDetail = error.detail || error.jsonBody?.detail || error.jsonBody?.error || errorMessage;
-                            
-                            console.error(`Navan import failed at ${currentDays} days:`, {
-                                error,
-                                message: errorMessage,
-                                detail: errorDetail,
-                                status: error.status,
-                                jsonBody: error.jsonBody
-                            });
-                            
-                            allResults.summary.errors.push({
-                                days: currentDays,
-                                message: errorDetail,
-                                type: 'Fetch error',
-                                status: error.status,
-                                fullError: error
-                            });
-                            allResults.summary.ranges.push({
-                                days: currentDays,
-                                success: false,
-                                error: errorDetail,
-                                status: error.status
-                            });
-                            updateProgress(currentDays, `Failed at ${currentDays} days`, errorDetail);
-                            
-                            // Show notification with detailed error
-                            showNotification(`Navan import failed at ${currentDays} days: ${errorDetail}`, 'error');
-                            break;
-                        }
-                    }
-                    
-                    // Final status message
-                    if (travelContainer) {
-                        const finalStatus = failedAtDays 
-                            ? `Completed up to ${lastSuccessfulDays} days. Failed at ${failedAtDays} days.`
-                            : `Successfully synced up to ${lastSuccessfulDays} days.`;
-                        updateProgress(lastSuccessfulDays, finalStatus, failedAtDays ? `Failed at ${failedAtDays} days` : null);
-                    }
+                    const result = await apiService.importNavanBookingsRange(payload);
                     
                     // Refresh travel data after sync
-                    try {
-                        const travelData = await apiService.getTravel();
-                        if (Array.isArray(travelData)) {
-                            setState({ travel: travelData }, { skipRender: true });
+                    if (result && result.summary) {
+                        try {
+                            const travelData = await apiService.getTravel();
+                            if (Array.isArray(travelData)) {
+                                setState({ travel: travelData }, { skipRender: true });
+                            }
+                        } catch (refreshError) {
+                            console.warn('Failed to refresh travel data:', refreshError);
                         }
-                    } catch (refreshError) {
-                        console.warn('Failed to refresh travel data:', refreshError);
                     }
                     
                     // Re-render travel content to show updated data
@@ -4187,12 +4076,7 @@
                         await renderTravelContent();
                     }
                     
-                    // Prepare final message
-                    const successMessage = failedAtDays
-                        ? `Navan sync completed up to ${lastSuccessfulDays} days. Failed at ${failedAtDays} days.`
-                        : `Navan sync completed successfully up to ${lastSuccessfulDays} days.`;
-                    
-                    return await handleNavanImportResponse(allResults, successMessage, extras);
+                    return await handleNavanImportResponse(result, 'Navan bookings synchronized successfully.', extras);
                 } catch (error) {
                     console.error('Navan range import error:', error);
                     showNotification(`Navan import failed: ${error.message || 'Unknown error'}`, 'error');
@@ -4254,7 +4138,7 @@
                     console.error('Modal container not found');
                     return;
                 }
-                const sizeClasses = { 'lg': 'max-w-lg', '4xl': 'max-w-4xl', '7xl': 'max-w-7xl' };
+                const sizeClasses = { 'lg': 'max-w-lg', '4xl': 'max-w-4xl', '6xl': 'max-w-6xl', '7xl': 'max-w-7xl', 'full': 'max-w-full' };
                 const maxWidthClass = sizeClasses[size] || sizeClasses['lg'];
                 modalContainer.innerHTML = `
                     <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-2xl w-full ${maxWidthClass} relative transform transition-all scale-95 opacity-0 animate-fade-in-up">
@@ -15431,7 +15315,7 @@
                             <div id="travel-costs-report-results" class="mt-4">
                                 <p class="text-sm text-gray-500 dark:text-gray-400 text-center">Select a date range and click "Generate Report" to view travel costs.</p>
                             </div>
-                        `, '6xl');
+                        `, 'full');
                         setTimeout(() => lucide.createIcons(), 100);
                         break;
                     }
@@ -15612,16 +15496,16 @@
                                                 </div>
                                             </div>
                                         </div>
-                                        <div class="overflow-x-auto custom-scrollbar">
-                                            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                        <div class="overflow-x-auto custom-scrollbar -mx-6 px-6">
+                                            <table class="w-full divide-y divide-gray-200 dark:divide-gray-700">
                                                 <thead class="bg-gray-50 dark:bg-gray-800">
                                                     <tr>
-                                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">CRC Name</th>
-                                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Travel Records</th>
-                                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Flights</th>
-                                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Hotels</th>
-                                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Cars</th>
-                                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Total Cost</th>
+                                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">CRC Name</th>
+                                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Travel Records</th>
+                                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Flights</th>
+                                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Hotels</th>
+                                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Cars</th>
+                                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Total Cost</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody class="bg-white dark:bg-gray-900 divide-y divide-gray-200 dark:divide-gray-700">
@@ -15638,24 +15522,24 @@
                                                         };
                                                         return `
                                                         <tr>
-                                                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${sanitize(row.crcName)}</td>
-                                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.travelRecords}</td>
-                                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.flightsCount}</td>
-                                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.hotelsCount}</td>
-                                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.carsCount}</td>
-                                                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">$${row.totalCost.toFixed(2)}</td>
+                                                            <td class="px-4 py-4 text-sm font-medium text-gray-900 dark:text-gray-100">${sanitize(row.crcName)}</td>
+                                                            <td class="px-4 py-4 text-sm text-gray-500 dark:text-gray-400">${row.travelRecords}</td>
+                                                            <td class="px-4 py-4 text-sm text-gray-500 dark:text-gray-400">${row.flightsCount}</td>
+                                                            <td class="px-4 py-4 text-sm text-gray-500 dark:text-gray-400">${row.hotelsCount}</td>
+                                                            <td class="px-4 py-4 text-sm text-gray-500 dark:text-gray-400">${row.carsCount}</td>
+                                                            <td class="px-4 py-4 text-sm font-medium text-gray-900 dark:text-gray-100">$${row.totalCost.toFixed(2)}</td>
                                                         </tr>
                                                     `;
                                                     }).join('')}
                                                 </tbody>
                                                 <tfoot class="bg-gray-50 dark:bg-gray-800">
                                                     <tr>
-                                                        <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">Total</td>
-                                                        <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">${totalRecords}</td>
-                                                        <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">${totalFlights}</td>
-                                                        <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">${totalHotels}</td>
-                                                        <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900 dark:text-gray-100">${totalCars}</td>
-                                                        <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-indigo-600 dark:text-indigo-400">$${grandTotal.toFixed(2)}</td>
+                                                        <td class="px-4 py-4 text-sm font-bold text-gray-900 dark:text-gray-100">Total</td>
+                                                        <td class="px-4 py-4 text-sm font-bold text-gray-900 dark:text-gray-100">${totalRecords}</td>
+                                                        <td class="px-4 py-4 text-sm font-bold text-gray-900 dark:text-gray-100">${totalFlights}</td>
+                                                        <td class="px-4 py-4 text-sm font-bold text-gray-900 dark:text-gray-100">${totalHotels}</td>
+                                                        <td class="px-4 py-4 text-sm font-bold text-gray-900 dark:text-gray-100">${totalCars}</td>
+                                                        <td class="px-4 py-4 text-sm font-bold text-indigo-600 dark:text-indigo-400">$${grandTotal.toFixed(2)}</td>
                                                     </tr>
                                                 </tfoot>
                                             </table>
