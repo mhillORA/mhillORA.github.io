@@ -657,6 +657,9 @@
                 <button data-action="export-csv-btn" class="bg-green-600 text-white py-2 px-3 sm:px-4 rounded-md hover:bg-green-700 transition-colors flex items-center text-sm">
                     <i data-lucide="download" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Export</span>
                 </button>
+                <button data-action="catch-up" class="bg-amber-600 text-white py-2 px-3 sm:px-4 rounded-md hover:bg-amber-700 transition-colors flex items-center text-sm">
+                    <i data-lucide="clock" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Catch-Up</span>
+                </button>
                 <div class="flex items-center gap-2">
                     <span class="text-xs sm:text-sm font-semibold text-gray-500 dark:text-gray-400">Version 1.0.5</span>
                     <button data-action="open-settings" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
@@ -1561,6 +1564,7 @@
                 timeOffReportSelectedCrcs: [],
                 timeOffReportData: null,
                 timeOffCollapsedEmployees: {},
+                changeLog: [], // Track changes for Catch-Up feature
                 settings: {
                     'Site Assignment': 8,
                     'Travel Day': 8,
@@ -3391,7 +3395,17 @@
 
             // --- CORE FUNCTIONS ---
             const setState = (newState, options = {}) => {
+                // Preserve changeLog if it exists and isn't being explicitly updated
+                const existingChangeLog = state.changeLog;
                 state = { ...state, ...newState };
+                // If changeLog wasn't in newState, preserve the existing one
+                if (!('changeLog' in newState) && existingChangeLog) {
+                    state.changeLog = existingChangeLog;
+                }
+                // Ensure changeLog is always an array
+                if (!state.changeLog) {
+                    state.changeLog = [];
+                }
                 if (options.skipRender) {
                     return;
                 }
@@ -3612,6 +3626,143 @@
             const DEFAULT_NAVAN_FUTURE_DAYS = 365;
             let dataRefreshTimerId = null;
             let isRefreshingData = false;
+
+            // --- Change Logging for Catch-Up Feature ---
+            const logChange = (type, details) => {
+                try {
+                    const change = {
+                        id: crypto.randomUUID(),
+                        timestamp: Date.now(),
+                        type, // 'shift_created', 'shift_updated', 'shift_deleted', 'crc_reassigned', 'study_updated'
+                        details
+                    };
+                    if (!state.changeLog) {
+                        state.changeLog = [];
+                    }
+                    state.changeLog.push(change);
+                    // Keep only last 7 days of changes
+                    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+                    state.changeLog = state.changeLog.filter(c => c.timestamp > sevenDaysAgo);
+                    // Persist to localStorage
+                    try {
+                        localStorage.setItem('chaos_changeLog', JSON.stringify(state.changeLog));
+                        console.log('Change logged:', type, details, 'Total changes:', state.changeLog.length);
+                    } catch (e) {
+                        console.warn('Failed to persist change log:', e);
+                    }
+                } catch (error) {
+                    console.error('Error in logChange:', error);
+                }
+            };
+
+            const loadChangeLog = () => {
+                try {
+                    const stored = localStorage.getItem('chaos_changeLog');
+                    if (stored) {
+                        const parsed = JSON.parse(stored);
+                        const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+                        state.changeLog = parsed.filter(c => c.timestamp > sevenDaysAgo);
+                        console.log('Loaded change log from localStorage:', state.changeLog.length, 'changes');
+                    } else {
+                        state.changeLog = state.changeLog || [];
+                        console.log('No change log in localStorage, initializing empty array');
+                    }
+                } catch (e) {
+                    console.warn('Failed to load change log:', e);
+                    state.changeLog = state.changeLog || [];
+                }
+            };
+
+            const getChangesLast24Hours = () => {
+                if (!state.changeLog) return [];
+                const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+                return state.changeLog
+                    .filter(c => c.timestamp > twentyFourHoursAgo)
+                    .sort((a, b) => b.timestamp - a.timestamp);
+            };
+
+            const formatChangeDetails = (change) => {
+                const time = new Date(change.timestamp);
+                const timeStr = time.toLocaleString();
+                const details = change.details || {};
+                
+                switch (change.type) {
+                    case 'shift_created':
+                        return {
+                            icon: 'plus-circle',
+                            color: 'text-green-600 dark:text-green-400',
+                            title: 'Shift Created',
+                            message: `New ${details.eventType || 'shift'} scheduled${details.date ? ` for ${details.date}` : ''}${details.siteName ? ` at ${details.siteName}` : ''}${details.crcNames && details.crcNames.length > 0 ? ` with ${details.crcNames.join(', ')}` : ''}`,
+                            time: timeStr
+                        };
+                    case 'shift_updated':
+                        const updates = [];
+                        if (details.crcChanged) {
+                            updates.push(`CRC changed from ${details.oldCrcName || 'unassigned'} to ${details.newCrcName || 'unassigned'}`);
+                        }
+                        if (details.dateChanged) {
+                            updates.push(`Date changed from ${details.oldDate || 'N/A'} to ${details.newDate || 'N/A'}`);
+                        }
+                        if (details.siteChanged) {
+                            updates.push(`Site changed from ${details.oldSiteName || 'N/A'} to ${details.newSiteName || 'N/A'}`);
+                        }
+                        if (details.studyChanged) {
+                            updates.push(`Study changed from ${details.oldStudyName || 'N/A'} to ${details.newStudyName || 'N/A'}`);
+                        }
+                        if (details.roleAssignmentsChanged) {
+                            updates.push('Role assignments updated');
+                        }
+                        return {
+                            icon: 'edit',
+                            color: 'text-blue-600 dark:text-blue-400',
+                            title: 'Shift Updated',
+                            message: `Shift${details.date ? ` on ${details.date}` : ''}${details.siteName ? ` at ${details.siteName}` : ''}: ${updates.length > 0 ? updates.join(', ') : 'Updated'}`,
+                            time: timeStr
+                        };
+                    case 'shift_deleted':
+                        return {
+                            icon: 'trash-2',
+                            color: 'text-red-600 dark:text-red-400',
+                            title: 'Shift Deleted',
+                            message: `${details.eventType || 'Shift'}${details.date ? ` on ${details.date}` : ''}${details.siteName ? ` at ${details.siteName}` : ''}${details.crcNames && details.crcNames.length > 0 ? ` with ${details.crcNames.join(', ')}` : ''} was removed`,
+                            time: timeStr
+                        };
+                    case 'crc_reassigned':
+                        return {
+                            icon: 'user-check',
+                            color: 'text-purple-600 dark:text-purple-400',
+                            title: 'CRC Reassigned',
+                            message: `${details.crcName || 'CRC'} reassigned${details.oldRole ? ` from ${details.oldRole}` : ''}${details.newRole ? ` to ${details.newRole}` : ''}${details.date ? ` on ${details.date}` : ''}${details.siteName ? ` at ${details.siteName}` : ''}`,
+                            time: timeStr
+                        };
+                    case 'study_updated':
+                        const studyUpdates = [];
+                        if (details.nameChanged) {
+                            studyUpdates.push(`Name changed from "${details.oldName || 'N/A'}" to "${details.newName || 'N/A'}"`);
+                        }
+                        if (details.requirementsChanged) {
+                            studyUpdates.push('Role requirements updated');
+                        }
+                        if (details.sitesChanged) {
+                            studyUpdates.push('Site assignments updated');
+                        }
+                        return {
+                            icon: 'file-edit',
+                            color: 'text-orange-600 dark:text-orange-400',
+                            title: 'Study Updated',
+                            message: `${details.studyName || 'Study'}: ${studyUpdates.length > 0 ? studyUpdates.join(', ') : 'Updated'}`,
+                            time: timeStr
+                        };
+                    default:
+                        return {
+                            icon: 'info',
+                            color: 'text-gray-600 dark:text-gray-400',
+                            title: 'Change',
+                            message: JSON.stringify(details),
+                            time: timeStr
+                        };
+                }
+            };
 
             const refreshDataSilently = async () => {
                 if (!state.initialLoadComplete) return;
@@ -7965,12 +8116,9 @@
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
                             <div class="flex items-center gap-2">
                                 <span class="w-4 h-4 rounded-full" style="background-color: ${study.color || '#cccccc'};"></span>
-                                <button data-action="view-study" data-id="${study.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${study.title || study.name || 'Untitled Study'}</button>
+                                <button data-action="edit-study" data-id="${study.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${study.title || study.name || 'Untitled Study'}</button>
                             </div>
-                            <div class="flex items-center gap-2">
-                                <button data-action="edit-study" data-id="${study.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 text-sm">Edit</button>
-                                <span class="text-xs text-gray-500 dark:text-gray-400">From ARTEMIS</span>
-                            </div>
+                            <span class="text-xs text-gray-500 dark:text-gray-400">From ARTEMIS</span>
                         </div>
                     `).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No ARTEMIS studies available.</p>';
                     studyList.innerHTML = studiesHTML;
@@ -13841,6 +13989,44 @@
                         break;
                     }
                     case 'set-main-tab': setState({ activeTab: tabId }); break;
+                    case 'catch-up': {
+                        const changes = getChangesLast24Hours();
+                        if (changes.length === 0) {
+                            openModal(`
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Catch-Up: Last 24 Hours</h3>
+                                <p class="dark:text-gray-300 mb-6">No changes have been made in the last 24 hours.</p>
+                                <div class="flex justify-end">
+                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
+                                </div>
+                            `);
+                        } else {
+                            const changesHTML = changes.map(change => {
+                                const formatted = formatChangeDetails(change);
+                                return `
+                                    <div class="flex items-start gap-3 p-3 bg-gray-50 dark:bg-gray-800 rounded-lg mb-2">
+                                        <i data-lucide="${formatted.icon}" class="w-5 h-5 ${formatted.color} mt-0.5"></i>
+                                        <div class="flex-1">
+                                            <div class="font-semibold ${formatted.color}">${formatted.title}</div>
+                                            <div class="text-sm text-gray-700 dark:text-gray-300 mt-1">${formatted.message}</div>
+                                            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">${formatted.time}</div>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('');
+                            openModal(`
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Catch-Up: Last 24 Hours</h3>
+                                <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">${changes.length} change${changes.length !== 1 ? 's' : ''} found</p>
+                                <div class="max-h-96 overflow-y-auto custom-scrollbar mb-4">
+                                    ${changesHTML}
+                                </div>
+                                <div class="flex justify-end">
+                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
+                                </div>
+                            `, 'lg');
+                            setTimeout(() => lucide.createIcons(), 100);
+                        }
+                        break;
+                    }
                     case 'edit-all-schedule-event': {
                         const event = state.crc_events.find(e => e.id === eventId);
                         if (event) {
@@ -14639,7 +14825,24 @@
                             `);
                         } else {
                             try {
+                            const eventToDelete = state.crc_events.find(e => e.id === eventId);
                             await apiService.deleteEvent(eventId);
+                                // Log change for Catch-Up
+                                if (eventToDelete) {
+                                    const siteName = eventToDelete.siteId ? (state.crc_sites.find(s => s.id === eventToDelete.siteId)?.name || 'Unknown Site') : null;
+                                    const crcNames = [];
+                                    if (eventToDelete.crcId) {
+                                        const crc = state.crcs.find(c => c.id === eventToDelete.crcId);
+                                        if (crc) crcNames.push(crc.name);
+                                    }
+                                    logChange('shift_deleted', {
+                                        eventId,
+                                        eventType: eventToDelete.type || 'Event',
+                                        date: eventToDelete.date,
+                                        siteName,
+                                        crcNames
+                                    });
+                                }
                                 // Re-fetch events from DB
                                 const updatedEvents = await apiService.getEvents();
                                 setState({ crc_events: updatedEvents });
@@ -14660,7 +14863,24 @@
                     }
                     case 'delete-single-event': {
                         try {
+                        const eventToDelete = state.crc_events.find(e => e.id === eventId);
                         await apiService.deleteEvent(eventId);
+                            // Log change for Catch-Up
+                            if (eventToDelete) {
+                                const siteName = eventToDelete.siteId ? (state.crc_sites.find(s => s.id === eventToDelete.siteId)?.name || 'Unknown Site') : null;
+                                const crcNames = [];
+                                if (eventToDelete.crcId) {
+                                    const crc = state.crcs.find(c => c.id === eventToDelete.crcId);
+                                    if (crc) crcNames.push(crc.name);
+                                }
+                                logChange('shift_deleted', {
+                                    eventId,
+                                    eventType: eventToDelete.type || 'Event',
+                                    date: eventToDelete.date,
+                                    siteName,
+                                    crcNames
+                                });
+                            }
                             // Re-fetch events from DB
                             const updatedEvents = await apiService.getEvents();
                             setState({ crc_events: updatedEvents });
@@ -16449,6 +16669,33 @@
                                         endDate: toDateOnlyString(endDateObj)
                                     };
                                     await apiService.updateEvent(eventId, updatePayload);
+                                    // Log change for Catch-Up
+                                    const oldEvent = existingEvent;
+                                    const siteName = selectedSiteId ? (state.crc_sites.find(s => s.id === selectedSiteId)?.name || 'Unknown Site') : null;
+                                    const studyName = selectedStudyIds.length > 0 ? (state.studies.find(s => selectedStudyIds.includes(s.id))?.title || state.studies.find(s => selectedStudyIds.includes(s.id))?.name || 'Unknown Study') : null;
+                                    const crcName = crcIds[0] ? (state.crcs.find(c => c.id === crcIds[0])?.name || 'Unknown CRC') : null;
+                                    const oldCrcName = oldEvent?.crcId ? (state.crcs.find(c => c.id === oldEvent.crcId)?.name || 'Unknown CRC') : null;
+                                    const oldSiteName = oldEvent?.siteId ? (state.crc_sites.find(s => s.id === oldEvent.siteId)?.name || 'Unknown Site') : null;
+                                    const oldStudyName = oldEvent?.studyIds && oldEvent.studyIds.length > 0 ? (state.studies.find(s => oldEvent.studyIds.includes(s.id))?.title || state.studies.find(s => oldEvent.studyIds.includes(s.id))?.name || 'Unknown Study') : null;
+                                    logChange('shift_updated', {
+                                        eventId,
+                                        eventType: data.eventType,
+                                        date: startDateStr,
+                                        siteName,
+                                        crcChanged: oldEvent?.crcId !== crcIds[0],
+                                        oldCrcName,
+                                        newCrcName: crcName,
+                                        dateChanged: oldEvent?.date !== startDateStr,
+                                        oldDate: oldEvent?.date,
+                                        newDate: startDateStr,
+                                        siteChanged: oldEvent?.siteId !== selectedSiteId,
+                                        oldSiteName,
+                                        newSiteName: siteName,
+                                        studyChanged: JSON.stringify(oldEvent?.studyIds || []) !== JSON.stringify(selectedStudyIds),
+                                        oldStudyName,
+                                        newStudyName: studyName,
+                                        roleAssignmentsChanged: Object.keys(roleAssignments).length > 0
+                                    });
                                 } else {
                                     const groupId = crypto.randomUUID();
                                     // Batch operations replaced with individual API calls
@@ -16577,6 +16824,34 @@
                                 } catch {}
                                 if (document.getElementById('crc-unavailability-calendar')) {
                                     try { renderUnavailabilityCalendar(); } catch {}
+                                }
+                                // Log change for Catch-Up (for new events)
+                                if (!isEditing) {
+                                    const siteName = selectedSiteId ? (state.crc_sites.find(s => s.id === selectedSiteId)?.name || 'Unknown Site') : null;
+                                    const crcNames = [];
+                                    if (eventType === 'Site Assignment' && Object.keys(roleAssignments).length > 0) {
+                                        const assignedCrcs = new Set();
+                                        Object.values(roleAssignments).forEach(assignments => {
+                                            assignments.forEach(crcId => {
+                                                if (crcId) assignedCrcs.add(crcId);
+                                            });
+                                        });
+                                        assignedCrcs.forEach(crcId => {
+                                            const crc = state.crcs.find(c => c.id === crcId);
+                                            if (crc) crcNames.push(crc.name);
+                                        });
+                                    } else if (crcIds.length > 0) {
+                                        crcIds.forEach(crcId => {
+                                            const crc = state.crcs.find(c => c.id === crcId);
+                                            if (crc) crcNames.push(crc.name);
+                                        });
+                                    }
+                                    logChange('shift_created', {
+                                        eventType: data.eventType,
+                                        date: startDateStr,
+                                        siteName,
+                                        crcNames
+                                    });
                                 }
                                 showNotification(isEditing ? 'Shift updated!' : 'Shift(s) created!', 'success');
                             } catch (err) {
@@ -16774,6 +17049,7 @@
                             
                             console.log('CHAOS: Study update data:', JSON.stringify(updateData, null, 2));
                             
+                            const oldStudy = state.studies.find(s => s.id === studyId);
                             const saved = await apiService.updateStudy(studyId, updateData);
                             console.log('CHAOS: Study updated successfully');
                             // Update local state so shift creation sees latest requirements immediately
@@ -16781,6 +17057,23 @@
                             setState({
                                 studies: state.studies.map(s => s.id === studyId ? updatedStudy : s)
                             });
+                            // Log change for Catch-Up
+                            if (oldStudy) {
+                                const studyName = updatedStudy.title || updatedStudy.name || 'Unknown Study';
+                                const nameChanged = (oldStudy.title || oldStudy.name) !== (updatedStudy.title || updatedStudy.name);
+                                const requirementsChanged = JSON.stringify(oldStudy.requiredRoles || []) !== JSON.stringify(updatedStudy.requiredRoles || []) ||
+                                    JSON.stringify(oldStudy.siteRoleRequirements || {}) !== JSON.stringify(updatedStudy.siteRoleRequirements || {});
+                                const sitesChanged = JSON.stringify(oldStudy.siteIds || []) !== JSON.stringify(updatedStudy.siteIds || []);
+                                logChange('study_updated', {
+                                    studyId,
+                                    studyName,
+                                    nameChanged,
+                                    oldName: oldStudy.title || oldStudy.name,
+                                    newName: updatedStudy.title || updatedStudy.name,
+                                    requirementsChanged,
+                                    sitesChanged
+                                });
+                            }
                             showNotification('Study updated successfully!', 'success');
                             
                             closeModal();
@@ -21663,6 +21956,7 @@
                         travel,
                         initialLoadComplete: true 
                     });
+                    loadChangeLog(); // Load change log from localStorage
                     setupRealtimeListeners();
                     
                     // Sync approved time off requests with unavailability events after state is fully set
