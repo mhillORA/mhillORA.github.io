@@ -17493,30 +17493,53 @@
                                 state.crc_events = [...state.crc_events, createdEvent];
                             };
                             
-                            // Helper to get travel hours from Navan data
-                            const getTravelHoursForCrc = (crcId, travelDate) => {
-                                if (!travelDate || !state.travel) return null;
+                            // Helper to get next business day (excluding weekends)
+                            const getNextBusinessDay = (date, days) => {
+                                const result = new Date(date);
+                                let daysAdded = 0;
+                                while (daysAdded < Math.abs(days)) {
+                                    result.setDate(result.getDate() + (days > 0 ? 1 : -1));
+                                    const dayOfWeek = result.getDay();
+                                    // Skip weekends (0 = Sunday, 6 = Saturday)
+                                    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+                                        daysAdded++;
+                                    }
+                                }
+                                return result;
+                            };
+                            
+                            // Helper to find flight within 1 business day and return flight data
+                            const findFlightWithinBusinessDay = (crcId, appointmentDate, isBefore) => {
+                                if (!state.travel) return null;
                                 const crc = state.crcs.find(c => c.id === crcId);
                                 if (!crc) return null;
                                 
                                 const crcNameLower = (crc.name || '').toLowerCase();
-                                const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
+                                const appointmentDateObj = typeof appointmentDate === 'string' ? new Date(appointmentDate + 'T00:00:00') : appointmentDate;
                                 
-                                const travelRecord = (state.travel || []).find(travel => {
-                                    if (!travel) return false;
-                                    const travelCrcId = travel.crcId;
-                                    if (travelCrcId !== crcId && travelCrcId !== crc.name) {
-                                        if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
-                                    }
+                                // Check exact date, 1 business day before/after, and 2-3 days (to account for weekends)
+                                const datesToCheck = [
+                                    toDateOnlyString(appointmentDateObj),
+                                    toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -1 : 1)),
+                                    toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -2 : 2)),
+                                    toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -3 : 3))
+                                ];
+                                
+                                for (const checkDate of datesToCheck) {
+                                    const travelRecord = (state.travel || []).find(travel => {
+                                        if (!travel || travel.bookingType !== 'FLIGHT') return false;
+                                        const travelCrcId = travel.crcId;
+                                        if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                            if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                        }
+                                        
+                                        const travelDate = getTravelPrimaryDate(travel);
+                                        if (!travelDate) return false;
+                                        const travelDateOnly = toDateOnlyString(travelDate);
+                                        return travelDateOnly === checkDate;
+                                    });
                                     
-                                    const travelDate = getTravelPrimaryDate(travel);
-                                    if (!travelDate) return false;
-                                    const travelDateOnly = toDateOnlyString(travelDate);
-                                    return travelDateOnly === travelDateStr;
-                                });
-                                
-                                if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
-                                    return travelRecord.flightDuration || travelRecord.hours || 8;
+                                    if (travelRecord) return travelRecord;
                                 }
                                 return null;
                             };
@@ -17549,7 +17572,10 @@
                                         
                                         // Only create if it doesn't already exist
                                         if (!existingTravelDay) {
-                                            const travelHours = getTravelHoursForCrc(crcId, startTravelDateStr) || 8;
+                                            // Find matching flight
+                                            const matchingFlight = findFlightWithinBusinessDay(crcId, startDateDuplicate, true);
+                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                            
                                             const travelPayload = {
                                                 ...duplicateBase,
                                                 name: 'Travel Day',
@@ -17560,6 +17586,19 @@
                                                 type: 'Travel Day',
                                                 hours: travelHours
                                             };
+                                            
+                                            // Add flight information if found
+                                            if (matchingFlight) {
+                                                if (matchingFlight.flightNumber) travelPayload.flightNumber = matchingFlight.flightNumber;
+                                                if (matchingFlight.airline) travelPayload.airline = matchingFlight.airline;
+                                                if (matchingFlight.origin) travelPayload.origin = matchingFlight.origin;
+                                                if (matchingFlight.destination) travelPayload.destination = matchingFlight.destination;
+                                                if (matchingFlight.departureTime) travelPayload.departureTime = matchingFlight.departureTime;
+                                                if (matchingFlight.arrivalTime) travelPayload.arrivalTime = matchingFlight.arrivalTime;
+                                                if (matchingFlight.confirmationNumber) travelPayload.confirmationNumber = matchingFlight.confirmationNumber;
+                                                if (matchingFlight.bookingId) travelPayload.travelBookingId = matchingFlight.bookingId;
+                                            }
+                                            
                                             await createAndStoreEvent(travelPayload);
                                         } else {
                                             console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation in duplicate schedule');
@@ -17595,7 +17634,10 @@
                                         
                                         // Only create if it doesn't already exist
                                         if (!existingTravelDay) {
-                                            const travelHours = getTravelHoursForCrc(crcId, endTravelDateStr) || 8;
+                                            // Find matching flight
+                                            const matchingFlight = findFlightWithinBusinessDay(crcId, endDateDuplicate, false);
+                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                            
                                             const travelPayload = {
                                                 ...duplicateBase,
                                                 name: 'Travel Day',
@@ -17606,6 +17648,19 @@
                                                 type: 'Travel Day',
                                                 hours: travelHours
                                             };
+                                            
+                                            // Add flight information if found
+                                            if (matchingFlight) {
+                                                if (matchingFlight.flightNumber) travelPayload.flightNumber = matchingFlight.flightNumber;
+                                                if (matchingFlight.airline) travelPayload.airline = matchingFlight.airline;
+                                                if (matchingFlight.origin) travelPayload.origin = matchingFlight.origin;
+                                                if (matchingFlight.destination) travelPayload.destination = matchingFlight.destination;
+                                                if (matchingFlight.departureTime) travelPayload.departureTime = matchingFlight.departureTime;
+                                                if (matchingFlight.arrivalTime) travelPayload.arrivalTime = matchingFlight.arrivalTime;
+                                                if (matchingFlight.confirmationNumber) travelPayload.confirmationNumber = matchingFlight.confirmationNumber;
+                                                if (matchingFlight.bookingId) travelPayload.travelBookingId = matchingFlight.bookingId;
+                                            }
+                                            
                                             await createAndStoreEvent(travelPayload);
                                         } else {
                                             console.log('Travel day already exists for CRC:', crcId, 'on date:', endTravelDateStr, '- skipping creation in duplicate schedule');
@@ -17649,6 +17704,57 @@
 
                         const processSubmit = async (confirmedOverride = false) => {
                             try {
+                                // Shared helper to get next business day (excluding weekends)
+                                const getNextBusinessDay = (date, days) => {
+                                    const result = new Date(date);
+                                    let daysAdded = 0;
+                                    while (daysAdded < Math.abs(days)) {
+                                        result.setDate(result.getDate() + (days > 0 ? 1 : -1));
+                                        const dayOfWeek = result.getDay();
+                                        // Skip weekends (0 = Sunday, 6 = Saturday)
+                                        if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+                                            daysAdded++;
+                                        }
+                                    }
+                                    return result;
+                                };
+                                
+                                // Shared helper to find flight within 1 business day and return flight data
+                                const findFlightWithinBusinessDay = (crcId, appointmentDate, isBefore) => {
+                                    if (!state.travel) return null;
+                                    const crc = state.crcs.find(c => c.id === crcId);
+                                    if (!crc) return null;
+                                    
+                                    const crcNameLower = (crc.name || '').toLowerCase();
+                                    const appointmentDateObj = typeof appointmentDate === 'string' ? new Date(appointmentDate + 'T00:00:00') : appointmentDate;
+                                    
+                                    // Check exact date, 1 business day before/after, and 2-3 days (to account for weekends)
+                                    const datesToCheck = [
+                                        toDateOnlyString(appointmentDateObj),
+                                        toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -1 : 1)),
+                                        toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -2 : 2)),
+                                        toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -3 : 3))
+                                    ];
+                                    
+                                    for (const checkDate of datesToCheck) {
+                                        const travelRecord = (state.travel || []).find(travel => {
+                                            if (!travel || travel.bookingType !== 'FLIGHT') return false;
+                                            const travelCrcId = travel.crcId;
+                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                            }
+                                            
+                                            const travelDate = getTravelPrimaryDate(travel);
+                                            if (!travelDate) return false;
+                                            const travelDateOnly = toDateOnlyString(travelDate);
+                                            return travelDateOnly === checkDate;
+                                        });
+                                        
+                                        if (travelRecord) return travelRecord;
+                                    }
+                                    return null;
+                                };
+                                
                                 // Collect role assignments from the new interface
                                 const roleAssignments = {};
                                 if (form._deduplicatedRoleAssignments) {
@@ -17813,35 +17919,60 @@
                                                 
                                                 // Only create if it doesn't already exist
                                                 if (!existingTravelDay) {
-                                                    // Get travel hours from Navan data if available
-                                                    const getTravelHoursForCrc = (crcId, travelDate) => {
-                                                        if (!travelDate || !state.travel) return null;
+                                                    // Helper to get next business day (excluding weekends)
+                                                    const getNextBusinessDay = (date, days) => {
+                                                        const result = new Date(date);
+                                                        let daysAdded = 0;
+                                                        while (daysAdded < Math.abs(days)) {
+                                                            result.setDate(result.getDate() + (days > 0 ? 1 : -1));
+                                                            const dayOfWeek = result.getDay();
+                                                            // Skip weekends (0 = Sunday, 6 = Saturday)
+                                                            if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+                                                                daysAdded++;
+                                                            }
+                                                        }
+                                                        return result;
+                                                    };
+                                                    
+                                                    // Helper to find flight within 1 business day
+                                                    const findFlightWithinBusinessDay = (crcId, appointmentDate, isBefore) => {
+                                                        if (!state.travel) return null;
                                                         const crc = state.crcs.find(c => c.id === crcId);
                                                         if (!crc) return null;
                                                         
                                                         const crcNameLower = (crc.name || '').toLowerCase();
-                                                        const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
+                                                        const appointmentDateObj = typeof appointmentDate === 'string' ? new Date(appointmentDate + 'T00:00:00') : appointmentDate;
                                                         
-                                                        const travelRecord = (state.travel || []).find(travel => {
-                                                            if (!travel) return false;
-                                                            const travelCrcId = travel.crcId;
-                                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
-                                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
-                                                            }
+                                                        // Check exact date, 1 business day before/after, and 2-3 days (to account for weekends)
+                                                        const datesToCheck = [
+                                                            toDateOnlyString(appointmentDateObj),
+                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -1 : 1)),
+                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -2 : 2)),
+                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -3 : 3))
+                                                        ];
+                                                        
+                                                        for (const checkDate of datesToCheck) {
+                                                            const travelRecord = (state.travel || []).find(travel => {
+                                                                if (!travel || travel.bookingType !== 'FLIGHT') return false;
+                                                                const travelCrcId = travel.crcId;
+                                                                if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                                                    if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                                                }
+                                                                
+                                                                const travelDate = getTravelPrimaryDate(travel);
+                                                                if (!travelDate) return false;
+                                                                const travelDateOnly = toDateOnlyString(travelDate);
+                                                                return travelDateOnly === checkDate;
+                                                            });
                                                             
-                                                            const travelDate = getTravelPrimaryDate(travel);
-                                                            if (!travelDate) return false;
-                                                            const travelDateOnly = toDateOnlyString(travelDate);
-                                                            return travelDateOnly === travelDateStr;
-                                                        });
-                                                        
-                                                        if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
-                                                            return travelRecord.flightDuration || travelRecord.hours || 8;
+                                                            if (travelRecord) return travelRecord;
                                                         }
                                                         return null;
                                                     };
                                                     
-                                                    const travelHours = getTravelHoursForCrc(crcId, startTravelDateStr) || 8;
+                                                    // Find matching flight
+                                                    const matchingFlight = findFlightWithinBusinessDay(crcId, startDate, true);
+                                                    const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                     
                                                     const startTravelEventData = { 
                                                         ...baseEventData, 
@@ -17853,7 +17984,20 @@
                                                         type: 'Travel Day',
                                                         hours: travelHours
                                                     };
-                                                    console.log('Creating start travel day for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours);
+                                                    
+                                                    // Add flight information if found
+                                                    if (matchingFlight) {
+                                                        if (matchingFlight.flightNumber) startTravelEventData.flightNumber = matchingFlight.flightNumber;
+                                                        if (matchingFlight.airline) startTravelEventData.airline = matchingFlight.airline;
+                                                        if (matchingFlight.origin) startTravelEventData.origin = matchingFlight.origin;
+                                                        if (matchingFlight.destination) startTravelEventData.destination = matchingFlight.destination;
+                                                        if (matchingFlight.departureTime) startTravelEventData.departureTime = matchingFlight.departureTime;
+                                                        if (matchingFlight.arrivalTime) startTravelEventData.arrivalTime = matchingFlight.arrivalTime;
+                                                        if (matchingFlight.confirmationNumber) startTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                        if (matchingFlight.bookingId) startTravelEventData.travelBookingId = matchingFlight.bookingId;
+                                                    }
+                                                    
+                                                    console.log('Creating start travel day for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
                                                     const created = await apiService.createEvent(startTravelEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
                                                     state.crc_events = [...state.crc_events, createdEvent];
@@ -17887,35 +18031,60 @@
                                                 
                                                 // Only create if it doesn't already exist
                                                 if (!existingTravelDay) {
-                                                    // Get travel hours from Navan data if available
-                                                    const getTravelHoursForCrc = (crcId, travelDate) => {
-                                                        if (!travelDate || !state.travel) return null;
+                                                    // Helper to get next business day (excluding weekends)
+                                                    const getNextBusinessDay = (date, days) => {
+                                                        const result = new Date(date);
+                                                        let daysAdded = 0;
+                                                        while (daysAdded < Math.abs(days)) {
+                                                            result.setDate(result.getDate() + (days > 0 ? 1 : -1));
+                                                            const dayOfWeek = result.getDay();
+                                                            // Skip weekends (0 = Sunday, 6 = Saturday)
+                                                            if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+                                                                daysAdded++;
+                                                            }
+                                                        }
+                                                        return result;
+                                                    };
+                                                    
+                                                    // Helper to find flight within 1 business day
+                                                    const findFlightWithinBusinessDay = (crcId, appointmentDate, isBefore) => {
+                                                        if (!state.travel) return null;
                                                         const crc = state.crcs.find(c => c.id === crcId);
                                                         if (!crc) return null;
                                                         
                                                         const crcNameLower = (crc.name || '').toLowerCase();
-                                                        const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
+                                                        const appointmentDateObj = typeof appointmentDate === 'string' ? new Date(appointmentDate + 'T00:00:00') : appointmentDate;
                                                         
-                                                        const travelRecord = (state.travel || []).find(travel => {
-                                                            if (!travel) return false;
-                                                            const travelCrcId = travel.crcId;
-                                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
-                                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
-                                                            }
+                                                        // Check exact date, 1 business day before/after, and 2-3 days (to account for weekends)
+                                                        const datesToCheck = [
+                                                            toDateOnlyString(appointmentDateObj),
+                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -1 : 1)),
+                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -2 : 2)),
+                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -3 : 3))
+                                                        ];
+                                                        
+                                                        for (const checkDate of datesToCheck) {
+                                                            const travelRecord = (state.travel || []).find(travel => {
+                                                                if (!travel || travel.bookingType !== 'FLIGHT') return false;
+                                                                const travelCrcId = travel.crcId;
+                                                                if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                                                    if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                                                }
+                                                                
+                                                                const travelDate = getTravelPrimaryDate(travel);
+                                                                if (!travelDate) return false;
+                                                                const travelDateOnly = toDateOnlyString(travelDate);
+                                                                return travelDateOnly === checkDate;
+                                                            });
                                                             
-                                                            const travelDate = getTravelPrimaryDate(travel);
-                                                            if (!travelDate) return false;
-                                                            const travelDateOnly = toDateOnlyString(travelDate);
-                                                            return travelDateOnly === travelDateStr;
-                                                        });
-                                                        
-                                                        if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
-                                                            return travelRecord.flightDuration || travelRecord.hours || 8;
+                                                            if (travelRecord) return travelRecord;
                                                         }
                                                         return null;
                                                     };
                                                     
-                                                    const travelHours = getTravelHoursForCrc(crcId, endTravelDateStr) || 8;
+                                                    // Find matching flight
+                                                    const matchingFlight = findFlightWithinBusinessDay(crcId, endDate, false);
+                                                    const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                     
                                                     const endTravelEventData = { 
                                                         ...baseEventData, 
@@ -17927,7 +18096,20 @@
                                                         type: 'Travel Day',
                                                         hours: travelHours
                                                     };
-                                                    console.log('Creating end travel day for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours);
+                                                    
+                                                    // Add flight information if found
+                                                    if (matchingFlight) {
+                                                        if (matchingFlight.flightNumber) endTravelEventData.flightNumber = matchingFlight.flightNumber;
+                                                        if (matchingFlight.airline) endTravelEventData.airline = matchingFlight.airline;
+                                                        if (matchingFlight.origin) endTravelEventData.origin = matchingFlight.origin;
+                                                        if (matchingFlight.destination) endTravelEventData.destination = matchingFlight.destination;
+                                                        if (matchingFlight.departureTime) endTravelEventData.departureTime = matchingFlight.departureTime;
+                                                        if (matchingFlight.arrivalTime) endTravelEventData.arrivalTime = matchingFlight.arrivalTime;
+                                                        if (matchingFlight.confirmationNumber) endTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                        if (matchingFlight.bookingId) endTravelEventData.travelBookingId = matchingFlight.bookingId;
+                                                    }
+                                                    
+                                                    console.log('Creating end travel day for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
                                                     const created = await apiService.createEvent(endTravelEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
                                                     state.crc_events = [...state.crc_events, createdEvent];
@@ -17961,35 +18143,9 @@
                                                 
                                                 // Only create if it doesn't already exist
                                                 if (!existingTravelDay) {
-                                                    // Get travel hours from Navan data if available
-                                                    const getTravelHoursForCrc = (crcId, travelDate) => {
-                                                        if (!travelDate || !state.travel) return null;
-                                                        const crc = state.crcs.find(c => c.id === crcId);
-                                                        if (!crc) return null;
-                                                        
-                                                        const crcNameLower = (crc.name || '').toLowerCase();
-                                                        const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
-                                                        
-                                                        const travelRecord = (state.travel || []).find(travel => {
-                                                            if (!travel) return false;
-                                                            const travelCrcId = travel.crcId;
-                                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
-                                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
-                                                            }
-                                                            
-                                                            const travelDate = getTravelPrimaryDate(travel);
-                                                            if (!travelDate) return false;
-                                                            const travelDateOnly = toDateOnlyString(travelDate);
-                                                            return travelDateOnly === travelDateStr;
-                                                        });
-                                                        
-                                                        if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
-                                                            return travelRecord.flightDuration || travelRecord.hours || 8;
-                                                        }
-                                                        return null;
-                                                    };
-                                                    
-                                                    const travelHours = getTravelHoursForCrc(crcId, startTravelDateStr) || 8;
+                                                    // Find matching flight
+                                                    const matchingFlight = findFlightWithinBusinessDay(crcId, startDate, true);
+                                                    const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                     
                                                     const startTravelEventData = { 
                                                         ...baseEventData, 
@@ -18001,7 +18157,20 @@
                                                         type: 'Travel Day',
                                                         hours: travelHours
                                                     };
-                                                    console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours);
+                                                    
+                                                    // Add flight information if found
+                                                    if (matchingFlight) {
+                                                        if (matchingFlight.flightNumber) startTravelEventData.flightNumber = matchingFlight.flightNumber;
+                                                        if (matchingFlight.airline) startTravelEventData.airline = matchingFlight.airline;
+                                                        if (matchingFlight.origin) startTravelEventData.origin = matchingFlight.origin;
+                                                        if (matchingFlight.destination) startTravelEventData.destination = matchingFlight.destination;
+                                                        if (matchingFlight.departureTime) startTravelEventData.departureTime = matchingFlight.departureTime;
+                                                        if (matchingFlight.arrivalTime) startTravelEventData.arrivalTime = matchingFlight.arrivalTime;
+                                                        if (matchingFlight.confirmationNumber) startTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                        if (matchingFlight.bookingId) startTravelEventData.travelBookingId = matchingFlight.bookingId;
+                                                    }
+                                                    
+                                                    console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
                                                     const created = await apiService.createEvent(startTravelEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
                                                     state.crc_events = [...state.crc_events, createdEvent];
@@ -18040,35 +18209,9 @@
                                                 
                                                 // Only create if it doesn't already exist
                                                 if (!existingTravelDay) {
-                                                    // Get travel hours from Navan data if available
-                                                    const getTravelHoursForCrc = (crcId, travelDate) => {
-                                                        if (!travelDate || !state.travel) return null;
-                                                        const crc = state.crcs.find(c => c.id === crcId);
-                                                        if (!crc) return null;
-                                                        
-                                                        const crcNameLower = (crc.name || '').toLowerCase();
-                                                        const travelDateStr = typeof travelDate === 'string' ? travelDate : toDateOnlyString(travelDate);
-                                                        
-                                                        const travelRecord = (state.travel || []).find(travel => {
-                                                            if (!travel) return false;
-                                                            const travelCrcId = travel.crcId;
-                                                            if (travelCrcId !== crcId && travelCrcId !== crc.name) {
-                                                                if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
-                                                            }
-                                                            
-                                                            const travelDate = getTravelPrimaryDate(travel);
-                                                            if (!travelDate) return false;
-                                                            const travelDateOnly = toDateOnlyString(travelDate);
-                                                            return travelDateOnly === travelDateStr;
-                                                        });
-                                                        
-                                                        if (travelRecord && travelRecord.bookingType === 'FLIGHT') {
-                                                            return travelRecord.flightDuration || travelRecord.hours || 8;
-                                                        }
-                                                        return null;
-                                                    };
-                                                    
-                                                    const travelHours = getTravelHoursForCrc(crcId, endTravelDateStr) || 8;
+                                                    // Find matching flight
+                                                    const matchingFlight = findFlightWithinBusinessDay(crcId, endDate, false);
+                                                    const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                     
                                                     const endTravelEventData = { 
                                                         ...baseEventData, 
@@ -18080,7 +18223,20 @@
                                                         type: 'Travel Day',
                                                         hours: travelHours
                                                     };
-                                                    console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours);
+                                                    
+                                                    // Add flight information if found
+                                                    if (matchingFlight) {
+                                                        if (matchingFlight.flightNumber) endTravelEventData.flightNumber = matchingFlight.flightNumber;
+                                                        if (matchingFlight.airline) endTravelEventData.airline = matchingFlight.airline;
+                                                        if (matchingFlight.origin) endTravelEventData.origin = matchingFlight.origin;
+                                                        if (matchingFlight.destination) endTravelEventData.destination = matchingFlight.destination;
+                                                        if (matchingFlight.departureTime) endTravelEventData.departureTime = matchingFlight.departureTime;
+                                                        if (matchingFlight.arrivalTime) endTravelEventData.arrivalTime = matchingFlight.arrivalTime;
+                                                        if (matchingFlight.confirmationNumber) endTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                        if (matchingFlight.bookingId) endTravelEventData.travelBookingId = matchingFlight.bookingId;
+                                                    }
+                                                    
+                                                    console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
                                                     const created = await apiService.createEvent(endTravelEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
                                                     state.crc_events = [...state.crc_events, createdEvent];
@@ -19077,9 +19233,8 @@
                 }
                 // Handle role assignment changes to update travel selection
                 if (target.name && target.name.startsWith('role-')) {
-                    setTimeout(() => {
-                        updateTravelSelectionContainer();
-                    }, 100);
+                    // Update travel selection immediately when role assignment changes
+                    updateTravelSelectionContainer();
                 }
                 // Handle period changes for availability updates
                 if (target.name === 'period' || target.id === 'period-select') {
@@ -19859,12 +20014,15 @@
                 
                 // Add event listeners to role selects for duplicate checking and travel updates
                 roleAssignmentContainer.querySelectorAll('select[name^="role-"]').forEach(select => {
-                    select.addEventListener('change', (e) => {
-                        checkForDuplicateAssignments();
-                        setTimeout(() => {
+                    // Use once: false to allow multiple listeners, or check if already has listener
+                    if (!select.dataset.hasTravelListener) {
+                        select.dataset.hasTravelListener = 'true';
+                        select.addEventListener('change', (e) => {
+                            checkForDuplicateAssignments();
+                            // Update travel selection immediately
                             updateTravelSelectionContainer();
-                        }, 100);
-                    });
+                        });
+                    }
                 });
                 
                 // Initial duplicate check
