@@ -14109,6 +14109,11 @@
                             </div>
                         </div>
                         <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Total Study Budget ($)</label>
+                            <input type="number" name="totalBudget" min="0" step="0.01" value="${study.totalBudget || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter total study budget">
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Total budget allocated for this study (travel and other expenses).</p>
+                        </div>
+                        <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-3">Sites for this Study</label>
                             <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Sites linked to this study in ARTEMIS. To change which sites are linked, edit the study in ARTEMIS.</p>
                             ${allowedSites.length > 0 ? `
@@ -14167,6 +14172,30 @@
                             <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Specify how many of each role are needed at each site:</p>
                             <div id="site-role-quantities-container" class="space-y-4">
                                 <!-- Site-specific role quantities will appear here -->
+                            </div>
+                        </div>
+                        <div id="site-budgets" class="mt-4">
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-3">Site Budgets</label>
+                            <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Set budget allocations for each site (optional):</p>
+                            <div id="site-budgets-container" class="space-y-3">
+                                ${allowedSites.map(site => {
+                                    const siteBudget = (study.siteBudgets && study.siteBudgets[site.id]) || '';
+                                    return `
+                                        <div class="flex items-center gap-3 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                                            <label class="flex-1 text-sm dark:text-gray-300">${site.name}</label>
+                                            <div class="flex items-center gap-2">
+                                                <span class="text-sm text-gray-600 dark:text-gray-400">$</span>
+                                                <input type="number" name="siteBudget-${site.id}" min="0" step="0.01" value="${siteBudget}" class="w-32 p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                                            </div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                        <div id="budget-comparison" class="mt-6 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
+                            <h3 class="text-lg font-semibold dark:text-gray-200 mb-3">Budget vs. Actual Travel Costs</h3>
+                            <div id="budget-comparison-content">
+                                <!-- Budget comparison will be calculated and displayed here -->
                             </div>
                         </div>
                         <div class="flex justify-end pt-4">
@@ -19320,6 +19349,19 @@
                         };
                         const parsedGroupCount = normalizeCountInput(data.groupCount);
                         const parsedVisitCount = normalizeCountInput(data.visitCount);
+                        const totalBudget = data.totalBudget ? parseFloat(data.totalBudget) : null;
+                        
+                        // Collect site budgets
+                        const siteBudgets = {};
+                        selectedSites.forEach(siteId => {
+                            const budgetValue = data[`siteBudget-${siteId}`];
+                            if (budgetValue !== undefined && budgetValue !== null && budgetValue !== '') {
+                                const budget = parseFloat(budgetValue);
+                                if (!Number.isNaN(budget) && budget >= 0) {
+                                    siteBudgets[siteId] = budget;
+                                }
+                            }
+                        });
                         
                         // Collect site-specific role quantities
                         // These quantities determine scheduling requirements - if 3 Doc Tech is set, exactly 3 must be scheduled
@@ -19367,7 +19409,9 @@
                                 siteRoleRequirements: siteRoleRequirements,
                                 lastUpdated: new Date().toISOString(),
                                 groupCount: parsedGroupCount !== null ? parsedGroupCount : (existingStudy.groupCount !== undefined ? existingStudy.groupCount : null),
-                                visitCount: parsedVisitCount !== null ? parsedVisitCount : (existingStudy.visitCount !== undefined ? existingStudy.visitCount : null)
+                                visitCount: parsedVisitCount !== null ? parsedVisitCount : (existingStudy.visitCount !== undefined ? existingStudy.visitCount : null),
+                                totalBudget: totalBudget !== null ? totalBudget : (existingStudy.totalBudget !== undefined ? existingStudy.totalBudget : null),
+                                siteBudgets: Object.keys(siteBudgets).length > 0 ? siteBudgets : (existingStudy.siteBudgets || {})
                             };
                             
                             // Remove system fields if present
@@ -24698,12 +24742,286 @@
                 `;
             };
 
+            const calculateStudyBudgetComparison = (study) => {
+                if (!study) return null;
+                
+                const parseTravelDateValue = (value) => {
+                    if (!value) return null;
+                    const date = value.includes('T') ? new Date(value) : new Date(`${value}T00:00:00`);
+                    return Number.isNaN(date.getTime()) ? null : date;
+                };
+                
+                const getTravelPrimaryDate = (travel) => {
+                    if (!travel) return null;
+                    const sources = [
+                        travel.departureTime,
+                        travel.hotelCheckIn,
+                        travel.pickupDate,
+                        travel.date,
+                        travel.arrivalTime,
+                        travel.hotelCheckOut,
+                        travel.dropoffDate
+                    ];
+                    for (const source of sources) {
+                        const parsed = parseTravelDateValue(source);
+                        if (parsed) return parsed;
+                    }
+                    return null;
+                };
+                
+                // Get all events for this study
+                const studyEvents = (state.crc_events || []).filter(e => 
+                    e.studyIds && e.studyIds.includes(study.id) && e.type === 'Site Assignment'
+                );
+                
+                // Get travel costs for CRCs assigned to this study
+                const studySiteIds = new Set(study.siteIds || []);
+                const studyCRCs = new Set(studyEvents.map(e => e.crcId).filter(Boolean));
+                
+                // Calculate travel costs per site
+                const siteCosts = {};
+                const visitCosts = {};
+                const siteVisitCosts = {};
+                
+                (state.travel || []).forEach(travel => {
+                    // Check if travel is linked to a CRC in this study
+                    const crc = state.crcs.find(c => 
+                        studyCRCs.has(c.id) &&
+                        (c.id === travel.crcId || 
+                         c.name.toLowerCase() === (travel.travelerName || '').toLowerCase())
+                    );
+                    
+                    if (!crc) return;
+                    
+                    // Find associated event to get site and visit
+                    const travelDate = getTravelPrimaryDate(travel);
+                    if (!travelDate) return;
+                    
+                    const travelDateStr = `${travelDate.getFullYear()}-${String(travelDate.getMonth() + 1).padStart(2, '0')}-${String(travelDate.getDate()).padStart(2, '0')}`;
+                    
+                    // Find events within 2 days of travel
+                    const relatedEvents = studyEvents.filter(e => {
+                        const eventDate = new Date(e.date + 'T00:00:00');
+                        const daysDiff = Math.abs((travelDate.getTime() - eventDate.getTime()) / (1000 * 60 * 60 * 24));
+                        return daysDiff <= 2 && e.crcId === crc.id;
+                    });
+                    
+                    if (relatedEvents.length === 0) return;
+                    
+                    // Calculate travel cost
+                    const costFields = ['flightCost', 'hotelCost', 'carRentalCost', 'grandTotal', 'totalCost'];
+                    let travelCost = 0;
+                    costFields.forEach(field => {
+                        const val = travel[field];
+                        if (typeof val === 'number' && !Number.isNaN(val)) {
+                            travelCost += val;
+                        } else if (typeof val === 'string' && val.trim()) {
+                            const parsed = parseFloat(val.replace(/[^0-9.\-]/g, ''));
+                            if (!Number.isNaN(parsed)) {
+                                travelCost += parsed;
+                            }
+                        }
+                    });
+                    
+                    // Group by site and visit
+                    relatedEvents.forEach(event => {
+                        const siteId = event.siteId;
+                        if (!siteId || !studySiteIds.has(siteId)) return;
+                        
+                        const visitNumber = event.visitNumber || 'Unknown';
+                        
+                        // Site costs
+                        if (!siteCosts[siteId]) {
+                            siteCosts[siteId] = { total: 0, travel: [] };
+                        }
+                        siteCosts[siteId].total += travelCost;
+                        siteCosts[siteId].travel.push({ travel, cost: travelCost, event });
+                        
+                        // Visit costs
+                        if (!visitCosts[visitNumber]) {
+                            visitCosts[visitNumber] = { total: 0, travel: [] };
+                        }
+                        visitCosts[visitNumber].total += travelCost;
+                        visitCosts[visitNumber].travel.push({ travel, cost: travelCost, event });
+                        
+                        // Site-Visit costs
+                        const siteVisitKey = `${siteId}-${visitNumber}`;
+                        if (!siteVisitCosts[siteVisitKey]) {
+                            siteVisitCosts[siteVisitKey] = { siteId, visitNumber, total: 0, travel: [] };
+                        }
+                        siteVisitCosts[siteVisitKey].total += travelCost;
+                        siteVisitCosts[siteVisitKey].travel.push({ travel, cost: travelCost, event });
+                    });
+                });
+                
+                return {
+                    totalBudget: study.totalBudget || null,
+                    siteBudgets: study.siteBudgets || {},
+                    siteCosts,
+                    visitCosts,
+                    siteVisitCosts,
+                    totalActualCost: Object.values(siteCosts).reduce((sum, s) => sum + s.total, 0)
+                };
+            };
+
+            const renderBudgetComparison = (study) => {
+                const container = document.getElementById('budget-comparison-content');
+                if (!container) return;
+                
+                const comparison = calculateStudyBudgetComparison(study);
+                if (!comparison) {
+                    container.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400">No budget data available.</p>';
+                    return;
+                }
+                
+                const totalBudget = comparison.totalBudget;
+                const totalActual = comparison.totalActualCost;
+                const budgetRemaining = totalBudget ? totalBudget - totalActual : null;
+                const budgetPercent = totalBudget ? (totalActual / totalBudget) * 100 : null;
+                
+                let html = '';
+                
+                // Overall budget summary
+                if (totalBudget) {
+                    const budgetStatus = budgetPercent > 100 ? 'text-red-600 dark:text-red-400' : 
+                                       budgetPercent > 80 ? 'text-yellow-600 dark:text-yellow-400' : 
+                                       'text-green-600 dark:text-green-400';
+                    
+                    html += `
+                        <div class="mb-4 p-3 bg-white dark:bg-gray-800 rounded-md border dark:border-gray-700">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="text-sm font-medium dark:text-gray-300">Total Study Budget</span>
+                                <span class="text-lg font-bold ${budgetStatus}">$${totalBudget.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                            </div>
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="text-sm dark:text-gray-400">Actual Travel Costs</span>
+                                <span class="text-sm font-semibold dark:text-gray-300">$${totalActual.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                            </div>
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="text-sm dark:text-gray-400">Remaining Budget</span>
+                                <span class="text-sm font-semibold ${budgetRemaining < 0 ? 'text-red-600 dark:text-red-400' : 'text-green-600 dark:text-green-400'}">
+                                    $${budgetRemaining.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                </span>
+                            </div>
+                            <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3 mt-2">
+                                <div class="h-3 rounded-full ${budgetPercent > 100 ? 'bg-red-500' : budgetPercent > 80 ? 'bg-yellow-500' : 'bg-green-500'}" 
+                                     style="width: ${Math.min(budgetPercent, 100)}%"></div>
+                            </div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${budgetPercent.toFixed(1)}% of budget used</p>
+                        </div>
+                    `;
+                }
+                
+                // Site-by-site breakdown
+                const studySiteIds = new Set(study.siteIds || []);
+                const sites = (state.crc_sites || []).filter(s => studySiteIds.has(s.id));
+                
+                if (sites.length > 0) {
+                    html += '<div class="space-y-3"><h4 class="text-sm font-semibold dark:text-gray-300 mb-2">Costs by Site</h4>';
+                    
+                    sites.forEach(site => {
+                        const siteBudget = comparison.siteBudgets[site.id] || null;
+                        const siteCost = comparison.siteCosts[site.id] || { total: 0 };
+                        const siteActual = siteCost.total;
+                        const siteRemaining = siteBudget ? siteBudget - siteActual : null;
+                        const sitePercent = siteBudget ? (siteActual / siteBudget) * 100 : null;
+                        
+                        html += `
+                            <div class="p-3 bg-white dark:bg-gray-800 rounded-md border dark:border-gray-700">
+                                <div class="flex justify-between items-center mb-2">
+                                    <span class="text-sm font-medium dark:text-gray-300">${site.name}</span>
+                                    ${siteBudget ? `<span class="text-sm font-semibold dark:text-gray-400">Budget: $${siteBudget.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>` : ''}
+                                </div>
+                                <div class="flex justify-between items-center mb-2">
+                                    <span class="text-xs dark:text-gray-400">Actual Costs</span>
+                                    <span class="text-sm font-semibold dark:text-gray-300">$${siteActual.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                </div>
+                                ${siteBudget ? `
+                                    <div class="flex justify-between items-center mb-2">
+                                        <span class="text-xs dark:text-gray-400">Remaining</span>
+                                        <span class="text-xs font-semibold ${siteRemaining < 0 ? 'text-red-600 dark:text-red-400' : 'text-green-600 dark:text-green-400'}">
+                                            $${siteRemaining.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                        </span>
+                                    </div>
+                                    <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2 mt-2">
+                                        <div class="h-2 rounded-full ${sitePercent > 100 ? 'bg-red-500' : sitePercent > 80 ? 'bg-yellow-500' : 'bg-green-500'}" 
+                                             style="width: ${Math.min(sitePercent, 100)}%"></div>
+                                    </div>
+                                ` : ''}
+                            </div>
+                        `;
+                    });
+                    
+                    html += '</div>';
+                }
+                
+                // Visit-by-visit breakdown
+                const sortedVisits = Object.keys(comparison.visitCosts).sort((a, b) => {
+                    if (a === 'Unknown') return 1;
+                    if (b === 'Unknown') return -1;
+                    return parseInt(a) - parseInt(b);
+                });
+                
+                if (sortedVisits.length > 0) {
+                    html += '<div class="mt-4 space-y-3"><h4 class="text-sm font-semibold dark:text-gray-300 mb-2">Costs by Visit</h4>';
+                    
+                    sortedVisits.forEach(visitNumber => {
+                        const visitCost = comparison.visitCosts[visitNumber];
+                        html += `
+                            <div class="p-2 bg-white dark:bg-gray-800 rounded-md border dark:border-gray-700">
+                                <div class="flex justify-between items-center">
+                                    <span class="text-sm font-medium dark:text-gray-300">Visit ${visitNumber}</span>
+                                    <span class="text-sm font-semibold dark:text-gray-300">$${visitCost.total.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    
+                    html += '</div>';
+                }
+                
+                // Site-Visit combination breakdown
+                const siteVisitKeys = Object.keys(comparison.siteVisitCosts).sort((a, b) => {
+                    const [siteA, visitA] = a.split('-');
+                    const [siteB, visitB] = b.split('-');
+                    const siteCompare = siteA.localeCompare(siteB);
+                    if (siteCompare !== 0) return siteCompare;
+                    if (visitA === 'Unknown') return 1;
+                    if (visitB === 'Unknown') return -1;
+                    return parseInt(visitA) - parseInt(visitB);
+                });
+                
+                if (siteVisitKeys.length > 0) {
+                    html += '<div class="mt-4 space-y-3"><h4 class="text-sm font-semibold dark:text-gray-300 mb-2">Costs by Site & Visit</h4>';
+                    
+                    siteVisitKeys.forEach(key => {
+                        const siteVisit = comparison.siteVisitCosts[key];
+                        const site = state.crc_sites.find(s => s.id === siteVisit.siteId);
+                        html += `
+                            <div class="p-2 bg-white dark:bg-gray-800 rounded-md border dark:border-gray-700">
+                                <div class="flex justify-between items-center">
+                                    <span class="text-sm font-medium dark:text-gray-300">${site?.name || 'Unknown Site'} - Visit ${siteVisit.visitNumber}</span>
+                                    <span class="text-sm font-semibold dark:text-gray-300">$${siteVisit.total.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    
+                    html += '</div>';
+                }
+                
+                container.innerHTML = html || '<p class="text-sm text-gray-500 dark:text-gray-400">No travel costs found for this study.</p>';
+            };
+
             const setupEditStudyModal = (study) => {
                 const roleCheckboxes = document.querySelectorAll('input[name="selectedRoles"]');
                 const siteInputs = document.querySelectorAll('input[name="studySites"]');
                 const siteRoleQuantities = document.getElementById('site-role-quantities');
                 const siteRoleQuantitiesContainer = document.getElementById('site-role-quantities-container');
                 const roleSearch = document.getElementById('role-search');
+                
+                // Render budget comparison
+                renderBudgetComparison(study);
 
                 // Use all existing requirements
                 const existingRequirements = study.siteRoleRequirements || {};
@@ -24799,6 +25117,35 @@
 
                 // Initial update (sites are fixed from ARTEMIS, so we just need to update when roles change)
                 updateRoleQuantities();
+                
+                // Update budget comparison when budget fields change
+                const budgetInputs = document.querySelectorAll('input[name="totalBudget"], input[name^="siteBudget-"]');
+                budgetInputs.forEach(input => {
+                    input.addEventListener('input', () => {
+                        // Recalculate with updated budget values
+                        const form = document.getElementById('edit-study-form');
+                        if (form) {
+                            const formData = new FormData(form);
+                            const updatedStudy = {
+                                ...study,
+                                totalBudget: formData.get('totalBudget') ? parseFloat(formData.get('totalBudget')) : null,
+                                siteBudgets: {}
+                            };
+                            
+                            // Collect site budgets
+                            const siteBudgetInputs = document.querySelectorAll('input[name^="siteBudget-"]');
+                            siteBudgetInputs.forEach(siteInput => {
+                                const siteId = siteInput.name.replace('siteBudget-', '');
+                                const budgetValue = siteInput.value;
+                                if (budgetValue && !Number.isNaN(parseFloat(budgetValue))) {
+                                    updatedStudy.siteBudgets[siteId] = parseFloat(budgetValue);
+                                }
+                            });
+                            
+                            renderBudgetComparison(updatedStudy);
+                        }
+                    });
+                });
             };
 
             const setupStudyRoleConfigurationModal = (study) => {
