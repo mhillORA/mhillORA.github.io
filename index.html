@@ -1553,7 +1553,7 @@
                 unavailabilityDate: new Date(),
                 selectedCrcForUnavailability: null,
                 calendarView: 'planning-grid', // 'month', 'week', or 'planning-grid'
-                calendarDisplayMode: 'employee', // 'employee', 'study', 'site', 'at-a-glance', 'world'
+                calendarDisplayMode: 'employee', // 'employee', 'study', 'site', 'at-a-glance', 'world', 'travel'
                 atAGlanceGroupBy: 'study', // 'study' or 'site'
                 // --- FIX: Corrected syntax error from original file ---
                 activeTab: 'scheduler', // Can be 'scheduler', 'dashboard', 'reporting', 'training', or 'trucks'
@@ -3615,6 +3615,13 @@
                     }
                     renderUtilization();
                     renderSidebarAvailability();
+                    renderNavanChecklist();
+                    // Initialize map if not already initialized
+                    if (typeof initializeSchedulerMap === 'function') {
+                        setTimeout(() => {
+                            initializeSchedulerMap();
+                        }, 200);
+                    }
                     // Initialize icons for toggle buttons
                     setTimeout(() => {
                         lucide.createIcons();
@@ -3757,7 +3764,75 @@
                     .filter(c => c.timestamp > twentyFourHoursAgo)
                     .sort((a, b) => b.timestamp - a.timestamp);
             };
+            
+            const getChangesByDateRange = (startDate, endDate, updatesOnly = false) => {
+                if (!state.changeLog) return [];
+                const start = startDate ? new Date(startDate).getTime() : 0;
+                const end = endDate ? new Date(endDate).getTime() + (24 * 60 * 60 * 1000) : Date.now();
+                
+                let changes = state.changeLog.filter(c => {
+                    return c.timestamp >= start && c.timestamp <= end;
+                });
+                
+                if (updatesOnly) {
+                    // Filter to only show updates (not creations or deletions)
+                    changes = changes.filter(c => 
+                        c.type === 'shift_updated' || 
+                        c.type === 'training_updated' || 
+                        c.type === 'study_updated' ||
+                        c.type === 'crc_reassigned'
+                    );
+                }
+                
+                return changes.sort((a, b) => b.timestamp - a.timestamp);
+            };
 
+            const renderCatchUpResults = (changes, startDate, endDate, updatesOnly) => {
+                const container = document.getElementById('catchup-results');
+                if (!container) return;
+                
+                if (changes.length === 0) {
+                    const dateRange = startDate && endDate 
+                        ? `${new Date(startDate).toLocaleDateString()} - ${new Date(endDate).toLocaleDateString()}`
+                        : 'the selected date range';
+                    container.innerHTML = `
+                        <p class="text-gray-500 dark:text-gray-400 text-center py-4">
+                            No ${updatesOnly ? 'updates' : 'changes'} found for ${dateRange}.
+                        </p>
+                    `;
+                    return;
+                }
+                
+                const changesHTML = changes.map(change => {
+                    const formatted = formatChangeDetails(change);
+                    return `
+                        <div class="flex items-start gap-3 p-3 bg-gray-50 dark:bg-gray-800 rounded-lg mb-2">
+                            <i data-lucide="${formatted.icon}" class="w-5 h-5 ${formatted.color} mt-0.5"></i>
+                            <div class="flex-1">
+                                <div class="font-semibold ${formatted.color}">${formatted.title}</div>
+                                <div class="text-sm text-gray-700 dark:text-gray-300 mt-1">${formatted.message}</div>
+                                <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">${formatted.time}</div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+                
+                const dateRange = startDate && endDate 
+                    ? `${new Date(startDate).toLocaleDateString()} - ${new Date(endDate).toLocaleDateString()}`
+                    : 'the selected date range';
+                const title = updatesOnly ? 'Updates Only' : 'All Changes';
+                
+                container.innerHTML = `
+                    <div class="mb-2">
+                        <p class="text-sm font-semibold dark:text-gray-300">${title} (${changes.length} ${changes.length === 1 ? 'change' : 'changes'})</p>
+                        <p class="text-xs text-gray-500 dark:text-gray-400">Date Range: ${dateRange}</p>
+                    </div>
+                    ${changesHTML}
+                `;
+                
+                setTimeout(() => lucide.createIcons(), 100);
+            };
+            
             const formatChangeDetails = (change) => {
                 const time = new Date(change.timestamp);
                 const timeStr = time.toLocaleString();
@@ -3828,6 +3903,24 @@
                             color: 'text-orange-600 dark:text-orange-400',
                             title: 'Study Updated',
                             message: `${details.studyName || 'Study'}: ${studyUpdates.length > 0 ? studyUpdates.join(', ') : 'Updated'}`,
+                            time: timeStr
+                        };
+                    case 'training_updated':
+                        const trainingUpdates = [];
+                        if (details.crcName) {
+                            trainingUpdates.push(`${details.crcName}`);
+                        }
+                        if (details.trainingName) {
+                            trainingUpdates.push(`Training: ${details.trainingName}`);
+                        }
+                        if (details.expirationDateChanged) {
+                            trainingUpdates.push(`Expiration date updated`);
+                        }
+                        return {
+                            icon: 'graduation-cap',
+                            color: 'text-indigo-600 dark:text-indigo-400',
+                            title: 'Training Updated',
+                            message: trainingUpdates.length > 0 ? trainingUpdates.join(' - ') : 'Training record updated',
                             time: timeStr
                         };
                     default:
@@ -5465,12 +5558,13 @@
                             <div id="crcUtilization" class="space-y-3 text-sm"></div>
                         </div>
                         <div id="sidebar-availability-container" class="space-y-3"></div>
+                        <div id="sidebar-navan-checklist" class="space-y-3"></div>
                         <div class="flex-grow flex flex-col min-h-[300px]">
                             <h3 class="text-lg font-semibold mb-2 text-gray-700 dark:text-gray-300">Site Locations Map</h3>
                             <div class="flex-grow rounded-lg overflow-hidden border dark:border-gray-700">
                                 <div id="chaos-scheduler-map" class="w-full h-full" style="min-height: 300px;"></div>
                             </div>
-                            <p class="text-xs text-center text-gray-500 dark:text-gray-400 mt-2">Viewing all site locations</p>
+                            <p class="text-xs text-center text-gray-500 dark:text-gray-400 mt-2">Viewing all site locations from ARTEMIS</p>
                         </div>
                     ` : `
                         <div class="flex items-center justify-center h-full">
@@ -5547,6 +5641,17 @@
                             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Counts each CRC-day assignment in range.</p>
                         </div>
                     </div>
+                    <div class="mt-6">
+                        <section class="p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
+                            <div class="flex items-center justify-between mb-3">
+                                <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-200">Study Budget vs. Actual Travel Costs</h3>
+                                <button data-action="export-budget-summary" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center text-sm">
+                                    <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export Summary
+                                </button>
+                            </div>
+                            <div id="dashboard-budget-comparison" class="overflow-x-auto"></div>
+                        </section>
+                    </div>
                     <div class="mt-6 grid grid-cols-1 xl:grid-cols-2 gap-6">
                         <section class="p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
                             <div class="flex items-center justify-between mb-3">
@@ -5569,16 +5674,11 @@
                         <section class="p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
                             <div class="flex items-center justify-between mb-3">
                                 <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-200">Role Needs by Visit</h3>
+                                <button data-action="toggle-role-needs" class="text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">
+                                    <i data-lucide="chevron-down" class="w-5 h-5"></i>
+                                </button>
                             </div>
                             <div id="dashboard-role-needs" class="overflow-x-auto"></div>
-                        </section>
-                    </div>
-                    <div class="mt-6">
-                        <section class="p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
-                            <div class="flex items-center justify-between mb-3">
-                                <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-200">Study Budget vs. Actual Travel Costs</h3>
-                            </div>
-                            <div id="dashboard-budget-comparison" class="overflow-x-auto"></div>
                         </section>
                     </div>
                 </div>
@@ -7041,9 +7141,7 @@
                     }
                 } else if (state.calendarView === 'planning-grid') {
                     if (state.calendarDisplayMode === 'at-a-glance') {
-                        container.innerHTML = getAtAGlanceViewHTML(state.atAGlanceGroupBy);
-                    } else if (state.calendarDisplayMode === 'world') {
-                        container.innerHTML = getWorldViewHTML();
+                        container.innerHTML = getAtAGlanceViewHTML();
                     } else if (state.calendarDisplayMode === 'travel') {
                         container.innerHTML = getTravelViewHTML();
                     } else {
@@ -7080,16 +7178,7 @@
                     return `<option value="${value}" ${isSelected ? 'selected' : ''}>${text}</option>`;
                 }).join('');
                 
-                let atAGlanceToggle = '';
-                if (state.calendarView === 'planning-grid' && state.calendarDisplayMode === 'at-a-glance') {
-                    atAGlanceToggle = `
-                        <div class="flex items-center rounded-md border dark:border-gray-600 ml-4">
-                            <span class="px-3 py-1 text-sm bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300">Group By:</span>
-                            <button data-action="set-at-a-glance-group" data-group="study" class="px-3 py-1 text-sm ${state.atAGlanceGroupBy === 'study' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Study</button>
-                            <button data-action="set-at-a-glance-group" data-group="site" class="px-3 py-1 text-sm ${state.atAGlanceGroupBy === 'site' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Site</button>
-                        </div>
-                    `;
-                }
+                // Removed at-a-glance toggle since we now show both study and site together
 
                 return `
                     <div class="mb-4 space-y-3">
@@ -7101,10 +7190,8 @@
                                 <button data-action="set-display-mode" data-mode="study" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'study' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Study</button>
                                 <button data-action="set-display-mode" data-mode="site" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'site' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Site</button>
                                 <button data-action="set-display-mode" data-mode="travel" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'travel' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Travel</button>
-                                <button data-action="set-display-mode" data-mode="at-a-glance" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'at-a-glance' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">At-a-Glance</button>
-                                <button data-action="set-display-mode" data-mode="world" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'world' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">World View</button>
+                                <button data-action="set-display-mode" data-mode="at-a-glance" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'at-a-glance' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">At-a-Glance</button>
                             </div>
-                            ${atAGlanceToggle}
                         </div>
                         <!-- Calendar View and Navigation on second row -->
                         <div class="flex flex-wrap items-center justify-between gap-2">
@@ -8461,96 +8548,85 @@
                     filteredEvents = filteredEvents.filter(e => crcsInRegion.includes(e.crcId));
                 }
 
-                const staffCountByGroupAndDate = {};
+                // Build staff counts for both study and site
+                const staffCountByStudyAndDate = {};
+                const staffCountBySiteAndDate = {};
+                
                 filteredEvents.forEach(event => {
                     if (!event.crcId) return;
-                    const groupIds = (groupBy === 'study')
-                        ? (event.studyIds && event.studyIds.length > 0 ? event.studyIds : ['unassigned'])
-                        : (event.siteId ? [event.siteId] : ['unassigned']);
                     
-                    groupIds.forEach(groupId => {
-                        if (!staffCountByGroupAndDate[groupId]) staffCountByGroupAndDate[groupId] = {};
-                        if (!staffCountByGroupAndDate[groupId][event.date]) staffCountByGroupAndDate[groupId][event.date] = new Set();
-                        staffCountByGroupAndDate[groupId][event.date].add(event.crcId);
+                    // Study grouping
+                    const studyIds = event.studyIds && event.studyIds.length > 0 ? event.studyIds : ['unassigned'];
+                    studyIds.forEach(studyId => {
+                        if (!staffCountByStudyAndDate[studyId]) staffCountByStudyAndDate[studyId] = {};
+                        if (!staffCountByStudyAndDate[studyId][event.date]) staffCountByStudyAndDate[studyId][event.date] = new Set();
+                        staffCountByStudyAndDate[studyId][event.date].add(event.crcId);
                     });
+                    
+                    // Site grouping
+                    const siteId = event.siteId || 'unassigned';
+                    if (!staffCountBySiteAndDate[siteId]) staffCountBySiteAndDate[siteId] = {};
+                    if (!staffCountBySiteAndDate[siteId][event.date]) staffCountBySiteAndDate[siteId][event.date] = new Set();
+                    staffCountBySiteAndDate[siteId][event.date].add(event.crcId);
                 });
 
-                const collection = groupBy === 'study' ? state.studies : state.crc_sites;
-                const unassignedGroup = { id: 'unassigned', name: `Unassigned ${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}` };
-                
-                let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;"><table class="min-w-full text-sm border-collapse">`;
-                tableHtml += `<thead class="sticky top-0 z-10"><tr class="bg-gray-100 dark:bg-gray-800"><th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold">${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}</th>`;
-                for (let day = 1; day <= daysInMonth; day++) {
-                    tableHtml += `<th class="p-2 font-normal w-10">${day}</th>`;
-                }
-                tableHtml += `</tr></thead>`;
-                
-                let tbodyHtml = '<tbody>';
-                const sortedGroups = [...collection, unassignedGroup]
-                    .filter(group => staffCountByGroupAndDate[group.id])
-                    .sort((a,b) => {
-                        const nameA = (a.name || a.title || '').toString();
-                        const nameB = (b.name || b.title || '').toString();
-                        return nameA.localeCompare(nameB);
-                    });
-                
-                sortedGroups.forEach(group => {
-                    const groupName = group.name || group.title || 'Unnamed';
-                    tbodyHtml += `<tr class="border-t dark:border-gray-700"><td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${groupName}</td>`;
+                const renderTable = (title, collection, unassignedGroup, staffCountByGroupAndDate) => {
+                    let tableHtml = `<div class="mb-6"><h4 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-3">${title}</h4>`;
+                    tableHtml += `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;"><table class="min-w-full text-sm border-collapse">`;
+                    tableHtml += `<thead class="sticky top-0 z-10"><tr class="bg-gray-100 dark:bg-gray-800"><th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold">${title}</th>`;
                     for (let day = 1; day <= daysInMonth; day++) {
-                        const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                        const staffSet = staffCountByGroupAndDate[group.id]?.[dateStr];
-                        const staffCount = staffSet ? staffSet.size : 0;
-                        
-                        // Calculate required staff based on study's site role requirements
-                        let requiredStaff = 0;
-                        if (groupBy === 'study' && group.id !== 'unassigned') {
-                            const study = state.studies.find(s => s.id === group.id);
-                            if (study && study.siteRoleRequirements) {
-                                // Sum all role requirements across all sites for this study
-                                Object.values(study.siteRoleRequirements).forEach(siteRequirements => {
-                                    Object.values(siteRequirements).forEach(roleCount => {
-                                        requiredStaff += roleCount;
-                                    });
-                                });
-                            }
-                        } else if (groupBy === 'site' && group.id !== 'unassigned') {
-                            // For site view, sum requirements across all studies that use this site
-                            state.studies.forEach(study => {
-                                if (study.siteRoleRequirements && study.siteRoleRequirements[group.id]) {
-                                    Object.values(study.siteRoleRequirements[group.id]).forEach(roleCount => {
-                                        requiredStaff += roleCount;
-                                    });
-                                }
-                            });
-                        }
-                        
-                        let cellClass = 'text-center border-l dark:border-gray-700';
-                        if (requiredStaff > 0) {
-                            // Use green/red based on whether staffing meets requirements
-                            if (staffCount >= requiredStaff) {
-                                cellClass += ' bg-green-100 dark:bg-green-900/50';
-                            } else if (staffCount > 0) {
-                                cellClass += ' bg-yellow-100 dark:bg-yellow-900/50';
-                            } else {
-                                cellClass += ' bg-red-100 dark:bg-red-900/50';
-                            }
-                        } else {
-                            // Fallback to original logic if no requirements defined
-                            if (staffCount === 1) cellClass += ' bg-blue-100 dark:bg-blue-900/50';
-                            if (staffCount === 2) cellClass += ' bg-green-100 dark:bg-green-900/50';
-                            if (staffCount >= 3) cellClass += ' bg-yellow-100 dark:bg-yellow-900/50 font-bold';
-                        }
-                        
-                        const displayText = staffCount > 0 ? (requiredStaff > 0 ? `${staffCount}/${requiredStaff}` : staffCount) : '-';
-                        tbodyHtml += `<td class="${cellClass}">${displayText}</td>`;
+                        tableHtml += `<th class="p-2 font-normal w-10">${day}</th>`;
                     }
-                    tbodyHtml += `</tr>`;
-                });
-                tbodyHtml += '</tbody>';
+                    tableHtml += `</tr></thead>`;
+                    
+                    let tbodyHtml = '<tbody>';
+                    const sortedGroups = [...collection, unassignedGroup]
+                        .filter(group => staffCountByGroupAndDate[group.id])
+                        .sort((a,b) => {
+                            const nameA = (a.name || a.title || '').toString();
+                            const nameB = (b.name || b.title || '').toString();
+                            return nameA.localeCompare(nameB);
+                        });
+                    
+                    sortedGroups.forEach(group => {
+                        const groupName = group.name || group.title || 'Unnamed';
+                        tbodyHtml += `<tr class="border-t dark:border-gray-700"><td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${groupName}</td>`;
+                        for (let day = 1; day <= daysInMonth; day++) {
+                            const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                            const staffSet = staffCountByGroupAndDate[group.id]?.[dateStr];
+                            const staffCount = staffSet ? staffSet.size : 0;
+                            
+                            let cellClass = 'text-center border-l dark:border-gray-700';
+                            // Color coding based on scheduled count only
+                            if (staffCount === 0) {
+                                cellClass += ' bg-gray-50 dark:bg-gray-800/30';
+                            } else if (staffCount === 1) {
+                                cellClass += ' bg-blue-100 dark:bg-blue-900/50';
+                            } else if (staffCount === 2) {
+                                cellClass += ' bg-green-100 dark:bg-green-900/50';
+                            } else if (staffCount >= 3) {
+                                cellClass += ' bg-yellow-100 dark:bg-yellow-900/50 font-bold';
+                            }
+                            
+                            const displayText = staffCount > 0 ? staffCount : '-';
+                            tbodyHtml += `<td class="${cellClass}">${displayText}</td>`;
+                        }
+                        tbodyHtml += `</tr>`;
+                    });
+                    tbodyHtml += '</tbody>';
+                    tableHtml += tbodyHtml + `</table></div></div>`;
+                    return tableHtml;
+                };
 
-                tableHtml += tbodyHtml + `</table></div>`;
-                return getCalendarHeaderHTML() + tableHtml;
+                // Render both study and site tables
+                const studyUnassignedGroup = { id: 'unassigned', name: 'Unassigned Study' };
+                const siteUnassignedGroup = { id: 'unassigned', name: 'Unassigned Site' };
+                
+                let html = getCalendarHeaderHTML();
+                html += renderTable('By Study', state.studies, studyUnassignedGroup, staffCountByStudyAndDate);
+                html += renderTable('By Site', state.crc_sites, siteUnassignedGroup, staffCountBySiteAndDate);
+                
+                return html;
             };
 
             const getWorldViewHTML = () => {
@@ -9445,10 +9521,127 @@
             const renderSidebarAvailability = () => {
                 const container = document.getElementById('sidebar-availability-container');
                 if (!container) return;
-                container.innerHTML = `
-                    <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Staff Availability</h3>
-                    <p class="text-sm text-gray-500 dark:text-gray-400">Availability summary will be displayed here.</p>
+                
+                const now = new Date();
+                const next90Days = new Date(now);
+                next90Days.setDate(next90Days.getDate() + 90);
+                
+                // Get approved time off requests
+                const approvedTimeOff = (state.timeOffRequests || []).filter(req => {
+                    const status = normalizeTimeOffStatus(req.status);
+                    if (status !== 'approved') return false;
+                    
+                    const reqDate = req.date || req.startDate;
+                    if (!reqDate) return false;
+                    
+                    const date = new Date(reqDate + 'T00:00:00');
+                    return date >= now && date <= next90Days;
+                }).sort((a, b) => {
+                    const dateA = new Date((a.date || a.startDate) + 'T00:00:00');
+                    const dateB = new Date((b.date || b.startDate) + 'T00:00:00');
+                    return dateA - dateB;
+                });
+                
+                // Group by date
+                const timeOffByDate = {};
+                approvedTimeOff.forEach(req => {
+                    const reqDate = req.date || req.startDate;
+                    if (!reqDate) return;
+                    const dateStr = new Date(reqDate + 'T00:00:00').toLocaleDateString();
+                    if (!timeOffByDate[dateStr]) {
+                        timeOffByDate[dateStr] = [];
+                    }
+                    const crc = state.crcs.find(c => c.id === req.crcId);
+                    timeOffByDate[dateStr].push(crc?.name || 'Unknown');
+                });
+                
+                let html = `
+                    <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Upcoming Time Off Approved</h3>
                 `;
+                
+                if (Object.keys(timeOffByDate).length === 0) {
+                    html += `<p class="text-sm text-gray-500 dark:text-gray-400">No approved time off in the next 90 days.</p>`;
+                } else {
+                    html += `<div class="space-y-2 max-h-60 overflow-y-auto">`;
+                    Object.entries(timeOffByDate).forEach(([dateStr, names]) => {
+                        html += `
+                            <div class="p-2 bg-gray-50 dark:bg-gray-700/50 rounded-md">
+                                <p class="text-sm font-medium text-gray-700 dark:text-gray-300">${dateStr}</p>
+                                <p class="text-xs text-gray-600 dark:text-gray-400">${names.join(', ')}</p>
+                            </div>
+                        `;
+                    });
+                    html += `</div>`;
+                }
+                
+                container.innerHTML = html;
+            };
+            
+            const renderNavanChecklist = () => {
+                const container = document.getElementById('sidebar-navan-checklist');
+                if (!container) return;
+                
+                const now = new Date();
+                const next90Days = new Date(now);
+                next90Days.setDate(next90Days.getDate() + 90);
+                
+                // Get upcoming travel records
+                const upcomingTravel = (state.travel || []).filter(t => {
+                    const travelDate = getTravelPrimaryDate(t);
+                    return travelDate && travelDate >= now && travelDate <= next90Days;
+                });
+                
+                // Separate into completed (has navanBookingId) and not completed
+                const completed = upcomingTravel.filter(t => t.navanBookingId || t.navanBookingUuid);
+                const notCompleted = upcomingTravel.filter(t => !t.navanBookingId && !t.navanBookingUuid);
+                
+                let html = `
+                    <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Navan Work Checklist</h3>
+                    <div class="space-y-3">
+                        <div class="p-3 bg-green-50 dark:bg-green-900/20 rounded-md border border-green-200 dark:border-green-800">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-sm font-medium text-green-800 dark:text-green-200">Completed</span>
+                                <span class="text-lg font-bold text-green-600 dark:text-green-400">${completed.length}</span>
+                            </div>
+                            ${completed.length > 0 ? `
+                                <div class="space-y-1 max-h-32 overflow-y-auto text-xs">
+                                    ${completed.slice(0, 5).map(t => {
+                                        const crc = state.crcs.find(c => c.id === t.crcId);
+                                        const date = getTravelPrimaryDate(t);
+                                        return `
+                                            <div class="text-green-700 dark:text-green-300">
+                                                ✓ ${crc?.name || t.travelerName || 'Unknown'} - ${date ? date.toLocaleDateString() : 'TBD'}
+                                            </div>
+                                        `;
+                                    }).join('')}
+                                    ${completed.length > 5 ? `<p class="text-green-600 dark:text-green-400 text-xs">... and ${completed.length - 5} more</p>` : ''}
+                                </div>
+                            ` : '<p class="text-xs text-green-600 dark:text-green-400">No completed Navan bookings</p>'}
+                        </div>
+                        <div class="p-3 bg-red-50 dark:bg-red-900/20 rounded-md border border-red-200 dark:border-red-800">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-sm font-medium text-red-800 dark:text-red-200">Not Completed</span>
+                                <span class="text-lg font-bold text-red-600 dark:text-red-400">${notCompleted.length}</span>
+                            </div>
+                            ${notCompleted.length > 0 ? `
+                                <div class="space-y-1 max-h-32 overflow-y-auto text-xs">
+                                    ${notCompleted.slice(0, 5).map(t => {
+                                        const crc = state.crcs.find(c => c.id === t.crcId);
+                                        const date = getTravelPrimaryDate(t);
+                                        return `
+                                            <div class="text-red-700 dark:text-red-300">
+                                                ✗ ${crc?.name || t.travelerName || 'Unknown'} - ${date ? date.toLocaleDateString() : 'TBD'}
+                                            </div>
+                                        `;
+                                    }).join('')}
+                                    ${notCompleted.length > 5 ? `<p class="text-red-600 dark:text-red-400 text-xs">... and ${notCompleted.length - 5} more</p>` : ''}
+                                </div>
+                            ` : '<p class="text-xs text-red-600 dark:text-red-400">All upcoming travel has Navan bookings</p>'}
+                        </div>
+                    </div>
+                `;
+                
+                container.innerHTML = html;
             };
 
             // --- TRAINING FUNCTIONS ---
@@ -12993,7 +13186,32 @@
             };
 
             const getEventViewModalHTML = (event) => {
-                const crc = state.crcs.find(c => c.id === event.crcId);
+                // Get all assigned CRCs from roleAssignments or fall back to crcId
+                const getAllAssignedCRCs = (evt) => {
+                    const assignedCrcs = [];
+                    if (evt.roleAssignments && typeof evt.roleAssignments === 'object' && Object.keys(evt.roleAssignments).length > 0) {
+                        // New format: roleAssignments contains arrays of crcIds per role
+                        Object.values(evt.roleAssignments).forEach(assignments => {
+                            if (Array.isArray(assignments)) {
+                                assignments.forEach(crcId => {
+                                    if (crcId && !assignedCrcs.find(c => c.id === crcId)) {
+                                        const crc = state.crcs.find(c => c.id === crcId);
+                                        if (crc) assignedCrcs.push(crc);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    // Fall back to single crcId if no roleAssignments
+                    if (assignedCrcs.length === 0 && evt.crcId) {
+                        const crc = state.crcs.find(c => c.id === evt.crcId);
+                        if (crc) assignedCrcs.push(crc);
+                    }
+                    return assignedCrcs;
+                };
+                
+                const assignedCRCs = getAllAssignedCRCs(event);
+                const crc = assignedCRCs.length > 0 ? assignedCRCs[0] : null;
                 const site = state.crc_sites.find(s => s.id === event.siteId);
                 const studies = event.studyIds ? event.studyIds.map(studyId => {
                     const study = state.studies.find(s => s.id === studyId);
@@ -13035,8 +13253,25 @@
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
-                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">CRC</label>
-                                <p class="text-sm dark:text-gray-200">${crc ? crc.name : 'Not assigned'}</p>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Assigned Employees</label>
+                                ${assignedCRCs.length > 0 ? `
+                                    <div class="space-y-1">
+                                        ${assignedCRCs.map(c => {
+                                            // Get roles for this CRC from roleAssignments
+                                            const crcRoles = [];
+                                            if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                                Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                                    if (Array.isArray(assignments) && assignments.includes(c.id)) {
+                                                        const role = state.roles.find(r => r.id === roleId);
+                                                        if (role) crcRoles.push(role.name);
+                                                    }
+                                                });
+                                            }
+                                            const roleText = crcRoles.length > 0 ? ` (${crcRoles.join(', ')})` : '';
+                                            return `<p class="text-sm dark:text-gray-200">${c.name}${roleText}</p>`;
+                                        }).join('')}
+                                    </div>
+                                ` : '<p class="text-sm dark:text-gray-200">Not assigned</p>'}
                             </div>
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Site</label>
@@ -13552,6 +13787,92 @@
                         <span class="font-semibold">Current Week's Hours (Sat-Fri):</span>
                         <span class="font-bold text-lg">${weeklyHours}</span>
                     </div>
+                    ${(() => {
+                        // Find next scheduled shift
+                        const today = new Date();
+                        today.setHours(0, 0, 0, 0);
+                        const nextShifts = (state.crc_events || [])
+                            .filter(e => e.crcId === crc.id && e.type === 'Site Assignment' && new Date(e.date + 'T00:00:00') >= today)
+                            .sort((a, b) => new Date(a.date) - new Date(b.date));
+                        
+                        const nextShift = nextShifts[0];
+                        let nextShiftHTML = '';
+                        let nextWeekHTML = '';
+                        
+                        if (nextShift) {
+                            const shiftDate = new Date(nextShift.date + 'T00:00:00');
+                            const site = state.crc_sites.find(s => s.id === nextShift.siteId);
+                            const studies = (nextShift.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
+                            const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study assigned';
+                            const roles = (nextShift.roles || []).join(', ') || 'No roles';
+                            const period = nextShift.period || 'Full Day';
+                            const hours = nextShift.hours || 8;
+                            
+                            nextShiftHTML = `
+                                <div class="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-md">
+                                    <h3 class="text-sm font-semibold text-blue-900 dark:text-blue-200 mb-2">Next Scheduled Shift</h3>
+                                    <div class="space-y-1 text-sm">
+                                        <div><span class="font-medium dark:text-blue-300">Date:</span> <span class="dark:text-blue-100">${formatDisplayDate(nextShift.date)}</span></div>
+                                        <div><span class="font-medium dark:text-blue-300">Site:</span> <span class="dark:text-blue-100">${site ? site.name : 'Unknown Site'}</span></div>
+                                        <div><span class="font-medium dark:text-blue-300">Study:</span> <span class="dark:text-blue-100">${studyNames}</span></div>
+                                        <div><span class="font-medium dark:text-blue-300">Roles:</span> <span class="dark:text-blue-100">${roles}</span></div>
+                                        <div><span class="font-medium dark:text-blue-300">Period:</span> <span class="dark:text-blue-100">${period} (${hours} hours)</span></div>
+                                        ${nextShift.visitNumber ? `<div><span class="font-medium dark:text-blue-300">Visit:</span> <span class="dark:text-blue-100">${nextShift.visitNumber}</span></div>` : ''}
+                                    </div>
+                                </div>
+                            `;
+                            
+                            // Calculate next scheduled week (week containing the next shift)
+                            // Week runs Sunday (0) to Saturday (6)
+                            const shiftDateObj = new Date(shiftDate);
+                            const dayOfWeek = shiftDateObj.getDay(); // 0 = Sunday, 6 = Saturday
+                            // Get Sunday of that week (week starts on Sunday)
+                            const sundayOffset = dayOfWeek; // If Sunday (0), offset is 0; otherwise subtract days to get to Sunday
+                            const weekStart = new Date(shiftDateObj);
+                            weekStart.setDate(shiftDateObj.getDate() - sundayOffset);
+                            weekStart.setHours(0, 0, 0, 0);
+                            const weekEnd = new Date(weekStart);
+                            weekEnd.setDate(weekStart.getDate() + 6); // Saturday (6 days after Sunday)
+                            weekEnd.setHours(23, 59, 59, 999);
+                            
+                            // Count shifts in that week
+                            const weekShifts = (state.crc_events || [])
+                                .filter(e => {
+                                    if (e.crcId !== crc.id || e.type !== 'Site Assignment') return false;
+                                    const eventDate = new Date(e.date + 'T00:00:00');
+                                    return eventDate >= weekStart && eventDate <= weekEnd;
+                                });
+                            
+                            const weekHours = weekShifts.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                            const uniqueDays = new Set(weekShifts.map(e => e.date)).size;
+                            
+                            nextWeekHTML = `
+                                <div class="mb-4 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-700 rounded-md">
+                                    <h3 class="text-sm font-semibold text-green-900 dark:text-green-200 mb-2">Next Scheduled Week</h3>
+                                    <div class="space-y-1 text-sm">
+                                        <div><span class="font-medium dark:text-green-300">Week:</span> <span class="dark:text-green-100">${formatDisplayDate(weekStart)} - ${formatDisplayDate(weekEnd)}</span></div>
+                                        <div><span class="font-medium dark:text-green-300">Shifts:</span> <span class="dark:text-green-100">${weekShifts.length} shift${weekShifts.length !== 1 ? 's' : ''} across ${uniqueDays} day${uniqueDays !== 1 ? 's' : ''}</span></div>
+                                        <div><span class="font-medium dark:text-green-300">Total Hours:</span> <span class="dark:text-green-100">${formatHours(weekHours)}</span></div>
+                                    </div>
+                                </div>
+                            `;
+                        } else {
+                            nextShiftHTML = `
+                                <div class="mb-4 p-3 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md">
+                                    <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Next Scheduled Shift</h3>
+                                    <p class="text-sm text-gray-600 dark:text-gray-400">No upcoming shifts scheduled.</p>
+                                </div>
+                            `;
+                            nextWeekHTML = `
+                                <div class="mb-4 p-3 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md">
+                                    <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Next Scheduled Week</h3>
+                                    <p class="text-sm text-gray-600 dark:text-gray-400">No upcoming shifts scheduled.</p>
+                                </div>
+                            `;
+                        }
+                        
+                        return nextShiftHTML + nextWeekHTML;
+                    })()}
                     ${crcTimeOffSummaryHTML}
                     ${travelSummaryHTML}
                     <form id="edit-crc-form" data-id="${crc.id}" class="space-y-4">
@@ -14231,28 +14552,26 @@
                             </div>
                         </div>
                         <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-3">Travel Budget by Category</label>
-                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-3">Study Budgets</label>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                                 <div>
-                                    <label class="block text-xs font-medium dark:text-gray-400 mb-1">Flight Budget ($)</label>
-                                    <input type="number" name="flightBudget" min="0" step="0.01" value="${study.flightBudget || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                                    <label class="block text-sm font-medium dark:text-gray-400 mb-1">Sponsor Budget ($)</label>
+                                    <input type="number" name="sponsorBudget" min="0" step="0.01" value="${study.sponsorBudget || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Budget allocated by sponsor for travel expenses.</p>
                                 </div>
                                 <div>
-                                    <label class="block text-xs font-medium dark:text-gray-400 mb-1">Hotel Budget ($)</label>
-                                    <input type="number" name="hotelBudget" min="0" step="0.01" value="${study.hotelBudget || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-medium dark:text-gray-400 mb-1">Car Rental Budget ($)</label>
-                                    <input type="number" name="carBudget" min="0" step="0.01" value="${study.carBudget || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                                    <label class="block text-sm font-medium dark:text-gray-400 mb-1">ORA Budget ($)</label>
+                                    <input type="number" name="oraBudget" min="0" step="0.01" value="${study.oraBudget || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="0.00">
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Budget allocated by ORA for travel expenses.</p>
                                 </div>
                             </div>
                             <div class="mt-2 p-2 bg-blue-50 dark:bg-blue-900/20 rounded-md">
                                 <div class="flex justify-between items-center">
-                                    <span class="text-sm font-medium dark:text-gray-300">Total Travel Budget:</span>
+                                    <span class="text-sm font-medium dark:text-gray-300">Total Budget:</span>
                                     <span id="calculated-total-budget" class="text-sm font-bold text-blue-600 dark:text-blue-400">$0.00</span>
                                 </div>
                             </div>
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Total budget is automatically calculated from the sum of flight, hotel, and car budgets.</p>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Total budget is automatically calculated from the sum of Sponsor and ORA budgets. Actual spend is calculated from travel records linked to this study.</p>
                         </div>
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-3">Sites for this Study</label>
@@ -15342,41 +15661,60 @@
                     }
                     case 'set-main-tab': setState({ activeTab: tabId }); break;
                     case 'catch-up': {
-                        const changes = getChangesLast24Hours();
-                        if (changes.length === 0) {
-                            openModal(`
-                                <h3 class="text-xl font-bold dark:text-white mb-4">Catch-Up: Last 24 Hours</h3>
-                                <p class="dark:text-gray-300 mb-6">No changes have been made in the last 24 hours.</p>
-                                <div class="flex justify-end">
-                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
-                                </div>
-                            `);
-                        } else {
-                            const changesHTML = changes.map(change => {
-                                const formatted = formatChangeDetails(change);
-                                return `
-                                    <div class="flex items-start gap-3 p-3 bg-gray-50 dark:bg-gray-800 rounded-lg mb-2">
-                                        <i data-lucide="${formatted.icon}" class="w-5 h-5 ${formatted.color} mt-0.5"></i>
-                                        <div class="flex-1">
-                                            <div class="font-semibold ${formatted.color}">${formatted.title}</div>
-                                            <div class="text-sm text-gray-700 dark:text-gray-300 mt-1">${formatted.message}</div>
-                                            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">${formatted.time}</div>
-                                        </div>
+                        const today = new Date();
+                        const lastWeek = new Date(today);
+                        lastWeek.setDate(lastWeek.getDate() - 7);
+                        const startDateStr = lastWeek.toISOString().split('T')[0];
+                        const endDateStr = today.toISOString().split('T')[0];
+                        
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-4">Catch-Up: Change History</h3>
+                            <div class="space-y-4 mb-4">
+                                <div class="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-1">Start Date</label>
+                                        <input type="date" id="catchup-start-date" value="${startDateStr}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                     </div>
-                                `;
-                            }).join('');
-                            openModal(`
-                                <h3 class="text-xl font-bold dark:text-white mb-4">Catch-Up: Last 24 Hours</h3>
-                                <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">${changes.length} change${changes.length !== 1 ? 's' : ''} found</p>
-                                <div class="max-h-96 overflow-y-auto custom-scrollbar mb-4">
-                                    ${changesHTML}
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-1">End Date</label>
+                                        <input type="date" id="catchup-end-date" value="${endDateStr}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    </div>
                                 </div>
-                                <div class="flex justify-end">
-                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
+                                <div class="flex gap-2">
+                                    <button data-action="catch-up-apply-filter" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">View Changes</button>
+                                    <button data-action="catch-up-updates-only" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700">UPDATES ONLY</button>
+                                    <button data-action="catch-up-last-24h" class="bg-gray-600 text-white py-2 px-4 rounded-md hover:bg-gray-700">Last 24 Hours</button>
                                 </div>
-                            `, 'lg');
-                            setTimeout(() => lucide.createIcons(), 100);
-                        }
+                            </div>
+                            <div id="catchup-results" class="max-h-96 overflow-y-auto custom-scrollbar mb-4">
+                                <p class="text-gray-500 dark:text-gray-400 text-center py-4">Select a date range and click "View Changes" to see history</p>
+                            </div>
+                            <div class="flex justify-end">
+                                <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
+                            </div>
+                        `, 'lg');
+                        break;
+                    }
+                    case 'catch-up-apply-filter': {
+                        const startDate = document.getElementById('catchup-start-date')?.value;
+                        const endDate = document.getElementById('catchup-end-date')?.value;
+                        const changes = getChangesByDateRange(startDate, endDate, false);
+                        renderCatchUpResults(changes, startDate, endDate, false);
+                        break;
+                    }
+                    case 'catch-up-updates-only': {
+                        const startDate = document.getElementById('catchup-start-date')?.value;
+                        const endDate = document.getElementById('catchup-end-date')?.value;
+                        const changes = getChangesByDateRange(startDate, endDate, true);
+                        renderCatchUpResults(changes, startDate, endDate, true);
+                        break;
+                    }
+                    case 'catch-up-last-24h': {
+                        const changes = getChangesLast24Hours();
+                        const today = new Date();
+                        const yesterday = new Date(today);
+                        yesterday.setDate(yesterday.getDate() - 1);
+                        renderCatchUpResults(changes, yesterday.toISOString().split('T')[0], today.toISOString().split('T')[0], false);
                         break;
                     }
                     case 'edit-all-schedule-event': {
@@ -17421,6 +17759,24 @@
                         e.preventDefault();
                         const button = e.target.closest('button');
                         await runNavanImportRange(button);
+                        break;
+                    }
+                    case 'navan-import-next-30': {
+                        e.preventDefault();
+                        const button = e.target.closest('button');
+                        await runNavanImportRange(button, { pastDays: 0, futureDays: 30 });
+                        break;
+                    }
+                    case 'navan-import-next-60': {
+                        e.preventDefault();
+                        const button = e.target.closest('button');
+                        await runNavanImportRange(button, { pastDays: 0, futureDays: 60 });
+                        break;
+                    }
+                    case 'navan-import-past-365': {
+                        e.preventDefault();
+                        const button = e.target.closest('button');
+                        await runNavanImportRange(button, { pastDays: 365, futureDays: 0 });
                         break;
                     }
                     case 'open-navan-import-modal': {
@@ -21540,7 +21896,7 @@
                 const currentMonth = now.getMonth();
                 const currentYear = now.getFullYear();
                 
-                // Calculate CRC utilization
+                // Calculate CRC utilization for current month
                 const crcUtilization = (state.crcs || []).map(crc => {
                     const monthEvents = (state.crc_events || []).filter(e => {
                         const eventDate = new Date(e.date + 'T00:00:00');
@@ -21562,8 +21918,77 @@
                     };
                 }).sort((a, b) => b.utilization - a.utilization).slice(0, 10);
 
-                if (crcUtilization.length === 0) {
-                    container.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-sm">No utilization data available for this month.</p>';
+                // Check if everyone is at 0
+                const allZero = crcUtilization.length === 0 || crcUtilization.every(crc => crc.hours === 0);
+                
+                if (allZero) {
+                    // Show next scheduled week instead
+                    const futureEvents = (state.crc_events || []).filter(e => {
+                        const eventDate = new Date(e.date + 'T00:00:00');
+                        return eventDate > now && e.type === 'Site Assignment';
+                    }).sort((a, b) => new Date(a.date) - new Date(b.date));
+                    
+                    if (futureEvents.length === 0) {
+                        container.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-sm">No scheduled shifts found.</p>';
+                        return;
+                    }
+                    
+                    // Find the week of the first future event
+                    const firstEventDate = new Date(futureEvents[0].date + 'T00:00:00');
+                    const weekStart = new Date(firstEventDate);
+                    weekStart.setDate(weekStart.getDate() - weekStart.getDay()); // Sunday
+                    const weekEnd = new Date(weekStart);
+                    weekEnd.setDate(weekEnd.getDate() + 6); // Saturday
+                    
+                    // Calculate utilization for that week
+                    const weekUtilization = (state.crcs || []).map(crc => {
+                        const weekEvents = futureEvents.filter(e => {
+                            const eventDate = new Date(e.date + 'T00:00:00');
+                            return e.crcId === crc.id &&
+                                   eventDate >= weekStart &&
+                                   eventDate <= weekEnd;
+                        });
+                        
+                        const totalHours = weekEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                        const utilizationPercent = Math.min((totalHours / 40) * 100, 100); // 40 hours per week
+                        
+                        return {
+                            name: crc.name,
+                            hours: totalHours,
+                            utilization: utilizationPercent,
+                            assignments: weekEvents.length
+                        };
+                    }).filter(crc => crc.hours > 0)
+                      .sort((a, b) => b.utilization - a.utilization)
+                      .slice(0, 10);
+                    
+                    if (weekUtilization.length === 0) {
+                        container.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-sm">No utilization data available.</p>';
+                        return;
+                    }
+                    
+                    container.innerHTML = `
+                        <div class="mb-3 p-2 bg-blue-50 dark:bg-blue-900/20 rounded-md border border-blue-200 dark:border-blue-800">
+                            <p class="text-xs text-blue-700 dark:text-blue-300 font-semibold">Next Scheduled Week</p>
+                            <p class="text-sm text-blue-800 dark:text-blue-200">${weekStart.toLocaleDateString()} - ${weekEnd.toLocaleDateString()}</p>
+                        </div>
+                        <div class="space-y-3">
+                            ${weekUtilization.map(crc => {
+                                const barColor = crc.utilization > 80 ? 'bg-red-500' : crc.utilization > 60 ? 'bg-yellow-500' : 'bg-green-500';
+                                return `
+                                    <div>
+                                        <div class="flex justify-between items-center mb-1">
+                                            <span class="text-sm font-medium dark:text-gray-300">${crc.name}</span>
+                                            <span class="text-xs text-gray-600 dark:text-gray-400">${crc.hours.toFixed(1)}h (${crc.utilization.toFixed(0)}%)</span>
+                                        </div>
+                                        <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                                            <div class="${barColor} h-2 rounded-full transition-all" style="width: ${Math.min(crc.utilization, 100)}%"></div>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    `;
                     return;
                 }
 
@@ -21762,13 +22187,92 @@
                 const container = document.getElementById('training-status-content');
                 if (!container) return;
 
-                // This would need training data - placeholder for now
-                container.innerHTML = `
-                    <div class="text-center py-4">
-                        <p class="text-gray-500 dark:text-gray-400 text-sm">Training status data will be displayed here.</p>
-                        <p class="text-xs text-gray-400 dark:text-gray-500 mt-2">Integration with training records coming soon.</p>
-                    </div>
-                `;
+                const now = new Date();
+                const next60Days = new Date(now);
+                next60Days.setDate(next60Days.getDate() + 60);
+                
+                // Collect all training expirations
+                const allExpirations = [];
+                (state.crcs || []).forEach(crc => {
+                    if (!crc.trainings || !Array.isArray(crc.trainings)) return;
+                    crc.trainings.forEach(training => {
+                        if (!training.expirationDate) return;
+                        const expDate = new Date(training.expirationDate);
+                        if (isNaN(expDate.getTime())) return;
+                        
+                        allExpirations.push({
+                            crcName: crc.name,
+                            trainingName: training.name || 'Unknown Training',
+                            expirationDate: expDate
+                        });
+                    });
+                });
+                
+                // Filter expirations in next 60 days
+                const expiringIn60Days = allExpirations.filter(exp => {
+                    return exp.expirationDate >= now && exp.expirationDate <= next60Days;
+                });
+                
+                // Find next expiration date (if any)
+                const futureExpirations = allExpirations.filter(exp => exp.expirationDate > now);
+                futureExpirations.sort((a, b) => a.expirationDate - b.expirationDate);
+                const nextExpiration = futureExpirations.length > 0 ? futureExpirations[0] : null;
+                
+                if (expiringIn60Days.length > 0) {
+                    container.innerHTML = `
+                        <div class="space-y-3">
+                            <div class="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4">
+                                <div class="flex items-center justify-between mb-2">
+                                    <h4 class="text-lg font-semibold text-yellow-800 dark:text-yellow-200">Trainings Expiring</h4>
+                                    <span class="text-2xl font-bold text-yellow-600 dark:text-yellow-400">${expiringIn60Days.length}</span>
+                                </div>
+                                <p class="text-sm text-yellow-700 dark:text-yellow-300">In the next 60 days</p>
+                            </div>
+                            <div class="space-y-2 max-h-60 overflow-y-auto">
+                                ${expiringIn60Days.slice(0, 10).map(exp => {
+                                    const daysUntil = Math.ceil((exp.expirationDate - now) / (1000 * 60 * 60 * 24));
+                                    const isUrgent = daysUntil <= 30;
+                                    return `
+                                        <div class="p-2 rounded-md ${isUrgent ? 'bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800' : 'bg-gray-50 dark:bg-gray-700/50'}">
+                                            <div class="flex justify-between items-center">
+                                                <div>
+                                                    <p class="text-sm font-medium dark:text-gray-300">${exp.crcName}</p>
+                                                    <p class="text-xs text-gray-600 dark:text-gray-400">${exp.trainingName}</p>
+                                                </div>
+                                                <div class="text-right">
+                                                    <p class="text-sm font-semibold ${isUrgent ? 'text-red-600 dark:text-red-400' : 'text-gray-700 dark:text-gray-300'}">${exp.expirationDate.toLocaleDateString()}</p>
+                                                    <p class="text-xs text-gray-500 dark:text-gray-400">${daysUntil === 0 ? 'Today' : daysUntil === 1 ? 'Tomorrow' : `${daysUntil} days`}</p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                                ${expiringIn60Days.length > 10 ? `<p class="text-xs text-gray-500 dark:text-gray-400 text-center">... and ${expiringIn60Days.length - 10} more</p>` : ''}
+                            </div>
+                        </div>
+                    `;
+                } else if (nextExpiration) {
+                    const daysUntil = Math.ceil((nextExpiration.expirationDate - now) / (1000 * 60 * 60 * 24));
+                    container.innerHTML = `
+                        <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-4">
+                            <div class="text-center">
+                                <p class="text-sm text-green-700 dark:text-green-300 mb-2">No trainings expiring in the next 60 days</p>
+                                <div class="mt-3">
+                                    <p class="text-xs text-green-600 dark:text-green-400 mb-1">Next Training Expiration</p>
+                                    <p class="text-lg font-semibold text-green-800 dark:text-green-200">${nextExpiration.expirationDate.toLocaleDateString()}</p>
+                                    <p class="text-sm text-green-700 dark:text-green-300 mt-1">${nextExpiration.crcName} - ${nextExpiration.trainingName}</p>
+                                    <p class="text-xs text-green-600 dark:text-green-400 mt-1">${daysUntil} days from now</p>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    container.innerHTML = `
+                        <div class="text-center py-4">
+                            <p class="text-gray-500 dark:text-gray-400 text-sm">No training expiration data available.</p>
+                        </div>
+                    `;
+                }
             };
 
             const renderTimeOffSummary = () => {
@@ -24039,8 +24543,14 @@
                                 `}
                             </div>
                             <div class="flex flex-col sm:flex-row gap-2">
-                                <button data-action="navan-import-range" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center justify-center">
-                                    <i data-lucide="cloud-download" class="w-4 h-4 mr-2"></i>Sync Recent Bookings
+                                <button data-action="navan-import-next-30" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center justify-center">
+                                    <i data-lucide="calendar" class="w-4 h-4 mr-2"></i>Next 30 Days
+                                </button>
+                                <button data-action="navan-import-next-60" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center justify-center">
+                                    <i data-lucide="calendar" class="w-4 h-4 mr-2"></i>Next 60 Days
+                                </button>
+                                <button data-action="navan-import-past-365" class="bg-amber-600 text-white py-2 px-4 rounded-md hover:bg-amber-700 transition-colors flex items-center justify-center">
+                                    <i data-lucide="clock" class="w-4 h-4 mr-2"></i>Past 365 Days
                                 </button>
                                 <button data-action="open-navan-import-modal" class="bg-white text-blue-700 border border-blue-300 py-2 px-4 rounded-md hover:bg-blue-100 transition-colors flex items-center justify-center dark:bg-blue-900/40 dark:text-blue-200 dark:border-blue-700 dark:hover:bg-blue-900/60">
                                     <i data-lucide="settings-2" class="w-4 h-4 mr-2"></i>Advanced Import
