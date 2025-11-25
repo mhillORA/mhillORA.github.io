@@ -12915,13 +12915,45 @@
                 html += '<p class="text-xs text-gray-500 dark:text-gray-400 mb-3">Only roles with valid, non-expired training are shown for each CRC. If no roles appear, the CRC needs to complete required training.</p>';
                 const allRoles = getAllRoles(state.crc_events, state.roles);
 
+                // Get all available roles for training dropdown (excluding Training role itself)
+                const availableTrainingRoles = state.roles
+                    .filter(r => r?.name && !isTrainingRoleName(r.name))
+                    .map(r => r.name)
+                    .filter((value, index, self) => self.findIndex(v => v.toLowerCase() === value.toLowerCase()) === index)
+                    .sort((a, b) => a.localeCompare(b));
+
+                // Get training role ID
+                const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
+
+                // Helper to get existing training assignment for a CRC
+                const getExistingTrainingForCrc = (crcId) => {
+                    if (!event || !event.trainingAssignments || typeof event.trainingAssignments !== 'object') {
+                        return '';
+                    }
+                    // Check if this CRC has a training assignment
+                    const trainingRoleAssignments = event.trainingAssignments[trainingRoleId];
+                    if (!Array.isArray(trainingRoleAssignments)) return '';
+                    // Find the index where this CRC is assigned to Training role
+                    if (event.roleAssignments && event.roleAssignments[trainingRoleId]) {
+                        const trainingIndex = event.roleAssignments[trainingRoleId].indexOf(crcId);
+                        if (trainingIndex >= 0 && trainingRoleAssignments[trainingIndex]) {
+                            return trainingRoleAssignments[trainingIndex];
+                        }
+                    }
+                    return '';
+                };
+
                 selectedCrcIds.forEach(crcId => {
                     const crc = state.crcs.find(c => c.id === crcId);
                     if (!crc) return;
 
                     let selectedRoles = new Set();
+                    let selectedTrainingRole = '';
                     if (event && event.crcId === crcId) {
                         selectedRoles = new Set(event.roles || []);
+                        // Get existing training role assignment if any
+                        selectedTrainingRole = getExistingTrainingForCrc(crcId);
                     }
                     
                     // Only show roles that the CRC has valid training for (Training role is always allowed)
@@ -12935,11 +12967,27 @@
                         return `<option value="${r}" ${isSelected ? 'selected' : ''}>${r}</option>`;
                     }).join('');
 
+                    // Build training role dropdown HTML
+                    const trainingRoleDropdownHtml = availableTrainingRoles.length > 0
+                        ? `
+                            <div id="training-role-selection-${crcId}" class="mt-2 ${selectedRoles.has(TRAINING_ROLE_NAME) ? '' : 'hidden'}">
+                                <label class="block text-xs font-medium dark:text-gray-400 mb-1">Training For Which Role?</label>
+                                <select name="trainingRole-${crcId}" class="w-full p-1.5 text-sm border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="">Select role being trained for</option>
+                                    ${availableTrainingRoles.map(roleName => 
+                                        `<option value="${roleName}" ${selectedTrainingRole === roleName ? 'selected' : ''}>${roleName}</option>`
+                                    ).join('')}
+                                </select>
+                            </div>
+                        `
+                        : '';
+
                     const noTrainingMessage = trainedRoles.length === 0 
                         ? `<div class="col-span-2 text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-2 rounded border border-red-200 dark:border-red-800">⚠️ No valid training for any roles</div>`
                         : `<div class="col-span-2">
-                            <select name="roles-${crcId}" multiple class="role-select-individual w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-24">${roleOptions}</select>
+                            <select name="roles-${crcId}" multiple class="role-select-individual w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-24" data-crc-id="${crcId}">${roleOptions}</select>
                             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${trainedRoles.length} role${trainedRoles.length !== 1 ? 's' : ''} available</p>
+                            ${trainingRoleDropdownHtml}
                           </div>`;
 
                     html += `
@@ -12950,6 +12998,32 @@
                     `;
                 });
                 container.innerHTML = html;
+
+                // Add event listeners to show/hide training role dropdown when Training is selected/deselected
+                container.querySelectorAll('.role-select-individual').forEach(selectElement => {
+                    const crcId = selectElement.dataset.crcId;
+                    const trainingRoleSelectionDiv = document.getElementById(`training-role-selection-${crcId}`);
+                    
+                    if (selectElement && trainingRoleSelectionDiv) {
+                        const handleRoleChange = () => {
+                            const selectedOptions = Array.from(selectElement.selectedOptions);
+                            const hasTraining = selectedOptions.some(option => option.value === TRAINING_ROLE_NAME);
+                            
+                            if (hasTraining) {
+                                trainingRoleSelectionDiv.classList.remove('hidden');
+                            } else {
+                                trainingRoleSelectionDiv.classList.add('hidden');
+                            }
+                        };
+                        
+                        // Remove existing listeners to avoid duplicates
+                        selectElement.removeEventListener('change', handleRoleChange);
+                        selectElement.addEventListener('change', handleRoleChange);
+                        
+                        // Initial check
+                        handleRoleChange();
+                    }
+                });
             };
 
             // --- MODAL HTML GENERATORS (No changes in this section) ---
@@ -19453,11 +19527,26 @@
                                 
                                 if (isEditing) {
                                     const roles = formData.getAll(`roles-${crcIds[0]}`);
+                                    
+                                    // Collect training role assignments for single shift form
+                                    const singleShiftTrainingAssignments = {};
+                                    const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                                    const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
+                                    const trainingRoleSelect = form.querySelector(`select[name="trainingRole-${crcIds[0]}"]`);
+                                    if (trainingRoleSelect && trainingRoleSelect.value && roles.includes(TRAINING_ROLE_NAME)) {
+                                        if (!singleShiftTrainingAssignments[trainingRoleId]) {
+                                            singleShiftTrainingAssignments[trainingRoleId] = [];
+                                        }
+                                        // For single shift, we only have one CRC, so index 0
+                                        singleShiftTrainingAssignments[trainingRoleId][0] = trainingRoleSelect.value;
+                                    }
+                                    
                                     const updatePayload = {
                                         ...baseEventData,
                                         type: data.eventType,
                                         crcId: crcIds[0],
                                         roles,
+                                        trainingAssignments: Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : undefined,
                                         groupNumber: groupNumberValue,
                                         date: startDateStr,
                                         startDate: startDateStr,
@@ -19736,8 +19825,21 @@
                                     } else {
                                         // Legacy handling for non-Site Assignment events or when no role assignments
                                         const targetCrcs = eventType === 'Open Shift' ? [null] : crcIds;
+                                        const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                                        const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
+                                        
                                         for (const crcId of targetCrcs) {
                                             const roles = crcId ? formData.getAll(`roles-${crcId}`) : [];
+                                            
+                                            // Collect training role assignment for this CRC
+                                            const singleShiftTrainingAssignments = {};
+                                            const trainingRoleSelect = crcId ? form.querySelector(`select[name="trainingRole-${crcId}"]`) : null;
+                                            if (trainingRoleSelect && trainingRoleSelect.value && roles.includes(TRAINING_ROLE_NAME)) {
+                                                if (!singleShiftTrainingAssignments[trainingRoleId]) {
+                                                    singleShiftTrainingAssignments[trainingRoleId] = [];
+                                                }
+                                                singleShiftTrainingAssignments[trainingRoleId][0] = trainingRoleSelect.value;
+                                            }
                                             
                                             // Check per-CRC travel checkboxes - only create travel days if explicitly checked
                                             const includeStartTravelForCrc = crcId ? (form.querySelector(`input[name="travel-start-${crcId}"]`)?.checked === true) : false;
@@ -19798,7 +19900,15 @@
                                             for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
                                                 const dateStr = toDateOnlyString(d);
                                                 const newEventRef = null;
-                                                let currentEventData = { ...baseEventData, name: (eventType === 'Site Assignment' ? 'Site Assignment' : eventType), crcId, roles, date: dateStr, groupId };
+                                                let currentEventData = { 
+                                                    ...baseEventData, 
+                                                    name: (eventType === 'Site Assignment' ? 'Site Assignment' : eventType), 
+                                                    crcId, 
+                                                    roles, 
+                                                    date: dateStr, 
+                                                    groupId,
+                                                    trainingAssignments: Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : undefined
+                                                };
                                                 if (eventType === 'Site Assignment') {
                                                     currentEventData.type = 'Site Assignment';
                                                 } else {
