@@ -1713,8 +1713,8 @@
 
             const normalizeEmploymentType = (value) => {
                 const v = (value || '').toString().trim().toLowerCase();
-                if (v === 'pte' || v.includes('per-diem') || v.includes('per diem') || v.includes('part-time') || v.includes('part time')) return 'PTE';
-                if (v === 'contractor' || v === 'contract') return 'Contractor';
+                // Combine PTE and Contractor into just "Contractor"
+                if (v === 'pte' || v.includes('per-diem') || v.includes('per diem') || v.includes('part-time') || v.includes('part time') || v === 'contractor' || v === 'contract') return 'Contractor';
                 return 'FTE';
             };
 
@@ -13045,7 +13045,6 @@
                                 <label class="block text-sm font-medium dark:text-gray-300">Employment Type</label>
                                 <select name="employmentType" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                     <option value="FTE" ${normalizeEmploymentType(crc.employmentType) === 'FTE' ? 'selected' : ''}>FTE</option>
-                                    <option value="PTE" ${normalizeEmploymentType(crc.employmentType) === 'PTE' ? 'selected' : ''}>PTE</option>
                                     <option value="Contractor" ${normalizeEmploymentType(crc.employmentType) === 'Contractor' ? 'selected' : ''}>Contractor</option>
                                 </select>
                             </div>
@@ -13309,7 +13308,8 @@
                             return;
                         }
                         
-                        const isPTO = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other'].includes(ptoType);
+                        // All time off types should create time off requests (Vacation, Sick, Personal, Holiday, Bereavement, Other)
+                        const isTimeOffType = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other', 'Sick', 'Sick Time'].includes(ptoType);
                         
                         try {
                             const start = new Date(startDate + 'T00:00:00');
@@ -13320,7 +13320,8 @@
                             while (currentDate <= end) {
                                 const dateStr = toDateOnlyString(currentDate);
                                 const period = formData.get(`period-${dateStr}`) || formData.get('defaultPeriod') || 'Full Day';
-                                const hours = period === 'Full Day' ? 8 : (period === 'Before 2pm' ? 4 : 4);
+                                // Support AM, PM, Before 2pm, and Full Day periods
+                                const hours = period === 'Full Day' ? 8 : (['AM', 'PM', 'Before 2pm'].includes(period) ? 4 : 4);
                                 
                                 days.push({ date: dateStr, period, hours });
                                 currentDate.setDate(currentDate.getDate() + 1);
@@ -13328,6 +13329,7 @@
                             
                             let createdCount = 0;
                             let timeOffRequestsCreated = 0;
+                            const createdTimeOffRequests = []; // Track created requests
                             
                             for (const day of days) {
                                 const eventData = {
@@ -13345,8 +13347,8 @@
                                 state.crc_events = [...state.crc_events, newEvent];
                                 createdCount++;
                                 
-                                // Create time off request for PTO types (not Sick Time)
-                                if (isPTO) {
+                                // Create time off request for ALL time off types (Vacation, Sick, Personal, Holiday, Bereavement, Other)
+                                if (isTimeOffType) {
                                     try {
                                         const timeOffRequest = {
                                             crcId: crcId,
@@ -13363,6 +13365,12 @@
                                         console.log('Creating time off request:', timeOffRequest);
                                         const createdRequest = await apiService.createTimeOffRequest(timeOffRequest);
                                         console.log('Time off request created successfully:', createdRequest);
+                                        // Store the created request (use response if available, otherwise use our request with generated ID)
+                                        if (createdRequest && createdRequest.id) {
+                                            createdTimeOffRequests.push(createdRequest);
+                                        } else {
+                                            createdTimeOffRequests.push({ ...timeOffRequest, id: crypto.randomUUID() });
+                                        }
                                         timeOffRequestsCreated++;
                                     } catch (error) {
                                         console.error('Error creating time off request for', day.date, error);
@@ -13379,33 +13387,52 @@
                                     console.log(`Refreshing time off requests after creating ${timeOffRequestsCreated} request(s)...`);
                                     // Small delay to ensure backend has processed the requests
                                     await new Promise(resolve => setTimeout(resolve, 500));
-                                    const updatedRequests = await apiService.getTimeOffRequests();
+                                    let updatedRequests = await apiService.getTimeOffRequests();
                                     console.log('Refreshed time off requests:', updatedRequests.length, 'total requests', updatedRequests);
+                                    
+                                    // Merge with locally created requests in case API hasn't returned them yet
+                                    if (createdTimeOffRequests.length > 0) {
+                                        const existingIds = new Set((updatedRequests || []).map(r => r.id));
+                                        const newRequests = createdTimeOffRequests.filter(r => !existingIds.has(r.id));
+                                        if (newRequests.length > 0) {
+                                            console.log('Adding', newRequests.length, 'locally created requests that API may not have returned yet');
+                                            updatedRequests = [...(updatedRequests || []), ...newRequests];
+                                        }
+                                    }
+                                    
+                                    // Update state directly to ensure it's available immediately
+                                    state.timeOffRequests = updatedRequests;
+                                    
                                     // Set the month filter to the first request's month so it shows up
                                     const firstRequestDate = days.length > 0 ? days[0].date : null;
                                     if (firstRequestDate) {
                                         const requestDate = new Date(firstRequestDate + 'T00:00:00');
                                         const requestMonth = `${requestDate.getFullYear()}-${String(requestDate.getMonth() + 1).padStart(2, '0')}`;
                                         console.log('Setting state with month filter:', requestMonth);
+                                        state.timeOffRequestsMonth = requestMonth;
+                                        state.timeOffRequestsStatusFilter = 'all';
+                                        state.activeTab = 'timeOffRequests';
                                         setState({ 
                                             timeOffRequests: updatedRequests,
                                             timeOffRequestsMonth: requestMonth,
-                                            timeOffRequestsStatusFilter: 'all', // Show all statuses to ensure pending requests are visible
+                                            timeOffRequestsStatusFilter: 'all',
                                             activeTab: 'timeOffRequests'
                                         });
                                     } else {
                                         console.log('Setting state without month filter');
+                                        state.timeOffRequestsStatusFilter = 'all';
+                                        state.activeTab = 'timeOffRequests';
                                         setState({ 
                                             timeOffRequests: updatedRequests,
-                                            timeOffRequestsStatusFilter: 'all', // Show all statuses to ensure pending requests are visible
+                                            timeOffRequestsStatusFilter: 'all',
                                             activeTab: 'timeOffRequests'
                                         });
                                     }
-                                    // Force render after state update
+                                    // Force render after state update - use longer delay to ensure state is set
                                     setTimeout(() => {
-                                        console.log('Rendering content after state update');
+                                        console.log('Rendering content after state update. State has', state.timeOffRequests.length, 'requests');
                                         renderContent();
-                                    }, 200);
+                                    }, 300);
                                 } catch (error) {
                                     console.error('Error refreshing time off requests:', error);
                                     showNotification('Time off requests created but failed to refresh the list. Please refresh the page.', 'warning');
@@ -13414,7 +13441,7 @@
                                 console.log('No time off requests were created (timeOffRequestsCreated = 0)');
                             }
                             
-                            const message = isPTO && timeOffRequestsCreated > 0
+                            const message = isTimeOffType && timeOffRequestsCreated > 0
                                 ? `${createdCount} day(s) set and ${timeOffRequestsCreated} time off request(s) created!`
                                 : `${createdCount} day(s) set successfully!`;
                             
@@ -15315,7 +15342,8 @@
                                             hours = 8;
                                         }
                                         // Sick Time is not PTO - it's separate from PTO
-                                        const isPTO = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other'].includes(ptoType);
+                                        // All time off types should create time off requests
+                                        const isTimeOffType = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other', 'Sick', 'Sick Time'].includes(ptoType);
                                         
                                         try {
                                             // Create unavailability event
@@ -15333,8 +15361,8 @@
                                             const newEvent = created && created.id ? created : { id: crypto.randomUUID(), ...eventData };
                                             state.crc_events = [...state.crc_events, newEvent];
                                             
-                                            // If it's a PTO type (not Sick Time), create a time off request
-                                            if (isPTO) {
+                                            // Create a time off request for ALL time off types
+                                            if (isTimeOffType) {
                                                 try {
                                                     const timeOffRequest = {
                                                         crcId: crcId,
@@ -15353,28 +15381,47 @@
                                                     const createdRequest = await apiService.createTimeOffRequest(timeOffRequest);
                                                     console.log('Time off request created successfully:', createdRequest);
                                                     
+                                                    // Store the created request for merging if API doesn't return it
+                                                    const localCreatedRequest = createdRequest && createdRequest.id 
+                                                        ? createdRequest 
+                                                        : { ...timeOffRequest, id: crypto.randomUUID() };
+                                                    
                                                     // Refresh time off requests immediately
                                                     try {
                                                         console.log('Refreshing time off requests after creation...');
                                                         // Small delay to ensure backend has processed the request
                                                         await new Promise(resolve => setTimeout(resolve, 500));
-                                                        const updatedRequests = await apiService.getTimeOffRequests();
+                                                        let updatedRequests = await apiService.getTimeOffRequests();
                                                         console.log('Refreshed time off requests:', updatedRequests.length, 'total requests', updatedRequests);
+                                                        
+                                                        // Merge with locally created request in case API hasn't returned it yet
+                                                        const existingIds = new Set((updatedRequests || []).map(r => r.id));
+                                                        if (!existingIds.has(localCreatedRequest.id)) {
+                                                            console.log('Adding locally created request that API may not have returned yet');
+                                                            updatedRequests = [...(updatedRequests || []), localCreatedRequest];
+                                                        }
+                                                        
+                                                        // Update state directly to ensure it's available immediately
+                                                        state.timeOffRequests = updatedRequests;
+                                                        
                                                         // Set the month filter to the request's month so it shows up
                                                         const requestDate = new Date(date + 'T00:00:00');
                                                         const requestMonth = `${requestDate.getFullYear()}-${String(requestDate.getMonth() + 1).padStart(2, '0')}`;
                                                         console.log('Setting state with month filter:', requestMonth);
+                                                        state.timeOffRequestsMonth = requestMonth;
+                                                        state.timeOffRequestsStatusFilter = 'all';
+                                                        state.activeTab = 'timeOffRequests';
                                                         setState({ 
                                                             timeOffRequests: updatedRequests,
                                                             timeOffRequestsMonth: requestMonth,
-                                                            timeOffRequestsStatusFilter: 'all', // Show all statuses to ensure pending requests are visible
+                                                            timeOffRequestsStatusFilter: 'all',
                                                             activeTab: 'timeOffRequests'
                                                         });
-                                                        // Force render after state update
+                                                        // Force render after state update - use longer delay to ensure state is set
                                                         setTimeout(() => {
-                                                            console.log('Rendering content after state update');
+                                                            console.log('Rendering content after state update. State has', state.timeOffRequests.length, 'requests');
                                                             renderContent();
-                                                        }, 200);
+                                                        }, 300);
                                                     } catch (refreshError) {
                                                         console.error('Error refreshing time off requests:', refreshError);
                                                         showNotification('Time off request created but failed to refresh the list. Please refresh the page.', 'warning');
@@ -16404,6 +16451,117 @@
                             console.error('Error rejecting time off request:', error);
                             showNotification('Failed to reject time off request. See console for details.', 'error');
                         }
+                        break;
+                    }
+                    case 'edit-time-off-request': {
+                        const request = state.timeOffRequests.find(r => r.id === id);
+                        if (!request) {
+                            showNotification('Time off request not found.', 'error');
+                            return;
+                        }
+                        
+                        const crc = state.crcs.find(c => c.id === request.crcId);
+                        const crcName = crc ? crc.name : 'Unknown';
+                        const dateValue = request.date || request.startDate || '';
+                        const endDateValue = request.endDate || request.date || request.startDate || '';
+                        const periodValue = request.period || 'Full Day';
+                        const typeValue = request.type || 'Vacation';
+                        const notesValue = request.notes || '';
+                        const hoursValue = request.hours || (periodValue === 'Full Day' ? 8 : 4);
+                        
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-4">Edit Time Off Request</h3>
+                            <form id="edit-time-off-request-form" data-id="${request.id}" class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Employee</label>
+                                    <input type="text" value="${crcName}" disabled class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Type</label>
+                                    <select name="type" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="Vacation" ${typeValue === 'Vacation' ? 'selected' : ''}>Vacation</option>
+                                        <option value="Sick" ${typeValue === 'Sick' || typeValue === 'Sick Time' ? 'selected' : ''}>Sick Time</option>
+                                        <option value="Personal" ${typeValue === 'Personal' ? 'selected' : ''}>Personal</option>
+                                        <option value="Holiday" ${typeValue === 'Holiday' ? 'selected' : ''}>Holiday</option>
+                                        <option value="Bereavement" ${typeValue === 'Bereavement' ? 'selected' : ''}>Bereavement</option>
+                                        <option value="Other" ${typeValue === 'Other' ? 'selected' : ''}>Other</option>
+                                    </select>
+                                </div>
+                                <div class="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-2">Start Date</label>
+                                        <input type="date" name="startDate" value="${dateValue}" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-2">End Date</label>
+                                        <input type="date" name="endDate" value="${endDateValue}" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    </div>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Period</label>
+                                    <select name="period" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="Full Day" ${periodValue === 'Full Day' ? 'selected' : ''}>Full Day (8 hours)</option>
+                                        <option value="AM" ${periodValue === 'AM' ? 'selected' : ''}>AM Half Day (4 hours)</option>
+                                        <option value="PM" ${periodValue === 'PM' ? 'selected' : ''}>PM Half Day (4 hours)</option>
+                                        <option value="Before 2pm" ${periodValue === 'Before 2pm' ? 'selected' : ''}>Before 2pm (4 hours)</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hours</label>
+                                    <input type="number" name="hours" value="${hoursValue}" min="1" max="8" step="0.5" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Notes</label>
+                                    <textarea name="notes" rows="3" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">${notesValue}</textarea>
+                                </div>
+                                <div class="flex justify-end gap-4">
+                                    <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                    <button type="submit" class="py-2 px-4 rounded-md bg-blue-600 text-white hover:bg-blue-700">Save Changes</button>
+                                </div>
+                            </form>
+                        `);
+                        
+                        // Set up form submission
+                        setTimeout(() => {
+                            const form = document.getElementById('edit-time-off-request-form');
+                            if (form) {
+                                form.addEventListener('submit', async (e) => {
+                                    e.preventDefault();
+                                    const formData = new FormData(form);
+                                    const updateData = {
+                                        ...request,
+                                        type: formData.get('type'),
+                                        date: formData.get('startDate'),
+                                        startDate: formData.get('startDate'),
+                                        endDate: formData.get('endDate'),
+                                        period: formData.get('period'),
+                                        hours: parseFloat(formData.get('hours')) || 8,
+                                        notes: formData.get('notes') || undefined
+                                    };
+                                    
+                                    try {
+                                        await apiService.updateTimeOffRequest(request.id, updateData);
+                                        const updatedRequests = await apiService.getTimeOffRequests();
+                                        setState({ timeOffRequests: updatedRequests });
+                                        showNotification('Time off request updated successfully!', 'success');
+                                        closeModal();
+                                        
+                                        // Refresh views
+                                        setTimeout(() => {
+                                            if (document.getElementById('time-off-requests-content')) {
+                                                renderTimeOffRequestsContent();
+                                            }
+                                            if (document.getElementById('time-off-content')) {
+                                                renderTimeOffContent();
+                                            }
+                                        }, 100);
+                                    } catch (error) {
+                                        console.error('Error updating time off request:', error);
+                                        showNotification('Failed to update time off request. See console for details.', 'error');
+                                    }
+                                });
+                            }
+                        }, 100);
                         break;
                     }
                     case 'delete-time-off-request': {
@@ -22292,6 +22450,7 @@
                                                     <button data-action="reject-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700">Reject</button>
                                                             `
                                                             : `
+                                                                <button data-action="edit-time-off-request" data-id="${request.id}" class="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 mr-2" title="Edit ${formatTimeOffStatus(request.status)} request">Edit</button>
                                                                 <button data-action="delete-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700" title="Delete ${formatTimeOffStatus(request.status)} request">Delete</button>
                                                                 `}
                                                 </td>
