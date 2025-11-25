@@ -661,7 +661,7 @@
                     <i data-lucide="clock" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Catch-Up</span>
                 </button>
                 <div class="flex items-center gap-2">
-                    <span class="text-xs sm:text-sm font-semibold text-gray-500 dark:text-gray-400">Version 2.0.0</span>
+                    <span class="text-xs sm:text-sm font-semibold text-gray-500 dark:text-gray-400">Version 2.0.2</span>
                     <button data-action="open-settings" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
                         <i data-lucide="settings" class="w-5 h-5"></i>
                     </button>
@@ -9610,6 +9610,12 @@
                             continue;
                         }
                         
+                        // Ensure map and markers manager are still available before creating marker
+                        if (!schedulerMap || !schedulerMap.markers) {
+                            console.warn('Map or markers manager not available during marker creation for site:', site.name);
+                            continue;
+                        }
+                        
                         // Create HTML marker
                         const markerHtml = `
                             <div style="background-color: #3b82f6; border: 2px solid white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); cursor: pointer;">
@@ -9617,11 +9623,22 @@
                             </div>
                         `;
                         
-                        const marker = new atlas.HtmlMarker({
-                            htmlContent: markerHtml,
-                            position: [lng, lat],
-                            pixelOffset: [0, -16]
-                        });
+                        let marker;
+                        try {
+                            marker = new atlas.HtmlMarker({
+                                htmlContent: markerHtml,
+                                position: [lng, lat],
+                                pixelOffset: [0, -16]
+                            });
+                        } catch (markerError) {
+                            console.error('Error creating marker for site:', site.name, markerError);
+                            continue;
+                        }
+                        
+                        if (!marker) {
+                            console.error('Failed to create marker for site:', site.name);
+                            continue;
+                        }
                         
                         // Create popup
                         const popupContent = `
@@ -9633,23 +9650,45 @@
                             </div>
                         `;
                         
-                        const popup = new atlas.Popup({
-                            content: popupContent,
-                            pixelOffset: [0, -40]
-                        });
+                        let popup;
+                        try {
+                            popup = new atlas.Popup({
+                                content: popupContent,
+                                pixelOffset: [0, -40]
+                            });
+                        } catch (popupError) {
+                            console.error('Error creating popup for site:', site.name, popupError);
+                        }
                         
-                        marker.events.add('click', () => {
-                            popup.open(schedulerMap);
-                            popup.setPosition([lng, lat]);
-                        });
+                        // Safely add click event handler if marker.events exists
+                        if (marker && marker.events && typeof marker.events.add === 'function') {
+                            try {
+                                marker.events.add('click', () => {
+                                    if (schedulerMap && popup) {
+                                        popup.open(schedulerMap);
+                                        popup.setPosition([lng, lat]);
+                                    }
+                                });
+                            } catch (eventError) {
+                                console.warn('Error adding click event to marker for site:', site.name, eventError);
+                            }
+                        }
                         
                         // Double-check markers manager exists before adding
                         if (schedulerMap && schedulerMap.markers && typeof schedulerMap.markers.add === 'function') {
-                            schedulerMap.markers.add(marker);
-                            markers.push({ position: [lng, lat], marker: marker });
-                            console.log('Site geocoded and added to map:', site.name, { lat, lng });
+                            try {
+                                schedulerMap.markers.add(marker);
+                                markers.push({ position: [lng, lat], marker: marker });
+                                console.log('Site geocoded and added to map:', site.name, { lat, lng });
+                            } catch (addError) {
+                                console.error('Error adding marker to map for site:', site.name, addError);
+                            }
                         } else {
-                            console.error('Cannot add marker - markers manager not available for site:', site.name);
+                            console.error('Cannot add marker - markers manager not available for site:', site.name, {
+                                hasMap: !!schedulerMap,
+                                hasMarkers: !!(schedulerMap && schedulerMap.markers),
+                                markersType: schedulerMap && schedulerMap.markers ? typeof schedulerMap.markers.add : 'N/A'
+                            });
                         }
                     } catch (error) {
                         console.error('Error geocoding site:', site.name, error);
@@ -20875,17 +20914,34 @@
                             }
                             
                             // Use the actual ID from the training type, or fall back to name if no ID exists
-                            const actualId = trainingType.id || trainingType.name || trainingTypeId;
+                            // For training types, the API might use name as the identifier
+                            const actualId = trainingType.id || trainingType.name || oldName || trainingTypeId;
                             
-                            console.log('Updating training type:', { actualId, trainingType, oldName, newName });
+                            console.log('Updating training type:', { actualId, trainingType, oldName, newName, trainingTypeId });
                             
                             // Update the training type in the database
-                            await apiService.updateTrainingType(actualId, {
-                                name: newName,
-                                requiredObservations: parseInt(data.requiredObservations) || 0,
-                                requiredPerformances: parseInt(data.requiredPerformances) || 0,
-                                linkedRoles
-                            });
+                            // Try with ID first, if that fails and we're using name, the encoding will handle it
+                            try {
+                                await apiService.updateTrainingType(actualId, {
+                                    name: newName,
+                                    requiredObservations: parseInt(data.requiredObservations) || 0,
+                                    requiredPerformances: parseInt(data.requiredPerformances) || 0,
+                                    linkedRoles
+                                });
+                            } catch (updateError) {
+                                // If update fails with 404 and we used ID, try with name instead
+                                if (updateError.status === 404 && trainingType.id && trainingType.name) {
+                                    console.log('Update by ID failed, trying with name instead:', trainingType.name);
+                                    await apiService.updateTrainingType(trainingType.name, {
+                                        name: newName,
+                                        requiredObservations: parseInt(data.requiredObservations) || 0,
+                                        requiredPerformances: parseInt(data.requiredPerformances) || 0,
+                                        linkedRoles
+                                    });
+                                } else {
+                                    throw updateError;
+                                }
+                            }
                             
                             // If name changed, update all CRC training records with this name
                             if (oldName !== newName) {
