@@ -13377,7 +13377,7 @@
                                         showNotification(`Failed to create time off request for ${day.date}. ${error?.message || error}`, 'error');
                                     }
                                 } else {
-                                    console.log('Skipping time off request creation - not PTO type or isPTO is false. ptoType:', ptoType, 'isPTO:', isPTO);
+                                    console.log('Skipping time off request creation - not time off type. ptoType:', ptoType, 'isTimeOffType:', isTimeOffType);
                                 }
                             }
                             
@@ -15434,14 +15434,14 @@
                                                     showNotification(`${ptoType} set. Note: Time off request could not be created automatically.`, 'warning');
                                                 }
                                             } else {
-                                                console.log('Skipping time off request creation - not PTO type. ptoType:', ptoType, 'isPTO:', isPTO);
+                                                console.log('Skipping time off request creation - not time off type. ptoType:', ptoType, 'isTimeOffType:', isTimeOffType);
                                                 showNotification(`${ptoType} set successfully!`, 'success');
                                             }
                                             
                                             closeModal();
                                             // If time off request was created, the tab switch above will handle rendering
                                             // Otherwise, refresh the current views
-                                            if (!isPTO || !state.currentUser) {
+                                            if (!isTimeOffType) {
                                                 setTimeout(() => {
                                                     if (document.getElementById('time-off-requests-content')) {
                                                         renderTimeOffRequestsContent();
@@ -16558,6 +16558,150 @@
                                     } catch (error) {
                                         console.error('Error updating time off request:', error);
                                         showNotification('Failed to update time off request. See console for details.', 'error');
+                                    }
+                                });
+                            }
+                        }, 100);
+                        break;
+                    }
+                    case 'change-time-off-status': {
+                        const request = state.timeOffRequests.find(r => r.id === id);
+                        if (!request) {
+                            showNotification('Time off request not found.', 'error');
+                            return;
+                        }
+                        
+                        const currentStatus = normalizeTimeOffStatus(request.status);
+                        const crc = state.crcs.find(c => c.id === request.crcId);
+                        const crcName = crc ? crc.name : 'Unknown';
+                        
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-4">Change Time Off Request Status</h3>
+                            <div class="space-y-4">
+                                <div>
+                                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">
+                                        <strong>Employee:</strong> ${crcName}<br>
+                                        <strong>Type:</strong> ${request.type || 'Time Off'}<br>
+                                        <strong>Date:</strong> ${formatDisplayDate(request.date || request.startDate)}<br>
+                                        <strong>Current Status:</strong> ${formatTimeOffStatus(request.status)}
+                                    </p>
+                                </div>
+                                <form id="change-time-off-status-form" data-id="${request.id}" class="space-y-4">
+                                    <div>
+                                        <label class="block text-sm font-medium dark:text-gray-300 mb-2">New Status</label>
+                                        <select name="status" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                            <option value="pending" ${currentStatus === 'pending' ? 'selected' : ''}>Pending Review</option>
+                                            <option value="approved" ${currentStatus === 'approved' ? 'selected' : ''}>Approved</option>
+                                            <option value="rejected" ${currentStatus === 'rejected' ? 'selected' : ''}>Rejected</option>
+                                        </select>
+                                    </div>
+                                    <div class="flex justify-end gap-4">
+                                        <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                        <button type="submit" class="py-2 px-4 rounded-md bg-yellow-600 text-white hover:bg-yellow-700">Change Status</button>
+                                    </div>
+                                </form>
+                            </div>
+                        `);
+                        
+                        // Set up form submission
+                        setTimeout(() => {
+                            const form = document.getElementById('change-time-off-status-form');
+                            if (form) {
+                                form.addEventListener('submit', async (e) => {
+                                    e.preventDefault();
+                                    const formData = new FormData(form);
+                                    const newStatus = formData.get('status');
+                                    
+                                    if (newStatus === currentStatus) {
+                                        showNotification('Status is already set to ' + formatTimeOffStatus(newStatus) + '.', 'info');
+                                        closeModal();
+                                        return;
+                                    }
+                                    
+                                    try {
+                                        const updateData = {
+                                            ...request,
+                                            status: newStatus,
+                                            approvedBy: state.currentUser?.id || state.currentUser?.username || 'admin',
+                                            approvedAt: newStatus !== 'pending' ? new Date().toISOString() : undefined
+                                        };
+                                        
+                                        await apiService.updateTimeOffRequest(request.id, updateData);
+                                        
+                                        // Handle status change effects
+                                        const date = request.date || request.startDate;
+                                        
+                                        if (newStatus === 'approved') {
+                                            // Create or update unavailability event for approved requests
+                                            const existingEvent = state.crc_events.find(e => 
+                                                e.crcId === request.crcId && 
+                                                e.date === date && 
+                                                e.type === 'Unavailable'
+                                            );
+                                            
+                                            if (!existingEvent) {
+                                                const eventData = {
+                                                    crcId: request.crcId,
+                                                    date: date,
+                                                    type: 'Unavailable',
+                                                    name: request.type || 'Vacation',
+                                                    period: request.period || 'Full Day',
+                                                    hours: request.hours || (request.period === 'Full Day' ? 8 : 4),
+                                                    notes: request.notes || `Approved time off: ${request.type}`,
+                                                    timeOffRequestId: request.id
+                                                };
+                                                
+                                                try {
+                                                    const createdEvent = await apiService.createEvent(eventData);
+                                                    const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                                                    state.crc_events = [...state.crc_events, newEvent];
+                                                } catch (eventError) {
+                                                    console.error('Error creating unavailability event:', eventError);
+                                                }
+                                            }
+                                        } else if (newStatus === 'rejected' || newStatus === 'pending') {
+                                            // Remove unavailability event if status changed from approved
+                                            if (currentStatus === 'approved') {
+                                                const existingEvent = state.crc_events.find(e => 
+                                                    e.crcId === request.crcId && 
+                                                    e.date === date && 
+                                                    e.type === 'Unavailable' &&
+                                                    (e.timeOffRequestId === request.id || (!e.timeOffRequestId && e.name === request.type))
+                                                );
+                                                
+                                                if (existingEvent) {
+                                                    try {
+                                                        await apiService.deleteEvent(existingEvent.id);
+                                                        state.crc_events = state.crc_events.filter(e => e.id !== existingEvent.id);
+                                                    } catch (eventError) {
+                                                        console.error('Error deleting unavailability event:', eventError);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Refresh time off requests
+                                        const updatedRequests = await apiService.getTimeOffRequests();
+                                        setState({ timeOffRequests: updatedRequests });
+                                        
+                                        showNotification(`Time off request status changed to ${formatTimeOffStatus(newStatus)}!`, 'success');
+                                        closeModal();
+                                        
+                                        // Refresh views
+                                        setTimeout(() => {
+                                            if (document.getElementById('time-off-requests-content')) {
+                                                renderTimeOffRequestsContent();
+                                            }
+                                            if (document.getElementById('time-off-content')) {
+                                                renderTimeOffContent();
+                                            }
+                                            if (document.getElementById('unavailability-calendar-container')) {
+                                                renderUnavailabilityCalendar();
+                                            }
+                                        }, 100);
+                                    } catch (error) {
+                                        console.error('Error changing time off request status:', error);
+                                        showNotification('Failed to change status. See console for details.', 'error');
                                     }
                                 });
                             }
@@ -22451,6 +22595,7 @@
                                                             `
                                                             : `
                                                                 <button data-action="edit-time-off-request" data-id="${request.id}" class="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 mr-2" title="Edit ${formatTimeOffStatus(request.status)} request">Edit</button>
+                                                                <button data-action="change-time-off-status" data-id="${request.id}" data-current-status="${statusKey}" class="bg-yellow-600 text-white px-3 py-1 rounded hover:bg-yellow-700 mr-2" title="Change status of ${formatTimeOffStatus(request.status)} request">Change Status</button>
                                                                 <button data-action="delete-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700" title="Delete ${formatTimeOffStatus(request.status)} request">Delete</button>
                                                                 `}
                                                 </td>
