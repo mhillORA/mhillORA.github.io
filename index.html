@@ -19230,6 +19230,7 @@
                         const roleAssignmentInputs = form.querySelectorAll('select[name^="role-"]');
                         let crcIds = formData.getAll('crcId');
                         const studyIds = formData.getAll('studyIds');
+                        const selectedStudyIds = studyIds || []; // Define early for use in validation
                         const duplicateSelectedCrcs = [];
                         const duplicateEnabled = data.duplicateEnabled === 'true';
                         let duplicateConfig = null;
@@ -19427,7 +19428,7 @@
                             period = `${formatTime(startHour, startMinute, startAmPm)} - ${formatTime(endHour, endMinute, endAmPm)}`;
                         }
                         const selectedSiteId = data.siteId;
-                        const selectedStudyIds = studyIds || [];
+                        // selectedStudyIds already defined above
                         const unavailabilityConflicts = [];
                         const siteStudyConflicts = [];
                         const duplicateRoleAssignments = [];
@@ -19943,25 +19944,28 @@
                                 };
                                 
                                 if (isEditing) {
-                                    const roles = formData.getAll(`roles-${crcIds[0]}`);
+                                    // For editing, handle both cases: with CRC or without CRC
+                                    const roles = crcIds.length > 0 ? formData.getAll(`roles-${crcIds[0]}`) : [];
                                     
                                     // Collect training role assignments for single shift form
                                     const singleShiftTrainingAssignments = {};
-                                    const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
-                                    const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
-                                    const trainingRoleSelect = form.querySelector(`select[name="trainingRole-${crcIds[0]}"]`);
-                                    if (trainingRoleSelect && trainingRoleSelect.value && roles.includes(TRAINING_ROLE_NAME)) {
-                                        if (!singleShiftTrainingAssignments[trainingRoleId]) {
-                                            singleShiftTrainingAssignments[trainingRoleId] = [];
+                                    if (crcIds.length > 0) {
+                                        const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                                        const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
+                                        const trainingRoleSelect = form.querySelector(`select[name="trainingRole-${crcIds[0]}"]`);
+                                        if (trainingRoleSelect && trainingRoleSelect.value && roles.includes(TRAINING_ROLE_NAME)) {
+                                            if (!singleShiftTrainingAssignments[trainingRoleId]) {
+                                                singleShiftTrainingAssignments[trainingRoleId] = [];
+                                            }
+                                            // For single shift, we only have one CRC, so index 0
+                                            singleShiftTrainingAssignments[trainingRoleId][0] = trainingRoleSelect.value;
                                         }
-                                        // For single shift, we only have one CRC, so index 0
-                                        singleShiftTrainingAssignments[trainingRoleId][0] = trainingRoleSelect.value;
                                     }
                                     
                                     const updatePayload = {
                                         ...baseEventData,
                                         type: data.eventType,
-                                        crcId: crcIds[0],
+                                        crcId: crcIds.length > 0 ? crcIds[0] : null, // Allow null CRC
                                         roles,
                                         trainingAssignments: Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : undefined,
                                         groupNumber: groupNumberValue,
@@ -20003,8 +20007,8 @@
                                     const startDate = new Date(startDateObj.getTime());
                                     const endDate = new Date(endDateObj.getTime());
                                     
-                                    // For Site Assignment with role assignments, create separate events for each assigned CRC
-                                    if (eventType === 'Site Assignment' && Object.keys(roleAssignments).length > 0) {
+                                    // For Site Assignment, create events for assigned CRCs OR create a single event with role requirements if no CRCs
+                                    if (eventType === 'Site Assignment') {
                                         const assignedCrcs = new Set();
                                         Object.values(roleAssignments).forEach(assignments => {
                                             assignments.forEach(crcId => {
@@ -20012,87 +20016,88 @@
                                             });
                                         });
                                         
-                                        for (const crcId of assignedCrcs) {
-                                            const roles = [];
-                                            Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
-                                                if (assignments.includes(crcId)) {
-                                                    const role = state.roles.find(r => r.id === roleId);
-                                                    if (role) roles.push(role.name);
+                                        // Helper functions for travel day creation (defined once, used multiple times)
+                                        const getNextBusinessDay = (date, days) => {
+                                            const result = new Date(date);
+                                            let daysAdded = 0;
+                                            while (daysAdded < Math.abs(days)) {
+                                                result.setDate(result.getDate() + (days > 0 ? 1 : -1));
+                                                const dayOfWeek = result.getDay();
+                                                // Skip weekends (0 = Sunday, 6 = Saturday)
+                                                if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+                                                    daysAdded++;
                                                 }
-                                            });
+                                            }
+                                            return result;
+                                        };
+                                        
+                                        const findFlightWithinBusinessDay = (crcId, appointmentDate, isBefore) => {
+                                            if (!state.travel) return null;
+                                            const crc = state.crcs.find(c => c.id === crcId);
+                                            if (!crc) return null;
                                             
-                                            // Check per-CRC travel checkboxes - only create travel days if explicitly checked
-                                            const includeStartTravelForCrc = form.querySelector(`input[name="travel-start-${crcId}"]`)?.checked === true;
-                                            const includeEndTravelForCrc = form.querySelector(`input[name="travel-end-${crcId}"]`)?.checked === true;
+                                            const crcNameLower = (crc.name || '').toLowerCase();
+                                            const appointmentDateObj = typeof appointmentDate === 'string' ? new Date(appointmentDate + 'T00:00:00') : appointmentDate;
                                             
-                                            // Create start travel day only if checkbox is checked for this CRC
-                                            if (includeStartTravelForCrc) {
-                                                const startTravelDate = new Date(startDate);
-                                                startTravelDate.setDate(startTravelDate.getDate() - 1);
-                                                const startTravelDateStr = toDateOnlyString(startTravelDate);
-                                                
-                                                // Check if travel day already exists for this CRC on this date
-                                                const existingTravelDay = state.crc_events.find(e => 
-                                                    e.crcId === crcId && 
-                                                    e.date === startTravelDateStr && 
-                                                    e.type === 'Travel Day'
-                                                );
-                                                
-                                                // Only create if it doesn't already exist
-                                                if (!existingTravelDay) {
-                                                    // Helper to get next business day (excluding weekends)
-                                                    const getNextBusinessDay = (date, days) => {
-                                                        const result = new Date(date);
-                                                        let daysAdded = 0;
-                                                        while (daysAdded < Math.abs(days)) {
-                                                            result.setDate(result.getDate() + (days > 0 ? 1 : -1));
-                                                            const dayOfWeek = result.getDay();
-                                                            // Skip weekends (0 = Sunday, 6 = Saturday)
-                                                            if (dayOfWeek !== 0 && dayOfWeek !== 6) {
-                                                                daysAdded++;
-                                                            }
-                                                        }
-                                                        return result;
-                                                    };
+                                            // Check exact date, 1 business day before/after, and 2-3 days (to account for weekends)
+                                            const datesToCheck = [
+                                                toDateOnlyString(appointmentDateObj),
+                                                toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -1 : 1)),
+                                                toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -2 : 2)),
+                                                toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -3 : 3))
+                                            ];
+                                            
+                                            for (const checkDate of datesToCheck) {
+                                                const travelRecord = (state.travel || []).find(travel => {
+                                                    if (!travel || travel.bookingType !== 'FLIGHT') return false;
+                                                    const travelCrcId = travel.crcId;
+                                                    if (travelCrcId !== crcId && travelCrcId !== crc.name) {
+                                                        if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
+                                                    }
                                                     
-                                                    // Helper to find flight within 1 business day
-                                                    const findFlightWithinBusinessDay = (crcId, appointmentDate, isBefore) => {
-                                                        if (!state.travel) return null;
-                                                        const crc = state.crcs.find(c => c.id === crcId);
-                                                        if (!crc) return null;
-                                                        
-                                                        const crcNameLower = (crc.name || '').toLowerCase();
-                                                        const appointmentDateObj = typeof appointmentDate === 'string' ? new Date(appointmentDate + 'T00:00:00') : appointmentDate;
-                                                        
-                                                        // Check exact date, 1 business day before/after, and 2-3 days (to account for weekends)
-                                                        const datesToCheck = [
-                                                            toDateOnlyString(appointmentDateObj),
-                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -1 : 1)),
-                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -2 : 2)),
-                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -3 : 3))
-                                                        ];
-                                                        
-                                                        for (const checkDate of datesToCheck) {
-                                                            const travelRecord = (state.travel || []).find(travel => {
-                                                                if (!travel || travel.bookingType !== 'FLIGHT') return false;
-                                                                const travelCrcId = travel.crcId;
-                                                                if (travelCrcId !== crcId && travelCrcId !== crc.name) {
-                                                                    if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
-                                                                }
-                                                                
-                                                                const travelDate = getTravelPrimaryDate(travel);
-                                                                if (!travelDate) return false;
-                                                                const travelDateOnly = toDateOnlyString(travelDate);
-                                                                return travelDateOnly === checkDate;
-                                                            });
-                                                            
-                                                            if (travelRecord) return travelRecord;
-                                                        }
-                                                        return null;
-                                                    };
+                                                    const travelDate = getTravelPrimaryDate(travel);
+                                                    if (!travelDate) return false;
+                                                    const travelDateOnly = toDateOnlyString(travelDate);
+                                                    return travelDateOnly === checkDate;
+                                                });
+                                                
+                                                if (travelRecord) return travelRecord;
+                                            }
+                                            return null;
+                                        };
+                                        
+                                        // If we have assigned CRCs, create separate events for each
+                                        if (assignedCrcs.size > 0) {
+                                            for (const crcId of assignedCrcs) {
+                                                const roles = [];
+                                                Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                                                    if (assignments.includes(crcId)) {
+                                                        const role = state.roles.find(r => r.id === roleId);
+                                                        if (role) roles.push(role.name);
+                                                    }
+                                                });
+                                                
+                                                // Check per-CRC travel checkboxes - only create travel days if explicitly checked
+                                                const includeStartTravelForCrc = form.querySelector(`input[name="travel-start-${crcId}"]`)?.checked === true;
+                                                const includeEndTravelForCrc = form.querySelector(`input[name="travel-end-${crcId}"]`)?.checked === true;
+                                                
+                                                // Create start travel day only if checkbox is checked for this CRC
+                                                if (includeStartTravelForCrc) {
+                                                    const startTravelDate = new Date(startDate);
+                                                    startTravelDate.setDate(startTravelDate.getDate() - 1);
+                                                    const startTravelDateStr = toDateOnlyString(startTravelDate);
                                                     
-                                                    // Find matching flight
-                                                    const matchingFlight = findFlightWithinBusinessDay(crcId, startDate, true);
+                                                    // Check if travel day already exists for this CRC on this date
+                                                    const existingTravelDay = state.crc_events.find(e => 
+                                                        e.crcId === crcId && 
+                                                        e.date === startTravelDateStr && 
+                                                        e.type === 'Travel Day'
+                                                    );
+                                                    
+                                                    // Only create if it doesn't already exist
+                                                    if (!existingTravelDay) {
+                                                        // Find matching flight
+                                                        const matchingFlight = findFlightWithinBusinessDay(crcId, startDate, true);
                                                     const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                     
                                                     const startTravelEventData = { 
@@ -20152,57 +20157,6 @@
                                                 
                                                 // Only create if it doesn't already exist
                                                 if (!existingTravelDay) {
-                                                    // Helper to get next business day (excluding weekends)
-                                                    const getNextBusinessDay = (date, days) => {
-                                                        const result = new Date(date);
-                                                        let daysAdded = 0;
-                                                        while (daysAdded < Math.abs(days)) {
-                                                            result.setDate(result.getDate() + (days > 0 ? 1 : -1));
-                                                            const dayOfWeek = result.getDay();
-                                                            // Skip weekends (0 = Sunday, 6 = Saturday)
-                                                            if (dayOfWeek !== 0 && dayOfWeek !== 6) {
-                                                                daysAdded++;
-                                                            }
-                                                        }
-                                                        return result;
-                                                    };
-                                                    
-                                                    // Helper to find flight within 1 business day
-                                                    const findFlightWithinBusinessDay = (crcId, appointmentDate, isBefore) => {
-                                                        if (!state.travel) return null;
-                                                        const crc = state.crcs.find(c => c.id === crcId);
-                                                        if (!crc) return null;
-                                                        
-                                                        const crcNameLower = (crc.name || '').toLowerCase();
-                                                        const appointmentDateObj = typeof appointmentDate === 'string' ? new Date(appointmentDate + 'T00:00:00') : appointmentDate;
-                                                        
-                                                        // Check exact date, 1 business day before/after, and 2-3 days (to account for weekends)
-                                                        const datesToCheck = [
-                                                            toDateOnlyString(appointmentDateObj),
-                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -1 : 1)),
-                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -2 : 2)),
-                                                            toDateOnlyString(getNextBusinessDay(appointmentDateObj, isBefore ? -3 : 3))
-                                                        ];
-                                                        
-                                                        for (const checkDate of datesToCheck) {
-                                                            const travelRecord = (state.travel || []).find(travel => {
-                                                                if (!travel || travel.bookingType !== 'FLIGHT') return false;
-                                                                const travelCrcId = travel.crcId;
-                                                                if (travelCrcId !== crcId && travelCrcId !== crc.name) {
-                                                                    if (travel.travelerName && travel.travelerName.toLowerCase() !== crcNameLower) return false;
-                                                                }
-                                                                
-                                                                const travelDate = getTravelPrimaryDate(travel);
-                                                                if (!travelDate) return false;
-                                                                const travelDateOnly = toDateOnlyString(travelDate);
-                                                                return travelDateOnly === checkDate;
-                                                            });
-                                                            
-                                                            if (travelRecord) return travelRecord;
-                                                        }
-                                                        return null;
-                                                    };
-                                                    
                                                     // Find matching flight
                                                     const matchingFlight = findFlightWithinBusinessDay(crcId, endDate, false);
                                                     const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
@@ -20441,6 +20395,42 @@
                                                 }
                                             }
                                         }
+                                        // No CRCs assigned, but we have role requirements - create a shift with role requirements only
+                                        // This allows creating empty shifts that show role requirements in the Roles view
+                                        if (assignedCrcs.size === 0) {
+                                            const dayCursor = new Date(startDate);
+                                            while (dayCursor <= endDate) {
+                                                const dateStr = toDateOnlyString(dayCursor);
+                                                
+                                                // Check if shift already exists for this study/site/date
+                                                const existingShift = state.crc_events.find(e => 
+                                                    e.type === 'Site Assignment' &&
+                                                    e.siteId === selectedSiteId &&
+                                                    e.studyIds && e.studyIds.length > 0 && e.studyIds[0] === selectedStudyIds[0] &&
+                                                    e.date === dateStr &&
+                                                    (!e.crcId || e.crcId === null)
+                                                );
+                                                
+                                                // Only create if it doesn't already exist
+                                                if (!existingShift) {
+                                                    const shiftEventData = {
+                                                        ...baseEventData,
+                                                        name: 'Site Assignment',
+                                                        crcId: null, // No CRC assigned yet
+                                                        roles: [], // Will be determined by role requirements
+                                                        date: dateStr,
+                                                        groupId,
+                                                        type: 'Site Assignment'
+                                                    };
+                                                    
+                                                    const created = await apiService.createEvent(shiftEventData);
+                                                    const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...shiftEventData };
+                                                    state.crc_events = [...state.crc_events, createdEvent];
+                                                }
+                                                
+                                                dayCursor.setDate(dayCursor.getDate() + 1);
+                                            }
+                                        }
                                     }
                                     // Batch operations replaced with individual API calls
                                     console.log('Batch committed successfully');
@@ -20456,9 +20446,15 @@
                                 // Force UI refreshes so schedule and calendar reflect new events immediately
                                 try {
                                     setState({ crc_events: state.crc_events.slice() });
-                                } catch {}
+                                } catch (e) {
+                                    // Ignore errors in UI refresh
+                                }
                                 if (document.getElementById('crc-unavailability-calendar')) {
-                                    try { renderUnavailabilityCalendar(); } catch {}
+                                    try { 
+                                        renderUnavailabilityCalendar(); 
+                                    } catch (e) {
+                                        // Ignore errors in calendar render
+                                    }
                                 }
                                 // Log change for Catch-Up (for new events)
                                 if (!isEditing) {
@@ -20495,7 +20491,8 @@
                                 setTimeout(() => {
                                     closeModal();
                                 }, 1500);
-                            } catch (err) {
+                            }
+                            catch (err) {
                                 console.error("Error submitting form:", err);
                                 showNotification('An error occurred.', 'error');
                             }
