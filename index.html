@@ -1009,6 +1009,35 @@
                     });
                 }
 
+                // Permission Sets methods
+                async getPermissionSets() {
+                    return this.request('/permission-sets');
+                }
+
+                async getPermissionSet(id) {
+                    return this.request(`/permission-sets/${id}`);
+                }
+
+                async createPermissionSet(data) {
+                    return this.request('/permission-sets', {
+                        method: 'POST',
+                        body: JSON.stringify(data)
+                    });
+                }
+
+                async updatePermissionSet(id, data) {
+                    return this.request(`/permission-sets/${id}`, {
+                        method: 'PUT',
+                        body: JSON.stringify(data)
+                    });
+                }
+
+                async deletePermissionSet(id) {
+                    return this.request(`/permission-sets/${id}`, {
+                        method: 'DELETE'
+                    });
+                }
+
                 // Time Off Request methods
                 async getTimeOffRequests() {
                     return this.request('/time-off-requests');
@@ -1571,6 +1600,7 @@
                 trucks: [],
                 truck_events: [],
                 users: [], // Users for authentication
+                permissionSets: [], // Permission sets/roles for access control
                 timeOffRequests: [], // Time off requests awaiting approval
                 timeOffRequestsMonth: null,
                 timeOffRequestsStatusFilter: 'all', // Default to showing all statuses
@@ -3640,6 +3670,12 @@
                     lucide.createIcons();
                 } else if (state.activeTab === 'dashboard') {
                     mainAppContent.innerHTML = getDashboardHTML();
+                    // Initialize map when dashboard is shown
+                    if (typeof initializeSchedulerMap === 'function') {
+                        setTimeout(() => {
+                            initializeSchedulerMap();
+                        }, 100);
+                    }
                     mainAppContent.className = 'w-full';
                     renderDashboardCharts();
                 } else if (state.activeTab === 'reporting') {
@@ -3967,8 +4003,20 @@
                         apiService.getRoles(),
                         apiService.getTrainingTypes()
                     ];
+                    
+                    // Load permission sets if user is Manager
+                    if (state.currentUser && state.currentUser.permissionLevel === 'Manager') {
+                        basePromises.push(apiService.getPermissionSets());
+                    }
 
-                    const [crcs, sites, studies, events, roles, training_types] = await Promise.all(basePromises);
+                    const results = await Promise.all(basePromises);
+                    let crcs, sites, studies, events, roles, training_types, permissionSets;
+                    if (state.currentUser && state.currentUser.permissionLevel === 'Manager') {
+                        [crcs, sites, studies, events, roles, training_types, permissionSets] = results;
+                    } else {
+                        [crcs, sites, studies, events, roles, training_types] = results;
+                        permissionSets = undefined;
+                    }
 
                     let timeOffRequests = [];
                     try {
@@ -4051,6 +4099,9 @@
                     };
                     if (usersUpdate) {
                         updates.users = usersUpdate;
+                    }
+                    if (permissionSets !== undefined) {
+                        updates.permissionSets = permissionSets;
                     }
 
                     setState(updates, { skipRender: true });
@@ -4231,29 +4282,90 @@
                 
                 setButtonLoading(button, true, 'Syncing...');
                 
-                // Fetch full range: 365 days back, 180 days forward
-                const pastDays = Number.isFinite(options.pastDays) ? Math.max(0, Math.floor(options.pastDays)) : DEFAULT_NAVAN_PAST_DAYS;
-                const futureDays = Number.isFinite(options.futureDays) ? Math.max(0, Math.floor(options.futureDays)) : DEFAULT_NAVAN_FUTURE_DAYS;
-                
-                const payload = {
-                    pastDays: pastDays,
-                    futureDays: futureDays
-                };
-                if (options.createdFrom && Number.isFinite(options.createdFrom)) {
-                    payload.createdFrom = options.createdFrom;
-                }
-                if (options.createdTo && Number.isFinite(options.createdTo)) {
-                    payload.createdTo = options.createdTo;
-                }
-                
-                // Update progress to show we're fetching the full range
-                updateProgress(pastDays, `Fetching ${pastDays} days back and ${futureDays} days forward...`);
-                
                 try {
-                    const result = await apiService.importNavanBookingsRange(payload);
+                    // Determine if we should use incremental approach (only when using default pastDays)
+                    const useDefaultPastDays = !Number.isFinite(options.pastDays);
+                    const futureDays = Number.isFinite(options.futureDays) ? Math.max(0, Math.floor(options.futureDays)) : DEFAULT_NAVAN_FUTURE_DAYS;
+                    
+                    let finalResult = null;
+                    let lastError = null;
+                    
+                    // If using default, try incremental approach: 30 days first, then 60 if successful
+                    if (useDefaultPastDays && !options.createdFrom && !options.createdTo) {
+                        // First attempt: 30 days back
+                        updateProgress(30, `Fetching 30 days back and ${futureDays} days forward...`);
+                        
+                        try {
+                            const payload30 = {
+                                pastDays: 30,
+                                futureDays: futureDays
+                            };
+                            
+                            const result30 = await apiService.importNavanBookingsRange(payload30);
+                            finalResult = result30;
+                            
+                            // If successful, try 60 days back
+                            updateProgress(60, `Fetching 60 days back and ${futureDays} days forward...`);
+                            
+                            try {
+                                const payload60 = {
+                                    pastDays: 60,
+                                    futureDays: futureDays
+                                };
+                                
+                                const result60 = await apiService.importNavanBookingsRange(payload60);
+                                finalResult = result60; // Use the 60-day result
+                            } catch (error60) {
+                                console.warn('Failed to fetch 60 days, keeping 30-day result:', error60);
+                                // Keep the 30-day result, just log the warning
+                                lastError = error60;
+                            }
+                        } catch (error30) {
+                            console.error('Navan range import error (30 days):', error30);
+                            showNotification(`Navan import failed: ${error30.message || 'Unknown error'}`, 'error');
+                            
+                            // Re-render travel content even on error to show current state
+                            if (travelContainer) {
+                                await renderTravelContent();
+                            }
+                            
+                            return false;
+                        }
+                    } else {
+                        // Use explicit options or custom date range
+                        const pastDays = Number.isFinite(options.pastDays) ? Math.max(0, Math.floor(options.pastDays)) : DEFAULT_NAVAN_PAST_DAYS;
+                        
+                        const payload = {
+                            pastDays: pastDays,
+                            futureDays: futureDays
+                        };
+                        if (options.createdFrom && Number.isFinite(options.createdFrom)) {
+                            payload.createdFrom = options.createdFrom;
+                        }
+                        if (options.createdTo && Number.isFinite(options.createdTo)) {
+                            payload.createdTo = options.createdTo;
+                        }
+                        
+                        // Update progress to show we're fetching the full range
+                        updateProgress(pastDays, `Fetching ${pastDays} days back and ${futureDays} days forward...`);
+                        
+                        try {
+                            finalResult = await apiService.importNavanBookingsRange(payload);
+                        } catch (error) {
+                            console.error('Navan range import error:', error);
+                            showNotification(`Navan import failed: ${error.message || 'Unknown error'}`, 'error');
+                            
+                            // Re-render travel content even on error to show current state
+                            if (travelContainer) {
+                                await renderTravelContent();
+                            }
+                            
+                            return false;
+                        }
+                    }
                     
                     // Refresh travel data after sync
-                    if (result && result.summary) {
+                    if (finalResult && finalResult.summary) {
                         try {
                             const travelData = await apiService.getTravel();
                             if (Array.isArray(travelData)) {
@@ -4269,17 +4381,12 @@
                         await renderTravelContent();
                     }
                     
-                    return await handleNavanImportResponse(result, 'Navan bookings synchronized successfully.', extras);
-                } catch (error) {
-                    console.error('Navan range import error:', error);
-                    showNotification(`Navan import failed: ${error.message || 'Unknown error'}`, 'error');
+                    // Show success message, noting if we only got 30 days
+                    const successMessage = lastError 
+                        ? 'Navan bookings synchronized successfully (30 days).' 
+                        : 'Navan bookings synchronized successfully.';
                     
-                    // Re-render travel content even on error to show current state
-                    if (travelContainer) {
-                        await renderTravelContent();
-                    }
-                    
-                    return false;
+                    return await handleNavanImportResponse(finalResult, successMessage, extras);
                 } finally {
                     setButtonLoading(button, false);
                 }
@@ -5603,13 +5710,6 @@
                         </div>
                         <div id="sidebar-availability-container" class="space-y-3"></div>
                         <div id="sidebar-navan-checklist" class="space-y-3"></div>
-                        <div class="flex-grow flex flex-col min-h-[300px]">
-                            <h3 class="text-lg font-semibold mb-2 text-gray-700 dark:text-gray-300">Site Locations Map</h3>
-                            <div class="flex-grow rounded-lg overflow-hidden border dark:border-gray-700">
-                                <div id="chaos-scheduler-map" class="w-full h-full" style="min-height: 300px;"></div>
-                            </div>
-                            <p class="text-xs text-center text-gray-500 dark:text-gray-400 mt-2">Viewing all site locations from ARTEMIS</p>
-                        </div>
                     ` : `
                         <div class="flex items-center justify-center h-full">
                             <button id="sidebar-toggle-btn-collapsed" data-action="toggle-sidebar" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors" title="Expand sidebar">
@@ -5667,6 +5767,13 @@
                                 <canvas id="studies-chart" class="w-full h-full"></canvas>
                             </div>
                         </div>
+                    </div>
+                    <div class="mt-6 mb-6">
+                        <h3 class="text-lg font-semibold mb-3 text-gray-700 dark:text-gray-300">Site Locations Map</h3>
+                        <div class="rounded-lg overflow-hidden border dark:border-gray-700" style="height: 500px;">
+                            <div id="chaos-scheduler-map" class="w-full h-full"></div>
+                        </div>
+                        <p class="text-xs text-center text-gray-500 dark:text-gray-400 mt-2">Viewing all site locations from ARTEMIS</p>
                     </div>
                     <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div class="p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
@@ -5854,17 +5961,34 @@
             };
 
             const getAllInclusiveScheduleHTML = () => {
+                // Check if current user is CRC and find matching CRC
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                let matchingCrcId = null;
+                
+                if (isCRCUser && state.currentUser.username) {
+                    // Find CRC that matches the user's name
+                    const matchingCrc = state.crcs.find(crc => 
+                        crc.name && crc.name.toLowerCase().trim() === state.currentUser.username.toLowerCase().trim()
+                    );
+                    if (matchingCrc) {
+                        matchingCrcId = matchingCrc.id;
+                    }
+                }
+                
                 // Initialize filters from state if they don't exist
                 if (!state.allScheduleFilters) {
                     const today = new Date();
                     state.allScheduleFilters = {
-                        crc: 'all',
+                        crc: isCRCUser && matchingCrcId ? matchingCrcId : 'all',
                         site: 'all',
                         study: 'all',
                         eventType: 'all',
                         startDate: toDateOnlyString(new Date(today.getFullYear(), today.getMonth(), 1)),
                         endDate: toDateOnlyString(new Date(today.getFullYear(), today.getMonth() + 1, 0))
                     };
+                } else if (isCRCUser && matchingCrcId) {
+                    // Force CRC filter to their own schedule
+                    state.allScheduleFilters.crc = matchingCrcId;
                 }
                 
                 // Get filtered events
@@ -5952,13 +6076,15 @@
                                 <h3 class="text-xl font-bold dark:text-gray-200">All-Inclusive Schedule View</h3>
                                 <p class="text-sm text-gray-600 dark:text-gray-400">Complete schedule showing all CRCs, positions, sites, and studies at a glance</p>
                             </div>
+                            ${!isCRCUser ? `
                             <button data-action="reset-all-schedule-filters" class="text-sm bg-gray-500 text-white px-3 py-1 rounded-md hover:bg-gray-600">
                                 <i data-lucide="refresh-cw" class="w-4 h-4 inline mr-1"></i>Reset Filters
                             </button>
+                            ` : ''}
                         </div>
                         
                         <!-- Filters -->
-                        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6 p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+                        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6 p-4 bg-gray-50 dark:bg-gray-700 rounded-lg" ${isCRCUser ? 'style="display: none;"' : ''}>
                             <div>
                                 <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Start Date</label>
                                 <input type="date" id="all-schedule-start-date" value="${state.allScheduleFilters.startDate}" class="w-full p-2 text-sm border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white">
@@ -9840,12 +9966,26 @@
             };
 
             const setupAllScheduleFilters = () => {
+                // Check if current user is CRC - if so, don't allow filter changes
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                
                 const startDateInput = document.getElementById('all-schedule-start-date');
                 const endDateInput = document.getElementById('all-schedule-end-date');
                 const crcFilter = document.getElementById('all-schedule-crc-filter');
                 const siteFilter = document.getElementById('all-schedule-site-filter');
                 const studyFilter = document.getElementById('all-schedule-study-filter');
                 const typeFilter = document.getElementById('all-schedule-type-filter');
+                
+                // Disable all filters for CRC users
+                if (isCRCUser) {
+                    if (startDateInput) startDateInput.disabled = true;
+                    if (endDateInput) endDateInput.disabled = true;
+                    if (crcFilter) crcFilter.disabled = true;
+                    if (siteFilter) siteFilter.disabled = true;
+                    if (studyFilter) studyFilter.disabled = true;
+                    if (typeFilter) typeFilter.disabled = true;
+                    return; // Don't set up event listeners for CRC users
+                }
                 
                 const updateFilters = () => {
                     state.allScheduleFilters = {
@@ -10264,14 +10404,22 @@
                 return `
                     <div class="space-y-6">
                         <div class="flex justify-between items-center mb-6">
-                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 flex-1">
+                            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 flex-1">
                                 <div class="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-lg">
                                     <h4 class="text-lg font-semibold text-blue-800 dark:text-blue-200">Total CRCs</h4>
                                     <p class="text-2xl font-bold text-blue-600 dark:text-blue-400">${state.crcs.length}</p>
                                 </div>
+                                <div class="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-lg">
+                                    <h4 class="text-lg font-semibold text-blue-800 dark:text-blue-200">In Training</h4>
+                                    <p class="text-2xl font-bold text-blue-600 dark:text-blue-400">${trainingSummary.inTrainingCount}</p>
+                                </div>
                                 <div class="bg-green-50 dark:bg-green-900/20 p-4 rounded-lg">
                                     <h4 class="text-lg font-semibold text-green-800 dark:text-green-200">Current Trainings</h4>
                                     <p class="text-2xl font-bold text-green-600 dark:text-green-400">${trainingSummary.currentTrainings}</p>
+                                </div>
+                                <div class="bg-yellow-50 dark:bg-yellow-900/20 p-4 rounded-lg">
+                                    <h4 class="text-lg font-semibold text-yellow-800 dark:text-yellow-200">Expiring Soon</h4>
+                                    <p class="text-2xl font-bold text-yellow-600 dark:text-yellow-400">${trainingSummary.expiringTrainings}</p>
                                 </div>
                                 <div class="bg-red-50 dark:bg-red-900/20 p-4 rounded-lg">
                                     <h4 class="text-lg font-semibold text-red-800 dark:text-red-200">Expired Trainings</h4>
@@ -10374,12 +10522,8 @@
                                     trainingsByDate[dateKey] = [];
                                 }
                                 
-                                let status = 'current';
-                                if (expDate <= today) {
-                                    status = 'expired';
-                                } else if (expDate <= thirtyDaysFromNow) {
-                                    status = 'expiring';
-                                }
+                                const trainingType = state.training_types?.find(tt => tt.name === training.name);
+                                const status = getTrainingStatus(training, trainingType, today, thirtyDaysFromNow);
                                 
                                 trainingsByDate[dateKey].push({
                                     crcName: crc.name,
@@ -10419,6 +10563,10 @@
                                 <span>Expiring Soon (30 days)</span>
                             </div>
                             <div class="flex items-center gap-2">
+                                <div class="w-4 h-4 bg-blue-100 dark:bg-blue-900/50 border border-blue-500 rounded"></div>
+                                <span>In Training</span>
+                            </div>
+                            <div class="flex items-center gap-2">
                                 <div class="w-4 h-4 bg-green-100 dark:bg-green-900/50 border border-green-500 rounded"></div>
                                 <span>Current</span>
                             </div>
@@ -10451,6 +10599,7 @@
                     const expiredCount = dayTrainings.filter(t => t.status === 'expired').length;
                     const expiringCount = dayTrainings.filter(t => t.status === 'expiring').length;
                     const currentCount = dayTrainings.filter(t => t.status === 'current').length;
+                    const inTrainingCount = dayTrainings.filter(t => t.status === 'inTraining').length;
                     
                     let dayClass = 'bg-white dark:bg-gray-900 hover:bg-gray-50 dark:hover:bg-gray-800';
                     if (isToday) {
@@ -10472,9 +10621,14 @@
                                             ${expiringCount} expiring
                                         </div>
                                     ` : ''}
+                                    ${inTrainingCount > 0 ? `
+                                        <div class="text-xs px-2 py-1 rounded bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-200 border border-blue-300 dark:border-blue-700">
+                                            ${inTrainingCount} in training
+                                        </div>
+                                    ` : ''}
                                     ${currentCount > 0 ? `
                                         <div class="text-xs px-2 py-1 rounded bg-green-100 dark:bg-green-900/50 text-green-800 dark:text-green-200 border border-green-300 dark:border-green-700">
-                                            ${currentCount} expire
+                                            ${currentCount} current
                                         </div>
                                     ` : ''}
                                     <button data-action="view-training-day" data-date="${dateStr}" class="text-xs text-blue-600 dark:text-blue-400 hover:underline w-full text-left">
@@ -10521,6 +10675,7 @@
                                     <label for="training-status-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Training Status</label>
                                     <select id="training-status-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                         <option value="all" selected>All Status</option>
+                                        <option value="inTraining">In Training</option>
                                         <option value="current">Current</option>
                                         <option value="expiring">Expiring Soon</option>
                                         <option value="expired">Expired</option>
@@ -10621,19 +10776,61 @@
                 `;
             };
 
+            const getTrainingStatus = (training, trainingType, today, thirtyDaysFromNow) => {
+                // If completion date is in the future, status is "inTraining"
+                if (training.completionDate) {
+                    const completionDate = new Date(training.completionDate);
+                    if (completionDate > today) {
+                        return 'inTraining';
+                    }
+                }
+                
+                // Check if training requires observations or completions that haven't been met
+                if (trainingType) {
+                    const requiredObservations = trainingType.requiredObservations || 0;
+                    const requiredPerformances = trainingType.requiredPerformances || 0;
+                    const currentObservations = training.currentObservations || 0;
+                    const currentPerformances = training.currentPerformances || 0;
+                    
+                    if ((requiredObservations > 0 && currentObservations < requiredObservations) ||
+                        (requiredPerformances > 0 && currentPerformances < requiredPerformances)) {
+                        return 'inTraining';
+                    }
+                }
+                
+                // Check expiration date
+                const expDate = new Date(training.expirationDate);
+                if (expDate <= today) {
+                    return 'expired';
+                } else if (expDate <= thirtyDaysFromNow) {
+                    return 'expiring';
+                }
+                
+                return 'current';
+            };
+
             const getTrainingSummary = () => {
                 const today = new Date();
+                const thirtyDaysFromNow = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
                 let currentTrainings = 0;
                 let expiredTrainings = 0;
+                let inTrainingCount = 0;
+                let expiringTrainings = 0;
                 
                 state.crcs.forEach(crc => {
                     if (crc.trainings) {
                         crc.trainings.forEach(training => {
-                            const expDate = new Date(training.expirationDate);
-                            if (expDate > today) {
-                                currentTrainings++;
-                            } else {
+                            const trainingType = state.training_types?.find(tt => tt.name === training.name);
+                            const status = getTrainingStatus(training, trainingType, today, thirtyDaysFromNow);
+                            
+                            if (status === 'expired') {
                                 expiredTrainings++;
+                            } else if (status === 'expiring') {
+                                expiringTrainings++;
+                            } else if (status === 'inTraining') {
+                                inTrainingCount++;
+                            } else if (status === 'current') {
+                                currentTrainings++;
                             }
                         });
                     }
@@ -10641,7 +10838,9 @@
                 
                 return {
                     currentTrainings,
-                    expiredTrainings
+                    expiredTrainings,
+                    inTrainingCount,
+                    expiringTrainings
                 };
             };
 
@@ -10666,19 +10865,14 @@
                 filteredCrcs.forEach(crc => {
                     if (crc.trainings) {
                         crc.trainings.forEach(training => {
-                            const expDate = new Date(training.expirationDate);
-                            let status = 'current';
-                            
-                            if (expDate <= today) {
-                                status = 'expired';
-                            } else if (expDate <= thirtyDaysFromNow) {
-                                status = 'expiring';
-                            }
+                            const trainingType = state.training_types?.find(tt => tt.name === training.name);
+                            const status = getTrainingStatus(training, trainingType, today, thirtyDaysFromNow);
                             
                             // Apply filters
                             if (statusFilter !== 'all' && status !== statusFilter) return;
                             if (typeFilter && !training.name.toLowerCase().includes(typeFilter.toLowerCase())) return;
                             
+                            const expDate = new Date(training.expirationDate);
                             reportData.push({
                                 crcName: crc.name,
                                 crcId: crc.id,
@@ -10692,9 +10886,9 @@
                     }
                 });
                 
-                // Sort by status (expired first), then by days until expiry
+                // Sort by status (expired first, then inTraining, then expiring, then current), then by days until expiry
                 reportData.sort((a, b) => {
-                    const statusOrder = { 'expired': 0, 'expiring': 1, 'current': 2 };
+                    const statusOrder = { 'expired': 0, 'inTraining': 1, 'expiring': 2, 'current': 3 };
                     if (statusOrder[a.status] !== statusOrder[b.status]) {
                         return statusOrder[a.status] - statusOrder[b.status];
                     }
@@ -10704,13 +10898,15 @@
                 const statusColors = {
                     'current': 'text-green-600 dark:text-green-400',
                     'expiring': 'text-yellow-600 dark:text-yellow-400',
-                    'expired': 'text-red-600 dark:text-red-400'
+                    'expired': 'text-red-600 dark:text-red-400',
+                    'inTraining': 'text-blue-600 dark:text-blue-400'
                 };
                 
                 const statusLabels = {
                     'current': 'Current',
                     'expiring': 'Expiring Soon',
-                    'expired': 'Expired'
+                    'expired': 'Expired',
+                    'inTraining': 'In Training'
                 };
                 
                 container.innerHTML = `
@@ -10732,7 +10928,7 @@
                             </thead>
                             <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                                 ${reportData.length > 0 ? reportData.map(training => `
-                                    <tr class="${training.status === 'expired' ? 'bg-red-50 dark:bg-red-900/20' : training.status === 'expiring' ? 'bg-yellow-50 dark:bg-yellow-900/20' : ''}">
+                                    <tr class="${training.status === 'expired' ? 'bg-red-50 dark:bg-red-900/20' : training.status === 'expiring' ? 'bg-yellow-50 dark:bg-yellow-900/20' : training.status === 'inTraining' ? 'bg-blue-50 dark:bg-blue-900/20' : ''}">
                                         <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${training.crcName}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${training.trainingName}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${new Date(training.completionDate).toLocaleDateString()}</td>
@@ -10977,6 +11173,36 @@
                         }
                     });
                 }
+                
+                // Tab switching logic
+                const tabButtons = modalContainer.querySelectorAll('.crc-profile-tab');
+                const tabContents = modalContainer.querySelectorAll('.crc-tab-content');
+                
+                tabButtons.forEach(button => {
+                    button.addEventListener('click', () => {
+                        const targetTab = button.dataset.tab;
+                        
+                        // Update button states
+                        tabButtons.forEach(btn => {
+                            btn.classList.remove('border-blue-600', 'text-blue-600', 'dark:text-blue-400', 'active');
+                            btn.classList.add('border-transparent', 'text-gray-500', 'dark:text-gray-400');
+                        });
+                        button.classList.remove('border-transparent', 'text-gray-500', 'dark:text-gray-400');
+                        button.classList.add('border-blue-600', 'text-blue-600', 'dark:text-blue-400', 'active');
+                        
+                        // Update content visibility
+                        tabContents.forEach(content => {
+                            content.classList.add('hidden');
+                            content.classList.remove('active');
+                        });
+                        
+                        const targetContent = modalContainer.querySelector(`#crc-${targetTab}-tab-content`);
+                        if (targetContent) {
+                            targetContent.classList.remove('hidden');
+                            targetContent.classList.add('active');
+                        }
+                    });
+                });
             };
 
             const setupEditTrainingModal = () => {
@@ -14426,11 +14652,20 @@
                             <button data-action="delete-crc" data-id="${crc.id}" class="px-4 py-2 rounded-md bg-red-600 text-white hover:bg-red-700 text-sm">Delete</button>
                         </div>
                     </div>
-                    <div class="mb-4 p-3 bg-gray-100 dark:bg-gray-700 rounded-md">
-                        <span class="font-semibold">Current Week's Hours (Sat-Fri):</span>
-                        <span class="font-bold text-lg">${weeklyHours}</span>
+                    <!-- Tab Navigation -->
+                    <div class="border-b dark:border-gray-700 mb-4">
+                        <nav class="flex space-x-4" role="tablist">
+                            <button data-tab="profile" class="crc-profile-tab px-4 py-2 text-sm font-medium border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 active" role="tab">Profile</button>
+                            <button data-tab="training" class="crc-profile-tab px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300" role="tab">Training</button>
+                        </nav>
                     </div>
-                    ${(() => {
+                    <!-- Profile Tab Content -->
+                    <div id="crc-profile-tab-content" class="crc-tab-content active">
+                        <div class="mb-4 p-3 bg-gray-100 dark:bg-gray-700 rounded-md">
+                            <span class="font-semibold">Current Week's Hours (Sat-Fri):</span>
+                            <span class="font-bold text-lg">${weeklyHours}</span>
+                        </div>
+                        ${(() => {
                         // Find next scheduled shift
                         const today = new Date();
                         today.setHours(0, 0, 0, 0);
@@ -14549,6 +14784,38 @@
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
+                                <label class="block text-sm font-medium dark:text-gray-300">Work Hours Schedule (when not traveling)</label>
+                                <input type="text" name="workHours" value="${crc.workHours || ''}" placeholder="e.g., 8-5, 9-6" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Standard work hours when not traveling</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300">ORA Email Address</label>
+                                <input type="email" name="oraEmail" value="${crc.oraEmail || ''}" placeholder="email@ora.com" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300">Phone Number (for contact when traveling)</label>
+                            <input type="tel" name="phoneNumber" value="${crc.phoneNumber || ''}" placeholder="(555) 123-4567" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Studies Trained On</label>
+                            <div class="border dark:border-gray-600 rounded bg-white dark:bg-gray-700 p-3 max-h-48 overflow-y-auto">
+                                ${(state.studies || []).length > 0 ? (state.studies || []).map(study => {
+                                    const studyId = study.id;
+                                    const studyName = study.title || study.name || studyId;
+                                    const isChecked = (crc.trainedStudies || []).includes(studyId);
+                                    return `
+                                        <label class="flex items-center space-x-2 py-1 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-600 rounded px-2">
+                                            <input type="checkbox" name="trainedStudies" value="${studyId}" ${isChecked ? 'checked' : ''} class="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500">
+                                            <span class="text-sm dark:text-gray-300">${studyName}</span>
+                                        </label>
+                                    `;
+                                }).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400">No studies available</p>'}
+                            </div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Select all studies this CRC is trained on</p>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
                                 <label class="block text-sm font-medium dark:text-gray-300">Training Level / Sign-off</label>
                                 <input type="text" name="trainingLevel" value="${crc.trainingLevel || ''}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                             </div>
@@ -14559,25 +14826,60 @@
                         </div>
                         <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md">Save Changes</button>
                     </form>
-                    <div class="mt-8 border-t dark:border-gray-700 pt-6">
-                        <h3 class="text-xl font-semibold dark:text-white mb-4">Training Records</h3>
+                    </div>
+                    <!-- Training Tab Content -->
+                    <div id="crc-training-tab-content" class="crc-tab-content hidden">
+                        <div class="mb-4 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-md">
+                            <h3 class="text-lg font-semibold text-blue-900 dark:text-blue-200 mb-2">Training Overview</h3>
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+                                <div>
+                                    <span class="text-blue-700 dark:text-blue-300">Total Trainings:</span>
+                                    <span class="font-bold text-blue-900 dark:text-blue-100 ml-2">${crc.trainings ? crc.trainings.length : 0}</span>
+                                </div>
+                                <div>
+                                    <span class="text-blue-700 dark:text-blue-300">Expired:</span>
+                                    <span class="font-bold text-red-600 dark:text-red-400 ml-2">${crc.trainings ? crc.trainings.filter(t => new Date(t.expirationDate) < today).length : 0}</span>
+                                </div>
+                                <div>
+                                    <span class="text-blue-700 dark:text-blue-300">Expiring Soon:</span>
+                                    <span class="font-bold text-yellow-600 dark:text-yellow-400 ml-2">${crc.trainings ? crc.trainings.filter(t => {
+                                        const expDate = new Date(t.expirationDate);
+                                        return expDate >= today && expDate <= thirtyDaysFromNow;
+                                    }).length : 0}</span>
+                                </div>
+                            </div>
+                        </div>
                         <div class="space-y-4">
+                            <h3 class="text-xl font-semibold dark:text-white mb-4">Training Records</h3>
                             ${trainingsHTML}
                         </div>
-                        <form id="add-training-form" data-id="${crc.id}" class="mt-6 space-y-3 border-t dark:border-gray-700 pt-4">
-                            <h4 class="font-semibold dark:text-gray-200">Add New Training</h4>
-                            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <form id="add-training-form" data-id="${crc.id}" class="mt-6 space-y-4 border-t dark:border-gray-700 pt-6">
+                            <h4 class="text-lg font-semibold dark:text-gray-200 mb-4">Add New Training</h4>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Training Name</label>
                                     <select name="trainingName" id="crc-training-name" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                         <option value="">Select or enter training name</option>
                                         ${trainingOptions}
                                     </select>
                                     <input type="text" id="crc-training-custom" placeholder="Or enter custom training name" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white mt-2">
                                 </div>
-                                <input type="text" name="completionDate" data-date-input autocomplete="off" placeholder="MM/DD/YYYY" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                <input type="text" name="expirationDate" data-date-input autocomplete="off" placeholder="MM/DD/YYYY" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Training Date</label>
+                                    <input type="text" name="completionDate" data-date-input autocomplete="off" placeholder="MM/DD/YYYY" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
                             </div>
-                            <button type="submit" class="w-full bg-green-500 text-white py-2 rounded-md">Add Training</button>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Expiration Date</label>
+                                    <input type="text" name="expirationDate" data-date-input autocomplete="off" placeholder="MM/DD/YYYY" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Notes (Optional)</label>
+                                    <input type="text" name="trainingNotes" placeholder="Additional notes about this training" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            </div>
+                            <button type="submit" class="w-full bg-green-500 text-white py-2 rounded-md hover:bg-green-600">Add Training</button>
                         </form>
                     </div>
                 `;
@@ -15598,6 +15900,14 @@
                             </p>
                         </div>
                         <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Permission Set (Optional)</label>
+                            <select name="permissionSetId" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="">None</option>
+                                ${(state.permissionSets || []).map(ps => `<option value="${ps.id}">${ps.name}</option>`).join('')}
+                            </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Select a permission set to apply default permissions. Individual permissions can be overridden per user.</p>
+                        </div>
+                        <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Email</label>
                             <input type="email" name="email" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter email (optional)">
                         </div>
@@ -15640,6 +15950,14 @@
                             </p>
                         </div>
                         <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Permission Set (Optional)</label>
+                            <select name="permissionSetId" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="">None</option>
+                                ${(state.permissionSets || []).map(ps => `<option value="${ps.id}" ${user.permissionSetId === ps.id ? 'selected' : ''}>${ps.name}</option>`).join('')}
+                            </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Select a permission set to apply default permissions. Individual permissions can be overridden per user.</p>
+                        </div>
+                        <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Email</label>
                             <input type="email" name="email" value="${user.email || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter email (optional)">
                         </div>
@@ -15650,6 +15968,154 @@
                         <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
                             <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Save Changes</button>
+                        </div>
+                    </form>
+                `;
+            };
+
+            const getPermissionSetsModalHTML = () => {
+                const permissionSets = state.permissionSets || [];
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">Permission Sets</h2>
+                    <div class="space-y-4 mb-6">
+                        <button data-action="open-add-permission-set-modal" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 transition-colors flex items-center">
+                            <i data-lucide="plus" class="w-4 h-4 mr-2"></i>Add Permission Set
+                        </button>
+                    </div>
+                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                <thead class="bg-gray-50 dark:bg-gray-700">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Name</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Tabs</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Studies</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Sites</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                    ${permissionSets.length === 0 ? `
+                                        <tr>
+                                            <td colspan="5" class="px-6 py-4 text-center text-gray-500 dark:text-gray-400">No permission sets found. Click "Add Permission Set" to create one.</td>
+                                        </tr>
+                                    ` : permissionSets.map(ps => `
+                                        <tr>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
+                                                ${ps.name || 'Unnamed'}
+                                            </td>
+                                            <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">
+                                                ${ps.tabs && ps.tabs.length > 0 ? ps.tabs.length + ' tab(s)' : 'None'}
+                                            </td>
+                                            <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">
+                                                ${ps.studies && ps.studies.length > 0 ? ps.studies.length + ' study/studies' : ps.studiesAccess === 'all' ? 'All' : 'None'}
+                                            </td>
+                                            <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">
+                                                ${ps.sites && ps.sites.length > 0 ? ps.sites.length + ' site(s)' : ps.sitesAccess === 'all' ? 'All' : 'None'}
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                <button data-action="edit-permission-set" data-id="${ps.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 mr-3">Edit</button>
+                                                <button data-action="delete-permission-set" data-id="${ps.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Delete</button>
+                                            </td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+            };
+
+            const getAddPermissionSetModalHTML = (permissionSet = null) => {
+                const isEdit = !!permissionSet;
+                const allTabs = [
+                    { id: 'scheduler', label: 'Scheduler' },
+                    { id: 'dashboard', label: 'Dashboard' },
+                    { id: 'allSchedule', label: 'All Schedule' },
+                    { id: 'studyWorkload', label: 'Study Workload' },
+                    { id: 'crcs', label: 'CRCs' },
+                    { id: 'reporting', label: 'Reporting' },
+                    { id: 'training', label: 'Training' },
+                    { id: 'jennysView', label: "Jenny's View" },
+                    { id: 'travel', label: 'Travel' },
+                    { id: 'timeOff', label: 'Time Off' },
+                    { id: 'timeOffRequests', label: 'Time Off Requests' },
+                    { id: 'sites', label: 'Sites' },
+                    { id: 'studies', label: 'Studies' },
+                    { id: 'users', label: 'Users' }
+                ];
+                
+                const selectedTabs = permissionSet?.tabs || [];
+                const selectedStudies = permissionSet?.studies || [];
+                const selectedSites = permissionSet?.sites || [];
+                const studiesAccess = permissionSet?.studiesAccess || 'selected';
+                const sitesAccess = permissionSet?.sitesAccess || 'selected';
+                const permissionLevel = permissionSet?.permissionLevel || 'read';
+                
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">${isEdit ? 'Edit' : 'Add'} Permission Set</h2>
+                    <form id="${isEdit ? 'edit' : 'add'}-permission-set-form" ${isEdit ? `data-id="${permissionSet.id}"` : ''} class="space-y-6 max-h-[80vh] overflow-y-auto">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Name</label>
+                            <input type="text" name="name" value="${permissionSet?.name || ''}" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter permission set name">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Permission Level</label>
+                            <select name="permissionLevel" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="read" ${permissionLevel === 'read' ? 'selected' : ''}>Read Only</option>
+                                <option value="edit" ${permissionLevel === 'edit' ? 'selected' : ''}>Edit</option>
+                                <option value="full" ${permissionLevel === 'full' ? 'selected' : ''}>Full Access (Select All)</option>
+                            </select>
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Tabs Access</label>
+                            <div class="border dark:border-gray-600 rounded-md p-3 max-h-48 overflow-y-auto bg-white dark:bg-gray-700">
+                                ${allTabs.map(tab => `
+                                    <label class="flex items-center py-1">
+                                        <input type="checkbox" name="tabs" value="${tab.id}" ${selectedTabs.includes(tab.id) ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm dark:text-gray-300">${tab.label}</span>
+                                    </label>
+                                `).join('')}
+                            </div>
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Studies Access</label>
+                            <select name="studiesAccess" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white mb-2">
+                                <option value="all" ${studiesAccess === 'all' ? 'selected' : ''}>All Studies</option>
+                                <option value="selected" ${studiesAccess === 'selected' ? 'selected' : ''}>Selected Studies Only</option>
+                            </select>
+                            <div id="studies-selection" class="border dark:border-gray-600 rounded-md p-3 max-h-48 overflow-y-auto bg-white dark:bg-gray-700" style="${studiesAccess === 'all' ? 'display: none;' : ''}">
+                                ${state.studies.map(study => `
+                                    <label class="flex items-center py-1">
+                                        <input type="checkbox" name="studies" value="${study.id}" ${selectedStudies.includes(study.id) ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm dark:text-gray-300">${study.name || study.title || study.id}</span>
+                                    </label>
+                                `).join('')}
+                            </div>
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Sites Access</label>
+                            <select name="sitesAccess" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white mb-2">
+                                <option value="all" ${sitesAccess === 'all' ? 'selected' : ''}>All Sites</option>
+                                <option value="selected" ${sitesAccess === 'selected' ? 'selected' : ''}>Selected Sites Only</option>
+                            </select>
+                            <div id="sites-selection" class="border dark:border-gray-600 rounded-md p-3 max-h-48 overflow-y-auto bg-white dark:bg-gray-700" style="${sitesAccess === 'all' ? 'display: none;' : ''}">
+                                ${state.crc_sites.map(site => `
+                                    <label class="flex items-center py-1">
+                                        <input type="checkbox" name="sites" value="${site.id}" ${selectedSites.includes(site.id) ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm dark:text-gray-300">${site.name || site.id}</span>
+                                    </label>
+                                `).join('')}
+                            </div>
+                        </div>
+                        
+                        <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="submit" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700">${isEdit ? 'Save Changes' : 'Create Permission Set'}</button>
                         </div>
                     </form>
                 `;
@@ -16435,95 +16901,21 @@
                                     </div>
                                 </div>
                             `;
-                        } else if (settingsClickCount >= 5) {
-                            // 5th+ click: Dennis Nedry laughing
-                            modalContent = `
-                                <div class="text-center py-4 md:py-8 px-2">
-                                    <div class="mb-4 md:mb-6">
-                                        <img src="https://media1.tenor.com/m/1wdX89Yzl7UAAAAC/dennis-nedry-laughing.gif" 
-                                             alt="Dennis Nedry Laughing" 
-                                             class="mx-auto rounded-lg shadow-lg mb-4"
-                                             style="max-width: 500px; width: 100%;"
-                                             onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
-                                        <div style="display: none;">
-                                            <i data-lucide="laugh" class="w-12 h-12 md:w-16 md:h-16 mx-auto text-purple-600 dark:text-purple-400 mb-4"></i>
-                                        </div>
-                                    </div>
-                                    <h2 class="text-2xl md:text-3xl font-bold text-gray-900 dark:text-white mb-3 md:mb-4">Still Going?!</h2>
-                                    <p class="text-xl md:text-2xl text-gray-700 dark:text-gray-300 mb-2">You've clicked ${settingsClickCount} times now...</p>
-                                    <p class="text-xs md:text-sm text-gray-500 dark:text-gray-400 mt-3 md:mt-4">I admire your persistence!</p>
-                                    <div class="mt-6 md:mt-8">
-                                        <button data-action="close-modal" class="px-4 md:px-6 py-2 md:py-3 rounded-md bg-purple-600 text-white hover:bg-purple-700 text-base md:text-lg">
-                                            OK, OK, I'm Done
-                                        </button>
-                                    </div>
-                                </div>
-                            `;
-                        } else if (settingsClickCount === 4) {
-                            // 4th click: Nice hat
-                            modalContent = `
-                                <div class="text-center py-4 md:py-8 px-2">
-                                    <div class="mb-4 md:mb-6">
-                                        <img src="https://media1.tenor.com/m/4ybW59MPaEkAAAAC/nice-hat-cute-hat.gif" 
-                                             alt="Nice Hat" 
-                                             class="mx-auto rounded-lg shadow-lg mb-4"
-                                             style="max-width: 500px; width: 100%;"
-                                             onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
-                                        <div style="display: none;">
-                                            <i data-lucide="hat" class="w-12 h-12 md:w-16 md:h-16 mx-auto text-pink-600 dark:text-pink-400 mb-4"></i>
-                                        </div>
-                                    </div>
-                                    <h2 class="text-2xl md:text-3xl font-bold text-gray-900 dark:text-white mb-3 md:mb-4">Nice Hat!</h2>
-                                    <p class="text-xl md:text-2xl text-gray-700 dark:text-gray-300 mb-2">You're really enjoying this, aren't you?</p>
-                                    <p class="text-xs md:text-sm text-gray-500 dark:text-gray-400 mt-3 md:mt-4">Click count: ${settingsClickCount}</p>
-                                    <div class="mt-6 md:mt-8">
-                                        <button data-action="close-modal" class="px-4 md:px-6 py-2 md:py-3 rounded-md bg-pink-600 text-white hover:bg-pink-700 text-base md:text-lg">
-                                            Maybe One More...
-                                        </button>
-                                    </div>
-                                </div>
-                            `;
-                        } else if (settingsClickCount === 3) {
-                            // 3rd click: Stick Stupid
-                            modalContent = `
-                                <div class="text-center py-4 md:py-8 px-2">
-                                    <div class="mb-4 md:mb-6">
-                                        <img src="https://media1.tenor.com/m/13K_bqlPnkEAAAAd/stickstupid-stick.gif" 
-                                             alt="Stick Stupid" 
-                                             class="mx-auto rounded-lg shadow-lg mb-4"
-                                             style="max-width: 500px; width: 100%;"
-                                             onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
-                                        <div style="display: none;">
-                                            <i data-lucide="smile" class="w-12 h-12 md:w-16 md:h-16 mx-auto text-yellow-600 dark:text-yellow-400 mb-4"></i>
-                                        </div>
-                                    </div>
-                                    <div class="mt-6 md:mt-8">
-                                        <button data-action="close-modal" class="px-4 md:px-6 py-2 md:py-3 rounded-md bg-yellow-600 text-white hover:bg-yellow-700 text-base md:text-lg">
-                                            Fine, I'll Stop
-                                        </button>
-                                    </div>
-                                </div>
-                            `;
                         } else {
-                            // First 2 clicks: Dennis Nedry message
+                            // All clicks: Dennis Nedry message (first GIF only)
                             modalContent = `
                                 <div class="text-center py-4 md:py-8 px-2">
-                                    <div class="mb-3 md:mb-4">
-                                        <img src="https://media.tenor.com/x7E9uhFQsPkAAAAM/dennis-jurassic-park.gif" 
-                                             alt="Dennis Nedry - Ah ah ah" 
-                                             class="mx-auto rounded-lg shadow-lg mb-3"
-                                             style="max-width: 250px; width: 100%;"
-                                             onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
-                                        <div style="display: none;">
-                                            <i data-lucide="alert-triangle" class="w-12 h-12 md:w-16 md:h-16 mx-auto text-red-600 dark:text-red-400 mb-4"></i>
-                                        </div>
+                                    <img src="https://media.tenor.com/x7E9uhFQsPkAAAAM/dennis-jurassic-park.gif" 
+                                         alt="Dennis Nedry - Ah ah ah" 
+                                         class="mx-auto rounded-lg shadow-lg"
+                                         style="max-width: 250px; width: 100%;"
+                                         onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+                                    <div style="display: none;">
+                                        <i data-lucide="alert-triangle" class="w-12 h-12 md:w-16 md:h-16 mx-auto text-red-600 dark:text-red-400"></i>
                                     </div>
-                                    <h2 class="text-2xl md:text-3xl font-bold text-gray-900 dark:text-white mb-3 md:mb-4">Ah ah ah...</h2>
-                                    <p class="text-xl md:text-2xl text-gray-700 dark:text-gray-300 mb-2">You didn't say the magic word!</p>
-                                    <p class="text-xs md:text-sm text-gray-500 dark:text-gray-400 italic mt-3 md:mt-4">- Dennis Nedry's System, Jurassic Park</p>
                                     <div class="mt-6 md:mt-8">
                                         <button data-action="close-modal" class="px-4 md:px-6 py-2 md:py-3 rounded-md bg-blue-600 text-white hover:bg-blue-700 text-base md:text-lg">
-                                            OK
+                                            Back to Safety
                                         </button>
                                     </div>
                                 </div>
@@ -16564,13 +16956,8 @@
                             if (crc.trainings) {
                                 crc.trainings.forEach(training => {
                                     if (training.expirationDate === dateStr) {
-                                        const expDate = new Date(training.expirationDate);
-                                        let status = 'current';
-                                        if (expDate <= today) {
-                                            status = 'expired';
-                                        } else if (expDate <= thirtyDaysFromNow) {
-                                            status = 'expiring';
-                                        }
+                                        const trainingType = state.training_types?.find(tt => tt.name === training.name);
+                                        const status = getTrainingStatus(training, trainingType, today, thirtyDaysFromNow);
                                         
                                         dayTrainings.push({
                                             crcName: crc.name,
@@ -18820,6 +19207,89 @@
                         })();
                         break;
                     }
+                    case 'open-permission-sets-modal': {
+                        openModal(getPermissionSetsModalHTML(), '6xl');
+                        break;
+                    }
+                    case 'open-add-permission-set-modal': {
+                        openModal(getAddPermissionSetModalHTML(), '4xl');
+                        setTimeout(() => {
+                            const studiesAccessSelect = document.querySelector('[name="studiesAccess"]');
+                            const sitesAccessSelect = document.querySelector('[name="sitesAccess"]');
+                            const studiesSelection = document.getElementById('studies-selection');
+                            const sitesSelection = document.getElementById('sites-selection');
+                            
+                            if (studiesAccessSelect && studiesSelection) {
+                                studiesAccessSelect.addEventListener('change', (e) => {
+                                    studiesSelection.style.display = e.target.value === 'all' ? 'none' : 'block';
+                                });
+                            }
+                            
+                            if (sitesAccessSelect && sitesSelection) {
+                                sitesAccessSelect.addEventListener('change', (e) => {
+                                    sitesSelection.style.display = e.target.value === 'all' ? 'none' : 'block';
+                                });
+                            }
+                        }, 100);
+                        break;
+                    }
+                    case 'edit-permission-set': {
+                        const permissionSet = state.permissionSets.find(ps => ps.id === id);
+                        if (permissionSet) {
+                            openModal(getAddPermissionSetModalHTML(permissionSet), '4xl');
+                            setTimeout(() => {
+                                const studiesAccessSelect = document.querySelector('[name="studiesAccess"]');
+                                const sitesAccessSelect = document.querySelector('[name="sitesAccess"]');
+                                const studiesSelection = document.getElementById('studies-selection');
+                                const sitesSelection = document.getElementById('sites-selection');
+                                
+                                if (studiesAccessSelect && studiesSelection) {
+                                    studiesAccessSelect.addEventListener('change', (e) => {
+                                        studiesSelection.style.display = e.target.value === 'all' ? 'none' : 'block';
+                                    });
+                                }
+                                
+                                if (sitesAccessSelect && sitesSelection) {
+                                    sitesAccessSelect.addEventListener('change', (e) => {
+                                        sitesSelection.style.display = e.target.value === 'all' ? 'none' : 'block';
+                                    });
+                                }
+                            }, 100);
+                        }
+                        break;
+                    }
+                    case 'delete-permission-set': {
+                        const permissionSet = state.permissionSets.find(ps => ps.id === id);
+                        if (permissionSet) {
+                            openModal(`
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Delete Permission Set</h3>
+                                <p class="dark:text-gray-300 mb-6">Are you sure you want to delete permission set <strong>${permissionSet.name}</strong>? This action cannot be undone.</p>
+                                <div class="flex justify-end gap-4">
+                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                    <button data-action="confirm-delete-permission-set" data-id="${permissionSet.id}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Permission Set</button>
+                                </div>
+                            `);
+                        }
+                        break;
+                    }
+                    case 'confirm-delete-permission-set': {
+                        const permissionSetId = e.target.dataset.id;
+                        (async () => {
+                            try {
+                                await apiService.deletePermissionSet(permissionSetId);
+                                setState({
+                                    permissionSets: state.permissionSets.filter(ps => ps.id !== permissionSetId)
+                                });
+                                closeModal();
+                                showNotification('Permission set deleted successfully', 'success');
+                                renderUsersContent();
+                            } catch (error) {
+                                console.error('Error deleting permission set:', error);
+                                showNotification('Failed to delete permission set', 'error');
+                            }
+                        })();
+                        break;
+                    }
                     case 'open-add-user-modal': {
                         openModal(getAddUserModalHTML());
                         break;
@@ -20550,6 +21020,9 @@
                         const crcId = form.dataset.id;
                         const crc = state.crcs.find(c => c.id === crcId);
                         if (crc) {
+                            // Collect trained studies from checkboxes
+                            const trainedStudies = Array.from(form.querySelectorAll('input[name="trainedStudies"]:checked')).map(cb => cb.value);
+                            
                             const updateData = {
                                 name: data.name,
                                 title: data.title || '',
@@ -20558,6 +21031,10 @@
                                 employmentType: normalizeEmploymentType(data.employmentType),
                                 trainingLevel: data.trainingLevel,
                                 capabilities: data.capabilities.split(',').map(s => s.trim()).filter(Boolean),
+                                workHours: data.workHours || '',
+                                oraEmail: data.oraEmail || '',
+                                phoneNumber: data.phoneNumber || '',
+                                trainedStudies: trainedStudies,
                             };
                             
                             // Geocode if home location changed
@@ -21221,6 +21698,67 @@
                         } catch (error) {
                             console.error('Error updating user:', error);
                             showNotification(error.message || 'Failed to update user. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'add-permission-set-form': {
+                        try {
+                            const tabs = formData.getAll('tabs');
+                            const studies = formData.getAll('studies');
+                            const sites = formData.getAll('sites');
+                            
+                            const permissionSetData = {
+                                name: data.name,
+                                permissionLevel: data.permissionLevel,
+                                tabs: tabs,
+                                studiesAccess: data.studiesAccess,
+                                studies: data.studiesAccess === 'selected' ? studies : [],
+                                sitesAccess: data.sitesAccess,
+                                sites: data.sitesAccess === 'selected' ? sites : []
+                            };
+                            
+                            const newPermissionSet = await apiService.createPermissionSet(permissionSetData);
+                            setState({
+                                permissionSets: [...(state.permissionSets || []), newPermissionSet]
+                            });
+                            showNotification('Permission set created successfully!', 'success');
+                            closeModal();
+                            // Refresh permission sets modal if open
+                            if (document.querySelector('[data-action="open-permission-sets-modal"]')) {
+                                // Modal will be refreshed on next open
+                            }
+                        } catch (error) {
+                            console.error('Error creating permission set:', error);
+                            showNotification(error.message || 'Failed to create permission set. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'edit-permission-set-form': {
+                        try {
+                            const permissionSetId = form.dataset.id;
+                            const tabs = formData.getAll('tabs');
+                            const studies = formData.getAll('studies');
+                            const sites = formData.getAll('sites');
+                            
+                            const permissionSetData = {
+                                name: data.name,
+                                permissionLevel: data.permissionLevel,
+                                tabs: tabs,
+                                studiesAccess: data.studiesAccess,
+                                studies: data.studiesAccess === 'selected' ? studies : [],
+                                sitesAccess: data.sitesAccess,
+                                sites: data.sitesAccess === 'selected' ? sites : []
+                            };
+                            
+                            const updatedPermissionSet = await apiService.updatePermissionSet(permissionSetId, permissionSetData);
+                            setState({
+                                permissionSets: (state.permissionSets || []).map(ps => ps.id === permissionSetId ? updatedPermissionSet : ps)
+                            });
+                            showNotification('Permission set updated successfully!', 'success');
+                            closeModal();
+                        } catch (error) {
+                            console.error('Error updating permission set:', error);
+                            showNotification(error.message || 'Failed to update permission set. See console for details.', 'error');
                         }
                         break;
                     }
@@ -24628,9 +25166,14 @@
                 let html = `
                     <div class="flex justify-between items-center mb-6">
                         <h2 class="text-2xl font-bold text-gray-900 dark:text-white">User Management</h2>
-                        <button data-action="open-add-user-modal" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
-                            <i data-lucide="user-plus" class="w-4 h-4 mr-2"></i>Add User
-                        </button>
+                        <div class="flex gap-2">
+                            <button data-action="open-permission-sets-modal" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 transition-colors flex items-center">
+                                <i data-lucide="shield" class="w-4 h-4 mr-2"></i>Permission Sets
+                            </button>
+                            <button data-action="open-add-user-modal" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
+                                <i data-lucide="user-plus" class="w-4 h-4 mr-2"></i>Add User
+                            </button>
+                        </div>
                     </div>
                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
                         <div class="overflow-x-auto">
@@ -24639,6 +25182,7 @@
                                     <tr>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Username</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Permission Level</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Permission Set</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Email</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Entra ID</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Created</th>
@@ -24655,6 +25199,9 @@
                                                 <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${permissionLevelColors[user.permissionLevel] || 'bg-gray-100 text-gray-800'}">
                                                     ${user.permissionLevel || 'CRC'}
                                                 </span>
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                ${user.permissionSetId ? (state.permissionSets.find(ps => ps.id === user.permissionSetId)?.name || 'N/A') : 'None'}
                                             </td>
                                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                                 ${user.email || 'N/A'}
