@@ -3671,6 +3671,49 @@
                 return level === 'full';
             };
             
+            // Helper function to get logged-in CRC's ID
+            const getLoggedInCrcId = () => {
+                if (!state.currentUser || state.currentUser.permissionLevel !== 'CRC') {
+                    return null;
+                }
+                
+                // Try to find CRC by username (which should match email)
+                if (state.currentUser.username) {
+                    const matchingCrc = state.crcs.find(crc => {
+                        const crcName = (crc.name || '').toLowerCase().trim();
+                        const username = state.currentUser.username.toLowerCase().trim();
+                        return crcName === username;
+                    });
+                    if (matchingCrc) {
+                        return matchingCrc.id;
+                    }
+                }
+                
+                // Try to find by email
+                if (state.currentUser.email) {
+                    const matchingCrc = state.crcs.find(crc => {
+                        const crcEmail = (crc.email || crc.userEmail || '').toLowerCase().trim();
+                        const userEmail = state.currentUser.email.toLowerCase().trim();
+                        return crcEmail === userEmail;
+                    });
+                    if (matchingCrc) {
+                        return matchingCrc.id;
+                    }
+                }
+                
+                return null;
+            };
+            
+            // Helper function to filter events for logged-in CRC
+            const getFilteredEventsForCrc = (events) => {
+                const crcId = getLoggedInCrcId();
+                if (!crcId) {
+                    return events; // Not a CRC user, return all events
+                }
+                // Filter to only show this CRC's events
+                return events.filter(event => event.crcId === crcId);
+            };
+            
             // Helper functions to get filtered lists
             const getFilteredStudies = () => {
                 if (!state.studies) return [];
@@ -6165,17 +6208,7 @@
             const getAllInclusiveScheduleHTML = () => {
                 // Check if current user is CRC and find matching CRC
                 const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
-                let matchingCrcId = null;
-                
-                if (isCRCUser && state.currentUser.username) {
-                    // Find CRC that matches the user's name
-                    const matchingCrc = state.crcs.find(crc => 
-                        crc.name && crc.name.toLowerCase().trim() === state.currentUser.username.toLowerCase().trim()
-                    );
-                    if (matchingCrc) {
-                        matchingCrcId = matchingCrc.id;
-                    }
-                }
+                const matchingCrcId = getLoggedInCrcId();
                 
                 // Initialize filters from state if they don't exist
                 if (!state.allScheduleFilters) {
@@ -6193,8 +6226,15 @@
                     state.allScheduleFilters.crc = matchingCrcId;
                 }
                 
-                // Get filtered events
-                let filteredEvents = state.crc_events.filter(event => {
+                // Get filtered events based on permissions
+                let baseEvents = getFilteredEvents();
+                
+                // For CRC users, filter to ONLY their events BEFORE date filtering
+                if (isCRCUser && matchingCrcId) {
+                    baseEvents = baseEvents.filter(e => e.crcId === matchingCrcId);
+                }
+                
+                let filteredEvents = baseEvents.filter(event => {
                     const eventDate = new Date(event.date + 'T00:00:00');
                     const startDate = new Date(state.allScheduleFilters.startDate + 'T00:00:00');
                     const endDate = new Date(state.allScheduleFilters.endDate + 'T23:59:59');
@@ -7437,6 +7477,14 @@
             const renderSupervisorFilters = () => {
                 const container = document.getElementById('supervisor-filters-container');
                 if (!container) return;
+                
+                // Hide filters only for CRC users, show for supervisors and managers
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                if (isCRCUser) {
+                    container.innerHTML = '';
+                    return;
+                }
+                
                 const crcOptions = state.crcs.map(crc => `<option value="${crc.id}">${crc.name}</option>`).join('');
                 const siteOptions = getFilteredSites().map(site => `<option value="${site.id}">${site.name}</option>`).join('');
                 const regions = [...new Set(state.crcs.map(crc => crc.region).filter(Boolean))];
@@ -7649,28 +7697,38 @@
                 const now = state.crcCalendarDate;
                 const year = now.getFullYear();
                 const month = now.getMonth();
+                
+                // Check if CRC user - filter to only their events
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const matchingCrcId = getLoggedInCrcId();
 
                 let crcsToDisplay = state.crcs;
-                if (state.selectedEmploymentTypeFilter !== 'all') {
-                    crcsToDisplay = crcsToDisplay.filter(c => normalizeEmploymentType(c.employmentType) === state.selectedEmploymentTypeFilter);
+                
+                // For CRC users, only show themselves
+                if (isCRCUser && matchingCrcId) {
+                    crcsToDisplay = [state.crcs.find(c => c.id === matchingCrcId)].filter(Boolean);
+                } else {
+                    if (state.selectedEmploymentTypeFilter !== 'all') {
+                        crcsToDisplay = crcsToDisplay.filter(c => normalizeEmploymentType(c.employmentType) === state.selectedEmploymentTypeFilter);
+                    }
+                    
+                    // Filter out CRCs who have time off (Paid Time Off or Unavailable) in the current month
+                    const monthStart = new Date(year, month, 1);
+                    const monthEnd = new Date(year, month + 1, 0);
+                    const monthStartStr = `${year}-${String(month + 1).padStart(2, '0')}-01`;
+                    const monthEndStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(monthEnd.getDate()).padStart(2, '0')}`;
+                    
+                    crcsToDisplay = crcsToDisplay.filter(crc => {
+                        // Check if this CRC has any time off events in the current month
+                        const hasTimeOff = state.crc_events.some(event => 
+                            event.crcId === crc.id && 
+                            (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
+                            event.date >= monthStartStr && 
+                            event.date <= monthEndStr
+                        );
+                        return !hasTimeOff;
+                    });
                 }
-                
-                // Filter out CRCs who have time off (Paid Time Off or Unavailable) in the current month
-                const monthStart = new Date(year, month, 1);
-                const monthEnd = new Date(year, month + 1, 0);
-                const monthStartStr = `${year}-${String(month + 1).padStart(2, '0')}-01`;
-                const monthEndStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(monthEnd.getDate()).padStart(2, '0')}`;
-                
-                crcsToDisplay = crcsToDisplay.filter(crc => {
-                    // Check if this CRC has any time off events in the current month
-                    const hasTimeOff = state.crc_events.some(event => 
-                        event.crcId === crc.id && 
-                        (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
-                        event.date >= monthStartStr && 
-                        event.date <= monthEndStr
-                    );
-                    return !hasTimeOff;
-                });
                 
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
@@ -7682,10 +7740,15 @@
                 filteredEvents = filteredEvents.filter(e => e.type !== 'Unavailable' && e.type !== 'Paid Time Off');
                 console.log('After filtering out PTO/Unavailable:', filteredEvents.length);
                 
-                if (state.selectedCrcFilter !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                // For CRC users, ONLY show their events
+                if (isCRCUser && matchingCrcId) {
+                    filteredEvents = filteredEvents.filter(e => e.crcId === matchingCrcId);
                 } else {
-                    filteredEvents = filteredEvents.filter(e => e.crcId === null || crcIdsToDisplay.includes(e.crcId));
+                    if (state.selectedCrcFilter !== 'all') {
+                        filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                    } else {
+                        filteredEvents = filteredEvents.filter(e => e.crcId === null || crcIdsToDisplay.includes(e.crcId));
+                    }
                 }
                 console.log('After CRC filter:', filteredEvents.length);
                 console.log('Travel Day events after CRC filter:', filteredEvents.filter(e => e.type === 'Travel Day'));
@@ -7779,34 +7842,50 @@
                 const startOfWeek = new Date(year, month, day - dayOfWeek);
                 const endOfWeek = new Date(startOfWeek);
                 endOfWeek.setDate(endOfWeek.getDate() + 6);
+                
+                // Check if CRC user - filter to only their events
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const matchingCrcId = getLoggedInCrcId();
 
                 let crcsToDisplay = state.crcs;
-                if (state.selectedEmploymentTypeFilter !== 'all') {
-                    crcsToDisplay = crcsToDisplay.filter(c => normalizeEmploymentType(c.employmentType) === state.selectedEmploymentTypeFilter);
+                
+                // For CRC users, only show themselves
+                if (isCRCUser && matchingCrcId) {
+                    crcsToDisplay = [state.crcs.find(c => c.id === matchingCrcId)].filter(Boolean);
+                } else {
+                    if (state.selectedEmploymentTypeFilter !== 'all') {
+                        crcsToDisplay = crcsToDisplay.filter(c => normalizeEmploymentType(c.employmentType) === state.selectedEmploymentTypeFilter);
+                    }
+                    
+                    // Filter out CRCs who have time off (Paid Time Off or Unavailable) in the current week
+                    const weekStartStr = `${startOfWeek.getFullYear()}-${String(startOfWeek.getMonth() + 1).padStart(2, '0')}-${String(startOfWeek.getDate()).padStart(2, '0')}`;
+                    const weekEndStr = `${endOfWeek.getFullYear()}-${String(endOfWeek.getMonth() + 1).padStart(2, '0')}-${String(endOfWeek.getDate()).padStart(2, '0')}`;
+                    
+                    crcsToDisplay = crcsToDisplay.filter(crc => {
+                        // Check if this CRC has any time off events in the current week
+                        const hasTimeOff = state.crc_events.some(event => 
+                            event.crcId === crc.id && 
+                            (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
+                            event.date >= weekStartStr && 
+                            event.date <= weekEndStr
+                        );
+                        return !hasTimeOff;
+                    });
                 }
-                
-                // Filter out CRCs who have time off (Paid Time Off or Unavailable) in the current week
-                const weekStartStr = `${startOfWeek.getFullYear()}-${String(startOfWeek.getMonth() + 1).padStart(2, '0')}-${String(startOfWeek.getDate()).padStart(2, '0')}`;
-                const weekEndStr = `${endOfWeek.getFullYear()}-${String(endOfWeek.getMonth() + 1).padStart(2, '0')}-${String(endOfWeek.getDate()).padStart(2, '0')}`;
-                
-                crcsToDisplay = crcsToDisplay.filter(crc => {
-                    // Check if this CRC has any time off events in the current week
-                    const hasTimeOff = state.crc_events.some(event => 
-                        event.crcId === crc.id && 
-                        (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
-                        event.date >= weekStartStr && 
-                        event.date <= weekEndStr
-                    );
-                    return !hasTimeOff;
-                });
                 
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
                 let filteredEvents = state.crc_events;
-                if (state.selectedCrcFilter !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                
+                // For CRC users, ONLY show their events
+                if (isCRCUser && matchingCrcId) {
+                    filteredEvents = filteredEvents.filter(e => e.crcId === matchingCrcId);
                 } else {
-                     filteredEvents = filteredEvents.filter(e => e.crcId === null || crcIdsToDisplay.includes(e.crcId));
+                    if (state.selectedCrcFilter !== 'all') {
+                        filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                    } else {
+                         filteredEvents = filteredEvents.filter(e => e.crcId === null || crcIdsToDisplay.includes(e.crcId));
+                    }
                 }
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
@@ -8490,6 +8569,10 @@
                 const dayOfWeek = getDaySaturdayStart(now);
                 const startOfWeek = new Date(year, month, day - dayOfWeek);
                 
+                // Check if CRC user - filter to only their events
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const matchingCrcId = getLoggedInCrcId();
+                
                 // Get all studies and sites
                 const allStudies = state.studies;
                 const allSites = state.crc_sites;
@@ -8502,8 +8585,13 @@
                     return eventDate >= startOfWeek && eventDate <= endOfWeek;
                 });
 
-                if (state.selectedCrcFilter !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                // For CRC users, ONLY show their events
+                if (isCRCUser && matchingCrcId) {
+                    filteredEvents = filteredEvents.filter(e => e.crcId === matchingCrcId);
+                } else {
+                    if (state.selectedCrcFilter !== 'all') {
+                        filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                    }
                 }
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
@@ -9190,10 +9278,20 @@
                 const month = now.getMonth();
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
                 const isDarkMode = document.documentElement.classList.contains('dark');
+                
+                // Check if CRC user - filter to only their events
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const matchingCrcId = getLoggedInCrcId();
 
                 let crcsToDisplay = state.crcs;
-                if (state.selectedEmploymentTypeFilter !== 'all') {
-                    crcsToDisplay = crcsToDisplay.filter(c => normalizeEmploymentType(c.employmentType) === state.selectedEmploymentTypeFilter);
+                
+                // For CRC users, only show themselves
+                if (isCRCUser && matchingCrcId) {
+                    crcsToDisplay = [state.crcs.find(c => c.id === matchingCrcId)].filter(Boolean);
+                } else {
+                    if (state.selectedEmploymentTypeFilter !== 'all') {
+                        crcsToDisplay = crcsToDisplay.filter(c => normalizeEmploymentType(c.employmentType) === state.selectedEmploymentTypeFilter);
+                    }
                 }
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
                 
@@ -9202,10 +9300,15 @@
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
 
-                if (state.selectedCrcFilter !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                // For CRC users, ONLY show their events
+                if (isCRCUser && matchingCrcId) {
+                    filteredEvents = filteredEvents.filter(e => e.crcId === matchingCrcId);
                 } else {
-                     filteredEvents = filteredEvents.filter(e => e.crcId === null || crcIdsToDisplay.includes(e.crcId));
+                    if (state.selectedCrcFilter !== 'all') {
+                        filteredEvents = filteredEvents.filter(e => e.crcId === state.selectedCrcFilter);
+                    } else {
+                         filteredEvents = filteredEvents.filter(e => e.crcId === null || crcIdsToDisplay.includes(e.crcId));
+                    }
                 }
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
