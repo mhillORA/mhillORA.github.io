@@ -3334,11 +3334,27 @@
             const getEventRoles = (event) => {
                 let roleNames = [];
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                    // New role assignment system - only show roles assigned to this specific CRC
+                    // New role assignment system - show all roles with their assignments
                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                         const role = state.roles.find(r => r.id === roleId);
-                        if (role && assignments.includes(event.crcId)) {
-                            roleNames.push(role.name);
+                        if (role) {
+                            // Check if this is a training role and if there's a training assignment
+                            if (isTrainingRoleName(role.name) && event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                // For training roles, show "Training - RoleName"
+                                const trainingAssignments = event.trainingAssignments[roleId];
+                                if (Array.isArray(trainingAssignments) && trainingAssignments.length > 0) {
+                                    // Get unique training role names
+                                    const trainingRoleNames = [...new Set(trainingAssignments.filter(Boolean))];
+                                    trainingRoleNames.forEach(trainingRoleName => {
+                                        roleNames.push(`Training - ${trainingRoleName}`);
+                                    });
+                                } else {
+                                    roleNames.push(role.name);
+                                }
+                            } else {
+                                // For non-training roles, or if no training assignment, just show the role name
+                                roleNames.push(role.name);
+                            }
                         }
                     });
                 } else if (event.roles && event.roles.length > 0) {
@@ -9277,14 +9293,14 @@
                                 if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
                                 const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join('') + ' - ' : '';
                                 
-                                // Get roles for this event - show role first, then CRC name
+                                // Get roles for this event - show role first, then CRC name (without visit header since it's shown separately)
                                 const roleNames = getEventRoles(event);
                                 let displayText = '';
                                 if (roleNames.length > 0) {
-                                    displayText = `${headerText}${roleNames.join(', ')}`;
+                                    displayText = `${roleNames.join(', ')}`;
                                     if (crc) displayText += ` - ${crc.name.split(' ')[0]}`;
                                 } else {
-                                    displayText = `${headerText}${crc ? crc.name.split(' ')[0] : 'Open'}`;
+                                    displayText = crc ? crc.name.split(' ')[0] : 'Open';
                                 }
                                 
                                 tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
@@ -20763,13 +20779,30 @@
                                         type: data.eventType,
                                         crcId: crcIds.length > 0 ? crcIds[0] : null, // Allow null CRC
                                         roles: finalRoles,
-                                        trainingAssignments: isTravelDayEdit ? undefined : (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : undefined),
+                                        roleAssignments: finalRoleAssignments, // Ensure roleAssignments are included in update
+                                        trainingAssignments: isTravelDayEdit ? undefined : (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
+                                        roleQuantityOverrides: finalRoleQuantityOverrides,
                                         groupNumber: groupNumberValue,
                                         date: startDateStr,
                                         startDate: startDateStr,
                                         endDate: toDateOnlyString(endDateObj)
                                     };
-                                    await apiService.updateEvent(eventId, updatePayload);
+                                    console.log('Updating event with payload:', updatePayload);
+                                    const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
+                                    console.log('Event updated, response:', updatedEvent);
+                                    
+                                    // Update the event in state with the response from the server
+                                    if (updatedEvent && updatedEvent.id) {
+                                        const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
+                                        if (eventIndex >= 0) {
+                                            // Merge the updated event data, preserving all fields from the server response
+                                            state.crc_events[eventIndex] = { ...state.crc_events[eventIndex], ...updatedEvent };
+                                        } else {
+                                            state.crc_events.push(updatedEvent);
+                                        }
+                                        // Force a refresh of the UI to show the updated data
+                                        setState({ crc_events: [...state.crc_events] });
+                                    }
                                     // Log change for Catch-Up
                                     const oldEvent = existingEvent;
                                     const siteName = selectedSiteId ? (state.crc_sites.find(s => s.id === selectedSiteId)?.name || 'Unknown Site') : null;
@@ -20932,9 +20965,44 @@
                                             for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
                                                 const dateStr = toDateOnlyString(d);
                                                 const newEventRef = null;
-                                                let currentEventData = { ...baseEventData, name: 'Site Assignment', crcId, roles, date: dateStr, groupId, type: 'Site Assignment' };
+                                                // Get role assignments for this specific CRC
+                                                const crcRoleAssignments = {};
+                                                Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                                                    if (assignments.includes(crcId)) {
+                                                        crcRoleAssignments[roleId] = [crcId];
+                                                    }
+                                                });
+                                                
+                                                // Get training assignments for this CRC
+                                                const crcTrainingAssignments = {};
+                                                if (finalTrainingAssignments) {
+                                                    Object.entries(finalTrainingAssignments).forEach(([roleId, assignments]) => {
+                                                        const roleAssignmentsForRole = roleAssignments[roleId] || [];
+                                                        const crcIndex = roleAssignmentsForRole.indexOf(crcId);
+                                                        if (crcIndex >= 0 && assignments[crcIndex]) {
+                                                            if (!crcTrainingAssignments[roleId]) {
+                                                                crcTrainingAssignments[roleId] = [];
+                                                            }
+                                                            crcTrainingAssignments[roleId][0] = assignments[crcIndex];
+                                                        }
+                                                    });
+                                                }
+                                                
+                                                let currentEventData = { 
+                                                    ...baseEventData, 
+                                                    name: 'Site Assignment', 
+                                                    crcId, 
+                                                    roles, 
+                                                    roleAssignments: Object.keys(crcRoleAssignments).length > 0 ? crcRoleAssignments : undefined,
+                                                    trainingAssignments: Object.keys(crcTrainingAssignments).length > 0 ? crcTrainingAssignments : undefined,
+                                                    date: dateStr, 
+                                                    groupId, 
+                                                    type: 'Site Assignment' 
+                                                };
+                                                console.log('Creating event with data:', currentEventData);
                                                 const created = await apiService.createEvent(currentEventData);
                                                 const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...currentEventData };
+                                                console.log('Event created, response:', createdEvent);
                                                 state.crc_events = [...state.crc_events, createdEvent];
                                             }
                                             
@@ -22853,26 +22921,28 @@
                                                 const trainingTypeBlock = isTrainingRoleName(roleName) ? buildTrainingTypeSelect(roleId, index, trainingTypeValue) : '';
                                                 
                                                 return `
-                                                    <div class="flex items-center gap-2">
-                                                        <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
-                                                        <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                                            <option value="">Select Staff</option>
-                                                            <option value="SITE_STAFF" ${crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
-                                                            ${qualifiedCrcs.map(c => {
-                                                                const isUnavailable = isCRCUnavailable(c.id, date, period);
-                                                                const unavailPeriod = getUnavailabilityPeriod(c.id, date);
-                                                                let statusText = '';
-                                                                if (isUnavailable) {
-                                                                    const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
-                                                                    statusText = ` (Time Off - ${periodText})`;
-                                                                }
-                                                                const styleClass = isUnavailable && c.id !== crcId ? 'text-red-600 dark:text-red-400' : '';
-                                                                return `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''} class="${styleClass}">${c.name}${statusText}</option>`;
-                                                            }).join('')}
-                                                            ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
-                                                        </select>
+                                                    <div class="space-y-1">
+                                                        <div class="flex items-center gap-2">
+                                                            <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
+                                                            <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                                                <option value="">Select Staff</option>
+                                                                <option value="SITE_STAFF" ${crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
+                                                                ${qualifiedCrcs.map(c => {
+                                                                    const isUnavailable = isCRCUnavailable(c.id, date, period);
+                                                                    const unavailPeriod = getUnavailabilityPeriod(c.id, date);
+                                                                    let statusText = '';
+                                                                    if (isUnavailable) {
+                                                                        const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
+                                                                        statusText = ` (Time Off - ${periodText})`;
+                                                                    }
+                                                                    const styleClass = isUnavailable && c.id !== crcId ? 'text-red-600 dark:text-red-400' : '';
+                                                                    return `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''} class="${styleClass}">${c.name}${statusText}</option>`;
+                                                                }).join('')}
+                                                                ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
+                                                            </select>
+                                                        </div>
+                                                        ${trainingTypeBlock}
                                                     </div>
-                                                    ${trainingTypeBlock}
                                                 `;
                                             }).join('')}
                                         </div>
@@ -23264,13 +23334,19 @@
                             <div class="space-y-2 role-assignment-slots" data-role-id="${roleId}">
                                 ${Array.from({length: displayQuantity}, (_, index) => {
                                     const options = buildRoleOptions(index);
+                                    const isTraining = isTrainingRoleName(role.name);
+                                    const existingTrainingType = getExistingTrainingType(roleId, index);
+                                    const trainingTypeSelect = isTraining ? buildTrainingTypeSelect(roleId, index, existingTrainingType) : '';
                                     return `
-                                        <div class="flex items-center gap-2">
-                                            <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
-                                            <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                                <option value="">Select Staff</option>
-                                                ${options}
-                                            </select>
+                                        <div class="space-y-1">
+                                            <div class="flex items-center gap-2">
+                                                <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
+                                                <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                                    <option value="">Select Staff</option>
+                                                    ${options}
+                                                </select>
+                                            </div>
+                                            ${trainingTypeSelect}
                                         </div>
                                     `;
                                 }).join('')}
@@ -23500,13 +23576,19 @@
                             <div class="space-y-2 role-assignment-slots" data-role-id="${roleId}">
                                 ${Array.from({length: displayQuantity}, (_, index) => {
                                     const options = buildRoleOptions(index);
+                                    const isTraining = isTrainingRoleName(role.name);
+                                    const existingTrainingType = getExistingTrainingType(roleId, index);
+                                    const trainingTypeSelect = isTraining ? buildTrainingTypeSelect(roleId, index, existingTrainingType) : '';
                                     return `
-                                        <div class="flex items-center gap-2">
-                                            <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
-                                            <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                                <option value="">Select Staff</option>
-                                                ${options}
-                                            </select>
+                                        <div class="space-y-1">
+                                            <div class="flex items-center gap-2">
+                                                <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
+                                                <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                                    <option value="">Select Staff</option>
+                                                    ${options}
+                                                </select>
+                                            </div>
+                                            ${trainingTypeSelect}
                                         </div>
                                     `;
                                 }).join('')}
