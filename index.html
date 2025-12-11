@@ -3450,6 +3450,95 @@
                 return roleNames;
             };
             
+            // Get ALL roles for an event, including empty ones (for planning grid display)
+            const getAllEventRoles = (event) => {
+                // For Travel Day events, return empty array (they don't have roles)
+                if (event.type === 'Travel Day') {
+                    return [];
+                }
+                
+                const roleNames = [];
+                const roleCounts = new Map(); // Track how many of each role (for empty slots)
+                
+                // Get role requirements from study
+                if (event.studyIds && event.studyIds.length > 0 && event.siteId) {
+                    const study = state.studies.find(s => event.studyIds.includes(s.id));
+                    if (study) {
+                        // Check visit-specific requirements first
+                        if (event.visitNumber && study.visitRoleRequirements) {
+                            const visitKey = `visit-${event.visitNumber}`;
+                            const visitReqs = study.visitRoleRequirements[visitKey] || study.visitRoleRequirements['default'];
+                            if (visitReqs) {
+                                Object.entries(visitReqs).forEach(([roleId, quantity]) => {
+                                    const role = state.roles.find(r => r.id === roleId);
+                                    if (role) {
+                                        roleCounts.set(roleId, { name: role.name, required: quantity, assigned: 0 });
+                                    }
+                                });
+                            }
+                        } else if (study.visitRoleRequirements && study.visitRoleRequirements['default']) {
+                            // Use default visit requirements
+                            Object.entries(study.visitRoleRequirements['default']).forEach(([roleId, quantity]) => {
+                                const role = state.roles.find(r => r.id === roleId);
+                                if (role) {
+                                    roleCounts.set(roleId, { name: role.name, required: quantity, assigned: 0 });
+                                }
+                            });
+                        } else if (study.siteRoleRequirements && study.siteRoleRequirements[event.siteId]) {
+                            // Fallback to site-specific requirements
+                            Object.entries(study.siteRoleRequirements[event.siteId]).forEach(([roleId, quantity]) => {
+                                const role = state.roles.find(r => r.id === roleId);
+                                if (role) {
+                                    roleCounts.set(roleId, { name: role.name, required: quantity, assigned: 0 });
+                                }
+                            });
+                        } else if (study.requiredRoles && study.requiredRoles.length > 0) {
+                            // Fallback to general required roles
+                            study.requiredRoles.forEach(roleId => {
+                                const role = state.roles.find(r => r.id === roleId);
+                                if (role) {
+                                    roleCounts.set(roleId, { name: role.name, required: 1, assigned: 0 });
+                                }
+                            });
+                        }
+                    }
+                }
+                
+                // Count assigned roles
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        const assignedCount = Array.isArray(assignments) ? assignments.filter(Boolean).length : 0;
+                        if (roleCounts.has(roleId)) {
+                            roleCounts.get(roleId).assigned = assignedCount;
+                        } else {
+                            // Role is assigned but not in requirements - add it
+                            const role = state.roles.find(r => r.id === roleId);
+                            if (role) {
+                                roleCounts.set(roleId, { name: role.name, required: assignedCount, assigned: assignedCount });
+                            }
+                        }
+                    });
+                }
+                
+                // Build role names list - include all required roles, showing empty ones
+                roleCounts.forEach(({ name, required, assigned }) => {
+                    for (let i = 0; i < required; i++) {
+                        if (i < assigned) {
+                            roleNames.push(name);
+                        } else {
+                            roleNames.push(`${name} (empty)`);
+                        }
+                    }
+                });
+                
+                // If no role requirements found, fall back to assigned roles only
+                if (roleNames.length === 0) {
+                    return getEventRoles(event);
+                }
+                
+                return roleNames;
+            };
+            
             // Helper function to get CRCs assigned to an event from roleAssignments
             const getEventCRCs = (event) => {
                 const crcs = [];
@@ -5274,7 +5363,14 @@
                     const studySelect = form.querySelector('select[name="studyIds"]');
                     const siteSelect = form.querySelector('select[name="siteId"]');
                     if (studySelect) {
-                        studySelect.addEventListener('change', handleShiftStudySiteSelection);
+                        studySelect.addEventListener('change', () => {
+                            // Immediately enable visit dropdown when study is selected
+                            const visitNumberSelect = document.getElementById('visitNumberSelect');
+                            if (visitNumberSelect && studySelect.value) {
+                                visitNumberSelect.disabled = false;
+                            }
+                            handleShiftStudySiteSelection();
+                        });
                     }
                     if (siteSelect) {
                         siteSelect.addEventListener('change', handleShiftStudySiteSelection);
@@ -5286,12 +5382,17 @@
                     // Initialize visit dropdown on form load
                     handleShiftStudySiteSelection();
                     
-                    // Ensure visit dropdown is enabled if a study is already selected
+                    // Ensure visit dropdown is enabled and populated if a study is already selected
                     const visitNumberSelect = document.getElementById('visitNumberSelect');
                     if (studySelect && visitNumberSelect) {
                         const selectedStudies = Array.from(studySelect.selectedOptions).map(opt => opt.value).filter(Boolean);
                         if (selectedStudies.length > 0) {
+                            // Immediately enable the dropdown
                             visitNumberSelect.disabled = false;
+                            // Force re-population of visit dropdown
+                            setTimeout(() => {
+                                handleShiftStudySiteSelection();
+                            }, 100);
                         }
                     }
 
@@ -6707,7 +6808,7 @@
                     const studies = (nextShift.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                     const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study assigned';
                     const roles = getEventRoles(nextShift);
-                    const roleNames = roles.length > 0 ? roles.join(', ') : 'No roles assigned';
+                    const roleNames = nextShift.type === 'Travel Day' ? 'Travel' : (roles.length > 0 ? roles.join(', ') : 'No roles assigned');
                     const period = nextShift.period || 'Full Day';
                     const hours = nextShift.hours || 8;
                     
@@ -9407,8 +9508,15 @@
                                     </div>
                                 `;
                             } else { // Right column - Position/Role
-                                const roleNames = getEventRoles(eventForThisRow);
-                                const positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                // For Travel Day events, just show "Travel"
+                                let positionDisplay;
+                                if (eventForThisRow.type === 'Travel Day') {
+                                    positionDisplay = 'Travel';
+                                } else {
+                                    // For other events, show all roles (including empty ones) for planning grid
+                                    const roleNames = getAllEventRoles(eventForThisRow);
+                                    positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                }
                                 
                                 gridHtml += `
                                     <div class="event-block p-2 text-xs cursor-pointer" 
@@ -9457,8 +9565,15 @@
                                     </div>
                                 `;
                             } else { // Right column - Position/Role
-                                const roleNames = getEventRoles(eventForThisRow);
-                                const positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                // For Travel Day events, just show "Travel"
+                                let positionDisplay;
+                                if (eventForThisRow.type === 'Travel Day') {
+                                    positionDisplay = 'Travel';
+                                } else {
+                                    // For other events, show all roles (including empty ones) for planning grid
+                                    const roleNames = getAllEventRoles(eventForThisRow);
+                                    positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                }
                                 
                                 gridHtml += `
                                     <div class="event-block p-2 text-xs cursor-pointer" 
@@ -9507,8 +9622,15 @@
                                     </div>
                                 `;
                             } else { // Right column - Position/Role
-                                const roleNames = getEventRoles(eventForThisRow);
-                                const positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                // For Travel Day events, just show "Travel"
+                                let positionDisplay;
+                                if (eventForThisRow.type === 'Travel Day') {
+                                    positionDisplay = 'Travel';
+                                } else {
+                                    // For other events, show all roles (including empty ones) for planning grid
+                                    const roleNames = getAllEventRoles(eventForThisRow);
+                                    positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                }
                                 
                                 gridHtml += `
                                     <div class="event-block p-2 text-xs cursor-pointer" 
@@ -9557,8 +9679,15 @@
                                     </div>
                                 `;
                             } else { // Right column - Position/Role
-                                const roleNames = getEventRoles(eventForThisRow);
-                                const positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                // For Travel Day events, just show "Travel"
+                                let positionDisplay;
+                                if (eventForThisRow.type === 'Travel Day') {
+                                    positionDisplay = 'Travel';
+                                } else {
+                                    // For other events, show all roles (including empty ones) for planning grid
+                                    const roleNames = getAllEventRoles(eventForThisRow);
+                                    positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                }
                                 
                                 gridHtml += `
                                     <div class="event-block p-2 text-xs cursor-pointer" 
@@ -10880,7 +11009,7 @@
                                         ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
                                         <strong>${displayText}</strong> ${overrideIcon}${roleIcon}<br>
                                         <span style="color: ${spanTextColor};">
-                                            ${roleNames.length > 0 ? roleNames.join(', ') : ((event.roles || []).join(', ') || 'No roles assigned')}
+                                            ${event.type === 'Travel Day' ? 'Travel' : (roleNames.length > 0 ? roleNames.join(', ') : ((event.roles || []).join(', ') || 'No roles assigned'))}
                                         </span>
                                     </div>`;
                                 }
@@ -15236,7 +15365,7 @@
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit Number</label>
-                                    <select name="visitNumber" id="visitNumberSelect" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                    <select name="visitNumber" id="visitNumberSelect" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" disabled>
                                         <option value="">Select Visit</option>
                                         <!-- Visit options will be populated dynamically based on study -->
                                     </select>
@@ -22315,7 +22444,11 @@
                                         }
                                         // Force a refresh of the UI to show the updated data
                                         setState({ crc_events: [...state.crc_events] });
+                                        // Refresh the view to show updated data immediately
+                                        renderContent();
                                     }
+                                    showNotification('Shift updated successfully!', 'success');
+                                    closeModal();
                                     // Log change for Catch-Up
                                     const oldEvent = existingEvent;
                                     const siteName = selectedSiteId ? (state.crc_sites.find(s => s.id === selectedSiteId)?.name || 'Unknown Site') : null;
@@ -24590,8 +24723,11 @@
                 if (visitNumberSelect) {
                     if (selectedStudyIds.length > 0) {
                         const study = state.studies.find(s => s.id === selectedStudyIds[0]); // Use first selected study
+                        console.log('Populating visit dropdown for study:', study);
                         const numberOfVisits = study?.numberOfVisits || 0;
                         const visitRoleRequirements = study?.visitRoleRequirements || {};
+                        
+                        console.log('Study numberOfVisits:', numberOfVisits);
                         
                         let visitOptions = '<option value="">Select Visit</option>';
                         
@@ -24619,6 +24755,7 @@
                         // Always enable the dropdown when a study is selected
                         visitNumberSelect.innerHTML = visitOptions;
                         visitNumberSelect.disabled = false;
+                        console.log('Visit dropdown enabled and populated with', numberOfVisits, 'visits');
                         
                         // Remove existing event listeners by cloning and replacing
                         const visitSelectClone = visitNumberSelect.cloneNode(true);
@@ -24627,6 +24764,7 @@
                         // Get the new select element and add event listener
                         const refreshedVisitSelect = document.getElementById('visitNumberSelect');
                         if (refreshedVisitSelect) {
+                            refreshedVisitSelect.disabled = false; // Ensure it's still enabled after cloning
                             refreshedVisitSelect.addEventListener('change', (e) => {
                                 handleShiftStudySiteSelection();
                             });
@@ -24635,7 +24773,10 @@
                         // Clear and disable if no study selected
                         visitNumberSelect.innerHTML = '<option value="">Select Visit</option>';
                         visitNumberSelect.disabled = true;
+                        console.log('Visit dropdown disabled - no study selected');
                     }
+                } else {
+                    console.log('visitNumberSelect element not found!');
                 }
                 
                 // Get required roles for the selected studies at the selected site
