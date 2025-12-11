@@ -4155,8 +4155,9 @@
                 if (state.currentUser && state.currentUser.permissionLevel === 'CRC') {
                     // Remove regular dashboard tab
                     tabs = tabs.filter(tab => tab.id !== 'dashboard');
-                    // Add CRC Dashboard at the beginning
+                    // Add CRC Dashboard and CRC Schedule at the beginning
                     tabs.unshift({ id: 'dashboard', label: 'CRC Dashboard' });
+                    tabs.splice(1, 0, { id: 'crc-schedule', label: 'My Schedule' });
                 }
                 
                 if (state.currentUser && state.currentUser.permissionLevel === 'Manager') {
@@ -4554,6 +4555,14 @@
                     mainAppContent.innerHTML = getUsersHTML();
                     mainAppContent.className = 'w-full';
                     renderUsersContent();
+                } else if (state.activeTab === 'crc-schedule') {
+                    mainAppContent.innerHTML = getCRCScheduleHTML();
+                    mainAppContent.className = 'w-full';
+                    // Initialize CRC Schedule view
+                    setTimeout(() => {
+                        renderCRCScheduleView();
+                        lucide.createIcons();
+                    }, 100);
                 } else if (state.activeTab === 'timeOff') {
                     mainAppContent.innerHTML = getTimeOffHTML();
                     mainAppContent.className = 'w-full';
@@ -6932,16 +6941,284 @@
                         <div class="mt-6 p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
                             <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-200 mb-3">Quick Actions</h3>
                             <div class="flex flex-wrap gap-2">
-                                <button data-action="set-tab" data-tab="scheduler" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors">
+                                <button data-action="set-main-tab" data-tab-id="crc-schedule" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors">
                                     View My Schedule
                                 </button>
-                                <button data-action="set-tab" data-tab="timeOff" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors">
+                                <button data-action="set-main-tab" data-tab-id="timeOff" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors">
                                     Request Time Off
                                 </button>
                             </div>
                         </div>
                     </div>
                 `;
+            };
+
+            const getCRCScheduleHTML = () => {
+                const matchingCrcId = getLoggedInCrcId();
+                if (!matchingCrcId) {
+                    return '<div class="p-4 text-center text-gray-600 dark:text-gray-400">Unable to identify your CRC profile. Please contact support.</div>';
+                }
+                
+                const crc = state.crcs.find(c => c.id === matchingCrcId);
+                if (!crc) {
+                    return '<div class="p-4 text-center text-gray-600 dark:text-gray-400">CRC profile not found. Please contact support.</div>';
+                }
+                
+                const now = state.crcCalendarDate || new Date();
+                const year = now.getFullYear();
+                const month = now.getMonth();
+                const monthName = new Date(year, month, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+                
+                return `
+                    <div class="w-full bg-white dark:bg-gray-800 p-4 md:p-6 rounded-lg shadow-md">
+                        <div class="mb-6 flex items-center justify-between">
+                            <div>
+                                <h2 class="text-2xl font-bold text-gray-800 dark:text-white mb-2">My Schedule</h2>
+                                <p class="text-gray-600 dark:text-gray-400">${crc.name}</p>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <button data-action="prev-crc-schedule-month" class="p-2 rounded-md bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600">
+                                    <i data-lucide="chevron-left" class="w-5 h-5"></i>
+                                </button>
+                                <span class="text-lg font-semibold text-gray-700 dark:text-gray-300 min-w-[200px] text-center">${monthName}</span>
+                                <button data-action="next-crc-schedule-month" class="p-2 rounded-md bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600">
+                                    <i data-lucide="chevron-right" class="w-5 h-5"></i>
+                                </button>
+                                <button data-action="today-crc-schedule" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">
+                                    Today
+                                </button>
+                            </div>
+                        </div>
+                        <div id="crc-schedule-calendar-container" class="w-full">
+                            <!-- Calendar will be rendered here -->
+                        </div>
+                    </div>
+                `;
+            };
+
+            const renderCRCScheduleView = () => {
+                const container = document.getElementById('crc-schedule-calendar-container');
+                if (!container) return;
+                
+                const matchingCrcId = getLoggedInCrcId();
+                if (!matchingCrcId) {
+                    container.innerHTML = '<div class="p-4 text-center text-gray-600 dark:text-gray-400">Unable to identify your CRC profile.</div>';
+                    return;
+                }
+                
+                const now = state.crcCalendarDate || new Date();
+                const year = now.getFullYear();
+                const month = now.getMonth();
+                const daysInMonth = new Date(year, month + 1, 0).getDate();
+                const firstDayOfMonth = new Date(year, month, 1).getDay();
+                
+                // Get all events for this CRC
+                const allCrcEvents = (state.crc_events || []).filter(e => {
+                    // Check legacy crcId
+                    if (e.crcId === matchingCrcId) return true;
+                    // Check roleAssignments
+                    if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
+                        return Object.values(e.roleAssignments).some(assignments => {
+                            if (Array.isArray(assignments)) {
+                                return assignments.includes(matchingCrcId);
+                            }
+                            return false;
+                        });
+                    }
+                    return false;
+                });
+                
+                // Filter out PTO/Unavailable/Sick Time and events without studyIds
+                const crcEvents = allCrcEvents.filter(e => 
+                    e.type !== 'Unavailable' && 
+                    e.type !== 'Paid Time Off' && 
+                    e.type !== 'Sick Time' &&
+                    e.type !== 'PTO' &&
+                    e.studyIds && 
+                    Array.isArray(e.studyIds) && 
+                    e.studyIds.length > 0 && 
+                    e.studyIds.filter(Boolean).length > 0
+                );
+                
+                // Group events by date
+                const eventsByDate = {};
+                crcEvents.forEach(event => {
+                    if (!eventsByDate[event.date]) {
+                        eventsByDate[event.date] = [];
+                    }
+                    eventsByDate[event.date].push(event);
+                });
+                
+                // Build calendar HTML
+                let calendarHTML = `
+                    <div class="grid grid-cols-7 gap-2 mb-2">
+                        ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => 
+                            `<div class="text-center font-semibold text-gray-700 dark:text-gray-300 py-2">${day}</div>`
+                        ).join('')}
+                    </div>
+                    <div class="grid grid-cols-7 gap-2">
+                `;
+                
+                // Empty cells for days before month starts
+                for (let i = 0; i < firstDayOfMonth; i++) {
+                    calendarHTML += `<div class="min-h-[100px] border border-gray-200 dark:border-gray-700 rounded-md bg-gray-50 dark:bg-gray-900/40"></div>`;
+                }
+                
+                // Days of the month
+                for (let day = 1; day <= daysInMonth; day++) {
+                    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                    const dayEvents = eventsByDate[dateStr] || [];
+                    const isToday = dateStr === toDateOnlyString(new Date());
+                    
+                    calendarHTML += `
+                        <div class="min-h-[100px] border ${isToday ? 'border-blue-500 border-2' : 'border-gray-200 dark:border-gray-700'} rounded-md bg-white dark:bg-gray-800 p-2 ${isToday ? 'bg-blue-50 dark:bg-blue-900/20' : ''}">
+                            <div class="text-sm font-semibold mb-1 ${isToday ? 'text-blue-600 dark:text-blue-400' : 'text-gray-700 dark:text-gray-300'}">${day}</div>
+                            <div class="space-y-1">
+                                ${dayEvents.map(event => {
+                                    const site = state.crc_sites.find(s => s.id === event.siteId);
+                                    const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
+                                    const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
+                                    const bgColor = event.type === 'Travel Day' ? '#f59e0b' : '#8b5cf6';
+                                    
+                                    return `
+                                        <div class="text-xs p-1 rounded cursor-pointer hover:opacity-80 transition-opacity" 
+                                             style="background-color: ${bgColor}; color: white;"
+                                             data-action="view-crc-schedule-event" 
+                                             data-event-id="${event.id}"
+                                             title="${event.type} - ${site ? site.name : 'Unknown Site'} - ${studyNames}">
+                                            <div class="font-medium truncate">${event.type === 'Travel Day' ? 'Travel' : (site ? site.name : 'Unknown')}</div>
+                                            <div class="text-[10px] opacity-90 truncate">${studyNames}</div>
+                                            ${event.period ? `<div class="text-[10px] opacity-75">${event.period}</div>` : ''}
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+                
+                calendarHTML += `</div>`;
+                container.innerHTML = calendarHTML;
+                
+                // Add event listeners for event clicks
+                container.querySelectorAll('[data-action="view-crc-schedule-event"]').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        const eventId = btn.dataset.eventId;
+                        const event = state.crc_events.find(e => e.id === eventId);
+                        if (event) {
+                            showCRCScheduleEventDetails(event, matchingCrcId);
+                        }
+                    });
+                });
+            };
+
+            const showCRCScheduleEventDetails = (event, currentCrcId) => {
+                const site = state.crc_sites.find(s => s.id === event.siteId);
+                const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
+                const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
+                
+                // Get all CRCs assigned to this event
+                const assignedCrcs = [];
+                if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                    const crc = state.crcs.find(c => c.id === event.crcId);
+                    if (crc) assignedCrcs.push({ crc, roles: event.roles || [] });
+                }
+                
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        if (Array.isArray(assignments)) {
+                            assignments.forEach(crcId => {
+                                if (crcId && crcId !== 'SITE_STAFF' && !assignedCrcs.find(ac => ac.crc.id === crcId)) {
+                                    const crc = state.crcs.find(c => c.id === crcId);
+                                    const role = state.roles.find(r => r.id === roleId);
+                                    if (crc) {
+                                        const existing = assignedCrcs.find(ac => ac.crc.id === crcId);
+                                        if (existing) {
+                                            if (role) existing.roles.push(role.name);
+                                        } else {
+                                            assignedCrcs.push({ crc, roles: role ? [role.name] : [] });
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
+                
+                // Remove duplicates and sort
+                const uniqueCrcs = [];
+                assignedCrcs.forEach(({ crc, roles }) => {
+                    const existing = uniqueCrcs.find(uc => uc.crc.id === crc.id);
+                    if (existing) {
+                        roles.forEach(role => {
+                            if (!existing.roles.includes(role)) existing.roles.push(role);
+                        });
+                    } else {
+                        uniqueCrcs.push({ crc, roles });
+                    }
+                });
+                
+                const assignedCrcsHTML = uniqueCrcs.length > 0 
+                    ? uniqueCrcs.map(({ crc, roles }) => {
+                        const isCurrentUser = crc.id === currentCrcId;
+                        return `
+                            <div class="p-2 ${isCurrentUser ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700' : 'bg-gray-50 dark:bg-gray-700'} rounded-md">
+                                <div class="font-medium ${isCurrentUser ? 'text-blue-900 dark:text-blue-200' : 'text-gray-700 dark:text-gray-300'}">
+                                    ${crc.name} ${isCurrentUser ? '(You)' : ''}
+                                </div>
+                                ${roles.length > 0 ? `<div class="text-xs text-gray-600 dark:text-gray-400 mt-1">${roles.join(', ')}</div>` : ''}
+                            </div>
+                        `;
+                    }).join('')
+                    : '<div class="text-sm text-gray-600 dark:text-gray-400">No staff assigned</div>';
+                
+                openModal(`
+                    <h3 class="text-xl font-bold dark:text-white mb-4">Shift Details</h3>
+                    <div class="space-y-4">
+                        <div>
+                            <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Date</div>
+                            <div class="text-gray-900 dark:text-white">${formatDisplayDate(event.date)}</div>
+                        </div>
+                        <div>
+                            <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Type</div>
+                            <div class="text-gray-900 dark:text-white">${event.type}</div>
+                        </div>
+                        ${site ? `
+                            <div>
+                                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Site</div>
+                                <div class="text-gray-900 dark:text-white">${site.name}</div>
+                            </div>
+                        ` : ''}
+                        <div>
+                            <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Study</div>
+                            <div class="text-gray-900 dark:text-white">${studyNames}</div>
+                        </div>
+                        ${event.period ? `
+                            <div>
+                                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Time</div>
+                                <div class="text-gray-900 dark:text-white">${event.period} ${event.hours ? `(${event.hours} hours)` : ''}</div>
+                            </div>
+                        ` : ''}
+                        ${event.visitNumber ? `
+                            <div>
+                                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Visit</div>
+                                <div class="text-gray-900 dark:text-white">${event.visitNumber}</div>
+                            </div>
+                        ` : ''}
+                        ${event.groupNumber ? `
+                            <div>
+                                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Group</div>
+                                <div class="text-gray-900 dark:text-white">${event.groupNumber}</div>
+                            </div>
+                        ` : ''}
+                        <div>
+                            <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Scheduled Staff</div>
+                            <div class="space-y-1 max-h-60 overflow-y-auto">
+                                ${assignedCrcsHTML}
+                            </div>
+                        </div>
+                    </div>
+                `, 'lg');
             };
 
             const getReportingHTML = () => {
@@ -18596,6 +18873,24 @@
                     case 'close-modal': closeModal(); break;
                     case 'prev-crc-month': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() - 1)) }); break;
                     case 'next-crc-month': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() + 1)) }); break;
+                    case 'prev-crc-schedule-month': 
+                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() - 1)) }); 
+                        if (state.activeTab === 'crc-schedule') {
+                            renderCRCScheduleView();
+                        }
+                        break;
+                    case 'next-crc-schedule-month': 
+                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() + 1)) }); 
+                        if (state.activeTab === 'crc-schedule') {
+                            renderCRCScheduleView();
+                        }
+                        break;
+                    case 'today-crc-schedule': 
+                        setState({ crcCalendarDate: new Date() }); 
+                        if (state.activeTab === 'crc-schedule') {
+                            renderCRCScheduleView();
+                        }
+                        break;
                     case 'prev-crc-week': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() - 7)) }); break;
                     case 'next-crc-week': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() + 7)) }); break;
                     case 'prev-unavailability-month':
@@ -24992,10 +25287,11 @@
                     console.log(`CRC options for ${role.name}:`, existingAssignments);
 
                     // Get override quantity if editing
+                    // Use roleQuantity from the loop scope (ensured to be defined)
                     const overrideQuantity = existingEvent && existingEvent.roleQuantityOverrides && existingEvent.roleQuantityOverrides[roleId]
                         ? existingEvent.roleQuantityOverrides[roleId]
-                        : quantity;
-                    const displayQuantity = overrideQuantity || quantity;
+                        : roleQuantity;
+                    const displayQuantity = overrideQuantity || roleQuantity;
 
                     roleAssignmentHTML += `
                         <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
@@ -25003,21 +25299,21 @@
                                 <h4 class="font-medium dark:text-white">${role.name}</h4>
                                 <div class="flex items-center gap-2">
                                     <label class="text-xs text-gray-600 dark:text-gray-400">Quantity:</label>
-                                    <input type="number" name="role-quantity-${roleId}" min="0" value="${displayQuantity}" class="w-16 p-1 text-sm border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white role-quantity-input" data-role-id="${roleId}" data-default-quantity="${quantity}">
-                                    <span class="text-xs text-gray-500 dark:text-gray-400">(default: ${quantity})</span>
+                                    <input type="number" name="role-quantity-${role.id}" min="0" value="${displayQuantity}" class="w-16 p-1 text-sm border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white role-quantity-input" data-role-id="${role.id}" data-default-quantity="${defaultQuantityForRole}">
+                                    <span class="text-xs text-gray-500 dark:text-gray-400">(default: ${defaultQuantityForRole})</span>
                                 </div>
                             </div>
-                            <div class="space-y-2 role-assignment-slots" data-role-id="${roleId}">
+                            <div class="space-y-2 role-assignment-slots" data-role-id="${role.id}">
                                 ${Array.from({length: displayQuantity}, (_, index) => {
                                     const options = buildRoleOptions(index);
                                     const isTraining = isTrainingRoleName(role.name);
-                                    const existingTrainingType = getExistingTrainingType(roleId, index);
-                                    const trainingTypeSelect = isTraining ? buildTrainingTypeSelect(roleId, index, existingTrainingType) : '';
+                                    const existingTrainingType = getExistingTrainingType(role.id, index);
+                                    const trainingTypeSelect = isTraining ? buildTrainingTypeSelect(role.id, index, existingTrainingType) : '';
                                     return `
                                         <div class="space-y-1">
                                             <div class="flex items-center gap-2">
                                                 <label class="text-sm text-gray-600 dark:text-gray-400 w-16">${index + 1}:</label>
-                                                <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                                <select name="role-${role.id}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                     <option value="">Select Staff</option>
                                                     ${options}
                                                 </select>
@@ -25154,7 +25450,10 @@
                         continue;
                     }
                     
-                    console.log(`Processing role: ${role.name} (${quantity} needed)`);
+                    // Ensure quantity is always defined (default to 1 if undefined)
+                    const roleQuantity = (quantity !== undefined && quantity !== null && quantity > 0) ? quantity : 1;
+                    
+                    console.log(`Processing role: ${role.name} (${roleQuantity} needed)`);
                     
                     // Get existing assignments for this role if editing
                     const existingAssignments = existingEvent && existingEvent.roleAssignments && existingEvent.roleAssignments[roleId] 
@@ -25214,8 +25513,8 @@
                         const bName = (b.crc?.name || '').toString();
                         return aName.localeCompare(bName);
                     });
-                    
-                    const buildRoleOptions = (slotIndex) => {
+                        
+                        const buildRoleOptions = (slotIndex) => {
                         const assignedCrcId = existingAssignments[slotIndex] || '';
                         // Add "Site Staff" option first
                         const siteStaffSelected = assignedCrcId === 'SITE_STAFF' ? 'selected' : '';
@@ -25252,10 +25551,11 @@
                     console.log(`CRC options for ${role.name}:`, existingAssignments);
 
                     // Get override quantity if editing
+                    // Use roleQuantity from the loop scope (ensured to be defined)
                     const overrideQuantity = existingEvent && existingEvent.roleQuantityOverrides && existingEvent.roleQuantityOverrides[roleId]
                         ? existingEvent.roleQuantityOverrides[roleId]
-                        : quantity;
-                    const displayQuantity = overrideQuantity || quantity;
+                        : roleQuantity;
+                    const displayQuantity = overrideQuantity || roleQuantity;
 
                     roleAssignmentHTML += `
                         <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
@@ -25263,8 +25563,8 @@
                                 <h4 class="font-medium dark:text-white">${role.name}</h4>
                                 <div class="flex items-center gap-2">
                                     <label class="text-xs text-gray-600 dark:text-gray-400">Quantity:</label>
-                                    <input type="number" name="role-quantity-${roleId}" min="0" value="${displayQuantity}" class="w-16 p-1 text-sm border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white role-quantity-input" data-role-id="${roleId}" data-default-quantity="${quantity}">
-                                    <span class="text-xs text-gray-500 dark:text-gray-400">(default: ${quantity})</span>
+                                    <input type="number" name="role-quantity-${roleId}" min="0" value="${displayQuantity}" class="w-16 p-1 text-sm border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white role-quantity-input" data-role-id="${roleId}" data-default-quantity="${roleQuantity}">
+                                    <span class="text-xs text-gray-500 dark:text-gray-400">(default: ${roleQuantity})</span>
                                 </div>
                             </div>
                             <div class="space-y-2 role-assignment-slots" data-role-id="${roleId}">
