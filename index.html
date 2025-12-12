@@ -5387,10 +5387,30 @@
                         updateProgress(pastDays, `Fetching ${pastDays} days back and ${futureDays} days forward...`);
                         
                         try {
-                            finalResult = await apiService.importNavanBookingsRange(payload);
+                            // Add timeout protection for Navan API calls (5 minutes max)
+                            const timeoutPromise = new Promise((_, reject) => {
+                                setTimeout(() => reject(new Error('Navan API request timed out after 5 minutes')), 5 * 60 * 1000);
+                            });
+                            
+                            finalResult = await Promise.race([
+                                apiService.importNavanBookingsRange(payload),
+                                timeoutPromise
+                            ]);
                         } catch (error) {
                             console.error('Navan range import error:', error);
-                            showNotification(`Navan import failed: ${error.message || 'Unknown error'}`, 'error');
+                            const errorMessage = error.message || 'Unknown error';
+                            
+                            // Provide more helpful error messages
+                            let userMessage = `Navan import failed: ${errorMessage}`;
+                            if (errorMessage.includes('timeout') || errorMessage.includes('timed out')) {
+                                userMessage = 'Navan import timed out. The API may be slow or overloaded. Try importing a smaller date range.';
+                            } else if (errorMessage.includes('429') || errorMessage.includes('rate limit')) {
+                                userMessage = 'Navan API rate limit exceeded. Please wait a few minutes and try again.';
+                            } else if (errorMessage.includes('401') || errorMessage.includes('unauthorized')) {
+                                userMessage = 'Navan API authentication failed. Please check API credentials.';
+                            }
+                            
+                            showNotification(userMessage, 'error', 8000);
                             
                             // Re-render travel content even on error to show current state
                             if (travelContainer) {
@@ -7824,7 +7844,7 @@
                                 <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
                                     ${canDeleteEvents ? `
                                     <td class="px-6 py-4 whitespace-nowrap">
-                                        <input type="checkbox" class="event-checkbox rounded border-gray-300 text-blue-600 focus:ring-blue-500" data-event-id="${event.id}" data-is-pto="${isPTO ? 'true' : 'false'}">
+                                        <input type="checkbox" class="event-checkbox rounded border-gray-300 text-blue-600 focus:ring-blue-500" data-event-id="${event.id}" data-is-pto="${isPTO ? 'true' : 'false'}" data-event-date="${date}">
                                     </td>
                                     ` : ''}
                                     <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
@@ -9224,11 +9244,9 @@
                     const todaysEvents = filteredEvents.filter(e => e.date === dateStr);
                     
                     let eventTags = todaysEvents.map(event => {
-                        console.log('Processing event for calendar:', event);
                         // Get CRCs from both legacy crcId and new roleAssignments
                         const eventCrcs = getEventCRCs(event);
                         const primaryCrc = eventCrcs.length > 0 ? eventCrcs[0] : null;
-                        console.log('CRC lookup:', { eventCrcId: event.crcId, eventCrcs, primaryCrc, roleAssignments: event.roleAssignments });
                         const site = state.crc_sites.find(s => s.id === event.siteId);
                         const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
                         const eventTypeColors = { 'Site Assignment': '#3b82f6', 'Travel Day': '#f97316', 'Paid Time Off': '#a855f7', 'Unavailable': '#6b7280', 'Open Shift': '#ef4444' };
@@ -9288,7 +9306,6 @@
                             (event.notes || title) : 
                             `${event.notes || title}\nMissing roles: ${roleFulfillment.missingRoles.join(', ')}`;
                         
-                        console.log('Event processed for calendar:', { event, title, bgColor, roleNames, crcName: primaryCrc?.name });
                         return `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}">${visitGroupHeader}${title}${overrideIcon}${roleIcon}</div>`;
                     }).join('');
 
@@ -11321,24 +11338,8 @@
                                 const allRoles = getAllEventRoles(event);
                                 const roleNames = allRoles.length > 0 ? allRoles : getEventRoles(event);
                                 
-                                // Build display text with site/study info if available
+                                // Build display text (site and study removed - shown in table headers)
                                 let displayParts = [];
-                                
-                                // Add site name if available
-                                if (eventSite) {
-                                    displayParts.push(eventSite.name);
-                                }
-                                
-                                // Add study name if available
-                                if (event.studyIds && event.studyIds.length > 0) {
-                                    const studyNames = event.studyIds.map(studyId => {
-                                        const study = state.studies.find(s => s.id === studyId);
-                                        return study ? (study.title || study.name) : null;
-                                    }).filter(Boolean);
-                                    if (studyNames.length > 0) {
-                                        displayParts.push(studyNames.join(', '));
-                                    }
-                                }
                                 
                                 // Add roles if available - show only first role or count if multiple
                                 if (roleNames.length > 0) {
@@ -12354,17 +12355,46 @@
                         bulkDeleteBtn.disabled = count === 0;
                     }
                     if (selectAllCheckbox) {
-                        selectAllCheckbox.indeterminate = count > 0 && count < eventCheckboxes.length;
-                        selectAllCheckbox.checked = count > 0 && count === eventCheckboxes.length;
+                        // Find checkboxes for the first visible day only
+                        const firstCheckbox = Array.from(eventCheckboxes).find(cb => cb.hasAttribute('data-event-date'));
+                        if (firstCheckbox) {
+                            const firstDate = firstCheckbox.getAttribute('data-event-date');
+                            const firstDayCheckboxes = Array.from(eventCheckboxes).filter(cb => 
+                                cb.getAttribute('data-event-date') === firstDate
+                            );
+                            const firstDayChecked = Array.from(firstDayCheckboxes).filter(cb => cb.checked);
+                            
+                            // Update select all checkbox state based on first day only
+                            selectAllCheckbox.indeterminate = firstDayChecked.length > 0 && firstDayChecked.length < firstDayCheckboxes.length;
+                            selectAllCheckbox.checked = firstDayCheckboxes.length > 0 && firstDayChecked.length === firstDayCheckboxes.length;
+                        } else {
+                            // Fallback: use all checkboxes if no date attribute
+                            selectAllCheckbox.indeterminate = count > 0 && count < eventCheckboxes.length;
+                            selectAllCheckbox.checked = count > 0 && count === eventCheckboxes.length;
+                        }
                     }
                 };
                 
-                // Select all checkbox handler
+                // Select all checkbox handler - only selects events for the first visible day
                 if (selectAllCheckbox) {
                     selectAllCheckbox.addEventListener('change', (e) => {
-                        eventCheckboxes.forEach(checkbox => {
-                            checkbox.checked = e.target.checked;
-                        });
+                        // Find the first visible date (first checkbox's date attribute)
+                        const firstCheckbox = Array.from(eventCheckboxes).find(cb => cb.hasAttribute('data-event-date'));
+                        if (!firstCheckbox) {
+                            // Fallback: select all if no date attribute found
+                            eventCheckboxes.forEach(checkbox => {
+                                checkbox.checked = e.target.checked;
+                            });
+                        } else {
+                            const firstDate = firstCheckbox.getAttribute('data-event-date');
+                            // Only select checkboxes for the first visible day
+                            eventCheckboxes.forEach(checkbox => {
+                                const checkboxDate = checkbox.getAttribute('data-event-date');
+                                if (checkboxDate === firstDate) {
+                                    checkbox.checked = e.target.checked;
+                                }
+                            });
+                        }
                         updateBulkDeleteButton();
                     });
                 }
@@ -17798,6 +17828,22 @@
                             let timeOffRequestsCreated = 0;
                             const createdTimeOffRequests = []; // Track created requests
                             
+                            // Count existing PTO instances for this CRC in the current calendar year (Jan-Dec)
+                            const currentYear = new Date().getFullYear();
+                            const yearStart = `${currentYear}-01-01`;
+                            const yearEnd = `${currentYear}-12-31`;
+                            
+                            const existingPtoInstances = state.crc_events.filter(e => 
+                                e.crcId === crcId && 
+                                e.date >= yearStart && 
+                                e.date <= yearEnd &&
+                                (e.type === 'Unavailable' || e.type === 'Paid Time Off' || e.type === 'PTO')
+                            );
+                            
+                            // Count unique dates (one PTO per day)
+                            const uniquePtoDates = new Set(existingPtoInstances.map(e => e.date));
+                            let currentYearPtoCount = uniquePtoDates.size;
+                            
                             for (const day of days) {
                                 // Check if this CRC already has an Unavailable or Paid Time Off event on this date
                                 // Only ONE PTO instance per day per person is allowed
@@ -17821,6 +17867,16 @@
                                     console.log(`Skipping ${day.date} - PTO already exists for this person on this date`);
                                     continue; // Skip this day, don't create duplicate
                                 }
+                                
+                                // Check if adding this day would exceed 365 PTO instances per calendar year
+                                if (currentYearPtoCount >= 365) {
+                                    const crc = state.crcs.find(c => c.id === crcId);
+                                    showNotification(`${crc?.name || 'This person'} has already reached the maximum of 365 PTO instances for ${currentYear}. Cannot add more PTO.`, 'error');
+                                    continue; // Skip this day
+                                }
+                                
+                                // Increment count for next iteration
+                                currentYearPtoCount++;
                                 
                                 const eventData = {
                                     name: ptoType,
@@ -20419,6 +20475,28 @@
                                             return;
                                         }
                                         
+                                        // Check if this CRC has reached the maximum of 365 PTO instances per calendar year (Jan-Dec)
+                                        const currentYear = new Date().getFullYear();
+                                        const yearStart = `${currentYear}-01-01`;
+                                        const yearEnd = `${currentYear}-12-31`;
+                                        
+                                        const existingPtoInstances = state.crc_events.filter(e => 
+                                            e.crcId === crcId && 
+                                            e.date >= yearStart && 
+                                            e.date <= yearEnd &&
+                                            (e.type === 'Unavailable' || e.type === 'Paid Time Off' || e.type === 'PTO')
+                                        );
+                                        
+                                        // Count unique dates (one PTO per day)
+                                        const uniquePtoDates = new Set(existingPtoInstances.map(e => e.date));
+                                        const currentYearPtoCount = uniquePtoDates.size;
+                                        
+                                        if (currentYearPtoCount >= 365) {
+                                            const crc = state.crcs.find(c => c.id === crcId);
+                                            showNotification(`${crc?.name || 'This person'} has already reached the maximum of 365 PTO instances for ${currentYear}. Cannot add more PTO.`, 'error');
+                                            return;
+                                        }
+                                        
                                         try {
                                             // Create unavailability event
                                             const eventData = { 
@@ -21993,7 +22071,6 @@
                     case 'navan-import-next-30': {
                         e.preventDefault();
                         e.stopPropagation();
-                        console.log('Next 30 days button clicked');
                         const button = e.target.closest('button');
                         if (!button) {
                             console.error('Button not found for navan-import-next-30');
@@ -22001,10 +22078,20 @@
                             return;
                         }
                         try {
+                            // Use smaller range to avoid timeout - split into smaller chunks if needed
                             await runNavanImportRange(button, { pastDays: 0, futureDays: 30 });
                         } catch (error) {
                             console.error('Error in navan-import-next-30:', error);
-                            showNotification(`Failed to import next 30 days: ${error.message || 'Unknown error'}`, 'error');
+                            const errorMessage = error.message || 'Unknown error';
+                            let userMessage = `Failed to import next 30 days: ${errorMessage}`;
+                            
+                            if (errorMessage.includes('timeout') || errorMessage.includes('timed out')) {
+                                userMessage = 'Navan import timed out. Try importing a smaller date range or wait a few minutes.';
+                            } else if (errorMessage.includes('429') || errorMessage.includes('rate limit')) {
+                                userMessage = 'Navan API rate limit exceeded. Please wait a few minutes before trying again.';
+                            }
+                            
+                            showNotification(userMessage, 'error', 8000);
                         }
                         break;
                     }

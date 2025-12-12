@@ -1916,6 +1916,13 @@ const fetchNavanAccessToken = async (context) => {
         const tokenData = await tokenResponse.json();
         const accessToken = tokenData?.access_token;
 
+        // Log token receipt status (without logging full token for security)
+        if (accessToken) {
+            context.log.info(`Navan OAuth token received successfully. Token length: ${accessToken.length}, Token preview: ${accessToken.substring(0, 10)}...`);
+        } else {
+            context.log.error('Navan OAuth response missing access_token. Full response:', JSON.stringify(tokenData));
+        }
+
         if (!accessToken) {
             context.log.error('Navan OAuth response missing access_token:', tokenData);
             return {
@@ -3328,6 +3335,32 @@ app.http('navanImport', {
                 };
             }
             const accessToken = tokenResult.accessToken;
+            
+            // Verify token was received
+            if (!accessToken) {
+                context.log.error('navanImport: Access token is null or undefined after successful token fetch');
+                summary.errors.push({
+                    message: 'Access token was not returned from token fetch',
+                    type: 'Token validation error'
+                });
+                summary.skippedBookings = limitArray(summary.skippedBookings);
+                summary.errors = limitArray(summary.errors);
+                return {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    jsonBody: {
+                        success: false,
+                        error: 'Navan token validation failed',
+                        detail: 'Token fetch succeeded but no access token was returned',
+                        summary
+                    }
+                };
+            }
+            
+            context.log.info(`navanImport: Access token received. Token length: ${accessToken.length}, Preview: ${accessToken.substring(0, 10)}...`);
 
             // 2. Load CRC list for matching
             context.log.info('navanImport: Step 2 - Loading CRCs');
