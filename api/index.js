@@ -3840,9 +3840,31 @@ app.http('navanImport', {
                 }
             } catch (importError) {
                 context.log.error('navanImport: Import error:', importError);
+                context.log.error('navanImport: Import error stack:', importError.stack);
+                context.log.error('navanImport: Import error name:', importError.name);
+                
+                // Build detailed error message
+                let errorDetail = importError.message || 'Unknown error';
+                if (importError.name) {
+                    errorDetail = `${importError.name}: ${errorDetail}`;
+                }
+                
+                // Check for common error patterns
+                if (errorDetail.includes('timeout') || errorDetail.includes('ETIMEDOUT')) {
+                    errorDetail = 'Request timed out. The Navan API may be slow or the date range is too large. Try a smaller range.';
+                } else if (errorDetail.includes('ECONNREFUSED') || errorDetail.includes('ENOTFOUND')) {
+                    errorDetail = 'Cannot connect to Navan API. Check network connectivity and API endpoint configuration.';
+                } else if (errorDetail.includes('401') || errorDetail.includes('Unauthorized')) {
+                    errorDetail = 'Navan API authentication failed. Check API credentials.';
+                } else if (errorDetail.includes('Unexpected token') || errorDetail.includes('JSON')) {
+                    errorDetail = 'Invalid response from Navan API. The API may have returned unexpected data.';
+                }
+                
                 summary.errors.push({
-                    message: importError.message,
-                    type: 'Fatal error'
+                    message: errorDetail,
+                    type: 'Fatal error',
+                    errorName: importError.name,
+                    originalMessage: importError.message
                 });
                 summary.skippedBookings = limitArray(summary.skippedBookings);
                 summary.errors = limitArray(summary.errors);
@@ -3855,7 +3877,9 @@ app.http('navanImport', {
                     jsonBody: {
                         success: summary.totals.processed > 0 || summary.totals.created > 0 || summary.totals.updated > 0,
                         error: 'Navan import encountered an error',
-                        detail: importError.message,
+                        detail: errorDetail,
+                        errorName: importError.name,
+                        errorMessage: importError.message,
                         summary
                     }
                 };
@@ -3881,6 +3905,11 @@ app.http('navanImport', {
             try {
                 ensureContextLogger(context);
                 context.log.error('navanImport CRITICAL error:', outerError);
+                context.log.error('navanImport CRITICAL error stack:', outerError.stack);
+                context.log.error('navanImport CRITICAL error name:', outerError.name);
+                if (outerError.cause) {
+                    context.log.error('navanImport CRITICAL error cause:', outerError.cause);
+                }
             } catch (e) {
                 console.error('navanImport CRITICAL error (logging failed):', e);
             }
@@ -3893,11 +3922,30 @@ app.http('navanImport', {
                 errors: []
             };
             
+            // Build detailed error message for user
+            let errorDetail = outerError.message || 'Unknown system error';
+            if (outerError.name) {
+                errorDetail = `${outerError.name}: ${errorDetail}`;
+            }
+            if (outerError.cause) {
+                errorDetail += ` (Cause: ${outerError.cause.message || outerError.cause})`;
+            }
+            
+            // Check for common error patterns
+            if (errorDetail.includes('timeout') || errorDetail.includes('ETIMEDOUT')) {
+                errorDetail = 'Request timed out. The Navan API may be slow or the date range is too large. Try a smaller range.';
+            } else if (errorDetail.includes('ECONNREFUSED') || errorDetail.includes('ENOTFOUND')) {
+                errorDetail = 'Cannot connect to Navan API. Check network connectivity and API endpoint configuration.';
+            } else if (errorDetail.includes('Unexpected token') || errorDetail.includes('JSON')) {
+                errorDetail = 'Invalid response from Navan API. The API may have returned unexpected data.';
+            }
+            
             if (safeSummary.errors) {
                 safeSummary.errors.push({
-                    message: outerError.message || 'Unknown error',
+                    message: errorDetail,
                     type: 'Critical Handler Failure',
-                    stack: outerError.stack
+                    errorName: outerError.name,
+                    errorMessage: outerError.message
                 });
             }
             
@@ -3913,8 +3961,9 @@ app.http('navanImport', {
                 jsonBody: {
                     success: false,
                     error: 'Navan import encountered a critical error',
-                    detail: outerError.message || 'Unknown system error',
-                    stack: outerError.stack,
+                    detail: errorDetail,
+                    errorName: outerError.name,
+                    errorMessage: outerError.message,
                     summary: safeSummary
                 }
             };
