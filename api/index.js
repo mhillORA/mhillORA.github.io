@@ -1856,12 +1856,6 @@ const getNavanCredentials = () => {
 };
 
 // Token cache (module-level, persists within function instance)
-let navanTokenCache = {
-    accessToken: null,
-    expiresAt: null,
-    tokenType: null
-};
-
 const fetchNavanAccessToken = async (context) => {
     const { clientId, clientSecret } = getNavanCredentials();
     context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
@@ -1885,19 +1879,7 @@ const fetchNavanAccessToken = async (context) => {
         };
     }
 
-    // Check if we have a valid cached token
-    const now = Date.now();
-    if (navanTokenCache.accessToken && navanTokenCache.expiresAt && now < navanTokenCache.expiresAt) {
-        const timeUntilExpiry = Math.floor((navanTokenCache.expiresAt - now) / 1000);
-        context.log.info(`Using cached Navan OAuth token (expires in ${timeUntilExpiry} seconds)`);
-        return { 
-            success: true, 
-            accessToken: navanTokenCache.accessToken,
-            tokenType: navanTokenCache.tokenType
-        };
-    }
-
-    // Token expired or missing, fetch new one
+    // Always request a fresh token
     try {
         const fetchFn = await getFetch();
         const oauthUrl = 'https://api.navan.com/ta-auth/oauth/token';
@@ -1948,7 +1930,7 @@ const fetchNavanAccessToken = async (context) => {
 
         // Log token receipt status (without logging full token for security)
         if (accessToken) {
-            context.log.info(`Navan OAuth token received successfully. Token length: ${accessToken.length}, Token preview: ${accessToken.substring(0, 10)}..., Expires in: ${expiresIn} seconds`);
+            context.log.info(`Navan OAuth token received successfully. Token length: ${accessToken.length}, Token preview: ${accessToken.substring(0, 10)}..., Expires in: ${expiresIn} seconds, TokenType: ${tokenType}`);
         } else {
             context.log.error('Navan OAuth response missing access_token. Full response:', JSON.stringify(tokenData));
         }
@@ -1973,15 +1955,7 @@ const fetchNavanAccessToken = async (context) => {
             };
         }
 
-        // Cache the token with expiry time (subtract 60 seconds for safety margin)
-        const expiryTime = now + (expiresIn * 1000) - (60 * 1000); // Subtract 1 minute buffer
-        navanTokenCache = {
-            accessToken: accessToken,
-            expiresAt: expiryTime,
-            tokenType: tokenType
-        };
-        
-        context.log.info(`Navan OAuth token cached. Will expire at ${new Date(expiryTime).toISOString()}`);
+        context.log.info(`Navan OAuth token fetched successfully (fresh token requested)`);
 
         return { 
             success: true, 
@@ -2009,24 +1983,26 @@ const fetchNavanAccessToken = async (context) => {
     }
 };
 
-const fetchNavanBookingsPage = async (accessToken, { createdFrom, createdTo, page = 0, size = 100 }) => {
+const fetchNavanBookingsPage = async (accessToken, { createdFrom, createdTo, page = 0, size = 100 }, tokenType = 'Bearer') => {
     const fetchFn = await getFetch();
+    const authHeader = `${tokenType} ${accessToken}`;
     return fetchFn(`https://app.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${size}&includeTransactions=false`, {
         method: 'GET',
         headers: {
-            'Authorization': `Bearer ${accessToken}`,
+            'Authorization': authHeader,
             'Content-Type': 'application/json',
             'accept': 'application/json'
         }
     });
 };
 
-const fetchNavanBookingByUuid = async (accessToken, bookingUuid) => {
+const fetchNavanBookingByUuid = async (accessToken, bookingUuid, tokenType = 'Bearer') => {
     const fetchFn = await getFetch();
+    const authHeader = `${tokenType} ${accessToken}`;
     return fetchFn(`https://app.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
         method: 'GET',
         headers: {
-            'Authorization': `Bearer ${accessToken}`,
+            'Authorization': authHeader,
             'Content-Type': 'application/json',
             'accept': 'application/json'
         }
@@ -2470,7 +2446,8 @@ app.http('navanLookup', {
                 return tokenResult.response;
             }
             const accessToken = tokenResult.accessToken;
-            context.log.info('OAuth token obtained successfully');
+            const tokenType = tokenResult.tokenType || 'Bearer';
+            context.log.info(`OAuth token obtained successfully. TokenType: ${tokenType}`);
             
             // Step 2: Get booking data from Navan
             // Strategy: First try to find booking by bookingId, then use its UUID for direct lookup
@@ -2483,10 +2460,11 @@ app.http('navanLookup', {
                 const fetchFn = await getFetch();
                 if (bookingUuid) {
                     context.log.info(`Direct UUID lookup for bookingUuid=${bookingUuid}`);
+                    const authHeader = `${tokenType} ${accessToken}`;
                     const uuidResponse = await fetchFn(`https://app.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                         method: 'GET',
                         headers: {
-                            'Authorization': `Bearer ${accessToken}`,
+                            'Authorization': authHeader,
                             'Content-Type': 'application/json',
                             'accept': 'application/json'
                         }
@@ -2538,10 +2516,11 @@ app.http('navanLookup', {
                     
                     while (!foundBooking && page < 10) {
                         context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
+                        const authHeader = `${tokenType} ${accessToken}`;
                         const bookingResponse = await fetchFn(`https://app.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
                             method: 'GET',
                             headers: {
-                                'Authorization': `Bearer ${accessToken}`,
+                                'Authorization': authHeader,
                                 'Content-Type': 'application/json',
                                 'accept': 'application/json'
                             }
@@ -2566,10 +2545,11 @@ app.http('navanLookup', {
                         if (foundBooking) {
                             bookingUuid = foundBooking.uuid;
                             context.log.info(`Booking found with UUID ${bookingUuid}, retrieving full details`);
+                            const authHeader = `${tokenType} ${accessToken}`;
                             const uuidResponse = await fetchFn(`https://app.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                                 method: 'GET',
                                 headers: {
-                                    'Authorization': `Bearer ${accessToken}`,
+                                    'Authorization': authHeader,
                                     'Content-Type': 'application/json',
                                     'accept': 'application/json'
                                 }
@@ -2864,6 +2844,7 @@ app.http('navanTest', {
             }
             
             const accessToken = tokenData?.access_token;
+            const tokenType = tokenData?.token_type || 'Bearer';
             
             if (!accessToken) {
                 context.log.error('No access token in response:', tokenData);
@@ -2891,6 +2872,7 @@ app.http('navanTest', {
                         oauthToken: true,
                         apiCall: false,
                         token: includeFullToken ? accessToken : `${accessToken.substring(0, 8)}...`,
+                        tokenType: tokenType,
                         message: 'Successfully obtained OAuth token. Bookings API call skipped. Add skipApiCall=false to test API call.',
                         note: includeFullToken ? 'Full token returned for diagnostics.' : 'Token truncated. Add includeToken=true to return full token (use with caution).'
                     },
@@ -2913,10 +2895,11 @@ app.http('navanTest', {
             try {
                 const fetchFn = await getFetch();
                 const diagnosticsUrl = `https://app.navan.com/v1/bookings?createdFrom=${createdFromParam}&createdTo=${createdToParam}&page=0&size=1&includeTransactions=false`;
+                const authHeader = `${tokenType} ${accessToken}`;
                 testApiResponse = await fetchFn(diagnosticsUrl, {
                     method: 'GET',
                     headers: {
-                        'Authorization': `Bearer ${accessToken}`,
+                        'Authorization': authHeader,
                         'Content-Type': 'application/json',
                         'accept': 'application/json'
                     }
@@ -3202,16 +3185,19 @@ app.http('routeDirections', {
     }
 });
 
-const fetchNavanBookingsInRange = async (context, accessToken, { createdFrom, createdTo, pageSize = 100, maxPages = 50 } = {}) => {
+const fetchNavanBookingsInRange = async (context, accessToken, { createdFrom, createdTo, pageSize = 100, maxPages = 50 } = {}, tokenType = 'Bearer') => {
     const bookings = [];
     let page = 0;
 
     while (page < maxPages) {
         try {
-            const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize });
+            const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize }, tokenType);
             if (!response.ok) {
                 const errorText = await response.text();
                 context.log.error(`Navan bookings range request failed (page ${page}): ${response.status} - ${errorText}`);
+                if (response.status === 401) {
+                    context.log.error(`Navan 401 Unauthorized - Token may be invalid. Token preview: ${accessToken.substring(0, 20)}..., TokenType: ${tokenType}`);
+                }
                 // If it's the first page, throw error. Otherwise, return what we have.
                 if (page === 0) {
                     throw new Error(`Failed to fetch bookings page ${page}: ${errorText}`);
@@ -3251,13 +3237,16 @@ const fetchNavanBookingsInRange = async (context, accessToken, { createdFrom, cr
     return bookings;
 };
 
-const fetchNavanBookingById = async (context, accessToken, bookingId, { createdFrom, createdTo, pageSize = 100, maxPages = 20 } = {}) => {
+const fetchNavanBookingById = async (context, accessToken, bookingId, { createdFrom, createdTo, pageSize = 100, maxPages = 20 } = {}, tokenType = 'Bearer') => {
     let page = 0;
     while (page < maxPages) {
-        const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize });
+        const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize }, tokenType);
         if (!response.ok) {
             const errorText = await response.text();
             context.log.error(`Navan bookingId search failed (page ${page}): ${response.status} - ${errorText}`);
+            if (response.status === 401) {
+                context.log.error(`Navan 401 Unauthorized - Token may be invalid. Token preview: ${accessToken.substring(0, 20)}..., TokenType: ${tokenType}`);
+            }
             throw new Error(`Failed to fetch bookings for bookingId search: ${errorText}`);
         }
 
@@ -3393,6 +3382,7 @@ app.http('navanImport', {
                 };
             }
             const accessToken = tokenResult.accessToken;
+            const tokenType = tokenResult.tokenType || 'Bearer';
             
             // Verify token was received
             if (!accessToken) {
@@ -3418,7 +3408,7 @@ app.http('navanImport', {
                 };
             }
             
-            context.log.info(`navanImport: Access token received. Token length: ${accessToken.length}, Preview: ${accessToken.substring(0, 10)}...`);
+            context.log.info(`navanImport: Access token received. Token length: ${accessToken.length}, Preview: ${accessToken.substring(0, 10)}..., TokenType: ${tokenType}`);
 
             // 2. Load CRC list for matching
             context.log.info('navanImport: Step 2 - Loading CRCs');
@@ -3476,7 +3466,7 @@ app.http('navanImport', {
                     let bookingRecord = null;
                     try {
                         if (bookingUuidCandidate) {
-                            const uuidResponse = await fetchNavanBookingByUuid(accessToken, bookingUuidCandidate);
+                            const uuidResponse = await fetchNavanBookingByUuid(accessToken, bookingUuidCandidate, tokenType);
                             if (uuidResponse.ok) {
                                 const uuidData = await uuidResponse.json();
                                 if (Array.isArray(uuidData?.data) && uuidData.data.length > 0) {
@@ -3492,7 +3482,7 @@ app.http('navanImport', {
                             bookingRecord = await fetchNavanBookingById(context, accessToken, bookingIdCandidate, {
                                 createdFrom,
                                 createdTo
-                            });
+                            }, tokenType);
                         }
                     } catch (lookupError) {
                         summary.errors.push({
@@ -3643,7 +3633,7 @@ app.http('navanImport', {
                             createdTo,
                             pageSize: pageSize,
                             maxPages: maxPages
-                        });
+                        }, tokenType);
                         context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings`);
                     } catch (fetchError) {
                         context.log.error('navanImport: Fetch error:', fetchError);
