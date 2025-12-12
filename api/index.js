@@ -1983,13 +1983,21 @@ const fetchNavanAccessToken = async (context) => {
     }
 };
 
-const fetchNavanBookingsPage = async (accessToken, { createdFrom, createdTo, page = 0, size = 100 }, tokenType = 'Bearer') => {
+const fetchNavanBookingsPage = async (accessToken, { createdFrom, createdTo, page = 0, size = 100 }, tokenType = 'Bearer', context = null) => {
     const fetchFn = await getFetch();
-    const authHeader = `${tokenType} ${accessToken}`;
-    return fetchFn(`https://app.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${size}&includeTransactions=false`, {
+    // Ensure tokenType has proper spacing
+    const authHeader = tokenType ? `${tokenType} ${accessToken}` : `Bearer ${accessToken}`;
+    const url = `https://app.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${size}&includeTransactions=false`;
+    
+    if (context) {
+        context.log.info(`Navan API Request: ${url}`);
+        context.log.info(`Navan API Auth Header: ${tokenType || 'Bearer'} ${accessToken.substring(0, 20)}...`);
+    }
+    
+    return fetchFn(url, {
         method: 'GET',
         headers: {
-            'Authorization': authHeader,
+            'Authorization': authHeader.trim(),
             'Content-Type': 'application/json',
             'accept': 'application/json'
         }
@@ -3191,12 +3199,19 @@ const fetchNavanBookingsInRange = async (context, accessToken, { createdFrom, cr
 
     while (page < maxPages) {
         try {
-            const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize }, tokenType);
+            const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize }, tokenType, context);
             if (!response.ok) {
                 const errorText = await response.text();
                 context.log.error(`Navan bookings range request failed (page ${page}): ${response.status} - ${errorText}`);
                 if (response.status === 401) {
-                    context.log.error(`Navan 401 Unauthorized - Token may be invalid. Token preview: ${accessToken.substring(0, 20)}..., TokenType: ${tokenType}`);
+                    context.log.error(`Navan 401 Unauthorized - Token may be invalid. Token preview: ${accessToken.substring(0, 20)}..., TokenType: ${tokenType}, Full auth header: ${tokenType ? `${tokenType} ${accessToken.substring(0, 20)}...` : `Bearer ${accessToken.substring(0, 20)}...`}`);
+                    // Try to get more details from error response
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        context.log.error(`Navan 401 error details:`, JSON.stringify(errorJson));
+                    } catch (e) {
+                        context.log.error(`Navan 401 error text: ${errorText}`);
+                    }
                 }
                 // If it's the first page, throw error. Otherwise, return what we have.
                 if (page === 0) {
@@ -3240,7 +3255,7 @@ const fetchNavanBookingsInRange = async (context, accessToken, { createdFrom, cr
 const fetchNavanBookingById = async (context, accessToken, bookingId, { createdFrom, createdTo, pageSize = 100, maxPages = 20 } = {}, tokenType = 'Bearer') => {
     let page = 0;
     while (page < maxPages) {
-        const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize }, tokenType);
+        const response = await fetchNavanBookingsPage(accessToken, { createdFrom, createdTo, page, size: pageSize }, tokenType, context);
         if (!response.ok) {
             const errorText = await response.text();
             context.log.error(`Navan bookingId search failed (page ${page}): ${response.status} - ${errorText}`);
@@ -3621,22 +3636,50 @@ app.http('navanImport', {
 
                     let bookings = [];
                     try {
-                        // For large date ranges (365+ days), use smaller page size and fewer pages to prevent timeout
-                        const isLargeRange = pastDays > 180;
-                        const pageSize = isLargeRange ? 25 : 50;  // Smaller page size for large ranges
-                        const maxPages = isLargeRange ? 50 : 100;  // Fewer pages for large ranges
+                        // For very large date ranges (365+ days), warn user and limit pages
+                        const dateRangeDays = Math.ceil((createdTo - createdFrom) / (24 * 60 * 60));
+                        const isVeryLargeRange = dateRangeDays > 180;
+                        const isExtremelyLargeRange = dateRangeDays > 300;
                         
-                        context.log.info(`navanImport: Fetching bookings with pageSize=${pageSize}, maxPages=${maxPages} (largeRange=${isLargeRange})`);
+                        if (isExtremelyLargeRange) {
+                            context.log.warn(`navanImport: Very large date range detected (${dateRangeDays} days). This may timeout. Consider using smaller ranges.`);
+                            summary.errors.push({
+                                message: `Large date range (${dateRangeDays} days) may cause timeout. Consider splitting into smaller ranges.`,
+                                type: 'Warning'
+                            });
+                        }
                         
-                        bookings = await fetchNavanBookingsInRange(context, accessToken, { 
+                        // For large date ranges, use smaller page size and fewer pages to prevent timeout
+                        const pageSize = isVeryLargeRange ? 25 : 50;  // Smaller page size for large ranges
+                        const maxPages = isExtremelyLargeRange ? 30 : (isVeryLargeRange ? 50 : 100);  // Fewer pages for very large ranges
+                        
+                        context.log.info(`navanImport: Fetching bookings with pageSize=${pageSize}, maxPages=${maxPages} (dateRange=${dateRangeDays} days)`);
+                        
+                        // Add timeout protection for the fetch operation itself
+                        const fetchStartTime = Date.now();
+                        const FETCH_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes max for fetching
+                        
+                        const fetchPromise = fetchNavanBookingsInRange(context, accessToken, { 
                             createdFrom, 
                             createdTo,
                             pageSize: pageSize,
                             maxPages: maxPages
                         }, tokenType);
-                        context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings`);
+                        
+                        const timeoutPromise = new Promise((_, reject) => {
+                            setTimeout(() => reject(new Error(`Navan fetch timed out after ${FETCH_TIMEOUT_MS / 1000} seconds`)), FETCH_TIMEOUT_MS);
+                        });
+                        
+                        bookings = await Promise.race([fetchPromise, timeoutPromise]);
+                        const fetchDuration = ((Date.now() - fetchStartTime) / 1000).toFixed(2);
+                        context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings in ${fetchDuration} seconds`);
                     } catch (fetchError) {
                         context.log.error('navanImport: Fetch error:', fetchError);
+                        const errorMessage = fetchError.message || 'Unknown fetch error';
+                        summary.errors.push({
+                            message: `Failed to fetch bookings from Navan: ${errorMessage}`,
+                            type: 'Fetch error'
+                        });
                         summary.skippedBookings = limitArray(summary.skippedBookings);
                         summary.errors = limitArray(summary.errors);
                         return {
@@ -3648,7 +3691,7 @@ app.http('navanImport', {
                             jsonBody: {
                                 success: false,
                                 error: 'Failed to fetch bookings from Navan',
-                                detail: fetchError.message,
+                                detail: errorMessage,
                                 summary
                             }
                         };
@@ -3662,8 +3705,10 @@ app.http('navanImport', {
                     
                     // Log start time to track duration
                     const startTime = Date.now();
-                    // Azure Functions timeout is typically 5-10 minutes, but we'll set a safety limit of 4 minutes
-                    const MAX_EXECUTION_TIME_MS = 4 * 60 * 1000; // 4 minutes
+                    // Azure Functions timeout is typically 5-10 minutes, but we'll set a safety limit
+                    // For very large imports, use shorter timeout to ensure we can return results
+                    const processingDateRangeDays = Math.ceil((createdTo - createdFrom) / (24 * 60 * 60));
+                    const MAX_EXECUTION_TIME_MS = processingDateRangeDays > 300 ? 2 * 60 * 1000 : 4 * 60 * 1000; // 2 minutes for very large, 4 minutes otherwise
 
                     const processedKeys = new Set();
                     let processedCount = 0;
@@ -3672,17 +3717,27 @@ app.http('navanImport', {
                     
                     // Process bookings in batches
                     while (offset < totalBookings) {
-                        // Check if we're running out of time
+                        // Check if we're running out of time - check more frequently for large imports
                         const elapsed = Date.now() - startTime;
-                        if (elapsed > MAX_EXECUTION_TIME_MS) {
-                            context.log.warn(`navanImport: Approaching timeout limit. Processed ${processedCount}/${totalBookings} bookings in ${(elapsed / 1000).toFixed(2)} seconds. Stopping to return partial results.`);
+                        const timeRemaining = MAX_EXECUTION_TIME_MS - elapsed;
+                        const timeRemainingSeconds = (timeRemaining / 1000).toFixed(0);
+                        
+                        // Stop early if we're running low on time (leave 30 seconds buffer for response)
+                        if (timeRemaining < 30000) {
+                            context.log.warn(`navanImport: Approaching timeout limit (${timeRemainingSeconds}s remaining). Processed ${processedCount}/${totalBookings} bookings in ${(elapsed / 1000).toFixed(2)} seconds. Stopping to return partial results.`);
                             summary.errors.push({
-                                message: `Processing stopped due to timeout limit. Processed ${processedCount} of ${totalBookings} bookings. Remaining bookings will be processed on next sync.`,
+                                message: `Processing stopped due to timeout limit. Processed ${processedCount} of ${totalBookings} bookings in ${(elapsed / 1000).toFixed(0)} seconds. Remaining bookings will be processed on next sync.`,
                                 type: 'Timeout warning',
                                 processed: processedCount,
-                                total: totalBookings
+                                total: totalBookings,
+                                elapsedSeconds: (elapsed / 1000).toFixed(0)
                             });
                             break;
+                        }
+                        
+                        // Log time remaining every 10 batches for large imports
+                        if (batchNumber % 10 === 0 && processingDateRangeDays > 180) {
+                            context.log.info(`navanImport: Progress check - ${processedCount}/${totalBookings} bookings processed, ${timeRemainingSeconds}s remaining`);
                         }
                         
                         batchNumber++;
