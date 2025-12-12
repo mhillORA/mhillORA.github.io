@@ -3223,12 +3223,28 @@ const fetchNavanBookingsInRange = async (context, accessToken, { createdFrom, cr
             }
 
             const data = await response.json();
+            
+            // Log full response structure for debugging
+            context.log.info(`Navan API Response (page ${page}):`, {
+                hasData: !!data?.data,
+                dataIsArray: Array.isArray(data?.data),
+                dataLength: data?.data?.length || 0,
+                hasPage: !!data?.page,
+                totalPages: data?.page?.totalPages,
+                totalElements: data?.page?.totalElements,
+                responseKeys: Object.keys(data || {}),
+                firstBookingSample: data?.data?.[0] ? Object.keys(data.data[0]) : null
+            });
+            
             if (Array.isArray(data?.data) && data.data.length > 0) {
                 bookings.push(...data.data);
                 context.log.info(`navanImport: Fetched page ${page + 1}, got ${data.data.length} bookings (total so far: ${bookings.length})`);
+            } else {
+                context.log.warn(`navanImport: Page ${page + 1} returned empty or invalid data. Response structure:`, JSON.stringify(data).substring(0, 500));
             }
 
             if (!data?.page || data.page.totalPages === undefined || page >= data.page.totalPages - 1) {
+                context.log.info(`navanImport: Reached end of pages. Total bookings fetched: ${bookings.length}`);
                 break;
             }
 
@@ -3424,6 +3440,7 @@ app.http('navanImport', {
             }
             
             context.log.info(`navanImport: Access token received. Token length: ${accessToken.length}, Preview: ${accessToken.substring(0, 10)}..., TokenType: ${tokenType}`);
+            context.log.info(`navanImport: Token validation - Token exists: ${!!accessToken}, TokenType: ${tokenType}, Auth header will be: ${tokenType} ${accessToken.substring(0, 20)}...`);
 
             // 2. Load CRC list for matching
             context.log.info('navanImport: Step 2 - Loading CRCs');
@@ -3673,6 +3690,13 @@ app.http('navanImport', {
                         bookings = await Promise.race([fetchPromise, timeoutPromise]);
                         const fetchDuration = ((Date.now() - fetchStartTime) / 1000).toFixed(2);
                         context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings in ${fetchDuration} seconds`);
+                        
+                        // Log detailed info if no bookings found
+                        if (!bookings || bookings.length === 0) {
+                            context.log.warn(`navanImport: No bookings found for date range ${new Date(createdFrom * 1000).toISOString()} to ${new Date(createdTo * 1000).toISOString()}`);
+                            context.log.warn(`navanImport: Date range details - createdFrom=${createdFrom}, createdTo=${createdTo}, range=${dateRangeDays} days`);
+                            context.log.warn(`navanImport: Token was used - TokenType: ${tokenType}, Token length: ${accessToken.length}`);
+                        }
                     } catch (fetchError) {
                         context.log.error('navanImport: Fetch error:', fetchError);
                         const errorMessage = fetchError.message || 'Unknown fetch error';
