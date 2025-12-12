@@ -1882,16 +1882,22 @@ const fetchNavanAccessToken = async (context) => {
         const fetchFn = await getFetch();
         const oauthUrl = 'https://api.navan.com/ta-auth/oauth/token';
         context.log.info(`Navan OAuth: Requesting token from ${oauthUrl}`);
+        
+        // Build form-encoded body (matching Postman format)
+        const bodyParams = new URLSearchParams({
+            grant_type: 'client_credentials',
+            client_id: clientId,
+            client_secret: clientSecret
+        });
+        const bodyString = bodyParams.toString();
+        context.log.info(`Navan OAuth: Body params - grant_type=client_credentials, client_id length=${clientId?.length || 0}, client_secret length=${clientSecret?.length || 0}`);
+        
         const tokenResponse = await fetchFn(oauthUrl, {
             method: 'POST',
             headers: {
-                'content-type': 'application/x-www-form-urlencoded'
+                'Content-Type': 'application/x-www-form-urlencoded'
             },
-            body: new URLSearchParams({
-                grant_type: 'client_credentials',
-                client_id: clientId,
-                client_secret: clientSecret
-            })
+            body: bodyString
         });
 
         if (!tokenResponse.ok) {
@@ -2762,16 +2768,22 @@ app.http('navanTest', {
                 const fetchFn = await getFetch();
                 const oauthUrl = 'https://api.navan.com/ta-auth/oauth/token';
                 context.log.info(`Navan OAuth Test: Requesting token from ${oauthUrl}`);
+                
+                // Build form-encoded body (matching Postman format)
+                const bodyParams = new URLSearchParams({
+                    grant_type: 'client_credentials',
+                    client_id: clientId,
+                    client_secret: clientSecret
+                });
+                const bodyString = bodyParams.toString();
+                context.log.info(`Navan OAuth Test: Body params - grant_type=client_credentials, client_id length=${clientId?.length || 0}, client_secret length=${clientSecret?.length || 0}`);
+                
                 tokenResponse = await fetchFn(oauthUrl, {
                     method: 'POST',
                     headers: {
-                        'content-type': 'application/x-www-form-urlencoded'
+                        'Content-Type': 'application/x-www-form-urlencoded'
                     },
-                    body: new URLSearchParams({
-                        grant_type: 'client_credentials',
-                        client_id: clientId,
-                        client_secret: clientSecret
-                    })
+                    body: bodyString
                 });
             } catch (fetchError) {
                 context.log.error('Fetch error during OAuth token request:', fetchError);
