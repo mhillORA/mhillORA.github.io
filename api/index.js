@@ -2397,7 +2397,7 @@ app.http('navanLookup', {
         let bookingUuidParam = null;
         
         try {
-            // Get query parameters - try multiple methods for compatibility
+            // Gets query parameters - try multiple methods for compatibility
             if (request.query && request.query.bookingId) {
                 bookingId = request.query.bookingId;
             } else if (request.query && typeof request.query.get === 'function') {
