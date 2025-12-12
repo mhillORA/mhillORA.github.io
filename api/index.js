@@ -3312,26 +3312,49 @@ app.http('navanImport', {
     route: 'navan-import',
     handler: async (request, context) => {
         // Wrap entire handler in try-catch to catch any unhandled errors
+        let summary = {
+            importType: 'range',
+            totals: {
+                fetched: 0,
+                processed: 0,
+                created: 0,
+                updated: 0,
+                skipped: 0
+            },
+            skippedBookings: [],
+            errors: []
+        };
+        
         try {
-            let summary = {
-                importType: 'range',
-                totals: {
-                    fetched: 0,
-                    processed: 0,
-                    created: 0,
-                    updated: 0,
-                    skipped: 0
-                },
-                skippedBookings: [],
-                errors: []
-            };
+            // Ensure context logger is available
+            if (!context) {
+                return {
+                    status: 500,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    jsonBody: {
+                        success: false,
+                        error: 'Function context not available',
+                        summary
+                    }
+                };
+            }
             
             const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
             
             ensureContextLogger(context);
 
             // Log request details for debugging
-            context.log.info(`navanImport: Request received. Method: ${request.method}, URL: ${request.url || 'N/A'}`);
+            context.log.info(`navanImport: Request received. Method: ${request.method || 'UNKNOWN'}, URL: ${request.url || 'N/A'}`);
+            if (request.headers) {
+                try {
+                    context.log.info(`navanImport: Request headers:`, JSON.stringify(request.headers));
+                } catch (headerError) {
+                    context.log.warn('navanImport: Could not stringify headers:', headerError.message);
+                }
+            }
             
             if (request.method === 'OPTIONS') {
                 return {
@@ -3346,12 +3369,32 @@ app.http('navanImport', {
 
             let body = {};
             try {
+                // Try to read the request body as JSON
                 body = await request.json();
                 context.log.info(`navanImport: Request body parsed. pastDays: ${body.pastDays}, futureDays: ${body.futureDays}, importType: ${body.importType}`);
             } catch (parseError) {
-                context.log.warn('navanImport: No JSON body or failed to parse request body, using defaults.');
-                context.log.warn('navanImport: Parse error:', parseError.message);
-                body = {};
+                context.log.error('navanImport: Failed to parse request body:', parseError.message);
+                context.log.error('navanImport: Parse error stack:', parseError.stack);
+                context.log.error('navanImport: Parse error name:', parseError.name);
+                // Return error response instead of continuing with empty body
+                summary.errors.push({
+                    message: `Failed to parse request body: ${parseError.message}`,
+                    type: 'Parse error'
+                });
+                return {
+                    status: 400,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    jsonBody: {
+                        success: false,
+                        error: 'Invalid request body',
+                        detail: `Failed to parse JSON: ${parseError.message}`,
+                        errorName: parseError.name,
+                        summary
+                    }
+                };
             }
 
             const importType = (body.importType || 'range').toLowerCase();
