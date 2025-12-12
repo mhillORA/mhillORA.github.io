@@ -1987,7 +1987,7 @@ const fetchNavanBookingsPage = async (accessToken, { createdFrom, createdTo, pag
     const fetchFn = await getFetch();
     // Ensure tokenType has proper spacing
     const authHeader = tokenType ? `${tokenType} ${accessToken}` : `Bearer ${accessToken}`;
-    const url = `https://app.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${size}&includeTransactions=false`;
+    const url = `https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${size}&includeTransactions=false`;
     
     if (context) {
         context.log.info(`Navan API Request: ${url}`);
@@ -1998,8 +1998,7 @@ const fetchNavanBookingsPage = async (accessToken, { createdFrom, createdTo, pag
         method: 'GET',
         headers: {
             'Authorization': authHeader.trim(),
-            'Content-Type': 'application/json',
-            'accept': 'application/json'
+            'Accept': 'application/json'
         }
     });
 };
@@ -2007,12 +2006,11 @@ const fetchNavanBookingsPage = async (accessToken, { createdFrom, createdTo, pag
 const fetchNavanBookingByUuid = async (accessToken, bookingUuid, tokenType = 'Bearer') => {
     const fetchFn = await getFetch();
     const authHeader = `${tokenType} ${accessToken}`;
-    return fetchFn(`https://app.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+    return fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
         method: 'GET',
         headers: {
             'Authorization': authHeader,
-            'Content-Type': 'application/json',
-            'accept': 'application/json'
+            'Accept': 'application/json'
         }
     });
 };
@@ -2370,7 +2368,7 @@ const upsertNavanBooking = async (context, booking, {
 // Navan booking lookup endpoint
 // This endpoint calls Navan API to get booking information by bookingId
 // Step 1: Get OAuth token from https://api.navan.com/ta-auth/oauth/token
-// Step 2: Call Navan Bookings API: https://app.navan.com/v1/bookings?createdFrom={timestamp}&createdTo={timestamp}
+// Step 2: Call Navan Bookings API: https://api.navan.com/v1/bookings?createdFrom={timestamp}&createdTo={timestamp}
 //        Then filter results by bookingId client-side
 // Configure API credentials in Azure Static Web App environment variables:
 // - NAVAN_CLIENT_ID: Set in Azure environment variables
@@ -2469,12 +2467,11 @@ app.http('navanLookup', {
                 if (bookingUuid) {
                     context.log.info(`Direct UUID lookup for bookingUuid=${bookingUuid}`);
                     const authHeader = `${tokenType} ${accessToken}`;
-                    const uuidResponse = await fetchFn(`https://app.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+                    const uuidResponse = await fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                         method: 'GET',
                         headers: {
                             'Authorization': authHeader,
-                            'Content-Type': 'application/json',
-                            'accept': 'application/json'
+                            'Accept': 'application/json'
                         }
                     });
                     if (!uuidResponse.ok) {
@@ -2525,12 +2522,11 @@ app.http('navanLookup', {
                     while (!foundBooking && page < 10) {
                         context.log.info(`Fetching page ${page} of bookings to find bookingId...`);
                         const authHeader = `${tokenType} ${accessToken}`;
-                        const bookingResponse = await fetchFn(`https://app.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
+                        const bookingResponse = await fetchFn(`https://api.navan.com/v1/bookings?createdFrom=${createdFrom}&createdTo=${createdTo}&page=${page}&size=${pageSize}&includeTransactions=false`, {
                             method: 'GET',
                             headers: {
                                 'Authorization': authHeader,
-                                'Content-Type': 'application/json',
-                                'accept': 'application/json'
+                                'Accept': 'application/json'
                             }
                         });
                         
@@ -2554,12 +2550,11 @@ app.http('navanLookup', {
                             bookingUuid = foundBooking.uuid;
                             context.log.info(`Booking found with UUID ${bookingUuid}, retrieving full details`);
                             const authHeader = `${tokenType} ${accessToken}`;
-                            const uuidResponse = await fetchFn(`https://app.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
+                            const uuidResponse = await fetchFn(`https://api.navan.com/v1/bookings?bookingUuid=${bookingUuid}&includeTransactions=false`, {
                                 method: 'GET',
                                 headers: {
                                     'Authorization': authHeader,
-                                    'Content-Type': 'application/json',
-                                    'accept': 'application/json'
+                                    'Accept': 'application/json'
                                 }
                             });
                             if (uuidResponse.ok) {
@@ -2902,14 +2897,13 @@ app.http('navanTest', {
             let testApiResponse;
             try {
                 const fetchFn = await getFetch();
-                const diagnosticsUrl = `https://app.navan.com/v1/bookings?createdFrom=${createdFromParam}&createdTo=${createdToParam}&page=0&size=1&includeTransactions=false`;
+                const diagnosticsUrl = `https://api.navan.com/v1/bookings?createdFrom=${createdFromParam}&createdTo=${createdToParam}&page=0&size=1&includeTransactions=false`;
                 const authHeader = `${tokenType} ${accessToken}`;
                 testApiResponse = await fetchFn(diagnosticsUrl, {
                     method: 'GET',
                     headers: {
                         'Authorization': authHeader,
-                        'Content-Type': 'application/json',
-                        'accept': 'application/json'
+                        'Accept': 'application/json'
                     }
                 });
             } catch (fetchError) {
