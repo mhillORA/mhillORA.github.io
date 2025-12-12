@@ -3585,6 +3585,26 @@
                 return roleNames;
             };
             
+            // Helper function to get visit display name from study
+            const getVisitDisplayName = (visitNumber, studyIds) => {
+                if (!visitNumber || !studyIds || studyIds.length === 0) {
+                    return visitNumber ? `Visit ${visitNumber}` : '';
+                }
+                
+                // Try to get visit name from the first study (most common case)
+                const study = state.studies.find(s => studyIds.includes(s.id));
+                if (study && study.visitNames) {
+                    const visitKey = `visit-${visitNumber}`;
+                    const visitName = study.visitNames[visitKey] || study.visitNames[visitNumber];
+                    if (visitName) {
+                        return visitName;
+                    }
+                }
+                
+                // Fallback to default format
+                return `Visit ${visitNumber}`;
+            };
+            
             // Helper function to get CRCs assigned to an event from roleAssignments
             const getEventCRCs = (event) => {
                 const crcs = [];
@@ -3694,15 +3714,19 @@
                     const eventsThisMonth = state.crc_events.filter(e => {
                         const eventDate = new Date(e.date + 'T00:00:00');
                         // Check if CRC is assigned to this event (either as primary crcId or in roleAssignments)
-                        return eventBelongsToCrc(e, crc.id) && eventDate.getFullYear() === year && eventDate.getMonth() === month;
+                        // AND it's a Site Assignment with CRC assigned (not empty/open shift)
+                        return eventBelongsToCrc(e, crc.id) && 
+                               eventDate.getFullYear() === year && 
+                               eventDate.getMonth() === month &&
+                               isSiteAssignmentWithCrc(e);
                     });
                     
-                    const productiveEventTypes = ['Site Assignment', 'Travel Day'];
                     const nonWorkEventTypes = ['Paid Time Off', 'Unavailable'];
 
                     const productiveDaysSet = new Set();
                     eventsThisMonth.forEach(e => {
-                        if (productiveEventTypes.includes(e.type)) {
+                        // Only count Site Assignments with CRCs assigned
+                        if (isSiteAssignmentWithCrc(e)) {
                             productiveDaysSet.add(e.date);
                         }
                     });
@@ -3742,15 +3766,15 @@
 
                 const stats = {};
                 state.crcs.forEach(crc => {
-                    // Only count Site Assignment and Travel Day events for utilization
-                    const productiveEventTypes = ['Site Assignment', 'Travel Day'];
+                    // Only count Site Assignment events with CRCs assigned (not empty/open shifts)
                     const eventsThisWeek = state.crc_events.filter(e => {
                         const eventDate = new Date(e.date + 'T12:00:00');
                         // Check if CRC is assigned to this event (either as primary crcId or in roleAssignments)
+                        // AND it's a Site Assignment with CRC assigned (not empty/open shift)
                         return eventBelongsToCrc(e, crc.id) && 
                                eventDate >= startOfWeek && 
                                eventDate <= endOfWeek &&
-                               productiveEventTypes.includes(e.type);
+                               isSiteAssignmentWithCrc(e);
                     });
                     const totalHours = eventsThisWeek.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
                     stats[crc.id] = {
@@ -4035,6 +4059,31 @@
                         return false;
                     });
                     if (foundInRoles) {
+                        return true;
+                    }
+                }
+                
+                return false;
+            };
+            
+            // Helper function to check if an event is a Site Assignment with a CRC assigned (not empty/open shift)
+            const isSiteAssignmentWithCrc = (event) => {
+                if (!event || event.type !== 'Site Assignment') return false;
+                
+                // Check if there's a CRC assigned via legacy crcId
+                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== null && event.crcId !== undefined) {
+                    return true;
+                }
+                
+                // Check if there are any CRCs assigned via roleAssignments
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    const hasAssignedCrc = Object.values(event.roleAssignments).some(assignments => {
+                        if (Array.isArray(assignments)) {
+                            return assignments.some(crcId => crcId && crcId !== 'SITE_STAFF' && crcId !== null && crcId !== undefined);
+                        }
+                        return false;
+                    });
+                    if (hasAssignedCrc) {
                         return true;
                     }
                 }
@@ -4922,10 +4971,14 @@
                     if (state.currentUser && state.currentUser.permissionLevel === 'Manager') {
                         basePromises.push(
                             apiService.getPermissionSets().catch(error => {
-                                // If permission sets endpoint doesn't exist (404), return empty array
+                                // If permission sets endpoint doesn't exist (404), return empty array silently
                                 if (error.status === 404) {
-                                    console.warn('Permission sets endpoint not found, skipping...');
+                                    // Silently handle - endpoint doesn't exist, which is fine
                                     return [];
+                                }
+                                // Only log non-404 errors
+                                if (error.status !== 404) {
+                                    console.warn('Permission sets endpoint error:', error.status);
                                 }
                                 throw error;
                             })
@@ -4994,6 +5047,63 @@
                     sanitizedStudies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
                     ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+                    
+                    // Clean up duplicate PTO/Unavailable events - keep only one per CRC per day
+                    const cleanupDuplicatePTOEvents = async (eventsList) => {
+                        const ptoMap = new Map(); // key: `${crcId}-${date}`, value: array of event IDs
+                        const duplicatesToDelete = [];
+                        
+                        // Find all Unavailable events and group by CRC+date
+                        eventsList.forEach(event => {
+                            if (event.type === 'Unavailable' && event.crcId && event.date) {
+                                const key = `${event.crcId}-${event.date}`;
+                                if (!ptoMap.has(key)) {
+                                    ptoMap.set(key, []);
+                                }
+                                ptoMap.get(key).push(event);
+                            }
+                        });
+                        
+                        // For each CRC+date with multiple events, keep the first one, mark others for deletion
+                        ptoMap.forEach((eventList, key) => {
+                            if (eventList.length > 1) {
+                                // Sort by createdAt (most recent first) or keep first
+                                eventList.sort((a, b) => {
+                                    const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+                                    const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+                                    return bTime - aTime; // Most recent first
+                                });
+                                
+                                // Keep the first (most recent), delete the rest
+                                for (let i = 1; i < eventList.length; i++) {
+                                    duplicatesToDelete.push(eventList[i]);
+                                }
+                            }
+                        });
+                        
+                        // Delete duplicates from database
+                        if (duplicatesToDelete.length > 0) {
+                            console.log(`Found ${duplicatesToDelete.length} duplicate PTO events to clean up`);
+                            for (const duplicate of duplicatesToDelete) {
+                                try {
+                                    await apiService.deleteEvent(duplicate.id);
+                                    console.log(`Deleted duplicate PTO event ${duplicate.id} for CRC ${duplicate.crcId} on ${duplicate.date}`);
+                                } catch (error) {
+                                    console.error(`Error deleting duplicate PTO event ${duplicate.id}:`, error);
+                                }
+                            }
+                            
+                            // Remove duplicates from the events array
+                            const duplicateIds = new Set(duplicatesToDelete.map(e => e.id));
+                            return eventsList.filter(e => !duplicateIds.has(e.id));
+                        }
+                        
+                        return eventsList;
+                    };
+                    
+                    // Clean up duplicates before sanitizing
+                    events = await cleanupDuplicatePTOEvents(events || []);
+                    
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
                     const sanitizedEvents = Array.isArray(events) ? events.reduce((acc, event) => {
                         if (Array.isArray(event.studyIds) && event.studyIds.length > 0) {
@@ -7419,6 +7529,10 @@
                 // Check if current user is CRC and find matching CRC
                 const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
                 const matchingCrcId = getLoggedInCrcId();
+                // Check permissions for edit/delete buttons
+                const isManager = state.currentUser && state.currentUser.permissionLevel === 'Manager';
+                const canEditEvents = canEdit() || isManager;
+                const canDeleteEvents = canDelete() || isManager;
                 
                 // Initialize filters from state if they don't exist
                 if (!state.allScheduleFilters) {
@@ -7623,15 +7737,27 @@
                         
                         <div class="mb-4 flex justify-between items-center">
                             <p class="text-sm text-gray-600 dark:text-gray-400">Showing <strong>${filteredEvents.length}</strong> events</p>
-                            <button data-action="export-all-schedule" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 flex items-center text-sm">
-                                <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export to CSV
-                            </button>
+                            <div class="flex gap-2">
+                                ${canDeleteEvents ? `
+                                <button id="bulk-delete-events-btn" data-action="bulk-delete-all-schedule-events" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 flex items-center text-sm disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                                    <i data-lucide="trash-2" class="w-4 h-4 mr-2"></i>Delete Selected (<span id="selected-count">0</span>)
+                                </button>
+                                ` : ''}
+                                <button data-action="export-all-schedule" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 flex items-center text-sm">
+                                    <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export to CSV
+                                </button>
+                            </div>
                         </div>
                         
                         <div class="overflow-x-auto">
                             <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                                 <thead class="bg-gray-50 dark:bg-gray-700">
                                     <tr>
+                                        ${canDeleteEvents ? `
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider w-12">
+                                            <input type="checkbox" id="select-all-events" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                        </th>
+                                        ` : ''}
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">CRC</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Date</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">CRC Name</th>
@@ -7650,7 +7776,7 @@
                 if (sortedDates.length === 0) {
                     scheduleHTML += `
                         <tr>
-                            <td colspan="9" class="px-6 py-4 text-center text-gray-500 dark:text-gray-400">No events found for the selected filters</td>
+                            <td colspan="${canDeleteEvents ? '11' : '10'}" class="px-6 py-4 text-center text-gray-500 dark:text-gray-400">No events found for the selected filters</td>
                         </tr>
                     `;
                 } else {
@@ -7696,6 +7822,11 @@
                             
                             scheduleHTML += `
                                 <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
+                                    ${canDeleteEvents ? `
+                                    <td class="px-6 py-4 whitespace-nowrap">
+                                        <input type="checkbox" class="event-checkbox rounded border-gray-300 text-blue-600 focus:ring-blue-500" data-event-id="${event.id}" data-is-pto="${isPTO ? 'true' : 'false'}">
+                                    </td>
+                                    ` : ''}
                                     <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
                                         ${index === 0 ? formattedDate : ''}
                                     </td>
@@ -7722,12 +7853,12 @@
                                     </td>
                                     <td class="px-6 py-4 whitespace-nowrap text-sm">
                                         <div class="flex items-center gap-2">
-                                            ${canEdit() ? `
+                                            ${canEditEvents ? `
                                             <button data-action="edit-all-schedule-event" data-event-id="${event.id}" class="p-1 rounded hover:bg-blue-100 dark:hover:bg-blue-900/40 text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300" title="Edit shift">
                                                 <i data-lucide="edit" class="w-4 h-4"></i>
                                             </button>
                                             ` : ''}
-                                            ${canDelete() ? `
+                                            ${canDeleteEvents ? `
                                             <button data-action="delete-individual-crc-event" data-event-id="${event.id}" class="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/40 text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300" title="Delete shift">
                                                 <i data-lucide="trash-2" class="w-4 h-4"></i>
                                             </button>
@@ -7961,7 +8092,6 @@
 
                 let reportData = [];
                 const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-                const productiveEventTypes = ['Site Assignment', 'Travel Day'];
 
                 selectedCrcs.forEach(crcId => {
                     selectedMonths.forEach(month => {
@@ -7976,7 +8106,10 @@
 
                         let eventsForMonth = state.crc_events.filter(e => {
                             const eventDate = new Date(e.date + 'T00:00:00');
-                            return e.crcId === crcId && eventDate.getFullYear() == year && eventDate.getMonth() == month;
+                            return eventBelongsToCrc(e, crcId) && 
+                                   eventDate.getFullYear() == year && 
+                                   eventDate.getMonth() == month &&
+                                   isSiteAssignmentWithCrc(e);
                         });
 
                         // Apply site filter
@@ -8010,7 +8143,8 @@
                             }
                         });
 
-                        const productiveDaysSet = new Set(eventsForMonth.filter(e => productiveEventTypes.includes(e.type)).map(e => e.date));
+                        // Only count Site Assignments with CRCs assigned (not empty/open shifts)
+                        const productiveDaysSet = new Set(eventsForMonth.filter(e => isSiteAssignmentWithCrc(e)).map(e => e.date));
                         const nonWorkDaysSet = new Set(eventsForMonth.filter(e => ['Paid Time Off', 'Unavailable'].includes(e.type)).map(e => e.date));
                         const travelDaysSet = new Set(eventsForMonth.filter(e => e.type === 'Travel Day').map(e => e.date));
                         timeOffDaysSet.forEach(date => nonWorkDaysSet.add(date));
@@ -8816,7 +8950,19 @@
                     } else if (state.calendarDisplayMode === 'travel') {
                         container.innerHTML = getTravelViewHTML();
                     } else {
-                        container.innerHTML = getGlobalViewDetailedHTML();
+                        // Check if we're in week view for planning grid
+                        const now = state.crcCalendarDate;
+                        const dayOfWeek = getDaySaturdayStart(now);
+                        const startOfWeek = new Date(now);
+                        startOfWeek.setDate(now.getDate() - dayOfWeek);
+                        startOfWeek.setHours(0, 0, 0, 0);
+                        
+                        // Use weekly planning grid if viewing a specific week, otherwise use monthly
+                        if (state.calendarDisplayMode === 'week' || state.calendarView === 'week') {
+                            container.innerHTML = getWeeklyShiftPlanningGridHTML();
+                        } else {
+                            container.innerHTML = getShiftViewPlanningGridHTML();
+                        }
                     }
                 } else if (state.calendarView === 'roles') {
                     container.innerHTML = getRolesViewHTML();
@@ -9118,9 +9264,13 @@
                             displayParts.push(study.title || study.name);
                         }
                         
-                        // Add roles if available
+                        // Add roles if available - show only first role or count if multiple
                         if (roleNames.length > 0) {
-                            displayParts.push(roleNames.join(', '));
+                            if (roleNames.length === 1) {
+                                displayParts.push(roleNames[0]);
+                            } else {
+                                displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                            }
                         }
                         
                         // Add CRC name if available
@@ -9325,9 +9475,13 @@
                             displayParts.push(study.title || study.name);
                         }
                         
-                        // Add roles if available
+                        // Add roles if available - show only first role or count if multiple
                         if (roleNames.length > 0) {
-                            displayParts.push(roleNames.join(', '));
+                            if (roleNames.length === 1) {
+                                displayParts.push(roleNames[0]);
+                            } else {
+                                displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                            }
                         }
                         
                         // Add CRC name if available
@@ -9469,80 +9623,147 @@
                     const dayClass = isToday ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-white dark:bg-gray-800';
                     const todaysEvents = filteredEvents.filter(e => e.date === dateStr);
                     
-                    // Group events by site, study, and roles to create shift blocks
-                    // Events with different roles should be separate blocks
-                    const shiftGroups = {};
+                    // Group events by site, study, visit, and split by individual role
+                    // Each role gets its own block showing: visit, role, and CRC title (or count if empty)
+                    const roleBlocks = [];
+                    const processedEvents = new Set();
+                    
                     todaysEvents.forEach(event => {
-                        if (event.type === 'Site Assignment' && event.siteId) {
+                        if (event.type === 'Site Assignment' && event.siteId && !processedEvents.has(event.id)) {
                             const site = state.crc_sites.find(s => s.id === event.siteId);
-                            const studies = event.studyIds ? event.studyIds.map(studyId => {
-                                const study = state.studies.find(s => s.id === studyId);
-                                return study ? (study.title || study.name) : studyId;
-                            }).join(', ') : 'Unassigned';
+                            const visitNumber = event.visitNumber || '';
                             
-                            // Get roles for this event to include in grouping key
-                            const roles = getEventRoles(event);
-                            const rolesKey = roles.length > 0 ? roles.sort().join(',') : 'no-roles';
+                            // Get all roles for this event (including empty ones)
+                            const allRoles = getAllEventRoles(event);
                             
-                            // Create unique key that includes site, studies, and roles
-                            const shiftKey = `${event.siteId}-${studies}-${rolesKey}`;
-                            if (!shiftGroups[shiftKey]) {
-                                shiftGroups[shiftKey] = {
-                                    site: site,
-                                    studies: studies,
-                                    roles: roles,
-                                    events: [],
-                                    totalHours: 0,
-                                    crcs: new Set()
-                                };
-                            }
-                            shiftGroups[shiftKey].events.push(event);
-                            shiftGroups[shiftKey].totalHours += parseFloat(event.hours) || 0;
-                            
-                            // Collect CRCs from both crcId (legacy) and roleAssignments (new system)
-                            if (event.crcId) {
-                                shiftGroups[shiftKey].crcs.add(event.crcId);
-                            }
-                            if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                                Object.values(event.roleAssignments).forEach(assignments => {
-                                    if (Array.isArray(assignments)) {
-                                        assignments.forEach(crcId => {
-                                            if (crcId && crcId !== 'SITE_STAFF') {
-                                                shiftGroups[shiftKey].crcs.add(crcId);
-                                            }
-                                        });
+                            // If no roles found, try to get from roleAssignments
+                            if (allRoles.length === 0 && event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                                Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                    const role = state.roles.find(r => r.id === roleId);
+                                    if (role) {
+                                        const assignedCount = Array.isArray(assignments) ? assignments.filter(Boolean).length : 0;
+                                        const requiredCount = 1; // Default to 1 if we don't know the requirement
+                                        if (assignedCount === requiredCount) {
+                                            allRoles.push(role.name);
+                                        } else {
+                                            allRoles.push(`${role.name} ${assignedCount}/${requiredCount}`);
+                                        }
                                     }
                                 });
+                            }
+                            
+                            // If still no roles, create a single block without role info
+                            if (allRoles.length === 0) {
+                                const crcNames = [];
+                                if (event.crcId) {
+                                    const crc = state.crcs.find(c => c.id === event.crcId);
+                                    if (crc) crcNames.push(crc.title || crc.name.split(' ')[0]);
+                                }
+                                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                                    Object.values(event.roleAssignments).forEach(assignments => {
+                                        if (Array.isArray(assignments)) {
+                                            assignments.forEach(crcId => {
+                                                if (crcId && crcId !== 'SITE_STAFF') {
+                                                    const crc = state.crcs.find(c => c.id === crcId);
+                                                    if (crc && !crcNames.includes(crc.title || crc.name.split(' ')[0])) {
+                                                        crcNames.push(crc.title || crc.name.split(' ')[0]);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                                
+                                const bgColor = site?.color || '#3b82f6';
+                                const textColor = getContrastColor(bgColor);
+                                const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                
+                                roleBlocks.push({
+                                    visit: visitNumber,
+                                    role: '',
+                                    crcTitle: crcNames.length > 0 ? crcNames.join(', ') : '0/1',
+                                    site: site,
+                                    bgColor: bgColor,
+                                    textColor: textColor,
+                                    spanTextColor: spanTextColor,
+                                    event: event
+                                });
+                                processedEvents.add(event.id);
+                            } else {
+                                // Create a separate block for each role
+                                allRoles.forEach(roleDisplay => {
+                                    // Extract role name and count from roleDisplay (e.g., "RoleName" or "RoleName 2/5")
+                                    const roleMatch = roleDisplay.match(/^(.+?)(?:\s+(?:x\d+|[\d/]+))?$/);
+                                    const roleName = roleMatch ? roleMatch[1] : roleDisplay;
+                                    const hasCount = roleDisplay.includes('/') || roleDisplay.includes('x');
+                                    
+                                    // Find the role ID
+                                    const role = state.roles.find(r => r.name === roleName);
+                                    const roleId = role ? role.id : null;
+                                    
+                                    // Get CRCs assigned to this specific role
+                                    const crcTitles = [];
+                                    if (roleId && event.roleAssignments && event.roleAssignments[roleId]) {
+                                        const assignments = event.roleAssignments[roleId];
+                                        if (Array.isArray(assignments)) {
+                                            assignments.forEach(crcId => {
+                                                if (crcId && crcId !== 'SITE_STAFF') {
+                                                    const crc = state.crcs.find(c => c.id === crcId);
+                                                    if (crc) {
+                                                        const title = crc.title || crc.name.split(' ')[0];
+                                                        if (!crcTitles.includes(title)) {
+                                                            crcTitles.push(title);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                    
+                                    // If no CRC assigned, show count (e.g., "0/1")
+                                    const displayText = crcTitles.length > 0 ? crcTitles.join(', ') : (hasCount ? roleDisplay.split(' ').slice(1).join(' ') : '0/1');
+                                    
+                                    const bgColor = site?.color || '#3b82f6';
+                                    const textColor = getContrastColor(bgColor);
+                                    const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                    
+                                    roleBlocks.push({
+                                        visit: visitNumber,
+                                        role: roleName,
+                                        crcTitle: displayText,
+                                        site: site,
+                                        bgColor: bgColor,
+                                        textColor: textColor,
+                                        spanTextColor: spanTextColor,
+                                        event: event
+                                    });
+                                });
+                                processedEvents.add(event.id);
                             }
                         }
                     });
 
-                    let shiftBlocks = Object.values(shiftGroups).map(shift => {
-                        const crcNames = Array.from(shift.crcs).map(crcId => {
-                            const crc = state.crcs.find(c => c.id === crcId);
-                            return crc ? crc.name.split(' ')[0] : 'Unknown';
-                        }).join(', ');
+                    let shiftBlocks = roleBlocks.map(block => {
+                        // Build display: visit, role, CRC title (or count)
+                        let displayParts = [];
+                        if (block.visit) {
+                            // Get visit display name from study
+                            const visitDisplayName = getVisitDisplayName(block.visit, block.event.studyIds);
+                            displayParts.push(visitDisplayName);
+                        }
+                        if (block.role) displayParts.push(block.role);
+                        displayParts.push(block.crcTitle);
                         
-                        // Build display text with roles
-                        const roleText = shift.roles.length > 0 ? shift.roles.join(', ') : '';
-                        const displayText = roleText ? `${shift.studies} - ${roleText}` : shift.studies;
-                        
-                        const bgColor = shift.site?.color || '#3b82f6';
-                        const textColor = getContrastColor(bgColor);
-                        const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                        const displayText = displayParts.join(' - ');
                         
                         return `
                             <div class="shift-block p-2 rounded text-xs cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" 
-                                 style="background-color: ${bgColor}; color: ${textColor};" 
+                                 style="background-color: ${block.bgColor}; color: ${block.textColor};" 
                                  data-action="view-shift-details" 
-                                 data-site-id="${shift.events[0].siteId}" 
+                                 data-site-id="${block.event.siteId}" 
                                  data-date="${dateStr}"
-                                 title="Shift: ${shift.site?.name || 'Unknown Site'} - ${displayText} (${crcNames})">
-                                <div class="font-semibold">${shift.site?.name || 'Unknown Site'}</div>
-                                <div style="color: ${spanTextColor};">
-                                    ${displayText}<br>
-                                    ${crcNames} (${shift.totalHours}h)
-                                </div>
+                                 title="Shift: ${block.site?.name || 'Unknown Site'} - ${displayText}">
+                                <div class="font-semibold">${displayText}</div>
                             </div>
                         `;
                     }).join('');
@@ -9578,9 +9799,13 @@
                             displayParts.push(study.title || study.name);
                         }
                         
-                        // Add roles if available
+                        // Add roles if available - show only first role or count if multiple
                         if (roleNames.length > 0) {
-                            displayParts.push(roleNames.join(', '));
+                            if (roleNames.length === 1) {
+                                displayParts.push(roleNames[0]);
+                            } else {
+                                displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                            }
                         }
                         
                         // Add CRC name if available
@@ -9596,7 +9821,7 @@
                                  style="background-color: ${bgColor}; color: ${textColor};" 
                                  data-action="view-crc-event" 
                                  data-event-id="${event.id}"
-                                 title="${event.type} - ${primaryCrc ? primaryCrc.name : (roleNames.length > 0 ? roleNames.join(', ') : 'Open')}: ${event.hours || 0}h">
+                                 title="${event.type} - ${primaryCrc ? primaryCrc.name : (roleNames.length > 0 ? (roleNames.length === 1 ? roleNames[0] : `${roleNames[0]} (+${roleNames.length - 1} more)`) : 'Open')}: ${event.hours || 0}h">
                                 <div class="font-semibold">${displayText}</div>
                                 <div style="color: ${spanTextColor};">
                                     ${event.type}
@@ -9716,80 +9941,147 @@
                     const dayClass = isToday ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-white dark:bg-gray-800';
                     const todaysEvents = filteredEvents.filter(e => e.date === dateStr);
                     
-                    // Group events by site, study, and roles to create shift blocks
-                    // Events with different roles should be separate blocks
-                    const shiftGroups = {};
+                    // Group events by site, study, visit, and split by individual role
+                    // Each role gets its own block showing: visit, role, and CRC title (or count if empty)
+                    const roleBlocks = [];
+                    const processedEvents = new Set();
+                    
                     todaysEvents.forEach(event => {
-                        if (event.type === 'Site Assignment' && event.siteId) {
+                        if (event.type === 'Site Assignment' && event.siteId && !processedEvents.has(event.id)) {
                             const site = state.crc_sites.find(s => s.id === event.siteId);
-                            const studies = event.studyIds ? event.studyIds.map(studyId => {
-                                const study = state.studies.find(s => s.id === studyId);
-                                return study ? (study.title || study.name) : studyId;
-                            }).join(', ') : 'Unassigned';
+                            const visitNumber = event.visitNumber || '';
                             
-                            // Get roles for this event to include in grouping key
-                            const roles = getEventRoles(event);
-                            const rolesKey = roles.length > 0 ? roles.sort().join(',') : 'no-roles';
+                            // Get all roles for this event (including empty ones)
+                            const allRoles = getAllEventRoles(event);
                             
-                            // Create unique key that includes site, studies, and roles
-                            const shiftKey = `${event.siteId}-${studies}-${rolesKey}`;
-                            if (!shiftGroups[shiftKey]) {
-                                shiftGroups[shiftKey] = {
-                                    site: site,
-                                    studies: studies,
-                                    roles: roles,
-                                    events: [],
-                                    totalHours: 0,
-                                    crcs: new Set()
-                                };
-                            }
-                            shiftGroups[shiftKey].events.push(event);
-                            shiftGroups[shiftKey].totalHours += parseFloat(event.hours) || 0;
-                            
-                            // Collect CRCs from both crcId (legacy) and roleAssignments (new system)
-                            if (event.crcId) {
-                                shiftGroups[shiftKey].crcs.add(event.crcId);
-                            }
-                            if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                                Object.values(event.roleAssignments).forEach(assignments => {
-                                    if (Array.isArray(assignments)) {
-                                        assignments.forEach(crcId => {
-                                            if (crcId && crcId !== 'SITE_STAFF') {
-                                                shiftGroups[shiftKey].crcs.add(crcId);
-                                            }
-                                        });
+                            // If no roles found, try to get from roleAssignments
+                            if (allRoles.length === 0 && event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                                Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                    const role = state.roles.find(r => r.id === roleId);
+                                    if (role) {
+                                        const assignedCount = Array.isArray(assignments) ? assignments.filter(Boolean).length : 0;
+                                        const requiredCount = 1; // Default to 1 if we don't know the requirement
+                                        if (assignedCount === requiredCount) {
+                                            allRoles.push(role.name);
+                                        } else {
+                                            allRoles.push(`${role.name} ${assignedCount}/${requiredCount}`);
+                                        }
                                     }
                                 });
+                            }
+                            
+                            // If still no roles, create a single block without role info
+                            if (allRoles.length === 0) {
+                                const crcNames = [];
+                                if (event.crcId) {
+                                    const crc = state.crcs.find(c => c.id === event.crcId);
+                                    if (crc) crcNames.push(crc.title || crc.name.split(' ')[0]);
+                                }
+                                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                                    Object.values(event.roleAssignments).forEach(assignments => {
+                                        if (Array.isArray(assignments)) {
+                                            assignments.forEach(crcId => {
+                                                if (crcId && crcId !== 'SITE_STAFF') {
+                                                    const crc = state.crcs.find(c => c.id === crcId);
+                                                    if (crc && !crcNames.includes(crc.title || crc.name.split(' ')[0])) {
+                                                        crcNames.push(crc.title || crc.name.split(' ')[0]);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                                
+                                const bgColor = site?.color || '#3b82f6';
+                                const textColor = getContrastColor(bgColor);
+                                const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                
+                                roleBlocks.push({
+                                    visit: visitNumber,
+                                    role: '',
+                                    crcTitle: crcNames.length > 0 ? crcNames.join(', ') : '0/1',
+                                    site: site,
+                                    bgColor: bgColor,
+                                    textColor: textColor,
+                                    spanTextColor: spanTextColor,
+                                    event: event
+                                });
+                                processedEvents.add(event.id);
+                            } else {
+                                // Create a separate block for each role
+                                allRoles.forEach(roleDisplay => {
+                                    // Extract role name and count from roleDisplay (e.g., "RoleName" or "RoleName 2/5")
+                                    const roleMatch = roleDisplay.match(/^(.+?)(?:\s+(?:x\d+|[\d/]+))?$/);
+                                    const roleName = roleMatch ? roleMatch[1] : roleDisplay;
+                                    const hasCount = roleDisplay.includes('/') || roleDisplay.includes('x');
+                                    
+                                    // Find the role ID
+                                    const role = state.roles.find(r => r.name === roleName);
+                                    const roleId = role ? role.id : null;
+                                    
+                                    // Get CRCs assigned to this specific role
+                                    const crcTitles = [];
+                                    if (roleId && event.roleAssignments && event.roleAssignments[roleId]) {
+                                        const assignments = event.roleAssignments[roleId];
+                                        if (Array.isArray(assignments)) {
+                                            assignments.forEach(crcId => {
+                                                if (crcId && crcId !== 'SITE_STAFF') {
+                                                    const crc = state.crcs.find(c => c.id === crcId);
+                                                    if (crc) {
+                                                        const title = crc.title || crc.name.split(' ')[0];
+                                                        if (!crcTitles.includes(title)) {
+                                                            crcTitles.push(title);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                    
+                                    // If no CRC assigned, show count (e.g., "0/1")
+                                    const displayText = crcTitles.length > 0 ? crcTitles.join(', ') : (hasCount ? roleDisplay.split(' ').slice(1).join(' ') : '0/1');
+                                    
+                                    const bgColor = site?.color || '#3b82f6';
+                                    const textColor = getContrastColor(bgColor);
+                                    const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                    
+                                    roleBlocks.push({
+                                        visit: visitNumber,
+                                        role: roleName,
+                                        crcTitle: displayText,
+                                        site: site,
+                                        bgColor: bgColor,
+                                        textColor: textColor,
+                                        spanTextColor: spanTextColor,
+                                        event: event
+                                    });
+                                });
+                                processedEvents.add(event.id);
                             }
                         }
                     });
 
-                    let shiftBlocks = Object.values(shiftGroups).map(shift => {
-                        const crcNames = Array.from(shift.crcs).map(crcId => {
-                            const crc = state.crcs.find(c => c.id === crcId);
-                            return crc ? crc.name.split(' ')[0] : 'Unknown';
-                        }).join(', ');
+                    let shiftBlocks = roleBlocks.map(block => {
+                        // Build display: visit, role, CRC title (or count)
+                        let displayParts = [];
+                        if (block.visit) {
+                            // Get visit display name from study
+                            const visitDisplayName = getVisitDisplayName(block.visit, block.event.studyIds);
+                            displayParts.push(visitDisplayName);
+                        }
+                        if (block.role) displayParts.push(block.role);
+                        displayParts.push(block.crcTitle);
                         
-                        // Build display text with roles
-                        const roleText = shift.roles.length > 0 ? shift.roles.join(', ') : '';
-                        const displayText = roleText ? `${shift.studies} - ${roleText}` : shift.studies;
-                        
-                        const bgColor = shift.site?.color || '#3b82f6';
-                        const textColor = getContrastColor(bgColor);
-                        const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                        const displayText = displayParts.join(' - ');
                         
                         return `
                             <div class="shift-block p-2 rounded text-xs cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" 
-                                 style="background-color: ${bgColor}; color: ${textColor};" 
+                                 style="background-color: ${block.bgColor}; color: ${block.textColor};" 
                                  data-action="view-shift-details" 
-                                 data-site-id="${shift.events[0].siteId}" 
+                                 data-site-id="${block.event.siteId}" 
                                  data-date="${dateStr}"
-                                 title="Shift: ${shift.site?.name || 'Unknown Site'} - ${displayText} (${crcNames})">
-                                <div class="font-semibold">${shift.site?.name || 'Unknown Site'}</div>
-                                <div style="color: ${spanTextColor};">
-                                    ${displayText}<br>
-                                    ${crcNames} (${shift.totalHours}h)
-                                </div>
+                                 title="Shift: ${block.site?.name || 'Unknown Site'} - ${displayText}">
+                                <div class="font-semibold">${displayText}</div>
                             </div>
                         `;
                     }).join('');
@@ -9825,9 +10117,13 @@
                             displayParts.push(study.title || study.name);
                         }
                         
-                        // Add roles if available
+                        // Add roles if available - show only first role or count if multiple
                         if (roleNames.length > 0) {
-                            displayParts.push(roleNames.join(', '));
+                            if (roleNames.length === 1) {
+                                displayParts.push(roleNames[0]);
+                            } else {
+                                displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                            }
                         }
                         
                         // Add CRC name if available
@@ -9843,7 +10139,7 @@
                                  style="background-color: ${bgColor}; color: ${textColor};" 
                                  data-action="view-crc-event" 
                                  data-event-id="${event.id}"
-                                 title="${event.type} - ${primaryCrc ? primaryCrc.name : (roleNames.length > 0 ? roleNames.join(', ') : 'Open')}: ${event.hours || 0}h">
+                                 title="${event.type} - ${primaryCrc ? primaryCrc.name : (roleNames.length > 0 ? (roleNames.length === 1 ? roleNames[0] : `${roleNames[0]} (+${roleNames.length - 1} more)`) : 'Open')}: ${event.hours || 0}h">
                                 <div class="font-semibold">${displayText}</div>
                                 <div style="color: ${spanTextColor};">
                                     ${event.type}
@@ -10033,7 +10329,8 @@
                                 } else {
                                     // For other events, show all roles (including empty ones) for planning grid
                                     const roleNames = getAllEventRoles(eventForThisRow);
-                                    positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                    // Show only first role or count if multiple
+                                    positionDisplay = roleNames.length > 0 ? (roleNames.length === 1 ? roleNames[0] : `${roleNames[0]} (+${roleNames.length - 1})`) : eventForThisRow.type;
                                 }
                                 
                                 gridHtml += `
@@ -10090,7 +10387,8 @@
                                 } else {
                                     // For other events, show all roles (including empty ones) for planning grid
                                     const roleNames = getAllEventRoles(eventForThisRow);
-                                    positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                    // Show only first role or count if multiple
+                                    positionDisplay = roleNames.length > 0 ? (roleNames.length === 1 ? roleNames[0] : `${roleNames[0]} (+${roleNames.length - 1})`) : eventForThisRow.type;
                                 }
                                 
                                 gridHtml += `
@@ -10147,7 +10445,8 @@
                                 } else {
                                     // For other events, show all roles (including empty ones) for planning grid
                                     const roleNames = getAllEventRoles(eventForThisRow);
-                                    positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                    // Show only first role or count if multiple
+                                    positionDisplay = roleNames.length > 0 ? (roleNames.length === 1 ? roleNames[0] : `${roleNames[0]} (+${roleNames.length - 1})`) : eventForThisRow.type;
                                 }
                                 
                                 gridHtml += `
@@ -10204,7 +10503,8 @@
                                 } else {
                                     // For other events, show all roles (including empty ones) for planning grid
                                     const roleNames = getAllEventRoles(eventForThisRow);
-                                    positionDisplay = roleNames.length > 0 ? roleNames.join(', ') : eventForThisRow.type;
+                                    // Show only first role or count if multiple
+                                    positionDisplay = roleNames.length > 0 ? (roleNames.length === 1 ? roleNames[0] : `${roleNames[0]} (+${roleNames.length - 1})`) : eventForThisRow.type;
                                 }
                                 
                                 gridHtml += `
@@ -11052,9 +11352,13 @@
                                     }
                                 }
                                 
-                                // Add roles if available
+                                // Add roles if available - show only first role or count if multiple
                                 if (roleNames.length > 0) {
-                                    displayParts.push(roleNames.join(', '));
+                                    if (roleNames.length === 1) {
+                                        displayParts.push(roleNames[0]);
+                                    } else {
+                                        displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                                    }
                                 }
                                 
                                 // Add CRC name if available
@@ -12047,6 +12351,43 @@
                 if (siteFilter) siteFilter.addEventListener('change', updateFilters);
                 if (studyFilter) studyFilter.addEventListener('change', updateFilters);
                 if (typeFilter) typeFilter.addEventListener('change', updateFilters);
+                
+                // Setup bulk delete checkboxes
+                const selectAllCheckbox = document.getElementById('select-all-events');
+                const eventCheckboxes = document.querySelectorAll('.event-checkbox');
+                const bulkDeleteBtn = document.getElementById('bulk-delete-events-btn');
+                const selectedCountSpan = document.getElementById('selected-count');
+                
+                const updateBulkDeleteButton = () => {
+                    const checkedBoxes = document.querySelectorAll('.event-checkbox:checked');
+                    const count = checkedBoxes.length;
+                    if (selectedCountSpan) selectedCountSpan.textContent = count;
+                    if (bulkDeleteBtn) {
+                        bulkDeleteBtn.disabled = count === 0;
+                    }
+                    if (selectAllCheckbox) {
+                        selectAllCheckbox.indeterminate = count > 0 && count < eventCheckboxes.length;
+                        selectAllCheckbox.checked = count > 0 && count === eventCheckboxes.length;
+                    }
+                };
+                
+                // Select all checkbox handler
+                if (selectAllCheckbox) {
+                    selectAllCheckbox.addEventListener('change', (e) => {
+                        eventCheckboxes.forEach(checkbox => {
+                            checkbox.checked = e.target.checked;
+                        });
+                        updateBulkDeleteButton();
+                    });
+                }
+                
+                // Individual checkbox handlers
+                eventCheckboxes.forEach(checkbox => {
+                    checkbox.addEventListener('change', updateBulkDeleteButton);
+                });
+                
+                // Initial update
+                updateBulkDeleteButton();
             };
             
             // Initialize scheduler map with site locations
@@ -14884,9 +15225,12 @@
                     filteredEvents = filteredEvents.filter(event => (event.studyIds || []).includes(state.dashboardStudyFilter));
                 }
 
+                // Filter to only Site Assignments with CRCs assigned (not empty/open shifts)
+                const workEvents = filteredEvents.filter(e => isSiteAssignmentWithCrc(e));
+                
                 const hoursByRole = {};
                 const hoursByStudy = {};
-                filteredEvents.forEach(event => {
+                workEvents.forEach(event => {
                     const hours = parseFloat(event.hours) || 0;
                     if (hours === 0) return;
                     if (event.roles && event.roles.length > 0) {
@@ -15051,7 +15395,8 @@
                     return result;
                 };
 
-                const visitEvents = filteredEvents.filter(event => event.type === 'Site Assignment' && event.date);
+                // Only count Site Assignments with CRCs assigned (not empty/open shifts)
+                const visitEvents = filteredEvents.filter(event => isSiteAssignmentWithCrc(event) && event.date);
                 const totalVisitKeys = new Set();
                 const totalCrcKeys = new Set();
 
@@ -16397,8 +16742,8 @@
                         ${event.visitNumber ? `
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div>
-                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit Number</label>
-                                    <p class="text-sm dark:text-gray-200">${event.visitNumber}</p>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit</label>
+                                    <p class="text-sm dark:text-gray-200">${getVisitDisplayName(event.visitNumber, event.studyIds)}</p>
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Principal Investigator</label>
@@ -16465,7 +16810,7 @@
                                             ${shiftEvent.visitNumber ? `
                                                 <div>
                                                     <span class="font-medium dark:text-gray-300">Visit:</span>
-                                                    <span class="dark:text-gray-200">${shiftEvent.visitNumber}</span>
+                                                    <span class="dark:text-gray-200">${getVisitDisplayName(shiftEvent.visitNumber, shiftEvent.studyIds)}</span>
                                                 </div>
                                             ` : ''}
                                         </div>
@@ -17466,6 +17811,29 @@
                             const createdTimeOffRequests = []; // Track created requests
                             
                             for (const day of days) {
+                                // Check if this CRC already has an Unavailable or Paid Time Off event on this date
+                                // Only ONE PTO instance per day per person is allowed
+                                const existingPto = state.crc_events.find(e => 
+                                    e.crcId === crcId && 
+                                    e.date === day.date && 
+                                    (e.type === 'Unavailable' || e.type === 'Paid Time Off' || e.type === 'PTO')
+                                );
+                                
+                                // Also check time off requests for this date
+                                const existingTimeOffRequest = (state.timeOffRequests || []).find(req => 
+                                    req.crcId === crcId && 
+                                    (req.date === day.date || 
+                                     (req.startDate === day.date) ||
+                                     (req.startDate && req.endDate && 
+                                      new Date(day.date) >= new Date(req.startDate) && 
+                                      new Date(day.date) <= new Date(req.endDate)))
+                                );
+                                
+                                if (existingPto || existingTimeOffRequest) {
+                                    console.log(`Skipping ${day.date} - PTO already exists for this person on this date`);
+                                    continue; // Skip this day, don't create duplicate
+                                }
+                                
                                 const eventData = {
                                     name: ptoType,
                                     crcId,
@@ -20051,6 +20419,18 @@
                                         // All time off types should create time off requests
                                         const isTimeOffType = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other', 'Sick', 'Sick Time'].includes(ptoType);
                                         
+                                        // Check if this CRC already has an Unavailable event on this date
+                                        const existingUnavailable = state.crc_events.find(e => 
+                                            e.crcId === crcId && 
+                                            e.date === date && 
+                                            e.type === 'Unavailable'
+                                        );
+                                        
+                                        if (existingUnavailable) {
+                                            showNotification(`${ptoType} already exists for this person on ${date}. Only one PTO/unavailable event per day per person is allowed.`, 'error');
+                                            return;
+                                        }
+                                        
                                         try {
                                             // Create unavailability event
                                             const eventData = { 
@@ -20452,6 +20832,109 @@
                         } catch (error) {
                             console.error("Error deleting event:", error);
                             showNotification('Failed to delete event. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'bulk-delete-all-schedule-events': {
+                        const checkedBoxes = document.querySelectorAll('.event-checkbox:checked');
+                        if (checkedBoxes.length === 0) {
+                            showNotification('Please select at least one event to delete.', 'warning');
+                            break;
+                        }
+                        
+                        const eventIds = [];
+                        const ptoRequestIds = [];
+                        checkedBoxes.forEach(checkbox => {
+                            const eventId = checkbox.dataset.eventId;
+                            const isPTO = checkbox.dataset.isPto === 'true';
+                            if (isPTO) {
+                                // Extract PTO request ID from the event ID (format: pto-{requestId}-{date})
+                                const match = eventId.match(/^pto-(.+?)-(.+)$/);
+                                if (match) {
+                                    ptoRequestIds.push(match[1]);
+                                }
+                            } else {
+                                eventIds.push(eventId);
+                            }
+                        });
+                        
+                        const totalCount = eventIds.length + ptoRequestIds.length;
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-4">Delete Multiple Events</h3>
+                            <p class="dark:text-gray-300 mb-6">Are you sure you want to delete <strong>${totalCount}</strong> selected event${totalCount !== 1 ? 's' : ''}? This action cannot be undone.</p>
+                            <div class="flex justify-end gap-4">
+                                <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                <button data-action="confirm-bulk-delete-all-schedule-events" data-event-ids="${eventIds.join(',')}" data-pto-request-ids="${ptoRequestIds.join(',')}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete ${totalCount} Event${totalCount !== 1 ? 's' : ''}</button>
+                            </div>
+                        `);
+                        break;
+                    }
+                    case 'confirm-bulk-delete-all-schedule-events': {
+                        const eventIdsStr = e.target.dataset.eventIds || '';
+                        const ptoRequestIdsStr = e.target.dataset.ptoRequestIds || '';
+                        const eventIds = eventIdsStr ? eventIdsStr.split(',').filter(id => id.trim()) : [];
+                        const ptoRequestIds = ptoRequestIdsStr ? ptoRequestIdsStr.split(',').filter(id => id.trim()) : [];
+                        
+                        try {
+                            let deletedCount = 0;
+                            let errorCount = 0;
+                            
+                            // Delete regular events
+                            for (const eventId of eventIds) {
+                                try {
+                                    await apiService.deleteEvent(eventId);
+                                    deletedCount++;
+                                } catch (error) {
+                                    console.error(`Error deleting event ${eventId}:`, error);
+                                    errorCount++;
+                                }
+                            }
+                            
+                            // Delete PTO requests
+                            for (const ptoRequestId of ptoRequestIds) {
+                                try {
+                                    await apiService.deleteTimeOffRequest(ptoRequestId);
+                                    deletedCount++;
+                                } catch (error) {
+                                    console.error(`Error deleting PTO request ${ptoRequestId}:`, error);
+                                    errorCount++;
+                                }
+                            }
+                            
+                            // Re-fetch events and time off requests from DB
+                            const [updatedEvents, updatedTimeOffRequests] = await Promise.all([
+                                apiService.getEvents(),
+                                apiService.getTimeOffRequests()
+                            ]);
+                            setState({ 
+                                crc_events: updatedEvents,
+                                timeOffRequests: updatedTimeOffRequests
+                            });
+                            
+                            if (errorCount > 0) {
+                                showNotification(`Deleted ${deletedCount} event${deletedCount !== 1 ? 's' : ''}, but ${errorCount} failed. See console for details.`, 'warning');
+                            } else {
+                                showNotification(`Successfully deleted ${deletedCount} event${deletedCount !== 1 ? 's' : ''}!`, 'success');
+                            }
+                            
+                            closeModal();
+                            
+                            // Refresh the All Schedule view
+                            if (state.activeTab === 'allSchedule') {
+                                mainAppContent.innerHTML = getAllInclusiveScheduleHTML();
+                                setupAllScheduleFilters();
+                                lucide.createIcons();
+                            }
+                            
+                            // Refresh calendar views
+                            renderCRCCalendar();
+                            // Only refresh the sidebar lists if they currently exist in the DOM
+                            if (typeof renderCRCLists === 'function' && document.getElementById('studyList')) {
+                                renderCRCLists();
+                            }
+                        } catch (error) {
+                            console.error("Error in bulk delete:", error);
+                            showNotification('Failed to delete events. See console for details.', 'error');
                         }
                         break;
                     }
@@ -24732,6 +25215,11 @@
                         // Setup CRC profile modal interactions
                         setTimeout(() => {
                             setupCRCProfileModal();
+                            // Switch to training tab after adding training
+                            const trainingTabButton = modalContainer.querySelector('.crc-profile-tab[data-tab="training"]');
+                            if (trainingTabButton) {
+                                trainingTabButton.click();
+                            }
                         }, 100);
                         break;
                     }
@@ -24774,6 +25262,11 @@
                             // Setup CRC profile modal interactions
                             setTimeout(() => {
                                 setupCRCProfileModal();
+                                // Switch to training tab after editing training
+                                const trainingTabButton = modalContainer.querySelector('.crc-profile-tab[data-tab="training"]');
+                                if (trainingTabButton) {
+                                    trainingTabButton.click();
+                                }
                             }, 100);
                         }
                         break;
@@ -27193,7 +27686,7 @@
                 
                 const upcomingEvents = (state.crc_events || []).filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
-                    return eventDate >= now && eventDate <= next30Days && e.type === 'Site Assignment';
+                    return eventDate >= now && eventDate <= next30Days && isSiteAssignmentWithCrc(e);
                 }).length;
                 
                 const pendingTimeOff = (state.timeOffRequests || []).filter(r => 
@@ -27215,14 +27708,14 @@
                     const eventDate = new Date(e.date + 'T00:00:00');
                     return eventDate.getMonth() === now.getMonth() && 
                            eventDate.getFullYear() === now.getFullYear() &&
-                           e.type === 'Site Assignment';
+                           isSiteAssignmentWithCrc(e);
                 }).length;
                 
                 const totalHoursThisMonth = (state.crc_events || []).filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
                     return eventDate.getMonth() === now.getMonth() && 
                            eventDate.getFullYear() === now.getFullYear() &&
-                           e.type === 'Site Assignment';
+                           isSiteAssignmentWithCrc(e);
                 }).reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
 
                 container.innerHTML = `
@@ -27286,10 +27779,10 @@
                 const crcUtilization = (state.crcs || []).map(crc => {
                     const monthEvents = (state.crc_events || []).filter(e => {
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        return e.crcId === crc.id &&
+                        return eventBelongsToCrc(e, crc.id) &&
                                eventDate.getMonth() === currentMonth &&
                                eventDate.getFullYear() === currentYear &&
-                               e.type === 'Site Assignment';
+                               isSiteAssignmentWithCrc(e);
                     });
                     
                     const totalHours = monthEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
@@ -27311,7 +27804,7 @@
                     // Show next scheduled week instead
                     const futureEvents = (state.crc_events || []).filter(e => {
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        return eventDate > now && e.type === 'Site Assignment';
+                        return eventDate > now && isSiteAssignmentWithCrc(e);
                     }).sort((a, b) => new Date(a.date) - new Date(b.date));
                     
                     if (futureEvents.length === 0) {
@@ -27330,9 +27823,10 @@
                     const weekUtilization = (state.crcs || []).map(crc => {
                         const weekEvents = futureEvents.filter(e => {
                             const eventDate = new Date(e.date + 'T00:00:00');
-                            return e.crcId === crc.id &&
+                            return eventBelongsToCrc(e, crc.id) &&
                                    eventDate >= weekStart &&
-                                   eventDate <= weekEnd;
+                                   eventDate <= weekEnd &&
+                                   isSiteAssignmentWithCrc(e);
                         });
                         
                         const totalHours = weekEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
@@ -27474,10 +27968,23 @@
                     
                     const weekEvents = (state.crc_events || []).filter(e => {
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        return eventDate >= weekStart && eventDate <= weekEnd && e.type === 'Site Assignment';
+                        return eventDate >= weekStart && eventDate <= weekEnd && isSiteAssignmentWithCrc(e);
                     });
                     
-                    const uniqueCRCs = new Set(weekEvents.map(e => e.crcId).filter(Boolean));
+                    // Collect unique CRCs from both crcId and roleAssignments
+                    const uniqueCRCs = new Set();
+                    weekEvents.forEach(e => {
+                        if (e.crcId && e.crcId !== 'SITE_STAFF') uniqueCRCs.add(e.crcId);
+                        if (e.roleAssignments) {
+                            Object.values(e.roleAssignments).forEach(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    assignments.forEach(crcId => {
+                                        if (crcId && crcId !== 'SITE_STAFF') uniqueCRCs.add(crcId);
+                                    });
+                                }
+                            });
+                        }
+                    });
                     const totalHours = weekEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
                     const totalAssignments = weekEvents.length;
                     
@@ -27726,13 +28233,26 @@
                 const container = document.getElementById('performance-content');
                 if (!container) return;
 
-                // Study performance
+                // Study performance - only count Site Assignments with CRCs assigned
                 const studyPerformance = (state.studies || []).map(study => {
                     const studyEvents = (state.crc_events || []).filter(e => 
-                        e.studyIds && e.studyIds.includes(study.id) && e.type === 'Site Assignment'
+                        e.studyIds && e.studyIds.includes(study.id) && isSiteAssignmentWithCrc(e)
                     );
                     const uniqueSites = new Set(studyEvents.map(e => e.siteId).filter(Boolean));
-                    const uniqueCRCs = new Set(studyEvents.map(e => e.crcId).filter(Boolean));
+                    // Collect unique CRCs from both crcId and roleAssignments
+                    const uniqueCRCs = new Set();
+                    studyEvents.forEach(e => {
+                        if (e.crcId && e.crcId !== 'SITE_STAFF') uniqueCRCs.add(e.crcId);
+                        if (e.roleAssignments) {
+                            Object.values(e.roleAssignments).forEach(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    assignments.forEach(crcId => {
+                                        if (crcId && crcId !== 'SITE_STAFF') uniqueCRCs.add(crcId);
+                                    });
+                                }
+                            });
+                        }
+                    });
                     
                     return {
                         name: study.title || study.name,
