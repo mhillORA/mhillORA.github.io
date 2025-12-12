@@ -1880,7 +1880,9 @@ const fetchNavanAccessToken = async (context) => {
 
     try {
         const fetchFn = await getFetch();
-        const tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
+        const oauthUrl = 'https://api.navan.com/ta-auth/oauth/token';
+        context.log.info(`Navan OAuth: Requesting token from ${oauthUrl}`);
+        const tokenResponse = await fetchFn(oauthUrl, {
             method: 'POST',
             headers: {
                 'content-type': 'application/x-www-form-urlencoded'
@@ -2758,7 +2760,9 @@ app.http('navanTest', {
             let tokenResponse;
             try {
                 const fetchFn = await getFetch();
-                tokenResponse = await fetchFn('https://api.navan.com/ta-auth/oauth/token', {
+                const oauthUrl = 'https://api.navan.com/ta-auth/oauth/token';
+                context.log.info(`Navan OAuth Test: Requesting token from ${oauthUrl}`);
+                tokenResponse = await fetchFn(oauthUrl, {
                     method: 'POST',
                     headers: {
                         'content-type': 'application/x-www-form-urlencoded'
@@ -3245,24 +3249,28 @@ app.http('navanImport', {
     authLevel: 'anonymous',
     route: 'navan-import',
     handler: async (request, context) => {
-        let summary = {
-            importType: 'range',
-            totals: {
-                fetched: 0,
-                processed: 0,
-                created: 0,
-                updated: 0,
-                skipped: 0
-            },
-            skippedBookings: [],
-            errors: []
-        };
-        
-        const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
-        
+        // Wrap entire handler in try-catch to catch any unhandled errors
         try {
+            let summary = {
+                importType: 'range',
+                totals: {
+                    fetched: 0,
+                    processed: 0,
+                    created: 0,
+                    updated: 0,
+                    skipped: 0
+                },
+                skippedBookings: [],
+                errors: []
+            };
+            
+            const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
+            
             ensureContextLogger(context);
 
+            // Log request details for debugging
+            context.log.info(`navanImport: Request received. Method: ${request.method}, URL: ${request.url || 'N/A'}`);
+            
             if (request.method === 'OPTIONS') {
                 return {
                     status: 200,
@@ -3277,8 +3285,10 @@ app.http('navanImport', {
             let body = {};
             try {
                 body = await request.json();
+                context.log.info(`navanImport: Request body parsed. pastDays: ${body.pastDays}, futureDays: ${body.futureDays}, importType: ${body.importType}`);
             } catch (parseError) {
                 context.log.warn('navanImport: No JSON body or failed to parse request body, using defaults.');
+                context.log.warn('navanImport: Parse error:', parseError.message);
                 body = {};
             }
 
@@ -3514,13 +3524,20 @@ app.http('navanImport', {
                     const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 365;
                     const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180; // 6 months
 
+                    // Warn if date range is very large (could cause timeout)
+                    if (pastDays > 180) {
+                        context.log.warn(`navanImport: Large date range requested: ${pastDays} days back. This may cause timeout. Consider using smaller ranges.`);
+                    }
+
                     let createdFrom = body.createdFrom ? parseInt(body.createdFrom, 10) : null;
                     let createdTo = body.createdTo ? parseInt(body.createdTo, 10) : null;
 
                     if (!createdFrom || !createdTo || Number.isNaN(createdFrom) || Number.isNaN(createdTo)) {
+                        context.log.info(`navanImport: Calculating date range from pastDays=${pastDays}, futureDays=${futureDays}`);
                         const normalized = normalizeNavanDateRange(pastDays, futureDays);
                         createdFrom = normalized.createdFrom;
                         createdTo = normalized.createdTo;
+                        context.log.info(`navanImport: Normalized dates - createdFrom=${createdFrom} (${new Date(createdFrom * 1000).toISOString()}), createdTo=${createdTo} (${new Date(createdTo * 1000).toISOString()})`);
                         summary.range = {
                             createdFrom,
                             createdTo,
@@ -3537,16 +3554,47 @@ app.http('navanImport', {
                     }
 
                     summary.range = { createdFrom, createdTo, pastDays, futureDays };
-                    context.log.info(`navanImport: Fetching range ${new Date(createdFrom * 1000).toISOString()} to ${new Date(createdTo * 1000).toISOString()}`);
+                    const dateRangeDays = Math.ceil((createdTo - createdFrom) / (24 * 60 * 60));
+                    context.log.info(`navanImport: Fetching range ${new Date(createdFrom * 1000).toISOString()} to ${new Date(createdTo * 1000).toISOString()} (${dateRangeDays} days)`);
+                    
+                    // Validate date range
+                    if (createdTo <= createdFrom) {
+                        context.log.error(`navanImport: Invalid date range - createdTo (${createdTo}) <= createdFrom (${createdFrom})`);
+                        summary.errors.push({
+                            message: `Invalid date range: end date must be after start date`,
+                            type: 'Date range validation error'
+                        });
+                        summary.skippedBookings = limitArray(summary.skippedBookings);
+                        summary.errors = limitArray(summary.errors);
+                        return {
+                            status: 400,
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*'
+                            },
+                            jsonBody: {
+                                success: false,
+                                error: 'Invalid date range',
+                                detail: `End date (${new Date(createdTo * 1000).toISOString()}) must be after start date (${new Date(createdFrom * 1000).toISOString()})`,
+                                summary
+                            }
+                        };
+                    }
 
                     let bookings = [];
                     try {
-                        // Use smaller page size and limit pages to prevent timeout during fetch
+                        // For large date ranges (365+ days), use smaller page size and fewer pages to prevent timeout
+                        const isLargeRange = pastDays > 180;
+                        const pageSize = isLargeRange ? 25 : 50;  // Smaller page size for large ranges
+                        const maxPages = isLargeRange ? 50 : 100;  // Fewer pages for large ranges
+                        
+                        context.log.info(`navanImport: Fetching bookings with pageSize=${pageSize}, maxPages=${maxPages} (largeRange=${isLargeRange})`);
+                        
                         bookings = await fetchNavanBookingsInRange(context, accessToken, { 
                             createdFrom, 
                             createdTo,
-                            pageSize: 50,  // Smaller page size
-                            maxPages: 100  // Limit total pages to prevent timeout
+                            pageSize: pageSize,
+                            maxPages: maxPages
                         });
                         context.log.info(`navanImport: Fetched ${bookings?.length || 0} bookings`);
                     } catch (fetchError) {
