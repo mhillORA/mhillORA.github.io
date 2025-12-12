@@ -4088,9 +4088,47 @@
                 return false;
             };
             
+            // Helper function to get hours for a specific CRC from an event
+            // Correctly divides hours when multiple CRCs are assigned to the same event
+            const getEventHoursForCrc = (event, crcId) => {
+                if (!event || !crcId) return 0;
+                
+                const eventHours = parseFloat(event.hours) || 0;
+                if (eventHours === 0) return 0;
+                
+                // Count how many CRCs are assigned to this event
+                const assignedCrcs = new Set();
+                
+                // Check legacy crcId
+                if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                    assignedCrcs.add(event.crcId);
+                }
+                
+                // Check roleAssignments
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    Object.values(event.roleAssignments).forEach(assignments => {
+                        if (Array.isArray(assignments)) {
+                            assignments.forEach(id => {
+                                if (id && id !== 'SITE_STAFF') {
+                                    assignedCrcs.add(id);
+                                }
+                            });
+                        }
+                    });
+                }
+                
+                // If this CRC is not assigned, return 0
+                if (!assignedCrcs.has(crcId)) return 0;
+                
+                // Divide hours equally among all assigned CRCs
+                const crcCount = assignedCrcs.size;
+                return crcCount > 0 ? eventHours / crcCount : 0;
+            };
+            
             // Helper function to calculate hours for a CRC from Site Assignment events only
             // Optionally includes Travel Day events
             // This ensures we only count work hours, not PTO/Unavailable/Open Shifts
+            // Correctly divides hours when multiple CRCs are assigned to the same event
             const calculateCrcHours = (events, crcId = null, options = {}) => {
                 const { includeTravel = false } = options;
                 
@@ -4116,8 +4154,14 @@
                     return false;
                 });
                 
-                // Sum hours from filtered events
-                return workEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                // Sum hours using helper function that correctly divides hours
+                if (crcId) {
+                    // For specific CRC, use getEventHoursForCrc to divide hours correctly
+                    return workEvents.reduce((sum, e) => sum + getEventHoursForCrc(e, crcId), 0);
+                } else {
+                    // For total hours (no specific CRC), sum all hours (no division needed)
+                    return workEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                }
             };
             
             // Helper function to filter events for logged-in CRC
@@ -5079,21 +5123,22 @@
                     
                     // Clean up duplicate PTO/Unavailable events - keep only one per CRC per day
                     // Only runs if duplicates are detected, and only deletes them once
+                    // Tracks cleaned CRC+date combinations to avoid re-processing
                     const cleanupDuplicatePTOEvents = async (eventsList) => {
-                        // Load previously cleaned duplicate IDs from localStorage
+                        // Load previously cleaned CRC+date combinations from localStorage
                         const cleanedDuplicatesKey = 'chaos_cleaned_pto_duplicates';
-                        let cleanedDuplicateIds = new Set();
+                        let cleanedDuplicateKeys = new Set();
                         try {
                             const stored = localStorage.getItem(cleanedDuplicatesKey);
                             if (stored) {
-                                cleanedDuplicateIds = new Set(JSON.parse(stored));
+                                cleanedDuplicateKeys = new Set(JSON.parse(stored));
                             }
                         } catch (e) {
                             // If localStorage fails, start fresh
-                            cleanedDuplicateIds = new Set();
+                            cleanedDuplicateKeys = new Set();
                         }
                         
-                        const ptoMap = new Map(); // key: `${crcId}-${date}`, value: array of event IDs
+                        const ptoMap = new Map(); // key: `${crcId}-${date}`, value: array of events
                         let hasDuplicates = false;
                         
                         // First pass: Find all PTO/Unavailable events and group by CRC+date
@@ -5119,10 +5164,16 @@
                         
                         // Only process if duplicates exist
                         const duplicatesToDelete = [];
+                        const cleanedKeys = [];
                         
                         // For each CRC+date with multiple events, keep the first one, mark others for deletion
                         ptoMap.forEach((eventList, key) => {
                             if (eventList.length > 1) {
+                                // Skip if we've already cleaned this CRC+date combination
+                                if (cleanedDuplicateKeys.has(key)) {
+                                    return; // Already cleaned, skip
+                                }
+                                
                                 // Sort by createdAt (most recent first) or keep first
                                 eventList.sort((a, b) => {
                                     const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
@@ -5131,40 +5182,41 @@
                                 });
                                 
                                 // Keep the first (most recent), delete the rest
-                                // But skip if we've already cleaned these duplicates
                                 for (let i = 1; i < eventList.length; i++) {
-                                    const duplicate = eventList[i];
-                                    // Only add to delete list if we haven't cleaned this duplicate before
-                                    if (!cleanedDuplicateIds.has(duplicate.id)) {
-                                        duplicatesToDelete.push(duplicate);
-                                    }
+                                    duplicatesToDelete.push(eventList[i]);
                                 }
+                                
+                                // Mark this CRC+date combination as cleaned
+                                cleanedKeys.push(key);
                             }
                         });
                         
                         // Delete duplicates from database (only if we found any NEW duplicates)
                         if (duplicatesToDelete.length > 0) {
                             console.log(`Found ${duplicatesToDelete.length} new duplicate PTO events to clean up`);
-                            const successfullyDeleted = [];
                             
                             for (const duplicate of duplicatesToDelete) {
                                 try {
                                     await apiService.deleteEvent(duplicate.id);
-                                    successfullyDeleted.push(duplicate.id);
                                     console.log(`Deleted duplicate PTO event ${duplicate.id} for CRC ${duplicate.crcId} on ${duplicate.date}`);
                                 } catch (error) {
                                     console.error(`Error deleting duplicate PTO event ${duplicate.id}:`, error);
-                                    // Don't mark as cleaned if deletion failed
+                                    // Remove the key from cleanedKeys if deletion failed
+                                    const key = `${duplicate.crcId}-${duplicate.date}`;
+                                    const keyIndex = cleanedKeys.indexOf(key);
+                                    if (keyIndex > -1) {
+                                        cleanedKeys.splice(keyIndex, 1);
+                                    }
                                 }
                             }
                             
-                            // Mark successfully deleted duplicates as cleaned
-                            if (successfullyDeleted.length > 0) {
-                                successfullyDeleted.forEach(id => cleanedDuplicateIds.add(id));
+                            // Mark successfully processed CRC+date combinations as cleaned
+                            if (cleanedKeys.length > 0) {
+                                cleanedKeys.forEach(key => cleanedDuplicateKeys.add(key));
                                 try {
-                                    // Store cleaned IDs (keep only last 1000 to avoid localStorage bloat)
-                                    const cleanedArray = Array.from(cleanedDuplicateIds);
-                                    const trimmedArray = cleanedArray.slice(-1000);
+                                    // Store cleaned keys (keep only last 500 to avoid localStorage bloat)
+                                    const cleanedArray = Array.from(cleanedDuplicateKeys);
+                                    const trimmedArray = cleanedArray.slice(-500);
                                     localStorage.setItem(cleanedDuplicatesKey, JSON.stringify(trimmedArray));
                                 } catch (e) {
                                     console.warn('Failed to save cleaned duplicates to localStorage:', e);
@@ -5465,9 +5517,9 @@
                         updateProgress(pastDays, `Fetching ${pastDays} days back and ${futureDays} days forward...`);
                         
                         try {
-                            // Add timeout protection for Navan API calls (5 minutes max)
+                            // Add timeout protection for Navan API calls (15 minutes max)
                             const timeoutPromise = new Promise((_, reject) => {
-                                setTimeout(() => reject(new Error('Navan API request timed out after 5 minutes')), 5 * 60 * 1000);
+                                setTimeout(() => reject(new Error('Navan API request timed out after 15 minutes')), 15 * 60 * 1000);
                             });
                             
                             finalResult = await Promise.race([
@@ -7450,6 +7502,18 @@
                     }).join('')
                     : '<div class="text-sm text-gray-600 dark:text-gray-400">No staff assigned</div>';
                 
+                // Get current user's CRC info
+                const currentCrc = state.crcs.find(c => c.id === currentCrcId);
+                const currentCrcRoles = [];
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        if (Array.isArray(assignments) && assignments.includes(currentCrcId)) {
+                            const role = state.roles.find(r => r.id === roleId);
+                            if (role) currentCrcRoles.push(role.name);
+                        }
+                    });
+                }
+                
                 openModal(`
                     <h3 class="text-xl font-bold dark:text-white mb-4">Shift Details</h3>
                     <div class="space-y-4">
@@ -7480,7 +7544,7 @@
                         ${event.visitNumber ? `
                             <div>
                                 <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Visit</div>
-                                <div class="text-gray-900 dark:text-white">${event.visitNumber}</div>
+                                <div class="text-gray-900 dark:text-white">${getVisitDisplayName(event.visitNumber, event.studyIds)}</div>
                             </div>
                         ` : ''}
                         ${event.groupNumber ? `
@@ -7489,12 +7553,28 @@
                                 <div class="text-gray-900 dark:text-white">${event.groupNumber}</div>
                             </div>
                         ` : ''}
-                        <div>
-                            <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Scheduled Staff</div>
-                            <div class="space-y-1 max-h-60 overflow-y-auto">
-                                ${assignedCrcsHTML}
+                        ${currentCrc ? `
+                            <div>
+                                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Your Assignment</div>
+                                <div class="p-2 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-md">
+                                    <div class="font-medium text-blue-900 dark:text-blue-200">${currentCrc.name}</div>
+                                    ${currentCrcRoles.length > 0 ? `<div class="text-xs text-gray-600 dark:text-gray-400 mt-1">${currentCrcRoles.join(', ')}</div>` : ''}
+                                </div>
                             </div>
-                        </div>
+                        ` : ''}
+                        ${uniqueCrcs.length > 1 ? `
+                            <div>
+                                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Other Staff on This Shift</div>
+                                <div class="space-y-1 max-h-60 overflow-y-auto">
+                                    ${uniqueCrcs.filter(({ crc }) => crc.id !== currentCrcId).map(({ crc, roles }) => `
+                                        <div class="p-2 bg-gray-50 dark:bg-gray-700 rounded-md">
+                                            <div class="font-medium text-gray-700 dark:text-gray-300">${crc.name}</div>
+                                            ${roles.length > 0 ? `<div class="text-xs text-gray-600 dark:text-gray-400 mt-1">${roles.join(', ')}</div>` : ''}
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
                     </div>
                 `, 'lg');
             };
@@ -19851,6 +19931,15 @@
             // ... rest of the switch statement
                     case 'view-availability': openModal(getAvailabilityModalHTML(), '7xl'); break;
                     case 'manage-unavailability': {
+                        // If clicking from Time Off tab and user is viewing their own requests, pre-select their CRC
+                        const isFromTimeOffTab = state.activeTab === 'timeOff' && state.currentUser;
+                        if (isFromTimeOffTab && state.currentUser && !state.selectedCrcForUnavailability) {
+                            const currentCrcId = getLoggedInCrcId();
+                            if (currentCrcId) {
+                                setState({ selectedCrcForUnavailability: currentCrcId }, { skipRender: true });
+                            }
+                        }
+                        
                         openModal(getManageUnavailabilityModalHTML(), '4xl');
                         // Setup event listeners after modal opens
                         setTimeout(() => {
@@ -29740,7 +29829,14 @@
                 let html = `
                     <div class="flex justify-between items-center mb-6">
                         <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Time Off Requests</h2>
-                        ${!viewingOwn ? '' : '<p class="text-sm text-gray-500 dark:text-gray-400 ml-4 hidden sm:block">Showing requests submitted by or for you.</p>'}
+                        <div class="flex items-center gap-3">
+                            ${!viewingOwn ? '' : '<p class="text-sm text-gray-500 dark:text-gray-400 ml-4 hidden sm:block">Showing requests submitted by or for you.</p>'}
+                            ${viewingOwn ? `
+                                <button data-action="manage-unavailability" class="bg-yellow-600 text-white py-2 px-4 rounded-md hover:bg-yellow-700 transition-colors flex items-center text-sm">
+                                    <i data-lucide="calendar-off" class="w-4 h-4 mr-2"></i>Submit Time Off
+                                </button>
+                            ` : ''}
+                        </div>
                     </div>
 
                     ${upcomingSectionsHTML}

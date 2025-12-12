@@ -1855,6 +1855,13 @@ const getNavanCredentials = () => {
     };
 };
 
+// Token cache (module-level, persists within function instance)
+let navanTokenCache = {
+    accessToken: null,
+    expiresAt: null,
+    tokenType: null
+};
+
 const fetchNavanAccessToken = async (context) => {
     const { clientId, clientSecret } = getNavanCredentials();
     context.log.info(`Navan credentials check: CLIENT_ID exists=${!!clientId}, SECRET_KEY exists=${!!clientSecret}`);
@@ -1878,10 +1885,23 @@ const fetchNavanAccessToken = async (context) => {
         };
     }
 
+    // Check if we have a valid cached token
+    const now = Date.now();
+    if (navanTokenCache.accessToken && navanTokenCache.expiresAt && now < navanTokenCache.expiresAt) {
+        const timeUntilExpiry = Math.floor((navanTokenCache.expiresAt - now) / 1000);
+        context.log.info(`Using cached Navan OAuth token (expires in ${timeUntilExpiry} seconds)`);
+        return { 
+            success: true, 
+            accessToken: navanTokenCache.accessToken,
+            tokenType: navanTokenCache.tokenType
+        };
+    }
+
+    // Token expired or missing, fetch new one
     try {
         const fetchFn = await getFetch();
         const oauthUrl = 'https://api.navan.com/ta-auth/oauth/token';
-        context.log.info(`Navan OAuth: Requesting token from ${oauthUrl}`);
+        context.log.info(`Navan OAuth: Requesting new token from ${oauthUrl}`);
         
         // Build form-encoded body (matching Postman format)
         const bodyParams = new URLSearchParams({
@@ -1923,10 +1943,12 @@ const fetchNavanAccessToken = async (context) => {
 
         const tokenData = await tokenResponse.json();
         const accessToken = tokenData?.access_token;
+        const expiresIn = tokenData?.expires_in || 3600; // Default to 1 hour if not provided
+        const tokenType = tokenData?.token_type || 'Bearer';
 
         // Log token receipt status (without logging full token for security)
         if (accessToken) {
-            context.log.info(`Navan OAuth token received successfully. Token length: ${accessToken.length}, Token preview: ${accessToken.substring(0, 10)}...`);
+            context.log.info(`Navan OAuth token received successfully. Token length: ${accessToken.length}, Token preview: ${accessToken.substring(0, 10)}..., Expires in: ${expiresIn} seconds`);
         } else {
             context.log.error('Navan OAuth response missing access_token. Full response:', JSON.stringify(tokenData));
         }
@@ -1951,7 +1973,21 @@ const fetchNavanAccessToken = async (context) => {
             };
         }
 
-        return { success: true, accessToken };
+        // Cache the token with expiry time (subtract 60 seconds for safety margin)
+        const expiryTime = now + (expiresIn * 1000) - (60 * 1000); // Subtract 1 minute buffer
+        navanTokenCache = {
+            accessToken: accessToken,
+            expiresAt: expiryTime,
+            tokenType: tokenType
+        };
+        
+        context.log.info(`Navan OAuth token cached. Will expire at ${new Date(expiryTime).toISOString()}`);
+
+        return { 
+            success: true, 
+            accessToken: accessToken,
+            tokenType: tokenType
+        };
     } catch (error) {
         context.log.error('Error requesting Navan OAuth token:', error);
         return {
