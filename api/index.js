@@ -3312,6 +3312,8 @@ app.http('navanImport', {
     route: 'navan-import',
     handler: async (request, context) => {
         // Wrap entire handler in try-catch to catch any unhandled errors
+        const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
+        
         let summary = {
             importType: 'range',
             totals: {
@@ -3342,19 +3344,10 @@ app.http('navanImport', {
                 };
             }
             
-            const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
-            
             ensureContextLogger(context);
 
             // Log request details for debugging
             context.log.info(`navanImport: Request received. Method: ${request.method || 'UNKNOWN'}, URL: ${request.url || 'N/A'}`);
-            if (request.headers) {
-                try {
-                    context.log.info(`navanImport: Request headers:`, JSON.stringify(request.headers));
-                } catch (headerError) {
-                    context.log.warn('navanImport: Could not stringify headers:', headerError.message);
-                }
-            }
             
             if (request.method === 'OPTIONS') {
                 return {
@@ -3759,8 +3752,8 @@ app.http('navanImport', {
                     }
                     summary.totals.fetched = bookings?.length || 0;
 
-                    // Process in smaller batches to prevent timeout - use 50 to be extra safe
-                    const BATCH_SIZE = 50;
+                    // Process in smaller batches to prevent timeout - use 20 per batch
+                    const BATCH_SIZE = 20;
                     const totalBookings = bookings.length;
                     context.log.info(`navanImport: Processing ${totalBookings} bookings in batches of ${BATCH_SIZE}`);
                     
