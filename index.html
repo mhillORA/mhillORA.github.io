@@ -5080,6 +5080,19 @@
                     // Clean up duplicate PTO/Unavailable events - keep only one per CRC per day
                     // Only runs if duplicates are detected, and only deletes them once
                     const cleanupDuplicatePTOEvents = async (eventsList) => {
+                        // Load previously cleaned duplicate IDs from localStorage
+                        const cleanedDuplicatesKey = 'chaos_cleaned_pto_duplicates';
+                        let cleanedDuplicateIds = new Set();
+                        try {
+                            const stored = localStorage.getItem(cleanedDuplicatesKey);
+                            if (stored) {
+                                cleanedDuplicateIds = new Set(JSON.parse(stored));
+                            }
+                        } catch (e) {
+                            // If localStorage fails, start fresh
+                            cleanedDuplicateIds = new Set();
+                        }
+                        
                         const ptoMap = new Map(); // key: `${crcId}-${date}`, value: array of event IDs
                         let hasDuplicates = false;
                         
@@ -5118,21 +5131,43 @@
                                 });
                                 
                                 // Keep the first (most recent), delete the rest
+                                // But skip if we've already cleaned these duplicates
                                 for (let i = 1; i < eventList.length; i++) {
-                                    duplicatesToDelete.push(eventList[i]);
+                                    const duplicate = eventList[i];
+                                    // Only add to delete list if we haven't cleaned this duplicate before
+                                    if (!cleanedDuplicateIds.has(duplicate.id)) {
+                                        duplicatesToDelete.push(duplicate);
+                                    }
                                 }
                             }
                         });
                         
-                        // Delete duplicates from database (only if we found any)
+                        // Delete duplicates from database (only if we found any NEW duplicates)
                         if (duplicatesToDelete.length > 0) {
-                            console.log(`Found ${duplicatesToDelete.length} duplicate PTO events to clean up - deleting once`);
+                            console.log(`Found ${duplicatesToDelete.length} new duplicate PTO events to clean up`);
+                            const successfullyDeleted = [];
+                            
                             for (const duplicate of duplicatesToDelete) {
                                 try {
                                     await apiService.deleteEvent(duplicate.id);
+                                    successfullyDeleted.push(duplicate.id);
                                     console.log(`Deleted duplicate PTO event ${duplicate.id} for CRC ${duplicate.crcId} on ${duplicate.date}`);
                                 } catch (error) {
                                     console.error(`Error deleting duplicate PTO event ${duplicate.id}:`, error);
+                                    // Don't mark as cleaned if deletion failed
+                                }
+                            }
+                            
+                            // Mark successfully deleted duplicates as cleaned
+                            if (successfullyDeleted.length > 0) {
+                                successfullyDeleted.forEach(id => cleanedDuplicateIds.add(id));
+                                try {
+                                    // Store cleaned IDs (keep only last 1000 to avoid localStorage bloat)
+                                    const cleanedArray = Array.from(cleanedDuplicateIds);
+                                    const trimmedArray = cleanedArray.slice(-1000);
+                                    localStorage.setItem(cleanedDuplicatesKey, JSON.stringify(trimmedArray));
+                                } catch (e) {
+                                    console.warn('Failed to save cleaned duplicates to localStorage:', e);
                                 }
                             }
                             
