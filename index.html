@@ -10704,43 +10704,43 @@
             };
 
             const getWeeklyPlanningGridHTML = () => {
-                // Use state.crcCalendarDate for weekly planning grid (same as monthly)
+                // Same format as monthly planning grid, but only showing 7 days
                 const now = state.crcCalendarDate;
                 const dayOfWeek = getDaySaturdayStart(now);
                 const startOfWeek = new Date(now);
                 startOfWeek.setDate(startOfWeek.getDate() - dayOfWeek);
-                const year = startOfWeek.getFullYear();
-                const month = startOfWeek.getMonth();
-                const day = startOfWeek.getDate();
+                startOfWeek.setHours(0, 0, 0, 0);
+                const isDarkMode = document.documentElement.classList.contains('dark');
                 
                 // Check if CRC user - filter to only their events
                 const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
                 const matchingCrcId = getLoggedInCrcId();
+
+                let crcsToDisplay = state.crcs;
                 
-                // Get all studies and sites
-                const allStudies = state.studies;
-                const allSites = state.crc_sites;
+                // For CRC users, only show themselves
+                if (isCRCUser && matchingCrcId) {
+                    crcsToDisplay = [state.crcs.find(c => c.id === matchingCrcId)].filter(Boolean);
+                } else {
+                    if (state.selectedEmploymentTypeFilter !== 'all') {
+                        crcsToDisplay = crcsToDisplay.filter(c => normalizeEmploymentType(c.employmentType) === state.selectedEmploymentTypeFilter);
+                    }
+                }
+                const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
                 
-                // Filter events for the current week
+                // Get the 7 days of the week
+                const weekDays = [];
+                for (let i = 0; i < 7; i++) {
+                    const day = new Date(startOfWeek);
+                    day.setDate(startOfWeek.getDate() + i);
+                    weekDays.push(day);
+                }
+                
+                // Filter events for the week
                 let filteredEvents = state.crc_events.filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
-                    const endOfWeek = new Date(startOfWeek);
-                    endOfWeek.setDate(endOfWeek.getDate() + 6);
-                    return eventDate >= startOfWeek && eventDate <= endOfWeek;
+                    return eventDate >= startOfWeek && eventDate < new Date(startOfWeek.getTime() + 7 * 24 * 60 * 60 * 1000);
                 });
-                
-                // Filter out PTO/Unavailable events - they should only appear in the time off calendar, not the main scheduler
-                // Filter out PTO/Unavailable/Sick Time events and events without studyIds
-                filteredEvents = filteredEvents.filter(e => 
-                    e.type !== 'Unavailable' && 
-                    e.type !== 'Paid Time Off' && 
-                    e.type !== 'Sick Time' &&
-                    e.type !== 'PTO' &&
-                    e.studyIds && 
-                    Array.isArray(e.studyIds) && 
-                    e.studyIds.length > 0 && 
-                    e.studyIds.filter(Boolean).length > 0
-                );
 
                 // For CRC users, ONLY show their events (check both crcId and roleAssignments)
                 if (isCRCUser && matchingCrcId) {
@@ -10763,6 +10763,16 @@
                 } else {
                     if (state.selectedCrcFilter !== 'all') {
                         filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.selectedCrcFilter));
+                    } else {
+                         filteredEvents = filteredEvents.filter(e => {
+                             // Include events with no CRC assigned OR events where any assigned CRC is in the display list
+                             if (!e.crcId && (!e.roleAssignments || Object.keys(e.roleAssignments).length === 0)) {
+                                 return true; // Unassigned events
+                             }
+                             // Check if any CRC assigned to this event is in the display list
+                             const eventCrcs = getEventCRCs(e);
+                             return eventCrcs.length === 0 || eventCrcs.some(crc => crcIdsToDisplay.includes(crc.id));
+                         });
                     }
                 }
                 if (state.selectedSiteFilter !== 'all') {
@@ -10789,241 +10799,193 @@
                     filteredEvents = filteredEvents.filter(e => e.type === state.selectedEventTypeFilter);
                 }
 
-                // Helpers to determine visibility
-                const isStudyActive = (study) => {
-                    const statusString = String(study.status || study.state || study.phase || '').toLowerCase();
-                    
-                    // Exclude ONLY closed studies - show everything else from ARTEMIS
-                    if (statusString.includes('closed')) {
-                        return false;
-                    }
-                    
-                    // Include all other studies from ARTEMIS (they have siteIds)
-                    // This includes: enrolling, recruiting, active, completed (but not closed), etc.
-                    return true;
-                };
-                const siteHasAssignmentThisWeek = (siteId) => filteredEvents.some(e => e.siteId === siteId && (e.type === 'Site Assignment' || e.type === 'Travel Day'));
-
-                // Create the weekly planning grid structure
-                let gridHtml = `
-                    <div class="mb-4 flex items-center gap-4">
-                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Weekly Planning Grid</h3>
-                        <div class="text-sm text-gray-500 dark:text-gray-400">
-                            Week of ${startOfWeek.toLocaleDateString('en-US', { month: 'long', day: 'numeric' })} - ${new Date(startOfWeek.getTime() + 6 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}
-                        </div>
-                    </div>
-                `;
-
-                // Create the grid structure
-                gridHtml += `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;">`;
-                gridHtml += `<table class="min-w-full text-xs border-collapse">`;
-                
-                // Column headers - Days of the week
-                gridHtml += `<thead>`;
-                gridHtml += `<tr class="bg-gray-100 dark:bg-gray-800">`;
-                gridHtml += `<th class="p-2 text-center sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold border-r dark:border-gray-700 w-48">Role / Site</th>`;
-                
-                // Add day headers
-                const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-                for (let i = 0; i < 7; i++) {
-                    const currentDay = new Date(startOfWeek);
-                    currentDay.setDate(currentDay.getDate() + i);
-                    const dayName = weekdays[i];
-                    const dateStr = toDateOnlyString(currentDay);
-                    const isToday = new Date().toDateString() === currentDay.toDateString();
-                    const dayClass = isToday ? 'bg-blue-600' : 'bg-gray-600';
-                    
-                    gridHtml += `<th class="p-2 text-center font-bold text-white ${dayClass} border-l dark:border-gray-700">
-                        <div class="text-sm">${dayName}</div>
-                        <div class="text-xs">${currentDay.getDate()}/${currentDay.getMonth() + 1}</div>
-                    </th>`;
-                }
-                gridHtml += `</tr>`;
-                gridHtml += `</thead>`;
-                
-                // Body with study, site, and role rows
-                gridHtml += `<tbody>`;
-                
-                // Group sites by study
-                for (const study of allStudies) {
-                    // Get sites for this study
-                    const studySites = allSites.filter(site => 
-                        study.sites && study.sites.includes(site.id)
-                    );
-                    // Only show sites that belong to an active study or have someone scheduled this week
-                    const visibleStudySites = studySites.filter(site => isStudyActive(study) || siteHasAssignmentThisWeek(site.id));
-
-                    if (visibleStudySites.length === 0) continue;
-                    
-                    // Add study header row
-                    gridHtml += `<tr class="bg-indigo-100 dark:bg-indigo-900/30 border-t-2 border-indigo-500">`;
-                    gridHtml += `<td colspan="8" class="p-3 text-left font-bold text-indigo-900 dark:text-indigo-200 sticky left-0 bg-indigo-100 dark:bg-indigo-900/30">
-                        <div class="flex items-center gap-2">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                            </svg>
-                            <span>${study.title}</span>
-                            <span class="text-xs font-normal text-indigo-700 dark:text-indigo-300">(${visibleStudySites.length} site${visibleStudySites.length !== 1 ? 's' : ''})</span>
-                        </div>
-                    </td>`;
-                    gridHtml += `</tr>`;
-                    
-                    // For each site, create rows for each role
-                    for (const site of visibleStudySites) {
-                        // Get role requirements for this study/site
-                        const visitRoleRequirements = study?.visitRoleRequirements || {};
-                        const defaultReqs = visitRoleRequirements['default'] || {};
-                        
-                        // Get all roles that are required or have assignments
-                        const allRoleIds = new Set();
-                        Object.keys(defaultReqs).forEach(roleId => allRoleIds.add(roleId));
-                        
-                        // Also check for roles that have assignments but might not be in requirements
-                        filteredEvents.forEach(event => {
-                            if (event.siteId === site.id && event.studyIds?.includes(study.id) && event.type === 'Site Assignment') {
-                                if (event.roleAssignments) {
-                                    Object.keys(event.roleAssignments).forEach(roleId => allRoleIds.add(roleId));
-                                }
+                // Calculate daily stats for the week
+                const dailyStats = {};
+                weekDays.forEach((day, index) => {
+                    const dateStr = toDateOnlyString(day);
+                    const dayEvents = filteredEvents.filter(e => e.date === dateStr);
+                    const uniqueCRCs = new Set();
+                    dayEvents.forEach(event => {
+                        // Check legacy crcId
+                        if (event.crcId) {
+                            const isUnavailable = isCRCUnavailable(event.crcId, dateStr, event.period || 'Full Day');
+                            if (!isUnavailable) {
+                                uniqueCRCs.add(event.crcId);
                             }
-                        });
-                        
-                        // Convert to array and sort by role order (MedHX/ICF first)
-                        const sortedRoleIds = Array.from(allRoleIds).sort((a, b) => {
-                            const roleA = state.roles.find(r => r.id === a);
-                            const roleB = state.roles.find(r => r.id === b);
-                            if (!roleA || !roleB) return 0;
-                            
-                            const aName = roleA.name || '';
-                            const bName = roleB.name || '';
-                            
-                            // Prioritize MedHX and ICF
-                            const aIsMedHX = aName.toLowerCase().includes('medhx') || aName.toLowerCase().includes('medh');
-                            const bIsMedHX = bName.toLowerCase().includes('medhx') || bName.toLowerCase().includes('medh');
-                            const aIsICF = aName.toLowerCase() === 'icf';
-                            const bIsICF = bName.toLowerCase() === 'icf';
-                            
-                            if (aIsMedHX && !bIsMedHX) return -1;
-                            if (!aIsMedHX && bIsMedHX) return 1;
-                            if (aIsICF && !bIsICF && !aIsMedHX) return -1;
-                            if (!aIsICF && bIsICF && !bIsMedHX) return 1;
-                            
-                            // Otherwise sort alphabetically
-                            return aName.localeCompare(bName);
-                        });
-                        
-                        // If no roles found, create a placeholder row
-                        if (sortedRoleIds.length === 0) {
-                            gridHtml += `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800/50">`;
-                            gridHtml += `<td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium border-r dark:border-gray-700">
-                                <div class="flex items-center gap-2">
-                                    <span class="text-gray-400">└</span>
-                                    <div>
-                                        <div class="font-semibold">${site.name}</div>
-                                        <div class="text-xs text-gray-500">${site.city || ''} ${site.state || ''}</div>
-                                    </div>
-                                </div>
-                            </td>`;
-                            for (let i = 0; i < 7; i++) {
-                                gridHtml += `<td class="p-1 text-center border-l dark:border-gray-700 align-top"></td>`;
-                            }
-                            gridHtml += `</tr>`;
-                            continue;
                         }
-                        
-                        // Create a row for each role
-                        for (const roleId of sortedRoleIds) {
-                            const role = state.roles.find(r => r.id === roleId);
-                            if (!role) continue;
-                            
-                            const requiredQty = parseInt(defaultReqs[roleId]) || 0;
-                            
-                            gridHtml += `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800/50">`;
-                            
-                            // Role name and site (sticky left column)
-                            gridHtml += `<td class="p-2 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium border-r dark:border-gray-700">
-                                <div class="flex items-center gap-2">
-                                    <span class="text-gray-400">└</span>
-                                    <div>
-                                        <div class="font-semibold">${role.name}</div>
-                                        <div class="text-xs text-gray-500">${site.name}${requiredQty > 1 ? ` (${requiredQty})` : ''}</div>
-                                    </div>
-                                </div>
-                            </td>`;
-                            
-                            // Add columns for each day of the week
-                            for (let i = 0; i < 7; i++) {
-                                const currentDay = new Date(startOfWeek);
-                                currentDay.setDate(currentDay.getDate() + i);
-                                const dateStr = toDateOnlyString(currentDay);
-                                
-                                // Find events for this site, study, and date
-                                const dayEvents = filteredEvents.filter(e => 
-                                    e.date === dateStr && 
-                                    e.siteId === site.id && 
-                                    e.studyIds?.includes(study.id) &&
-                                    e.type === 'Site Assignment'
-                                );
-                                
-                                // Get assigned CRCs for this role on this day
-                                const assignedCrcIds = [];
-                                dayEvents.forEach(event => {
-                                    if (event.roleAssignments && event.roleAssignments[roleId]) {
-                                        const crcIds = event.roleAssignments[roleId];
-                                        if (Array.isArray(crcIds)) {
-                                            assignedCrcIds.push(...crcIds.filter(Boolean));
+                        // Check roleAssignments for all assigned CRCs
+                        if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                            Object.values(event.roleAssignments).forEach(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    assignments.forEach(crcId => {
+                                        if (crcId && crcId !== 'SITE_STAFF') {
+                                            const isUnavailable = isCRCUnavailable(crcId, dateStr, event.period || 'Full Day');
+                                            if (!isUnavailable) {
+                                                uniqueCRCs.add(crcId);
+                                            }
                                         }
-                                    }
-                                });
-                                
-                                // Remove duplicates
-                                const uniqueCrcIds = [...new Set(assignedCrcIds)];
-                                
-                                // Site color background
-                                const bgColor = site.color || '#3b82f6';
-                                const textColor = getContrastColor(bgColor);
-                                
-                                gridHtml += `<td class="p-1 text-center border-l dark:border-gray-700 align-top" data-site="${site.id}" data-date="${dateStr}" data-role="${roleId}">`;
-                                
-                                if (uniqueCrcIds.length > 0) {
-                                    // Show assigned staff - role first, then CRC name below
-                                    uniqueCrcIds.forEach((crcId, idx) => {
-                                        const crc = state.crcs.find(c => c.id === crcId);
-                                        const nameDisplay = crc ? crc.name : 'Unknown';
-                                        
-                                        gridHtml += `
-                                            <div class="event-block p-1 text-xs cursor-pointer ${idx > 0 ? 'mt-1' : ''}" 
-                                                     style="background-color: ${bgColor}; color: ${textColor};" 
-                                                     data-action="view-crc-event" 
-                                                     data-event-id="${dayEvents[0]?.id || ''}">
-                                                <div class="font-semibold text-xs leading-tight">${role.name}</div>
-                                                <div class="text-xs leading-tight opacity-90">${nameDisplay}</div>
-                                            </div>
-                                        `;
                                     });
-                                } else {
-                                    // Show blank/empty for unassigned role - show role name with "Needed" or blank indicator
-                                    gridHtml += `
-                                        <div class="event-block p-1 text-xs border-2 border-dashed border-gray-300 dark:border-gray-600" 
-                                                 style="min-height: 24px; background-color: ${bgColor}20;">
-                                            <div class="font-semibold text-xs text-gray-600 dark:text-gray-400">${role.name}</div>
-                                            <div class="text-gray-400 dark:text-gray-500 text-xs">—</div>
-                                        </div>
-                                    `;
+                                }
+                            });
+                        }
+                    });
+                    const openShifts = dayEvents.filter(e => e.type === 'Open Shift').length;
+                    const totalHours = dayEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                    dailyStats[index] = {
+                        totalStaff: uniqueCRCs.size,
+                        openShifts,
+                        totalHours
+                    };
+                });
+
+                const eventsByStudy = filteredEvents.reduce((acc, event) => {
+                    // Only group events that have studyIds assigned
+                    if (event.studyIds && event.studyIds.length > 0) {
+                        event.studyIds.forEach(studyId => {
+                            if (!acc[studyId]) acc[studyId] = [];
+                            acc[studyId].push(event);
+                        });
+                    }
+                    return acc;
+                }, {});
+                
+                let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;"><table class="min-w-full text-xs border-collapse">`;
+                tableHtml += `<thead>`;
+                tableHtml += `<tr class="bg-gray-100 dark:bg-gray-800" style="position: sticky; top: 0; z-index: 21;"><th class="global-view-header global-view-site-header sticky left-0 z-30 bg-gray-100 dark:bg-gray-800 p-2 font-bold">Site / Study</th>`;
+                weekDays.forEach((day, index) => {
+                    const dayName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][index];
+                    tableHtml += `<th class="global-view-header p-2 font-bold text-lg">${dayName} ${day.getDate()}</th>`;
+                });
+                tableHtml += `</tr>`;
+                tableHtml += `<tr class="border-t-2 border-b dark:border-gray-600 bg-gray-50 dark:bg-gray-900/50" style="position: sticky; top: 2.7rem; z-index: 20;"><th class="global-view-header global-view-site-header sticky left-0 z-30 bg-gray-50 dark:bg-gray-900/50 font-semibold p-1">Daily Summary</th>`;
+                weekDays.forEach((day, index) => {
+                    const stats = dailyStats[index];
+                    const openShiftClass = stats.openShifts > 0 ? 'text-red-500 font-bold' : '';
+                    tableHtml += `<td class="p-1 text-center border-l dark:border-gray-700">
+                        <div class="flex items-center justify-center" title="Total Staff Assigned"><i data-lucide="users" class="w-3 h-3 mr-1 text-gray-500"></i>${stats.totalStaff}</div>
+                        <div class="flex items-center justify-center ${openShiftClass}" title="Open Shifts"><i data-lucide="alert-circle" class="w-3 h-3 mr-1"></i>${stats.openShifts}</div>
+                        <div class="flex items-center justify-center" title="Total Hours Scheduled"><i data-lucide="clock" class="w-3 h-3 mr-1 text-gray-500"></i>${stats.totalHours}</div>
+                    </td>`;
+                });
+                tableHtml += `</tr></thead><tbody>`;
+                
+                const sortedStudies = [...state.studies]
+                    .filter(study => eventsByStudy[study.id])
+                    .sort((a,b) => {
+                        const nameA = (a.name || a.title || '').toString();
+                        const nameB = (b.name || b.title || '').toString();
+                        return nameA.localeCompare(nameB);
+                    });
+                
+                sortedStudies.forEach(study => {
+                    const studyEvents = eventsByStudy[study.id];
+                    if (!studyEvents || studyEvents.length === 0) return;
+                    
+                    const studyColor = study.color || (isDarkMode ? '#374151' : '#e5e7eb');
+                    const studyTextColor = getContrastColor(studyColor);
+
+                    tableHtml += `<tr class="border-t-2 dark:border-gray-600"><td colspan="8" class="global-view-study-header p-2" style="background-color: ${studyColor}; color: ${studyTextColor}; position: sticky; top: 6.7rem; z-index: 19;">${study.title || study.name}</td></tr>`;
+
+                    const eventsBySite = studyEvents.reduce((acc, event) => {
+                            const siteId = event.siteId || 'unassigned';
+                        if(!acc[siteId]) acc[siteId] = [];
+                        acc[siteId].push(event);
+                        return acc;
+                    }, {});
+                            
+                    const sortedSiteIds = Object.keys(eventsBySite).sort((a, b) => {
+                        const siteA = state.crc_sites.find(s => s.id === a)?.name || 'zz';
+                        const siteB = state.crc_sites.find(s => s.id === b)?.name || 'zz';
+                        return siteA.localeCompare(siteB);
+                    });
+                    
+                    sortedSiteIds.forEach(siteId => {
+                        const site = state.crc_sites.find(s => s.id === siteId);
+                        const siteName = site ? `${site.name} <span class='font-light text-gray-500'>(${site.city || ''}, ${site.state || ''})</span>` : 'Time Off';
+                        tableHtml += `<tr class="border-t dark:border-gray-700"><td class="global-view-header global-view-site-header sticky left-0 bg-white dark:bg-gray-900 pl-8 font-medium">${siteName}</td>`;
+                        
+                        weekDays.forEach((day, dayIndex) => {
+                            const dateStr = toDateOnlyString(day);
+                            const dayEvents = (eventsBySite[siteId] || []).filter(e => e.date === dateStr);
+                            // Deduplicate events by ID to prevent showing the same event multiple times
+                            const uniqueDayEvents = Array.from(new Map(dayEvents.map(e => [e.id, e])).values());
+                            tableHtml += `<td class="global-view-cell bg-white dark:bg-gray-900 align-top p-1 custom-scrollbar" data-action="open-crc-event-modal" data-date="${dateStr}">`;
+                            
+                            uniqueDayEvents.forEach(event => {
+                                // Get CRCs from both legacy crcId and new roleAssignments
+                                const eventCrcs = getEventCRCs(event);
+                                const primaryCrc = eventCrcs.length > 0 ? eventCrcs[0] : null;
+                                const eventSite = state.crc_sites.find(s => s.id === event.siteId);
+                                const pi = event.principalInvestigator || eventSite?.principalInvestigator;
+                                let eventBgColor = eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
+                                if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
+                                else if (event.type === 'Travel Day') eventBgColor = isDarkMode ? '#431407' : '#fed7aa';
+                                const eventTextColor = getContrastColor(eventBgColor);
+                                const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
+                                const travelText = event.type === 'Travel Day' ? `<span class="font-bold" style="color: ${spanTextColor}">TRAVEL</span><br>` : '';
+                                
+                                // Check role fulfillment
+                                const roleFulfillment = checkRoleFulfillment(event);
+                                const roleIcon = roleFulfillment.fulfilled ? 
+                                    `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
+                                    `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                                
+                                // Build tooltip with missing roles info (only shown on hover/click)
+                                const tooltipParts = [];
+                                if (event.notes) tooltipParts.push(event.notes);
+                                if (!roleFulfillment.fulfilled && roleFulfillment.missingRoles.length > 0) {
+                                    tooltipParts.push(`Missing roles: ${roleFulfillment.missingRoles.join(', ')}`);
+                                }
+                                if (event.visitNumber) tooltipParts.push(`Visit: ${event.visitNumber}`);
+                                if (pi) tooltipParts.push(`PI: ${pi}`);
+                                if (event.period && event.period !== 'Full Day') tooltipParts.push(`Period: ${event.period}`);
+                                const tooltip = tooltipParts.length > 0 ? tooltipParts.join('\n') : '';
+                                
+                                // Build header with visit and group (V1G1 format)
+                                const visitGroupHeader = [];
+                                if (event.visitNumber) visitGroupHeader.push(`V${event.visitNumber}`);
+                                if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
+                                const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join('') + ' - ' : '';
+                                
+                                // Get roles for this event - show role first, then CRC name (without visit header since it's shown separately)
+                                // Use getAllEventRoles to get all roles including empty ones
+                                const allRoles = getAllEventRoles(event);
+                                const roleNames = allRoles.length > 0 ? allRoles : getEventRoles(event);
+                                
+                                // Build display text (site and study removed - shown in table headers)
+                                let displayParts = [];
+                                
+                                // Add roles if available - show only first role or count if multiple
+                                if (roleNames.length > 0) {
+                                    if (roleNames.length === 1) {
+                                        displayParts.push(roleNames[0]);
+                                    } else {
+                                        displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                                    }
                                 }
                                 
-                                gridHtml += `</td>`;
-                            }
-                            
-                            gridHtml += `</tr>`;
-                        }
-                    }
-                }
-                
-                gridHtml += `</tbody>`;
-                gridHtml += `</table>`;
-                gridHtml += `</div>`;
-                
-                return getCalendarHeaderHTML() + gridHtml;
+                                // Add CRC name if available
+                                if (primaryCrc) {
+                                    displayParts.push(primaryCrc.name.split(' ')[0]);
+                                }
+                                
+                                // Build final display text
+                                let displayText = displayParts.length > 0 ? displayParts.join(' - ') : 'Open Shift';
+                                
+                                tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                    ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                    <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                </div>`;
+                            });
+                            tableHtml += `</td>`;
+                        });
+                        tableHtml += `</tr>`;
+                    });
+                });
+
+                tableHtml += `</tbody></table></div>`;
+                return getCalendarHeaderHTML() + tableHtml;
             };
             
             const getRolesViewHTML = () => {
