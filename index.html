@@ -1674,6 +1674,10 @@
             }
 
             const apiService = new ApiService();
+            // Bind methods to ensure 'this' context is preserved
+            apiService.importNavanBookingsRange = apiService.importNavanBookingsRange.bind(apiService);
+            apiService.importNavanBookingsRangeCacheOnly = apiService.importNavanBookingsRangeCacheOnly.bind(apiService);
+            apiService.importNavanBookingsList = apiService.importNavanBookingsList.bind(apiService);
 
             // MSAL Configuration for Entra ID
             let msalInstance = null;
@@ -3574,18 +3578,28 @@
                     }
                 }
                 
-                // Count assigned roles
+                // Count assigned roles (including training roles)
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                         const assignedCount = Array.isArray(assignments) ? assignments.filter(Boolean).length : 0;
+                        const role = state.roles.find(r => r.id === roleId);
+                        if (!role) return;
+                        
+                        // For training roles, show the training role name (e.g., "Training - ICF")
+                        let displayName = role.name;
+                        if (isTrainingRoleName(role.name) && event.trainingAssignments && event.trainingAssignments[roleId]) {
+                            const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                            if (trainingTypes.length > 0) {
+                                displayName = `Training - ${trainingTypes.join(', ')}`;
+                            }
+                        }
+                        
                         if (roleCounts.has(roleId)) {
                             roleCounts.get(roleId).assigned = assignedCount;
+                            roleCounts.get(roleId).name = displayName; // Update display name
                         } else {
                             // Role is assigned but not in requirements - add it
-                            const role = state.roles.find(r => r.id === roleId);
-                            if (role) {
-                                roleCounts.set(roleId, { name: role.name, required: assignedCount, assigned: assignedCount });
-                            }
+                            roleCounts.set(roleId, { name: displayName, required: assignedCount, assigned: assignedCount });
                         }
                     });
                 }
@@ -5567,8 +5581,12 @@
                                 pastDays: 30,
                                 futureDays: futureDays
                             };
+                            if (useBackdoorMode) {
+                                payload30.backdoorMode = true;
+                            }
                             
-                            const result30 = await apiService.importNavanBookingsRange(payload30);
+                            const importFn30 = useBackdoorMode ? apiService.importNavanBookingsRangeCacheOnly : apiService.importNavanBookingsRange;
+                            const result30 = await importFn30(payload30);
                             finalResult = result30;
                             
                             // If successful, try 60 days back
@@ -5579,8 +5597,12 @@
                                     pastDays: 60,
                                     futureDays: futureDays
                                 };
+                                if (useBackdoorMode) {
+                                    payload60.backdoorMode = true;
+                                }
                                 
-                                const result60 = await apiService.importNavanBookingsRange(payload60);
+                                const importFn60 = useBackdoorMode ? apiService.importNavanBookingsRangeCacheOnly : apiService.importNavanBookingsRange;
+                                const result60 = await importFn60(payload60);
                                 finalResult = result60; // Use the 60-day result
                             } catch (error60) {
                                 console.warn('Failed to fetch 60 days, keeping 30-day result:', error60);
@@ -9984,8 +10006,8 @@
                     const dayClass = isToday ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-white dark:bg-gray-800';
                     const todaysEvents = filteredEvents.filter(e => e.date === dateStr);
                     
-                    // Group events by site, study, visit, and split by individual role
-                    // Each role gets its own block showing: visit, role, and CRC title (or count if empty)
+                    // Group events by CRC - each CRC gets their own block showing all their roles
+                    // This ensures that if CRC A and B both have the same roles, they each get separate blocks
                     const roleBlocks = [];
                     const processedEvents = new Set();
                     
@@ -9994,95 +10016,69 @@
                             const site = state.crc_sites.find(s => s.id === event.siteId);
                             const visitNumber = event.visitNumber || '';
                             
-                            // Get all roles for this event (including empty ones)
-                            const allRoles = getAllEventRoles(event);
+                            // NEW APPROACH: Create blocks per CRC (not per role)
+                            // Group by CRC, each CRC gets their own block showing all their roles
+                            const crcRoleMap = new Map(); // Map< crcId, Set<roleName> >
                             
-                            // If no roles found, try to get from roleAssignments
-                            if (allRoles.length === 0 && event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                            // Collect all CRC assignments from roleAssignments
+                            if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                                 Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                                     const role = state.roles.find(r => r.id === roleId);
-                                    if (role) {
-                                        const assignedCount = Array.isArray(assignments) ? assignments.filter(Boolean).length : 0;
-                                        const requiredCount = 1; // Default to 1 if we don't know the requirement
-                                        if (assignedCount === requiredCount) {
-                                            allRoles.push(role.name);
-                                        } else {
-                                            allRoles.push(`${role.name} ${assignedCount}/${requiredCount}`);
+                                    if (!role) return;
+                                    
+                                    // Format role name (handle training roles)
+                                    let roleDisplayName = role.name;
+                                    if (isTrainingRoleName(role.name) && event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                        const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                                        if (trainingTypes.length > 0) {
+                                            roleDisplayName = `Training - ${trainingTypes.join(', ')}`;
                                         }
+                                    }
+                                    
+                                    if (Array.isArray(assignments)) {
+                                        assignments.forEach(crcId => {
+                                            if (crcId) {
+                                                if (!crcRoleMap.has(crcId)) {
+                                                    crcRoleMap.set(crcId, new Set());
+                                                }
+                                                crcRoleMap.get(crcId).add(roleDisplayName);
+                                            }
+                                        });
                                     }
                                 });
                             }
                             
-                            // If still no roles, create a single block without role info
-                            if (allRoles.length === 0) {
-                                const crcNames = [];
-                                if (event.crcId) {
-                                    const crc = state.crcs.find(c => c.id === event.crcId);
-                                    if (crc) crcNames.push(crc.title || crc.name.split(' ')[0]);
+                            // Handle legacy crcId if present
+                            if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                                if (!crcRoleMap.has(event.crcId)) {
+                                    crcRoleMap.set(event.crcId, new Set());
                                 }
-                                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                                    Object.values(event.roleAssignments).forEach(assignments => {
-                                        if (Array.isArray(assignments)) {
-                                            assignments.forEach(crcId => {
-                                                if (crcId && crcId !== 'SITE_STAFF') {
-                                                    const crc = state.crcs.find(c => c.id === crcId);
-                                                    if (crc && !crcNames.includes(crc.title || crc.name.split(' ')[0])) {
-                                                        crcNames.push(crc.title || crc.name.split(' ')[0]);
-                                                    }
-                                                }
-                                            });
+                                // Add roles from legacy roles array if available
+                                if (event.roles && Array.isArray(event.roles)) {
+                                    event.roles.forEach(roleName => {
+                                        if (roleName) {
+                                            crcRoleMap.get(event.crcId).add(roleName);
                                         }
                                     });
                                 }
-                                
-                                const bgColor = site?.color || '#3b82f6';
-                                const textColor = getContrastColor(bgColor);
-                                const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
-                                
-                                roleBlocks.push({
-                                    visit: visitNumber,
-                                    role: '',
-                                    crcTitle: crcNames.length > 0 ? crcNames.join(', ') : '0/1',
-                                    site: site,
-                                    bgColor: bgColor,
-                                    textColor: textColor,
-                                    spanTextColor: spanTextColor,
-                                    event: event
-                                });
-                                processedEvents.add(event.id);
-                            } else {
-                                // Create a separate block for each role
-                                allRoles.forEach(roleDisplay => {
-                                    // Extract role name and count from roleDisplay (e.g., "RoleName" or "RoleName 2/5")
-                                    const roleMatch = roleDisplay.match(/^(.+?)(?:\s+(?:x\d+|[\d/]+))?$/);
-                                    const roleName = roleMatch ? roleMatch[1] : roleDisplay;
-                                    const hasCount = roleDisplay.includes('/') || roleDisplay.includes('x');
+                            }
+                            
+                            // Create a block for each CRC (including Site Staff)
+                            if (crcRoleMap.size > 0) {
+                                crcRoleMap.forEach((roleSet, crcId) => {
+                                    const roles = Array.from(roleSet);
                                     
-                                    // Find the role ID
-                                    const role = state.roles.find(r => r.name === roleName);
-                                    const roleId = role ? role.id : null;
-                                    
-                                    // Get CRCs assigned to this specific role
-                                    const crcTitles = [];
-                                    if (roleId && event.roleAssignments && event.roleAssignments[roleId]) {
-                                        const assignments = event.roleAssignments[roleId];
-                                        if (Array.isArray(assignments)) {
-                                            assignments.forEach(crcId => {
-                                                if (crcId && crcId !== 'SITE_STAFF') {
-                                                    const crc = state.crcs.find(c => c.id === crcId);
-                                                    if (crc) {
-                                                        const title = crc.title || crc.name.split(' ')[0];
-                                                        if (!crcTitles.includes(title)) {
-                                                            crcTitles.push(title);
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        }
+                                    // Get CRC display name (handle Site Staff)
+                                    let crcDisplayName;
+                                    if (crcId === 'SITE_STAFF') {
+                                        crcDisplayName = 'Site Staff';
+                                    } else {
+                                        const crc = state.crcs.find(c => c.id === crcId);
+                                        crcDisplayName = crc ? (crc.title || crc.name.split(' ')[0]) : crcId;
                                     }
                                     
-                                    // If no CRC assigned, show count (e.g., "0/1")
-                                    const displayText = crcTitles.length > 0 ? crcTitles.join(', ') : (hasCount ? roleDisplay.split(' ').slice(1).join(' ') : '0/1');
+                                    // Combine roles for display (e.g., "Doc Tech, MedHx")
+                                    const roleDisplay = roles.length > 0 ? roles.join(', ') : '';
                                     
                                     const bgColor = site?.color || '#3b82f6';
                                     const textColor = getContrastColor(bgColor);
@@ -10090,14 +10086,31 @@
                                     
                                     roleBlocks.push({
                                         visit: visitNumber,
-                                        role: roleName,
-                                        crcTitle: displayText,
+                                        role: roleDisplay,
+                                        crcTitle: crcDisplayName,
                                         site: site,
                                         bgColor: bgColor,
                                         textColor: textColor,
                                         spanTextColor: spanTextColor,
                                         event: event
                                     });
+                                });
+                                processedEvents.add(event.id);
+                            } else {
+                                // No assignments - create empty block
+                                const bgColor = site?.color || '#3b82f6';
+                                const textColor = getContrastColor(bgColor);
+                                const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                
+                                roleBlocks.push({
+                                    visit: visitNumber,
+                                    role: '',
+                                    crcTitle: '0/1',
+                                    site: site,
+                                    bgColor: bgColor,
+                                    textColor: textColor,
+                                    spanTextColor: spanTextColor,
+                                    event: event
                                 });
                                 processedEvents.add(event.id);
                             }
@@ -10302,8 +10315,8 @@
                     const dayClass = isToday ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-white dark:bg-gray-800';
                     const todaysEvents = filteredEvents.filter(e => e.date === dateStr);
                     
-                    // Group events by site, study, visit, and split by individual role
-                    // Each role gets its own block showing: visit, role, and CRC title (or count if empty)
+                    // Group events by CRC - each CRC gets their own block showing all their roles
+                    // This ensures that if CRC A and B both have the same roles, they each get separate blocks
                     const roleBlocks = [];
                     const processedEvents = new Set();
                     
@@ -10312,95 +10325,69 @@
                             const site = state.crc_sites.find(s => s.id === event.siteId);
                             const visitNumber = event.visitNumber || '';
                             
-                            // Get all roles for this event (including empty ones)
-                            const allRoles = getAllEventRoles(event);
+                            // NEW APPROACH: Create blocks per CRC (not per role)
+                            // Group by CRC, each CRC gets their own block showing all their roles
+                            const crcRoleMap = new Map(); // Map< crcId, Set<roleName> >
                             
-                            // If no roles found, try to get from roleAssignments
-                            if (allRoles.length === 0 && event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                            // Collect all CRC assignments from roleAssignments
+                            if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                                 Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                                     const role = state.roles.find(r => r.id === roleId);
-                                    if (role) {
-                                        const assignedCount = Array.isArray(assignments) ? assignments.filter(Boolean).length : 0;
-                                        const requiredCount = 1; // Default to 1 if we don't know the requirement
-                                        if (assignedCount === requiredCount) {
-                                            allRoles.push(role.name);
-                                        } else {
-                                            allRoles.push(`${role.name} ${assignedCount}/${requiredCount}`);
+                                    if (!role) return;
+                                    
+                                    // Format role name (handle training roles)
+                                    let roleDisplayName = role.name;
+                                    if (isTrainingRoleName(role.name) && event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                        const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                                        if (trainingTypes.length > 0) {
+                                            roleDisplayName = `Training - ${trainingTypes.join(', ')}`;
                                         }
+                                    }
+                                    
+                                    if (Array.isArray(assignments)) {
+                                        assignments.forEach(crcId => {
+                                            if (crcId) {
+                                                if (!crcRoleMap.has(crcId)) {
+                                                    crcRoleMap.set(crcId, new Set());
+                                                }
+                                                crcRoleMap.get(crcId).add(roleDisplayName);
+                                            }
+                                        });
                                     }
                                 });
                             }
                             
-                            // If still no roles, create a single block without role info
-                            if (allRoles.length === 0) {
-                                const crcNames = [];
-                                if (event.crcId) {
-                                    const crc = state.crcs.find(c => c.id === event.crcId);
-                                    if (crc) crcNames.push(crc.title || crc.name.split(' ')[0]);
+                            // Handle legacy crcId if present
+                            if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                                if (!crcRoleMap.has(event.crcId)) {
+                                    crcRoleMap.set(event.crcId, new Set());
                                 }
-                                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                                    Object.values(event.roleAssignments).forEach(assignments => {
-                                        if (Array.isArray(assignments)) {
-                                            assignments.forEach(crcId => {
-                                                if (crcId && crcId !== 'SITE_STAFF') {
-                                                    const crc = state.crcs.find(c => c.id === crcId);
-                                                    if (crc && !crcNames.includes(crc.title || crc.name.split(' ')[0])) {
-                                                        crcNames.push(crc.title || crc.name.split(' ')[0]);
-                                                    }
-                                                }
-                                            });
+                                // Add roles from legacy roles array if available
+                                if (event.roles && Array.isArray(event.roles)) {
+                                    event.roles.forEach(roleName => {
+                                        if (roleName) {
+                                            crcRoleMap.get(event.crcId).add(roleName);
                                         }
                                     });
                                 }
-                                
-                                const bgColor = site?.color || '#3b82f6';
-                                const textColor = getContrastColor(bgColor);
-                                const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
-                                
-                                roleBlocks.push({
-                                    visit: visitNumber,
-                                    role: '',
-                                    crcTitle: crcNames.length > 0 ? crcNames.join(', ') : '0/1',
-                                    site: site,
-                                    bgColor: bgColor,
-                                    textColor: textColor,
-                                    spanTextColor: spanTextColor,
-                                    event: event
-                                });
-                                processedEvents.add(event.id);
-                            } else {
-                                // Create a separate block for each role
-                                allRoles.forEach(roleDisplay => {
-                                    // Extract role name and count from roleDisplay (e.g., "RoleName" or "RoleName 2/5")
-                                    const roleMatch = roleDisplay.match(/^(.+?)(?:\s+(?:x\d+|[\d/]+))?$/);
-                                    const roleName = roleMatch ? roleMatch[1] : roleDisplay;
-                                    const hasCount = roleDisplay.includes('/') || roleDisplay.includes('x');
+                            }
+                            
+                            // Create a block for each CRC (including Site Staff)
+                            if (crcRoleMap.size > 0) {
+                                crcRoleMap.forEach((roleSet, crcId) => {
+                                    const roles = Array.from(roleSet);
                                     
-                                    // Find the role ID
-                                    const role = state.roles.find(r => r.name === roleName);
-                                    const roleId = role ? role.id : null;
-                                    
-                                    // Get CRCs assigned to this specific role
-                                    const crcTitles = [];
-                                    if (roleId && event.roleAssignments && event.roleAssignments[roleId]) {
-                                        const assignments = event.roleAssignments[roleId];
-                                        if (Array.isArray(assignments)) {
-                                            assignments.forEach(crcId => {
-                                                if (crcId && crcId !== 'SITE_STAFF') {
-                                                    const crc = state.crcs.find(c => c.id === crcId);
-                                                    if (crc) {
-                                                        const title = crc.title || crc.name.split(' ')[0];
-                                                        if (!crcTitles.includes(title)) {
-                                                            crcTitles.push(title);
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        }
+                                    // Get CRC display name (handle Site Staff)
+                                    let crcDisplayName;
+                                    if (crcId === 'SITE_STAFF') {
+                                        crcDisplayName = 'Site Staff';
+                                    } else {
+                                        const crc = state.crcs.find(c => c.id === crcId);
+                                        crcDisplayName = crc ? (crc.title || crc.name.split(' ')[0]) : crcId;
                                     }
                                     
-                                    // If no CRC assigned, show count (e.g., "0/1")
-                                    const displayText = crcTitles.length > 0 ? crcTitles.join(', ') : (hasCount ? roleDisplay.split(' ').slice(1).join(' ') : '0/1');
+                                    // Combine roles for display (e.g., "Doc Tech, MedHx")
+                                    const roleDisplay = roles.length > 0 ? roles.join(', ') : '';
                                     
                                     const bgColor = site?.color || '#3b82f6';
                                     const textColor = getContrastColor(bgColor);
@@ -10408,14 +10395,31 @@
                                     
                                     roleBlocks.push({
                                         visit: visitNumber,
-                                        role: roleName,
-                                        crcTitle: displayText,
+                                        role: roleDisplay,
+                                        crcTitle: crcDisplayName,
                                         site: site,
                                         bgColor: bgColor,
                                         textColor: textColor,
                                         spanTextColor: spanTextColor,
                                         event: event
                                     });
+                                });
+                                processedEvents.add(event.id);
+                            } else {
+                                // No assignments - create empty block
+                                const bgColor = site?.color || '#3b82f6';
+                                const textColor = getContrastColor(bgColor);
+                                const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                
+                                roleBlocks.push({
+                                    visit: visitNumber,
+                                    role: '',
+                                    crcTitle: '0/1',
+                                    site: site,
+                                    bgColor: bgColor,
+                                    textColor: textColor,
+                                    spanTextColor: spanTextColor,
+                                    event: event
                                 });
                                 processedEvents.add(event.id);
                             }
@@ -26997,6 +27001,52 @@
             };
 
             // New function to handle study/site selection for shift creation
+            // Helper function to collect current role assignments from form before regenerating
+            const collectCurrentFormRoleAssignments = (form) => {
+                const currentRoleAssignments = {};
+                const currentTrainingAssignments = {};
+                
+                // Collect all role assignment inputs
+                const roleInputs = form.querySelectorAll('select[name^="role-"]');
+                roleInputs.forEach(input => {
+                    const parts = input.name.split('-').slice(1);
+                    if (parts.length >= 2) {
+                        const roleId = parts[0];
+                        const index = parseInt(parts[1], 10);
+                        if (Number.isFinite(index)) {
+                            if (!currentRoleAssignments[roleId]) {
+                                currentRoleAssignments[roleId] = [];
+                            }
+                            while (currentRoleAssignments[roleId].length <= index) {
+                                currentRoleAssignments[roleId].push(null);
+                            }
+                            currentRoleAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
+                        }
+                    }
+                });
+                
+                // Collect training assignments
+                const trainingInputs = form.querySelectorAll('select[name^="trainingType-"]');
+                trainingInputs.forEach(input => {
+                    const parts = input.name.split('-').slice(1);
+                    if (parts.length >= 3) {
+                        const roleId = parts[0];
+                        const index = parseInt(parts[2], 10);
+                        if (Number.isFinite(index)) {
+                            if (!currentTrainingAssignments[roleId]) {
+                                currentTrainingAssignments[roleId] = [];
+                            }
+                            while (currentTrainingAssignments[roleId].length <= index) {
+                                currentTrainingAssignments[roleId].push(null);
+                            }
+                            currentTrainingAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
+                        }
+                    }
+                });
+                
+                return { currentRoleAssignments, currentTrainingAssignments };
+            };
+
             const handleShiftStudySiteSelection = async () => {
                 console.log('handleShiftStudySiteSelection called');
                 const studySelect = document.querySelector('select[name="studyIds"]');
@@ -27026,6 +27076,24 @@
                 // Check if we're editing an existing event
                 const isEditing = form && form.dataset.eventId;
                 const existingEvent = isEditing ? state.crc_events.find(e => e.id === form.dataset.eventId) : null;
+                
+                // IMPORTANT: Collect current form state BEFORE regenerating to preserve user changes
+                const { currentRoleAssignments, currentTrainingAssignments } = collectCurrentFormRoleAssignments(form);
+                console.log('Current form role assignments:', currentRoleAssignments);
+                console.log('Current form training assignments:', currentTrainingAssignments);
+                
+                // Merge current form state with existing event data (form state takes precedence)
+                const mergedRoleAssignments = existingEvent?.roleAssignments ? { ...existingEvent.roleAssignments } : {};
+                const mergedTrainingAssignments = existingEvent?.trainingAssignments ? { ...existingEvent.trainingAssignments } : {};
+                
+                // Override with current form state (preserves unsaved changes)
+                Object.keys(currentRoleAssignments).forEach(roleId => {
+                    mergedRoleAssignments[roleId] = currentRoleAssignments[roleId];
+                });
+                Object.keys(currentTrainingAssignments).forEach(roleId => {
+                    mergedTrainingAssignments[roleId] = currentTrainingAssignments[roleId];
+                });
+                
                 console.log('Is editing:', isEditing, 'Existing event:', existingEvent);
                 if (existingEvent) {
                     console.log('Event roleAssignments:', existingEvent.roleAssignments);
@@ -27138,14 +27206,15 @@
                 
                 if (selectedStudyIds.length === 0 || !selectedSiteId) {
                     // If editing and we have existing role assignments, show them even without study/site selection
-                    if (isEditing && existingEvent) {
-                        // Check for new roleAssignments structure first
-                        if (existingEvent.roleAssignments && Object.keys(existingEvent.roleAssignments).length > 0) {
-                            console.log('Editing mode: showing existing role assignments (new structure)');
+                    if (isEditing && (existingEvent || Object.keys(mergedRoleAssignments).length > 0)) {
+                        // Check for new roleAssignments structure first - use merged data to preserve form state
+                        const roleAssignmentsToShow = Object.keys(mergedRoleAssignments).length > 0 ? mergedRoleAssignments : (existingEvent?.roleAssignments || {});
+                        if (Object.keys(roleAssignmentsToShow).length > 0) {
+                            console.log('Editing mode: showing existing role assignments (new structure, with form state preserved)');
                             let roleAssignmentHTML = '<div class="space-y-4">';
                             roleAssignmentHTML += '<p class="text-sm text-blue-600 dark:text-blue-400 mb-4">Current role assignments:</p>';
                             
-                            Object.entries(existingEvent.roleAssignments).forEach(([roleId, assignments]) => {
+                            Object.entries(roleAssignmentsToShow).forEach(([roleId, assignments]) => {
                                 const role = state.roles.find(r => r.id === roleId);
                                 if (!role) return;
                                 
@@ -27161,7 +27230,8 @@
                                                 // Only show CRCs who have valid training for this role
                                                 const qualifiedCrcs = state.crcs.filter(c => hasValidTraining(c, roleName))
                                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                                                const trainingTypeValue = getExistingTrainingType(roleId, index);
+                                                // Get training type from merged data (form state takes precedence)
+                                                const trainingTypeValue = (mergedTrainingAssignments[roleId] && mergedTrainingAssignments[roleId][index]) || getExistingTrainingType(roleId, index);
                                                 const trainingTypeBlock = isTrainingRoleName(roleName) ? buildTrainingTypeSelect(roleId, index, trainingTypeValue) : '';
                                                 
                                                 return `
@@ -27197,8 +27267,8 @@
                             roleAssignmentHTML += '</div>';
                             roleAssignmentContainer.innerHTML = roleAssignmentHTML;
                             
-                            // Explicitly set select values to ensure existing assignments are displayed
-                            Object.entries(existingEvent.roleAssignments).forEach(([roleId, assignments]) => {
+                            // Explicitly set select values to ensure existing assignments are displayed (use merged data)
+                            Object.entries(roleAssignmentsToShow).forEach(([roleId, assignments]) => {
                                 assignments.forEach((crcId, index) => {
                                     if (crcId) {
                                         const select = roleAssignmentContainer.querySelector(`select[name="role-${roleId}-${index}"]`);
