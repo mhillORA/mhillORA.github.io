@@ -1720,7 +1720,7 @@
                 selectedCrcForUnavailability: null,
                 calendarView: 'planning-grid', // 'month', 'week', or 'planning-grid'
                 calendarDisplayMode: 'employee', // 'employee', 'study', 'site', 'at-a-glance', 'world', 'travel'
-                planningGridMode: 'monthly', // 'monthly' or 'weekly' for planning grid view
+                planningGridMode: 'monthly', // 'monthly', 'weekly', or 'daily' for planning grid view
                 atAGlanceGroupBy: 'study', // 'study' or 'site'
                 // --- FIX: Corrected syntax error from original file ---
                 activeTab: 'scheduler', // Can be 'scheduler', 'dashboard', 'reporting', 'training', or 'trucks'
@@ -9164,8 +9164,10 @@
                     } else if (state.calendarDisplayMode === 'travel') {
                         container.innerHTML = getTravelViewHTML();
                     } else {
-                        // Use planning grid mode to determine monthly vs weekly view
-                        if (state.planningGridMode === 'weekly') {
+                        // Use planning grid mode to determine monthly vs weekly vs daily view
+                        if (state.planningGridMode === 'daily') {
+                            container.innerHTML = getDailyPlanningGridHTML();
+                        } else if (state.planningGridMode === 'weekly') {
                             container.innerHTML = getWeeklyPlanningGridHTML();
                         } else {
                             container.innerHTML = getGlobalViewDetailedHTML();
@@ -9183,11 +9185,19 @@
                 const monthName = now.toLocaleString('default', { month: 'long', year: 'numeric' });
                 const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - getDaySaturdayStart(now));
                 const weekName = `Week of ${startOfWeek.toLocaleDateString('en-US', {month: 'long', day: 'numeric'})}`;
+                const dayName = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
                 
                 let title;
                 if (state.calendarView === 'week') title = weekName;
-                else if (state.calendarView === 'planning-grid') title = `Planning Grid - ${monthName}`;
-                else if (state.calendarView === 'roles') title = `Roles View - ${weekName}`;
+                else if (state.calendarView === 'planning-grid') {
+                    if (state.planningGridMode === 'daily') {
+                        title = `Planning Grid - ${dayName}`;
+                    } else if (state.planningGridMode === 'weekly') {
+                        title = `Planning Grid - ${weekName}`;
+                    } else {
+                        title = `Planning Grid - ${monthName}`;
+                    }
+                } else if (state.calendarView === 'roles') title = `Roles View - ${weekName}`;
                 else if (state.calendarView === 'total-view') title = `Total View - ${monthName}`;
                 else title = monthName;
                 
@@ -9224,7 +9234,8 @@
                                     <button data-action="set-view" data-view="planning-grid" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'planning-grid' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Planning Grid</button>
                                     ${state.calendarView === 'planning-grid' ? `
                                         <button data-action="set-planning-grid-mode" data-mode="monthly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'monthly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Monthly</button>
-                                        <button data-action="set-planning-grid-mode" data-mode="weekly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'weekly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Weekly</button>
+                                        <button data-action="set-planning-grid-mode" data-mode="weekly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'weekly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Weekly</button>
+                                        <button data-action="set-planning-grid-mode" data-mode="daily" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'daily' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Daily</button>
                                     ` : ''}
                                 </div>
                                 <div class="flex items-center rounded-md border dark:border-gray-600 overflow-x-auto">
@@ -11023,6 +11034,270 @@
                             });
                             tableHtml += `</td>`;
                         });
+                        tableHtml += `</tr>`;
+                    });
+                });
+
+                tableHtml += `</tbody></table></div>`;
+                return getCalendarHeaderHTML() + tableHtml;
+            };
+
+            const getDailyPlanningGridHTML = () => {
+                // Same format as weekly/monthly planning grid, but only showing 1 day
+                const now = state.crcCalendarDate;
+                const day = new Date(now);
+                day.setHours(0, 0, 0, 0);
+                const isDarkMode = document.documentElement.classList.contains('dark');
+                
+                // Check if CRC user - filter to only their events
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const matchingCrcId = getLoggedInCrcId();
+
+                let crcsToDisplay = state.crcs;
+                
+                // For CRC users, only show themselves
+                if (isCRCUser && matchingCrcId) {
+                    crcsToDisplay = [state.crcs.find(c => c.id === matchingCrcId)].filter(Boolean);
+                } else {
+                    if (state.selectedEmploymentTypeFilter !== 'all') {
+                        crcsToDisplay = crcsToDisplay.filter(c => normalizeEmploymentType(c.employmentType) === state.selectedEmploymentTypeFilter);
+                    }
+                }
+                const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
+                
+                const dateStr = toDateOnlyString(day);
+                
+                // Filter events for the single day
+                let filteredEvents = state.crc_events.filter(e => e.date === dateStr);
+
+                // For CRC users, ONLY show their events (check both crcId and roleAssignments)
+                if (isCRCUser && matchingCrcId) {
+                    const beforeFilter = filteredEvents.length;
+                    filteredEvents = filteredEvents.filter(e => {
+                        const belongs = eventBelongsToCrc(e, matchingCrcId);
+                        if (belongs) {
+                            console.log('Event belongs to CRC:', {
+                                eventId: e.id,
+                                date: e.date,
+                                type: e.type,
+                                crcId: e.crcId,
+                                hasRoleAssignments: !!(e.roleAssignments && Object.keys(e.roleAssignments).length > 0),
+                                matchingCrcId: matchingCrcId
+                            });
+                        }
+                        return belongs;
+                    });
+                    console.log(`CRC filter: ${beforeFilter} events before, ${filteredEvents.length} events after for CRC ID: ${matchingCrcId}`);
+                } else {
+                    if (state.selectedCrcFilter !== 'all') {
+                        filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.selectedCrcFilter));
+                    } else {
+                         filteredEvents = filteredEvents.filter(e => {
+                             // Include events with no CRC assigned OR events where any assigned CRC is in the display list
+                             if (!e.crcId && (!e.roleAssignments || Object.keys(e.roleAssignments).length === 0)) {
+                                 return true; // Unassigned events
+                             }
+                             // Check if any CRC assigned to this event is in the display list
+                             const eventCrcs = getEventCRCs(e);
+                             return eventCrcs.length === 0 || eventCrcs.some(crc => crcIdsToDisplay.includes(crc.id));
+                         });
+                    }
+                }
+                if (state.selectedSiteFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
+                }
+                if (state.selectedRegionFilter !== 'all') {
+                    const crcsInRegion = state.crcs.filter(c => c.region === state.selectedRegionFilter).map(c => c.id);
+                    filteredEvents = filteredEvents.filter(e => {
+                        // Check legacy crcId
+                        if (e.crcId && crcsInRegion.includes(e.crcId)) return true;
+                        // Check roleAssignments
+                        if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
+                            return Object.values(e.roleAssignments).some(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    return assignments.some(crcId => crcsInRegion.includes(crcId));
+                                }
+                                return false;
+                            });
+                        }
+                        return false;
+                    });
+                }
+                if (state.selectedEventTypeFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.type === state.selectedEventTypeFilter);
+                }
+
+                // Calculate daily stats
+                const dayEvents = filteredEvents;
+                const uniqueCRCs = new Set();
+                dayEvents.forEach(event => {
+                    // Check legacy crcId
+                    if (event.crcId) {
+                        const isUnavailable = isCRCUnavailable(event.crcId, dateStr, event.period || 'Full Day');
+                        if (!isUnavailable) {
+                            uniqueCRCs.add(event.crcId);
+                        }
+                    }
+                    // Check roleAssignments for all assigned CRCs
+                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                        Object.values(event.roleAssignments).forEach(assignments => {
+                            if (Array.isArray(assignments)) {
+                                assignments.forEach(crcId => {
+                                    if (crcId && crcId !== 'SITE_STAFF') {
+                                        const isUnavailable = isCRCUnavailable(crcId, dateStr, event.period || 'Full Day');
+                                        if (!isUnavailable) {
+                                            uniqueCRCs.add(crcId);
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+                const openShifts = dayEvents.filter(e => e.type === 'Open Shift').length;
+                const totalHours = dayEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                const dailyStats = {
+                    totalStaff: uniqueCRCs.size,
+                    openShifts,
+                    totalHours
+                };
+
+                const eventsByStudy = filteredEvents.reduce((acc, event) => {
+                    // Only group events that have studyIds assigned
+                    if (event.studyIds && event.studyIds.length > 0) {
+                        event.studyIds.forEach(studyId => {
+                            if (!acc[studyId]) acc[studyId] = [];
+                            acc[studyId].push(event);
+                        });
+                    }
+                    return acc;
+                }, {});
+                
+                const dayName = day.toLocaleDateString('en-US', { weekday: 'long' });
+                const dayDate = day.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+                
+                let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;"><table class="min-w-full text-xs border-collapse">`;
+                tableHtml += `<thead>`;
+                tableHtml += `<tr class="bg-gray-100 dark:bg-gray-800" style="position: sticky; top: 0; z-index: 21;"><th class="global-view-header global-view-site-header sticky left-0 z-30 bg-gray-100 dark:bg-gray-800 p-2 font-bold">Site / Study</th>`;
+                tableHtml += `<th class="global-view-header p-2 font-bold text-lg">${dayName} ${day.getDate()}</th>`;
+                tableHtml += `</tr>`;
+                tableHtml += `<tr class="border-t-2 border-b dark:border-gray-600 bg-gray-50 dark:bg-gray-900/50" style="position: sticky; top: 2.7rem; z-index: 20;"><th class="global-view-header global-view-site-header sticky left-0 z-30 bg-gray-50 dark:bg-gray-900/50 font-semibold p-1">Daily Summary</th>`;
+                const openShiftClass = dailyStats.openShifts > 0 ? 'text-red-500 font-bold' : '';
+                tableHtml += `<td class="p-1 text-center border-l dark:border-gray-700">
+                    <div class="flex items-center justify-center" title="Total Staff Assigned"><i data-lucide="users" class="w-3 h-3 mr-1 text-gray-500"></i>${dailyStats.totalStaff}</div>
+                    <div class="flex items-center justify-center ${openShiftClass}" title="Open Shifts"><i data-lucide="alert-circle" class="w-3 h-3 mr-1"></i>${dailyStats.openShifts}</div>
+                    <div class="flex items-center justify-center" title="Total Hours Scheduled"><i data-lucide="clock" class="w-3 h-3 mr-1 text-gray-500"></i>${dailyStats.totalHours}</div>
+                </td>`;
+                tableHtml += `</tr></thead><tbody>`;
+                
+                const sortedStudies = [...state.studies]
+                    .filter(study => eventsByStudy[study.id])
+                    .sort((a,b) => {
+                        const nameA = (a.name || a.title || '').toString();
+                        const nameB = (b.name || b.title || '').toString();
+                        return nameA.localeCompare(nameB);
+                    });
+                
+                sortedStudies.forEach(study => {
+                    const studyEvents = eventsByStudy[study.id];
+                    if (!studyEvents || studyEvents.length === 0) return;
+                    
+                    const studyColor = study.color || (isDarkMode ? '#374151' : '#e5e7eb');
+                    const studyTextColor = getContrastColor(studyColor);
+
+                    tableHtml += `<tr class="border-t-2 dark:border-gray-600"><td colspan="2" class="global-view-study-header p-2" style="background-color: ${studyColor}; color: ${studyTextColor}; position: sticky; top: 6.7rem; z-index: 19;">${study.title || study.name}</td></tr>`;
+
+                    const eventsBySite = studyEvents.reduce((acc, event) => {
+                            const siteId = event.siteId || 'unassigned';
+                        if(!acc[siteId]) acc[siteId] = [];
+                        acc[siteId].push(event);
+                        return acc;
+                    }, {});
+                            
+                    const sortedSiteIds = Object.keys(eventsBySite).sort((a, b) => {
+                        const siteA = state.crc_sites.find(s => s.id === a)?.name || 'zz';
+                        const siteB = state.crc_sites.find(s => s.id === b)?.name || 'zz';
+                        return siteA.localeCompare(siteB);
+                    });
+                    
+                    sortedSiteIds.forEach(siteId => {
+                        const site = state.crc_sites.find(s => s.id === siteId);
+                        const siteName = site ? `${site.name} <span class='font-light text-gray-500'>(${site.city || ''}, ${site.state || ''})</span>` : 'Time Off';
+                        tableHtml += `<tr class="border-t dark:border-gray-700"><td class="global-view-header global-view-site-header sticky left-0 bg-white dark:bg-gray-900 pl-8 font-medium">${siteName}</td>`;
+                        
+                        const dayEvents = (eventsBySite[siteId] || []).filter(e => e.date === dateStr);
+                        // Deduplicate events by ID to prevent showing the same event multiple times
+                        const uniqueDayEvents = Array.from(new Map(dayEvents.map(e => [e.id, e])).values());
+                        tableHtml += `<td class="global-view-cell bg-white dark:bg-gray-900 align-top p-1 custom-scrollbar" data-action="open-crc-event-modal" data-date="${dateStr}">`;
+                        
+                        uniqueDayEvents.forEach(event => {
+                            // Get CRCs from both legacy crcId and new roleAssignments
+                            const eventCrcs = getEventCRCs(event);
+                            const primaryCrc = eventCrcs.length > 0 ? eventCrcs[0] : null;
+                            const eventSite = state.crc_sites.find(s => s.id === event.siteId);
+                            const pi = event.principalInvestigator || eventSite?.principalInvestigator;
+                            let eventBgColor = eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
+                            if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
+                            else if (event.type === 'Travel Day') eventBgColor = isDarkMode ? '#431407' : '#fed7aa';
+                            const eventTextColor = getContrastColor(eventBgColor);
+                            const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                            const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
+                            const travelText = event.type === 'Travel Day' ? `<span class="font-bold" style="color: ${spanTextColor}">TRAVEL</span><br>` : '';
+                            
+                            // Check role fulfillment
+                            const roleFulfillment = checkRoleFulfillment(event);
+                            const roleIcon = roleFulfillment.fulfilled ? 
+                                `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
+                                `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                            
+                            // Build tooltip with missing roles info (only shown on hover/click)
+                            const tooltipParts = [];
+                            if (event.notes) tooltipParts.push(event.notes);
+                            if (!roleFulfillment.fulfilled && roleFulfillment.missingRoles.length > 0) {
+                                tooltipParts.push(`Missing roles: ${roleFulfillment.missingRoles.join(', ')}`);
+                            }
+                            if (event.visitNumber) tooltipParts.push(`Visit: ${event.visitNumber}`);
+                            if (pi) tooltipParts.push(`PI: ${pi}`);
+                            if (event.period && event.period !== 'Full Day') tooltipParts.push(`Period: ${event.period}`);
+                            const tooltip = tooltipParts.length > 0 ? tooltipParts.join('\n') : '';
+                            
+                            // Build header with visit and group (V1G1 format)
+                            const visitGroupHeader = [];
+                            if (event.visitNumber) visitGroupHeader.push(`V${event.visitNumber}`);
+                            if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
+                            const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join('') + ' - ' : '';
+                            
+                            // Get roles for this event - show role first, then CRC name (without visit header since it's shown separately)
+                            // Use getAllEventRoles to get all roles including empty ones
+                            const allRoles = getAllEventRoles(event);
+                            const roleNames = allRoles.length > 0 ? allRoles : getEventRoles(event);
+                            
+                            // Build display text (site and study removed - shown in table headers)
+                            let displayParts = [];
+                            
+                            // Add roles if available - show only first role or count if multiple
+                            if (roleNames.length > 0) {
+                                if (roleNames.length === 1) {
+                                    displayParts.push(roleNames[0]);
+                                } else {
+                                    displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                                }
+                            }
+                            
+                            // Add CRC name if available
+                            if (primaryCrc) {
+                                displayParts.push(primaryCrc.name.split(' ')[0]);
+                            }
+                            
+                            // Build final display text
+                            let displayText = displayParts.length > 0 ? displayParts.join(' - ') : 'Open Shift';
+                            
+                            tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                            </div>`;
+                        });
+                        tableHtml += `</td>`;
                         tableHtml += `</tr>`;
                     });
                 });
