@@ -4024,3 +4024,244 @@ app.http('navanImport', {
         }
     }
 });
+
+// =================================================================================
+// AUTOMATIC NAVAN IMPORT (Timer Trigger)
+// =================================================================================
+// This timer automatically syncs Navan bookings on a schedule
+// Runs every 6 hours (at :00 minutes past the hour)
+// You can adjust the schedule by changing the CRON expression:
+// - "0 */6 * * *" = every 6 hours
+// - "0 0 * * *" = daily at midnight
+// - "0 */12 * * *" = every 12 hours
+// - "0 0 */1 * *" = daily at midnight
+app.timer('navanAutoImport', {
+    schedule: '0 */6 * * *', // Every 6 hours
+    handler: async (myTimer, context) => {
+        ensureContextLogger(context);
+        context.log.info('navanAutoImport: Timer triggered - Starting automatic Navan import');
+        
+        const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
+        
+        let summary = {
+            importType: 'range',
+            totals: {
+                fetched: 0,
+                processed: 0,
+                created: 0,
+                updated: 0,
+                skipped: 0
+            },
+            skippedBookings: [],
+            errors: []
+        };
+        
+        try {
+            // Use default date range: 30 days past, 180 days future (6 months)
+            const pastDays = 30;
+            const futureDays = 180;
+            
+            context.log.info(`navanAutoImport: Using default date range - pastDays=${pastDays}, futureDays=${futureDays}`);
+            
+            // 1. Authenticate with Navan
+            context.log.info('navanAutoImport: Step 1 - Authenticating with Navan');
+            let tokenResult;
+            try {
+                tokenResult = await fetchNavanAccessToken(context);
+            } catch (tokenError) {
+                context.log.error('navanAutoImport: Error fetching Navan access token:', tokenError);
+                summary.errors.push({
+                    message: `Failed to fetch Navan access token: ${tokenError.message}`,
+                    type: 'Token fetch error'
+                });
+                context.log.error('navanAutoImport: Automatic import failed - authentication error');
+                return;
+            }
+            
+            if (!tokenResult.success || !tokenResult.accessToken) {
+                context.log.error('navanAutoImport: Authentication failed or no token received');
+                summary.errors.push({
+                    message: tokenResult.response?.jsonBody?.detail || 'Failed to authenticate with Navan',
+                    type: 'Authentication error'
+                });
+                context.log.error('navanAutoImport: Automatic import failed - authentication failed');
+                return;
+            }
+            
+            const accessToken = tokenResult.accessToken;
+            const tokenType = tokenResult.tokenType || 'Bearer';
+            context.log.info(`navanAutoImport: Access token received. Token length: ${accessToken.length}`);
+            
+            // 2. Load CRC list for matching
+            context.log.info('navanAutoImport: Step 2 - Loading CRCs');
+            let crcList;
+            try {
+                crcList = await loadAllCrcs(context);
+                context.log.info(`navanAutoImport: Loaded ${crcList?.length || 0} CRC records`);
+            } catch (crcError) {
+                context.log.error('navanAutoImport: Error loading CRC list:', crcError);
+                summary.errors.push({
+                    message: `Failed to load CRC list: ${crcError.message}`,
+                    type: 'CRC load error'
+                });
+                crcList = [];
+            }
+            const crcResolver = buildCrcResolver(crcList);
+            
+            // 3. Calculate date range
+            const normalized = normalizeNavanDateRange(pastDays, futureDays);
+            const createdFrom = normalized.createdFrom;
+            const createdTo = normalized.createdTo;
+            summary.range = { createdFrom, createdTo, pastDays, futureDays };
+            
+            const dateRangeDays = Math.ceil((createdTo - createdFrom) / (24 * 60 * 60));
+            context.log.info(`navanAutoImport: Fetching range ${new Date(createdFrom * 1000).toISOString()} to ${new Date(createdTo * 1000).toISOString()} (${dateRangeDays} days)`);
+            
+            // 4. Fetch bookings
+            let bookings = [];
+            try {
+                const pageSize = 50;
+                const maxPages = 100;
+                
+                context.log.info(`navanAutoImport: Fetching bookings with pageSize=${pageSize}, maxPages=${maxPages}`);
+                
+                bookings = await fetchNavanBookingsInRange(context, accessToken, { 
+                    createdFrom, 
+                    createdTo,
+                    pageSize: pageSize,
+                    maxPages: maxPages
+                }, tokenType);
+                
+                context.log.info(`navanAutoImport: Fetched ${bookings?.length || 0} bookings`);
+            } catch (fetchError) {
+                context.log.error('navanAutoImport: Fetch error:', fetchError);
+                summary.errors.push({
+                    message: `Failed to fetch bookings from Navan: ${fetchError.message}`,
+                    type: 'Fetch error'
+                });
+                context.log.error('navanAutoImport: Automatic import failed - fetch error');
+                return;
+            }
+            
+            summary.totals.fetched = bookings?.length || 0;
+            
+            // 5. Process bookings in batches
+            const BATCH_SIZE = 20;
+            const totalBookings = bookings.length;
+            context.log.info(`navanAutoImport: Processing ${totalBookings} bookings in batches of ${BATCH_SIZE}`);
+            
+            const startTime = Date.now();
+            const MAX_EXECUTION_TIME_MS = 8 * 60 * 1000; // 8 minutes max for timer (Azure Functions timers can run longer)
+            
+            const processedKeys = new Set();
+            let processedCount = 0;
+            let batchNumber = 0;
+            let offset = 0;
+            
+            while (offset < totalBookings) {
+                const elapsed = Date.now() - startTime;
+                const timeRemaining = MAX_EXECUTION_TIME_MS - elapsed;
+                
+                // Stop early if we're running low on time
+                if (timeRemaining < 30000) {
+                    context.log.warn(`navanAutoImport: Approaching timeout limit. Processed ${processedCount}/${totalBookings} bookings. Stopping to return partial results.`);
+                    summary.errors.push({
+                        message: `Processing stopped due to timeout limit. Processed ${processedCount} of ${totalBookings} bookings. Remaining bookings will be processed on next sync.`,
+                        type: 'Timeout warning',
+                        processed: processedCount,
+                        total: totalBookings
+                    });
+                    break;
+                }
+                
+                batchNumber++;
+                const batchEnd = Math.min(offset + BATCH_SIZE, totalBookings);
+                const batch = bookings.slice(offset, batchEnd);
+                
+                context.log.info(`navanAutoImport: Processing batch ${batchNumber} (bookings ${offset + 1}-${batchEnd} of ${totalBookings})`);
+                
+                for (const booking of batch) {
+                    const key = booking.uuid || booking.bookingId;
+                    if (!key || processedKeys.has(key)) {
+                        continue;
+                    }
+                    processedKeys.add(key);
+                    processedCount++;
+                    
+                    if (processedCount % 50 === 0) {
+                        context.log.info(`navanAutoImport: Processed ${processedCount}/${totalBookings} bookings...`);
+                    }
+                    
+                    try {
+                        const importResult = await upsertNavanBooking(context, booking, {
+                            bookingId: booking.bookingId,
+                            bookingUuid: booking.uuid,
+                            readOnly: false,
+                            crcResolver,
+                            allowFallbackCrc: false
+                        });
+                        
+                        if (importResult.skipped) {
+                            summary.totals.skipped += 1;
+                            summary.skippedBookings.push({
+                                bookingId: booking.bookingId,
+                                bookingUuid: booking.uuid,
+                                travelerName: booking?.passengers?.[0]?.person?.name || null,
+                                reason: importResult.reason || 'CRC match not found'
+                            });
+                            continue;
+                        }
+                        
+                        summary.totals.processed += 1;
+                        if (importResult.action === 'created') {
+                            summary.totals.created += 1;
+                        } else if (importResult.action === 'updated') {
+                            summary.totals.updated += 1;
+                        }
+                    } catch (saveError) {
+                        const errorMsg = saveError.message;
+                        summary.errors.push({
+                            bookingId: booking.bookingId,
+                            bookingUuid: booking.uuid,
+                            message: errorMsg
+                        });
+                        
+                        if (errorMsg.includes('container not found') || errorMsg.includes('DATABASE_ERROR')) {
+                            context.log.error('navanAutoImport: Critical database error - aborting');
+                            return;
+                        }
+                        
+                        context.log.warn(`navanAutoImport: Failed to save booking ${booking.bookingId || booking.uuid}: ${errorMsg}. Continuing...`);
+                    }
+                }
+                
+                offset = batchEnd;
+                context.log.info(`navanAutoImport: Batch ${batchNumber} completed. Processed ${processedCount}/${totalBookings} bookings so far.`);
+                
+                if (offset < totalBookings) {
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+            }
+            
+            const endTime = Date.now();
+            const durationSeconds = ((endTime - startTime) / 1000).toFixed(2);
+            context.log.info(`navanAutoImport: Automatic import completed. Total processed: ${processedCount}/${totalBookings} bookings in ${durationSeconds} seconds.`);
+            context.log.info(`navanAutoImport: Summary - Created: ${summary.totals.created}, Updated: ${summary.totals.updated}, Skipped: ${summary.totals.skipped}, Errors: ${summary.errors.length}`);
+            
+            // Clean up summary
+            summary.skippedBookings = limitArray(summary.skippedBookings);
+            summary.errors = limitArray(summary.errors);
+            
+        } catch (error) {
+            context.log.error('navanAutoImport: Critical error:', error);
+            context.log.error('navanAutoImport: Error stack:', error.stack);
+            summary.errors.push({
+                message: error.message || 'Unknown error',
+                type: 'Critical error',
+                errorName: error.name
+            });
+        }
+        
+        context.log.info('navanAutoImport: Timer execution completed');
+    }
+});

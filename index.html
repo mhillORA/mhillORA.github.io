@@ -5368,9 +5368,11 @@
                 }
             };
 
-            const handleNavanImportResponse = async (result, successMessage, { closeModal: shouldCloseModal } = {}) => {
+            const handleNavanImportResponse = async (result, successMessage, { closeModal: shouldCloseModal, silent: isSilent = false } = {}) => {
                 if (!result) {
-                    showNotification('Navan import failed: No response from server.', 'error');
+                    if (!isSilent) {
+                        showNotification('Navan import failed: No response from server.', 'error');
+                    }
                     return false;
                 }
                 if (result.success) {
@@ -5398,9 +5400,17 @@
                             detailMessage = `${fetched} record${fetched !== 1 ? 's' : ''} fetched, none processed`;
                         }
                         
-                        showNotification(`${successMessage || 'Navan import completed successfully.'} ${detailMessage}`, 'success', 8000);
+                        if (!isSilent) {
+                            showNotification(`${successMessage || 'Navan import completed successfully.'} ${detailMessage}`, 'success', 8000);
+                        } else {
+                            console.log(`Navan auto-import completed: ${detailMessage}`);
+                        }
                     } else {
-                        showNotification(successMessage || 'Navan import completed successfully.', 'success');
+                        if (!isSilent) {
+                            showNotification(successMessage || 'Navan import completed successfully.', 'success');
+                        } else {
+                            console.log('Navan auto-import completed successfully');
+                        }
                     }
                     if (shouldCloseModal) {
                         closeModal();
@@ -5425,6 +5435,9 @@
                     userMessage += ` - ${errorMessage}`;
                 }
                 
+                // Only show notifications if not silent
+                const isSilent = extras?.silent === true;
+                
                 // Show errors from summary if available
                 if (result.summary && result.summary.errors && result.summary.errors.length > 0) {
                     const firstError = result.summary.errors[0];
@@ -5433,7 +5446,11 @@
                     }
                 }
                 
-                showNotification(userMessage, 'error', 10000);
+                if (!isSilent) {
+                    showNotification(userMessage, 'error', 10000);
+                } else {
+                    console.warn('Navan auto-import failed:', userMessage);
+                }
                 if (result.summary) {
                     applyNavanImportSummary(result.summary);
                 }
@@ -5442,10 +5459,11 @@
 
             const runNavanImportRange = async (button, options = {}, extras = {}) => {
                 console.log('runNavanImportRange called with options:', options);
-                // Show syncing message with progress bar in travel content area
+                const isSilent = extras.silent === true;
+                // Show syncing message with progress bar in travel content area (only if not silent)
                 const travelContainer = document.getElementById('travel-content');
                 const updateProgress = (currentDays, status, error = null) => {
-                    if (!travelContainer) return;
+                    if (!travelContainer || isSilent) return;
                     const progressHTML = `
                         <div class="mb-6 p-6 rounded-md border border-blue-300 dark:border-blue-700 bg-blue-100 dark:bg-blue-900/40">
                             <div class="flex flex-col items-center gap-4">
@@ -5469,7 +5487,9 @@
                     travelContainer.innerHTML = progressHTML;
                 };
                 
-                setButtonLoading(button, true, 'Syncing...');
+                if (button) {
+                    setButtonLoading(button, true, 'Syncing...');
+                }
                 
                 try {
                     // Determine if we should use incremental approach (only when using default pastDays)
@@ -5511,10 +5531,12 @@
                             }
                         } catch (error30) {
                             console.error('Navan range import error (30 days):', error30);
-                            showNotification(`Navan import failed: ${error30.message || 'Unknown error'}`, 'error');
+                            if (!isSilent) {
+                                showNotification(`Navan import failed: ${error30.message || 'Unknown error'}`, 'error');
+                            }
                             
                             // Re-render travel content even on error to show current state
-                            if (travelContainer) {
+                            if (travelContainer && !isSilent) {
                                 await renderTravelContent();
                             }
                             
@@ -5570,10 +5592,12 @@
                                 userMessage = 'Navan import server error (500). The function may have timed out or encountered an error. Check Azure Functions logs for details.';
                             }
                             
-                            showNotification(userMessage, 'error', 8000);
+                            if (!isSilent) {
+                                showNotification(userMessage, 'error', 8000);
+                            }
                             
                             // Re-render travel content even on error to show current state
-                            if (travelContainer) {
+                            if (travelContainer && !isSilent) {
                                 await renderTravelContent();
                             }
                             
@@ -5593,8 +5617,8 @@
                         }
                     }
                     
-                    // Re-render travel content to show updated data
-                    if (travelContainer) {
+                    // Re-render travel content to show updated data (only if not silent)
+                    if (travelContainer && !isSilent) {
                         await renderTravelContent();
                     }
                     
@@ -5605,7 +5629,9 @@
                     
                     return await handleNavanImportResponse(finalResult, successMessage, extras);
                 } finally {
-                    setButtonLoading(button, false);
+                    if (button) {
+                        setButtonLoading(button, false);
+                    }
                 }
             };
 
@@ -31077,6 +31103,31 @@
                     }
                 }
                 window.navanConnectionStatus = state.navanConnectionStatus;
+
+                // Automatically trigger Navan import if connection is successful and it's been a while since last import
+                const AUTO_IMPORT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes - only auto-import if it's been at least 30 min since last run
+                const lastImportTime = state.navanImportLastRun || 0;
+                const timeSinceLastImport = nowMs - lastImportTime;
+                const connectionDetails = state.navanConnectionStatus?.details || {};
+                const shouldAutoImport = connectionDetails.connected && 
+                                        connectionDetails.oauthToken &&
+                                        connectionDetails.apiCall &&
+                                        timeSinceLastImport > AUTO_IMPORT_INTERVAL_MS;
+                
+                if (shouldAutoImport) {
+                    console.log('Travel tab opened - automatically triggering Navan import (last import was ' + Math.round(timeSinceLastImport / 60000) + ' minutes ago)');
+                    // Trigger import in background (don't await - let it run while we render the UI)
+                    runNavanImportRange(null, {
+                        pastDays: 30,
+                        futureDays: 180
+                    }, {
+                        closeModal: false,
+                        silent: true // Don't show notifications for auto-imports
+                    }).catch(error => {
+                        console.warn('Automatic Navan import failed:', error);
+                        // Don't show error notification for auto-imports to avoid annoying users
+                    });
+                }
 
                 // Group travel by CRC
                 const travelByCRC = {};
