@@ -596,6 +596,7 @@ const validateEventsSchema = (data) => {
 
     normalizeNumberField('hours');
     normalizeNumberField('mileage');
+    normalizeNumberField('numberOfPatients');
 
     if (data.isOverridden !== undefined && typeof data.isOverridden !== 'boolean') {
         errors.push('isOverridden must be a boolean');
