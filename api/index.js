@@ -28,21 +28,43 @@ const getFetch = async () => {
     }
     if (!fetch) {
         try {
-            // Try CommonJS require first (node-fetch v2)
-            try {
-                const requiredFetch = require('node-fetch');
-                fetch = normalizeFetch(requiredFetch);
-            } catch (requireError) {
-                // Fallback to ESM import (node-fetch v3)
-                const nodeFetch = await import('node-fetch');
-                fetch = normalizeFetch(nodeFetch);
+            // Try native fetch first (Azure Functions may support it now)
+            if (typeof globalThis !== 'undefined' && globalThis.fetch) {
+                fetch = globalThis.fetch;
+                console.log('Using native fetch');
+            } else if (typeof global !== 'undefined' && global.fetch) {
+                fetch = global.fetch;
+                console.log('Using global fetch');
+            } else {
+                // Try ESM import first (node-fetch v3 is ESM-only)
+                try {
+                    const nodeFetch = await import('node-fetch');
+                    fetch = normalizeFetch(nodeFetch);
+                    if (fetch) {
+                        console.log('Using node-fetch v3 (ESM)');
+                    }
+                } catch (esmError) {
+                    // Fallback to CommonJS require (node-fetch v2)
+                    try {
+                        const requiredFetch = require('node-fetch');
+                        fetch = normalizeFetch(requiredFetch);
+                        if (fetch) {
+                            console.log('Using node-fetch v2 (CommonJS)');
+                        }
+                    } catch (requireError) {
+                        throw new Error(`Failed to load fetch: ESM error: ${esmError.message}, CommonJS error: ${requireError.message}`);
+                    }
+                }
             }
-            if (!fetch) {
-                throw new Error('node-fetch module did not export a fetch function');
+            
+            if (!fetch || typeof fetch !== 'function') {
+                throw new Error('No valid fetch function found. Tried: native, ESM node-fetch, CommonJS node-fetch');
             }
         } catch (importError) {
             fetchError = importError;
-            throw new Error(`Failed to import node-fetch: ${importError.message}. Make sure node-fetch is installed in package.json.`);
+            const errorMessage = `Failed to import fetch: ${importError.message}. Make sure node-fetch is installed in package.json or native fetch is available.`;
+            console.error(errorMessage);
+            throw new Error(errorMessage);
         }
     }
     return fetch;
@@ -1850,9 +1872,17 @@ const normalizeNavanDateRange = (pastDays = 30, futureDays = 180) => {
 };
 
 const getNavanCredentials = () => {
+    const clientId = process.env.NAVAN_CLIENT_ID;
+    const clientSecret = process.env.NAVAN_SECRET_KEY;
+    
+    // Log credential status (without exposing values)
+    if (typeof console !== 'undefined' && console.log) {
+        console.log(`Navan credentials check: CLIENT_ID=${clientId ? `set (${clientId.length} chars)` : 'MISSING'}, SECRET_KEY=${clientSecret ? `set (${clientSecret.length} chars)` : 'MISSING'}`);
+    }
+    
     return {
-        clientId: process.env.NAVAN_CLIENT_ID,
-        clientSecret: process.env.NAVAN_SECRET_KEY
+        clientId,
+        clientSecret
     };
 };
 
@@ -3328,6 +3358,10 @@ app.http('navanImport', {
             errors: []
         };
         
+        // For backdoor mode: collect travel records without saving to DB
+        const cachedTravelRecords = [];
+        let backdoorMode = false;
+        
         try {
             // Ensure context logger is available
             if (!context) {
@@ -3362,10 +3396,12 @@ app.http('navanImport', {
             }
 
             let body = {};
+            let backdoorMode = false;
             try {
                 // Try to read the request body as JSON
                 body = await request.json();
-                context.log.info(`navanImport: Request body parsed. pastDays: ${body.pastDays}, futureDays: ${body.futureDays}, importType: ${body.importType}`);
+                backdoorMode = body.backdoorMode === true || body.cacheOnly === true;
+                context.log.info(`navanImport: Request body parsed. pastDays: ${body.pastDays}, futureDays: ${body.futureDays}, importType: ${body.importType}, backdoorMode: ${backdoorMode}`);
             } catch (parseError) {
                 context.log.error('navanImport: Failed to parse request body:', parseError.message);
                 context.log.error('navanImport: Parse error stack:', parseError.stack);
@@ -3572,10 +3608,15 @@ app.http('navanImport', {
                         const importResult = await upsertNavanBooking(context, bookingRecord, {
                             bookingId: bookingRecord.bookingId || bookingIdCandidate,
                             bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
-                            readOnly: false,
+                            readOnly: backdoorMode, // Skip DB writes in backdoor mode
                             crcResolver,
                             allowFallbackCrc: false
                         });
+                        
+                        // In backdoor mode, collect travel records for caching
+                        if (backdoorMode && importResult.travelRecord) {
+                            cachedTravelRecords.push(importResult.travelRecord);
+                        }
 
                         if (importResult.skipped) {
                             summary.totals.skipped += 1;
@@ -3819,10 +3860,15 @@ app.http('navanImport', {
                                 const importResult = await upsertNavanBooking(context, booking, {
                                     bookingId: booking.bookingId,
                                     bookingUuid: booking.uuid,
-                                    readOnly: false,
+                                    readOnly: backdoorMode, // Skip DB writes in backdoor mode
                                     crcResolver,
                                     allowFallbackCrc: false
                                 });
+                                
+                                // In backdoor mode, collect travel records for caching
+                                if (backdoorMode && importResult.travelRecord) {
+                                    cachedTravelRecords.push(importResult.travelRecord);
+                                }
 
                                 if (importResult.skipped) {
                                     summary.totals.skipped += 1;
@@ -3943,6 +3989,18 @@ app.http('navanImport', {
             // Clean up summary for response
             summary.skippedBookings = limitArray(summary.skippedBookings);
             summary.errors = limitArray(summary.errors);
+            
+            // In backdoor mode, include cached travel records in response
+            const responseBody = {
+                success: true,
+                summary,
+                backdoorMode: backdoorMode
+            };
+            
+            if (backdoorMode && cachedTravelRecords.length > 0) {
+                responseBody.cachedTravelRecords = cachedTravelRecords;
+                context.log.info(`navanImport: Backdoor mode - returning ${cachedTravelRecords.length} cached travel records (not saved to DB)`);
+            }
 
             return {
                 status: 200,
@@ -3950,10 +4008,7 @@ app.http('navanImport', {
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*'
                 },
-                jsonBody: {
-                    success: true,
-                    summary
-                }
+                jsonBody: responseBody
             };
         } catch (outerError) {
             // Catch-all for unexpected runtime errors

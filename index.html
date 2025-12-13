@@ -1178,7 +1178,34 @@
 
                 // Travel methods
                 async getTravel() {
-                    return this.request('/travel');
+                    const dbTravel = await this.request('/travel');
+                    // Merge with cached Navan records from backdoor mode
+                    try {
+                        const cachedStr = localStorage.getItem('chaos_navanCachedTravel');
+                        if (cachedStr) {
+                            const cachedTravel = JSON.parse(cachedStr);
+                            if (Array.isArray(cachedTravel) && cachedTravel.length > 0) {
+                                // Merge: use cached records to override/update DB records, add new ones
+                                const dbMap = new Map(dbTravel.map(t => {
+                                    const key = t.navanBookingId || t.navanBookingUuid || t.id;
+                                    return [key, t];
+                                }));
+                                cachedTravel.forEach(cached => {
+                                    const key = cached.navanBookingId || cached.navanBookingUuid || cached.id;
+                                    if (key && dbMap.has(key)) {
+                                        dbMap.set(key, { ...dbMap.get(key), ...cached, _cached: true });
+                                    } else {
+                                        const newKey = cached.id || (Date.now().toString(36) + Math.random().toString(36).substr(2));
+                                        dbMap.set(newKey, { ...cached, _cached: true, id: newKey });
+                                    }
+                                });
+                                return Array.from(dbMap.values());
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('Error reading cached Navan travel records:', e);
+                    }
+                    return dbTravel;
                 }
 
                 async getTravelRecord(id) {
@@ -1216,6 +1243,14 @@
                     return this.request('/navan-import', {
                         method: 'POST',
                         body: JSON.stringify({ importType: 'list', bookings })
+                    });
+                }
+                
+                // Backdoor mode: cache Navan data without writing to DB
+                async importNavanBookingsRangeCacheOnly(options = {}) {
+                    return this.request('/navan-import', {
+                        method: 'POST',
+                        body: JSON.stringify({ importType: 'range', backdoorMode: true, ...options })
                     });
                 }
 
@@ -1756,6 +1791,7 @@
                 navanImportSummary: null,
                 navanImportLastRun: null,
                 navanImportInProgress: false,
+                navanBackdoorMode: false, // Backdoor mode: cache only, don't write to DB
                 crcStats: {},
                 timeOffSummaryRange: 'month',
                 timeOffSummaryCustomStart: null,
@@ -5377,6 +5413,19 @@
                     return false;
                 }
                 if (result.success) {
+                    // Save cached travel records from backdoor mode to localStorage
+                    if (result.backdoorMode && result.cachedTravelRecords && Array.isArray(result.cachedTravelRecords)) {
+                        try {
+                            localStorage.setItem('chaos_navanCachedTravel', JSON.stringify(result.cachedTravelRecords));
+                            console.log(`Backdoor mode: Cached ${result.cachedTravelRecords.length} travel records to localStorage (not saved to DB)`);
+                            if (!isSilent) {
+                                showNotification(`Navan API works! Cached ${result.cachedTravelRecords.length} records (not saved to DB).`, 'success', 10000);
+                            }
+                        } catch (e) {
+                            console.warn('Failed to cache Navan travel records:', e);
+                        }
+                    }
+                    
                     if (result.summary) {
                         applyNavanImportSummary(result.summary);
                         
@@ -5458,6 +5507,8 @@
             const runNavanImportRange = async (button, options = {}, extras = {}) => {
                 console.log('runNavanImportRange called with options:', options);
                 const isSilent = extras.silent === true;
+                // Check if backdoor mode is enabled (either in state or explicitly passed)
+                const useBackdoorMode = state.navanBackdoorMode || extras.backdoorMode || options.backdoorMode || false;
                 
                 // Prevent multiple simultaneous imports
                 if (state.navanImportInProgress && !isSilent) {
@@ -5569,13 +5620,19 @@
                         
                         try {
                             console.log('Calling apiService.importNavanBookingsRange with payload:', payload);
+                            // Use backdoor mode if enabled (skip DB writes, cache to localStorage)
+                            const importFn = useBackdoorMode ? apiService.importNavanBookingsRangeCacheOnly : apiService.importNavanBookingsRange;
+                            if (useBackdoorMode) {
+                                payload.backdoorMode = true;
+                            }
+                            
                             // Add timeout protection for Navan API calls (15 minutes max)
                             const timeoutPromise = new Promise((_, reject) => {
                                 setTimeout(() => reject(new Error('Navan API request timed out after 15 minutes')), 15 * 60 * 1000);
                             });
                             
                             finalResult = await Promise.race([
-                                apiService.importNavanBookingsRange(payload),
+                                importFn(payload),
                                 timeoutPromise
                             ]);
                             console.log('Navan import result received:', finalResult);
