@@ -2311,6 +2311,7 @@ const upsertNavanBooking = async (context, booking, {
     bookingId,
     bookingUuid = null,
     readOnly = false,
+    updateOnly = false, // If true, only update existing records, don't create new ones
     crcResolver = null,
     allowFallbackCrc = true
 } = {}) => {
@@ -2389,6 +2390,12 @@ const upsertNavanBooking = async (context, booking, {
             throw upsertError;
         }
     } else {
+        // If updateOnly is true, skip creating new records
+        if (updateOnly) {
+            context.log.info(`Skipping creation of new travel record for Navan booking ${bookingIdentifier} (updateOnly mode)`);
+            return { travelRecord, action: 'skipped', saved: false, matched, reason: 'updateOnly mode - record does not exist' };
+        }
+        
         const newTravel = { ...travelRecord, id: generateId() };
         context.log.info('Creating new travel record with data:', safeStringify(newTravel));
         try {
@@ -3621,6 +3628,7 @@ app.http('navanImport', {
                             bookingId: bookingRecord.bookingId || bookingIdCandidate,
                             bookingUuid: bookingRecord.uuid || bookingUuidCandidate,
                             readOnly: backdoorMode, // Skip DB writes in backdoor mode
+                            updateOnly: body.updateOnly === true, // Only update existing records, don't create new ones
                             crcResolver,
                             allowFallbackCrc: false
                         });
@@ -3675,8 +3683,9 @@ app.http('navanImport', {
                     }
                 }
                 } else {
-                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 365;
-                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 180; // 6 months
+                    // Safe defaults: 30 days past, 60 days future (changed from 365/180 to prevent timeout)
+                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 30;
+                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 60;
 
                     // Warn if date range is very large (could cause timeout)
                     if (pastDays > 180) {
@@ -3873,6 +3882,7 @@ app.http('navanImport', {
                                     bookingId: booking.bookingId,
                                     bookingUuid: booking.uuid,
                                     readOnly: backdoorMode, // Skip DB writes in backdoor mode
+                                    updateOnly: body.updateOnly === true, // Only update existing records, don't create new ones
                                     crcResolver,
                                     allowFallbackCrc: false
                                 });
@@ -3898,6 +3908,14 @@ app.http('navanImport', {
                                     summary.totals.created += 1;
                                 } else if (importResult.action === 'updated') {
                                     summary.totals.updated += 1;
+                                } else if (importResult.action === 'skipped') {
+                                    summary.totals.skipped += 1;
+                                    summary.skippedBookings.push({
+                                        bookingId: booking.bookingId,
+                                        bookingUuid: booking.uuid,
+                                        travelerName: booking?.passengers?.[0]?.person?.name || null,
+                                        reason: importResult.reason || 'Skipped in update-only mode'
+                                    });
                                 }
                             } catch (saveError) {
                                 const errorMsg = saveError.message;
