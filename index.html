@@ -683,6 +683,9 @@
                 <button data-action="view-availability" class="bg-teal-600 text-white py-2 px-3 sm:px-4 rounded-md hover:bg-teal-700 transition-colors flex items-center text-sm">
                     <i data-lucide="calendar-check" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Availability</span>
                 </button>
+                <button data-action="undo-last-change" id="undo-button" class="bg-gray-600 text-white py-2 px-3 sm:px-4 rounded-md hover:bg-gray-700 transition-colors flex items-center text-sm disabled:opacity-50 disabled:cursor-not-allowed" title="Undo last scheduling change" disabled>
+                    <i data-lucide="undo-2" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Undo</span>
+                </button>
                 <button data-action="auto-create-shift" class="bg-indigo-600 text-white py-2 px-3 sm:px-4 rounded-md hover:bg-indigo-700 transition-colors flex items-center text-sm">
                     <i data-lucide="wand-2" class="w-4 h-4 sm:mr-2"></i><span class="hidden lg:inline">Create Shift</span>
                 </button>
@@ -1808,6 +1811,8 @@
                 timeOffCollapsedEmployees: {},
                 jennysViewIncludeTravel: true, // Default to including travel time in Jenny's view
                 changeLog: [], // Track changes for Catch-Up feature
+                undoHistory: [], // Stack of previous event states for undo functionality
+                undoHistoryMaxSize: 10, // Maximum number of undo states to keep
                 settings: {
                     'Site Assignment': 8,
                     'Travel Day': 8,
@@ -1848,6 +1853,141 @@
                 return R * c;
             };
 
+            // Undo functionality helpers
+            const saveStateToUndoHistory = () => {
+                // Deep clone current events state
+                const eventsSnapshot = JSON.parse(JSON.stringify(state.crc_events));
+                state.undoHistory.push(eventsSnapshot);
+                
+                // Limit history size
+                if (state.undoHistory.length > state.undoHistoryMaxSize) {
+                    state.undoHistory.shift(); // Remove oldest
+                }
+                
+                // Store in localStorage as backup
+                try {
+                    localStorage.setItem('chaos_undoHistory', JSON.stringify(state.undoHistory));
+                } catch (e) {
+                    console.warn('Failed to save undo history to localStorage:', e);
+                }
+                
+                console.log('State saved to undo history. History size:', state.undoHistory.length);
+                updateUndoButtonState();
+            };
+            
+            const undoLastChange = async () => {
+                if (state.undoHistory.length === 0) {
+                    showNotification('No changes to undo.', 'warning');
+                    return;
+                }
+                
+                const previousState = state.undoHistory.pop();
+                if (!previousState || !Array.isArray(previousState)) {
+                    showNotification('Cannot undo: Invalid history state.', 'error');
+                    return;
+                }
+                
+                // Get current state to determine what changed
+                const currentEvents = state.crc_events;
+                const previousEvents = previousState;
+                
+                // Find events that were added (in current but not in previous)
+                const addedEvents = currentEvents.filter(curr => 
+                    !previousEvents.some(prev => prev.id === curr.id)
+                );
+                
+                // Find events that were removed (in previous but not in current)
+                const removedEvents = previousEvents.filter(prev => 
+                    !currentEvents.some(curr => curr.id === prev.id)
+                );
+                
+                // Find events that were modified (exist in both but different)
+                const modifiedEvents = currentEvents.filter(curr => {
+                    const prev = previousEvents.find(p => p.id === curr.id);
+                    return prev && JSON.stringify(prev) !== JSON.stringify(curr);
+                });
+                
+                try {
+                    // Delete events that were added
+                    for (const event of addedEvents) {
+                        try {
+                            await apiService.deleteEvent(event.id);
+                        } catch (e) {
+                            console.warn('Failed to delete event during undo:', e);
+                        }
+                    }
+                    
+                    // Restore events that were removed
+                    for (const event of removedEvents) {
+                        try {
+                            await apiService.createEvent(event);
+                        } catch (e) {
+                            console.warn('Failed to restore event during undo:', e);
+                        }
+                    }
+                    
+                    // Restore modified events to previous state
+                    for (const currentEvent of modifiedEvents) {
+                        const prevEvent = previousEvents.find(p => p.id === currentEvent.id);
+                        if (prevEvent) {
+                            try {
+                                // Remove id for update call
+                                const { id, ...updateData } = prevEvent;
+                                await apiService.updateEvent(id, updateData);
+                            } catch (e) {
+                                console.warn('Failed to restore modified event during undo:', e);
+                            }
+                        }
+                    }
+                    
+                    // Update local state
+                    state.crc_events = JSON.parse(JSON.stringify(previousEvents));
+                    setState({ crc_events: state.crc_events });
+                    
+                    // Update localStorage
+                    try {
+                        localStorage.setItem('chaos_undoHistory', JSON.stringify(state.undoHistory));
+                    } catch (e) {
+                        console.warn('Failed to update undo history in localStorage:', e);
+                    }
+                    
+                    showNotification(`Undo: Restored ${removedEvents.length} removed, reverted ${modifiedEvents.length} modified, deleted ${addedEvents.length} added events.`, 'success');
+                    updateUndoButtonState();
+                    renderContent();
+                } catch (error) {
+                    console.error('Error during undo:', error);
+                    showNotification('Failed to undo changes. See console for details.', 'error');
+                    // Restore the history item since undo failed
+                    state.undoHistory.push(previousState);
+                    updateUndoButtonState();
+                }
+            };
+            
+            // Update undo button state based on history
+            const updateUndoButtonState = () => {
+                const undoButton = document.getElementById('undo-button');
+                if (undoButton) {
+                    undoButton.disabled = state.undoHistory.length === 0;
+                }
+            };
+            
+            // Load undo history from localStorage on startup
+            try {
+                const savedHistory = localStorage.getItem('chaos_undoHistory');
+                if (savedHistory) {
+                    state.undoHistory = JSON.parse(savedHistory);
+                    // Limit size
+                    if (state.undoHistory.length > state.undoHistoryMaxSize) {
+                        state.undoHistory = state.undoHistory.slice(-state.undoHistoryMaxSize);
+                    }
+                }
+            } catch (e) {
+                console.warn('Failed to load undo history from localStorage:', e);
+            }
+            
+            // Note: updateUndoButtonState() should be called after setState operations that affect events
+            // We'll call it explicitly in the relevant places rather than overriding setState
+            
             // Get CRC address from CRC data
             const getCrcAddress = (crc) => {
                 if (!crc) return null;
@@ -3407,12 +3547,29 @@
 
             const getUnavailabilityPeriod = (crcId, date) => {
                 if (!crcId || !date) return null;
-                // Check for Unavailable events first
-                const ev = (state.crc_events || []).find(e => e.crcId === crcId && e.type === 'Unavailable' && e.date === date);
+                // Get approved time off request IDs
+                const approvedRequestIds = new Set(
+                    state.timeOffRequests
+                        .filter(req => req.status === 'approved')
+                        .map(req => req.id)
+                );
+                
+                // Check for Unavailable events first (only if they have approved time off request or are manually created)
+                const ev = (state.crc_events || []).find(e => 
+                    e.crcId === crcId && 
+                    e.type === 'Unavailable' && 
+                    e.date === date &&
+                    (!e.timeOffRequestId || approvedRequestIds.has(e.timeOffRequestId))
+                );
                 if (ev) return ev.period || 'Full Day';
                 
-                // Check for Paid Time Off events
-                const ptoEv = (state.crc_events || []).find(e => e.crcId === crcId && e.type === 'Paid Time Off' && e.date === date);
+                // Check for Paid Time Off events (only if they have approved time off request or are manually created)
+                const ptoEv = (state.crc_events || []).find(e => 
+                    e.crcId === crcId && 
+                    e.type === 'Paid Time Off' && 
+                    e.date === date &&
+                    (!e.timeOffRequestId || approvedRequestIds.has(e.timeOffRequestId))
+                );
                 if (ptoEv) return ptoEv.period || 'Full Day';
                 
                 // Check for approved time off requests
@@ -3452,11 +3609,20 @@
                 // If there's a rejected time off request for this date, they are available
                 if (rejectedTimeOffRequest) return false;
                 
+                // Get approved time off request IDs
+                const approvedRequestIds = new Set(
+                    state.timeOffRequests
+                        .filter(req => req.status === 'approved')
+                        .map(req => req.id)
+                );
+                
                 // Check if CRC has any events on this date that would make them unavailable
+                // Only consider events that have approved time off requests or are manually created (no timeOffRequestId)
                 const eventsOnDate = state.crc_events.filter(event => 
                     event.crcId === crcId && 
                     event.date === date &&
-                    (event.type === 'Paid Time Off' || event.type === 'Unavailable')
+                    (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
+                    (!event.timeOffRequestId || approvedRequestIds.has(event.timeOffRequestId))
                 );
                 
                 // Check for approved time off requests (including multi-day ranges)
@@ -5809,9 +5975,10 @@
                         startDateInput.addEventListener('change', (e) => {
                             if (e.target.value) {
                                 const startDate = new Date(e.target.value + 'T00:00:00');
-                                const nextDate = new Date(startDate);
-                                nextDate.setDate(nextDate.getDate() + 1);
-                                endDateInput.value = toDateOnlyString(nextDate);
+                                // Default end date to same as start date (not next day)
+                                if (!endDateInput.value || endDateInput.value < e.target.value) {
+                                    endDateInput.value = e.target.value;
+                                }
                                 // Update travel selection when dates change
                                 updateTravelSelectionContainer();
                             }
@@ -10084,6 +10251,9 @@
                                     const textColor = getContrastColor(bgColor);
                                     const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                     
+                                    // Get hours for this event
+                                    const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : 8);
+                                    
                                     roleBlocks.push({
                                         visit: visitNumber,
                                         role: roleDisplay,
@@ -10092,7 +10262,8 @@
                                         bgColor: bgColor,
                                         textColor: textColor,
                                         spanTextColor: spanTextColor,
-                                        event: event
+                                        event: event,
+                                        hours: eventHours
                                     });
                                 });
                                 processedEvents.add(event.id);
@@ -10101,6 +10272,7 @@
                                 const bgColor = site?.color || '#3b82f6';
                                 const textColor = getContrastColor(bgColor);
                                 const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : 8);
                                 
                                 roleBlocks.push({
                                     visit: visitNumber,
@@ -10110,7 +10282,8 @@
                                     bgColor: bgColor,
                                     textColor: textColor,
                                     spanTextColor: spanTextColor,
-                                    event: event
+                                    event: event,
+                                    hours: eventHours
                                 });
                                 processedEvents.add(event.id);
                             }
@@ -10127,6 +10300,10 @@
                         }
                         if (block.role) displayParts.push(block.role);
                         displayParts.push(block.crcTitle);
+                        // Add hours display
+                        if (block.hours) {
+                            displayParts.push(`${block.hours}h`);
+                        }
                         
                         const displayText = displayParts.join(' - ');
                         
@@ -10393,6 +10570,9 @@
                                     const textColor = getContrastColor(bgColor);
                                     const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                     
+                                    // Get hours for this event
+                                    const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : 8);
+                                    
                                     roleBlocks.push({
                                         visit: visitNumber,
                                         role: roleDisplay,
@@ -10401,7 +10581,8 @@
                                         bgColor: bgColor,
                                         textColor: textColor,
                                         spanTextColor: spanTextColor,
-                                        event: event
+                                        event: event,
+                                        hours: eventHours
                                     });
                                 });
                                 processedEvents.add(event.id);
@@ -10410,6 +10591,7 @@
                                 const bgColor = site?.color || '#3b82f6';
                                 const textColor = getContrastColor(bgColor);
                                 const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+                                const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : 8);
                                 
                                 roleBlocks.push({
                                     visit: visitNumber,
@@ -10419,7 +10601,8 @@
                                     bgColor: bgColor,
                                     textColor: textColor,
                                     spanTextColor: spanTextColor,
-                                    event: event
+                                    event: event,
+                                    hours: eventHours
                                 });
                                 processedEvents.add(event.id);
                             }
@@ -10436,6 +10619,10 @@
                         }
                         if (block.role) displayParts.push(block.role);
                         displayParts.push(block.crcTitle);
+                        // Add hours display
+                        if (block.hours) {
+                            displayParts.push(`${block.hours}h`);
+                        }
                         
                         const displayText = displayParts.join(' - ');
                         
@@ -16960,7 +17147,8 @@
                 }).join('');
                 const isFullDayEvent = isEditing && (!event.period || event.period === 'Full Day');
                 const startDateValue = seriesStartDate || event?.date || date;
-                const endDateValue = seriesEndDate || event?.endDate || event?.date || date;
+                // When creating new shift, default end date to same as start date
+                const endDateValue = seriesEndDate || (isEditing ? (event?.endDate || event?.date || date) : (seriesStartDate || event?.date || date));
                 const baseGroupNumber = event?.groupNumber || '';
                 const baseVisitNumber = event?.visitNumber || '';
                 const defaultDuplicateGroup = baseGroupNumber ? suggestNextGroupNumber(baseGroupNumber) : '';
@@ -17000,11 +17188,11 @@
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Start Date</label>
-                                <input type="date" name="startDate" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${seriesStartDate || event?.date || date}">
+                                <input type="date" name="startDate" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${startDateValue}">
                             </div>
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">End Date</label>
-                                <input type="date" name="endDate" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${seriesEndDate || event?.date || date}">
+                                <input type="date" name="endDate" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${endDateValue}">
                             </div>
                         </div>
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -17078,7 +17266,7 @@
                             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Group Number</label>
-                                    <input type="text" name="groupNumber" value="${event ? event.groupNumber || '' : ''}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., G1">
+                                    <input type="text" name="groupNumber" value="${event ? event.groupNumber || '' : ''}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 1, 1-2, 1/2" pattern="[0-9\-\/\\]+" title="Only numbers and symbols (-, /, \) allowed">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit Number</label>
@@ -17380,7 +17568,7 @@
                     <div class="flex justify-between pt-6">
                         <div class="flex gap-2">
                             <button data-action="edit-crc-event" data-event-id="${event.id}" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Edit Shift</button>
-                            ${siteEvents.length > 1 ? `<button data-action="delete-whole-shift" data-site-id="${event.siteId}" data-date="${event.date}" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700">Delete Whole Shift</button>` : `<button data-action="delete-individual-crc-event" data-event-id="${event.id}" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700">Delete Shift</button>`}
+                            <button data-action="delete-individual-crc-event" data-event-id="${event.id}" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700">Delete This Shift</button>
                         </div>
                         <button data-action="close-modal" class="bg-gray-600 text-white py-2 px-4 rounded-md hover:bg-gray-700">Close</button>
                     </div>
@@ -17599,7 +17787,7 @@
                     <div class="flex justify-between pt-6">
                         <div class="flex gap-2">
                             <button data-action="edit-crc-event" data-event-id="${event.id}" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Edit Event</button>
-                            <button data-action="delete-individual-crc-event" data-event-id="${event.id}" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700">Delete This Event</button>
+                            <button data-action="delete-individual-crc-event" data-event-id="${event.id}" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700">Delete This Shift</button>
                             ${siteEvents.length > 1 ? `<button data-action="delete-whole-shift" data-site-id="${event.siteId}" data-date="${event.date}" class="bg-red-800 text-white py-2 px-4 rounded-md hover:bg-red-900">Delete Whole Shift</button>` : ''}
                         </div>
                         <button data-action="close-modal" class="bg-gray-600 text-white py-2 px-4 rounded-md hover:bg-gray-700">Close</button>
@@ -20147,11 +20335,22 @@
                 const year = now.getFullYear();
                 const month = now.getMonth();
                 const monthName = now.toLocaleString('default', { month: 'long', year: 'numeric' });
+                // Get approved time off request IDs
+                const approvedRequestIds = new Set(
+                    state.timeOffRequests
+                        .filter(req => req.status === 'approved' && req.crcId === state.selectedCrcForUnavailability)
+                        .map(req => req.id)
+                );
+                
+                // Only show Unavailable/Paid Time Off events that:
+                // 1. Have a timeOffRequestId matching an approved request, OR
+                // 2. Don't have a timeOffRequestId (manually created)
                 const unavailableEventsThisMonth = state.crc_events.filter(e =>
                     e.crcId === state.selectedCrcForUnavailability &&
-                    e.type === 'Unavailable' &&
+                    (e.type === 'Unavailable' || e.type === 'Paid Time Off') &&
                     new Date(e.date + 'T00:00:00').getFullYear() === year &&
-                    new Date(e.date + 'T00:00:00').getMonth() === month
+                    new Date(e.date + 'T00:00:00').getMonth() === month &&
+                    (!e.timeOffRequestId || approvedRequestIds.has(e.timeOffRequestId))
                 );
                 const eventsMap = new Map(unavailableEventsThisMonth.map(e => [e.date, e]));
 
@@ -21059,7 +21258,9 @@
                     case 'copy-shift': {
                         const eventToCopy = state.crc_events.find(e => e.id === eventId);
                         if(eventToCopy) {
-                            const { id, date, groupId, ...rest } = eventToCopy;
+                            // Copy all data except date-related fields and identifiers
+                            // This preserves: siteId, studyIds, roleAssignments, trainingAssignments, roles, etc.
+                            const { id, date, startDate, endDate, groupId, createdAt, ...rest } = eventToCopy;
                             copiedShiftData = rest;
                             closeModal();
                             showNotification('Shift copied. Click a day to paste.', 'info');
@@ -21655,7 +21856,7 @@
                         if (event) {
                             openModal(`
                                 <h3 class="text-xl font-bold dark:text-white mb-4">Delete Individual Event</h3>
-                                <p class="dark:text-gray-300 mb-6">Are you sure you want to delete this individual event? This action cannot be undone.</p>
+                                <p class="dark:text-gray-300 mb-6">Are you sure you want to delete this individual event? You can undo this change if needed.</p>
                                 <div class="flex justify-end gap-4">
                                     <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                                     <button data-action="confirm-delete-individual-event" data-event-id="${eventId}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Event</button>
@@ -21664,12 +21865,18 @@
                         }
                         break;
                     }
+                    case 'undo-last-change': {
+                        await undoLastChange();
+                        break;
+                    }
                     case 'confirm-delete-individual-event': {
                         try {
+                            saveStateToUndoHistory();
                             await apiService.deleteEvent(eventId);
                             // Re-fetch events from DB
                             const updatedEvents = await apiService.getEvents();
                             setState({ crc_events: updatedEvents });
+                            updateUndoButtonState();
                             showNotification('Event deleted successfully!', 'success');
                             closeModal();
                             // Refresh calendar views
@@ -21801,7 +22008,7 @@
                             openModal(`
                                 <h3 class="text-xl font-bold dark:text-white mb-4">Delete Whole Shift</h3>
                                 <p class="dark:text-gray-300 mb-4">Are you sure you want to delete the entire shift for <strong>${site ? site.name : 'this site'}</strong> on <strong>${new Date(date + 'T00:00:00').toLocaleDateString()}</strong>?</p>
-                                <p class="dark:text-gray-300 mb-6">This will delete <strong>${shiftEvents.length} events</strong> and cannot be undone.</p>
+                                <p class="dark:text-gray-300 mb-6">This will delete <strong>${shiftEvents.length} events</strong>. You can undo this change if needed.</p>
                                 <div class="flex justify-end gap-4">
                                     <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                                     <button data-action="confirm-delete-whole-shift" data-site-id="${siteId}" data-date="${date}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Whole Shift</button>
@@ -21812,6 +22019,7 @@
                     }
                     case 'confirm-delete-whole-shift': {
                         try {
+                            saveStateToUndoHistory();
                             const siteId = e.target.dataset.siteId;
                             const date = e.target.dataset.date;
                             
@@ -21830,6 +22038,7 @@
                             // Re-fetch events from DB
                             const updatedEvents = await apiService.getEvents();
                             setState({ crc_events: updatedEvents });
+                            updateUndoButtonState();
                             
                             showNotification(`Deleted ${eventsToDelete.length} events from the shift!`, 'success');
                             closeModal();
@@ -23798,11 +24007,19 @@
                             });
                             
                             // Update existing study with role configuration
-                            await apiService.updateStudy(studyId, { 
+                            const oldStudy = state.studies.find(s => s.id === studyId);
+                            const saved = await apiService.updateStudy(studyId, { 
                                 requiredRoles: selectedRoles,
                                 siteIds: selectedSites,
                                 siteRoleRequirements: siteRoleRequirements
                             });
+                            
+                            // Update local state
+                            const updatedStudy = saved && saved.id ? saved : { ...oldStudy, requiredRoles: selectedRoles, siteIds: selectedSites, siteRoleRequirements: siteRoleRequirements };
+                            setState({
+                                studies: state.studies.map(s => s.id === studyId ? updatedStudy : s)
+                            });
+                            
                             showNotification('Study configuration saved successfully!', 'success');
                             closeModal();
                         } catch (error) {
@@ -24481,6 +24698,9 @@
                                     return null;
                                 };
                                 
+                                // Save state to undo history before making changes
+                                saveStateToUndoHistory();
+                                
                                 // Collect role quantity overrides FIRST (before role assignments)
                                 // This ensures we know how many slots to create for each role
                                 const roleQuantityOverrides = {};
@@ -24632,6 +24852,20 @@
                                 // Always include trainingAssignments if there are any (even if some are null, to preserve structure)
                                 // This ensures training assignments are saved when a CRC is assigned to Training role
                                 const finalTrainingAssignments = isTravelDay ? undefined : (Object.keys(trainingAssignments).length > 0 ? trainingAssignments : (existingEvent?.trainingAssignments ? existingEvent.trainingAssignments : undefined));
+                                
+                                // Collect training modes (practicum, finalPracticum, observation) from checkboxes
+                                const trainingModes = {};
+                                if (!isTravelDay) {
+                                    const { currentTrainingModes } = collectCurrentFormRoleAssignments(form);
+                                    Object.keys(currentTrainingModes).forEach(key => {
+                                        const mode = currentTrainingModes[key];
+                                        if (mode && (mode.practicum || mode.finalPracticum || mode.observation)) {
+                                            trainingModes[key] = mode;
+                                        }
+                                    });
+                                }
+                                const finalTrainingModes = isTravelDay ? undefined : (Object.keys(trainingModes).length > 0 ? trainingModes : (existingEvent?.trainingModes ? existingEvent.trainingModes : undefined));
+                                
                                 // Always include roleQuantityOverrides if any were collected
                                 // This ensures role quantity changes are saved
                                 // If no overrides were collected but there are existing ones, preserve them
@@ -24650,6 +24884,7 @@
                                     isOverridden: confirmedOverride,
                                     roleAssignments: finalRoleAssignments,
                                     trainingAssignments: finalTrainingAssignments,
+                                    trainingModes: finalTrainingModes,
                                     roleQuantityOverrides: finalRoleQuantityOverrides,
                                     groupNumber: groupNumberValue,
                                 };
@@ -24730,6 +24965,7 @@
                                                 roles: finalRolesForGroup,
                                                 roleAssignments: finalRoleAssignments,
                                                 trainingAssignments: finalTrainingAssignments,
+                                                trainingModes: finalTrainingModes,
                                                 roleQuantityOverrides: finalRoleQuantityOverrides,
                                                 groupNumber: groupNumberValue,
                                                 date: dateStr,
@@ -24801,10 +25037,10 @@
                                         // Update the existing event
                                         const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
                                         
-                                        // Update in state
+                                        // Update in state - fully replace with server response
                                         const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
                                         if (eventIndex >= 0 && updatedEvent && updatedEvent.id) {
-                                            state.crc_events[eventIndex] = { ...state.crc_events[eventIndex], ...updatedEvent };
+                                            state.crc_events[eventIndex] = updatedEvent;
                                         }
                                         
                                         // Create events for additional days (skip the first day since we already updated it)
@@ -24821,6 +25057,7 @@
                                                 roles: finalRoles,
                                                 roleAssignments: finalRoleAssignments,
                                                 trainingAssignments: finalTrainingAssignments,
+                                                trainingModes: finalTrainingModes,
                                                 roleQuantityOverrides: finalRoleQuantityOverrides,
                                                 groupNumber: groupNumberValue,
                                                 date: dateStr,
@@ -24898,11 +25135,12 @@
                                         if (updatedEvent && updatedEvent.id) {
                                             const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
                                             if (eventIndex >= 0) {
-                                                state.crc_events[eventIndex] = { ...state.crc_events[eventIndex], ...updatedEvent };
+                                                // Fully replace the event with server response
+                                                state.crc_events[eventIndex] = updatedEvent;
                                             }
                                         }
                                         
-                                        setState({ crc_events: [...state.crc_events] });
+                                        setState({ crc_events: [...state.crc_events] }, { skipRender: false });
                                         renderContent();
                                         showNotification('Shift updated successfully!', 'success');
                                         closeModal();
@@ -24951,13 +25189,13 @@
                                         if (updatedEvent && updatedEvent.id) {
                                             const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
                                             if (eventIndex >= 0) {
-                                                // Merge the updated event data, preserving all fields from the server response
-                                                state.crc_events[eventIndex] = { ...state.crc_events[eventIndex], ...updatedEvent };
+                                                // Fully replace the event with server response to ensure all updates are reflected
+                                                state.crc_events[eventIndex] = updatedEvent;
                                             } else {
                                                 state.crc_events.push(updatedEvent);
                                             }
                                             // Force a refresh of the UI to show the updated data
-                                            setState({ crc_events: [...state.crc_events] });
+                                            setState({ crc_events: [...state.crc_events] }, { skipRender: false });
                                             // Refresh the view to show updated data immediately
                                             renderContent();
                                         }
@@ -25134,8 +25372,9 @@
                                                     }
                                                 });
                                                 
-                                                // Get training assignments for this CRC
+                                                // Get training assignments and modes for this CRC
                                                 const crcTrainingAssignments = {};
+                                                const crcTrainingModes = {};
                                                 if (finalTrainingAssignments) {
                                                     Object.entries(finalTrainingAssignments).forEach(([roleId, assignments]) => {
                                                         const roleAssignmentsForRole = roleAssignments[roleId] || [];
@@ -25145,6 +25384,15 @@
                                                                 crcTrainingAssignments[roleId] = [];
                                                             }
                                                             crcTrainingAssignments[roleId][0] = assignments[crcIndex];
+                                                            
+                                                            // Get training modes for this CRC
+                                                            if (finalTrainingModes) {
+                                                                const modeKey = `${roleId}-${crcIndex}`;
+                                                                const newModeKey = `${roleId}-0`;
+                                                                if (finalTrainingModes[modeKey]) {
+                                                                    crcTrainingModes[newModeKey] = finalTrainingModes[modeKey];
+                                                                }
+                                                            }
                                                         }
                                                     });
                                                 }
@@ -25156,6 +25404,7 @@
                                                     roles, 
                                                     roleAssignments: Object.keys(crcRoleAssignments).length > 0 ? crcRoleAssignments : undefined,
                                                     trainingAssignments: Object.keys(crcTrainingAssignments).length > 0 ? crcTrainingAssignments : undefined,
+                                                    trainingModes: Object.keys(crcTrainingModes).length > 0 ? crcTrainingModes : undefined,
                                                     date: dateStr, 
                                                     groupId, 
                                                     type: 'Site Assignment' 
@@ -25958,9 +26207,19 @@
                             console.log('CHAOS: Study updated successfully');
                             // Update local state so shift creation sees latest requirements immediately
                             const updatedStudy = saved && saved.id ? saved : updateData;
+                            
+                            // Check if visit names changed - if so, we need to refresh the display
+                            const visitNamesChanged = JSON.stringify(oldStudy?.visitNames || {}) !== JSON.stringify(updatedStudy.visitNames || {});
+                            
                             setState({
                                 studies: state.studies.map(s => s.id === studyId ? updatedStudy : s)
                             });
+                            
+                            // If visit names changed, trigger a full render to update all visit displays
+                            if (visitNamesChanged) {
+                                console.log('Visit names changed, refreshing display...');
+                                renderContent();
+                            }
                             // Log change for Catch-Up
                             if (oldStudy) {
                                 const studyName = updatedStudy.title || updatedStudy.name || 'Unknown Study';
@@ -27040,7 +27299,8 @@
                     }
                 });
                 
-                // Collect training assignments
+                // Collect training assignments and training modes
+                const currentTrainingModes = {};
                 const trainingInputs = form.querySelectorAll('select[name^="trainingType-"]');
                 trainingInputs.forEach(input => {
                     const parts = input.name.split('-').slice(1);
@@ -27055,11 +27315,29 @@
                                 currentTrainingAssignments[roleId].push(null);
                             }
                             currentTrainingAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
+                            
+                            // Collect training mode checkboxes
+                            const key = `${roleId}-${index}`;
+                            if (!currentTrainingModes[key]) {
+                                currentTrainingModes[key] = {};
+                            }
+                            const practicumCheckbox = form.querySelector(`input[name="trainingPracticum-${roleId}-${index}"]`);
+                            const finalPracticumCheckbox = form.querySelector(`input[name="trainingFinalPracticum-${roleId}-${index}"]`);
+                            const observationCheckbox = form.querySelector(`input[name="trainingObservation-${roleId}-${index}"]`);
+                            currentTrainingModes[key].practicum = practicumCheckbox ? practicumCheckbox.checked : false;
+                            currentTrainingModes[key].finalPracticum = finalPracticumCheckbox ? finalPracticumCheckbox.checked : false;
+                            currentTrainingModes[key].observation = observationCheckbox ? observationCheckbox.checked : false;
+                            const practicumCheckbox = form.querySelector(`input[name="trainingPracticum-${roleId}-${index}"]`);
+                            const finalPracticumCheckbox = form.querySelector(`input[name="trainingFinalPracticum-${roleId}-${index}"]`);
+                            const observationCheckbox = form.querySelector(`input[name="trainingObservation-${roleId}-${index}"]`);
+                            currentTrainingModes[key].practicum = practicumCheckbox ? practicumCheckbox.checked : false;
+                            currentTrainingModes[key].finalPracticum = finalPracticumCheckbox ? finalPracticumCheckbox.checked : false;
+                            currentTrainingModes[key].observation = observationCheckbox ? observationCheckbox.checked : false;
                         }
                     }
                 });
                 
-                return { currentRoleAssignments, currentTrainingAssignments };
+                return { currentRoleAssignments, currentTrainingAssignments, currentTrainingModes };
             };
 
             const handleShiftStudySiteSelection = async () => {
@@ -27093,13 +27371,15 @@
                 const existingEvent = isEditing ? state.crc_events.find(e => e.id === form.dataset.eventId) : null;
                 
                 // IMPORTANT: Collect current form state BEFORE regenerating to preserve user changes
-                const { currentRoleAssignments, currentTrainingAssignments } = collectCurrentFormRoleAssignments(form);
+                const { currentRoleAssignments, currentTrainingAssignments, currentTrainingModes } = collectCurrentFormRoleAssignments(form);
                 console.log('Current form role assignments:', currentRoleAssignments);
                 console.log('Current form training assignments:', currentTrainingAssignments);
+                console.log('Current form training modes:', currentTrainingModes);
                 
                 // Merge current form state with existing event data (form state takes precedence)
                 const mergedRoleAssignments = existingEvent?.roleAssignments ? { ...existingEvent.roleAssignments } : {};
                 const mergedTrainingAssignments = existingEvent?.trainingAssignments ? { ...existingEvent.trainingAssignments } : {};
+                const mergedTrainingModes = existingEvent?.trainingModes ? { ...existingEvent.trainingModes } : {};
                 
                 // Override with current form state (preserves unsaved changes)
                 Object.keys(currentRoleAssignments).forEach(roleId => {
@@ -27107,6 +27387,9 @@
                 });
                 Object.keys(currentTrainingAssignments).forEach(roleId => {
                     mergedTrainingAssignments[roleId] = currentTrainingAssignments[roleId];
+                });
+                Object.keys(currentTrainingModes).forEach(key => {
+                    mergedTrainingModes[key] = currentTrainingModes[key];
                 });
                 
                 console.log('Is editing:', isEditing, 'Existing event:', existingEvent);
@@ -27124,7 +27407,7 @@
                     .filter((value, index, self) => self.findIndex(v => v.toLowerCase() === value.toLowerCase()) === index)
                     .sort((a, b) => a.localeCompare(b));
                 
-                const buildTrainingTypeSelect = (roleId, index, selectedValue = '') => {
+                const buildTrainingTypeSelect = (roleId, index, selectedValue = '', trainingMode = {}) => {
                     // Get all roles except Training role for the dropdown
                     const availableRoles = state.roles
                         .filter(r => r?.name && !isTrainingRoleName(r.name))
@@ -27138,12 +27421,32 @@
                     const optionsHtml = ['<option value="">Select Role</option>']
                         .concat(availableRoles.map(name => `<option value="${name}" ${name === selectedValue ? 'selected' : ''}>${name}</option>`))
                         .join('');
+                    
+                    // Get training mode values (practicum, finalPracticum, observation)
+                    const isPracticum = trainingMode.practicum || false;
+                    const isFinalPracticum = trainingMode.finalPracticum || false;
+                    const isObservation = trainingMode.observation || false;
+                    
                     return `
-                        <div class="mt-2">
+                        <div class="mt-2 space-y-2">
                             <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Training For Role</label>
                             <select name="trainingType-${roleId}-${index}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                 ${optionsHtml}
                             </select>
+                            <div class="flex flex-wrap gap-3 mt-2">
+                                <label class="flex items-center text-xs">
+                                    <input type="checkbox" name="trainingPracticum-${roleId}-${index}" ${isPracticum ? 'checked' : ''} class="mr-1 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                    <span class="text-gray-700 dark:text-gray-300">Practicum</span>
+                                </label>
+                                <label class="flex items-center text-xs">
+                                    <input type="checkbox" name="trainingFinalPracticum-${roleId}-${index}" ${isFinalPracticum ? 'checked' : ''} class="mr-1 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                    <span class="text-gray-700 dark:text-gray-300">Final Practicum</span>
+                                </label>
+                                <label class="flex items-center text-xs">
+                                    <input type="checkbox" name="trainingObservation-${roleId}-${index}" ${isObservation ? 'checked' : ''} class="mr-1 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                    <span class="text-gray-700 dark:text-gray-300">Observation</span>
+                                </label>
+                            </div>
                         </div>
                     `;
                 };
@@ -27155,6 +27458,14 @@
                     const assignments = existingEvent.trainingAssignments[roleId];
                     if (!Array.isArray(assignments)) return '';
                     return assignments[index] || '';
+                };
+                
+                const getExistingTrainingMode = (roleId, index) => {
+                    const key = `${roleId}-${index}`;
+                    if (!existingEvent || !existingEvent.trainingModes || typeof existingEvent.trainingModes !== 'object') {
+                        return {};
+                    }
+                    return existingEvent.trainingModes[key] || {};
                 };
                 
                 const selectedStudyIds = Array.from(studySelect.selectedOptions).map(option => option.value).filter(id => id);
@@ -27245,9 +27556,11 @@
                                                 // Only show CRCs who have valid training for this role
                                                 const qualifiedCrcs = state.crcs.filter(c => hasValidTraining(c, roleName))
                                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                                                // Get training type from merged data (form state takes precedence)
+                                                // Get training type and mode from merged data (form state takes precedence)
                                                 const trainingTypeValue = (mergedTrainingAssignments[roleId] && mergedTrainingAssignments[roleId][index]) || getExistingTrainingType(roleId, index);
-                                                const trainingTypeBlock = isTrainingRoleName(roleName) ? buildTrainingTypeSelect(roleId, index, trainingTypeValue) : '';
+                                                const trainingModeKey = `${roleId}-${index}`;
+                                                const trainingMode = mergedTrainingModes[trainingModeKey] || getExistingTrainingMode(roleId, index);
+                                                const trainingTypeBlock = isTrainingRoleName(roleName) ? buildTrainingTypeSelect(roleId, index, trainingTypeValue, trainingMode) : '';
                                                 
                                                 return `
                                                     <div class="space-y-1">
@@ -27597,10 +27910,10 @@
                         if (!roleName) continue;
                         const roleKey = roleName.toLowerCase();
                         if (seenRoleNames.has(roleKey)) continue;
-                        // Get existing assignments for this role if editing
-                        const existingAssignments = existingEvent && existingEvent.roleAssignments && existingEvent.roleAssignments[role.id] 
+                        // Get existing assignments for this role if editing - use merged data to preserve form state
+                        const existingAssignments = (mergedRoleAssignments[role.id] || (existingEvent && existingEvent.roleAssignments && existingEvent.roleAssignments[role.id] 
                             ? existingEvent.roleAssignments[role.id].filter(Boolean) 
-                            : [];
+                            : [])).filter(Boolean);
                         const existingCrcId = existingAssignments[0] || '';
                         
                         // Only show CRCs who have valid training for this role
@@ -27772,7 +28085,8 @@
                                     const options = buildRoleOptions(index);
                                     const isTraining = isTrainingRoleName(role.name);
                                     const existingTrainingType = getExistingTrainingType(role.id, index);
-                                    const trainingTypeSelect = isTraining ? buildTrainingTypeSelect(role.id, index, existingTrainingType) : '';
+                                    const existingTrainingMode = getExistingTrainingMode(role.id, index);
+                                    const trainingTypeSelect = isTraining ? buildTrainingTypeSelect(role.id, index, existingTrainingType, existingTrainingMode) : '';
                                     return `
                                         <div class="space-y-1">
                                             <div class="flex items-center gap-2">
@@ -27795,36 +28109,41 @@
                     roleAssignmentContainer.innerHTML = roleAssignmentHTML;
                     console.log('Manual role assignment HTML generated and inserted');
                     
-                    // Explicitly set select values to ensure existing assignments are displayed
-                    if (isEditing && existingEvent && existingEvent.roleAssignments) {
-                        Object.entries(existingEvent.roleAssignments).forEach(([roleId, assignments]) => {
-                            assignments.forEach((crcId, index) => {
-                                if (crcId) {
-                                    const select = roleAssignmentContainer.querySelector(`select[name="role-${roleId}-${index}"]`);
-                                    if (select) {
-                                        select.value = crcId;
-                                        console.log(`Set select role-${roleId}-${index} to ${crcId}`);
-                                    }
-                                }
-                            });
-                        });
-                        
-                        // Also set training type select values if they exist
-                        if (existingEvent.trainingAssignments && typeof existingEvent.trainingAssignments === 'object') {
-                            Object.entries(existingEvent.trainingAssignments).forEach(([roleId, trainingArray]) => {
-                                if (Array.isArray(trainingArray)) {
-                                    trainingArray.forEach((trainingType, index) => {
-                                        if (trainingType) {
-                                            const trainingSelect = roleAssignmentContainer.querySelector(`select[name="trainingType-${roleId}-${index}"]`);
-                                            if (trainingSelect) {
-                                                trainingSelect.value = trainingType;
-                                                console.log(`Set training type select trainingType-${roleId}-${index} to ${trainingType}`);
-                                            }
+                    // Explicitly set select values to ensure existing assignments are displayed - use merged data to preserve form state
+                    const roleAssignmentsToRestore = Object.keys(mergedRoleAssignments).length > 0 ? mergedRoleAssignments : (existingEvent?.roleAssignments || {});
+                    const trainingAssignmentsToRestore = Object.keys(mergedTrainingAssignments).length > 0 ? mergedTrainingAssignments : (existingEvent?.trainingAssignments || {});
+                    
+                    if (Object.keys(roleAssignmentsToRestore).length > 0) {
+                        Object.entries(roleAssignmentsToRestore).forEach(([roleId, assignments]) => {
+                            if (Array.isArray(assignments)) {
+                                assignments.forEach((crcId, index) => {
+                                    if (crcId) {
+                                        const select = roleAssignmentContainer.querySelector(`select[name="role-${roleId}-${index}"]`);
+                                        if (select) {
+                                            select.value = crcId;
+                                            console.log(`Set select role-${roleId}-${index} to ${crcId} (preserved from form state)`);
                                         }
-                                    });
-                                }
-                            });
-                        }
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    
+                    // Also set training type select values if they exist - use merged data
+                    if (Object.keys(trainingAssignmentsToRestore).length > 0) {
+                        Object.entries(trainingAssignmentsToRestore).forEach(([roleId, trainingArray]) => {
+                            if (Array.isArray(trainingArray)) {
+                                trainingArray.forEach((trainingType, index) => {
+                                    if (trainingType) {
+                                        const trainingSelect = roleAssignmentContainer.querySelector(`select[name="trainingType-${roleId}-${index}"]`);
+                                        if (trainingSelect) {
+                                            trainingSelect.value = trainingType;
+                                            console.log(`Set training type select trainingType-${roleId}-${index} to ${trainingType} (preserved from form state)`);
+                                        }
+                                    }
+                                });
+                            }
+                        });
                     }
                     
                     // Add event listeners for quantity changes
@@ -27883,7 +28202,7 @@
                                     
                                     // Add training dropdown if this is a training role
                                     if (isTraining) {
-                                        const trainingTypeSelect = buildTrainingTypeSelect(roleId, i, '');
+                                        const trainingTypeSelect = buildTrainingTypeSelect(roleId, i, '', {});
                                         const tempDiv = document.createElement('div');
                                         tempDiv.innerHTML = trainingTypeSelect;
                                         if (tempDiv.firstElementChild) {
@@ -27951,11 +28270,11 @@
                     
                     console.log(`Processing role: ${role.name} (${roleQuantity} needed)`);
                     
-                    // Get existing assignments for this role if editing
-                    const existingAssignments = existingEvent && existingEvent.roleAssignments && existingEvent.roleAssignments[roleId] 
+                    // Get existing assignments for this role if editing - use merged data to preserve form state
+                    const existingAssignments = (mergedRoleAssignments[roleId] || (existingEvent && existingEvent.roleAssignments && existingEvent.roleAssignments[roleId] 
                         ? existingEvent.roleAssignments[roleId].filter(Boolean) 
-                        : [];
-                    console.log(`Existing assignments for ${role.name}:`, existingAssignments);
+                        : [])).filter(Boolean);
+                    console.log(`Existing assignments for ${role.name}:`, existingAssignments, '(preserved from form state)');
                     
                     // Get CRCs who can fill this role (only show those with valid training)
                     let qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, role.name))
@@ -28132,7 +28451,8 @@
                                     const options = buildRoleOptions(index);
                                     const isTraining = isTrainingRoleName(role.name);
                                     const existingTrainingType = getExistingTrainingType(roleId, index);
-                                    const trainingTypeSelect = isTraining ? buildTrainingTypeSelect(roleId, index, existingTrainingType) : '';
+                                    const existingTrainingMode = getExistingTrainingMode(roleId, index);
+                                    const trainingTypeSelect = isTraining ? buildTrainingTypeSelect(roleId, index, existingTrainingType, existingTrainingMode) : '';
                                     return `
                                         <div class="space-y-1">
                                             <div class="flex items-center gap-2">
@@ -28282,7 +28602,7 @@
                                     
                                     // Add training dropdown if this is a training role
                                     if (isTraining) {
-                                        const trainingTypeSelect = buildTrainingTypeSelect(roleId, i, '');
+                                        const trainingTypeSelect = buildTrainingTypeSelect(roleId, i, '', {});
                                         const tempDiv = document.createElement('div');
                                         tempDiv.innerHTML = trainingTypeSelect;
                                         slotContainerDiv.appendChild(tempDiv.firstElementChild);
@@ -28470,11 +28790,17 @@
                     let endTravelDateStr = '';
                     
                     if (startDate) {
-                        startTravelDate = new Date(new Date(startDate).getTime() - 24 * 60 * 60 * 1000);
+                        // Calculate travel date as exactly 1 day before start date
+                        const startDateObj = new Date(startDate + 'T00:00:00');
+                        startDateObj.setDate(startDateObj.getDate() - 1);
+                        startTravelDate = startDateObj;
                         startTravelDateStr = toDateOnlyString(startTravelDate);
                     }
                     if (endDate) {
-                        endTravelDate = new Date(new Date(endDate).getTime() + 24 * 60 * 60 * 1000);
+                        // Calculate travel date as exactly 1 day after end date
+                        const endDateObj = new Date(endDate + 'T00:00:00');
+                        endDateObj.setDate(endDateObj.getDate() + 1);
+                        endTravelDate = endDateObj;
                         endTravelDateStr = toDateOnlyString(endTravelDate);
                     }
                     
@@ -33211,7 +33537,26 @@
             const syncApprovedTimeOffRequests = async (timeOffRequests) => {
                 try {
                     const approvedRequests = timeOffRequests.filter(req => req.status === 'approved');
+                    const approvedRequestIds = new Set(approvedRequests.map(req => req.id));
                     
+                    // First, remove events for requests that are no longer approved (rejected, deleted, or pending)
+                    const eventsToRemove = state.crc_events.filter(e => 
+                        e.timeOffRequestId && 
+                        !approvedRequestIds.has(e.timeOffRequestId) &&
+                        (e.type === 'Unavailable' || e.type === 'Paid Time Off')
+                    );
+                    
+                    for (const eventToRemove of eventsToRemove) {
+                        try {
+                            await apiService.deleteEvent(eventToRemove.id);
+                            state.crc_events = state.crc_events.filter(e => e.id !== eventToRemove.id);
+                            console.log(`Removed event for non-approved time off request: ${eventToRemove.timeOffRequestId}`);
+                        } catch (deleteError) {
+                            console.error('Error deleting event for non-approved request:', deleteError);
+                        }
+                    }
+                    
+                    // Then, create events for approved requests that don't have events yet
                     for (const request of approvedRequests) {
                         const date = request.date || request.startDate;
                         if (!date || !request.crcId) continue;
@@ -33220,8 +33565,8 @@
                         const existingEvent = state.crc_events.find(e => 
                             e.crcId === request.crcId && 
                             e.date === date && 
-                            e.type === 'Unavailable' &&
-                            (e.timeOffRequestId === request.id || (!e.timeOffRequestId && e.name === request.type))
+                            (e.type === 'Unavailable' || e.type === 'Paid Time Off') &&
+                            e.timeOffRequestId === request.id
                         );
                         
                         if (!existingEvent) {
@@ -33229,7 +33574,7 @@
                             const eventData = {
                                 crcId: request.crcId,
                                 date: date,
-                                type: 'Unavailable',
+                                type: request.type === 'Paid Time Off' ? 'Paid Time Off' : 'Unavailable',
                                 name: request.type || 'Vacation',
                                 period: request.period || 'Full Day',
                                 hours: request.hours || (request.period === 'Full Day' ? 8 : 4),
@@ -33241,6 +33586,7 @@
                                 const createdEvent = await apiService.createEvent(eventData);
                                 const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
                                 state.crc_events = [...state.crc_events, newEvent];
+                                console.log(`Created event for approved time off request: ${request.id}`);
                             } catch (eventError) {
                                 console.error('Error syncing time off request to event:', eventError);
                             }
