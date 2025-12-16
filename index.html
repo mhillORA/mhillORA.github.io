@@ -27714,7 +27714,78 @@
                 console.log('Current form training modes:', currentTrainingModes);
                 
                 // Merge current form state with existing event data (form state takes precedence)
-                const mergedRoleAssignments = existingEvent?.roleAssignments ? { ...existingEvent.roleAssignments } : {};
+                let mergedRoleAssignments = existingEvent?.roleAssignments ? { ...existingEvent.roleAssignments } : {};
+                
+                // IMPORTANT: Handle legacy events that use crcId instead of roleAssignments
+                // If roleAssignments is empty but crcId exists, convert it to roleAssignments format
+                if (existingEvent && Object.keys(mergedRoleAssignments).length === 0 && existingEvent.crcId) {
+                    console.log('Legacy event detected: converting crcId to roleAssignments format');
+                    // Get the roles from the event (legacy events have roles array)
+                    const legacyRoles = existingEvent.roles || [];
+                    if (legacyRoles.length > 0) {
+                        // Create roleAssignments from legacy roles and crcId
+                        legacyRoles.forEach(roleName => {
+                            const role = state.roles.find(r => r.name === roleName);
+                            if (role) {
+                                if (!mergedRoleAssignments[role.id]) {
+                                    mergedRoleAssignments[role.id] = [];
+                                }
+                                mergedRoleAssignments[role.id].push(existingEvent.crcId);
+                            }
+                        });
+                    } else {
+                        // If no roles specified, we need to find what role this CRC should be assigned to
+                        // Check study requirements first
+                        if (existingEvent.type === 'Site Assignment' && existingEvent.studyIds && existingEvent.studyIds.length > 0) {
+                            const study = state.studies.find(s => s.id === existingEvent.studyIds[0]);
+                            if (study) {
+                                // Try requiredRoles first
+                                if (study.requiredRoles && study.requiredRoles.length > 0) {
+                                    const roleId = study.requiredRoles[0];
+                                    const role = state.roles.find(r => r.id === roleId);
+                                    if (role) {
+                                        mergedRoleAssignments[roleId] = [existingEvent.crcId];
+                                        console.log(`Assigned legacy crcId to role ${role.name} based on study.requiredRoles`);
+                                    }
+                                }
+                                // If still empty, try visitRoleRequirements default
+                                if (Object.keys(mergedRoleAssignments).length === 0 && study.visitRoleRequirements && study.visitRoleRequirements['default']) {
+                                    const defaultReqs = study.visitRoleRequirements['default'];
+                                    const firstRoleId = Object.keys(defaultReqs)[0];
+                                    if (firstRoleId) {
+                                        const role = state.roles.find(r => r.id === firstRoleId);
+                                        if (role) {
+                                            mergedRoleAssignments[firstRoleId] = [existingEvent.crcId];
+                                            console.log(`Assigned legacy crcId to role ${role.name} based on study.visitRoleRequirements['default']`);
+                                        }
+                                    }
+                                }
+                                // If still empty, try siteRoleRequirements
+                                if (Object.keys(mergedRoleAssignments).length === 0 && existingEvent.siteId && study.siteRoleRequirements && study.siteRoleRequirements[existingEvent.siteId]) {
+                                    const siteReqs = study.siteRoleRequirements[existingEvent.siteId];
+                                    const firstRoleId = Object.keys(siteReqs)[0];
+                                    if (firstRoleId) {
+                                        const role = state.roles.find(r => r.id === firstRoleId);
+                                        if (role) {
+                                            mergedRoleAssignments[firstRoleId] = [existingEvent.crcId];
+                                            console.log(`Assigned legacy crcId to role ${role.name} based on study.siteRoleRequirements`);
+                                        }
+                                    }
+                                }
+                            }
+                            // Final fallback: use training role if study requires it
+                            if (Object.keys(mergedRoleAssignments).length === 0) {
+                                const trainingRole = state.roles.find(r => isTrainingRoleName(r.name));
+                                if (trainingRole) {
+                                    mergedRoleAssignments[trainingRole.id] = [existingEvent.crcId];
+                                    console.log(`Assigned legacy crcId to Training role as final fallback`);
+                                }
+                            }
+                        }
+                    }
+                    console.log('Converted legacy event to roleAssignments:', mergedRoleAssignments);
+                }
+                
                 const mergedTrainingAssignments = existingEvent?.trainingAssignments ? { ...existingEvent.trainingAssignments } : {};
                 const mergedTrainingModes = existingEvent?.trainingModes ? { ...existingEvent.trainingModes } : {};
                 
@@ -28580,6 +28651,29 @@
                 // Generate role assignment interface
                 let roleAssignmentHTML = '<div class="space-y-4">';
                 console.log('Generating role assignment interface for', requiredRoles.size, 'roles');
+                
+                // IMPORTANT: If editing and we have existing roleAssignments, merge them with required roles
+                // This ensures we show all existing assignments even if they're not in the study requirements
+                if (isEditing && existingEvent && existingEvent.roleAssignments && Object.keys(existingEvent.roleAssignments).length > 0) {
+                    console.log('Merging existing roleAssignments with required roles');
+                    Object.keys(existingEvent.roleAssignments).forEach(roleId => {
+                        if (!requiredRoles.has(roleId)) {
+                            // Add role to requiredRoles if it exists in roleAssignments but not in study requirements
+                            const role = state.roles.find(r => r.id === roleId);
+                            if (role) {
+                                const existingCount = existingEvent.roleAssignments[roleId]?.length || 0;
+                                requiredRoles.set(roleId, Math.max(requiredRoles.get(roleId) || 0, existingCount));
+                                console.log(`Added role ${role.name} to requiredRoles with quantity ${requiredRoles.get(roleId)}`);
+                            }
+                        } else {
+                            // Ensure quantity is at least as many as existing assignments
+                            const existingCount = existingEvent.roleAssignments[roleId]?.length || 0;
+                            const requiredCount = requiredRoles.get(roleId) || 0;
+                            requiredRoles.set(roleId, Math.max(requiredCount, existingCount));
+                            console.log(`Updated role ${roleId} quantity to ${requiredRoles.get(roleId)} (existing: ${existingCount}, required: ${requiredCount})`);
+                        }
+                    });
+                }
                 
                 // Sort roles by Excel order before processing, but prioritize MedHX if selected
                 const sortedRoleEntries = Array.from(requiredRoles.entries()).sort(([roleIdA], [roleIdB]) => {
