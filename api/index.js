@@ -3396,7 +3396,6 @@ app.http('navanImport', {
             }
 
             let body = {};
-            let backdoorMode = false;
             try {
                 // Try to read the request body as JSON
                 body = await request.json();
