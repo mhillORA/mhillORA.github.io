@@ -3683,10 +3683,10 @@ app.http('navanImport', {
                     }
                 }
                 } else {
-                    // Set an extremely conservative default to beat the 30-second platform timeout.
-                    // 7 days past and 7 days future (14 days total) should complete in 1-2 page fetches
-                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 7;
-                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 7;
+                    // Default: 30 days past, 60 days future (90 days total)
+                    // This range should complete within the 30-second platform timeout
+                    const pastDays = Number.isFinite(body.pastDays) ? Math.max(0, Number(body.pastDays)) : 30;
+                    const futureDays = Number.isFinite(body.futureDays) ? Math.max(0, Number(body.futureDays)) : 60;
 
                     // Warn if date range is very large (could cause timeout)
                     if (pastDays > 180) {
