@@ -2314,7 +2314,20 @@ const upsertNavanBooking = async (context, booking, {
     crcResolver = null,
     allowFallbackCrc = true
 } = {}) => {
-    const travelContainer = readOnly ? null : getContainer('travel');
+    let travelContainer = null;
+    if (!readOnly) {
+        try {
+            travelContainer = getContainer('travel');
+        } catch (containerError) {
+            context.log.error('upsertNavanBooking: Error getting travel container:', containerError.message);
+            context.log.error('upsertNavanBooking: Container error stack:', containerError.stack);
+            // If container doesn't exist, throw a clear error
+            if (containerError.code === 404 || (containerError.message && containerError.message.includes('NotFound'))) {
+                throw new Error("DATABASE_ERROR: 'travel' container not found. Please create the 'travel' container in Cosmos DB with partition key '/id'.");
+            }
+            throw containerError;
+        }
+    }
     const { crcId, travelerName, matched } = await resolveCrcIdForNavanBooking(booking, context, { allowFallbackName: allowFallbackCrc, crcResolver });
 
     if (!crcId) {
