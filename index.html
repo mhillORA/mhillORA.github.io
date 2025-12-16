@@ -11437,19 +11437,17 @@
                             const uniqueDayEvents = Array.from(new Map(dayEvents.map(e => [e.id, e])).values());
                             tableHtml += `<td class="global-view-cell bg-white dark:bg-gray-900 align-top p-1 custom-scrollbar" data-action="open-crc-event-modal" data-date="${dateStr}">`;
                             
+                            // Create one block for EVERY role assignment - each role + CRC combination gets its own block
                             uniqueDayEvents.forEach(event => {
-                                // Get CRCs from both legacy crcId and new roleAssignments
-                                const eventCrcs = getEventCRCs(event);
-                                const primaryCrc = eventCrcs.length > 0 ? eventCrcs[0] : null;
                                 const eventSite = state.crc_sites.find(s => s.id === event.siteId);
+                                const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
                                 const pi = event.principalInvestigator || eventSite?.principalInvestigator;
-                                let eventBgColor = eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
+                                let eventBgColor = eventSite?.color || study?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
                                 if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
                                 else if (event.type === 'Travel Day') eventBgColor = isDarkMode ? '#431407' : '#fed7aa';
                                 const eventTextColor = getContrastColor(eventBgColor);
                                 const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                 const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
-                                const travelText = event.type === 'Travel Day' ? `<span class="font-bold" style="color: ${spanTextColor}">TRAVEL</span><br>` : '';
                                 
                                 // Check role fulfillment
                                 const roleFulfillment = checkRoleFulfillment(event);
@@ -11457,7 +11455,13 @@
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                     `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
                                 
-                                // Build tooltip with missing roles info (only shown on hover/click)
+                                // Build header with visit and group (V1G1 format)
+                                const visitGroupHeader = [];
+                                if (event.visitNumber) visitGroupHeader.push(`V${event.visitNumber}`);
+                                if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
+                                const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join('') + ' - ' : '';
+                                
+                                // Build tooltip
                                 const tooltipParts = [];
                                 if (event.notes) tooltipParts.push(event.notes);
                                 if (!roleFulfillment.fulfilled && roleFulfillment.missingRoles.length > 0) {
@@ -11468,41 +11472,93 @@
                                 if (event.period && event.period !== 'Full Day') tooltipParts.push(`Period: ${event.period}`);
                                 const tooltip = tooltipParts.length > 0 ? tooltipParts.join('\n') : '';
                                 
-                                // Build header with visit and group (V1G1 format)
-                                const visitGroupHeader = [];
-                                if (event.visitNumber) visitGroupHeader.push(`V${event.visitNumber}`);
-                                if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
-                                const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join('') + ' - ' : '';
-                                
-                                // Get roles for this event - show role first, then CRC name (without visit header since it's shown separately)
-                                // Use getAllEventRoles to get all roles including empty ones
-                                const allRoles = getAllEventRoles(event);
-                                const roleNames = allRoles.length > 0 ? allRoles : getEventRoles(event);
-                                
-                                // Build display text (site and study removed - shown in table headers)
-                                let displayParts = [];
-                                
-                                // Add roles if available - show only first role or count if multiple
-                                if (roleNames.length > 0) {
-                                    if (roleNames.length === 1) {
-                                        displayParts.push(roleNames[0]);
+                                // For Travel Day events, create one block per traveler
+                                if (event.type === 'Travel Day') {
+                                    const eventCrcs = getEventCRCs(event);
+                                    if (eventCrcs.length > 0) {
+                                        eventCrcs.forEach(crc => {
+                                            const displayText = `Travel - ${crc.name.split(' ')[0]}`;
+                                            tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                                ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                                <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                            </div>`;
+                                        });
                                     } else {
-                                        displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                                        const displayText = 'Travel - Unassigned';
+                                        tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                            ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                            <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                        </div>`;
                                     }
+                                } else if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                                    // Create one block for each role assignment (role + CRC)
+                                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                        const role = state.roles.find(r => r.id === roleId);
+                                        if (!role) return;
+                                        
+                                        // Format role name (handle training roles)
+                                        let roleDisplayName = role.name;
+                                        if (isTrainingRoleName(role.name)) {
+                                            if (event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                                const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                                                if (trainingTypes.length > 0) {
+                                                    roleDisplayName = `Training - ${trainingTypes.join(', ')}`;
+                                                } else {
+                                                    roleDisplayName = `Training`;
+                                                }
+                                            } else {
+                                                roleDisplayName = `Training`;
+                                            }
+                                        }
+                                        
+                                        if (Array.isArray(assignments) && assignments.length > 0) {
+                                            // Create one block per CRC assigned to this role
+                                            assignments.forEach(crcId => {
+                                                if (!crcId) return;
+                                                
+                                                let crcDisplayName;
+                                                if (crcId === 'SITE_STAFF') {
+                                                    crcDisplayName = 'Site Staff';
+                                                } else {
+                                                    const crc = state.crcs.find(c => c.id === crcId);
+                                                    crcDisplayName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                                }
+                                                
+                                                const displayText = `${roleDisplayName} - ${crcDisplayName}`;
+                                                tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                                    ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                                    <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                                </div>`;
+                                            });
+                                        } else {
+                                            // Role exists but no one assigned - show empty role
+                                            const displayText = `${roleDisplayName} - Unassigned`;
+                                            tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                                ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                                <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                            </div>`;
+                                        }
+                                    });
+                                } else if (event.crcId) {
+                                    // Legacy: event has crcId but no roleAssignments
+                                    const crc = state.crcs.find(c => c.id === event.crcId);
+                                    const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                    const allRoles = getAllEventRoles(event);
+                                    const roleNames = allRoles.length > 0 ? allRoles : getEventRoles(event);
+                                    const roleDisplay = roleNames.length > 0 ? roleNames.join(', ') : event.type;
+                                    const displayText = `${roleDisplay} - ${crcName}`;
+                                    tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                        ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                        <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                    </div>`;
+                                } else {
+                                    // No assignments - show open shift
+                                    const displayText = 'Open Shift';
+                                    tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                        ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                        <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                    </div>`;
                                 }
-                                
-                                // Add CRC name if available
-                                if (primaryCrc) {
-                                    displayParts.push(primaryCrc.name.split(' ')[0]);
-                                }
-                                
-                                // Build final display text
-                                let displayText = displayParts.length > 0 ? displayParts.join(' - ') : 'Open Shift';
-                                
-                                tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                    ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
-                                    <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
-                                </div>`;
                             });
                             tableHtml += `</td>`;
                         });
@@ -12254,19 +12310,17 @@
                             const uniqueDayEvents = Array.from(new Map(dayEvents.map(e => [e.id, e])).values());
                             tableHtml += `<td class="global-view-cell bg-white dark:bg-gray-900 align-top p-1 custom-scrollbar" data-action="open-crc-event-modal" data-date="${dateStr}">`;
                             
+                            // Create one block for EVERY role assignment - each role + CRC combination gets its own block
                             uniqueDayEvents.forEach(event => {
-                                // Get CRCs from both legacy crcId and new roleAssignments
-                                const eventCrcs = getEventCRCs(event);
-                                const primaryCrc = eventCrcs.length > 0 ? eventCrcs[0] : null;
                                 const eventSite = state.crc_sites.find(s => s.id === event.siteId);
+                                const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
                                 const pi = event.principalInvestigator || eventSite?.principalInvestigator;
-                                let eventBgColor = eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
+                                let eventBgColor = eventSite?.color || study?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
                                 if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
                                 else if (event.type === 'Travel Day') eventBgColor = isDarkMode ? '#431407' : '#fed7aa';
                                 const eventTextColor = getContrastColor(eventBgColor);
                                 const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                 const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
-                                const travelText = event.type === 'Travel Day' ? `<span class="font-bold" style="color: ${spanTextColor}">TRAVEL</span><br>` : '';
                                 
                                 // Check role fulfillment
                                 const roleFulfillment = checkRoleFulfillment(event);
@@ -12274,7 +12328,13 @@
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                     `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
                                 
-                                // Build tooltip with missing roles info (only shown on hover/click)
+                                // Build header with visit and group (V1G1 format)
+                                const visitGroupHeader = [];
+                                if (event.visitNumber) visitGroupHeader.push(`V${event.visitNumber}`);
+                                if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
+                                const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join('') + ' - ' : '';
+                                
+                                // Build tooltip
                                 const tooltipParts = [];
                                 if (event.notes) tooltipParts.push(event.notes);
                                 if (!roleFulfillment.fulfilled && roleFulfillment.missingRoles.length > 0) {
@@ -12285,41 +12345,93 @@
                                 if (event.period && event.period !== 'Full Day') tooltipParts.push(`Period: ${event.period}`);
                                 const tooltip = tooltipParts.length > 0 ? tooltipParts.join('\n') : '';
                                 
-                                // Build header with visit and group (V1G1 format)
-                                const visitGroupHeader = [];
-                                if (event.visitNumber) visitGroupHeader.push(`V${event.visitNumber}`);
-                                if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
-                                const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join('') + ' - ' : '';
-                                
-                                // Get roles for this event - show role first, then CRC name (without visit header since it's shown separately)
-                                // Use getAllEventRoles to get all roles including empty ones
-                                const allRoles = getAllEventRoles(event);
-                                const roleNames = allRoles.length > 0 ? allRoles : getEventRoles(event);
-                                
-                                // Build display text (site and study removed - shown in table headers)
-                                let displayParts = [];
-                                
-                                // Add roles if available - show only first role or count if multiple
-                                if (roleNames.length > 0) {
-                                    if (roleNames.length === 1) {
-                                        displayParts.push(roleNames[0]);
+                                // For Travel Day events, create one block per traveler
+                                if (event.type === 'Travel Day') {
+                                    const eventCrcs = getEventCRCs(event);
+                                    if (eventCrcs.length > 0) {
+                                        eventCrcs.forEach(crc => {
+                                            const displayText = `Travel - ${crc.name.split(' ')[0]}`;
+                                            tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                                ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                                <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                            </div>`;
+                                        });
                                     } else {
-                                        displayParts.push(`${roleNames[0]} (+${roleNames.length - 1})`);
+                                        const displayText = 'Travel - Unassigned';
+                                        tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                            ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                            <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                        </div>`;
                                     }
+                                } else if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                                    // Create one block for each role assignment (role + CRC)
+                                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                        const role = state.roles.find(r => r.id === roleId);
+                                        if (!role) return;
+                                        
+                                        // Format role name (handle training roles)
+                                        let roleDisplayName = role.name;
+                                        if (isTrainingRoleName(role.name)) {
+                                            if (event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                                const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                                                if (trainingTypes.length > 0) {
+                                                    roleDisplayName = `Training - ${trainingTypes.join(', ')}`;
+                                                } else {
+                                                    roleDisplayName = `Training`;
+                                                }
+                                            } else {
+                                                roleDisplayName = `Training`;
+                                            }
+                                        }
+                                        
+                                        if (Array.isArray(assignments) && assignments.length > 0) {
+                                            // Create one block per CRC assigned to this role
+                                            assignments.forEach(crcId => {
+                                                if (!crcId) return;
+                                                
+                                                let crcDisplayName;
+                                                if (crcId === 'SITE_STAFF') {
+                                                    crcDisplayName = 'Site Staff';
+                                                } else {
+                                                    const crc = state.crcs.find(c => c.id === crcId);
+                                                    crcDisplayName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                                }
+                                                
+                                                const displayText = `${roleDisplayName} - ${crcDisplayName}`;
+                                                tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                                    ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                                    <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                                </div>`;
+                                            });
+                                        } else {
+                                            // Role exists but no one assigned - show empty role
+                                            const displayText = `${roleDisplayName} - Unassigned`;
+                                            tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                                ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                                <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                            </div>`;
+                                        }
+                                    });
+                                } else if (event.crcId) {
+                                    // Legacy: event has crcId but no roleAssignments
+                                    const crc = state.crcs.find(c => c.id === event.crcId);
+                                    const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                    const allRoles = getAllEventRoles(event);
+                                    const roleNames = allRoles.length > 0 ? allRoles : getEventRoles(event);
+                                    const roleDisplay = roleNames.length > 0 ? roleNames.join(', ') : event.type;
+                                    const displayText = `${roleDisplay} - ${crcName}`;
+                                    tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                        ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                        <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                    </div>`;
+                                } else {
+                                    // No assignments - show open shift
+                                    const displayText = 'Open Shift';
+                                    tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                        ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                        <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                    </div>`;
                                 }
-                                
-                                // Add CRC name if available
-                                if (primaryCrc) {
-                                    displayParts.push(primaryCrc.name.split(' ')[0]);
-                                }
-                                
-                                // Build final display text
-                                let displayText = displayParts.length > 0 ? displayParts.join(' - ') : 'Open Shift';
-                                
-                                tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                    ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
-                                    <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
-                                </div>`;
                             });
                             tableHtml += `</td>`;
                         }
