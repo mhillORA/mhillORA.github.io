@@ -36,7 +36,7 @@ const getFetch = async () => {
                 fetch = global.fetch;
                 console.log('Using global fetch');
             } else {
-                // Try ESM import first (node-fetch v3 is ESM-only)
+                // Try ESM imports first (node-fetch v3 is ESM-only)
                 try {
                     const nodeFetch = await import('node-fetch');
                     fetch = normalizeFetch(nodeFetch);
