@@ -3610,7 +3610,7 @@
                 return null;
             };
 
-            const isCRCUnavailable = (crcId, date, period) => {
+            const isCRCUnavailable = (crcId, date, period, excludeEventId = null) => {
                 if (!crcId || !date) return false;
                 
                 // Check for rejected time off requests - if rejected, they should be available
@@ -3628,6 +3628,33 @@
                 // If there's a rejected time off request for this date, they are available
                 if (rejectedTimeOffRequest) return false;
                 
+                // Check for ANY Site Assignment on this date (excluding the current event if editing)
+                const conflictingSiteAssignments = state.crc_events.filter(event => {
+                    // Exclude the current event being edited
+                    if (excludeEventId && event.id === excludeEventId) return false;
+                    
+                    // Must be a Site Assignment on the same date
+                    if (event.type !== 'Site Assignment' || event.date !== date) return false;
+                    
+                    // Check if this CRC is assigned to this event
+                    if (event.crcId === crcId) return true;
+                    
+                    // Check roleAssignments
+                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                        return Object.values(event.roleAssignments).some(assignments => {
+                            if (Array.isArray(assignments)) {
+                                return assignments.includes(crcId);
+                            }
+                            return false;
+                        });
+                    }
+                    
+                    return false;
+                });
+                
+                // If there's a conflicting Site Assignment, they are unavailable
+                if (conflictingSiteAssignments.length > 0) return true;
+                
                 // Get approved time off request IDs
                 const approvedRequestIds = new Set(
                     state.timeOffRequests
@@ -3637,12 +3664,15 @@
                 
                 // Check if CRC has any events on this date that would make them unavailable
                 // Only consider events that have approved time off requests or are manually created (no timeOffRequestId)
-                const eventsOnDate = state.crc_events.filter(event => 
-                    event.crcId === crcId && 
-                    event.date === date &&
-                    (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
-                    (!event.timeOffRequestId || approvedRequestIds.has(event.timeOffRequestId))
-                );
+                const eventsOnDate = state.crc_events.filter(event => {
+                    // Exclude the current event being edited
+                    if (excludeEventId && event.id === excludeEventId) return false;
+                    
+                    return event.crcId === crcId && 
+                           event.date === date &&
+                           (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
+                           (!event.timeOffRequestId || approvedRequestIds.has(event.timeOffRequestId));
+                });
                 
                 // Check for approved time off requests (including multi-day ranges)
                 const approvedTimeOffRequest = state.timeOffRequests.find(req => {
@@ -3674,6 +3704,43 @@
                 return eventsOnDate.some(event => 
                     !event.period || event.period === 'Full Day' || event.period === period
                 );
+            };
+            
+            // Helper function to get conflicting appointment info for display
+            const getConflictingAppointmentInfo = (crcId, date, excludeEventId = null) => {
+                const conflictingEvents = state.crc_events.filter(event => {
+                    if (excludeEventId && event.id === excludeEventId) return false;
+                    if (event.type !== 'Site Assignment' || event.date !== date) return false;
+                    
+                    if (event.crcId === crcId) return true;
+                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                        return Object.values(event.roleAssignments).some(assignments => {
+                            if (Array.isArray(assignments)) {
+                                return assignments.includes(crcId);
+                            }
+                            return false;
+                        });
+                    }
+                    return false;
+                });
+                
+                if (conflictingEvents.length === 0) return null;
+                
+                // Get info from first conflicting event
+                const conflict = conflictingEvents[0];
+                const site = state.crc_sites.find(s => s.id === conflict.siteId);
+                const study = conflict.studyIds && conflict.studyIds.length > 0 
+                    ? state.studies.find(s => s.id === conflict.studyIds[0])
+                    : null;
+                
+                const siteName = site ? site.name : 'Unknown Site';
+                const studyName = study ? (study.title || study.name) : 'Unknown Study';
+                
+                return {
+                    site: siteName,
+                    study: studyName,
+                    event: conflict
+                };
             };
 
             const getEventRoles = (event) => {
@@ -28856,9 +28923,11 @@
                         const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
                         
                         // Calculate availability and distance for each CRC, then sort
+                        const excludeEventId = existingEvent ? existingEvent.id : null;
                         const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                            const isUnavailable = isCRCUnavailable(crc.id, date, period);
+                            const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId);
                             const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
+                            const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
                             let distance = null;
                             
                             // Calculate distance if site is available
@@ -28872,6 +28941,7 @@
                                 crc,
                                 isUnavailable,
                                 unavailPeriod,
+                                conflictInfo,
                                 distance,
                                 isSelected: crc.id === existingCrcId,
                                 hasPending,
@@ -28882,8 +28952,9 @@
                         // Add untrained assigned CRCs to the list (marked as untrained)
                         if (untrainedAssignedCrcs.length > 0) {
                             const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
-                                const isUnavailable = isCRCUnavailable(crc.id, date, period);
+                                const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId);
                                 const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
+                                const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
                                 let distance = null;
                                 
                                 if (site) {
@@ -28896,6 +28967,7 @@
                                     crc,
                                     isUnavailable,
                                     unavailPeriod,
+                                    conflictInfo,
                                     distance,
                                     isSelected: existingAssignments.includes(crc.id),
                                     hasPending,
@@ -28905,24 +28977,27 @@
                             crcsWithInfo.push(...untrainedCrcsWithInfo);
                         }
                         
-                        // Sort: available first (by distance), then unavailable (by distance)
+                        // Sort: selected first, then available (by distance), then unavailable at bottom (by name)
                         crcsWithInfo.sort((a, b) => {
                             // Selected items always come first
                             if (a.isSelected !== b.isSelected) {
                                 return a.isSelected ? -1 : 1;
                             }
-                            // Available before unavailable
+                            // Available before unavailable (unavailable goes to bottom)
                             if (a.isUnavailable !== b.isUnavailable) {
                                 return a.isUnavailable ? 1 : -1;
                             }
-                            // Within same availability, sort by distance (closest first)
-                            if (a.distance !== null && b.distance !== null) {
-                                return a.distance - b.distance;
+                            
+                            // For available CRCs: sort by distance (closest first)
+                            if (!a.isUnavailable && !b.isUnavailable) {
+                                if (a.distance !== null && b.distance !== null) {
+                                    return a.distance - b.distance;
+                                }
+                                if (a.distance !== null && b.distance === null) return -1;
+                                if (a.distance === null && b.distance !== null) return 1;
                             }
-                            // If one has distance and other doesn't, prefer the one with distance
-                            if (a.distance !== null && b.distance === null) return -1;
-                            if (a.distance === null && b.distance !== null) return 1;
-                            // Otherwise sort by name
+                            
+                            // For unavailable CRCs at bottom, or if no distance info: sort by name
                             const aName = (a.crc?.name || '').toString();
                             const bName = (b.crc?.name || '').toString();
                             return aName.localeCompare(bName);
@@ -28934,14 +29009,12 @@
                         const siteStaffSelected = assignedCrcId === 'SITE_STAFF' ? 'selected' : '';
                         let optionsHtml = `<option value="SITE_STAFF" ${siteStaffSelected} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
                         
-                        // Add CRC options
-                        optionsHtml += crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, hasPending, isUntrained }) => {
-                            let statusText = '';
-                            if (isUnavailable) {
-                                const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
-                                statusText = ` (Time Off - ${periodText})`;
-                            }
-
+                        // Add CRC options - split into available and unavailable for proper ordering
+                        const availableCrcs = crcsWithInfo.filter(c => !c.isUnavailable);
+                        const unavailableCrcs = crcsWithInfo.filter(c => c.isUnavailable);
+                        
+                        // Add available CRCs first
+                        optionsHtml += availableCrcs.map(({ crc, distance, hasPending, isUntrained }) => {
                             let distanceText = '';
                             if (distance !== null) {
                                 distanceText = ` - ${distance} mi`;
@@ -28951,11 +29024,34 @@
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
                             const styleClasses = [];
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
-                            if (isUnavailable && assignedCrcId !== crc.id) styleClasses.push('text-red-600 dark:text-red-400');
-                            if (hasPending && !isUnavailable && assignedCrcId !== crc.id) styleClasses.push('text-yellow-600 dark:text-yellow-400');
+                            if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${pendingText}${distanceText}${statusText}</option>`;
+                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${pendingText}${distanceText}</option>`;
+                        }).join('');
+                        
+                        // Add unavailable CRCs at the bottom (grayed out but selectable)
+                        optionsHtml += unavailableCrcs.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained }) => {
+                            let statusText = '';
+                            if (conflictInfo) {
+                                statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
+                            } else {
+                                const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
+                                statusText = ` (Time Off - ${periodText})`;
+                            }
+
+                            let distanceText = '';
+                            if (distance !== null && !conflictInfo) {
+                                distanceText = ` - ${distance} mi`;
+                            }
+
+                            const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            // Gray out unavailable CRCs but keep them selectable
+                            const styleClasses = ['text-gray-400 dark:text-gray-500'];
+                            if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
+                            const styleClass = styleClasses.join(' ');
+                            const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
 
                         if (qualifiedCrcs.length === 0) {
@@ -29109,16 +29205,37 @@
                                 // Build options for new slots
                                 let optionsHtml = '<option value="">Select Staff</option>';
                                 optionsHtml += `<option value="SITE_STAFF" class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
+                                const excludeEventIdForDynamic = existingEvent ? existingEvent.id : null;
+                                
+                                // Separate available and unavailable CRCs
+                                const availableCrcs = [];
+                                const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                                    const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                    let statusText = '';
+                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic);
                                     if (isUnavailable) {
+                                        unavailableCrcs.push(crc);
+                                    } else {
+                                        availableCrcs.push(crc);
+                                    }
+                                });
+                                
+                                // Add available CRCs first
+                                availableCrcs.forEach(crc => {
+                                    optionsHtml += `<option value="${crc.id}">${crc.name}</option>`;
+                                });
+                                
+                                // Add unavailable CRCs at the bottom (grayed out but selectable)
+                                unavailableCrcs.forEach(crc => {
+                                    const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
+                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic);
+                                    let statusText = '';
+                                    if (conflictInfo) {
+                                        statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
+                                    } else {
                                         const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
                                         statusText = ` (Time Off - ${periodText})`;
                                     }
-                                    const styleClass = isUnavailable ? 'text-red-600 dark:text-red-400' : '';
-                                    optionsHtml += `<option value="${crc.id}" class="${styleClass}">${crc.name}${statusText}</option>`;
+                                    optionsHtml += `<option value="${crc.id}" class="text-gray-400 dark:text-gray-500">${crc.name}${statusText}</option>`;
                                 });
                                 
                                 const isTraining = isTrainingRoleName(roleForSlot.name);
@@ -29271,9 +29388,11 @@
                     const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
                     
                     // Calculate availability and distance for each CRC, then sort
+                    const excludeEventId = existingEvent ? existingEvent.id : null;
                     const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                        const isUnavailable = isCRCUnavailable(crc.id, date, period);
+                        const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId);
                         const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
+                        const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
                         let distance = null;
                         
                         // Calculate distance if site is available
@@ -29287,6 +29406,7 @@
                             crc,
                             isUnavailable,
                             unavailPeriod,
+                            conflictInfo,
                             distance,
                             isSelected: existingAssignments.includes(crc.id),
                             hasPending,
@@ -29297,8 +29417,9 @@
                     // Add untrained assigned CRCs to the list (marked as untrained)
                     if (untrainedAssignedCrcs.length > 0) {
                         const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
-                            const isUnavailable = isCRCUnavailable(crc.id, date, period);
+                            const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId);
                             const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
+                            const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
                             let distance = null;
                             
                             if (site) {
@@ -29311,6 +29432,7 @@
                                 crc,
                                 isUnavailable,
                                 unavailPeriod,
+                                conflictInfo,
                                 distance,
                                 isSelected: existingAssignments.includes(crc.id),
                                 hasPending,
@@ -29320,24 +29442,27 @@
                         crcsWithInfo.push(...untrainedCrcsWithInfo);
                     }
                     
-                    // Sort: available first (by distance), then unavailable (by distance)
+                    // Sort: selected first, then available (by distance), then unavailable at bottom (by name)
                     crcsWithInfo.sort((a, b) => {
                         // Selected items always come first
                         if (a.isSelected !== b.isSelected) {
                             return a.isSelected ? -1 : 1;
                         }
-                        // Available before unavailable
+                        // Available before unavailable (unavailable goes to bottom)
                         if (a.isUnavailable !== b.isUnavailable) {
                             return a.isUnavailable ? 1 : -1;
                         }
-                        // Within same availability, sort by distance (closest first)
-                        if (a.distance !== null && b.distance !== null) {
-                            return a.distance - b.distance;
+                        
+                        // For available CRCs: sort by distance (closest first)
+                        if (!a.isUnavailable && !b.isUnavailable) {
+                            if (a.distance !== null && b.distance !== null) {
+                                return a.distance - b.distance;
+                            }
+                            if (a.distance !== null && b.distance === null) return -1;
+                            if (a.distance === null && b.distance !== null) return 1;
                         }
-                        // If one has distance and other doesn't, prefer the one with distance
-                        if (a.distance !== null && b.distance === null) return -1;
-                        if (a.distance === null && b.distance !== null) return 1;
-                        // Otherwise sort by name
+                        
+                        // For unavailable CRCs at bottom, or if no distance info: sort by name
                         const aName = (a.crc?.name || '').toString();
                         const bName = (b.crc?.name || '').toString();
                         return aName.localeCompare(bName);
@@ -29349,14 +29474,12 @@
                         const siteStaffSelected = assignedCrcId === 'SITE_STAFF' ? 'selected' : '';
                         let optionsHtml = `<option value="SITE_STAFF" ${siteStaffSelected} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
                         
-                        // Add trained CRC options (these are the ones that should normally appear)
-                        optionsHtml += crcsWithInfo.map(({ crc, isUnavailable, unavailPeriod, distance, hasPending, isUntrained }) => {
-                            let statusText = '';
-                            if (isUnavailable) {
-                                const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
-                                statusText = ` (Time Off - ${periodText})`;
-                            }
-
+                        // Split into available and unavailable for proper ordering
+                        const availableCrcs = crcsWithInfo.filter(c => !c.isUnavailable);
+                        const unavailableCrcs = crcsWithInfo.filter(c => c.isUnavailable);
+                        
+                        // Add available CRCs first
+                        optionsHtml += availableCrcs.map(({ crc, distance, hasPending, isUntrained }) => {
                             let distanceText = '';
                             if (distance !== null) {
                                 distanceText = ` - ${distance} mi`;
@@ -29366,11 +29489,34 @@
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
                             const styleClasses = [];
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
-                            if (isUnavailable && assignedCrcId !== crc.id) styleClasses.push('text-red-600 dark:text-red-400');
-                            if (hasPending && !isUnavailable && assignedCrcId !== crc.id) styleClasses.push('text-yellow-600 dark:text-yellow-400');
+                            if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${pendingText}${distanceText}${statusText}</option>`;
+                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${pendingText}${distanceText}</option>`;
+                        }).join('');
+                        
+                        // Add unavailable CRCs at the bottom (grayed out but selectable)
+                        optionsHtml += unavailableCrcs.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained }) => {
+                            let statusText = '';
+                            if (conflictInfo) {
+                                statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
+                            } else {
+                                const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
+                                statusText = ` (Time Off - ${periodText})`;
+                            }
+
+                            let distanceText = '';
+                            if (distance !== null && !conflictInfo) {
+                                distanceText = ` - ${distance} mi`;
+                            }
+
+                            const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            // Gray out unavailable CRCs but keep them selectable
+                            const styleClasses = ['text-gray-400 dark:text-gray-500'];
+                            if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
+                            const styleClass = styleClasses.join(' ');
+                            const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
 
                         // Only include untrained assigned CRCs if they're currently assigned to this specific slot
@@ -29567,16 +29713,37 @@
                                 // Build options for new slots
                                 let optionsHtml = '<option value="">Select Staff</option>';
                                 optionsHtml += `<option value="SITE_STAFF" class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
+                                const excludeEventIdForDynamic = existingEvent ? existingEvent.id : null;
+                                
+                                // Separate available and unavailable CRCs
+                                const availableCrcs = [];
+                                const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = isCRCUnavailable(crc.id, date, period);
-                                    const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                    let statusText = '';
+                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic);
                                     if (isUnavailable) {
+                                        unavailableCrcs.push(crc);
+                                    } else {
+                                        availableCrcs.push(crc);
+                                    }
+                                });
+                                
+                                // Add available CRCs first
+                                availableCrcs.forEach(crc => {
+                                    optionsHtml += `<option value="${crc.id}">${crc.name}</option>`;
+                                });
+                                
+                                // Add unavailable CRCs at the bottom (grayed out but selectable)
+                                unavailableCrcs.forEach(crc => {
+                                    const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
+                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic);
+                                    let statusText = '';
+                                    if (conflictInfo) {
+                                        statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
+                                    } else {
                                         const periodText = unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod;
                                         statusText = ` (Time Off - ${periodText})`;
                                     }
-                                    const styleClass = isUnavailable ? 'text-red-600 dark:text-red-400' : '';
-                                    optionsHtml += `<option value="${crc.id}" class="${styleClass}">${crc.name}${statusText}</option>`;
+                                    optionsHtml += `<option value="${crc.id}" class="text-gray-400 dark:text-gray-500">${crc.name}${statusText}</option>`;
                                 });
                                 
                                 const isTraining = isTrainingRoleName(role.name);
