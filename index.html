@@ -3475,7 +3475,7 @@
             
             // Role order matching Excel template
             const ROLE_ORDER = [
-                'ICF', 'MedHx', 'EyeCup', 'CAE', 'Schirmers', 'Doc Tech', 'Dispense', 
+                'ICF', 'ICF/medHx', 'Medhx Update', 'Medhx', 'EyeCup', 'CAE', 'Schirmers', 'Doc Tech', 'Dispense', 
                 'Tear Collection', 'Skin Test', 'Allergy Doc Tech', 'CAC (Timed)', 
                 'CAC (Titration)', 'Allergen', 'QC', 'SV', 'oversight', 'Travel'
             ];
@@ -3566,40 +3566,56 @@
 
             const getUnavailabilityPeriod = (crcId, date) => {
                 if (!crcId || !date) return null;
+                
+                // Normalize the date parameter to YYYY-MM-DD format for comparison
+                const normalizedDate = toDateOnlyString(parseDateFlexible(date));
+                if (!normalizedDate) return null;
+                
                 // Get approved time off request IDs
                 const approvedRequestIds = new Set(
                     state.timeOffRequests
-                        .filter(req => req.status === 'approved')
+                        .filter(req => {
+                            const normalizedStatus = normalizeTimeOffStatus(req.status);
+                            return normalizedStatus === 'approved';
+                        })
                         .map(req => req.id)
                 );
                 
                 // Check for Unavailable events first (only if they have approved time off request or are manually created)
-                const ev = (state.crc_events || []).find(e => 
-                    e.crcId === crcId && 
-                    e.type === 'Unavailable' && 
-                    e.date === date &&
-                    (!e.timeOffRequestId || approvedRequestIds.has(e.timeOffRequestId))
-                );
+                const ev = (state.crc_events || []).find(e => {
+                    const eventDate = toDateOnlyString(parseDateFlexible(e.date));
+                    return e.crcId === crcId && 
+                           e.type === 'Unavailable' && 
+                           eventDate === normalizedDate &&
+                           (!e.timeOffRequestId || approvedRequestIds.has(e.timeOffRequestId));
+                });
                 if (ev) return ev.period || 'Full Day';
                 
                 // Check for Paid Time Off events (only if they have approved time off request or are manually created)
-                const ptoEv = (state.crc_events || []).find(e => 
-                    e.crcId === crcId && 
-                    e.type === 'Paid Time Off' && 
-                    e.date === date &&
-                    (!e.timeOffRequestId || approvedRequestIds.has(e.timeOffRequestId))
-                );
+                const ptoEv = (state.crc_events || []).find(e => {
+                    const eventDate = toDateOnlyString(parseDateFlexible(e.date));
+                    return e.crcId === crcId && 
+                           e.type === 'Paid Time Off' && 
+                           eventDate === normalizedDate &&
+                           (!e.timeOffRequestId || approvedRequestIds.has(e.timeOffRequestId));
+                });
                 if (ptoEv) return ptoEv.period || 'Full Day';
                 
                 // Check for approved time off requests
                 const approvedTimeOffRequest = state.timeOffRequests.find(req => {
-                    if (req.crcId !== crcId || req.status !== 'approved') return false;
-                    const reqDate = req.date || req.startDate;
-                    const reqEndDate = req.endDate;
+                    if (req.crcId !== crcId) return false;
+                    const normalizedStatus = normalizeTimeOffStatus(req.status);
+                    if (normalizedStatus !== 'approved') return false;
                     
-                    // Check if date falls within approved request range
-                    if (reqDate === date) return true;
-                    if (reqEndDate && reqDate && date >= reqDate && date <= reqEndDate) return true;
+                    // Normalize request dates
+                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
+                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
+                    
+                    if (!reqStart) return false;
+                    
+                    // Check if normalized date falls within the request range
+                    if (normalizedDate === reqStart) return true;
+                    if (reqEnd && normalizedDate >= reqStart && normalizedDate <= reqEnd) return true;
                     return false;
                 });
                 
@@ -3613,15 +3629,25 @@
             const isCRCUnavailable = (crcId, date, period, excludeEventId = null) => {
                 if (!crcId || !date) return false;
                 
+                // Normalize the date parameter to YYYY-MM-DD format for comparison
+                const normalizedDate = toDateOnlyString(parseDateFlexible(date));
+                if (!normalizedDate) return false;
+                
                 // Check for rejected time off requests - if rejected, they should be available
                 const rejectedTimeOffRequest = state.timeOffRequests.find(req => {
-                    if (req.crcId !== crcId || req.status !== 'rejected') return false;
-                    const reqDate = req.date || req.startDate;
-                    const reqEndDate = req.endDate;
+                    if (req.crcId !== crcId) return false;
+                    const normalizedStatus = normalizeTimeOffStatus(req.status);
+                    if (normalizedStatus !== 'rejected') return false;
                     
-                    // Check if date falls within rejected request range
-                    if (reqDate === date) return true;
-                    if (reqEndDate && reqDate && date >= reqDate && date <= reqEndDate) return true;
+                    // Normalize request dates
+                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
+                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
+                    
+                    if (!reqStart) return false;
+                    
+                    // Check if normalized date falls within rejected request range
+                    if (normalizedDate === reqStart) return true;
+                    if (reqEnd && normalizedDate >= reqStart && normalizedDate <= reqEnd) return true;
                     return false;
                 });
                 
@@ -3633,8 +3659,12 @@
                     // Exclude the current event being edited
                     if (excludeEventId && event.id === excludeEventId) return false;
                     
-                    // Must be a Site Assignment on the same date
-                    if (event.type !== 'Site Assignment' || event.date !== date) return false;
+                    // Must be a Site Assignment
+                    if (event.type !== 'Site Assignment') return false;
+                    
+                    // Normalize event date for comparison
+                    const eventDate = toDateOnlyString(parseDateFlexible(event.date));
+                    if (!eventDate || eventDate !== normalizedDate) return false;
                     
                     // Check if this CRC is assigned to this event
                     if (event.crcId === crcId) return true;
@@ -3655,34 +3685,32 @@
                 // If there's a conflicting Site Assignment, they are unavailable
                 if (conflictingSiteAssignments.length > 0) return true;
                 
-                // Get approved time off request IDs
+                // Get approved time off request IDs (using normalized status check)
                 const approvedRequestIds = new Set(
                     state.timeOffRequests
-                        .filter(req => req.status === 'approved')
+                        .filter(req => {
+                            const normalizedStatus = normalizeTimeOffStatus(req.status);
+                            return normalizedStatus === 'approved';
+                        })
                         .map(req => req.id)
                 );
                 
-                // Check if CRC has any events on this date that would make them unavailable
-                // Only consider events that have approved time off requests or are manually created (no timeOffRequestId)
-                const eventsOnDate = state.crc_events.filter(event => {
-                    // Exclude the current event being edited
-                    if (excludeEventId && event.id === excludeEventId) return false;
-                    
-                    return event.crcId === crcId && 
-                           event.date === date &&
-                           (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
-                           (!event.timeOffRequestId || approvedRequestIds.has(event.timeOffRequestId));
-                });
-                
                 // Check for approved time off requests (including multi-day ranges)
                 const approvedTimeOffRequest = state.timeOffRequests.find(req => {
-                    if (req.crcId !== crcId || req.status !== 'approved') return false;
-                    const reqDate = req.date || req.startDate;
-                    const reqEndDate = req.endDate;
+                    if (req.crcId !== crcId) return false;
+                    // Only check approved requests
+                    const normalizedStatus = normalizeTimeOffStatus(req.status);
+                    if (normalizedStatus !== 'approved') return false;
                     
-                    // Check if date falls within approved request range
-                    if (reqDate === date) return true;
-                    if (reqEndDate && reqDate && date >= reqDate && date <= reqEndDate) return true;
+                    // Normalize request dates
+                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
+                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
+                    
+                    if (!reqStart) return false;
+                    
+                    // Check if normalized date falls within the request range
+                    if (normalizedDate === reqStart) return true;
+                    if (reqEnd && normalizedDate >= reqStart && normalizedDate <= reqEnd) return true;
                     return false;
                 });
                 
@@ -3695,6 +3723,31 @@
                     if (requestPeriod === 'Full Day' || requestPeriod === period) return true;
                 }
                 
+                // Check if CRC has any events on this date that would make them unavailable
+                // Only consider events that have approved time off requests or are manually created (no timeOffRequestId)
+                const eventsOnDate = state.crc_events.filter(event => {
+                    // Exclude the current event being edited
+                    if (excludeEventId && event.id === excludeEventId) return false;
+                    
+                    // Normalize event date for comparison
+                    const eventDate = toDateOnlyString(parseDateFlexible(event.date));
+                    if (!eventDate || eventDate !== normalizedDate) return false;
+                    
+                    return event.crcId === crcId && 
+                           (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
+                           (!event.timeOffRequestId || approvedRequestIds.has(event.timeOffRequestId));
+                });
+                
+                // If there's an approved time off request, check if it covers this period
+                if (approvedTimeOffRequest) {
+                    const requestPeriod = approvedTimeOffRequest.period || 'Full Day';
+                    // If period is 'Full Day', any approved request makes them unavailable
+                    if (period === 'Full Day') return true;
+                    // For specific periods, check if the request covers that period
+                    if (requestPeriod === 'Full Day' || requestPeriod === period) return true;
+                }
+                
+                // If no approved time off request and no events, they are available
                 if (eventsOnDate.length === 0) return false;
                 
                 // If period is 'Full Day', any unavailability makes them unavailable
@@ -5580,8 +5633,8 @@
                         return eventsList;
                     };
                     
-                    // Clean up duplicates before sanitizing (only runs if duplicates exist)
-                    events = await cleanupDuplicatePTOEvents(events || []);
+                    // Duplicate PTO cleanup disabled - existing logic should prevent duplicates
+                    // events = await cleanupDuplicatePTOEvents(events || []);
                     
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
                     const sanitizedEvents = Array.isArray(events) ? events.reduce((acc, event) => {
@@ -19442,7 +19495,14 @@
                                         timeOffRequestsCreated++;
                                     } catch (error) {
                                         console.error('Error creating time off request for', day.date, error);
-                                        showNotification(`Failed to create time off request for ${day.date}. ${error?.message || error}`, 'error');
+                                        // Check if it's a duplicate error (409)
+                                        let errorMessage = error?.message || error?.toString() || 'Unknown error';
+                                        if (error?.response?.jsonBody?.message) {
+                                            errorMessage = error.response.jsonBody.message;
+                                        } else if (error?.message?.includes('Duplicate') || error?.message?.includes('409')) {
+                                            errorMessage = 'A time off request already exists for this employee on this date.';
+                                        }
+                                        showNotification(`Failed to create time off request for ${day.date}. ${errorMessage}`, 'error');
                                     }
                                 } else {
                                     console.log('Skipping time off request creation - not time off type. ptoType:', ptoType, 'isTimeOffType:', isTimeOffType);
@@ -23187,12 +23247,28 @@
                                 return;
                             }
                             
-                            const updatedRequest = await apiService.updateTimeOffRequest(id, {
-                                ...request,
-                                status: 'approved',
-                                approvedBy: state.currentUser?.id || state.currentUser?.username || 'admin',
-                                approvedAt: new Date().toISOString()
-                            });
+                            try {
+                                const updatedRequest = await apiService.updateTimeOffRequest(id, {
+                                    ...request,
+                                    status: 'approved',
+                                    approvedBy: state.currentUser?.id || state.currentUser?.username || 'admin',
+                                    approvedAt: new Date().toISOString()
+                                });
+                            } catch (approveError) {
+                                // Check if it's a duplicate approved request error (409)
+                                let errorMessage = approveError?.message || approveError?.toString() || 'Unknown error';
+                                if (approveError?.response?.jsonBody?.message) {
+                                    errorMessage = approveError.response.jsonBody.message;
+                                } else if (approveError?.message?.includes('Duplicate') || approveError?.message?.includes('409')) {
+                                    errorMessage = 'An approved time off request already exists for this employee on this date.';
+                                }
+                                showNotification(`Failed to approve time off request: ${errorMessage}`, 'error');
+                                return;
+                            }
+                            
+                            // If we get here, the approval was successful, so fetch the updated request
+                            const updatedRequests = await apiService.getTimeOffRequests();
+                            const updatedRequest = updatedRequests.find(r => r.id === id);
                             
                             // Refresh time off requests from API to ensure we have latest data
                             try {
@@ -28382,14 +28458,21 @@
                     const availableRoles = state.roles
                         .filter(r => r?.name && !isTrainingRoleName(r.name))
                         .map(r => r.name)
-                        .filter((value, index, self) => self.findIndex(v => v.toLowerCase() === value.toLowerCase()) === index)
-                        .sort((a, b) => a.localeCompare(b));
+                        .filter((value, index, self) => self.findIndex(v => v.toLowerCase() === value.toLowerCase()) === index);
                     
-                    if (availableRoles.length === 0) {
+                    // Sort roles: prioritized ones first (ICF, ICF/medHx, Medhx Update, Medhx), then others by name
+                    const sortedRoles = availableRoles.sort((a, b) => {
+                        const aOrder = getRoleSortOrder(a);
+                        const bOrder = getRoleSortOrder(b);
+                        if (aOrder !== bOrder) return aOrder - bOrder;
+                        return a.localeCompare(b);
+                    });
+                    
+                    if (sortedRoles.length === 0) {
                         return `<div class="mt-2 text-xs text-yellow-600 dark:text-yellow-400">No roles available. Add roles first.</div>`;
                     }
                     const optionsHtml = ['<option value="">Select Role</option>']
-                        .concat(availableRoles.map(name => `<option value="${name}" ${name === selectedValue ? 'selected' : ''}>${name}</option>`))
+                        .concat(sortedRoles.map(name => `<option value="${name}" ${name === selectedValue ? 'selected' : ''}>${name}</option>`))
                         .join('');
                     
                     // Get training mode values (practicum, finalPracticum, observation)

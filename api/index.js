@@ -1364,6 +1364,57 @@ app.http('time-off-requests', {
                     
                     validateTimeOffRequestsSchema(body);
                     
+                    // Check for duplicate time off requests for the same CRC and date(s)
+                    const normalizedDate = body.date || body.startDate;
+                    const normalizedStartDate = body.startDate || body.date;
+                    const normalizedEndDate = body.endDate || body.date || body.startDate;
+                    
+                    const { resources: existingRequests } = await container.items
+                        .query({
+                            query: "SELECT * FROM c WHERE c.crcId = @crcId",
+                            parameters: [{ name: "@crcId", value: body.crcId }]
+                        })
+                        .fetchAll();
+                    
+                    // Check if there's already a time off request for this CRC on the same date(s)
+                    const duplicateRequest = existingRequests.find(req => {
+                        if (!req.date && !req.startDate) return false;
+                        
+                        const reqDate = req.date || req.startDate;
+                        const reqStartDate = req.startDate || req.date;
+                        const reqEndDate = req.endDate || req.date || req.startDate;
+                        
+                        // Check for exact date match
+                        if (reqDate === normalizedDate || reqStartDate === normalizedStartDate) {
+                            return true;
+                        }
+                        
+                        // Check for date range overlap
+                        const reqStart = new Date(reqStartDate);
+                        const reqEnd = new Date(reqEndDate);
+                        const newStart = new Date(normalizedStartDate);
+                        const newEnd = new Date(normalizedEndDate);
+                        
+                        // Check if date ranges overlap
+                        if (newStart <= reqEnd && newEnd >= reqStart) {
+                            return true;
+                        }
+                        
+                        return false;
+                    });
+                    
+                    if (duplicateRequest) {
+                        return {
+                            status: 409,
+                            jsonBody: { 
+                                error: 'Duplicate time off request',
+                                message: 'A time off request already exists for this employee on the selected date(s).',
+                                existingRequestId: duplicateRequest.id
+                            },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                    
                     // Set default status to pending if not provided
                     const newRequest = { 
                         ...body,
@@ -1385,9 +1436,65 @@ app.http('time-off-requests', {
                     const updateId = id || requestBody.id;
                     validateTimeOffRequestsSchema(requestBody);
                     
-                    // If status is being changed to approved, set approvedBy and approvedAt
-                    if (requestBody.status === 'approved' && !requestBody.approvedBy) {
-                        requestBody.approvedAt = new Date().toISOString();
+                    // When approving, check for duplicate approved requests for the same CRC and date(s)
+                    if (requestBody.status === 'approved') {
+                        const normalizedDate = requestBody.date || requestBody.startDate;
+                        const normalizedStartDate = requestBody.startDate || requestBody.date;
+                        const normalizedEndDate = requestBody.endDate || requestBody.date || requestBody.startDate;
+                        
+                        const { resources: existingRequests } = await container.items
+                            .query({
+                                query: "SELECT * FROM c WHERE c.crcId = @crcId AND c.status = 'approved' AND c.id != @excludeId",
+                                parameters: [
+                                    { name: "@crcId", value: requestBody.crcId },
+                                    { name: "@excludeId", value: updateId }
+                                ]
+                            })
+                            .fetchAll();
+                        
+                        // Check if there's already an approved time off request for this CRC on the same date(s)
+                        const duplicateApproved = existingRequests.find(req => {
+                            if (!req.date && !req.startDate) return false;
+                            
+                            const reqDate = req.date || req.startDate;
+                            const reqStartDate = req.startDate || req.date;
+                            const reqEndDate = req.endDate || req.date || req.startDate;
+                            
+                            // Check for exact date match
+                            if (reqDate === normalizedDate || reqStartDate === normalizedStartDate) {
+                                return true;
+                            }
+                            
+                            // Check for date range overlap
+                            const reqStart = new Date(reqStartDate);
+                            const reqEnd = new Date(reqEndDate);
+                            const newStart = new Date(normalizedStartDate);
+                            const newEnd = new Date(normalizedEndDate);
+                            
+                            // Check if date ranges overlap
+                            if (newStart <= reqEnd && newEnd >= reqStart) {
+                                return true;
+                            }
+                            
+                            return false;
+                        });
+                        
+                        if (duplicateApproved) {
+                            return {
+                                status: 409,
+                                jsonBody: { 
+                                    error: 'Duplicate approved time off request',
+                                    message: 'An approved time off request already exists for this employee on the selected date(s).',
+                                    existingRequestId: duplicateApproved.id
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                        
+                        // Set approvedBy and approvedAt
+                        if (!requestBody.approvedBy) {
+                            requestBody.approvedAt = new Date().toISOString();
+                        }
                     }
                     
                     const updatedRequest = { ...requestBody, id: updateId };
