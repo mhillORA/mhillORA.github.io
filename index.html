@@ -4099,7 +4099,7 @@
             };
             
             // Helper function to get visit display name from study
-            // Returns just the visit number (e.g., "1") for use with "V" prefix, or a custom name without prefix
+            // Returns { display: string, isCustomName: boolean } to indicate if V prefix should be added
             const getVisitDisplayName = (visitNumber, studyIds) => {
                 if (!visitNumber || !studyIds || studyIds.length === 0) {
                     return visitNumber ? visitNumber : '';
@@ -4111,8 +4111,18 @@
                     const visitKey = `visit-${visitNumber}`;
                     const visitName = study.visitNames[visitKey] || study.visitNames[visitNumber];
                     if (visitName) {
-                        // Return custom name without "V" prefix since we add it in the display
-                        return visitName;
+                        // Return custom name - check if it already starts with V or Visit
+                        // If custom name is just a number or starts with a number, return just the number
+                        const trimmed = visitName.trim();
+                        if (/^\d+$/.test(trimmed)) {
+                            return trimmed; // Just a number, will get V prefix
+                        }
+                        if (/^v\d+$/i.test(trimmed) || /^visit\s*\d+$/i.test(trimmed)) {
+                            // Already has V or Visit prefix - return just the number part
+                            return trimmed.replace(/^v(?:isit)?\s*/i, '');
+                        }
+                        // Custom name like "Screening" - return as-is (caller will handle V prefix)
+                        return trimmed;
                     }
                 }
                 
@@ -4133,7 +4143,7 @@
                     Object.values(event.roleAssignments).forEach(assignments => {
                         if (Array.isArray(assignments)) {
                             assignments.forEach(crcId => {
-                                if (crcId && crcId !== 'SITE_STAFF') {
+                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                     const crc = state.crcs.find(c => c.id === crcId);
                                     if (crc && !crcs.find(c => c.id === crc.id)) {
                                         crcs.push(crc);
@@ -4173,7 +4183,8 @@
                 // Check for new roleAssignments structure first
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                        const validAssignments = assignments.filter(Boolean); // Filter out empty/null assignments
+                        // Filter out empty/null assignments AND 'UNASSIGNED' (which is an explicit unfilled marker)
+                        const validAssignments = assignments.filter(a => a && a !== 'UNASSIGNED');
                         assignedRoles[roleId] = validAssignments.length;
                     });
                 }
@@ -4209,21 +4220,23 @@
                     }
                 });
                 
-                // Also check roleAssignments for null slots (open positions)
+                // Also check roleAssignments for null slots or UNASSIGNED (open positions)
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                         if (Array.isArray(assignments)) {
                             const role = state.roles.find(r => r.id === roleId);
                             if (role) {
                                 assignments.forEach((crcId, index) => {
-                                    if (!crcId || crcId === '') {
+                                    // Treat empty, null, or UNASSIGNED as unfilled slots
+                                    if (!crcId || crcId === '' || crcId === 'UNASSIGNED') {
                                         // This is an unfilled slot
                                         const alreadyAdded = unfilledSlots.find(s => s.roleId === roleId && s.slotIndex === index);
                                         if (!alreadyAdded) {
                                             unfilledSlots.push({ roleId, roleName: role.name, slotIndex: index });
                                             totalUnfilled++;
                                             if (!missingRoles.find(m => m.startsWith(role.name))) {
-                                                const filled = assignments.filter(Boolean).length;
+                                                // Count filled excluding UNASSIGNED
+                                                const filled = assignments.filter(a => a && a !== 'UNASSIGNED').length;
                                                 missingRoles.push(`${role.name} (${filled}/${assignments.length})`);
                                             }
                                         }
@@ -4686,16 +4699,16 @@
             const isSiteAssignmentWithCrc = (event) => {
                 if (!event || event.type !== 'Site Assignment') return false;
                 
-                // Check if there's a CRC assigned via legacy crcId
-                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== null && event.crcId !== undefined) {
+                // Check if there's a CRC assigned via legacy crcId (SITE_STAFF and UNASSIGNED don't count)
+                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED' && event.crcId !== null && event.crcId !== undefined) {
                     return true;
                 }
                 
-                // Check if there are any CRCs assigned via roleAssignments
+                // Check if there are any CRCs assigned via roleAssignments (SITE_STAFF and UNASSIGNED don't count)
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                     const hasAssignedCrc = Object.values(event.roleAssignments).some(assignments => {
                         if (Array.isArray(assignments)) {
-                            return assignments.some(crcId => crcId && crcId !== 'SITE_STAFF' && crcId !== null && crcId !== undefined);
+                            return assignments.some(crcId => crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED' && crcId !== null && crcId !== undefined);
                         }
                         return false;
                     });
@@ -4715,11 +4728,11 @@
                 const eventHours = parseFloat(event.hours) || 0;
                 if (eventHours === 0) return 0;
                 
-                // Count how many CRCs are assigned to this event
+                // Count how many CRCs are assigned to this event (SITE_STAFF and UNASSIGNED don't count)
                 const assignedCrcs = new Set();
                 
                 // Check legacy crcId
-                if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
                     assignedCrcs.add(event.crcId);
                 }
                 
@@ -4728,7 +4741,7 @@
                     Object.values(event.roleAssignments).forEach(assignments => {
                         if (Array.isArray(assignments)) {
                             assignments.forEach(id => {
-                                if (id && id !== 'SITE_STAFF') {
+                                if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') {
                                     assignedCrcs.add(id);
                                 }
                             });
@@ -8216,7 +8229,7 @@
                 
                 // Get all CRCs assigned to this event
                 const assignedCrcs = [];
-                if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
                     const crc = state.crcs.find(c => c.id === event.crcId);
                     if (crc) assignedCrcs.push({ crc, roles: event.roles || [] });
                 }
@@ -8225,7 +8238,7 @@
                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                         if (Array.isArray(assignments)) {
                             assignments.forEach(crcId => {
-                                if (crcId && crcId !== 'SITE_STAFF' && !assignedCrcs.find(ac => ac.crc.id === crcId)) {
+                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED' && !assignedCrcs.find(ac => ac.crc.id === crcId)) {
                                     const crc = state.crcs.find(c => c.id === crcId);
                                     const role = state.roles.find(r => r.id === roleId);
                                     if (crc) {
@@ -8777,10 +8790,12 @@
                             // Check if this is a PTO event
                             const isPTO = event.isPTORequest || event.type === 'Paid Time Off';
                             
-                            // Handle Site Staff display
+                            // Handle Site Staff and Unassigned display
                             let crcDisplayName = 'Open Shift';
                             if (event.crcId === 'SITE_STAFF') {
                                 crcDisplayName = 'Site Staff';
+                            } else if (event.crcId === 'UNASSIGNED') {
+                                crcDisplayName = '⚠ Unassigned';
                             } else if (crc) {
                                 crcDisplayName = crc.name;
                             }
@@ -10875,8 +10890,8 @@
                                 });
                             }
                             
-                            // Handle legacy crcId if present
-                            if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                            // Handle legacy crcId if present (skip SITE_STAFF and UNASSIGNED)
+                            if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
                                 if (!crcRoleMap.has(event.crcId)) {
                                     crcRoleMap.set(event.crcId, new Set());
                                 }
@@ -10895,10 +10910,12 @@
                                 crcRoleMap.forEach((roleSet, crcId) => {
                                     const roles = Array.from(roleSet);
                                     
-                                    // Get CRC display name (handle Site Staff)
+                                    // Get CRC display name (handle Site Staff and Unassigned)
                                     let crcDisplayName;
                                     if (crcId === 'SITE_STAFF') {
                                         crcDisplayName = 'Site Staff';
+                                    } else if (crcId === 'UNASSIGNED') {
+                                        crcDisplayName = '⚠ Unassigned';
                                     } else {
                                         const crc = state.crcs.find(c => c.id === crcId);
                                         crcDisplayName = crc ? (crc.title || crc.name.split(' ')[0]) : crcId;
@@ -11202,8 +11219,8 @@
                                 });
                             }
                             
-                            // Handle legacy crcId if present
-                            if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                            // Handle legacy crcId if present (skip SITE_STAFF and UNASSIGNED)
+                            if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
                                 if (!crcRoleMap.has(event.crcId)) {
                                     crcRoleMap.set(event.crcId, new Set());
                                 }
@@ -11222,10 +11239,12 @@
                                 crcRoleMap.forEach((roleSet, crcId) => {
                                     const roles = Array.from(roleSet);
                                     
-                                    // Get CRC display name (handle Site Staff)
+                                    // Get CRC display name (handle Site Staff and Unassigned)
                                     let crcDisplayName;
                                     if (crcId === 'SITE_STAFF') {
                                         crcDisplayName = 'Site Staff';
+                                    } else if (crcId === 'UNASSIGNED') {
+                                        crcDisplayName = '⚠ Unassigned';
                                     } else {
                                         const crc = state.crcs.find(c => c.id === crcId);
                                         crcDisplayName = crc ? (crc.title || crc.name.split(' ')[0]) : crcId;
@@ -11861,7 +11880,7 @@
                             Object.values(event.roleAssignments).forEach(assignments => {
                                 if (Array.isArray(assignments)) {
                                     assignments.forEach(crcId => {
-                                        if (crcId && crcId !== 'SITE_STAFF') {
+                                        if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                             const isUnavailable = isCRCUnavailable(crcId, dateStr, event.period || 'Full Day');
                                             if (!isUnavailable) {
                                                 uniqueCRCs.add(crcId);
@@ -11981,8 +12000,8 @@
                                 const group = shiftGroups.get(shiftKey);
                                 group.events.push(event);
                                 
-                                // Collect all CRCs from this event
-                                if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                                // Collect all CRCs from this event (skip SITE_STAFF and UNASSIGNED)
+                                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
                                     group.allCrcIds.add(event.crcId);
                                 }
                                 if (event.roleAssignments && typeof event.roleAssignments === 'object') {
@@ -13041,8 +13060,8 @@
                                 const group = shiftGroups.get(shiftKey);
                                 group.events.push(event);
                                 
-                                // Collect all CRCs from this event
-                                if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                                // Collect all CRCs from this event (skip SITE_STAFF and UNASSIGNED)
+                                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
                                     group.allCrcIds.add(event.crcId);
                                 }
                                 if (event.roleAssignments && typeof event.roleAssignments === 'object') {
@@ -29781,6 +29800,7 @@
                                                             <select name="role-${roleId}-${index}" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                                 <option value="">Select Staff</option>
                                                                 <option value="SITE_STAFF" ${crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
+                                                                <option value="UNASSIGNED" ${crcId === 'UNASSIGNED' ? 'selected' : ''} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>
                                                                 ${qualifiedCrcs.map(c => {
                                                                     // Pass excludeEventId and excludeGroupId to avoid showing CRCs on this shift as unavailable
                                                                     const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
@@ -29915,6 +29935,7 @@
                                                 <select name="role-legacy-0" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                                     <option value="">Select Staff</option>
                                                     <option value="SITE_STAFF" ${existingEvent.crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
+                                                    <option value="UNASSIGNED" ${existingEvent.crcId === 'UNASSIGNED' ? 'selected' : ''} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>
                                                     ${qualifiedCrcs.map(c => {
                                                         // Pass excludeEventId and excludeGroupId to avoid showing CRCs on this shift as unavailable
                                                         const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
@@ -30314,7 +30335,9 @@
                         const assignedCrcId = existingAssignments[slotIndex] || '';
                         // Add "Site Staff" option first
                         const siteStaffSelected = assignedCrcId === 'SITE_STAFF' ? 'selected' : '';
+                        const unassignedSelected = assignedCrcId === 'UNASSIGNED' ? 'selected' : '';
                         let optionsHtml = `<option value="SITE_STAFF" ${siteStaffSelected} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
+                        optionsHtml += `<option value="UNASSIGNED" ${unassignedSelected} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>`;
                         
                         // Add CRC options - split into available and unavailable for proper ordering
                         const availableCrcs = crcsWithInfo.filter(c => !c.isUnavailable);
@@ -30526,6 +30549,7 @@
                                 // Build options for new slots
                                 let optionsHtml = '<option value="">Select Staff</option>';
                                 optionsHtml += `<option value="SITE_STAFF" class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
+                                optionsHtml += `<option value="UNASSIGNED" class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>`;
                                 const excludeEventIdForDynamic = existingEvent ? existingEvent.id : null;
                                 const excludeGroupIdForDynamic = existingEvent ? existingEvent.groupId : null;
                                 
@@ -30795,7 +30819,9 @@
                         const assignedCrcId = existingAssignments[slotIndex] || '';
                         // Add "Site Staff" option first
                         const siteStaffSelected = assignedCrcId === 'SITE_STAFF' ? 'selected' : '';
+                        const unassignedSelected = assignedCrcId === 'UNASSIGNED' ? 'selected' : '';
                         let optionsHtml = `<option value="SITE_STAFF" ${siteStaffSelected} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
+                        optionsHtml += `<option value="UNASSIGNED" ${unassignedSelected} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>`;
                         
                         // Split into available and unavailable for proper ordering
                         const availableCrcs = crcsWithInfo.filter(c => !c.isUnavailable);
@@ -31049,6 +31075,7 @@
                                 // Build options for new slots
                                 let optionsHtml = '<option value="">Select Staff</option>';
                                 optionsHtml += `<option value="SITE_STAFF" class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
+                                optionsHtml += `<option value="UNASSIGNED" class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>`;
                                 const excludeEventIdForDynamic = existingEvent ? existingEvent.id : null;
                                 const excludeGroupIdForDynamic = existingEvent ? existingEvent.groupId : null;
                                 
