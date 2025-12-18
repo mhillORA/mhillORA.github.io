@@ -4519,6 +4519,15 @@
                     return true;
                 }
                 
+                // CRC users have restricted tab access - they cannot access:
+                // scheduler, timeOffRequests, managerView, reporting
+                if (state.currentUser && state.currentUser.permissionLevel === 'CRC') {
+                    const crcRestrictedTabs = ['scheduler', 'timeOffRequests', 'managerView', 'reporting'];
+                    if (crcRestrictedTabs.includes(tabId)) {
+                        return false;
+                    }
+                }
+                
                 // Check user-specific overrides first
                 if (permissions.userTabs !== undefined) {
                     return permissions.userTabs === 'all' || permissions.userTabs.includes(tabId);
@@ -4957,11 +4966,16 @@
                 // Filter tabs based on permissions
                 let tabs = allTabs.filter(tab => canAccessTab(tab.id));
                 
-                // For CRC users, add CRC Dashboard tab at the beginning and remove regular dashboard
+                // For CRC users, customize their tab access
                 if (state.currentUser && state.currentUser.permissionLevel === 'CRC') {
-                    // Remove regular dashboard tab
-                    tabs = tabs.filter(tab => tab.id !== 'dashboard');
-                    // Add CRC Dashboard and CRC Schedule at the beginning
+                    // Remove tabs that CRCs should not access:
+                    // - scheduler (they use My Schedule instead)
+                    // - timeOffRequests (they can only see their own time off, not manage others)
+                    // - dashboard (replaced with CRC Dashboard)
+                    // - managerView (manager only)
+                    // - reporting (manager/supervisor only)
+                    tabs = tabs.filter(tab => !['dashboard', 'scheduler', 'timeOffRequests', 'managerView', 'reporting'].includes(tab.id));
+                    // Add CRC Dashboard and My Schedule at the beginning
                     tabs.unshift({ id: 'dashboard', label: 'CRC Dashboard' });
                     tabs.splice(1, 0, { id: 'crc-schedule', label: 'My Schedule' });
                 }
@@ -8029,6 +8043,58 @@
                     `;
                 }
                 
+                // Get CRC's travel plans
+                const crcNameLower = (crc.name || '').toLowerCase();
+                const upcomingTravel = (state.travel || []).filter(travel => {
+                    if (!travel) return false;
+                    // Check if travel belongs to this CRC by crcId or name
+                    const travelCrcId = travel.crcId;
+                    if (travelCrcId === matchingCrcId || travelCrcId === crc.name) return true;
+                    if (travel.travelerName && travel.travelerName.toLowerCase() === crcNameLower) return true;
+                    return false;
+                }).filter(travel => {
+                    // Filter to upcoming travel (within next 30 days)
+                    const travelDate = getTravelPrimaryDate(travel);
+                    if (!travelDate) return false;
+                    const travelDateObj = new Date(travelDate);
+                    const thirtyDaysFromNow = new Date(today);
+                    thirtyDaysFromNow.setDate(today.getDate() + 30);
+                    return travelDateObj >= today && travelDateObj <= thirtyDaysFromNow;
+                }).sort((a, b) => {
+                    const dateA = getTravelPrimaryDate(a);
+                    const dateB = getTravelPrimaryDate(b);
+                    return new Date(dateA) - new Date(dateB);
+                });
+                
+                let travelHTML = '';
+                if (upcomingTravel.length > 0) {
+                    travelHTML = `
+                        <div class="p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-lg">
+                            <h3 class="text-lg font-semibold text-amber-900 dark:text-amber-200 mb-3">✈ My Upcoming Travel</h3>
+                            <div class="space-y-2">
+                                ${upcomingTravel.slice(0, 5).map(travel => {
+                                    const travelDate = getTravelPrimaryDate(travel);
+                                    const flightInfo = travel.flightNumber ? `Flight ${travel.flightNumber}` : (travel.bookingType || 'Travel');
+                                    const route = travel.origin && travel.destination ? `${travel.origin} → ${travel.destination}` : '';
+                                    const timeInfo = travel.departureTime ? `Departs: ${travel.departureTime}` : '';
+                                    return `
+                                        <div class="p-2 bg-white dark:bg-gray-800 rounded border border-amber-100 dark:border-amber-800">
+                                            <div class="text-sm">
+                                                <div class="font-medium dark:text-amber-300">${formatDisplayDate(travelDate)} - ${flightInfo}</div>
+                                                <div class="text-xs text-gray-600 dark:text-gray-400 mt-1">
+                                                    ${route ? route + ' • ' : ''}${timeInfo}
+                                                </div>
+                                                ${travel.confirmationNumber ? `<div class="text-xs text-gray-500 dark:text-gray-500 mt-1">Confirmation: ${travel.confirmationNumber}</div>` : ''}
+                                            </div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                                ${upcomingTravel.length > 5 ? `<div class="text-xs text-gray-600 dark:text-gray-400 text-center mt-2">+${upcomingTravel.length - 5} more travel bookings</div>` : ''}
+                            </div>
+                        </div>
+                    `;
+                }
+                
                 return `
                     <div class="w-full bg-white dark:bg-gray-800 p-4 md:p-6 rounded-lg shadow-md">
                         <div class="mb-6">
@@ -8046,7 +8112,10 @@
                             ${locationHTML}
                         </div>
                         
-                        ${upcomingShiftsHTML}
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                            ${upcomingShiftsHTML}
+                            ${travelHTML}
+                        </div>
                         
                         <div class="mt-6 p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
                             <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-200 mb-3">Quick Actions</h3>
@@ -10860,29 +10929,24 @@
                                     const role = state.roles.find(r => r.id === roleId);
                                     if (!role) return;
                                     
-                                    // Format role name (handle training roles)
-                                    let roleDisplayName = role.name;
-                                    if (isTrainingRoleName(role.name)) {
-                                        // For training roles, check if there are training assignments
-                                        if (event.trainingAssignments && event.trainingAssignments[roleId]) {
-                                            const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
-                                            if (trainingTypes.length > 0) {
-                                                roleDisplayName = `Training, ${trainingTypes.join(', ')}`;
-                                            } else {
-                                                roleDisplayName = `Training`;
-                                            }
-                                        } else {
-                                            // Training role assigned but no training type selected yet - still show it
-                                            roleDisplayName = `Training`;
-                                        }
-                                    }
-                                    
                                     if (Array.isArray(assignments)) {
-                                        assignments.forEach(crcId => {
+                                        assignments.forEach((crcId, index) => {
                                             if (crcId) {
                                                 if (!crcRoleMap.has(crcId)) {
                                                     crcRoleMap.set(crcId, new Set());
                                                 }
+                                                
+                                                // Format role name - for training roles, get the specific training type for this index
+                                                let roleDisplayName = role.name;
+                                                if (isTrainingRoleName(role.name)) {
+                                                    // Get the specific training type for this CRC's index
+                                                    if (event.trainingAssignments && event.trainingAssignments[roleId] && event.trainingAssignments[roleId][index]) {
+                                                        roleDisplayName = `Training, ${event.trainingAssignments[roleId][index]}`;
+                                                    } else {
+                                                        roleDisplayName = `Training`;
+                                                    }
+                                                }
+                                                
                                                 crcRoleMap.get(crcId).add(roleDisplayName);
                                             }
                                         });
@@ -10940,7 +11004,8 @@
                                         textColor: textColor,
                                         spanTextColor: spanTextColor,
                                         event: event,
-                                        hours: eventHours
+                                        hours: eventHours,
+                                        isUnassigned: crcId === 'UNASSIGNED'
                                     });
                                 });
                                 processedEvents.add(event.id);
@@ -10984,10 +11049,14 @@
                         
                         const displayText = displayParts.join(' - ');
                         
+                        // Add flashing red style for unassigned blocks
+                        const unassignedClass = block.isUnassigned ? 'unfilled-role-box' : '';
+                        const unassignedStyle = block.isUnassigned ? 'background-color: rgba(239, 68, 68, 0.3) !important;' : `background-color: ${block.bgColor};`;
+                        
                         // Use view-crc-event with the specific event ID so clicking shows just that one shift
                         return `
-                            <div class="shift-block p-2 rounded text-xs cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" 
-                                 style="background-color: ${block.bgColor}; color: ${block.textColor};" 
+                            <div class="shift-block p-2 rounded text-xs cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1 ${unassignedClass}" 
+                                 style="${unassignedStyle} color: ${block.isUnassigned ? '#991b1b' : block.textColor};" 
                                  data-action="view-crc-event" 
                                  data-event-id="${block.event.id}"
                                  title="Shift: ${block.site?.name || 'Unknown Site'} - ${displayText}">
@@ -11189,29 +11258,24 @@
                                     const role = state.roles.find(r => r.id === roleId);
                                     if (!role) return;
                                     
-                                    // Format role name (handle training roles)
-                                    let roleDisplayName = role.name;
-                                    if (isTrainingRoleName(role.name)) {
-                                        // For training roles, check if there are training assignments
-                                        if (event.trainingAssignments && event.trainingAssignments[roleId]) {
-                                            const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
-                                            if (trainingTypes.length > 0) {
-                                                roleDisplayName = `Training, ${trainingTypes.join(', ')}`;
-                                            } else {
-                                                roleDisplayName = `Training`;
-                                            }
-                                        } else {
-                                            // Training role assigned but no training type selected yet - still show it
-                                            roleDisplayName = `Training`;
-                                        }
-                                    }
-                                    
                                     if (Array.isArray(assignments)) {
-                                        assignments.forEach(crcId => {
+                                        assignments.forEach((crcId, index) => {
                                             if (crcId) {
                                                 if (!crcRoleMap.has(crcId)) {
                                                     crcRoleMap.set(crcId, new Set());
                                                 }
+                                                
+                                                // Format role name - for training roles, get the specific training type for this index
+                                                let roleDisplayName = role.name;
+                                                if (isTrainingRoleName(role.name)) {
+                                                    // Get the specific training type for this CRC's index
+                                                    if (event.trainingAssignments && event.trainingAssignments[roleId] && event.trainingAssignments[roleId][index]) {
+                                                        roleDisplayName = `Training, ${event.trainingAssignments[roleId][index]}`;
+                                                    } else {
+                                                        roleDisplayName = `Training`;
+                                                    }
+                                                }
+                                                
                                                 crcRoleMap.get(crcId).add(roleDisplayName);
                                             }
                                         });
@@ -11269,7 +11333,8 @@
                                         textColor: textColor,
                                         spanTextColor: spanTextColor,
                                         event: event,
-                                        hours: eventHours
+                                        hours: eventHours,
+                                        isUnassigned: crcId === 'UNASSIGNED'
                                     });
                                 });
                                 processedEvents.add(event.id);
@@ -11313,10 +11378,14 @@
                         
                         const displayText = displayParts.join(' - ');
                         
+                        // Add flashing red style for unassigned blocks
+                        const unassignedClass = block.isUnassigned ? 'unfilled-role-box' : '';
+                        const unassignedStyle = block.isUnassigned ? 'background-color: rgba(239, 68, 68, 0.3) !important;' : `background-color: ${block.bgColor};`;
+                        
                         // Use view-crc-event with the specific event ID so clicking shows just that one shift
                         return `
-                            <div class="shift-block p-2 rounded text-xs cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" 
-                                 style="background-color: ${block.bgColor}; color: ${block.textColor};" 
+                            <div class="shift-block p-2 rounded text-xs cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1 ${unassignedClass}" 
+                                 style="${unassignedStyle} color: ${block.isUnassigned ? '#991b1b' : block.textColor};" 
                                  data-action="view-crc-event" 
                                  data-event-id="${block.event.id}"
                                  title="Shift: ${block.site?.name || 'Unknown Site'} - ${displayText}">
@@ -12139,7 +12208,7 @@
                                     
                                     crcToRoles.forEach((roles, crcId) => {
                                         const crc = state.crcs.find(c => c.id === crcId);
-                                        const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                        const crcName = crcId === 'SITE_STAFF' ? 'Site Staff' : (crcId === 'UNASSIGNED' ? '⚠ Unassigned' : (crc ? crc.name.split(' ')[0] : 'Unknown'));
                                         // Show ALL roles before the name
                                         const displayText = roles.length > 0 ? `${roles.join(', ')} - ${crcName}` : crcName;
                                         // Add border between blocks for cleaner separation
@@ -12526,7 +12595,7 @@
                                     
                                     crcToRoles.forEach((roles, crcId) => {
                                         const crc = state.crcs.find(c => c.id === crcId);
-                                        const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                        const crcName = crcId === 'SITE_STAFF' ? 'Site Staff' : (crcId === 'UNASSIGNED' ? '⚠ Unassigned' : (crc ? crc.name.split(' ')[0] : 'Unknown'));
                                         
                                         let displayText;
                                         if (event.type === 'Travel Day') {
@@ -13200,7 +13269,7 @@
                                     
                                     crcToRoles.forEach((roles, crcId) => {
                                         const crc = state.crcs.find(c => c.id === crcId);
-                                        const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                        const crcName = crcId === 'SITE_STAFF' ? 'Site Staff' : (crcId === 'UNASSIGNED' ? '⚠ Unassigned' : (crc ? crc.name.split(' ')[0] : 'Unknown'));
                                         // Show ALL roles before the name
                                         const displayText = roles.length > 0 ? `${roles.join(', ')} - ${crcName}` : crcName;
                                         // Add border between blocks for cleaner separation
@@ -17644,6 +17713,9 @@
                 };
 
                 const crcNameMap = new Map(state.crcs.map(crc => [crc.id, crc.name || 'Unknown CRC']));
+                // Add special entries for SITE_STAFF and UNASSIGNED
+                crcNameMap.set('SITE_STAFF', 'Site Staff');
+                crcNameMap.set('UNASSIGNED', '⚠ Unassigned');
 
                 const visitIdentifier = (event) => `${event.date}|${event.siteId || 'unassigned'}|${event.visitNumber || ''}`;
 
@@ -20511,36 +20583,55 @@
                                     // Update state directly to ensure it's available immediately
                                     state.timeOffRequests = updatedRequests;
                                     
-                                    // Set the month filter to the first request's month so it shows up
-                                    const firstRequestDate = days.length > 0 ? days[0].date : null;
-                                    if (firstRequestDate) {
-                                        const requestDate = new Date(firstRequestDate + 'T00:00:00');
-                                        const requestMonth = `${requestDate.getFullYear()}-${String(requestDate.getMonth() + 1).padStart(2, '0')}`;
-                                        console.log('Setting state with month filter:', requestMonth);
-                                        state.timeOffRequestsMonth = requestMonth;
-                                        state.timeOffRequestsStatusFilter = 'all';
-                                        state.activeTab = 'timeOffRequests';
-                                        setState({ 
-                                            timeOffRequests: updatedRequests,
-                                            timeOffRequestsMonth: requestMonth,
-                                            timeOffRequestsStatusFilter: 'all',
-                                            activeTab: 'timeOffRequests'
-                                        });
+                                    // For CRCs (non-managers), don't redirect to Time Off Requests tab
+                                    // Just refresh their current view showing only their own requests
+                                    const isManager = state.currentUser && state.currentUser.permissionLevel === 'Manager';
+                                    
+                                    if (isManager) {
+                                        // Managers: redirect to Time Off Requests tab to see all requests
+                                        const firstRequestDate = days.length > 0 ? days[0].date : null;
+                                        if (firstRequestDate) {
+                                            const requestDate = new Date(firstRequestDate + 'T00:00:00');
+                                            const requestMonth = `${requestDate.getFullYear()}-${String(requestDate.getMonth() + 1).padStart(2, '0')}`;
+                                            console.log('Manager: Setting state with month filter:', requestMonth);
+                                            state.timeOffRequestsMonth = requestMonth;
+                                            state.timeOffRequestsStatusFilter = 'all';
+                                            state.activeTab = 'timeOffRequests';
+                                            setState({ 
+                                                timeOffRequests: updatedRequests,
+                                                timeOffRequestsMonth: requestMonth,
+                                                timeOffRequestsStatusFilter: 'all',
+                                                activeTab: 'timeOffRequests'
+                                            });
+                                        } else {
+                                            console.log('Manager: Setting state without month filter');
+                                            state.timeOffRequestsStatusFilter = 'all';
+                                            state.activeTab = 'timeOffRequests';
+                                            setState({ 
+                                                timeOffRequests: updatedRequests,
+                                                timeOffRequestsStatusFilter: 'all',
+                                                activeTab: 'timeOffRequests'
+                                            });
+                                        }
+                                        // Force render after state update
+                                        setTimeout(() => {
+                                            console.log('Rendering content after state update. State has', state.timeOffRequests.length, 'requests');
+                                            renderContent();
+                                        }, 300);
                                     } else {
-                                        console.log('Setting state without month filter');
-                                        state.timeOffRequestsStatusFilter = 'all';
-                                        state.activeTab = 'timeOffRequests';
-                                        setState({ 
-                                            timeOffRequests: updatedRequests,
-                                            timeOffRequestsStatusFilter: 'all',
-                                            activeTab: 'timeOffRequests'
-                                        });
+                                        // CRCs: Stay on current view, just refresh their time off display
+                                        console.log('CRC: Staying on current view, refreshing time off display');
+                                        setState({ timeOffRequests: updatedRequests });
+                                        // Refresh the time off content if visible
+                                        setTimeout(() => {
+                                            if (document.getElementById('time-off-content')) {
+                                                renderTimeOffContent();
+                                            }
+                                            if (document.getElementById('unavailability-calendar-container')) {
+                                                renderUnavailabilityCalendar();
+                                            }
+                                        }, 100);
                                     }
-                                    // Force render after state update - use longer delay to ensure state is set
-                                    setTimeout(() => {
-                                        console.log('Rendering content after state update. State has', state.timeOffRequests.length, 'requests');
-                                        renderContent();
-                                    }, 300);
                                 } catch (error) {
                                     console.error('Error refreshing time off requests:', error);
                                     showNotification('Time off requests created but failed to refresh the list. Please refresh the page.', 'warning');
@@ -23331,24 +23422,43 @@
                                                         // Update state directly to ensure it's available immediately
                                                         state.timeOffRequests = updatedRequests;
                                                         
-                                                        // Set the month filter to the request's month so it shows up
-                                                        const requestDate = new Date(date + 'T00:00:00');
-                                                        const requestMonth = `${requestDate.getFullYear()}-${String(requestDate.getMonth() + 1).padStart(2, '0')}`;
-                                                        console.log('Setting state with month filter:', requestMonth);
-                                                        state.timeOffRequestsMonth = requestMonth;
-                                                        state.timeOffRequestsStatusFilter = 'all';
-                                                        state.activeTab = 'timeOffRequests';
-                                                        setState({ 
-                                                            timeOffRequests: updatedRequests,
-                                                            timeOffRequestsMonth: requestMonth,
-                                                            timeOffRequestsStatusFilter: 'all',
-                                                            activeTab: 'timeOffRequests'
-                                                        });
-                                                        // Force render after state update - use longer delay to ensure state is set
-                                                        setTimeout(() => {
-                                                            console.log('Rendering content after state update. State has', state.timeOffRequests.length, 'requests');
-                                                            renderContent();
-                                                        }, 300);
+                                                        // For CRCs (non-managers), don't redirect to Time Off Requests tab
+                                                        // Just refresh their current view showing only their own requests
+                                                        const isManager = state.currentUser && state.currentUser.permissionLevel === 'Manager';
+                                                        
+                                                        if (isManager) {
+                                                            // Managers: redirect to Time Off Requests tab to see all requests
+                                                            const requestDate = new Date(date + 'T00:00:00');
+                                                            const requestMonth = `${requestDate.getFullYear()}-${String(requestDate.getMonth() + 1).padStart(2, '0')}`;
+                                                            console.log('Manager: Setting state with month filter:', requestMonth);
+                                                            state.timeOffRequestsMonth = requestMonth;
+                                                            state.timeOffRequestsStatusFilter = 'all';
+                                                            state.activeTab = 'timeOffRequests';
+                                                            setState({ 
+                                                                timeOffRequests: updatedRequests,
+                                                                timeOffRequestsMonth: requestMonth,
+                                                                timeOffRequestsStatusFilter: 'all',
+                                                                activeTab: 'timeOffRequests'
+                                                            });
+                                                            // Force render after state update
+                                                            setTimeout(() => {
+                                                                console.log('Rendering content after state update. State has', state.timeOffRequests.length, 'requests');
+                                                                renderContent();
+                                                            }, 300);
+                                                        } else {
+                                                            // CRCs: Stay on current view, just refresh their time off display
+                                                            console.log('CRC: Staying on current view, refreshing time off display');
+                                                            setState({ timeOffRequests: updatedRequests });
+                                                            // Refresh the time off content if visible
+                                                            setTimeout(() => {
+                                                                if (document.getElementById('time-off-content')) {
+                                                                    renderTimeOffContent();
+                                                                }
+                                                                if (document.getElementById('unavailability-calendar-container')) {
+                                                                    renderUnavailabilityCalendar();
+                                                                }
+                                                            }, 100);
+                                                        }
                                                     } catch (refreshError) {
                                                         console.error('Error refreshing time off requests:', refreshError);
                                                         showNotification('Time off request created but failed to refresh the list. Please refresh the page.', 'warning');
@@ -29533,49 +29643,11 @@
                             });
                             console.log('Converted using legacy roles array:', mergedRoleAssignments);
                         } else {
-                            // If no roles specified in legacy event, assign to ALL study required roles
-                            // This ensures the CRC appears in all relevant role dropdowns
-                            if (existingEvent.type === 'Site Assignment' && existingEvent.studyIds && existingEvent.studyIds.length > 0) {
-                                const study = state.studies.find(s => s.id === existingEvent.studyIds[0]);
-                                if (study) {
-                                    // Try requiredRoles first - assign to ALL required roles
-                                    if (study.requiredRoles && study.requiredRoles.length > 0) {
-                                        study.requiredRoles.forEach(roleId => {
-                                            const role = state.roles.find(r => r.id === roleId);
-                                            if (role) {
-                                                if (!mergedRoleAssignments[roleId]) {
-                                                    mergedRoleAssignments[roleId] = [];
-                                                }
-                                                if (!mergedRoleAssignments[roleId].includes(existingEvent.crcId)) {
-                                                    mergedRoleAssignments[roleId].push(existingEvent.crcId);
-                                                    console.log(`✓ Assigned legacy crcId ${existingEvent.crcId} to role ${role.name} (${roleId}) based on study.requiredRoles`);
-                                                }
-                                            }
-                                        });
-                                    }
-                                    // If still empty, try visitRoleRequirements default
-                                    if (Object.keys(mergedRoleAssignments).length === 0 && study.visitRoleRequirements && study.visitRoleRequirements['default']) {
-                                        const defaultReqs = study.visitRoleRequirements['default'];
-                                        Object.keys(defaultReqs).forEach(roleId => {
-                                            const role = state.roles.find(r => r.id === roleId);
-                                            if (role) {
-                                                mergedRoleAssignments[roleId] = [existingEvent.crcId];
-                                                console.log(`✓ Assigned legacy crcId ${existingEvent.crcId} to role ${role.name} (${roleId}) based on study.visitRoleRequirements['default']`);
-                                            }
-                                        });
-                                    }
-                                    // If still empty, try siteRoleRequirements
-                                    if (Object.keys(mergedRoleAssignments).length === 0 && existingEvent.siteId && study.siteRoleRequirements && study.siteRoleRequirements[existingEvent.siteId]) {
-                                        const siteReqs = study.siteRoleRequirements[existingEvent.siteId];
-                                        Object.keys(siteReqs).forEach(roleId => {
-                                            const role = state.roles.find(r => r.id === roleId);
-                                            if (role) {
-                                                mergedRoleAssignments[roleId] = [existingEvent.crcId];
-                                                console.log(`✓ Assigned legacy crcId ${existingEvent.crcId} to role ${role.name} (${roleId}) based on study.siteRoleRequirements`);
-                                            }
-                                        });
-                                    }
-                                }
+                            // If no roles specified in legacy event, do NOT auto-assign to all roles
+                            // This was causing the "one person added to every role" bug
+                            // Just leave the form empty and let the user assign roles manually
+                            console.log('Legacy event with no roles array - NOT auto-assigning to roles. User must assign manually.');
+                            if (false) { // Disabled - was causing auto-population issues
                                 // Final fallback: use training role if study requires it
                                 if (Object.keys(mergedRoleAssignments).length === 0) {
                                     const trainingRole = state.roles.find(r => isTrainingRoleName(r.name));
@@ -33351,9 +33423,30 @@
 
                 const allRequests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
                 const viewingOwn = !!state.currentUser;
-                const requestsToShow = viewingOwn
-                    ? allRequests.filter(req => req.requestedBy === state.currentUser.id || req.crcId === state.currentUser.id)
-                    : allRequests;
+                
+                // For CRC users, they can ONLY see their own requests
+                // Use getLoggedInCrcId() to get the matched CRC ID
+                const loggedInCrcId = getLoggedInCrcId();
+                const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                
+                let requestsToShow;
+                if (isCrcUser && loggedInCrcId) {
+                    // CRC users can ONLY see their own time off requests
+                    requestsToShow = allRequests.filter(req => 
+                        req.crcId === loggedInCrcId || 
+                        req.requestedBy === state.currentUser.id ||
+                        req.requestedBy === loggedInCrcId
+                    );
+                } else if (viewingOwn) {
+                    // Other logged in users see their own requests
+                    requestsToShow = allRequests.filter(req => 
+                        req.requestedBy === state.currentUser.id || 
+                        req.crcId === state.currentUser.id ||
+                        (loggedInCrcId && req.crcId === loggedInCrcId)
+                    );
+                } else {
+                    requestsToShow = allRequests;
+                }
 
                 const pendingRequests = requestsToShow.filter(req => normalizeTimeOffStatus(req.status) === 'pending');
                 const approvedRequests = requestsToShow.filter(req => normalizeTimeOffStatus(req.status) === 'approved');
@@ -33366,6 +33459,9 @@
                 };
 
                 const crcNameMap = new Map(state.crcs.map(crc => [crc.id, crc.name || 'Unknown CRC']));
+                // Add special entries for SITE_STAFF and UNASSIGNED
+                crcNameMap.set('SITE_STAFF', 'Site Staff');
+                crcNameMap.set('UNASSIGNED', '⚠ Unassigned');
                 const startOfToday = (() => {
                     const now = new Date();
                     return new Date(now.getFullYear(), now.getMonth(), now.getDate());
