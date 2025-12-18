@@ -12689,12 +12689,66 @@
                         for (let day = 1; day <= daysInMonth; day++) {
                             const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                             const dayEvents = (eventsBySite[siteId] || []).filter(e => e.date === dateStr);
-                            // Deduplicate events by ID to prevent showing the same event multiple times
-                            const uniqueDayEvents = Array.from(new Map(dayEvents.map(e => [e.id, e])).values());
+                            
+                            // Group events by shift characteristics (groupId or visit/group/period combo)
+                            // This prevents showing the same shift multiple times when multiple CRCs are assigned
+                            // SAME LOGIC AS WEEKLY/DAILY VIEWS
+                            const shiftGroups = new Map();
+                            dayEvents.forEach(event => {
+                                // Create a unique key for this shift
+                                const shiftKey = event.groupId || JSON.stringify({
+                                    studyIds: (event.studyIds || []).sort().join(','),
+                                    visitNumber: event.visitNumber || '',
+                                    groupNumber: event.groupNumber || '',
+                                    period: event.period || 'Full Day',
+                                    type: event.type || 'Site Assignment'
+                                });
+                                
+                                if (!shiftGroups.has(shiftKey)) {
+                                    shiftGroups.set(shiftKey, {
+                                        primaryEvent: event,
+                                        events: [],
+                                        allCrcIds: new Set(),
+                                        allRoles: new Map(), // roleId -> Set of crcIds
+                                        allNotes: []
+                                    });
+                                }
+                                
+                                const group = shiftGroups.get(shiftKey);
+                                group.events.push(event);
+                                
+                                // Collect all CRCs from this event
+                                if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                                    group.allCrcIds.add(event.crcId);
+                                }
+                                if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                        if (!group.allRoles.has(roleId)) {
+                                            group.allRoles.set(roleId, new Set());
+                                        }
+                                        if (Array.isArray(assignments)) {
+                                            assignments.forEach(crcId => {
+                                                if (crcId && crcId !== 'SITE_STAFF') {
+                                                    group.allCrcIds.add(crcId);
+                                                    group.allRoles.get(roleId).add(crcId);
+                                                } else if (crcId === 'SITE_STAFF') {
+                                                    group.allRoles.get(roleId).add('SITE_STAFF');
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                                
+                                if (event.notes && !group.allNotes.includes(event.notes)) {
+                                    group.allNotes.push(event.notes);
+                                }
+                            });
+                            
                             tableHtml += `<td class="global-view-cell bg-white dark:bg-gray-900 align-top p-1 custom-scrollbar" data-action="open-crc-event-modal" data-date="${dateStr}">`;
                             
-                            // Create one block for EVERY role assignment - each role + CRC combination gets its own block
-                            uniqueDayEvents.forEach(event => {
+                            // Render each grouped shift as ONE block with header + CRC blocks (SAME AS WEEKLY/DAILY VIEWS)
+                            Array.from(shiftGroups.values()).forEach(group => {
+                                const event = group.primaryEvent;
                                 const eventSite = state.crc_sites.find(s => s.id === event.siteId);
                                 const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
                                 const pi = event.principalInvestigator || eventSite?.principalInvestigator;
@@ -12705,120 +12759,113 @@
                                 const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                 const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
                                 
-                                // Check role fulfillment
+                                // Check role fulfillment using the aggregated data
                                 const roleFulfillment = checkRoleFulfillment(event);
                                 const roleIcon = roleFulfillment.fulfilled ? 
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                     `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
                                 
-                                // Build header information for the shift (Visit, Group, Hours)
-                                const headerParts = [];
-                                if (event.visitNumber) headerParts.push(`Visit ${event.visitNumber}`);
-                                if (event.groupNumber) headerParts.push(`Group ${event.groupNumber}`);
-                                if (event.hours) headerParts.push(`${event.hours}h`);
-                                const headerText = headerParts.length > 0 ? headerParts.join(' • ') : '';
+                                // Build header with visit and group (V1G1 format) - SAME AS WEEKLY/DAILY
+                                const visitGroupHeader = [];
+                                if (event.visitNumber) visitGroupHeader.push(`V${getVisitDisplayName(event.visitNumber, event.studyIds)}`);
+                                if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
+                                if (event.hours) visitGroupHeader.push(`${event.hours}h`);
+                                const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join(' • ') : '';
+                                
+                                // Get all CRC names from the grouped shift
+                                const allCrcs = Array.from(group.allCrcIds).map(crcId => state.crcs.find(c => c.id === crcId)).filter(Boolean);
+                                const crcNamesList = allCrcs.length > 0 ? allCrcs.map(c => c.name.split(' ')[0]).join(', ') : '';
                                 
                                 // Build tooltip
                                 const tooltipParts = [];
-                                if (event.notes) tooltipParts.push(event.notes);
+                                if (group.allNotes.length > 0) tooltipParts.push(group.allNotes.join('; '));
                                 if (!roleFulfillment.fulfilled && roleFulfillment.missingRoles.length > 0) {
                                     tooltipParts.push(`Missing roles: ${roleFulfillment.missingRoles.join(', ')}`);
                                 }
                                 if (event.visitNumber) tooltipParts.push(`Visit: ${getVisitDisplayName(event.visitNumber, event.studyIds)}`);
                                 if (pi) tooltipParts.push(`PI: ${pi}`);
                                 if (event.period && event.period !== 'Full Day') tooltipParts.push(`Period: ${event.period}`);
+                                if (allCrcs.length > 0) tooltipParts.push(`Staff: ${allCrcs.map(c => c.name).join(', ')}`);
                                 const tooltip = tooltipParts.length > 0 ? tooltipParts.join('\n') : '';
                                 
-                                // Build all blocks for this event
-                                let blocksHtml = '';
-                                
-                                // For Travel Day events, create one block per traveler
+                                // For Travel Day events, show all travelers in one block
                                 if (event.type === 'Travel Day') {
-                                    const eventCrcs = getEventCRCs(event);
-                                    if (eventCrcs.length > 0) {
-                                        eventCrcs.forEach(crc => {
-                                            const displayText = `Travel - ${crc.name.split(' ')[0]}`;
-                                            blocksHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                                <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
-                                            </div>`;
-                                        });
-                                    } else {
-                                        const displayText = 'Travel - Unassigned';
-                                        blocksHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                            <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
-                                        </div>`;
-                                    }
-                                } else if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                                    // Create one block for each role assignment (role + CRC)
-                                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                    const displayText = allCrcs.length > 0 
+                                        ? `Travel - ${crcNamesList}`
+                                        : 'Travel - Unassigned';
+                                    tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                        ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                        <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                    </div>`;
+                                } else if (group.allRoles.size > 0 || allCrcs.length > 0) {
+                                    // Group by CRC - each CRC gets their own block with all their roles combined
+                                    // First, build a map of CRC -> roles
+                                    const crcToRoles = new Map();
+                                    const siteStaffRoles = [];
+                                    
+                                    group.allRoles.forEach((crcIds, roleId) => {
                                         const role = state.roles.find(r => r.id === roleId);
                                         if (!role) return;
                                         
-                                        // Format role name (handle training roles)
                                         let roleDisplayName = role.name;
                                         if (isTrainingRoleName(role.name)) {
-                                            if (event.trainingAssignments && event.trainingAssignments[roleId]) {
-                                                const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
-                                                if (trainingTypes.length > 0) {
-                                                    roleDisplayName = `Training - ${trainingTypes.join(', ')}`;
-                                                } else {
-                                                    roleDisplayName = `Training`;
-                                                }
-                                            } else {
-                                                roleDisplayName = `Training`;
-                                            }
+                                            roleDisplayName = 'Training';
                                         }
                                         
-                                        if (Array.isArray(assignments) && assignments.length > 0) {
-                                            // Create one block per CRC assigned to this role
-                                            assignments.forEach(crcId => {
-                                                if (!crcId) return;
-                                                
-                                                let crcDisplayName;
-                                                if (crcId === 'SITE_STAFF') {
-                                                    crcDisplayName = 'Site Staff';
-                                                } else {
-                                                    const crc = state.crcs.find(c => c.id === crcId);
-                                                    crcDisplayName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                        Array.from(crcIds).forEach(crcId => {
+                                            if (crcId === 'SITE_STAFF') {
+                                                if (!siteStaffRoles.includes(roleDisplayName)) {
+                                                    siteStaffRoles.push(roleDisplayName);
                                                 }
-                                                
-                                                const displayText = `${roleDisplayName} - ${crcDisplayName}`;
-                                                blocksHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                                    <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
-                                                </div>`;
-                                            });
-                                        } else {
-                                            // Role exists but no one assigned - show empty role
-                                            const displayText = `${roleDisplayName} - Unassigned`;
-                                            blocksHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                                <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
-                                            </div>`;
+                                            } else {
+                                                if (!crcToRoles.has(crcId)) {
+                                                    crcToRoles.set(crcId, []);
+                                                }
+                                                if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
+                                                    crcToRoles.get(crcId).push(roleDisplayName);
+                                                }
+                                            }
+                                        });
+                                    });
+                                    
+                                    // Also add CRCs that might not have roles explicitly set
+                                    allCrcs.forEach(crc => {
+                                        if (!crcToRoles.has(crc.id)) {
+                                            crcToRoles.set(crc.id, []);
                                         }
                                     });
-                                } else if (event.crcId) {
-                                    // Legacy: event has crcId but no roleAssignments
-                                    const crc = state.crcs.find(c => c.id === event.crcId);
-                                    const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
-                                    const allRoles = getAllEventRoles(event);
-                                    const roleNames = allRoles.length > 0 ? allRoles : getEventRoles(event);
-                                    const roleDisplay = roleNames.length > 0 ? roleNames.join(', ') : event.type;
-                                    const displayText = `${roleDisplay} - ${crcName}`;
-                                    blocksHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                        <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
-                                    </div>`;
+                                    
+                                    // Build individual blocks for each CRC (each with their combined roles)
+                                    // All blocks click to open the FULL shift (same event.id)
+                                    let blocksHtml = '';
+                                    crcToRoles.forEach((roles, crcId) => {
+                                        const crc = state.crcs.find(c => c.id === crcId);
+                                        const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                        const displayText = roles.length > 0 ? `${roles.join(', ')} - ${crcName}` : crcName;
+                                        blocksHtml += `<div class="px-2 py-1 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
+                                            <strong>${displayText}</strong>
+                                        </div>`;
+                                    });
+                                    
+                                    // Add Site Staff block if any
+                                    if (siteStaffRoles.length > 0) {
+                                        const displayText = `${siteStaffRoles.join(', ')} - Site Staff`;
+                                        blocksHtml += `<div class="px-2 py-1 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
+                                            <strong>${displayText}</strong>
+                                        </div>`;
+                                    }
+                                    
+                                    // Wrap in container with header
+                                    const header = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300" style="border-left: 3px solid ${eventBgColor}; border-top: 1px solid ${eventBgColor}; border-right: 1px solid ${eventBgColor}">${headerText} ${overrideIcon}${roleIcon}</div>` : '';
+                                    const blocksWrapper = `<div class="rounded-b mb-1" style="background-color: ${eventBgColor}; border: 1px solid ${eventBgColor};">${blocksHtml}</div>`;
+                                    tableHtml += `<div class="mb-1">${header}${blocksWrapper}</div>`;
                                 } else {
-                                    // No assignments - show open shift
+                                    // No roles and no CRCs - show as open shift
                                     const displayText = 'Open Shift';
-                                    blocksHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                    tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                        ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
                                         <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
                                     </div>`;
-                                }
-                                
-                                // Wrap header and blocks in a grouped container
-                                if (blocksHtml) {
-                                    const header = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300 mb-0" style="border-left: 3px solid ${eventBgColor}; border-top: 1px solid ${eventBgColor}; border-right: 1px solid ${eventBgColor}">${headerText}</div>` : '';
-                                    const blocksWrapper = `<div class="rounded-b border-l border-r border-b mb-1" style="border-color: ${eventBgColor}">${blocksHtml}</div>`;
-                                    tableHtml += headerText ? `<div class="mb-1">${header}${blocksWrapper}</div>` : blocksWrapper;
                                 }
                             });
                             tableHtml += `</td>`;
