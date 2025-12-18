@@ -3556,6 +3556,76 @@
                 // If role has no trainingNames set, return empty array (no training required)
                 return [];
             };
+            
+            // Find all roles that require a specific training
+            const getRolesRequiringTraining = (trainingName) => {
+                if (!trainingName) return [];
+                const trainingLower = trainingName.trim().toLowerCase();
+                return (state.roles || []).filter(role => {
+                    if (!role || !Array.isArray(role.trainingNames)) return false;
+                    return role.trainingNames.some(tn => 
+                        tn && tn.trim().toLowerCase() === trainingLower
+                    );
+                });
+            };
+            
+            // Get the last date a CRC was assigned to a role that requires a specific training
+            const getLastPerformedDate = (crcId, trainingName) => {
+                if (!crcId || !trainingName) return null;
+                
+                // Find all roles that require this training
+                const rolesRequiringTraining = getRolesRequiringTraining(trainingName);
+                if (rolesRequiringTraining.length === 0) return null;
+                
+                const roleIds = new Set(rolesRequiringTraining.map(r => r.id));
+                const roleNames = new Set(rolesRequiringTraining.map(r => r.name.toLowerCase()));
+                
+                let lastDate = null;
+                
+                // Check all events for this CRC
+                (state.crc_events || []).forEach(event => {
+                    if (!event || event.type !== 'Site Assignment') return;
+                    
+                    // Check if this CRC is assigned to any role in this event
+                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                            // Check if this role requires the training
+                            if (!roleIds.has(roleId)) return;
+                            
+                            // Check if this CRC is assigned to this role
+                            if (!Array.isArray(assignments)) return;
+                            const isCrcAssigned = assignments.some(assignedId => {
+                                if (assignedId === crcId) return true;
+                                // Also check by name in case of ID mismatch
+                                const assignedCrc = state.crcs.find(c => c.id === assignedId);
+                                return assignedCrc && assignedCrc.id === crcId;
+                            });
+                            
+                            if (isCrcAssigned && event.date) {
+                                const eventDate = new Date(event.date + 'T00:00:00');
+                                if (!lastDate || eventDate > lastDate) {
+                                    lastDate = eventDate;
+                                }
+                            }
+                        });
+                    }
+                    
+                    // Also check legacy roles array
+                    if (event.crcId === crcId && Array.isArray(event.roles)) {
+                        const hasRequiredRole = event.roles.some(roleName => 
+                            roleNames.has(roleName.toLowerCase())
+                        );
+                        if (hasRequiredRole && event.date) {
+                            const eventDate = new Date(event.date + 'T00:00:00');
+                            if (!lastDate || eventDate > lastDate) {
+                                lastDate = eventDate;
+                            }
+                        }
+                    }
+                });
+                
+                return lastDate;
+            };
 
             const hasValidTraining = (crc, roleName) => {
                 if (isTrainingRoleName(roleName)) return true;
@@ -11825,65 +11895,88 @@
                                         <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
                                     </div>`;
                                 } else if (group.allRoles.size > 0 || allCrcs.length > 0) {
-                                    // Group by CRC - show all roles for each person on one line
-                                    // First, build a map of CRC -> roles
+                                    // Group by CRC - each CRC gets their own block with ALL their roles combined
+                                    // First, build a map of CRC -> roles (using roleAssignments from the primary event)
                                     const crcToRoles = new Map();
                                     const siteStaffRoles = [];
                                     
-                                    group.allRoles.forEach((crcIds, roleId) => {
-                                        const role = state.roles.find(r => r.id === roleId);
-                                        if (!role) return;
-                                        
-                                        let roleDisplayName = role.name;
-                                        if (isTrainingRoleName(role.name)) {
-                                            roleDisplayName = 'Training';
-                                        }
-                                        
-                                        Array.from(crcIds).forEach(crcId => {
-                                            if (crcId === 'SITE_STAFF') {
-                                                if (!siteStaffRoles.includes(roleDisplayName)) {
-                                                    siteStaffRoles.push(roleDisplayName);
-                                                }
-                                            } else {
-                                                if (!crcToRoles.has(crcId)) {
-                                                    crcToRoles.set(crcId, []);
-                                                }
-                                                if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
-                                                    crcToRoles.get(crcId).push(roleDisplayName);
+                                    // Get roles from the event's roleAssignments
+                                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                            const role = state.roles.find(r => r.id === roleId);
+                                            let roleDisplayName = role ? role.name : roleId;
+                                            
+                                            // Handle training roles - get the training type from trainingAssignments
+                                            if (role && isTrainingRoleName(role.name)) {
+                                                if (event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                                    const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                                                    if (trainingTypes.length > 0) {
+                                                        roleDisplayName = `Training - ${trainingTypes.join(', ')}`;
+                                                    } else {
+                                                        roleDisplayName = 'Training';
+                                                    }
+                                                } else {
+                                                    roleDisplayName = 'Training';
                                                 }
                                             }
+                                            
+                                            if (Array.isArray(assignments)) {
+                                                assignments.forEach(crcId => {
+                                                    if (crcId === 'SITE_STAFF') {
+                                                        if (!siteStaffRoles.includes(roleDisplayName)) {
+                                                            siteStaffRoles.push(roleDisplayName);
+                                                        }
+                                                    } else if (crcId) {
+                                                        if (!crcToRoles.has(crcId)) {
+                                                            crcToRoles.set(crcId, []);
+                                                        }
+                                                        if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
+                                                            crcToRoles.get(crcId).push(roleDisplayName);
+                                                        }
+                                                    }
+                                                });
+                                            }
                                         });
-                                    });
+                                    }
                                     
-                                    // Also add CRCs that might not have roles explicitly set
+                                    // Also add CRCs from legacy crcId that might not have roles
                                     allCrcs.forEach(crc => {
                                         if (!crcToRoles.has(crc.id)) {
                                             crcToRoles.set(crc.id, []);
                                         }
                                     });
                                     
-                                    // Build display: "Role1, Role2 - Name" for each person
-                                    const displayParts = [];
+                                    // Build individual blocks for each CRC (each with their combined roles)
+                                    // All blocks click to open the FULL shift (same event.id)
+                                    let blocksHtml = '';
+                                    let blockIndex = 0;
+                                    const totalBlocks = crcToRoles.size + (siteStaffRoles.length > 0 ? 1 : 0);
+                                    
                                     crcToRoles.forEach((roles, crcId) => {
                                         const crc = state.crcs.find(c => c.id === crcId);
                                         const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
-                                        if (roles.length > 0) {
-                                            displayParts.push(`${roles.join(', ')} - ${crcName}`);
-                                        } else {
-                                            displayParts.push(crcName);
-                                        }
+                                        // Show ALL roles before the name
+                                        const displayText = roles.length > 0 ? `${roles.join(', ')} - ${crcName}` : crcName;
+                                        // Add border between blocks for cleaner separation
+                                        const borderStyle = blockIndex < totalBlocks - 1 ? `border-bottom: 1px solid ${spanTextColor};` : '';
+                                        blocksHtml += `<div class="px-2 py-1.5 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor}; ${borderStyle}" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
+                                            <strong>${displayText}</strong>
+                                        </div>`;
+                                        blockIndex++;
                                     });
                                     
-                                    // Add Site Staff if any
+                                    // Add Site Staff block if any
                                     if (siteStaffRoles.length > 0) {
-                                        displayParts.push(`${siteStaffRoles.join(', ')} - Site Staff`);
+                                        const displayText = `${siteStaffRoles.join(', ')} - Site Staff`;
+                                        blocksHtml += `<div class="px-2 py-1.5 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
+                                            <strong>${displayText}</strong>
+                                        </div>`;
                                     }
                                     
-                                    const displayText = displayParts.length > 0 ? displayParts.join(' | ') : 'Open Shift';
-                                    tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 mb-1" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                        ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
-                                        <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
-                                    </div>`;
+                                    // Wrap in container with header - cleaner borders
+                                    const header = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300" style="border-left: 3px solid ${eventBgColor}; border-top: 1px solid ${eventBgColor}; border-right: 1px solid ${eventBgColor}">${headerText} ${overrideIcon}${roleIcon}</div>` : '';
+                                    const blocksWrapper = `<div class="rounded-b mb-1" style="background-color: ${eventBgColor}; border: 1px solid ${eventBgColor};">${blocksHtml}</div>`;
+                                    tableHtml += `<div class="mb-1">${header}${blocksWrapper}</div>`;
                                 } else {
                                     // No assignments - show open shift
                                     const displayText = 'Open Shift';
@@ -12186,58 +12279,91 @@
                             
                             // If there are CRCs, create grouped container with header + staff blocks
                             if (allCrcs.length > 0 || event.type === 'Travel Day') {
-                                // Build header
-                                const header = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300 mb-0" style="border-left: 3px solid ${eventBgColor}; border-top: 1px solid ${eventBgColor}; border-right: 1px solid ${eventBgColor}">${headerText}</div>` : '';
+                                // Build header (matching weekly/monthly format with override and role icons)
+                                const header = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300 mb-0" style="border-left: 3px solid ${eventBgColor}; border-top: 1px solid ${eventBgColor}; border-right: 1px solid ${eventBgColor}">${headerText} ${overrideIcon}${roleIcon}</div>` : '';
                                 
                                 // Build all blocks - one per CRC, showing all their roles
                                 let blocksHtml = '';
                                 if (allCrcs.length > 0) {
-                                    allCrcs.forEach(crc => {
-                                        // Find ALL roles for this CRC
-                                        const crcRoles = [];
-                                        group.allRoles.forEach((crcIds, roleId) => {
-                                            if (crcIds.has(crc.id)) {
-                                                const role = state.roles.find(r => r.id === roleId);
-                                                if (role) {
-                                                    let roleName = role.name;
-                                                    if (isTrainingRoleName(role.name)) {
-                                                        roleName = 'Training';
+                                    // Build a map of CRC -> roles with proper training type display
+                                    const crcToRoles = new Map();
+                                    
+                                    // Get roles from the event's roleAssignments
+                                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                            const role = state.roles.find(r => r.id === roleId);
+                                            let roleDisplayName = role ? role.name : roleId;
+                                            
+                                            // Handle training roles - get the training type from trainingAssignments
+                                            if (role && isTrainingRoleName(role.name)) {
+                                                if (event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                                    const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                                                    if (trainingTypes.length > 0) {
+                                                        roleDisplayName = `Training - ${trainingTypes.join(', ')}`;
+                                                    } else {
+                                                        roleDisplayName = 'Training';
                                                     }
-                                                    if (!crcRoles.includes(roleName)) {
-                                                        crcRoles.push(roleName);
-                                                    }
+                                                } else {
+                                                    roleDisplayName = 'Training';
                                                 }
                                             }
+                                            
+                                            if (Array.isArray(assignments)) {
+                                                assignments.forEach(crcId => {
+                                                    if (crcId && crcId !== 'SITE_STAFF') {
+                                                        if (!crcToRoles.has(crcId)) {
+                                                            crcToRoles.set(crcId, []);
+                                                        }
+                                                        if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
+                                                            crcToRoles.get(crcId).push(roleDisplayName);
+                                                        }
+                                                    }
+                                                });
+                                            }
                                         });
+                                    }
+                                    
+                                    // Also add CRCs from legacy crcId that might not have roles
+                                    allCrcs.forEach(crc => {
+                                        if (!crcToRoles.has(crc.id)) {
+                                            crcToRoles.set(crc.id, []);
+                                        }
+                                    });
+                                    
+                                    let blockIndex = 0;
+                                    const totalBlocks = crcToRoles.size;
+                                    
+                                    crcToRoles.forEach((roles, crcId) => {
+                                        const crc = state.crcs.find(c => c.id === crcId);
+                                        const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
                                         
                                         let displayText;
                                         if (event.type === 'Travel Day') {
-                                            displayText = `Travel - ${crc.name.split(' ')[0]}`;
-                                        } else if (crcRoles.length > 0) {
+                                            displayText = `Travel - ${crcName}`;
+                                        } else if (roles.length > 0) {
                                             // Show all roles comma-separated, then the name
-                                            displayText = `${crcRoles.join(', ')} - ${crc.name.split(' ')[0]}`;
+                                            displayText = `${roles.join(', ')} - ${crcName}`;
                                         } else {
-                                            displayText = crc.name.split(' ')[0];
+                                            displayText = crcName;
                                         }
                                         
-                                        const eventBlockPadding = isMobile ? 'p-1 mb-0.5' : 'p-1.5 mb-1';
-                                        const eventTextSize = isMobile ? 'text-xs' : '';
-                                        blocksHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 ${eventBlockPadding} ${eventTextSize}" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                            <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
+                                        // Add border between blocks for cleaner separation
+                                        const borderStyle = blockIndex < totalBlocks - 1 ? `border-bottom: 1px solid ${spanTextColor};` : '';
+                                        blocksHtml += `<div class="px-2 py-1.5 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor}; ${borderStyle}" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
+                                            <strong>${displayText}</strong>
                                         </div>`;
+                                        blockIndex++;
                                     });
                                 } else {
                                     // Travel day with no CRCs
-                                    const eventBlockPadding = isMobile ? 'p-1 mb-0.5' : 'p-1.5 mb-1';
-                                    const eventTextSize = isMobile ? 'text-xs' : '';
-                                    blocksHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 ${eventBlockPadding} ${eventTextSize}" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                        <strong>Travel - Unassigned</strong> ${overrideIcon}${roleIcon}
+                                    blocksHtml += `<div class="px-2 py-1.5 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
+                                        <strong>Travel - Unassigned</strong>
                                     </div>`;
                                 }
                                 
-                                // Wrap header and blocks in a grouped container
-                                const blocksWrapper = `<div class="rounded-b border-l border-r border-b mb-1" style="border-color: ${eventBgColor}">${blocksHtml}</div>`;
-                                tableHtml += headerText ? `<div class="mb-1">${header}${blocksWrapper}</div>` : blocksWrapper;
+                                // Wrap header and blocks in a grouped container - cleaner borders matching weekly/monthly
+                                const blocksWrapper = `<div class="rounded-b mb-1" style="background-color: ${eventBgColor}; border: 1px solid ${eventBgColor};">${blocksHtml}</div>`;
+                                tableHtml += `<div class="mb-1">${header}${blocksWrapper}</div>`;
                             } else {
                                 // No CRCs assigned - show one block for the event (open shift)
                                 const displayText = 'Open Shift';
@@ -12818,37 +12944,51 @@
                                         <strong>${displayText}</strong> ${overrideIcon}${roleIcon}
                                     </div>`;
                                 } else if (group.allRoles.size > 0 || allCrcs.length > 0) {
-                                    // Group by CRC - each CRC gets their own block with all their roles combined
-                                    // First, build a map of CRC -> roles
+                                    // Group by CRC - each CRC gets their own block with ALL their roles combined
+                                    // First, build a map of CRC -> roles (using roleAssignments from the primary event)
                                     const crcToRoles = new Map();
                                     const siteStaffRoles = [];
                                     
-                                    group.allRoles.forEach((crcIds, roleId) => {
-                                        const role = state.roles.find(r => r.id === roleId);
-                                        if (!role) return;
-                                        
-                                        let roleDisplayName = role.name;
-                                        if (isTrainingRoleName(role.name)) {
-                                            roleDisplayName = 'Training';
-                                        }
-                                        
-                                        Array.from(crcIds).forEach(crcId => {
-                                            if (crcId === 'SITE_STAFF') {
-                                                if (!siteStaffRoles.includes(roleDisplayName)) {
-                                                    siteStaffRoles.push(roleDisplayName);
-                                                }
-                                            } else {
-                                                if (!crcToRoles.has(crcId)) {
-                                                    crcToRoles.set(crcId, []);
-                                                }
-                                                if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
-                                                    crcToRoles.get(crcId).push(roleDisplayName);
+                                    // Get roles from the event's roleAssignments
+                                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                            const role = state.roles.find(r => r.id === roleId);
+                                            let roleDisplayName = role ? role.name : roleId;
+                                            
+                                            // Handle training roles
+                                            if (role && isTrainingRoleName(role.name)) {
+                                                if (event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                                    const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                                                    if (trainingTypes.length > 0) {
+                                                        roleDisplayName = `Training - ${trainingTypes.join(', ')}`;
+                                                    } else {
+                                                        roleDisplayName = 'Training';
+                                                    }
+                                                } else {
+                                                    roleDisplayName = 'Training';
                                                 }
                                             }
+                                            
+                                            if (Array.isArray(assignments)) {
+                                                assignments.forEach(crcId => {
+                                                    if (crcId === 'SITE_STAFF') {
+                                                        if (!siteStaffRoles.includes(roleDisplayName)) {
+                                                            siteStaffRoles.push(roleDisplayName);
+                                                        }
+                                                    } else if (crcId) {
+                                                        if (!crcToRoles.has(crcId)) {
+                                                            crcToRoles.set(crcId, []);
+                                                        }
+                                                        if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
+                                                            crcToRoles.get(crcId).push(roleDisplayName);
+                                                        }
+                                                    }
+                                                });
+                                            }
                                         });
-                                    });
+                                    }
                                     
-                                    // Also add CRCs that might not have roles explicitly set
+                                    // Also add CRCs from legacy crcId that might not have roles
                                     allCrcs.forEach(crc => {
                                         if (!crcToRoles.has(crc.id)) {
                                             crcToRoles.set(crc.id, []);
@@ -12858,24 +12998,31 @@
                                     // Build individual blocks for each CRC (each with their combined roles)
                                     // All blocks click to open the FULL shift (same event.id)
                                     let blocksHtml = '';
+                                    let blockIndex = 0;
+                                    const totalBlocks = crcToRoles.size + (siteStaffRoles.length > 0 ? 1 : 0);
+                                    
                                     crcToRoles.forEach((roles, crcId) => {
                                         const crc = state.crcs.find(c => c.id === crcId);
                                         const crcName = crc ? crc.name.split(' ')[0] : 'Unknown';
+                                        // Show ALL roles before the name
                                         const displayText = roles.length > 0 ? `${roles.join(', ')} - ${crcName}` : crcName;
-                                        blocksHtml += `<div class="px-2 py-1 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
+                                        // Add border between blocks for cleaner separation
+                                        const borderStyle = blockIndex < totalBlocks - 1 ? `border-bottom: 1px solid ${spanTextColor};` : '';
+                                        blocksHtml += `<div class="px-2 py-1.5 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor}; ${borderStyle}" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
                                             <strong>${displayText}</strong>
                                         </div>`;
+                                        blockIndex++;
                                     });
                                     
                                     // Add Site Staff block if any
                                     if (siteStaffRoles.length > 0) {
                                         const displayText = `${siteStaffRoles.join(', ')} - Site Staff`;
-                                        blocksHtml += `<div class="px-2 py-1 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
+                                        blocksHtml += `<div class="px-2 py-1.5 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10" style="color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" title="${tooltip}">
                                             <strong>${displayText}</strong>
                                         </div>`;
                                     }
                                     
-                                    // Wrap in container with header
+                                    // Wrap in container with header - cleaner borders
                                     const header = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300" style="border-left: 3px solid ${eventBgColor}; border-top: 1px solid ${eventBgColor}; border-right: 1px solid ${eventBgColor}">${headerText} ${overrideIcon}${roleIcon}</div>` : '';
                                     const blocksWrapper = `<div class="rounded-b mb-1" style="background-color: ${eventBgColor}; border: 1px solid ${eventBgColor};">${blocksHtml}</div>`;
                                     tableHtml += `<div class="mb-1">${header}${blocksWrapper}</div>`;
@@ -19255,6 +19402,7 @@
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Training</th>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Training Date</th>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Expiration Date</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Last Performed</th>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Progress</th>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th>
                             </tr>
@@ -19274,6 +19422,12 @@
                                 // Get current progress
                                 const currentObservations = t.observations || 0;
                                 const currentPerformances = t.performances || 0;
+                                
+                                // Get last performed date for this training
+                                const lastPerformedDate = getLastPerformedDate(crc.id, t.name);
+                                const lastPerformedHTML = lastPerformedDate 
+                                    ? `<span class="text-green-600 dark:text-green-400">${formatDateInputValue(lastPerformedDate.toISOString().split('T')[0])}</span>`
+                                    : '<span class="text-gray-400 dark:text-gray-500 italic">Never</span>';
                                 
                                 // Create progress display
                                 let progressHTML = '';
@@ -19306,6 +19460,7 @@
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${t.name}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${formatDateInputValue(t.completionDate)}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${formatDateInputValue(t.expirationDate)}</td>
+                                    <td class="px-4 py-2 whitespace-nowrap text-sm">${lastPerformedHTML}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${progressHTML}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">
                                         <button data-action="edit-training" data-crc-id="${crc.id}" data-training-index="${index}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">Edit</button>
