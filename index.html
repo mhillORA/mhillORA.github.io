@@ -3741,7 +3741,7 @@
                 return null;
             };
 
-            const isCRCUnavailable = (crcId, date, period, excludeEventId = null) => {
+            const isCRCUnavailable = (crcId, date, period, excludeEventId = null, excludeGroupId = null) => {
                 if (!crcId || !date) return false;
                 
                 // Normalize the date parameter to YYYY-MM-DD format for comparison
@@ -3773,6 +3773,9 @@
                 const conflictingSiteAssignments = state.crc_events.filter(event => {
                     // Exclude the current event being edited
                     if (excludeEventId && event.id === excludeEventId) return false;
+                    
+                    // Also exclude all events in the same group (for multi-day shifts)
+                    if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
                     
                     // Must be a Site Assignment
                     if (event.type !== 'Site Assignment') return false;
@@ -3892,9 +3895,11 @@
             };
             
             // Helper function to get conflicting appointment info for display
-            const getConflictingAppointmentInfo = (crcId, date, excludeEventId = null) => {
+            const getConflictingAppointmentInfo = (crcId, date, excludeEventId = null, excludeGroupId = null) => {
                 const conflictingEvents = state.crc_events.filter(event => {
                     if (excludeEventId && event.id === excludeEventId) return false;
+                    // Also exclude all events in the same group (for multi-day shifts)
+                    if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
                     if (event.type !== 'Site Assignment' || event.date !== date) return false;
                     
                     if (event.crcId === crcId) return true;
@@ -4119,7 +4124,7 @@
             };
 
             const checkRoleFulfillment = (event) => {
-                if (!event.studyIds || event.studyIds.length === 0 || !event.siteId) return { fulfilled: true, missingRoles: [] };
+                if (!event.studyIds || event.studyIds.length === 0 || !event.siteId) return { fulfilled: true, missingRoles: [], unfilledSlots: [], totalUnfilled: 0 };
                 
                 // Get role requirements for this specific Study-Site combination
                 const studySiteRoleRequirements = {};
@@ -4159,22 +4164,58 @@
                     });
                 }
                 
-                // Check fulfillment
+                // Check fulfillment and gather unfilled slot info
                 const missingRoles = [];
+                const unfilledSlots = []; // Detailed list of unfilled slots with role names
+                let totalUnfilled = 0;
+                
                 Object.keys(studySiteRoleRequirements).forEach(roleId => {
                     const required = studySiteRoleRequirements[roleId];
                     const assigned = assignedRoles[roleId] || 0;
                     if (assigned < required) {
                         const role = state.roles.find(r => r.id === roleId);
                         if (role) {
+                            const unfilled = required - assigned;
                             missingRoles.push(`${role.name} (${assigned}/${required})`);
+                            // Add each unfilled slot to the list
+                            for (let i = 0; i < unfilled; i++) {
+                                unfilledSlots.push({ roleId, roleName: role.name, slotIndex: assigned + i });
+                            }
+                            totalUnfilled += unfilled;
                         }
                     }
                 });
                 
+                // Also check roleAssignments for null slots (open positions)
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        if (Array.isArray(assignments)) {
+                            const role = state.roles.find(r => r.id === roleId);
+                            if (role) {
+                                assignments.forEach((crcId, index) => {
+                                    if (!crcId || crcId === '') {
+                                        // This is an unfilled slot
+                                        const alreadyAdded = unfilledSlots.find(s => s.roleId === roleId && s.slotIndex === index);
+                                        if (!alreadyAdded) {
+                                            unfilledSlots.push({ roleId, roleName: role.name, slotIndex: index });
+                                            totalUnfilled++;
+                                            if (!missingRoles.find(m => m.startsWith(role.name))) {
+                                                const filled = assignments.filter(Boolean).length;
+                                                missingRoles.push(`${role.name} (${filled}/${assignments.length})`);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                }
+                
                 return {
-                    fulfilled: missingRoles.length === 0,
-                    missingRoles: missingRoles
+                    fulfilled: missingRoles.length === 0 && totalUnfilled === 0,
+                    missingRoles: missingRoles,
+                    unfilledSlots: unfilledSlots,
+                    totalUnfilled: totalUnfilled
                 };
             };
 
@@ -10276,13 +10317,18 @@
                                 const roleFulfillment = checkRoleFulfillment(event);
                                 const roleIcon = roleFulfillment.fulfilled ? 
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
-                                    `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                                    `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
                                 
                                 const tooltip = roleFulfillment.fulfilled ? 
                                     (event.notes || title) : 
-                                    `${event.notes || title}\nMissing roles: ${roleFulfillment.missingRoles.join(', ')}`;
+                                    `${event.notes || title}\nOpen: ${roleFulfillment.missingRoles.join(', ')}`;
                                 
-                                return `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>`;
+                                // Build unfilled roles display if there are unfilled slots
+                                const unfilledRolesDisplay = !roleFulfillment.fulfilled && roleFulfillment.unfilledSlots && roleFulfillment.unfilledSlots.length > 0 
+                                    ? `<div class="text-[10px] mt-0.5 text-red-200 italic">Open: ${[...new Set(roleFulfillment.unfilledSlots.map(s => s.roleName))].join(', ')}</div>` 
+                                    : '';
+                                
+                                return `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}"><div class="flex items-center justify-between">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>${unfilledRolesDisplay}</div>`;
                             }).join('');
                             
                             // Wrap header and blocks in a grouped container
@@ -10323,15 +10369,20 @@
                             const roleFulfillment = checkRoleFulfillment(event);
                             const roleIcon = roleFulfillment.fulfilled ? 
                                 `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
-                                `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                                `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
                             
                             const tooltip = roleFulfillment.fulfilled ? 
                                 (event.notes || title) : 
-                                `${event.notes || title}\nMissing roles: ${roleFulfillment.missingRoles.join(', ')}`;
+                                `${event.notes || title}\nOpen: ${roleFulfillment.missingRoles.join(', ')}`;
+                            
+                            // Build unfilled roles display if there are unfilled slots
+                            const unfilledRolesDisplay = !roleFulfillment.fulfilled && roleFulfillment.unfilledSlots && roleFulfillment.unfilledSlots.length > 0 
+                                ? `<div class="text-[10px] mt-0.5 text-red-200 italic">Open: ${[...new Set(roleFulfillment.unfilledSlots.map(s => s.roleName))].join(', ')}</div>` 
+                                : '';
                             
                             // Wrap header and block in a grouped container
                             const headerNoCrcs = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}">${headerText}</div>` : '';
-                            const block = `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag rounded-b border-l border-r border-b" style="background-color:${bgColor}; color: ${textColor}; border-color: ${bgColor};" title="${tooltip}">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>`;
+                            const block = `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag rounded-b border-l border-r border-b" style="background-color:${bgColor}; color: ${textColor}; border-color: ${bgColor};" title="${tooltip}"><div class="flex items-center justify-between">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>${unfilledRolesDisplay}</div>`;
                             
                             return headerText ? `<div class="mb-1">${headerNoCrcs}${block}</div>` : block;
                         }
@@ -10549,13 +10600,18 @@
                                 const roleFulfillment = checkRoleFulfillment(event);
                                 const roleIcon = roleFulfillment.fulfilled ? 
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
-                                    `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                                    `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
                                 
                                 const tooltip = roleFulfillment.fulfilled ? 
                                     (event.notes || title) : 
-                                    `${event.notes || title}\nMissing roles: ${roleFulfillment.missingRoles.join(', ')}`;
+                                    `${event.notes || title}\nOpen: ${roleFulfillment.missingRoles.join(', ')}`;
                                 
-                                return `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>`;
+                                // Build unfilled roles display if there are unfilled slots
+                                const unfilledRolesDisplay = !roleFulfillment.fulfilled && roleFulfillment.unfilledSlots && roleFulfillment.unfilledSlots.length > 0 
+                                    ? `<div class="text-[10px] mt-0.5 text-red-200 italic">Open: ${[...new Set(roleFulfillment.unfilledSlots.map(s => s.roleName))].join(', ')}</div>` 
+                                    : '';
+                                
+                                return `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}"><div class="flex items-center justify-between">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>${unfilledRolesDisplay}</div>`;
                             }).join('');
                             
                             // Wrap header and blocks in a grouped container
@@ -10596,7 +10652,7 @@
                             const roleFulfillment = checkRoleFulfillment(event);
                             const roleIcon = roleFulfillment.fulfilled ? 
                                 `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
-                                `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                                `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
                             
                             // Build visit/group header (V1G1 format)
                             const visitGroupParts = [];
@@ -10606,9 +10662,14 @@
                             
                             const tooltip = roleFulfillment.fulfilled ? 
                                 (event.notes || title) : 
-                                `${event.notes || title}\nMissing roles: ${roleFulfillment.missingRoles.join(', ')}`;
+                                `${event.notes || title}\nOpen: ${roleFulfillment.missingRoles.join(', ')}`;
                             
-                            return [`<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}">${visitGroupHeader}${title}${event.isOverridden ? overrideIcon : roleIcon}</div>`];
+                            // Build unfilled roles display if there are unfilled slots
+                            const unfilledRolesDisplay = !roleFulfillment.fulfilled && roleFulfillment.unfilledSlots && roleFulfillment.unfilledSlots.length > 0 
+                                ? `<div class="text-[10px] mt-0.5 text-red-200 italic">Open: ${[...new Set(roleFulfillment.unfilledSlots.map(s => s.roleName))].join(', ')}</div>` 
+                                : '';
+                            
+                            return [`<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}"><div class="flex items-center justify-between">${visitGroupHeader}${title}${event.isOverridden ? overrideIcon : roleIcon}</div>${unfilledRolesDisplay}</div>`];
                         }
                     }).join('');
 
@@ -11923,7 +11984,7 @@
                                 const roleFulfillment = checkRoleFulfillment(event);
                                 const roleIcon = roleFulfillment.fulfilled ? 
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
-                                    `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                                    `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
                                 
                                 // Build header with visit and group (V1G1 format)
                                 const visitGroupHeader = [];
@@ -12324,7 +12385,7 @@
                             const roleFulfillment = checkRoleFulfillment(event);
                             const roleIcon = roleFulfillment.fulfilled ? 
                                 `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
-                                `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                                `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
                             
                             // Build header information for the shift (Visit, Group, Hours)
                             const headerParts = [];
@@ -12983,7 +13044,7 @@
                                 const roleFulfillment = checkRoleFulfillment(event);
                                 const roleIcon = roleFulfillment.fulfilled ? 
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
-                                    `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
+                                    `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
                                 
                                 // Build header with visit and group (V1G1 format) - SAME AS WEEKLY/DAILY
                                 const visitGroupHeader = [];
@@ -25845,11 +25906,15 @@
                             // Build deduplicated assignments map based on selection order
                             const assignmentsMap = new Map();
                             roleAssignmentInputs.forEach(input => {
-                                const parts = input.name.split('-').slice(1);
-                                if (parts.length < 2) return;
-                                const [roleId, indexRaw] = parts;
-                                const index = parseInt(indexRaw, 10);
-                                if (!Number.isFinite(index)) return;
+                                // Name format: role-{roleId}-{index}
+                                // roleId may contain dashes, so we extract the index from the end
+                                const nameWithoutPrefix = input.name.replace('role-', '');
+                                const lastDashIndex = nameWithoutPrefix.lastIndexOf('-');
+                                if (lastDashIndex === -1) return;
+                                
+                                const roleId = nameWithoutPrefix.substring(0, lastDashIndex);
+                                const index = parseInt(nameWithoutPrefix.substring(lastDashIndex + 1), 10);
+                                if (!Number.isFinite(index) || !roleId) return;
                                 if (!assignmentsMap.has(roleId)) {
                                     assignmentsMap.set(roleId, []);
                                 }
@@ -26001,10 +26066,17 @@
                         
                         // Check for time off conflicts (both events and time off requests)
                         // Exclude SITE_STAFF from unavailability checks (can be used unlimited times)
+                        // When editing, pass the eventId to exclude the current event from conflict checks
+                        const excludeEventId = isEditing ? eventId : null;
+                        // Also get all event IDs in the same group to exclude them
+                        const excludeGroupEventIds = isEditing && existingGroupId ? 
+                            state.crc_events.filter(e => e.groupId === existingGroupId).map(e => e.id) : [];
+                        
                         allCrcIds.forEach(crcId => {
                             // Skip SITE_STAFF - can be used unlimited times
                             if (!crcId || crcId === 'SITE_STAFF') return;
-                            const isUnavailable = isCRCUnavailable(crcId, startDateStr, period);
+                            // Pass excludeEventId and excludeGroupId to properly exclude current event and all events in same group when editing
+                            const isUnavailable = isCRCUnavailable(crcId, startDateStr, period, excludeEventId, existingGroupId);
                             if (isUnavailable) {
                                 const p = getUnavailabilityPeriod(crcId, startDateStr);
                                 unavailabilityConflicts.push({ crcId, period: p || 'Full Day' });
@@ -26012,13 +26084,18 @@
                             
                             // Check if this CRC is already scheduled for a different site/study on this date
                             // Exclude SITE_STAFF from site/study conflict checks (can be used unlimited times)
+                            // Also exclude events in the same group when editing
                             if (crcId !== 'SITE_STAFF' && selectedSiteId && selectedStudyIds.length > 0) {
-                                const conflictingEvents = state.crc_events.filter(event => 
-                                    event.crcId === crcId &&
-                                    event.date === startDateStr &&
-                                    event.type === 'Site Assignment' &&
-                                    (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)))
-                                );
+                                const conflictingEvents = state.crc_events.filter(event => {
+                                    // Exclude current event and events in same group when editing
+                                    if (excludeEventId && event.id === excludeEventId) return false;
+                                    if (excludeGroupEventIds.includes(event.id)) return false;
+                                    
+                                    return event.crcId === crcId &&
+                                        event.date === startDateStr &&
+                                        event.type === 'Site Assignment' &&
+                                        (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)));
+                                });
                                 
                                 if (conflictingEvents.length > 0) {
                                     const conflictEvent = conflictingEvents[0];
@@ -26432,11 +26509,15 @@
                                 } else {
                                     // Fallback: collect directly from form inputs
                                     roleAssignmentInputs.forEach(input => {
-                                        const parts = input.name.split('-').slice(1);
-                                        if (parts.length < 2) return;
-                                        const [roleId, indexRaw] = parts;
-                                        const index = parseInt(indexRaw, 10);
-                                        if (!Number.isFinite(index)) return;
+                                        // Name format: role-{roleId}-{index}
+                                        // roleId may contain dashes, so we extract the index from the end
+                                        const nameWithoutPrefix = input.name.replace('role-', '');
+                                        const lastDashIndex = nameWithoutPrefix.lastIndexOf('-');
+                                        if (lastDashIndex === -1) return;
+                                        
+                                        const roleId = nameWithoutPrefix.substring(0, lastDashIndex);
+                                        const index = parseInt(nameWithoutPrefix.substring(lastDashIndex + 1), 10);
+                                        if (!Number.isFinite(index) || !roleId) return;
                                         
                                         if (!roleAssignments[roleId]) {
                                             roleAssignments[roleId] = [];
@@ -26486,24 +26567,27 @@
                                 // Now collect training assignments from form inputs
                                 const trainingTypeInputs = form.querySelectorAll('select[name^="trainingType-"]');
                                 trainingTypeInputs.forEach(input => {
-                                    const parts = input.name.split('-');
-                                    if (parts.length >= 3) {
-                                        const roleId = parts[1];
-                                        const index = parseInt(parts[2]);
-                                        if (!Number.isFinite(index)) return;
-                                        
-                                        // Ensure the array exists and is large enough
-                                        if (!trainingAssignments[roleId]) {
-                                            trainingAssignments[roleId] = [];
-                                        }
-                                        // Ensure array is large enough for this index
-                                        while (trainingAssignments[roleId].length <= index) {
-                                            trainingAssignments[roleId].push(null);
-                                        }
-                                        
-                                        // Set the training assignment value (even if empty, to allow clearing)
-                                        trainingAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
+                                    // Name format: trainingType-{roleId}-{index}
+                                    // roleId may contain dashes, so we extract the index from the end
+                                    const nameWithoutPrefix = input.name.replace('trainingType-', '');
+                                    const lastDashIndex = nameWithoutPrefix.lastIndexOf('-');
+                                    if (lastDashIndex === -1) return;
+                                    
+                                    const roleId = nameWithoutPrefix.substring(0, lastDashIndex);
+                                    const index = parseInt(nameWithoutPrefix.substring(lastDashIndex + 1));
+                                    if (!Number.isFinite(index) || !roleId) return;
+                                    
+                                    // Ensure the array exists and is large enough
+                                    if (!trainingAssignments[roleId]) {
+                                        trainingAssignments[roleId] = [];
                                     }
+                                    // Ensure array is large enough for this index
+                                    while (trainingAssignments[roleId].length <= index) {
+                                        trainingAssignments[roleId].push(null);
+                                    }
+                                    
+                                    // Set the training assignment value (even if empty, to allow clearing)
+                                    trainingAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
                                 });
                                 
                                 // Ensure training assignments arrays match role assignments arrays in length
@@ -28935,15 +29019,25 @@
                     const selectedSiteId = siteSelect ? siteSelect.value : null;
                     const selectedStudyIds = studySelect ? Array.from(studySelect.selectedOptions).map(opt => opt.value).filter(Boolean) : [];
                     
+                    // Get exclude info for editing mode
+                    const isEditingEvent = form && form.dataset.eventId;
+                    const editingEvent = isEditingEvent ? (window._currentEditingEvent || state.crc_events.find(e => e.id === form.dataset.eventId)) : null;
+                    const excludeEventIdForChange = editingEvent ? editingEvent.id : null;
+                    const excludeGroupIdForChange = editingEvent ? editingEvent.groupId : null;
+                    
                     const roleNameFromSelect = (() => {
-                        const parts = target.name.split('-').slice(1);
-                        if (parts.length === 0) return '';
-                        const role = state.roles.find(r => r.id === parts[0]);
+                        // Name format: role-{roleId}-{index}, roleId may contain dashes
+                        const nameWithoutPrefix = target.name.replace('role-', '');
+                        const lastDashIndex = nameWithoutPrefix.lastIndexOf('-');
+                        if (lastDashIndex === -1) return '';
+                        const roleId = nameWithoutPrefix.substring(0, lastDashIndex);
+                        const role = state.roles.find(r => r.id === roleId);
                         return role ? role.name : '';
                     })();
                     
                     // Check for time off (using isCRCUnavailable which checks both events and time off requests)
-                    const isUnavailable = isCRCUnavailable(selectedCrcId, date, period);
+                    // Exclude current event and group when editing
+                    const isUnavailable = isCRCUnavailable(selectedCrcId, date, period, excludeEventIdForChange, excludeGroupIdForChange);
                     const unavailPeriod = getUnavailabilityPeriod(selectedCrcId, date);
                     
                     // Check for conflicts: same CRC can be in multiple roles for same shift, but not different sites/studies on same day
@@ -28955,12 +29049,17 @@
                     
                     // Check if this CRC is already scheduled for a different site/study on this date
                     if (selectedSiteId && selectedStudyIds.length > 0) {
-                        const conflictingEvents = state.crc_events.filter(event => 
-                            event.crcId === selectedCrcId &&
-                            event.date === date &&
-                            event.type === 'Site Assignment' &&
-                            (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)))
-                        );
+                        const conflictingEvents = state.crc_events.filter(event => {
+                            // Exclude the current event being edited
+                            if (excludeEventIdForChange && event.id === excludeEventIdForChange) return false;
+                            // Exclude events in the same group (for multi-day shifts)
+                            if (excludeGroupIdForChange && event.groupId && event.groupId === excludeGroupIdForChange) return false;
+                            
+                            return event.crcId === selectedCrcId &&
+                                event.date === date &&
+                                event.type === 'Site Assignment' &&
+                                (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)));
+                        });
                         
                         if (conflictingEvents.length > 0) {
                             hasConflict = true;
@@ -29197,19 +29296,23 @@
                 // Collect all role assignment inputs
                 const roleInputs = form.querySelectorAll('select[name^="role-"]');
                 roleInputs.forEach(input => {
-                    const parts = input.name.split('-').slice(1);
-                    if (parts.length >= 2) {
-                        const roleId = parts[0];
-                        const index = parseInt(parts[1], 10);
-                        if (Number.isFinite(index)) {
-                            if (!currentRoleAssignments[roleId]) {
-                                currentRoleAssignments[roleId] = [];
-                            }
-                            while (currentRoleAssignments[roleId].length <= index) {
-                                currentRoleAssignments[roleId].push(null);
-                            }
-                            currentRoleAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
+                    // Name format: role-{roleId}-{index}
+                    // roleId may contain dashes, so we extract the index from the end
+                    const nameWithoutPrefix = input.name.replace('role-', '');
+                    const lastDashIndex = nameWithoutPrefix.lastIndexOf('-');
+                    if (lastDashIndex === -1) return;
+                    
+                    const roleId = nameWithoutPrefix.substring(0, lastDashIndex);
+                    const index = parseInt(nameWithoutPrefix.substring(lastDashIndex + 1), 10);
+                    
+                    if (Number.isFinite(index) && roleId) {
+                        if (!currentRoleAssignments[roleId]) {
+                            currentRoleAssignments[roleId] = [];
                         }
+                        while (currentRoleAssignments[roleId].length <= index) {
+                            currentRoleAssignments[roleId].push(null);
+                        }
+                        currentRoleAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
                     }
                 });
                 
@@ -29217,32 +29320,35 @@
                 const currentTrainingModes = {};
                 const trainingInputs = form.querySelectorAll('select[name^="trainingType-"]');
                 trainingInputs.forEach(input => {
-                    const parts = input.name.split('-').slice(1);
-                    // Name format is trainingType-roleId-index, so after slice(1) we get [roleId, index] (2 parts)
-                    if (parts.length >= 2) {
-                        const roleId = parts[0];
-                        const index = parseInt(parts[1], 10);
-                        if (Number.isFinite(index)) {
-                            if (!currentTrainingAssignments[roleId]) {
-                                currentTrainingAssignments[roleId] = [];
-                            }
-                            while (currentTrainingAssignments[roleId].length <= index) {
-                                currentTrainingAssignments[roleId].push(null);
-                            }
-                            currentTrainingAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
-                            
-                            // Collect training mode checkboxes
-                            const key = `${roleId}-${index}`;
-                            if (!currentTrainingModes[key]) {
-                                currentTrainingModes[key] = {};
-                            }
-                            const practicumCheckbox = form.querySelector(`input[name="trainingPracticum-${roleId}-${index}"]`);
-                            const finalPracticumCheckbox = form.querySelector(`input[name="trainingFinalPracticum-${roleId}-${index}"]`);
-                            const observationCheckbox = form.querySelector(`input[name="trainingObservation-${roleId}-${index}"]`);
-                            currentTrainingModes[key].practicum = practicumCheckbox ? practicumCheckbox.checked : false;
-                            currentTrainingModes[key].finalPracticum = finalPracticumCheckbox ? finalPracticumCheckbox.checked : false;
-                            currentTrainingModes[key].observation = observationCheckbox ? observationCheckbox.checked : false;
+                    // Name format: trainingType-{roleId}-{index}
+                    // roleId may contain dashes, so we extract the index from the end
+                    const nameWithoutPrefix = input.name.replace('trainingType-', '');
+                    const lastDashIndex = nameWithoutPrefix.lastIndexOf('-');
+                    if (lastDashIndex === -1) return;
+                    
+                    const roleId = nameWithoutPrefix.substring(0, lastDashIndex);
+                    const index = parseInt(nameWithoutPrefix.substring(lastDashIndex + 1), 10);
+                    
+                    if (Number.isFinite(index) && roleId) {
+                        if (!currentTrainingAssignments[roleId]) {
+                            currentTrainingAssignments[roleId] = [];
                         }
+                        while (currentTrainingAssignments[roleId].length <= index) {
+                            currentTrainingAssignments[roleId].push(null);
+                        }
+                        currentTrainingAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
+                        
+                        // Collect training mode checkboxes
+                        const key = `${roleId}-${index}`;
+                        if (!currentTrainingModes[key]) {
+                            currentTrainingModes[key] = {};
+                        }
+                        const practicumCheckbox = form.querySelector(`input[name="trainingPracticum-${roleId}-${index}"]`);
+                        const finalPracticumCheckbox = form.querySelector(`input[name="trainingFinalPracticum-${roleId}-${index}"]`);
+                        const observationCheckbox = form.querySelector(`input[name="trainingObservation-${roleId}-${index}"]`);
+                        currentTrainingModes[key].practicum = practicumCheckbox ? practicumCheckbox.checked : false;
+                        currentTrainingModes[key].finalPracticum = finalPracticumCheckbox ? finalPracticumCheckbox.checked : false;
+                        currentTrainingModes[key].observation = observationCheckbox ? observationCheckbox.checked : false;
                     }
                 });
                 
@@ -29599,7 +29705,10 @@
                                                                 <option value="">Select Staff</option>
                                                                 <option value="SITE_STAFF" ${crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
                                                                 ${qualifiedCrcs.map(c => {
-                                                                    const isUnavailable = isCRCUnavailable(c.id, date, period);
+                                                                    // Pass excludeEventId and excludeGroupId to avoid showing CRCs on this shift as unavailable
+                                                                    const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
+                                                                    const excludeGroupIdForEdit = existingEvent ? existingEvent.groupId : null;
+                                                                    const isUnavailable = isCRCUnavailable(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
                                                                     const unavailPeriod = getUnavailabilityPeriod(c.id, date);
                                                                     let statusText = '';
                                                                     if (isUnavailable) {
@@ -29685,7 +29794,10 @@
                                                     <option value="">Select Staff</option>
                                                     <option value="SITE_STAFF" ${existingEvent.crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
                                                     ${qualifiedCrcs.map(c => {
-                                                        const isUnavailable = isCRCUnavailable(c.id, date, period);
+                                                        // Pass excludeEventId and excludeGroupId to avoid showing CRCs on this shift as unavailable
+                                                        const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
+                                                        const excludeGroupIdForEdit = existingEvent ? existingEvent.groupId : null;
+                                                        const isUnavailable = isCRCUnavailable(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
                                                         const unavailPeriod = getUnavailabilityPeriod(c.id, date);
                                                         let statusText = '';
                                                         if (isUnavailable) {
@@ -29996,10 +30108,11 @@
                         
                         // Calculate availability and distance for each CRC, then sort
                         const excludeEventId = existingEvent ? existingEvent.id : null;
+                        const excludeGroupId = existingEvent ? existingEvent.groupId : null;
                         const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                            const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId);
+                            const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                             const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                            const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
+                            const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                             let distance = null;
                             
                             // Calculate distance if site is available
@@ -30024,7 +30137,7 @@
                         // Add untrained assigned CRCs to the list (marked as untrained)
                         if (untrainedAssignedCrcs.length > 0) {
                             const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
-                                const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId);
+                                const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                                 const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
                                 const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
                                 let distance = null;
@@ -30292,12 +30405,13 @@
                                 let optionsHtml = '<option value="">Select Staff</option>';
                                 optionsHtml += `<option value="SITE_STAFF" class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
                                 const excludeEventIdForDynamic = existingEvent ? existingEvent.id : null;
+                                const excludeGroupIdForDynamic = existingEvent ? existingEvent.groupId : null;
                                 
                                 // Separate available and unavailable CRCs
                                 const availableCrcs = [];
                                 const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic);
+                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
                                     if (isUnavailable) {
                                         unavailableCrcs.push(crc);
                                     } else {
@@ -30313,7 +30427,7 @@
                                 // Add unavailable CRCs at the bottom (grayed out but selectable)
                                 unavailableCrcs.forEach(crc => {
                                     const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic);
+                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic, excludeGroupIdForDynamic);
                                     let statusText = '';
                                     if (conflictInfo) {
                                         statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
@@ -30475,10 +30589,11 @@
                     
                     // Calculate availability and distance for each CRC, then sort
                     const excludeEventId = existingEvent ? existingEvent.id : null;
+                    const excludeGroupId = existingEvent ? existingEvent.groupId : null;
                     const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                        const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId);
+                        const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                         const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                        const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
+                        const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                         let distance = null;
                         
                         // Calculate distance if site is available
@@ -30503,9 +30618,9 @@
                     // Add untrained assigned CRCs to the list (marked as untrained)
                     if (untrainedAssignedCrcs.length > 0) {
                         const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
-                            const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId);
+                            const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                             const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                            const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
+                            const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                             let distance = null;
                             
                             if (site) {
@@ -30813,12 +30928,13 @@
                                 let optionsHtml = '<option value="">Select Staff</option>';
                                 optionsHtml += `<option value="SITE_STAFF" class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
                                 const excludeEventIdForDynamic = existingEvent ? existingEvent.id : null;
+                                const excludeGroupIdForDynamic = existingEvent ? existingEvent.groupId : null;
                                 
                                 // Separate available and unavailable CRCs
                                 const availableCrcs = [];
                                 const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic);
+                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
                                     if (isUnavailable) {
                                         unavailableCrcs.push(crc);
                                     } else {
@@ -30834,7 +30950,7 @@
                                 // Add unavailable CRCs at the bottom (grayed out but selectable)
                                 unavailableCrcs.forEach(crc => {
                                     const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic);
+                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic, excludeGroupIdForDynamic);
                                     let statusText = '';
                                     if (conflictInfo) {
                                         statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
@@ -36481,5 +36597,4 @@
     })(); // Close the async IIFE
     </script>
 	</body>
-</html>
 </html>
