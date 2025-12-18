@@ -238,11 +238,25 @@
             animation: slowRedFlash 2s ease-in-out infinite;
         }
         
-        /* Unassigned Shift Block Flash Animation - same as manager view tab */
+        /* Unassigned Shift Block Flash Animation - uses dedicated keyframes */
+        @keyframes unassignedFlash {
+            0%, 100% { 
+                background-color: rgba(239, 68, 68, 0.15);
+                border-color: rgba(239, 68, 68, 0.5);
+                box-shadow: 0 0 8px rgba(239, 68, 68, 0.3);
+            }
+            50% { 
+                background-color: rgba(239, 68, 68, 0.4);
+                border-color: rgba(239, 68, 68, 0.9);
+                box-shadow: 0 0 15px rgba(239, 68, 68, 0.6);
+            }
+        }
+        
         .unassigned-block-flash {
-            animation: slowRedFlash 2s ease-in-out infinite;
-            background-color: rgba(239, 68, 68, 0.15);
-            border: 2px solid rgba(239, 68, 68, 0.5);
+            animation: unassignedFlash 1.5s ease-in-out infinite !important;
+            background-color: rgba(239, 68, 68, 0.15) !important;
+            border: 2px solid rgba(239, 68, 68, 0.5) !important;
+            color: #dc2626 !important;
         }
         
         /* Unfilled Role Block Flash Animation */
@@ -8239,25 +8253,69 @@
                     return false;
                 });
                 
-                // Filter out PTO/Unavailable/Sick Time and events without studyIds
+                // Separate time off events from shift events
+                const timeOffTypes = ['Unavailable', 'Paid Time Off', 'Sick Time', 'PTO', 'Vacation', 'Personal', 'Holiday', 'Bereavement', 'Per Diem', 'Sick'];
+                const timeOffEvents = allCrcEvents.filter(e => timeOffTypes.includes(e.type) || timeOffTypes.includes(e.name));
+                
+                // Shift events - must have studyIds
                 const crcEvents = allCrcEvents.filter(e => 
-                    e.type !== 'Unavailable' && 
-                    e.type !== 'Paid Time Off' && 
-                    e.type !== 'Sick Time' &&
-                    e.type !== 'PTO' &&
+                    !timeOffTypes.includes(e.type) && 
+                    !timeOffTypes.includes(e.name) &&
                     e.studyIds && 
                     Array.isArray(e.studyIds) && 
                     e.studyIds.length > 0 && 
                     e.studyIds.filter(Boolean).length > 0
                 );
                 
+                // Also get time off requests for this CRC
+                const crcTimeOffRequests = (state.timeOffRequests || []).filter(req => 
+                    (req.crcId === matchingCrcId || req.requestedBy === matchingCrcId) &&
+                    req.status !== 'rejected'
+                );
+                
                 // Group events by date
                 const eventsByDate = {};
                 crcEvents.forEach(event => {
                     if (!eventsByDate[event.date]) {
-                        eventsByDate[event.date] = [];
+                        eventsByDate[event.date] = { shifts: [], timeOff: [] };
                     }
-                    eventsByDate[event.date].push(event);
+                    eventsByDate[event.date].shifts.push(event);
+                });
+                
+                // Add time off events
+                timeOffEvents.forEach(event => {
+                    if (!eventsByDate[event.date]) {
+                        eventsByDate[event.date] = { shifts: [], timeOff: [] };
+                    }
+                    eventsByDate[event.date].timeOff.push(event);
+                });
+                
+                // Add time off requests (they might span multiple days)
+                crcTimeOffRequests.forEach(req => {
+                    const startDate = parseDateFlexible(req.startDate);
+                    const endDate = parseDateFlexible(req.endDate || req.startDate);
+                    if (startDate && endDate) {
+                        const cursor = new Date(startDate);
+                        while (cursor <= endDate) {
+                            const dateStr = toDateOnlyString(cursor);
+                            if (!eventsByDate[dateStr]) {
+                                eventsByDate[dateStr] = { shifts: [], timeOff: [] };
+                            }
+                            // Only add if not already added as an event
+                            const alreadyExists = eventsByDate[dateStr].timeOff.some(e => 
+                                e.requestId === req.id || e.id === req.id
+                            );
+                            if (!alreadyExists) {
+                                eventsByDate[dateStr].timeOff.push({
+                                    ...req,
+                                    requestId: req.id,
+                                    type: req.type || req.name || 'Time Off',
+                                    isRequest: true
+                                });
+                            }
+                            cursor.setDate(cursor.getDate() + 1);
+                        }
+                    }
                 });
                 
                 // Build calendar HTML
@@ -8278,14 +8336,30 @@
                 // Days of the month
                 for (let day = 1; day <= daysInMonth; day++) {
                     const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                    const dayEvents = eventsByDate[dateStr] || [];
+                    const dayData = eventsByDate[dateStr] || { shifts: [], timeOff: [] };
                     const isToday = dateStr === toDateOnlyString(new Date());
                     
                     calendarHTML += `
                         <div class="min-h-[100px] border ${isToday ? 'border-blue-500 border-2' : 'border-gray-200 dark:border-gray-700'} rounded-md bg-white dark:bg-gray-800 p-2 ${isToday ? 'bg-blue-50 dark:bg-blue-900/20' : ''}">
                             <div class="text-sm font-semibold mb-1 ${isToday ? 'text-blue-600 dark:text-blue-400' : 'text-gray-700 dark:text-gray-300'}">${day}</div>
                             <div class="space-y-1">
-                                ${dayEvents.map(event => {
+                                ${dayData.timeOff.map(event => {
+                                    const typeDisplay = event.name || event.type || 'Time Off';
+                                    const statusBadge = event.isRequest ? 
+                                        (event.status === 'pending' ? ' (Pending)' : event.status === 'approved' ? ' ✓' : '') : '';
+                                    const bgColor = event.status === 'pending' ? '#f59e0b' : '#ef4444';
+                                    const periodDisplay = event.period && event.period !== 'Full Day' ? event.period : '';
+                                    
+                                    return `
+                                        <div class="text-xs p-1 rounded cursor-pointer hover:opacity-80 transition-opacity" 
+                                             style="background-color: ${bgColor}; color: white;"
+                                             title="${typeDisplay}${statusBadge}${periodDisplay ? ' - ' + periodDisplay : ''}">
+                                            <div class="font-medium truncate">🏖 ${typeDisplay}${statusBadge}</div>
+                                            ${periodDisplay ? `<div class="text-[10px] opacity-75">${periodDisplay}</div>` : ''}
+                                        </div>
+                                    `;
+                                }).join('')}
+                                ${dayData.shifts.map(event => {
                                     const site = state.crc_sites.find(s => s.id === event.siteId);
                                     const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                                     const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
@@ -8297,7 +8371,7 @@
                                              data-action="view-crc-schedule-event" 
                                              data-event-id="${event.id}"
                                              title="${event.type} - ${site ? site.name : 'Unknown Site'} - ${studyNames}">
-                                            <div class="font-medium truncate">${event.type === 'Travel Day' ? 'Travel' : (site ? site.name : 'Unknown')}</div>
+                                            <div class="font-medium truncate">${event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown')}</div>
                                             <div class="text-[10px] opacity-90 truncate">${studyNames}</div>
                                             ${event.period ? `<div class="text-[10px] opacity-75">${event.period}</div>` : ''}
                                         </div>
@@ -10962,6 +11036,12 @@
                                     // Get role name - use role.name if found, otherwise use roleId as fallback
                                     const roleName = role ? role.name : roleId;
                                     
+                                    // Check if this is a training role by ID or name
+                                    const isTraining = (role && isTrainingRoleName(role.name)) || 
+                                                       roleId === 'training-role' || 
+                                                       roleId.toLowerCase().includes('training') ||
+                                                       (roleName && roleName.toLowerCase().includes('training'));
+                                    
                                     if (Array.isArray(assignments)) {
                                         assignments.forEach((crcId, index) => {
                                             if (crcId) {
@@ -10971,7 +11051,7 @@
                                                 
                                                 // Format role name - for training roles, get the specific training type for this index
                                                 let roleDisplayName = roleName;
-                                                if (role && isTrainingRoleName(role.name)) {
+                                                if (isTraining) {
                                                     // Get the specific training type for this CRC's index
                                                     if (event.trainingAssignments && event.trainingAssignments[roleId] && event.trainingAssignments[roleId][index]) {
                                                         roleDisplayName = `Training, ${event.trainingAssignments[roleId][index]}`;
@@ -11293,6 +11373,12 @@
                                     // Get role name - use role.name if found, otherwise use roleId as fallback
                                     const roleName = role ? role.name : roleId;
                                     
+                                    // Check if this is a training role by ID or name
+                                    const isTraining = (role && isTrainingRoleName(role.name)) || 
+                                                       roleId === 'training-role' || 
+                                                       roleId.toLowerCase().includes('training') ||
+                                                       (roleName && roleName.toLowerCase().includes('training'));
+                                    
                                     if (Array.isArray(assignments)) {
                                         assignments.forEach((crcId, index) => {
                                             if (crcId) {
@@ -11302,7 +11388,7 @@
                                                 
                                                 // Format role name - for training roles, get the specific training type for this index
                                                 let roleDisplayName = roleName;
-                                                if (role && isTrainingRoleName(role.name)) {
+                                                if (isTraining) {
                                                     // Get the specific training type for this CRC's index
                                                     if (event.trainingAssignments && event.trainingAssignments[roleId] && event.trainingAssignments[roleId][index]) {
                                                         roleDisplayName = `Training, ${event.trainingAssignments[roleId][index]}`;
@@ -13103,15 +13189,6 @@
                         return acc;
                     }, {});
                     
-                    // Debug: Log eventsBySite for this study
-                    console.log('Monthly Debug - eventsBySite for study:', {
-                        studyId: study.id,
-                        studyName: study.title || study.name,
-                        siteCount: Object.keys(eventsBySite).length,
-                        totalEvents: studyEvents.length,
-                        eventDates: studyEvents.slice(0, 5).map(e => ({ date: e.date, siteId: e.siteId }))
-                    });
-                            
                     const sortedSiteIds = Object.keys(eventsBySite).sort((a, b) => {
                         const siteA = state.crc_sites.find(s => s.id === a)?.name || 'zz';
                         const siteB = state.crc_sites.find(s => s.id === b)?.name || 'zz';
@@ -13127,16 +13204,6 @@
                             const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                             const allSiteEvents = eventsBySite[siteId] || [];
                             const dayEvents = allSiteEvents.filter(e => e.date === dateStr);
-                            
-                            // Debug: Log if we have events for this site but none match this day
-                            if (day === 1 && allSiteEvents.length > 0 && dayEvents.length === 0) {
-                                console.log('Monthly Debug - Site has events but none for day 1:', {
-                                    siteId,
-                                    dateStr,
-                                    allSiteEventDates: allSiteEvents.map(e => e.date),
-                                    expectedFormat: dateStr
-                                });
-                            }
                             
                             // Group events by shift characteristics (groupId or visit/group/period combo)
                             // This prevents showing the same shift multiple times when multiple CRCs are assigned
@@ -22946,8 +23013,6 @@
                                     e.type === clickedEvent.type
                                 );
                                 
-                                console.log(`Aggregating ${shiftEvents.length} events for shift group ${clickedEvent.groupId} on ${clickedEvent.date}`);
-                                
                                 // Aggregate all roleAssignments from all events in the shift
                                 const aggregatedRoleAssignments = {};
                                 const aggregatedTrainingAssignments = {};
@@ -26137,7 +26202,6 @@
                                 }
                             });
                             crcIds = Array.from(assignedCrcIds);
-                            console.log('Collected CRC IDs from role assignments:', crcIds);
                             
                             // Build deduplicated assignments map based on selection order
                             const assignmentsMap = new Map();
@@ -26207,12 +26271,6 @@
                             // Allow shift creation if we have either role assignments OR role requirements
                             // This means we can create empty shifts that show role requirements
                             hasValidCrcSelection = hasRoleAssignments || hasRoleRequirements;
-                            
-                            console.log('Site Assignment validation:', {
-                                hasRoleAssignments,
-                                hasRoleRequirements,
-                                selectedStudyIds: selectedStudyIds.length
-                            });
                         }
                         
                         // Note: We no longer require CRC selection - shifts can be created empty
@@ -26802,9 +26860,7 @@
                                 
                                 // Now collect training assignments from form inputs
                                 const trainingTypeInputs = form.querySelectorAll('select[name^="trainingType-"]');
-                                console.log('TRAINING DEBUG - Found trainingTypeInputs:', trainingTypeInputs.length);
                                 trainingTypeInputs.forEach(input => {
-                                    console.log('TRAINING DEBUG - Input name:', input.name, 'value:', input.value);
                                     // Name format: trainingType-{roleId}-{index}
                                     // roleId may contain dashes, so we extract the index from the end
                                     const nameWithoutPrefix = input.name.replace('trainingType-', '');
@@ -26864,10 +26920,6 @@
                                 // Always include trainingAssignments if there are any (even if some are null, to preserve structure)
                                 // This ensures training assignments are saved when a CRC is assigned to Training role
                                 const finalTrainingAssignments = isTravelDay ? undefined : (Object.keys(trainingAssignments).length > 0 ? trainingAssignments : (existingEvent?.trainingAssignments ? existingEvent.trainingAssignments : undefined));
-                                
-                                // Debug logging for training assignments
-                                console.log('TRAINING DEBUG - trainingAssignments collected:', trainingAssignments);
-                                console.log('TRAINING DEBUG - finalTrainingAssignments:', finalTrainingAssignments);
                                 
                                 // Collect training modes (practicum, finalPracticum, observation) from checkboxes
                                 const trainingModes = {};
@@ -26977,8 +27029,8 @@
                                             const eventPayload = {
                                                 ...baseEventData,
                                                 type: data.eventType,
-                                                crcId: crcIds.length > 0 ? crcIds[0] : null,
-                                                roles: finalRolesForGroup,
+                                                crcId: null, // Legacy field - use roleAssignments instead
+                                                roles: [], // Legacy field - use roleAssignments instead
                                                 roleAssignments: finalRoleAssignments,
                                                 trainingAssignments: finalTrainingAssignments,
                                                 trainingModes: finalTrainingModes,
@@ -27038,8 +27090,8 @@
                                         const updatePayload = {
                                             ...baseEventData,
                                             type: data.eventType,
-                                            crcId: crcIds.length > 0 ? crcIds[0] : null,
-                                            roles: finalRoles,
+                                            crcId: null, // Legacy field - use roleAssignments instead
+                                            roles: [], // Legacy field - use roleAssignments instead
                                             roleAssignments: finalRoleAssignments,
                                             trainingAssignments: isTravelDayEdit ? undefined : (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
@@ -27069,8 +27121,8 @@
                                             const eventPayload = {
                                                 ...baseEventData,
                                                 type: data.eventType,
-                                                crcId: crcIds.length > 0 ? crcIds[0] : null,
-                                                roles: finalRoles,
+                                                crcId: null, // Legacy field - use roleAssignments instead
+                                                roles: [], // Legacy field - use roleAssignments instead
                                                 roleAssignments: finalRoleAssignments,
                                                 trainingAssignments: finalTrainingAssignments,
                                                 trainingModes: finalTrainingModes,
@@ -27134,8 +27186,8 @@
                                         const updatePayload = {
                                             ...baseEventData,
                                             type: data.eventType,
-                                            crcId: crcIds.length > 0 ? crcIds[0] : null,
-                                            roles: finalRoles,
+                                            crcId: null, // Legacy field - use roleAssignments instead
+                                            roles: [], // Legacy field - use roleAssignments instead
                                             roleAssignments: finalRoleAssignments,
                                             trainingAssignments: isTravelDayEdit ? undefined : (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
@@ -27187,8 +27239,8 @@
                                         const updatePayload = {
                                             ...baseEventData,
                                             type: data.eventType,
-                                            crcId: crcIds.length > 0 ? crcIds[0] : null, // Allow null CRC
-                                            roles: finalRoles,
+                                            crcId: null, // Legacy field - use roleAssignments instead
+                                            roles: [], // Legacy field - use roleAssignments instead
                                             roleAssignments: finalRoleAssignments, // Ensure roleAssignments are included in update
                                             trainingAssignments: isTravelDayEdit ? undefined : (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
@@ -27197,9 +27249,7 @@
                                             startDate: startDateStr,
                                             endDate: toDateOnlyString(endDateObj)
                                         };
-                                        console.log('Updating event with payload:', updatePayload);
                                         const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
-                                        console.log('Event updated, response:', updatedEvent);
                                         
                                         // Update the event in state with the response from the server
                                         if (updatedEvent && updatedEvent.id) {
@@ -29604,7 +29654,6 @@
             };
 
             const handleShiftStudySiteSelection = async () => {
-                console.log('handleShiftStudySiteSelection called');
                 const studySelect = document.querySelector('select[name="studyIds"]');
                 const siteSelect = document.querySelector('select[name="siteId"]');
                 const roleAssignmentContainer = document.getElementById('role-assignment-container');
@@ -29622,8 +29671,6 @@
                 const date = dateInput ? dateInput.value : toDateOnlyString(new Date());
                 const period = periodSelect ? periodSelect.value : 'Full Day';
                 
-                console.log('Elements found:', { studySelect, siteSelect, roleAssignmentContainer, form });
-                
                 if (!studySelect || !siteSelect || !roleAssignmentContainer) {
                     console.log('Missing elements, returning early');
                     return;
@@ -29637,104 +29684,45 @@
                     // Prefer the event stored on window (the one passed to modal) as it has the most up-to-date data
                     if (window._currentEditingEvent && window._currentEditingEvent.id === form.dataset.eventId) {
                         existingEvent = window._currentEditingEvent;
-                        console.log('Using event from window._currentEditingEvent:', existingEvent);
                     } else {
                         // Fall back to state lookup
                         existingEvent = state.crc_events.find(e => e.id === form.dataset.eventId);
-                        console.log('Using event from state lookup:', existingEvent);
                     }
                 }
                 
-                // IMPORTANT: Collect current form state BEFORE regenerating to preserve user changes
-                const { currentRoleAssignments, currentTrainingAssignments, currentTrainingModes } = collectCurrentFormRoleAssignments(form);
-                console.log('Current form role assignments:', currentRoleAssignments);
-                console.log('Current form training assignments:', currentTrainingAssignments);
-                console.log('Current form training modes:', currentTrainingModes);
+                // Check if role assignment inputs already exist (user made changes we need to preserve)
+                const existingRoleInputs = roleAssignmentContainer.querySelectorAll('select[name^="role-"]');
+                const hasExistingFormInputs = existingRoleInputs.length > 0;
                 
-                // Merge current form state with existing event data (form state takes precedence)
-                let mergedRoleAssignments = existingEvent?.roleAssignments ? { ...existingEvent.roleAssignments } : {};
+                // Only collect form state if there are already inputs (to preserve user changes)
+                let currentRoleAssignments = {};
+                let currentTrainingAssignments = {};
+                let currentTrainingModes = {};
                 
-                // IMPORTANT: Handle legacy events that use crcId instead of roleAssignments
-                // If roleAssignments is empty but crcId exists, convert it to roleAssignments format
-                const hasEmptyRoleAssignments = !mergedRoleAssignments || Object.keys(mergedRoleAssignments).length === 0;
-                const hasLegacyCrcId = existingEvent && existingEvent.crcId;
-                
-                if (hasLegacyCrcId && hasEmptyRoleAssignments) {
-                    // Safety check: ensure state.roles and state.studies are available
-                    if (!state.roles || !state.studies || !Array.isArray(state.roles) || !Array.isArray(state.studies)) {
-                        console.warn('Cannot convert legacy event: state.roles or state.studies not loaded yet');
-                    } else {
-                        console.log('Legacy event detected: converting crcId to roleAssignments format', {
-                            crcId: existingEvent.crcId,
-                            roles: existingEvent.roles,
-                            studyIds: existingEvent.studyIds
-                        });
-                        
-                        // Get the roles from the event (legacy events have roles array)
-                        const legacyRoles = existingEvent.roles || [];
-                        if (legacyRoles.length > 0) {
-                            // Create roleAssignments from legacy roles and crcId
-                            legacyRoles.forEach(roleName => {
-                                const role = state.roles.find(r => r.name === roleName);
-                                if (role) {
-                                    if (!mergedRoleAssignments[role.id]) {
-                                        mergedRoleAssignments[role.id] = [];
-                                    }
-                                    mergedRoleAssignments[role.id].push(existingEvent.crcId);
-                                }
-                            });
-                            console.log('Converted using legacy roles array:', mergedRoleAssignments);
-                        } else {
-                            // If no roles specified in legacy event, do NOT auto-assign to all roles
-                            // This was causing the "one person added to every role" bug
-                            // Just leave the form empty and let the user assign roles manually
-                            console.log('Legacy event with no roles array - NOT auto-assigning to roles. User must assign manually.');
-                            if (false) { // Disabled - was causing auto-population issues
-                                // Final fallback: use training role if study requires it
-                                if (Object.keys(mergedRoleAssignments).length === 0) {
-                                    const trainingRole = state.roles.find(r => isTrainingRoleName(r.name));
-                                    if (trainingRole) {
-                                        mergedRoleAssignments[trainingRole.id] = [existingEvent.crcId];
-                                        console.log(`✓ Assigned legacy crcId ${existingEvent.crcId} to Training role (${trainingRole.id}) as final fallback`);
-                                    }
-                                }
-                            }
-                        }
-                        console.log('Final mergedRoleAssignments after conversion:', mergedRoleAssignments);
-                    }
+                if (hasExistingFormInputs) {
+                    const collected = collectCurrentFormRoleAssignments(form);
+                    currentRoleAssignments = collected.currentRoleAssignments;
+                    currentTrainingAssignments = collected.currentTrainingAssignments;
+                    currentTrainingModes = collected.currentTrainingModes;
                 }
                 
-                const mergedTrainingAssignments = existingEvent?.trainingAssignments ? { ...existingEvent.trainingAssignments } : {};
-                const mergedTrainingModes = existingEvent?.trainingModes ? { ...existingEvent.trainingModes } : {};
+                // Use ONLY the existing event's roleAssignments - do NOT convert legacy data
+                // Legacy events should be saved with roleAssignments structure when edited
+                let mergedRoleAssignments = existingEvent?.roleAssignments ? JSON.parse(JSON.stringify(existingEvent.roleAssignments)) : {};
+                const mergedTrainingAssignments = existingEvent?.trainingAssignments ? JSON.parse(JSON.stringify(existingEvent.trainingAssignments)) : {};
+                const mergedTrainingModes = existingEvent?.trainingModes ? JSON.parse(JSON.stringify(existingEvent.trainingModes)) : {};
                 
-                // Override with current form state (preserves unsaved changes)
-                // Only override if currentRoleAssignments has values (to avoid wiping out converted legacy data)
-                if (Object.keys(currentRoleAssignments).length > 0) {
+                // Override with current form state ONLY if user has made changes (form inputs exist)
+                if (hasExistingFormInputs && Object.keys(currentRoleAssignments).length > 0) {
                     Object.keys(currentRoleAssignments).forEach(roleId => {
                         mergedRoleAssignments[roleId] = currentRoleAssignments[roleId];
                     });
-                }
-                Object.keys(currentTrainingAssignments).forEach(roleId => {
-                    mergedTrainingAssignments[roleId] = currentTrainingAssignments[roleId];
-                });
-                Object.keys(currentTrainingModes).forEach(key => {
-                    mergedTrainingModes[key] = currentTrainingModes[key];
-                });
-                
-                console.log('Is editing:', isEditing, 'Existing event:', existingEvent);
-                console.log('mergedRoleAssignments after all processing:', mergedRoleAssignments);
-                if (existingEvent) {
-                    console.log('Event roleAssignments:', existingEvent.roleAssignments);
-                    console.log('Event trainingAssignments:', existingEvent.trainingAssignments);
-                    console.log('Event trainingModes:', existingEvent.trainingModes);
-                    console.log('Event roles:', existingEvent.roles);
-                    console.log('Event crcId:', existingEvent.crcId);
-                    console.log('Event ID:', existingEvent.id);
-                    // Log the full event object to see what we're working with
-                    console.log('Full existing event object:', JSON.stringify(existingEvent, null, 2));
-                } else {
-                    console.warn('No existing event found! Form event ID:', form?.dataset?.eventId);
-                    console.warn('Window stored event:', window._currentEditingEvent);
+                    Object.keys(currentTrainingAssignments).forEach(roleId => {
+                        mergedTrainingAssignments[roleId] = currentTrainingAssignments[roleId];
+                    });
+                    Object.keys(currentTrainingModes).forEach(key => {
+                        mergedTrainingModes[key] = currentTrainingModes[key];
+                    });
                 }
                 
                 const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
@@ -29816,48 +29804,30 @@
                 const selectedStudyIds = Array.from(studySelect.selectedOptions).map(option => option.value).filter(id => id);
                 const selectedSiteId = siteSelect.value;
                 
-                console.log('Selected study IDs:', selectedStudyIds);
-                console.log('Selected site ID:', selectedSiteId);
-                console.log('Available studies:', state.studies);
-                console.log('Available roles:', state.roles);
-                console.log('Available CRCs:', state.crcs);
-                
                 // Filter sites based on selected studies
                 if (selectedStudyIds.length > 0) {
                     const availableSiteIds = new Set();
                     selectedStudyIds.forEach(studyId => {
                         const study = state.studies.find(s => s.id === studyId);
-                        console.log('Study found:', study);
                         
                         // Prioritize siteIds from ARTEMIS, then check siteRoleRequirements, then fallback to sites
                         let studySites = [];
                         if (study?.siteIds && Array.isArray(study.siteIds) && study.siteIds.length > 0) {
                             studySites = study.siteIds;
-                            console.log('Using study.siteIds from ARTEMIS:', studySites);
                         } else if (study?.siteRoleRequirements && Object.keys(study.siteRoleRequirements).length > 0) {
                             studySites = Object.keys(study.siteRoleRequirements);
-                            console.log('Using study.siteRoleRequirements:', studySites);
                         } else if (study?.sites && Array.isArray(study.sites) && study.sites.length > 0) {
                             studySites = study.sites;
-                            console.log('Using study.sites:', studySites);
                         }
                         
                         if (studySites.length > 0) {
-                            console.log('Study sites:', studySites);
                             studySites.forEach(siteId => availableSiteIds.add(siteId));
-                        } else {
-                            console.log('No sites found on study. Checked study.siteIds, study.siteRoleRequirements, and study.sites');
-                            // If no specific sites found, show all sites as available
-                            console.log('Showing all sites as available for manual selection');
                         }
                     });
-                    
-                    console.log('Available site IDs:', Array.from(availableSiteIds));
                     
                     // Update site options - STRICT to Artemis-selected only
                     const currentSiteId = siteSelect.value;
                     const availableSites = state.crc_sites.filter(site => availableSiteIds.has(site.id));
-                    console.log('Available sites (Artemis-selected only):', availableSites);
 
                     if (availableSites.length === 0) {
                         siteSelect.innerHTML = `<option value="">No Artemis-approved sites</option>`;
@@ -29964,7 +29934,6 @@
                                                 }
                                             }
                                             select.value = crcId;
-                                            console.log(`Set select role-${roleId}-${index} to ${crcId} (early return path)`);
                                         }
                                     }
                                 });
@@ -30107,14 +30076,12 @@
                 if (visitNumberSelect) {
                     if (selectedStudyIds.length > 0) {
                         const study = state.studies.find(s => s.id === selectedStudyIds[0]); // Use first selected study
-                        console.log('Populating visit dropdown for study:', study);
                         const numberOfVisits = study?.numberOfVisits || 0;
                         const visitRoleRequirements = study?.visitRoleRequirements || {};
                         
                         // Preserve the currently selected value before repopulating
                         const currentSelectedValue = visitNumberSelect.value || '';
                         
-                        console.log('Study numberOfVisits:', numberOfVisits);
                         
                         let visitOptions = '<option value="">Select Visit</option>';
                         
@@ -30147,7 +30114,6 @@
                             visitNumberSelect.value = currentSelectedValue;
                         }
                         visitNumberSelect.disabled = false;
-                        console.log('Visit dropdown enabled and populated with', numberOfVisits, 'visits, selected value:', currentSelectedValue);
                         
                         // Remove existing event listeners by cloning and replacing
                         const visitSelectClone = visitNumberSelect.cloneNode(true);
@@ -30175,7 +30141,6 @@
                         // Clear and disable if no study selected
                         visitNumberSelect.innerHTML = '<option value="">Select Visit</option>';
                         visitNumberSelect.disabled = true;
-                        console.log('Visit dropdown disabled - no study selected');
                     }
                 } else {
                     console.log('visitNumberSelect element not found!');
@@ -30504,10 +30469,9 @@
                         return optionsHtml;
                     };
 
-                    console.log(`CRC options for ${role.name}:`, existingAssignments);
-
-                    // Get override quantity if editing - default to 1 if no quantity specified
-                    const defaultQuantityForRole = 1;
+                    // Get override quantity if editing - use study's role requirement as default
+                    const studyRequiredQuantity = requiredRoles.get(role.id) || 1;
+                    const defaultQuantityForRole = studyRequiredQuantity;
                     const overrideQuantity = existingEvent && existingEvent.roleQuantityOverrides && existingEvent.roleQuantityOverrides[role.id]
                         ? existingEvent.roleQuantityOverrides[role.id]
                         : defaultQuantityForRole;
@@ -30587,7 +30551,6 @@
                                                 }
                                             }
                                             select.value = crcId;
-                                            console.log(`Set select role-${roleId}-${index} to ${crcId} (preserved from form state)`);
                                         }
                                     }
                                 });
@@ -30807,12 +30770,8 @@
                     // Ensure quantity is always defined (default to 1 if undefined)
                     const roleQuantity = (quantity !== undefined && quantity !== null && quantity > 0) ? quantity : 1;
                     
-                    console.log(`Processing role: ${role.name} (${roleQuantity} needed)`);
-                    
                     // Get existing assignments for this role if editing - use mergedRoleAssignments which has converted legacy data
                     let existingAssignments = (mergedRoleAssignments[roleId] || []).filter(Boolean);
-                    
-                    console.log(`Existing assignments for ${role.name} (roleId: ${roleId}):`, existingAssignments, 'from mergedRoleAssignments:', mergedRoleAssignments[roleId]);
                     
                     // Get CRCs who can fill this role (only show those with valid training)
                     let qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, role.name))
@@ -30997,8 +30956,6 @@
                         return optionsHtml;
                     };
 
-                    console.log(`CRC options for ${role.name}:`, existingAssignments);
-
                     // Get override quantity if editing
                     // Use roleQuantity from the loop scope (ensured to be defined)
                     const overrideQuantity = existingEvent && existingEvent.roleQuantityOverrides && existingEvent.roleQuantityOverrides[roleId]
@@ -31074,14 +31031,11 @@
                                         }
                                     }
                                     select.value = crcId;
-                                    console.log(`Set select role-${roleId}-${index} to ${crcId}`);
                                 }
                             }
                         });
                     });
                 }
-                console.log('Role assignment HTML generated and inserted');
-                
                 // Function to check for duplicate assignments and highlight them
                 const checkForDuplicateAssignments = () => {
                     const form = document.getElementById('crc-event-form');
