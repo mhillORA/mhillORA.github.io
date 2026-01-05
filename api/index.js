@@ -1079,12 +1079,19 @@ async function crudHandler(context, request, containerName) {
                     try {
                         const { resource: existingUser } = await container.item(updateId, updateId).read();
                         if (existingUser) {
-                            // Merge existing user data with update data
-                            mergedRequestBody = { ...existingUser, ...requestBody };
+                            // Merge existing user data with update data, but exclude password from existing user
+                            // to avoid issues with hashed vs plain text passwords
+                            const { password: _, ...existingUserWithoutPassword } = existingUser;
+                            mergedRequestBody = { ...existingUserWithoutPassword, ...requestBody };
+                        } else {
+                            // User not found - this is an update, so we need the user to exist
+                            context.log.warn(`User ${updateId} not found for update`);
+                            // Continue with requestBody only - validation will fail if required fields are missing
                         }
                     } catch (error) {
-                        // If user doesn't exist, continue with just requestBody
-                        context.log.warn(`User ${updateId} not found, proceeding with new user creation`);
+                        // Log the error but continue - validation will catch if required fields are missing
+                        context.log.error(`Error reading user ${updateId} for update:`, error.message || error);
+                        // Continue with requestBody only
                     }
                 }
                 
@@ -1163,7 +1170,7 @@ async function crudHandler(context, request, containerName) {
                             break;
                     }
                 } catch (validationError) {
-                    console.error(`Validation error for ${containerName}:`, validationError.message);
+                    context.log.error(`Validation error for ${containerName}:`, validationError.message);
                     return {
                         status: 400,
                         jsonBody: { error: validationError.message },
@@ -1171,16 +1178,40 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
                 
-                const updatedItem = { ...requestBody, id: updateId };
-                const { resource: result } = await container.items.upsert(updatedItem);
-                
-                // Calculate enrollment for studies
-                if (containerName === 'studies') {
-                    const enrollment = await calculateStudyEnrollment(result.id);
-                    result.enrolled = enrollment;
+                try {
+                    // For users, ensure we preserve all existing fields when updating
+                    let updatedItem = { ...requestBody, id: updateId };
+                    if (containerName === 'users' && updateId) {
+                        try {
+                            const { resource: existingUser } = await container.item(updateId, updateId).read();
+                            if (existingUser) {
+                                // Merge existing user fields with update fields, preserving existing data
+                                updatedItem = { ...existingUser, ...requestBody, id: updateId };
+                            }
+                        } catch (readError) {
+                            // If we can't read the existing user, proceed with just requestBody
+                            // This might happen if the user was just created or there's a transient error
+                            context.log.warn(`Could not read existing user ${updateId} for merge, proceeding with update:`, readError.message);
+                        }
+                    }
+                    
+                    const { resource: result } = await container.items.upsert(updatedItem);
+                    
+                    // Calculate enrollment for studies
+                    if (containerName === 'studies') {
+                        const enrollment = await calculateStudyEnrollment(result.id);
+                        result.enrolled = enrollment;
+                    }
+                    
+                    return { jsonBody: result };
+                } catch (upsertError) {
+                    context.log.error(`Error upserting ${containerName} item:`, upsertError.message || upsertError);
+                    return {
+                        status: 500,
+                        jsonBody: { error: `Failed to update ${containerName}: ${upsertError.message || 'Unknown error'}` },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
                 }
-                
-                return { jsonBody: result };
 
             case 'DELETE':
                 if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
