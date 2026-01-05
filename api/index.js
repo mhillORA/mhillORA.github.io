@@ -1763,6 +1763,177 @@ app.http('usersAuthenticate', {
     },
 });
 
+// Artemis authentication endpoint - allows access only for Manager/Admin level users
+// This endpoint is used by Artemis to verify credentials from SMO Scheduler
+app.http('usersAuthenticateArtemis', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/authenticate-artemis',
+    handler: async (request, context) => {
+        try {
+            // Handle OPTIONS for CORS
+            if (request.method === 'OPTIONS') {
+                return {
+                    status: 200,
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                        'Access-Control-Allow-Headers': 'Content-Type'
+                    }
+                };
+            }
+
+            const { username, password } = await request.json();
+            
+            if (!username || !password) {
+                return {
+                    status: 400,
+                    jsonBody: { 
+                        success: false,
+                        error: 'Username and password are required',
+                        allowed: false
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            let container;
+            try {
+                container = getContainer('users');
+            } catch (error) {
+                context.log.error('Artemis auth: Error getting users container:', error);
+                return {
+                    status: 500,
+                    jsonBody: { 
+                        success: false,
+                        error: 'Database error. Please check if users container exists.',
+                        allowed: false
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            let users;
+            try {
+                const { resources } = await container.items
+                    .query({
+                        query: "SELECT * FROM c WHERE c.username = @username",
+                        parameters: [{ name: "@username", value: username }]
+                    })
+                    .fetchAll();
+                users = resources || [];
+            } catch (error) {
+                context.log.error('Artemis auth: Error querying users:', error);
+                return {
+                    status: 500,
+                    jsonBody: { 
+                        success: false,
+                        error: 'Database error during authentication',
+                        allowed: false
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            if (users.length === 0) {
+                return {
+                    status: 401,
+                    jsonBody: { 
+                        success: false,
+                        error: 'Invalid username or password',
+                        allowed: false
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            const user = users[0];
+            
+            // Verify password
+            if (!verifyPassword(password, user.password)) {
+                return {
+                    status: 401,
+                    jsonBody: { 
+                        success: false,
+                        error: 'Invalid username or password',
+                        allowed: false
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            // Check permission level - only allow Manager or Admin level users
+            // Supervisor and CRC are denied access
+            const permissionLevel = user.permissionLevel || 'CRC';
+            const allowedLevels = ['Manager', 'Admin'];
+            const isAllowed = allowedLevels.includes(permissionLevel);
+            
+            if (!isAllowed) {
+                context.log.info(`Artemis auth: Access denied for user ${username} with permission level ${permissionLevel}`);
+                return {
+                    status: 403,
+                    jsonBody: { 
+                        success: false,
+                        error: 'Access denied. Only Manager and Admin level users can access Artemis.',
+                        allowed: false,
+                        permissionLevel: permissionLevel
+                    },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                };
+            }
+            
+            // Return success with user info (without password)
+            const { password: _, ...userWithoutPassword } = user;
+            context.log.info(`Artemis auth: Access granted for user ${username} with permission level ${permissionLevel}`);
+            return {
+                status: 200,
+                jsonBody: {
+                    success: true,
+                    allowed: true,
+                    user: userWithoutPassword
+                },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            };
+            
+        } catch (error) {
+            context.log.error('Artemis authentication error:', error);
+            return {
+                status: 500,
+                jsonBody: { 
+                    success: false,
+                    error: 'Authentication failed. Please try again.',
+                    allowed: false
+                },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            };
+        }
+    },
+});
+
 // Register users list endpoint (no id parameter)
 app.http('usersList', {
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -4373,10 +4544,13 @@ app.http('navanImport', {
 // - "0 */12 * * *" = every 12 hours
 // - "0 0 */1 * *" = daily at midnight
 app.timer('navanAutoImport', {
-    schedule: '0 */6 * * *', // Every 6 hours
+    // Run daily at 7 AM EST (12:00 UTC)
+    // Note: During daylight saving time (EDT), this will run at 8 AM EDT (12:00 UTC)
+    // To run at exactly 7 AM EDT, use '0 11 * * *' (11:00 UTC), but that would be 6 AM EST
+    schedule: '0 12 * * *', // Daily at 12:00 UTC (7 AM EST / 8 AM EDT)
     handler: async (myTimer, context) => {
         ensureContextLogger(context);
-        context.log.info('navanAutoImport: Timer triggered - Starting automatic Navan import');
+        context.log.info('navanAutoImport: Timer triggered - Starting automatic Navan import (daily at 7 AM EST)');
         
         const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
         
@@ -4394,9 +4568,9 @@ app.timer('navanAutoImport', {
         };
         
         try {
-            // Use default date range: 30 days past, 180 days future (6 months)
+            // Use date range: 30 days past, 30 days future (as requested)
             const pastDays = 30;
-            const futureDays = 180;
+            const futureDays = 30;
             
             context.log.info(`navanAutoImport: Using default date range - pastDays=${pastDays}, futureDays=${futureDays}`);
             
