@@ -2327,12 +2327,34 @@ const resolveCrcIdForNavanBooking = async (booking, context, { allowFallbackName
 const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crcId, travelerName, context) => {
     const bookingType = booking.bookingType || 'FLIGHT';
 
+    // Helper to extract local date from Navan datetime strings (preserve local timezone, don't convert to UTC)
+    const extractLocalDate = (dateTimeString) => {
+        if (!dateTimeString) return null;
+        // Navan provides dates in format like "2024-01-15T10:30:00" or ISO format
+        // Extract just the date part (YYYY-MM-DD) without timezone conversion
+        if (typeof dateTimeString === 'string') {
+            const datePart = dateTimeString.split('T')[0];
+            if (datePart && /^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+                return datePart;
+            }
+        }
+        // If it's a Date object or full ISO string, parse it but use local date components
+        const date = new Date(dateTimeString);
+        if (!Number.isNaN(date.getTime())) {
+            // Use local date components to avoid timezone shifts
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+        return null;
+    };
+
     let date = null;
     if (booking.startDate) {
-        date = booking.startDate;
+        date = extractLocalDate(booking.startDate);
     } else if (booking.segments && booking.segments.length > 0 && booking.segments[0].startLocalDateTime) {
-        const dateTime = new Date(booking.segments[0].startLocalDateTime);
-        date = dateTime.toISOString().split('T')[0];
+        date = extractLocalDate(booking.segments[0].startLocalDateTime);
     }
 
     const navanStatus = (booking.bookingStatus || booking.approvalStatus || 'CONFIRMED').toLowerCase();
@@ -2351,7 +2373,7 @@ const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crc
 
     const travelRecord = {
         crcId: crcId || 'unknown',
-        date: date || new Date().toISOString().split('T')[0],
+        date: date || extractLocalDate(new Date().toISOString()),
         navanBookingId: bookingId,
         navanBookingUuid: bookingUuid || booking.uuid || null,
         navanInvoiceUrl: booking.invoice || null,
@@ -2379,10 +2401,26 @@ const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crc
             travelRecord.destination = String(segment.arrival.airportCode);
         }
         if (segment?.startLocalDateTime) {
-            travelRecord.departureTime = new Date(segment.startLocalDateTime).toISOString();
+            // Preserve local datetime - store as ISO but use local date components
+            const localDate = extractLocalDate(segment.startLocalDateTime);
+            const localTime = segment.startLocalDateTime.includes('T') ? segment.startLocalDateTime.split('T')[1] : null;
+            if (localDate && localTime) {
+                // Combine local date and time, then convert to ISO (preserves the local time)
+                travelRecord.departureTime = `${localDate}T${localTime.split('+')[0].split('-')[0].split('Z')[0]}`;
+            } else {
+                travelRecord.departureTime = segment.startLocalDateTime;
+            }
         }
         if (segment?.endLocalDateTime) {
-            travelRecord.arrivalTime = new Date(segment.endLocalDateTime).toISOString();
+            // Preserve local datetime - store as ISO but use local date components
+            const localDate = extractLocalDate(segment.endLocalDateTime);
+            const localTime = segment.endLocalDateTime.includes('T') ? segment.endLocalDateTime.split('T')[1] : null;
+            if (localDate && localTime) {
+                // Combine local date and time, then convert to ISO (preserves the local time)
+                travelRecord.arrivalTime = `${localDate}T${localTime.split('+')[0].split('-')[0].split('Z')[0]}`;
+            } else {
+                travelRecord.arrivalTime = segment.endLocalDateTime;
+            }
         }
         if (booking.grandTotal || booking.usdGrandTotal) {
             const cost = booking.grandTotal || booking.usdGrandTotal;
@@ -2424,12 +2462,20 @@ const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crc
             travelRecord.hotelCountry = String(segment?.departure?.country || booking.destination?.country || '');
         }
         if (segment?.startLocalDateTime || booking.startDate) {
-            const checkIn = segment?.startLocalDateTime ? new Date(segment.startLocalDateTime) : new Date(booking.startDate);
-            travelRecord.hotelCheckIn = checkIn.toISOString();
+            const dateTimeString = segment?.startLocalDateTime || booking.startDate;
+            const localDate = extractLocalDate(dateTimeString);
+            if (localDate) {
+                const localTime = dateTimeString.includes('T') ? dateTimeString.split('T')[1] : '00:00:00';
+                travelRecord.hotelCheckIn = `${localDate}T${localTime.split('+')[0].split('-')[0].split('Z')[0]}`;
+            }
         }
         if (segment?.endLocalDateTime || booking.endDate) {
-            const checkOut = segment?.endLocalDateTime ? new Date(segment.endLocalDateTime) : new Date(booking.endDate);
-            travelRecord.hotelCheckOut = checkOut.toISOString();
+            const dateTimeString = segment?.endLocalDateTime || booking.endDate;
+            const localDate = extractLocalDate(dateTimeString);
+            if (localDate) {
+                const localTime = dateTimeString.includes('T') ? dateTimeString.split('T')[1] : '00:00:00';
+                travelRecord.hotelCheckOut = `${localDate}T${localTime.split('+')[0].split('-')[0].split('Z')[0]}`;
+            }
         }
         if (booking.grandTotal || booking.usdGrandTotal) {
             const cost = booking.grandTotal || booking.usdGrandTotal;

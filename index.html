@@ -1895,6 +1895,13 @@
                 travelCrcExpanded: {}, // Track which CRC groups are expanded in travel view
                 travelCalendarMonth: undefined, // Calendar month (0-11), undefined = current month
                 travelCalendarYear: undefined, // Calendar year, undefined = current year
+                travelFilterType: 'thisYear', // 'thisYear', 'lastYear', 'month', 'quarter', 'custom'
+                travelFilterMonth: null,
+                travelFilterQuarter: null,
+                travelFilterYear: null,
+                travelFilterStartDate: null,
+                travelFilterEndDate: null,
+                travelFilterCrcId: null,
                 navanConnectionStatus: null,
                 navanConnectionLastCheck: 0,
                 navanImportSummary: null,
@@ -14196,23 +14203,24 @@
                     return travelDate.getFullYear() === year && travelDate.getMonth() === month;
                 });
 
-                // Group by CRC
+                // Group by CRC (only include valid CRCs to prevent duplicates)
                 const travelByCRC = {};
                 monthTravel.forEach(travel => {
-                    const crcId = travel.crcId;
-                    const crc = state.crcs.find(c => 
-                        c.id === crcId || 
-                        c.name.toLowerCase() === (travel.travelerName || '').toLowerCase()
-                    );
-                    const key = crcId || travel.travelerName || 'unassigned';
-                    if (!travelByCRC[key]) {
-                        travelByCRC[key] = {
+                    if (!travel) return;
+                    const validCrcId = resolveValidCrcIdForTravel(travel);
+                    if (!validCrcId) return; // Skip invalid/unmatched travel records
+                    
+                    const crc = state.crcs.find(c => c.id === validCrcId);
+                    if (!crc) return; // Skip if CRC not found (shouldn't happen, but safety check)
+                    
+                    if (!travelByCRC[validCrcId]) {
+                        travelByCRC[validCrcId] = {
                             crc: crc,
-                            name: crc?.name || travel.travelerName || 'Unknown',
+                            name: crc.name || 'Unknown',
                             travel: []
                         };
                     }
-                    travelByCRC[key].travel.push(travel);
+                    travelByCRC[validCrcId].travel.push(travel);
                 });
 
                 let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;"><table class="min-w-full text-xs border-collapse">`;
@@ -24694,20 +24702,23 @@
                                 
                                 console.log('Filtered travel records:', filteredTravel.length);
                         
-                                // Group by CRC
+                                // Group by CRC (only include valid CRCs to prevent duplicates)
                                 const travelByCRC = {};
                                 filteredTravel.forEach(travel => {
-                                    const crcId = travel.crcId;
-                                    if (!crcId) return; // Skip records without CRC ID
-                                    if (!travelByCRC[crcId]) {
-                                        travelByCRC[crcId] = [];
+                                    if (!travel) return;
+                                    const validCrcId = resolveValidCrcIdForTravel(travel);
+                                    if (!validCrcId) return; // Skip invalid/unmatched travel records
+                                    
+                                    if (!travelByCRC[validCrcId]) {
+                                        travelByCRC[validCrcId] = [];
                                     }
-                                    travelByCRC[crcId].push(travel);
+                                    travelByCRC[validCrcId].push(travel);
                                 });
                                 
-                                // Calculate totals per CRC
+                                // Calculate totals per CRC (filter out null entries)
                                 const reportData = Object.keys(travelByCRC).map(crcId => {
-                                    const crc = state.crcs.find(c => c.id === crcId) || { name: crcId };
+                                    const crc = state.crcs.find(c => c.id === crcId);
+                                    if (!crc) return null; // Skip if CRC not found (shouldn't happen, but safety check)
                                     const travelRecords = travelByCRC[crcId];
                                     let flightsCount = 0;
                                     let hotelsCount = 0;
@@ -24743,7 +24754,7 @@
                                         carsCount,
                                         totalCost: Number.isFinite(totalCost) ? Math.round(totalCost * 100) / 100 : 0
                                     };
-                                }).sort((a, b) => a.crcName.localeCompare(b.crcName));
+                                }).filter(row => row !== null).sort((a, b) => a.crcName.localeCompare(b.crcName));
                                 
                                 // Calculate grand totals
                                 const grandTotal = reportData.reduce((sum, row) => sum + row.totalCost, 0);
@@ -34713,6 +34724,83 @@
                 `;
             };
 
+            // Helper function to resolve valid CRC ID from travel record
+            // Returns the actual CRC ID if the travel record matches a valid CRC, or null if invalid
+            // This prevents duplicate grouping when the same person has multiple travel records with different IDs
+            const resolveValidCrcIdForTravel = (travel) => {
+                if (!travel || !state.crcs) return null;
+                
+                // First, check if crcId directly matches a CRC in the system
+                if (travel.crcId) {
+                    const directMatch = state.crcs.find(c => c.id === travel.crcId);
+                    if (directMatch) return travel.crcId;
+                }
+                
+                // If crcId doesn't match, try to match by travelerName
+                if (travel.travelerName) {
+                    const nameMatch = state.crcs.find(c => 
+                        c.name && c.name.trim().toLowerCase() === travel.travelerName.trim().toLowerCase()
+                    );
+                    if (nameMatch) return nameMatch.id;
+                }
+                
+                // No valid match found - this is an invalid/unmatched travel record
+                return null;
+            };
+
+            // Helper function to get fiscal year dates (assuming FY starts October 1)
+            const getFiscalYearDates = (yearOffset = 0) => {
+                const now = new Date();
+                const currentYear = now.getFullYear();
+                const currentMonth = now.getMonth(); // 0-11
+                
+                // Determine current fiscal year (FY starts Oct 1, so Oct-Dec is next calendar year's FY)
+                let fiscalYear = currentYear;
+                if (currentMonth >= 9) { // October (9) through December (11) belong to next FY
+                    fiscalYear = currentYear + 1;
+                }
+                
+                // Apply offset (0 = current FY, -1 = last FY, etc.)
+                const targetFY = fiscalYear + yearOffset;
+                
+                // FY start: October 1 of previous calendar year
+                const fyStart = new Date(targetFY - 1, 9, 1); // Month 9 = October
+                // FY end: September 30 of current calendar year
+                const fyEnd = new Date(targetFY, 8, 30); // Month 8 = September
+                
+                return {
+                    start: toDateOnlyString(fyStart),
+                    end: toDateOnlyString(fyEnd),
+                    year: targetFY
+                };
+            };
+            
+            // Helper to get quarter dates
+            const getQuarterDates = (year, quarter) => {
+                const quarterStartMonths = [0, 3, 6, 9]; // Jan, Apr, Jul, Oct
+                const startMonth = quarterStartMonths[quarter - 1];
+                const endMonth = startMonth + 2;
+                
+                const start = new Date(year, startMonth, 1);
+                const end = new Date(year, endMonth + 1, 0); // Last day of end month
+                
+                return {
+                    start: toDateOnlyString(start),
+                    end: toDateOnlyString(end)
+                };
+            };
+            
+            // Helper to get month dates
+            const getMonthDates = (year, month) => {
+                const start = new Date(year, month, 1);
+                const end = new Date(year, month + 1, 0); // Last day of month
+                
+                return {
+                    start: toDateOnlyString(start),
+                    end: toDateOnlyString(end)
+                };
+            };
+
             const renderTravelContent = async () => {
                 const container = document.getElementById('travel-content');
                 if (!container) return;
@@ -34825,18 +34913,27 @@
                     });
                 }
 
-                // Group travel by CRC
+                // Group travel by CRC (only include valid CRCs to prevent duplicates)
                 const travelByCRC = {};
                 state.travel.forEach(travel => {
-                    if (!travelByCRC[travel.crcId]) {
-                        travelByCRC[travel.crcId] = [];
+                    if (!travel) return;
+                    const validCrcId = resolveValidCrcIdForTravel(travel);
+                    if (!validCrcId) return; // Skip invalid/unmatched travel records
+                    
+                    if (!travelByCRC[validCrcId]) {
+                        travelByCRC[validCrcId] = [];
                     }
-                    travelByCRC[travel.crcId].push(travel);
+                    travelByCRC[validCrcId].push(travel);
                 });
 
-                // Group flights by date for calendar view
+                // Group flights by date for calendar view (only include valid CRCs)
                 const flightsByDate = {};
                 state.travel.forEach(travel => {
+                    if (!travel) return;
+                    // Only include travel records with valid CRCs
+                    const validCrcId = resolveValidCrcIdForTravel(travel);
+                    if (!validCrcId) return; // Skip invalid/unmatched travel records
+                    
                     if (travel.date && travel.flightNumber) {
                         const travelDateObj = typeof travel.date === 'string'
                             ? parseDateOnly(travel.date)
@@ -34986,15 +35083,57 @@
                     <!-- Filter Controls -->
                     <div class="mb-6 p-4 bg-gray-50 dark:bg-gray-800 rounded-lg border dark:border-gray-700">
                         <h3 class="text-lg font-semibold dark:text-white mb-4">Filter Travel Costs</h3>
-                        <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4 mb-4">
                             <div>
-                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Start Date</label>
-                                <input type="date" id="travel-filter-start-date" value="${travelFilterStartDate}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Period</label>
+                                <select id="travel-filter-type" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="thisYear" ${travelFilterType === 'thisYear' ? 'selected' : ''}>This Year (FY)</option>
+                                    <option value="lastYear" ${travelFilterType === 'lastYear' ? 'selected' : ''}>Last Year (FY)</option>
+                                    <option value="month" ${travelFilterType === 'month' ? 'selected' : ''}>Month</option>
+                                    <option value="quarter" ${travelFilterType === 'quarter' ? 'selected' : ''}>Quarter</option>
+                                    <option value="custom" ${travelFilterType === 'custom' ? 'selected' : ''}>Custom Range</option>
+                                </select>
                             </div>
-                            <div>
-                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">End Date</label>
-                                <input type="date" id="travel-filter-end-date" value="${travelFilterEndDate}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                            </div>
+                            ${travelFilterType === 'month' ? `
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Month</label>
+                                    <select id="travel-filter-month" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                        ${[0,1,2,3,4,5,6,7,8,9,10,11].map(m => {
+                                            const monthName = new Date(2000, m).toLocaleDateString('en-US', { month: 'long' });
+                                            return `<option value="${m}" ${travelFilterMonth === m ? 'selected' : ''}>${monthName}</option>`;
+                                        }).join('')}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Year</label>
+                                    <input type="number" id="travel-filter-year" value="${travelFilterYear || new Date().getFullYear()}" min="2020" max="2100" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            ` : ''}
+                            ${travelFilterType === 'quarter' ? `
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Quarter</label>
+                                    <select id="travel-filter-quarter" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="1" ${travelFilterQuarter === 1 ? 'selected' : ''}>Q1 (Jan-Mar)</option>
+                                        <option value="2" ${travelFilterQuarter === 2 ? 'selected' : ''}>Q2 (Apr-Jun)</option>
+                                        <option value="3" ${travelFilterQuarter === 3 ? 'selected' : ''}>Q3 (Jul-Sep)</option>
+                                        <option value="4" ${travelFilterQuarter === 4 ? 'selected' : ''}>Q4 (Oct-Dec)</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Year</label>
+                                    <input type="number" id="travel-filter-year" value="${travelFilterYear || new Date().getFullYear()}" min="2020" max="2100" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            ` : ''}
+                            ${travelFilterType === 'custom' ? `
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Start Date</label>
+                                    <input type="date" id="travel-filter-start-date" value="${travelFilterStartDate}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">End Date</label>
+                                    <input type="date" id="travel-filter-end-date" value="${travelFilterEndDate}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            ` : ''}
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">CRC</label>
                                 <select id="travel-filter-crc" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
@@ -35002,43 +35141,50 @@
                                     ${state.crcs.map(crc => `<option value="${crc.id}" ${crc.id === travelFilterCrcId ? 'selected' : ''}>${crc.name}</option>`).join('')}
                                 </select>
                             </div>
-                            <div class="flex items-end">
-                                <button id="travel-filter-apply" class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors">
-                                    Apply Filters
-                                </button>
-                            </div>
-                            <div class="flex items-end">
-                                <button id="travel-export-csv" class="w-full bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center justify-center">
-                                    <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export CSV
-                                </button>
-                            </div>
                         </div>
+                        <div class="flex gap-2">
+                            <button id="travel-filter-apply" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors">
+                                Apply Filters
+                            </button>
+                            <button id="travel-export-csv" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center">
+                                <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export CSV
+                            </button>
+                        </div>
+                        ${effectiveStartDate && effectiveEndDate ? `
+                            <div class="mt-3 text-sm text-gray-600 dark:text-gray-400">
+                                Showing: ${formatDisplayDate(effectiveStartDate)} to ${formatDisplayDate(effectiveEndDate)}
+                            </div>
+                        ` : ''}
                     </div>
                     
                     <div id="travel-list-view" class="travel-view ${currentView === 'list' ? '' : 'hidden'}">
                 `;
 
-                // Filter travel records
-                let filteredTravel = state.travel;
-                if (travelFilterStartDate || travelFilterEndDate || travelFilterCrcId) {
-                    filteredTravel = state.travel.filter(travel => {
+                // Filter travel records to only include those with valid CRCs
+                let filteredTravel = state.travel.filter(travel => {
+                    const validCrcId = resolveValidCrcIdForTravel(travel);
+                    return validCrcId !== null;
+                });
+                
+                // Apply additional filters (date range, specific CRC)
+                if (effectiveStartDate || effectiveEndDate || travelFilterCrcId) {
+                    filteredTravel = filteredTravel.filter(travel => {
                         if (!travel) return false;
                         
-                        // Filter by CRC
+                        // Filter by CRC (after validation, we know this is a valid CRC)
                         if (travelFilterCrcId) {
-                            const crcMatch = travel.crcId === travelFilterCrcId || 
-                                           (travel.travelerName && state.crcs.find(c => c.id === travelFilterCrcId && c.name === travel.travelerName));
-                            if (!crcMatch) return false;
+                            const validCrcId = resolveValidCrcIdForTravel(travel);
+                            if (validCrcId !== travelFilterCrcId) return false;
                         }
                         
-                        // Filter by date range
-                        if (travelFilterStartDate || travelFilterEndDate) {
+                        // Filter by date range (using effective dates from fiscal year filter)
+                        if (effectiveStartDate || effectiveEndDate) {
                             const travelDate = getTravelPrimaryDate(travel);
                             if (!travelDate) return false;
                             const travelDateStr = toDateOnlyString(travelDate);
                             
-                            if (travelFilterStartDate && travelDateStr < travelFilterStartDate) return false;
-                            if (travelFilterEndDate && travelDateStr > travelFilterEndDate) return false;
+                            if (effectiveStartDate && travelDateStr < effectiveStartDate) return false;
+                            if (effectiveEndDate && travelDateStr > effectiveEndDate) return false;
                         }
                         
                         return true;
@@ -35057,14 +35203,18 @@
                     `;
                 } else {
                     // Rebuild travelByCRC from filtered travel
+                    // Use normalized CRC IDs to ensure same person isn't split across multiple groups
                     const filteredTravelByCRC = {};
                     filteredTravel.forEach(travel => {
                         if (!travel) return;
-                        const crcId = travel.crcId || travel.travelerName || 'Unknown';
-                        if (!filteredTravelByCRC[crcId]) {
-                            filteredTravelByCRC[crcId] = [];
+                        // Use resolveValidCrcIdForTravel to get the normalized CRC ID (prevents duplicates)
+                        const validCrcId = resolveValidCrcIdForTravel(travel);
+                        if (!validCrcId) return; // Skip if invalid (shouldn't happen after filtering, but safety check)
+                        
+                        if (!filteredTravelByCRC[validCrcId]) {
+                            filteredTravelByCRC[validCrcId] = [];
                         }
-                        filteredTravelByCRC[crcId].push(travel);
+                        filteredTravelByCRC[validCrcId].push(travel);
                     });
 
                     // Calculate monthly costs
@@ -35478,16 +35628,37 @@
                 
                 // Setup filter event listener
                 document.getElementById('travel-filter-apply')?.addEventListener('click', () => {
-                    const startDate = document.getElementById('travel-filter-start-date')?.value || '';
-                    const endDate = document.getElementById('travel-filter-end-date')?.value || '';
+                    const filterType = document.getElementById('travel-filter-type')?.value || 'thisYear';
                     const crcId = document.getElementById('travel-filter-crc')?.value || '';
                     
-                    setState({
-                        travelFilterStartDate: startDate,
-                        travelFilterEndDate: endDate,
+                    let filterState = {
+                        travelFilterType: filterType,
                         travelFilterCrcId: crcId
-                    });
+                    };
                     
+                    if (filterType === 'month') {
+                        const month = parseInt(document.getElementById('travel-filter-month')?.value || '0', 10);
+                        const year = parseInt(document.getElementById('travel-filter-year')?.value || new Date().getFullYear(), 10);
+                        filterState.travelFilterMonth = month;
+                        filterState.travelFilterYear = year;
+                    } else if (filterType === 'quarter') {
+                        const quarter = parseInt(document.getElementById('travel-filter-quarter')?.value || '1', 10);
+                        const year = parseInt(document.getElementById('travel-filter-year')?.value || new Date().getFullYear(), 10);
+                        filterState.travelFilterQuarter = quarter;
+                        filterState.travelFilterYear = year;
+                    } else if (filterType === 'custom') {
+                        const startDate = document.getElementById('travel-filter-start-date')?.value || '';
+                        const endDate = document.getElementById('travel-filter-end-date')?.value || '';
+                        filterState.travelFilterStartDate = startDate;
+                        filterState.travelFilterEndDate = endDate;
+                    }
+                    
+                    setState(filterState);
+                    renderTravelContent();
+                });
+                
+                // Update filter UI when filter type changes
+                document.getElementById('travel-filter-type')?.addEventListener('change', () => {
                     renderTravelContent();
                 });
                 
