@@ -1073,6 +1073,21 @@ async function crudHandler(context, request, containerName) {
                 const requestBody = await request.json();
                 const updateId = id || requestBody.id;
                 
+                // For users, fetch existing user data to merge with update data for validation
+                let mergedRequestBody = requestBody;
+                if (containerName === 'users' && updateId) {
+                    try {
+                        const { resource: existingUser } = await container.item(updateId, updateId).read();
+                        if (existingUser) {
+                            // Merge existing user data with update data
+                            mergedRequestBody = { ...existingUser, ...requestBody };
+                        }
+                    } catch (error) {
+                        // If user doesn't exist, continue with just requestBody
+                        context.log.warn(`User ${updateId} not found, proceeding with new user creation`);
+                    }
+                }
+                
                 // Normalize cost fields for travel - convert empty strings to undefined
                 if (containerName === 'travel') {
                     if (requestBody.flightCost === '' || requestBody.flightCost === null) requestBody.flightCost = undefined;
@@ -1126,7 +1141,7 @@ async function crudHandler(context, request, containerName) {
                             validateRolesSchema(requestBody);
                             break;
                         case 'users':
-                            validateUsersSchema(requestBody);
+                            validateUsersSchema(mergedRequestBody);
                             // Hash password if provided
                             if (requestBody.password) {
                                 requestBody.password = hashPassword(requestBody.password);
