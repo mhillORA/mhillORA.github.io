@@ -1325,6 +1325,12 @@
                     });
                 }
 
+                async cleanupEvents() {
+                    return this.request('/events/cleanup', {
+                        method: 'POST'
+                    });
+                }
+
                 async importNavanBookingsRange(options = {}) {
                     return this.request('/navan-import', {
                         method: 'POST',
@@ -4198,6 +4204,36 @@
                 return crcs;
             };
 
+            // Helper function to get roles and training info for a specific CRC in an event
+            const getCRCRolesForEvent = (crcId, event) => {
+                const roles = [];
+                const trainingInfo = [];
+                
+                if (!event.roleAssignments || !event.roleAssignments) return { roles, trainingInfo };
+                
+                // Find all roles this CRC is assigned to
+                Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                    if (Array.isArray(assignments) && assignments.includes(crcId)) {
+                        const role = state.roles.find(r => r.id === roleId);
+                        if (role) {
+                            const roleName = role.name;
+                            roles.push(roleName);
+                            
+                            // If this is a Training role, get what they're training for
+                            if (isTrainingRoleName(roleName) && event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                const trainingAssignments = event.trainingAssignments[roleId];
+                                const crcIndex = assignments.indexOf(crcId);
+                                if (crcIndex >= 0 && trainingAssignments[crcIndex]) {
+                                    trainingInfo.push(trainingAssignments[crcIndex]);
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                return { roles, trainingInfo };
+            };
+
             const checkRoleFulfillment = (event) => {
                 if (!event.studyIds || event.studyIds.length === 0 || !event.siteId) return { fulfilled: true, missingRoles: [], unfilledSlots: [], totalUnfilled: 0 };
                 
@@ -5233,8 +5269,8 @@
                                         state.authReady = true;
                                         state.userId = 'chaos-user';
                                         
-                                        // Check if user needs to change password (new users or if mustChangePassword flag is set)
-                                        const needsPasswordChange = user.mustChangePassword === true || !user.passwordChangedAt;
+                                        // Check if user needs to change password (only if mustChangePassword flag is explicitly set to true)
+                                        const needsPasswordChange = user.mustChangePassword === true;
                                         if (needsPasswordChange) {
                                             // Show password change modal after a short delay
                                             setTimeout(() => {
@@ -17070,6 +17106,13 @@
                                 <button type="button" data-action="navigate-to-users" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700">Go to Users Tab</button>
                             </div>
                         ` : ''}
+                        ${state.currentUser && state.currentUser.permissionLevel === 'Manager' ? `
+                            <div class="border-t dark:border-gray-700 pt-6">
+                                <h3 class="text-lg font-semibold dark:text-white mb-4">Database Cleanup</h3>
+                                <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Remove events with empty or invalid role assignments (N/A entries) from the database.</p>
+                                <button type="button" data-action="cleanup-events" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700">Clean Up N/A Entries</button>
+                            </div>
+                        ` : ''}
                     </div>
                 `;
             };
@@ -22947,6 +22990,36 @@
                         closeModal();
                         break;
                     }
+                    case 'cleanup-events': {
+                        if (!state.currentUser || state.currentUser.permissionLevel !== 'Manager') {
+                            showNotification('Only administrators can perform cleanup operations.', 'error');
+                            break;
+                        }
+                        
+                        if (!confirm('This will permanently delete all events with empty or invalid role assignments (N/A entries). This action cannot be undone. Continue?')) {
+                            break;
+                        }
+                        
+                        try {
+                            showNotification('Cleaning up events...', 'info');
+                            const result = await apiService.cleanupEvents();
+                            
+                            if (result.success) {
+                                showNotification(`Cleanup complete! Deleted ${result.deletedCount} invalid event(s). Scanned ${result.totalScanned} total events.`, 'success');
+                                
+                                // Refresh events from backend
+                                const events = await apiService.getEvents();
+                                setState({ crc_events: events });
+                                renderContent();
+                            } else {
+                                showNotification('Cleanup completed with errors. Check console for details.', 'warning');
+                            }
+                        } catch (error) {
+                            console.error('Cleanup error:', error);
+                            showNotification('Error during cleanup. Check console for details.', 'error');
+                        }
+                        break;
+                    }
                     case 'prev-training-month':
                         if (!state.trainingCalendarDate) state.trainingCalendarDate = new Date();
                         setState({ trainingCalendarDate: new Date(state.trainingCalendarDate.setMonth(state.trainingCalendarDate.getMonth() - 1)) });
@@ -23458,20 +23531,27 @@
                                 isOverridden: false
                             };
                             
-                            // Store for the modal
-                            window._currentEditingEvent = null; // Clear any existing edit state
+                            // Store for the modal - use a temporary ID so the form treats it as existing data to populate
+                            // We'll clear this ID when submitting so it creates a new event
+                            copiedEvent._tempCopyId = 'copy-' + Date.now();
+                            window._currentEditingEvent = copiedEvent; // Store so handleShiftStudySiteSelection can access it
                             window._copiedEventForPaste = copiedEvent;
                             window._copiedSeriesDates = { start: seriesStartDate || defaultDate, end: seriesEndDate || defaultDate };
                             
                             closeModal();
                             
                             // Open the full edit modal with copied data, defaulting to today's date
-                            openModal(getCRCEventModalHTML(defaultDate, copiedEvent, seriesStartDate || defaultDate, seriesEndDate || defaultDate), '4xl');
+                            // Pass the event with a temp ID so getCRCEventModalHTML populates the form
+                            const eventForModal = { ...copiedEvent, id: copiedEvent._tempCopyId };
+                            openModal(getCRCEventModalHTML(defaultDate, eventForModal, seriesStartDate || defaultDate, seriesEndDate || defaultDate), '4xl');
                             
                             // Initialize the role assignment interface after modal opens
                             setTimeout(() => {
                                 const form = document.getElementById('crc-event-form');
                                 if (form && copiedEvent) {
+                                    // Set the form's eventId to the temp ID so handleShiftStudySiteSelection finds the event
+                                    form.dataset.eventId = copiedEvent._tempCopyId;
+                                    
                                     const studySelect = form.querySelector('select[name="studyIds"]');
                                     const siteSelect = form.querySelector('select[name="siteId"]');
                                     
@@ -23491,12 +23571,9 @@
                                         siteSelect.dispatchEvent(new Event('change', { bubbles: true }));
                                     }
                                     
-                                    // Mark form as a copy (not an edit) so it creates new event
-                                    form.dataset.eventId = ''; // Empty means new event
+                                    // Load role assignments - this will use window._currentEditingEvent which has all the copied data
+                                    handleShiftStudySiteSelection();
                                 }
-                                
-                                // Load role assignments
-                                handleShiftStudySiteSelection();
                             }, 300);
                             
                             showNotification('Shift copied. Edit dates and make changes, then save.', 'success');
@@ -26367,7 +26444,12 @@
                         break;
                     }
                     case 'crc-event-form': {
-                        const eventId = form.dataset.eventId;
+                        let eventId = form.dataset.eventId;
+                        // If this is a copied event (has _tempCopyId), clear the ID to create a new event
+                        if (eventId && eventId.startsWith('copy-')) {
+                            eventId = '';
+                            form.dataset.eventId = '';
+                        }
                         const isEditing = !!eventId;
                         const existingEvent = isEditing ? state.crc_events.find(e => e.id === eventId) : null;
                         const existingGroupId = existingEvent && existingEvent.groupId ? existingEvent.groupId : null;
@@ -27173,10 +27255,39 @@
                                 // Role quantity overrides were already collected above (before role assignments)
                                 // This ensures role assignments respect the quantity overrides
 
+                                // Filter out role assignments that have no valid CRC assignments (all null/empty)
+                                // This prevents creating events with empty role assignments that show as "N/A"
+                                const filteredRoleAssignments = {};
+                                Object.keys(roleAssignments).forEach(roleId => {
+                                    const assignmentsArray = roleAssignments[roleId] || [];
+                                    // Check if there's at least one valid assignment (not null, not empty string, not 'SITE_STAFF', not 'UNASSIGNED')
+                                    const hasValidAssignment = assignmentsArray.some(crcId => 
+                                        crcId && 
+                                        typeof crcId === 'string' &&
+                                        crcId.trim() !== '' &&
+                                        crcId !== 'SITE_STAFF' && 
+                                        crcId !== 'UNASSIGNED'
+                                    );
+                                    if (hasValidAssignment) {
+                                        filteredRoleAssignments[roleId] = assignmentsArray;
+                                    }
+                                });
+
                                 // Travel Day events should not have roles assigned
                                 const isTravelDay = data.eventType === 'Travel Day';
-                                // Always include roleAssignments, even if empty (to preserve structure and allow clearing)
-                                const finalRoleAssignments = isTravelDay ? {} : (Object.keys(roleAssignments).length > 0 ? roleAssignments : {});
+                                // Only include roleAssignments if they have valid assignments (filter out empty ones)
+                                const finalRoleAssignments = isTravelDay ? {} : (Object.keys(filteredRoleAssignments).length > 0 ? filteredRoleAssignments : {});
+                                
+                                // Ensure training assignments only reference roles that are in filteredRoleAssignments
+                                // This prevents orphaned training assignments for roles that were filtered out
+                                if (!isTravelDay && Object.keys(finalRoleAssignments).length > 0) {
+                                    Object.keys(trainingAssignments).forEach(roleId => {
+                                        if (!finalRoleAssignments[roleId]) {
+                                            delete trainingAssignments[roleId];
+                                        }
+                                    });
+                                }
+                                
                                 // Always include trainingAssignments if there are any (even if some are null, to preserve structure)
                                 // This ensures training assignments are saved when a CRC is assigned to Training role
                                 const finalTrainingAssignments = isTravelDay ? undefined : (Object.keys(trainingAssignments).length > 0 ? trainingAssignments : (existingEvent?.trainingAssignments ? existingEvent.trainingAssignments : undefined));

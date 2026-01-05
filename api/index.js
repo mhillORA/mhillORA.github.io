@@ -1922,6 +1922,102 @@ const initializeDefaultAdmin = async () => {
 // Call initialization
 initializeDefaultAdmin();
 
+// Cleanup endpoint to remove events with empty/invalid role assignments (N/A entries)
+app.http('cleanupEvents', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'events/cleanup',
+    handler: async (request, context) => {
+        try {
+            const container = getContainer('events');
+            
+            // Get all events
+            const { resources: allEvents } = await container.items.readAll().fetchAll();
+            
+            const eventsToDelete = [];
+            
+            // Find events with empty/invalid role assignments
+            for (const event of allEvents) {
+                // Skip Travel Day events - they're supposed to have empty roleAssignments
+                if (event.type === 'Travel Day') {
+                    continue;
+                }
+                
+                // Check if event has roleAssignments that are empty or only contain invalid values
+                if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                    const roleAssignmentKeys = Object.keys(event.roleAssignments);
+                    
+                    // If roleAssignments exists but has no keys, skip (might be valid for some events)
+                    if (roleAssignmentKeys.length === 0) {
+                        // Check if this event has a crcId (legacy) - if not, it's an N/A entry
+                        if (!event.crcId) {
+                            eventsToDelete.push(event.id);
+                        }
+                        continue;
+                    }
+                    
+                    // Check if all role assignments are empty/invalid
+                    let hasValidAssignment = false;
+                    for (const roleId of roleAssignmentKeys) {
+                        const assignments = event.roleAssignments[roleId];
+                        if (Array.isArray(assignments)) {
+                            const validAssignments = assignments.filter(crcId => 
+                                crcId && 
+                                typeof crcId === 'string' &&
+                                crcId.trim() !== '' &&
+                                crcId !== 'SITE_STAFF' && 
+                                crcId !== 'UNASSIGNED'
+                            );
+                            if (validAssignments.length > 0) {
+                                hasValidAssignment = true;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // If no valid assignments found, mark for deletion
+                    if (!hasValidAssignment) {
+                        eventsToDelete.push(event.id);
+                    }
+                } else if (!event.roleAssignments) {
+                    // No roleAssignments and no crcId (legacy) - likely an N/A entry
+                    if (!event.crcId) {
+                        eventsToDelete.push(event.id);
+                    }
+                }
+            }
+            
+            // Delete the invalid events
+            let deletedCount = 0;
+            const deletionErrors = [];
+            
+            for (const eventId of eventsToDelete) {
+                try {
+                    await container.item(eventId, eventId).delete();
+                    deletedCount++;
+                } catch (deleteError) {
+                    deletionErrors.push({ eventId, error: deleteError.message });
+                    context.log.warn(`Failed to delete event ${eventId}:`, deleteError.message);
+                }
+            }
+            
+            return {
+                status: 200,
+                jsonBody: {
+                    success: true,
+                    deletedCount,
+                    totalScanned: allEvents.length,
+                    eventsToDeleteCount: eventsToDelete.length,
+                    errors: deletionErrors.length > 0 ? deletionErrors : undefined
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        } catch (error) {
+            return handleError(context, error, 'Cleanup events operation failed');
+        }
+    },
+});
+
 // Azure Maps key endpoint (for frontend to get key securely)
 app.http('azure-maps-config', {
     methods: ['GET', 'OPTIONS'],
