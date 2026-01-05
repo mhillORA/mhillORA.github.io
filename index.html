@@ -9015,6 +9015,7 @@
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Position/Role</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Site</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Study</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Time Off/PTO</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Hours</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Period</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Notes</th>
@@ -9027,7 +9028,7 @@
                 if (sortedDates.length === 0) {
                     scheduleHTML += `
                         <tr>
-                            <td colspan="${canDeleteEvents ? '10' : '9'}" class="px-6 py-4 text-center text-gray-500 dark:text-gray-400">No events found for the selected filters</td>
+                            <td colspan="${canDeleteEvents ? '11' : '10'}" class="px-6 py-4 text-center text-gray-500 dark:text-gray-400">No events found for the selected filters</td>
                         </tr>
                     `;
                 } else {
@@ -9094,6 +9095,9 @@
                                     </td>
                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                         ${studyDisplay}
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                        ${isPTO ? (event.type || 'PTO') : '—'}
                                     </td>
                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                         ${event.hours || 'N/A'}h
@@ -10266,13 +10270,8 @@
                     nextAction = 'next-crc-month';
                 }
                 
-                const monthOptions = Array.from({ length: 12 }).map((_, i) => {
-                    const date = new Date(now.getFullYear(), now.getMonth() + i, 1);
-                    const value = `${date.getFullYear()}-${date.getMonth()}`;
-                    const text = date.toLocaleString('default', { month: 'long', year: 'numeric' });
-                    const isSelected = date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth();
-                    return `<option value="${value}" ${isSelected ? 'selected' : ''}>${text}</option>`;
-                }).join('');
+                // Generate month value in YYYY-MM format for input type="month"
+                const currentMonthValue = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
                 
                 // Generate date options for daily view - all dates in current month
                 let dateOptions = '';
@@ -10333,9 +10332,7 @@
                                         ${dateOptions}
                                     </select>
                                 ` : ''}
-                                <select id="month-selector" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
-                                    ${monthOptions}
-                                </select>
+                                <input type="month" id="month-selector" value="${currentMonthValue}" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
                                 <button data-action="${nextAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right" class="w-4 h-4 md:w-5 md:h-5"></i></button>
                             </div>
                         </div>
@@ -17202,7 +17199,68 @@
                 // Sort by date
                 filteredEvents.sort((a, b) => a.date.localeCompare(b.date));
                 
-                const headers = ['Date', 'CRC Name', 'Position/Role', 'Site', 'Study', 'Hours', 'Period', 'Notes'];
+                // Add time off requests to filtered events for export (same logic as display)
+                const timeOffRequests = state.timeOffRequests || [];
+                const ptoEventKeys = new Set();
+                timeOffRequests.forEach(request => {
+                    if (!request.crcId) return;
+                    const requestStatus = normalizeTimeOffStatus(request.status);
+                    if (requestStatus !== 'pending' && requestStatus !== 'approved') return;
+                    
+                    const requestStart = parseDateFlexible(request.startDate || request.date);
+                    const requestEnd = parseDateFlexible(request.endDate || request.startDate || request.date);
+                    if (!requestStart) return;
+                    
+                    const filterStart = new Date(state.allScheduleFilters.startDate + 'T00:00:00');
+                    const filterEnd = new Date(state.allScheduleFilters.endDate + 'T23:59:59');
+                    
+                    const currentDate = new Date(requestStart);
+                    const endDateObj = requestEnd ? new Date(requestEnd) : new Date(requestStart);
+                    
+                    while (currentDate <= endDateObj) {
+                        const dateStr = toDateOnlyString(currentDate);
+                        const dateObj = new Date(dateStr + 'T00:00:00');
+                        
+                        if (dateObj >= filterStart && dateObj <= filterEnd) {
+                            const ptoEventKey = `${request.crcId}-${dateStr}`;
+                            if (!ptoEventKeys.has(ptoEventKey)) {
+                                ptoEventKeys.add(ptoEventKey);
+                                const ptoEvent = {
+                                    id: `pto-${request.id}-${dateStr}`,
+                                    crcId: request.crcId,
+                                    date: dateStr,
+                                    type: 'Paid Time Off',
+                                    name: 'Paid Time Off',
+                                    period: request.period || 'Full Day',
+                                    hours: request.hours || 8,
+                                    notes: request.reason || request.notes || '',
+                                    isPTORequest: true
+                                };
+                                filteredEvents.push(ptoEvent);
+                            }
+                        }
+                        currentDate.setDate(currentDate.getDate() + 1);
+                    }
+                });
+                
+                // Re-apply filters to include PTO events
+                if (state.allScheduleFilters.crc !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
+                }
+                if (state.allScheduleFilters.site !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site);
+                }
+                if (state.allScheduleFilters.study !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => (e.studyIds || []).includes(state.allScheduleFilters.study));
+                }
+                if (state.allScheduleFilters.eventType !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.type === state.allScheduleFilters.eventType);
+                }
+                
+                // Sort by date again after adding PTO events
+                filteredEvents.sort((a, b) => a.date.localeCompare(b.date));
+                
+                const headers = ['Date', 'CRC Name', 'Position/Role', 'Site', 'Study', 'Time Off/PTO', 'Hours', 'Period', 'Notes'];
                 const rows = filteredEvents.map(event => {
                     const crc = state.crcs.find(c => c.id === event.crcId);
                     const site = state.crc_sites.find(s => s.id === event.siteId);
@@ -17211,6 +17269,8 @@
                         return study ? (study.title || study.name) : studyId;
                     }).join('; ') : 'None';
                     const roles = getEventRoles(event).join('; ') || 'N/A';
+                    const isPTO = event.isPTORequest || event.type === 'Paid Time Off' || event.type === 'PTO';
+                    const timeOffPTO = isPTO ? (event.type || 'PTO') : '';
                     
                     return [
                         event.date,
@@ -17218,6 +17278,7 @@
                         roles,
                         site ? site.name : 'N/A',
                         studies,
+                        timeOffPTO,
                         event.hours || 'N/A',
                         event.period || 'Full Day',
                         (event.notes || '').replace(/"/g, '""')
@@ -29783,11 +29844,17 @@
                     renderUnavailabilityCalendar();
                 }
                 if (target.id === 'month-selector') {
-                    const [year, month] = target.value.split('-');
+                    // Parse month input (format: YYYY-MM, where month is 1-based)
+                    const monthValue = target.value;
+                    if (!monthValue || !/^\d{4}-\d{2}$/.test(monthValue)) {
+                        return; // Invalid format, skip
+                    }
+                    const [year, monthStr] = monthValue.split('-');
+                    const month = parseInt(monthStr, 10) - 1; // Convert to 0-based for JavaScript Date
                     // If in daily view, preserve the day if possible, otherwise use day 1
                     if (state.calendarView === 'planning-grid' && state.planningGridMode === 'daily') {
                         const currentDay = state.crcCalendarDate.getDate();
-                        const daysInNewMonth = new Date(year, parseInt(month) + 1, 0).getDate();
+                        const daysInNewMonth = new Date(year, month + 1, 0).getDate();
                         const newDay = Math.min(currentDay, daysInNewMonth);
                         setState({ crcCalendarDate: new Date(year, month, newDay) });
                     } else {
