@@ -1805,7 +1805,8 @@ app.http('usersList', {
                     ...body, 
                     id: generateId(),
                     password: hashedPassword,
-                    createdAt: new Date().toISOString()
+                    createdAt: new Date().toISOString(),
+                    mustChangePassword: body.mustChangePassword !== undefined ? body.mustChangePassword : true // Default to true for new users
                 };
                 const { resource: createdUser } = await container.items.create(newUser);
                 const { password: _, ...userWithoutPassword } = createdUser;
