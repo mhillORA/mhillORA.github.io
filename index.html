@@ -5175,7 +5175,7 @@
                 }
                 
                 // Hide scheduling-related buttons for CRC users
-                const crcHiddenActions = ['view-availability', 'auto-create-shift', 'download-template', 'import-csv-btn', 'export-csv-btn', 'catch-up', 'undo-last-change'];
+                const crcHiddenActions = ['view-availability', 'auto-create-shift', 'download-template', 'import-csv-btn', 'export-csv-btn', 'catch-up', 'undo-last-change', 'export-budget-summary', 'export-utilization-report', 'export-timeoff-report', 'export-all-schedule'];
                 crcHiddenActions.forEach(action => {
                     const buttons = document.querySelectorAll(`button[data-action="${action}"]`);
                     buttons.forEach(btn => {
@@ -5186,6 +5186,17 @@
                         }
                     });
                 });
+                
+                // Also hide export buttons by ID for CRC users
+                if (state.currentUser && state.currentUser.permissionLevel === 'CRC') {
+                    const exportButtonIds = ['export-utilization-report-btn', 'export-timeoff-report-btn', 'export-timeoff-daily-btn'];
+                    exportButtonIds.forEach(id => {
+                        const btn = document.getElementById(id);
+                        if (btn) {
+                            btn.style.display = 'none';
+                        }
+                    });
+                }
             };
 
             const renderContent = () => {
@@ -7302,7 +7313,7 @@
 
                     const normalizedEventType = (EventType || '').toString().trim().toLowerCase();
                     const normalizedEventTypeSimple = normalizedEventType.replace(/[\s-]/g, '');
-                    const isTimeOffImportRow = ['timeoffrequest', 'timeoff', 'pto', 'ptorequest', 'vacation', 'personal', 'sick', 'holiday', 'bereavement'].includes(normalizedEventTypeSimple);
+                    const isTimeOffImportRow = ['timeoffrequest', 'timeoff', 'pto', 'ptorequest', 'vacation', 'sick', 'holiday', 'bereavement', 'juryduty', 'jury'].includes(normalizedEventTypeSimple);
 
                     if (isTimeOffImportRow) {
                         if (!CRCName) {
@@ -8070,7 +8081,6 @@
                 let nextShiftHTML = '';
                 let nextSiteHTML = '';
                 let nextStudyHTML = '';
-                let locationHTML = '';
                 let upcomingShiftsHTML = '';
                 
                 if (nextShift) {
@@ -8115,17 +8125,6 @@
                             </div>
                         `;
                         
-                        if (siteAddress) {
-                            locationHTML = `
-                                <div class="p-4 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-700 rounded-lg">
-                                    <h3 class="text-lg font-semibold text-purple-900 dark:text-purple-200 mb-3">Location</h3>
-                                    <div class="text-sm">
-                                        <div class="mb-2"><span class="font-medium dark:text-purple-300">${siteAddress}</span></div>
-                                        ${site.city && site.state ? `<div class="text-xs text-gray-600 dark:text-gray-400">${site.city}, ${site.state}</div>` : ''}
-                                    </div>
-                                </div>
-                            `;
-                        }
                     }
                     
                     if (studies.length > 0) {
@@ -8247,7 +8246,6 @@
                         
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
                             ${nextStudyHTML}
-                            ${locationHTML}
                         </div>
                         
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
@@ -8346,7 +8344,7 @@
                 });
                 
                 // Separate time off events from shift events
-                const timeOffTypes = ['Unavailable', 'Paid Time Off', 'Sick Time', 'PTO', 'Vacation', 'Personal', 'Holiday', 'Bereavement', 'Per Diem', 'Sick'];
+                const timeOffTypes = ['Unavailable', 'Paid Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty'];
                 const timeOffEvents = allCrcEvents.filter(e => timeOffTypes.includes(e.type) || timeOffTypes.includes(e.name));
                 
                 // Shift events - must have studyIds
@@ -17169,6 +17167,10 @@
             };
 
             const exportAllSchedule = () => {
+                // Check if current user is CRC and get their ID
+                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const matchingCrcId = getLoggedInCrcId();
+                
                 // Get filtered events
                 let filteredEvents = state.crc_events.filter(event => {
                     const eventDate = new Date(event.date + 'T00:00:00');
@@ -17177,9 +17179,27 @@
                     return eventDate >= startDate && eventDate <= endDate;
                 });
 
-                // Apply filters
-                if (state.allScheduleFilters.crc !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
+                // For CRC users, filter to ONLY their events BEFORE other filters
+                if (isCRCUser && matchingCrcId) {
+                    filteredEvents = filteredEvents.filter(e => {
+                        // Check legacy crcId
+                        if (e.crcId === matchingCrcId) return true;
+                        // Check roleAssignments
+                        if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
+                            return Object.values(e.roleAssignments).some(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    return assignments.includes(matchingCrcId);
+                                }
+                                return false;
+                            });
+                        }
+                        return false;
+                    });
+                } else {
+                    // Apply CRC filter for non-CRC users
+                    if (state.allScheduleFilters.crc !== 'all') {
+                        filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
+                    }
                 }
                 if (state.allScheduleFilters.site !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site);
@@ -17204,6 +17224,8 @@
                 const ptoEventKeys = new Set();
                 timeOffRequests.forEach(request => {
                     if (!request.crcId) return;
+                    // For CRC users, only include their own time off requests
+                    if (isCRCUser && matchingCrcId && request.crcId !== matchingCrcId) return;
                     const requestStatus = normalizeTimeOffStatus(request.status);
                     if (requestStatus !== 'pending' && requestStatus !== 'approved') return;
                     
@@ -17243,8 +17265,8 @@
                     }
                 });
                 
-                // Re-apply filters to include PTO events
-                if (state.allScheduleFilters.crc !== 'all') {
+                // Re-apply filters to include PTO events (for CRC users, filter is already applied above)
+                if (!isCRCUser && state.allScheduleFilters.crc !== 'all') {
                     filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
                 }
                 if (state.allScheduleFilters.site !== 'all') {
@@ -20682,7 +20704,7 @@
                     <div class="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md">
                         <p class="text-sm text-blue-800 dark:text-blue-200">
                             <strong>How to use:</strong> Click on a day in the calendar below to set unavailability, or use the "Add Multiple Days" button to select a date range with specific time periods. 
-                            If you select a PTO type (Vacation, Sick, Personal, etc.), a time off request will be automatically created for approval.
+                            If you select a PTO type (Vacation, Sick, Holiday, etc.), a time off request will be automatically created for approval.
                         </p>
                     </div>
                     <div class="mb-4 flex gap-2">
@@ -20708,7 +20730,7 @@
                 // Show notes field for PTO types and Sick Time
                 if (ptoSelect && notesField) {
                     ptoSelect.addEventListener('change', () => {
-                        const isPTO = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other'].includes(ptoSelect.value);
+                        const isPTO = ['Vacation', 'Holiday', 'Bereavement', 'Jury Duty'].includes(ptoSelect.value);
                         const needsNotes = isPTO || ptoSelect.value === 'Sick';
                         if (needsNotes) {
                             notesField.classList.remove('hidden');
@@ -20716,6 +20738,12 @@
                             notesField.classList.add('hidden');
                         }
                     });
+                    // Show notes field initially if a PTO type is selected
+                    const isPTO = ['Vacation', 'Holiday', 'Bereavement', 'Jury Duty'].includes(ptoSelect.value);
+                    const needsNotes = isPTO || ptoSelect.value === 'Sick';
+                    if (needsNotes) {
+                        notesField.classList.remove('hidden');
+                    }
                 }
                 
                 // Generate days list when dates change
@@ -20789,8 +20817,8 @@
                             return;
                         }
                         
-                        // All time off types should create time off requests (Per Diem, Vacation, Sick, Personal, Holiday, Bereavement, Other)
-                        const isTimeOffType = ['Per Diem', 'Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other', 'Sick', 'Sick Time'].includes(ptoType);
+                        // All time off types should create time off requests (Per Diem, Vacation, Sick, Holiday, Bereavement, Jury Duty)
+                        const isTimeOffType = ['Per Diem', 'Vacation', 'Holiday', 'Bereavement', 'Jury Duty', 'Sick', 'Sick Time'].includes(ptoType);
                         
                         try {
                             const start = new Date(startDate + 'T00:00:00');
@@ -20877,7 +20905,7 @@
                                 state.crc_events = [...state.crc_events, newEvent];
                                 createdCount++;
                                 
-                                // Create time off request for ALL time off types (Vacation, Sick, Personal, Holiday, Bereavement, Other)
+                                // Create time off request for ALL time off types (Vacation, Sick, Holiday, Bereavement, Jury Duty)
                                 if (isTimeOffType) {
                                     try {
                                         const timeOffRequest = {
@@ -21039,10 +21067,9 @@
                                 <option value="Per Diem">Per Diem</option>
                                 <option value="Vacation">Vacation (PTO)</option>
                                 <option value="Sick">Sick Time</option>
-                                <option value="Personal">Personal (PTO)</option>
                                 <option value="Holiday">Holiday (PTO)</option>
                                 <option value="Bereavement">Bereavement (PTO)</option>
-                                <option value="Other">Other (PTO)</option>
+                                <option value="Jury Duty">Jury Duty (PTO)</option>
                             </select>
                         </div>
                         <div>
@@ -21063,7 +21090,7 @@
                             </select>
                             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">This will be applied to all days. You can customize individual days below.</p>
                         </div>
-                        <div id="multiple-notes-field" class="hidden">
+                        <div id="multiple-notes-field">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Notes (optional)</label>
                             <textarea name="notes" rows="3" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Additional details..."></textarea>
                         </div>
@@ -22523,7 +22550,7 @@
                         // If there's an approved time off request, show as unavailable
                         const requestType = approvedRequest.type || 'Vacation';
                         const period = approvedRequest.period || 'Full Day';
-                        const isPTO = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other'].includes(requestType);
+                        const isPTO = ['Vacation', 'Holiday', 'Bereavement', 'Jury Duty'].includes(requestType);
                         const isSickTime = requestType === 'Sick Time';
                         
                         if (isPTO) {
@@ -22541,7 +22568,7 @@
                         const eventName = event.name || 'Unavailable';
                         // Different colors for PTO types
                         // Sick Time is not PTO - it's separate
-                        const isPTO = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other'].includes(eventName);
+                        const isPTO = ['Vacation', 'Holiday', 'Bereavement', 'Jury Duty'].includes(eventName);
                         const isSickTime = eventName === 'Sick' || eventName === 'Sick Time';
                         if (isPTO) {
                             dayClass = 'bg-blue-100 dark:bg-blue-900/40 hover:bg-blue-200 dark:hover:bg-blue-900/60';
@@ -23699,10 +23726,9 @@
                                             <option value="Per Diem">Per Diem</option>
                                             <option value="Vacation">Vacation (PTO)</option>
                                             <option value="Sick">Sick Time</option>
-                                            <option value="Personal">Personal (PTO)</option>
                                             <option value="Holiday">Holiday (PTO)</option>
                                             <option value="Bereavement">Bereavement (PTO)</option>
-                                            <option value="Other">Other (PTO)</option>
+                                            <option value="Jury Duty">Jury Duty (PTO)</option>
                                         </select>
                                     </div>
                                     <div>
@@ -23743,7 +23769,7 @@
                                             </div>
                                         </div>
                                     </div>
-                                    <div id="pto-notes-field" class="hidden">
+                                    <div id="pto-notes-field">
                                         <label class="block text-sm font-medium dark:text-gray-300 mb-2">Notes (optional)</label>
                                         <textarea name="notes" rows="3" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Additional details..."></textarea>
                                     </div>
@@ -23764,7 +23790,7 @@
                                 if (ptoSelect && notesField) {
                                     ptoSelect.addEventListener('change', () => {
                                         // Show notes for PTO types (but Sick Time is not PTO, so it doesn't need notes)
-                                        const isPTO = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other'].includes(ptoSelect.value);
+                                        const isPTO = ['Vacation', 'Holiday', 'Bereavement', 'Jury Duty'].includes(ptoSelect.value);
                                         const needsNotes = isPTO || ptoSelect.value === 'Sick';
                                         if (needsNotes) {
                                             notesField.classList.remove('hidden');
@@ -23772,6 +23798,12 @@
                                             notesField.classList.add('hidden');
                                         }
                                     });
+                                    // Show notes field initially if a PTO type is selected
+                                    const isPTO = ['Vacation', 'Holiday', 'Bereavement', 'Jury Duty'].includes(ptoSelect.value);
+                                    const needsNotes = isPTO || ptoSelect.value === 'Sick';
+                                    if (needsNotes) {
+                                        notesField.classList.remove('hidden');
+                                    }
                                 }
                                 
                                 // Handle period selection change to show/hide custom time inputs
@@ -23827,7 +23859,7 @@
                                         }
                                         // Sick Time is not PTO - it's separate from PTO
                                         // All time off types should create time off requests
-                                        const isTimeOffType = ['Vacation', 'Personal', 'Holiday', 'Bereavement', 'Other', 'Sick', 'Sick Time'].includes(ptoType);
+                                        const isTimeOffType = ['Vacation', 'Holiday', 'Bereavement', 'Jury Duty', 'Sick', 'Sick Time'].includes(ptoType);
                                         
                                         // Check if this CRC already has an Unavailable event on this date
                                         const existingUnavailable = state.crc_events.find(e => 
@@ -25101,65 +25133,112 @@
                                 return;
                             }
                             
-                            const updatedRequest = await apiService.updateTimeOffRequest(id, {
-                                ...request,
-                                status: 'rejected',
-                                approvedBy: state.currentUser?.id || state.currentUser?.username || 'admin',
-                                approvedAt: new Date().toISOString()
-                            });
+                            const crc = state.crcs.find(c => c.id === request.crcId);
+                            const crcName = crc ? crc.name : 'Unknown';
                             
-                            // Refresh time off requests from API to ensure we have latest data
-                            try {
-                                const updatedRequests = await apiService.getTimeOffRequests();
-                                setState({ timeOffRequests: updatedRequests });
-                            } catch (refreshError) {
-                                console.error('Error refreshing time off requests:', refreshError);
-                                // Fallback to local update if API refresh fails
-                                setState({
-                                    timeOffRequests: state.timeOffRequests.map(r => r.id === id ? updatedRequest : r)
-                                });
-                            }
+                            // Show modal to get rejection reason
+                            openModal(`
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Reject Time Off Request</h3>
+                                <div class="space-y-4">
+                                    <div>
+                                        <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
+                                            <strong>Employee:</strong> ${crcName}<br>
+                                            <strong>Type:</strong> ${request.type || 'Time Off'}<br>
+                                            <strong>Date:</strong> ${formatDisplayDate(request.date || request.startDate)}${request.endDate && request.endDate !== request.date && request.endDate !== request.startDate ? ` - ${formatDisplayDate(request.endDate)}` : ''}
+                                        </p>
+                                    </div>
+                                    <form id="reject-time-off-request-form" data-id="${request.id}" class="space-y-4">
+                                        <div>
+                                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Rejection Reason (optional)</label>
+                                            <textarea name="rejectionNotes" rows="4" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Please provide a reason for rejecting this request..."></textarea>
+                                        </div>
+                                        <div class="flex justify-end gap-4">
+                                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                            <button type="submit" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Reject Request</button>
+                                        </div>
+                                    </form>
+                                </div>
+                            `, 'md');
                             
-                            // Remove unavailability event if it was created from this time off request
-                            const date = request.date || request.startDate;
-                            const existingEvent = state.crc_events.find(e => 
-                                e.crcId === request.crcId && 
-                                e.date === date && 
-                                e.type === 'Unavailable' &&
-                                (e.timeOffRequestId === request.id || (!e.timeOffRequestId && e.name === request.type))
-                            );
-                            
-                            if (existingEvent) {
-                                try {
-                                    await apiService.deleteEvent(existingEvent.id);
-                                    state.crc_events = state.crc_events.filter(e => e.id !== existingEvent.id);
-                                } catch (eventError) {
-                                    console.error('Error deleting unavailability event:', eventError);
-                                }
-                            }
-                            
-                            showNotification('Time off request rejected.', 'success');
-                            
-                            // Refresh all time off views
+                            // Set up form submission
                             setTimeout(() => {
-                                if (document.getElementById('time-off-requests-content')) {
-                                    renderTimeOffRequestsContent();
-                                }
-                                if (document.getElementById('time-off-content')) {
-                                    renderTimeOffContent();
-                                }
-                                if (document.getElementById('unavailability-calendar-container')) {
-                                    renderUnavailabilityCalendar();
+                                const form = document.getElementById('reject-time-off-request-form');
+                                if (form) {
+                                    form.addEventListener('submit', async (e) => {
+                                        e.preventDefault();
+                                        const formData = new FormData(form);
+                                        const rejectionNotes = formData.get('rejectionNotes') || '';
+                                        
+                                        try {
+                                            const updatedRequest = await apiService.updateTimeOffRequest(id, {
+                                                ...request,
+                                                status: 'rejected',
+                                                approvedBy: state.currentUser?.id || state.currentUser?.username || 'admin',
+                                                approvedAt: new Date().toISOString(),
+                                                rejectionNotes: rejectionNotes || undefined
+                                            });
+                                            
+                                            // Refresh time off requests from API to ensure we have latest data
+                                            try {
+                                                const updatedRequests = await apiService.getTimeOffRequests();
+                                                setState({ timeOffRequests: updatedRequests });
+                                            } catch (refreshError) {
+                                                console.error('Error refreshing time off requests:', refreshError);
+                                                // Fallback to local update if API refresh fails
+                                                setState({
+                                                    timeOffRequests: state.timeOffRequests.map(r => r.id === id ? updatedRequest : r)
+                                                });
+                                            }
+                                            
+                                            // Remove unavailability event if it was created from this time off request
+                                            const date = request.date || request.startDate;
+                                            const existingEvent = state.crc_events.find(e => 
+                                                e.crcId === request.crcId && 
+                                                e.date === date && 
+                                                e.type === 'Unavailable' &&
+                                                (e.timeOffRequestId === request.id || (!e.timeOffRequestId && e.name === request.type))
+                                            );
+                                            
+                                            if (existingEvent) {
+                                                try {
+                                                    await apiService.deleteEvent(existingEvent.id);
+                                                    state.crc_events = state.crc_events.filter(e => e.id !== existingEvent.id);
+                                                } catch (eventError) {
+                                                    console.error('Error deleting unavailability event:', eventError);
+                                                }
+                                            }
+                                            
+                                            showNotification('Time off request rejected.', 'success');
+                                            closeModal();
+                                            
+                                            // Refresh all time off views
+                                            setTimeout(() => {
+                                                if (document.getElementById('time-off-requests-content')) {
+                                                    renderTimeOffRequestsContent();
+                                                }
+                                                if (document.getElementById('time-off-content')) {
+                                                    renderTimeOffContent();
+                                                }
+                                                if (document.getElementById('unavailability-calendar-container')) {
+                                                    renderUnavailabilityCalendar();
+                                                }
+                                            }, 100);
+                                            
+                                            // Refresh main calendar if it's showing
+                                            if (typeof renderCRCLists === 'function') {
+                                                renderCRCLists();
+                                            }
+                                        } catch (error) {
+                                            console.error('Error rejecting time off request:', error);
+                                            showNotification('Failed to reject time off request. See console for details.', 'error');
+                                        }
+                                    });
                                 }
                             }, 100);
-                            
-                            // Refresh main calendar if it's showing
-                            if (typeof renderCRCLists === 'function') {
-                                renderCRCLists();
-                            }
+                            break;
                         } catch (error) {
-                            console.error('Error rejecting time off request:', error);
-                            showNotification('Failed to reject time off request. See console for details.', 'error');
+                            console.error('Error setting up reject modal:', error);
+                            showNotification('Failed to open reject dialog. See console for details.', 'error');
                         }
                         break;
                     }
@@ -25191,10 +25270,9 @@
                                     <select name="type" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                         <option value="Vacation" ${typeValue === 'Vacation' ? 'selected' : ''}>Vacation</option>
                                         <option value="Sick" ${typeValue === 'Sick' || typeValue === 'Sick Time' ? 'selected' : ''}>Sick Time</option>
-                                        <option value="Personal" ${typeValue === 'Personal' ? 'selected' : ''}>Personal</option>
                                         <option value="Holiday" ${typeValue === 'Holiday' ? 'selected' : ''}>Holiday</option>
                                         <option value="Bereavement" ${typeValue === 'Bereavement' ? 'selected' : ''}>Bereavement</option>
-                                        <option value="Other" ${typeValue === 'Other' ? 'selected' : ''}>Other</option>
+                                        <option value="Jury Duty" ${typeValue === 'Jury Duty' ? 'selected' : ''}>Jury Duty</option>
                                     </select>
                                 </div>
                                 <div class="grid grid-cols-2 gap-4">
@@ -25459,6 +25537,12 @@
                                                     <div>
                                                         <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Notes:</label>
                                                         <p class="text-gray-900 dark:text-gray-100">${request.notes}</p>
+                                                    </div>
+                                                ` : ''}
+                                                ${request.rejectionNotes ? `
+                                                    <div>
+                                                        <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Rejection Reason:</label>
+                                                        <p class="text-gray-900 dark:text-gray-100 text-red-600 dark:text-red-400">${request.rejectionNotes}</p>
                                                     </div>
                                                 ` : ''}
                                                 ${request.requestedBy ? `
