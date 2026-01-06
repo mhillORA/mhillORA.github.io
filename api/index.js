@@ -238,11 +238,12 @@ const validateSitesSchema = (data) => {
         errors.push('status must be one of: Active, Inactive, Suspended');
     }
     
-    if (data.latitude !== undefined && (typeof data.latitude !== 'number' || data.latitude < -90 || data.latitude > 90)) {
+    // Latitude and longitude are optional - only validate if provided and not null
+    if (data.latitude !== undefined && data.latitude !== null && (typeof data.latitude !== 'number' || data.latitude < -90 || data.latitude > 90)) {
         errors.push('latitude must be a number between -90 and 90');
     }
     
-    if (data.longitude !== undefined && (typeof data.longitude !== 'number' || data.longitude < -180 || data.longitude > 180)) {
+    if (data.longitude !== undefined && data.longitude !== null && (typeof data.longitude !== 'number' || data.longitude < -180 || data.longitude > 180)) {
         errors.push('longitude must be a number between -180 and 180');
     }
     
