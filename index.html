@@ -6355,7 +6355,42 @@
                 // Show syncing message with progress bar in travel content area (only if not silent)
                 const travelContainer = document.getElementById('travel-content');
                 const updateProgress = (currentDays, status, error = null) => {
-                    if (!travelContainer || isSilent) return;
+                    if (isSilent) return;
+                    // If travel container doesn't exist, switch to travel tab first
+                    if (!travelContainer) {
+                        setState({ activeTab: 'travel' });
+                        renderContent();
+                        renderNav();
+                        // Wait a bit for the tab to render, then try again
+                        setTimeout(() => {
+                            const newTravelContainer = document.getElementById('travel-content');
+                            if (newTravelContainer) {
+                                const progressHTML = `
+                                    <div class="mb-6 p-6 rounded-md border border-blue-300 dark:border-blue-700 bg-blue-100 dark:bg-blue-900/40">
+                                        <div class="flex flex-col items-center gap-4">
+                                            <div class="flex items-center gap-3">
+                                                <div class="inline-block animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 dark:border-blue-400"></div>
+                                                <span class="text-lg font-medium text-blue-900 dark:text-blue-200">Syncing Navan data, be right with you...</span>
+                                            </div>
+                                                <div class="w-full max-w-md">
+                                                    <div class="flex justify-between text-sm text-blue-800 dark:text-blue-300 mb-2">
+                                                        <span>${status}</span>
+                                                        <span>${currentDays} days</span>
+                                                    </div>
+                                                    <div class="w-full bg-blue-200 dark:bg-blue-800 rounded-full h-3 overflow-hidden">
+                                                        <div class="bg-blue-600 dark:bg-blue-400 h-full transition-all duration-300" style="width: ${Math.min(100, (currentDays / 365) * 100)}%"></div>
+                                                    </div>
+                                                    ${error ? `<div class="mt-2 text-sm text-red-600 dark:text-red-400">Error at ${currentDays} days: ${error}</div>` : ''}
+                                                </div>
+                                                <p class="text-sm text-blue-700 dark:text-blue-300 italic mt-2">"we only have one rule, no hats"</p>
+                                        </div>
+                                    </div>
+                                `;
+                                newTravelContainer.innerHTML = progressHTML;
+                            }
+                        }, 100);
+                        return;
+                    }
                     const progressHTML = `
                         <div class="mb-6 p-6 rounded-md border border-blue-300 dark:border-blue-700 bg-blue-100 dark:bg-blue-900/40">
                             <div class="flex flex-col items-center gap-4">
@@ -17147,6 +17182,8 @@
             const getUserSettingsModalHTML = () => {
                 const isManagerOrSupervisor = state.currentUser && 
                     (state.currentUser.permissionLevel === 'Manager' || state.currentUser.permissionLevel === 'Supervisor');
+                const currentUsername = state.currentUser ? state.currentUser.username : '';
+                const currentEmail = state.currentUser ? (state.currentUser.email || '') : '';
                 
                 return `
                     <h2 class="text-2xl font-bold dark:text-white mb-6">User Settings</h2>
@@ -17154,6 +17191,16 @@
                         <div>
                             <h3 class="text-lg font-semibold dark:text-white mb-4">Change Password</h3>
                             <form id="change-password-form" class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Username</label>
+                                    <input type="text" name="username" value="${currentUsername}" required readonly class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Username">
+                                </div>
+                                ${currentEmail ? `
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Email</label>
+                                    <input type="email" value="${currentEmail}" readonly class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Email">
+                                </div>
+                                ` : ''}
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-2">Current Password</label>
                                     <input type="password" name="currentPassword" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter current password">
@@ -29787,6 +29834,7 @@
                         e.preventDefault();
                         const form = e.target;
                         const formData = new FormData(form);
+                        // Get username from form (should be auto-filled) or fall back to current user
                         const username = formData.get('username') || (state.currentUser ? state.currentUser.username : null);
                         const currentPassword = formData.get('currentPassword');
                         const newPassword = formData.get('newPassword');
@@ -29794,6 +29842,12 @@
                         
                         if (!username) {
                             showNotification('Username is required', 'error');
+                            return;
+                        }
+                        
+                        // Ensure we're using the logged-in user's username
+                        if (state.currentUser && state.currentUser.username && username !== state.currentUser.username) {
+                            showNotification('You can only change your own password', 'error');
                             return;
                         }
                         
@@ -35422,26 +35476,18 @@
             const getFiscalYearDates = (yearOffset = 0) => {
                 const now = new Date();
                 const currentYear = now.getFullYear();
-                const currentMonth = now.getMonth(); // 0-11
                 
-                // Determine current fiscal year (FY starts Oct 1, so Oct-Dec is next calendar year's FY)
-                let fiscalYear = currentYear;
-                if (currentMonth >= 9) { // October (9) through December (11) belong to next FY
-                    fiscalYear = currentYear + 1;
-                }
+                // Apply offset (0 = current calendar year, -1 = last calendar year, etc.)
+                const targetYear = currentYear + yearOffset;
                 
-                // Apply offset (0 = current FY, -1 = last FY, etc.)
-                const targetFY = fiscalYear + yearOffset;
-                
-                // FY start: October 1 of previous calendar year
-                const fyStart = new Date(targetFY - 1, 9, 1); // Month 9 = October
-                // FY end: September 30 of current calendar year
-                const fyEnd = new Date(targetFY, 8, 30); // Month 8 = September
+                // Calendar year: January 1 to December 31
+                const yearStart = new Date(targetYear, 0, 1); // Month 0 = January
+                const yearEnd = new Date(targetYear, 11, 31); // Month 11 = December
                 
                 return {
-                    start: toDateOnlyString(fyStart),
-                    end: toDateOnlyString(fyEnd),
-                    year: targetFY
+                    start: toDateOnlyString(yearStart),
+                    end: toDateOnlyString(yearEnd),
+                    year: targetYear
                 };
             };
             
