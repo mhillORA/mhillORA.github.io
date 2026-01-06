@@ -7862,13 +7862,33 @@
                 const year = now.getFullYear();
                 const month = now.getMonth();
 
-                const eventsThisMonth = state.crc_events.filter(e => {
+                // Start with all events for the current month
+                let eventsThisMonth = state.crc_events.filter(e => {
                     const eventDate = new Date(e.date + "T00:00:00");
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
                 
+                // Apply the same filters that are used in the calendar view
+                // CRC filter
+                if (state.selectedCrcFilter && state.selectedCrcFilter !== 'all') {
+                    eventsThisMonth = eventsThisMonth.filter(e => eventBelongsToCrc(e, state.selectedCrcFilter));
+                }
+                
+                // Site filter
+                if (state.selectedSiteFilter && state.selectedSiteFilter !== 'all') {
+                    eventsThisMonth = eventsThisMonth.filter(e => e.siteId === state.selectedSiteFilter);
+                }
+                
+                // Event type filter
+                if (state.selectedEventTypeFilter && state.selectedEventTypeFilter !== 'all') {
+                    eventsThisMonth = eventsThisMonth.filter(e => e.type === state.selectedEventTypeFilter);
+                }
+                
+                // Open shifts filter
+                eventsThisMonth = applyOpenShiftsFilter(eventsThisMonth);
+                
                 if (eventsThisMonth.length === 0) {
-                    showNotification('No events in the current month to export.', 'info');
+                    showNotification('No events match the current filters to export.', 'info');
                     return;
                 }
 
@@ -31154,6 +31174,13 @@
                 
                 // Get required roles for the selected studies at the selected site
                 const requiredRoles = new Map();
+                
+                // Get visit number FIRST, before looping through studies (reuse the variable declared earlier)
+                const visitNumberSelectForRoles = form.querySelector('select[name="visitNumber"]');
+                const visitNumberInput = form.querySelector('input[name="visitNumber"]');
+                const visitNumber = visitNumberSelectForRoles ? visitNumberSelectForRoles.value : (visitNumberInput ? visitNumberInput.value : null);
+                const hasVisitSelected = visitNumber && visitNumber !== '';
+                
                 selectedStudyIds.forEach(studyId => {
                     const study = state.studies.find(s => s.id === studyId);
                     console.log('Processing study for roles:', {
@@ -31165,15 +31192,13 @@
                         visitRoleRequirements: study?.visitRoleRequirements,
                         siteRoleRequirements: study?.siteRoleRequirements,
                         requiredRoles: study?.requiredRoles,
-                        selectedSiteId
+                        selectedSiteId,
+                        visitNumber,
+                        hasVisitSelected
                     });
                     
-                    // First, check for visit-specific role requirements
-                    const visitNumberSelect = form.querySelector('select[name="visitNumber"]');
-                    const visitNumberInput = form.querySelector('input[name="visitNumber"]');
-                    const visitNumber = visitNumberSelect ? visitNumberSelect.value : (visitNumberInput ? visitNumberInput.value : null);
-                    
-                    if (study && study.visitRoleRequirements) {
+                    // If a visit is selected, ONLY use visit-specific requirements (don't accumulate across studies)
+                    if (hasVisitSelected && study && study.visitRoleRequirements) {
                         let visitReqs = null;
                         
                         // Try to get visit-specific requirements
@@ -31189,54 +31214,64 @@
                             console.log('✓ Using default visit requirements:', visitReqs);
                         }
                         
-                        if (visitReqs) {
+                        // ONLY use visit requirements if they exist - don't fall back to other requirements
+                        if (visitReqs && Object.keys(visitReqs).length > 0) {
                             Object.entries(visitReqs).forEach(([roleId, quantity]) => {
+                                const role = state.roles.find(r => r.id === roleId);
+                                if (role) {
+                                    // For visit-specific, use the visit's quantity directly (don't accumulate)
+                                    requiredRoles.set(roleId, quantity);
+                                    console.log(`  → Set role ${role.name} with quantity ${quantity} from visitRoleRequirements`);
+                                }
+                            });
+                            // If we found visit requirements, skip fallbacks for this study
+                            return;
+                        } else if (visitReqs && Object.keys(visitReqs).length === 0) {
+                            // Visit exists but has no requirements - clear roles and return
+                            console.log('✓ Visit selected but has no role requirements - showing no roles');
+                            return;
+                        }
+                    }
+                    
+                    // Only use fallbacks if NO visit is selected OR visit requirements don't exist
+                    if (!hasVisitSelected || !study?.visitRoleRequirements) {
+                        // Fallback: check for site-specific role requirements (legacy support)
+                        if (study && study.siteRoleRequirements && study.siteRoleRequirements[selectedSiteId]) {
+                            console.log('✓ Found site role requirements (legacy):', study.siteRoleRequirements[selectedSiteId]);
+                            Object.entries(study.siteRoleRequirements[selectedSiteId]).forEach(([roleId, quantity]) => {
                                 const role = state.roles.find(r => r.id === roleId);
                                 if (role) {
                                     const currentQuantity = requiredRoles.get(roleId) || 0;
                                     requiredRoles.set(roleId, currentQuantity + quantity);
-                                    console.log(`  → Added role ${role.name} with quantity ${quantity} from visitRoleRequirements`);
+                                    console.log(`  → Added role ${role.name} with quantity ${quantity} from siteRoleRequirements`);
                                 }
                             });
                         }
-                    }
-                    
-                    // Fallback: check for site-specific role requirements (legacy support)
-                    if (requiredRoles.size === 0 && study && study.siteRoleRequirements && study.siteRoleRequirements[selectedSiteId]) {
-                        console.log('✓ Found site role requirements (legacy):', study.siteRoleRequirements[selectedSiteId]);
-                        Object.entries(study.siteRoleRequirements[selectedSiteId]).forEach(([roleId, quantity]) => {
-                            const role = state.roles.find(r => r.id === roleId);
-                            if (role) {
-                                const currentQuantity = requiredRoles.get(roleId) || 0;
-                                requiredRoles.set(roleId, currentQuantity + quantity);
-                                console.log(`  → Added role ${role.name} with quantity ${quantity} from siteRoleRequirements`);
-                            }
-                        });
-                    }
-                    // Fallback: if no site-specific requirements, use general requiredRoles
-                    else if (study && study.requiredRoles && study.requiredRoles.length > 0) {
-                        console.log('✓ Using general requiredRoles from study:', study.requiredRoles);
-                        study.requiredRoles.forEach(roleId => {
-                            const role = state.roles.find(r => r.id === roleId);
-                            if (role) {
-                                const currentQuantity = requiredRoles.get(roleId) || 0;
-                                requiredRoles.set(roleId, currentQuantity + 1); // Default to 1 if no specific quantity
-                                console.log(`  → Added role ${role.name} with default quantity 1 from requiredRoles`);
-                            } else {
-                                console.log(`  ✗ Role not found for ID: ${roleId}`);
-                            }
-                        });
-                    }
-                    // Additional fallback: check if study has any role-related properties
-                    else if (study && (study.roles || study.roleAssignments || study.roleRequirements)) {
-                        console.log('✓ Found role-related properties in study:', {
-                            roles: study.roles,
-                            roleAssignments: study.roleAssignments,
-                            roleRequirements: study.roleRequirements
-                        });
-                        // If we find role-related data but no specific requirements, we'll handle this in the fallback below
-                    } else {
-                        console.log('✗ No specific role requirements found for study', studyId, '- will use manual assignment fallback');
+                        // Fallback: if no site-specific requirements, use general requiredRoles
+                        else if (study && study.requiredRoles && study.requiredRoles.length > 0) {
+                            console.log('✓ Using general requiredRoles from study:', study.requiredRoles);
+                            study.requiredRoles.forEach(roleId => {
+                                const role = state.roles.find(r => r.id === roleId);
+                                if (role) {
+                                    const currentQuantity = requiredRoles.get(roleId) || 0;
+                                    requiredRoles.set(roleId, currentQuantity + 1); // Default to 1 if no specific quantity
+                                    console.log(`  → Added role ${role.name} with default quantity 1 from requiredRoles`);
+                                } else {
+                                    console.log(`  ✗ Role not found for ID: ${roleId}`);
+                                }
+                            });
+                        }
+                        // Additional fallback: check if study has any role-related properties
+                        else if (study && (study.roles || study.roleAssignments || study.roleRequirements)) {
+                            console.log('✓ Found role-related properties in study:', {
+                                roles: study.roles,
+                                roleAssignments: study.roleAssignments,
+                                roleRequirements: study.roleRequirements
+                            });
+                            // If we find role-related data but no specific requirements, we'll handle this in the fallback below
+                        } else {
+                            console.log('✗ No specific role requirements found for study', studyId, '- will use manual assignment fallback');
+                        }
                     }
                 });
                 
