@@ -1083,6 +1083,15 @@ async function crudHandler(context, request, containerName) {
                             // to avoid issues with hashed vs plain text passwords
                             const { password: _, ...existingUserWithoutPassword } = existingUser;
                             mergedRequestBody = { ...existingUserWithoutPassword, ...requestBody };
+                            
+                            // Ensure username exists for validation (use existing username, id, email, or generate default)
+                            if (!mergedRequestBody.username || typeof mergedRequestBody.username !== 'string') {
+                                mergedRequestBody.username = existingUser.username || 
+                                                           existingUser.id || 
+                                                           existingUser.email || 
+                                                           `user_${updateId}`;
+                                context.log.info(`Generated default username for user ${updateId}: ${mergedRequestBody.username}`);
+                            }
                         } else {
                             // User not found - this is an update, so we need the user to exist
                             context.log.warn(`User ${updateId} not found for update`);
@@ -1216,19 +1225,46 @@ async function crudHandler(context, request, containerName) {
             case 'DELETE':
                 if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
                 try {
-                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
-                    const { resource } = await container.item(id, id).read();
-                    if (!resource) {
-                        // Treat missing as already deleted
-                        return { status: 204 };
+                    // Check if resource exists first
+                    try {
+                        const { resource } = await container.item(id, id).read();
+                        if (!resource) {
+                            // Treat missing as already deleted
+                            return { status: 204 };
+                        }
+                    } catch (readError) {
+                        // If read fails (e.g., not found), return 204 for idempotency
+                        const errorCode = readError.code || readError.statusCode;
+                        const errorMessage = (readError.message || '').toLowerCase();
+                        if (errorCode === 404 || 
+                            errorMessage.includes('notfound') || 
+                            errorMessage.includes('not found')) {
+                            return { status: 204 };
+                        }
+                        // For other read errors, log but continue to try delete
+                        context.log.warn(`Error reading ${containerName} ${id} before delete:`, readError.message);
                     }
-                } catch (e) {
-                    // If read fails (e.g., not found), return 204 for idempotency
-                    return { status: 204 };
+                    
+                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
+                    try {
+                        await container.item(id, id).delete();
+                        return { status: 204 };
+                    } catch (deleteError) {
+                        // If delete fails with not found, treat as success (idempotency)
+                        const errorCode = deleteError.code || deleteError.statusCode;
+                        const errorMessage = (deleteError.message || '').toLowerCase();
+                        if (errorCode === 404 || 
+                            errorMessage.includes('notfound') || 
+                            errorMessage.includes('not found')) {
+                            return { status: 204 };
+                        }
+                        // Re-throw other errors
+                        throw deleteError;
+                    }
+                } catch (error) {
+                    context.log.error(`Error deleting ${containerName} ${id}:`, error.message || error);
+                    return handleError(context, error, `Failed to delete ${containerName} with id ${id}`);
                 }
-                // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
-                await container.item(id, id).delete();
-                return { status: 204 };
 
             case 'OPTIONS':
                 return { status: 200 };
