@@ -706,6 +706,32 @@ const verifyPassword = (password, hash) => {
     return hashPassword(password) === hash;
 };
 
+// Helper function to correct admin user permission level
+const correctAdminUser = async (user, container, context) => {
+    if (!user || !user.username) return user;
+    
+    const username = (user.username || '').toLowerCase().trim();
+    if (username === 'admin') {
+        // Admin must always be Manager
+        if (user.permissionLevel !== 'Manager') {
+            context.log.warn(`Correcting admin user permission level from ${user.permissionLevel} to Manager`);
+            user.permissionLevel = 'Manager';
+            user.crcId = null; // Remove CRC link
+            
+            // Save the correction to the database
+            try {
+                const correctedUser = { ...user, id: user.id };
+                await container.items.upsert(correctedUser);
+                context.log.info('Admin user permission level corrected in database');
+            } catch (error) {
+                context.log.error('Failed to save admin user correction:', error);
+                // Continue anyway - we'll return the corrected user object
+            }
+        }
+    }
+    return user;
+};
+
 const validateSchedulesSchema = (data) => {
     const errors = [];
     
@@ -1197,13 +1223,8 @@ async function crudHandler(context, request, containerName) {
                                 // Merge existing user fields with update fields, preserving existing data
                                 updatedItem = { ...existingUser, ...requestBody, id: updateId };
                                 
-                                // Protect admin user: username "admin" must always have Manager permission level
-                                const username = (updatedItem.username || '').toLowerCase().trim();
-                                if (username === 'admin') {
-                                    updatedItem.permissionLevel = 'Manager';
-                                    // Remove any CRC link for admin user
-                                    updatedItem.crcId = null;
-                                }
+                                // Correct admin user if needed (this will also save the correction)
+                                updatedItem = await correctAdminUser(updatedItem, container, context);
                             }
                         } catch (readError) {
                             // If we can't read the existing user, proceed with just requestBody
@@ -1227,6 +1248,12 @@ async function crudHandler(context, request, containerName) {
                     }
                     
                     const { resource: result } = await container.items.upsert(updatedItem);
+                    
+                    // For users, ensure admin is corrected after upsert
+                    if (containerName === 'users') {
+                        const correctedResult = await correctAdminUser(result, container, context);
+                        return { jsonBody: correctedResult };
+                    }
                     
                     // Calculate enrollment for studies
                     if (containerName === 'studies') {
@@ -1742,6 +1769,9 @@ app.http('usersAuthenticateEntra', {
                     user = createdUser;
                 }
 
+                // Correct admin user if needed
+                user = await correctAdminUser(user, container, context);
+
                 // Return user without sensitive data
                 const { password: _, ...userWithoutPassword } = user;
                 return { jsonBody: userWithoutPassword };
@@ -1842,7 +1872,7 @@ app.http('usersAuthenticate', {
                 };
             }
             
-            const user = users[0];
+            let user = users[0];
             
             if (!verifyPassword(password, user.password)) {
                 return {
@@ -1851,6 +1881,9 @@ app.http('usersAuthenticate', {
                     headers: { 'Content-Type': 'application/json' }
                 };
             }
+            
+            // Correct admin user if needed
+            user = await correctAdminUser(user, container, context);
             
             // Return user without password
             const { password: _, ...userWithoutPassword } = user;
@@ -2119,8 +2152,12 @@ app.http('users', {
             switch (method) {
                 case 'GET':
                     // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
-                    const { resource } = await container.item(id, id).read(); 
+                    let resource = await container.item(id, id).read().then(r => r.resource);
                     if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
+                    
+                    // Correct admin user if needed
+                    resource = await correctAdminUser(resource, container, context);
+                    
                     // Don't return password hash
                     const { password: pwd, ...userWithoutPassword } = resource;
                     return { jsonBody: userWithoutPassword };
