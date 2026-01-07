@@ -5540,6 +5540,12 @@
                     mainAppContent.className = '';
                 }
                 
+                // Prevent CRC users from accessing scheduler tab - redirect to dashboard
+                if (state.activeTab === 'scheduler' && state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
+                    setState({ activeTab: 'dashboard' });
+                    // Continue to render with the dashboard tab instead
+                }
+                
                 if (state.activeTab === 'scheduler') {
                     mainAppContent.innerHTML = getSchedulerHTML();
                     mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
@@ -25553,6 +25559,31 @@
                             return;
                         }
                         
+                        // Permission check: CRC users can only edit their own pending requests
+                        const statusKey = normalizeTimeOffStatus(request.status);
+                        const loggedInCrcId = getLoggedInCrcId();
+                        const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                        
+                        if (isCrcUser) {
+                            if (statusKey !== 'pending') {
+                                showNotification('You can only edit pending time off requests.', 'error');
+                                return;
+                            }
+                            
+                            // Check if request belongs to the logged-in CRC user
+                            const canEdit = loggedInCrcId && (
+                                request.crcId === loggedInCrcId || 
+                                request.requestedBy === loggedInCrcId ||
+                                request.requestedBy === state.currentUser.id ||
+                                request.crcId === state.currentUser.id
+                            );
+                            
+                            if (!canEdit) {
+                                showNotification('You can only edit your own time off requests.', 'error');
+                                return;
+                            }
+                        }
+                        
                         const crc = state.crcs.find(c => c.id === request.crcId);
                         const crcName = crc ? crc.name : 'Unknown';
                         const dateValue = request.date || request.startDate || '';
@@ -25561,6 +25592,13 @@
                         const typeValue = request.type || 'Vacation';
                         const notesValue = request.notes || '';
                         const hoursValue = request.hours || (periodValue === 'Full Day' ? 8 : 4);
+                        
+                        // For CRC users, make employee field read-only (it already is disabled)
+                        const isEditingOwnRequest = isCrcUser && loggedInCrcId && (
+                            request.crcId === loggedInCrcId || 
+                            request.requestedBy === loggedInCrcId ||
+                            request.requestedBy === state.currentUser.id
+                        );
                         
                         openModal(`
                             <h3 class="text-xl font-bold dark:text-white mb-4">Edit Time Off Request</h3>
@@ -25886,6 +25924,31 @@
                                 return;
                             }
                             
+                            // Permission check: CRC users can only delete their own pending requests
+                            const statusKey = normalizeTimeOffStatus(request.status);
+                            const loggedInCrcId = getLoggedInCrcId();
+                            const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                            
+                            if (isCrcUser) {
+                                if (statusKey !== 'pending') {
+                                    showNotification('You can only delete pending time off requests.', 'error');
+                                    return;
+                                }
+                                
+                                // Check if request belongs to the logged-in CRC user
+                                const canDelete = loggedInCrcId && (
+                                    request.crcId === loggedInCrcId || 
+                                    request.requestedBy === loggedInCrcId ||
+                                    request.requestedBy === state.currentUser.id ||
+                                    request.crcId === state.currentUser.id
+                                );
+                                
+                                if (!canDelete) {
+                                    showNotification('You can only delete your own time off requests.', 'error');
+                                    return;
+                                }
+                            }
+                            
                             // Confirm deletion
                             const crc = state.crcs.find(c => c.id === request.crcId);
                             const employeeName = crc ? crc.name : 'Unknown';
@@ -25916,7 +25979,14 @@
                                 }
                                 
                                 showNotification('Time off request deleted successfully!', 'success');
-                                renderTimeOffRequestsContent();
+                                
+                                // Refresh time off views
+                                if (document.getElementById('time-off-requests-content')) {
+                                    renderTimeOffRequestsContent();
+                                }
+                                if (document.getElementById('time-off-content')) {
+                                    renderTimeOffContent();
+                                }
                                 
                                 // Refresh calendar views
                                 if (state.activeTab === 'unavailability') {
@@ -34999,7 +35069,31 @@
                                                     ${request.createdAt ? formatDisplayDate(request.createdAt) : 'N/A'}
                                                 </td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                    ${statusKey === 'pending' && viewingOwn && (request.requestedBy === state.currentUser.id || request.crcId === state.currentUser.id) ? `<button data-action="cancel-time-off-request" data-id="${request.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Cancel</button>` : ''}
+                                                    ${(() => {
+                                                        // Check if user can edit/delete this request
+                                                        // CRC users can only edit/delete their own pending requests
+                                                        const canEditDelete = statusKey === 'pending' && state.currentUser && 
+                                                            (isCrcUser ? (
+                                                                // For CRC users, check if request belongs to their CRC
+                                                                (loggedInCrcId && (request.crcId === loggedInCrcId || request.requestedBy === loggedInCrcId)) ||
+                                                                request.requestedBy === state.currentUser.id ||
+                                                                request.crcId === state.currentUser.id
+                                                            ) : (
+                                                                // For other users (viewingOwn), allow if they requested it or it's their CRC
+                                                                viewingOwn && (request.requestedBy === state.currentUser.id || request.crcId === state.currentUser.id)
+                                                            ));
+                                                        
+                                                        if (canEditDelete) {
+                                                            return `
+                                                                <div class="flex items-center gap-2">
+                                                                    <button data-action="edit-time-off-request" data-id="${request.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">Edit</button>
+                                                                    <span class="text-gray-300 dark:text-gray-600">|</span>
+                                                                    <button data-action="delete-time-off-request" data-id="${request.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Delete</button>
+                                                                </div>
+                                                            `;
+                                                        }
+                                                        return '';
+                                                    })()}
                                                 </td>
                                             </tr>
                                         `;
@@ -38390,6 +38484,11 @@
 							} catch (error) {
 								console.error('CHAOS: Error loading users:', error);
 							}
+						}
+						
+						// Redirect CRC users to dashboard on refresh (instead of scheduler)
+						if (session.user.permissionLevel === 'CRC') {
+							setState({ activeTab: 'dashboard' });
 						}
 						
 						renderNav();
