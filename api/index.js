@@ -1196,11 +1196,33 @@ async function crudHandler(context, request, containerName) {
                             if (existingUser) {
                                 // Merge existing user fields with update fields, preserving existing data
                                 updatedItem = { ...existingUser, ...requestBody, id: updateId };
+                                
+                                // Protect admin user: username "admin" must always have Manager permission level
+                                const username = (updatedItem.username || '').toLowerCase().trim();
+                                if (username === 'admin') {
+                                    updatedItem.permissionLevel = 'Manager';
+                                    // Remove any CRC link for admin user
+                                    updatedItem.crcId = null;
+                                }
                             }
                         } catch (readError) {
                             // If we can't read the existing user, proceed with just requestBody
                             // This might happen if the user was just created or there's a transient error
                             context.log.warn(`Could not read existing user ${updateId} for merge, proceeding with update:`, readError.message);
+                            
+                            // Still protect admin user even if we can't read existing user
+                            const username = (requestBody.username || '').toLowerCase().trim();
+                            if (username === 'admin') {
+                                updatedItem.permissionLevel = 'Manager';
+                                updatedItem.crcId = null;
+                            }
+                        }
+                    } else if (containerName === 'users' && requestBody.username) {
+                        // For new users, protect admin username
+                        const username = (requestBody.username || '').toLowerCase().trim();
+                        if (username === 'admin') {
+                            updatedItem.permissionLevel = 'Manager';
+                            updatedItem.crcId = null;
                         }
                     }
                     
