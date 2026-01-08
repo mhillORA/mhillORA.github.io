@@ -3247,9 +3247,13 @@
                     day: '2-digit'
                 });
                 const parts = formatter.formatToParts(dateObj);
-                const year = parseInt(parts.find(p => p.type === 'year').value);
-                const month = parseInt(parts.find(p => p.type === 'month').value);
-                const day = parseInt(parts.find(p => p.type === 'day').value);
+                const yearPart = parts.find(p => p.type === 'year');
+                const monthPart = parts.find(p => p.type === 'month');
+                const dayPart = parts.find(p => p.type === 'day');
+                if (!yearPart || !monthPart || !dayPart) return null;
+                const year = parseInt(yearPart.value);
+                const month = parseInt(monthPart.value);
+                const day = parseInt(dayPart.value);
                 return { year, month, day, timezone };
             };
             
@@ -3261,51 +3265,51 @@
                 
                 // Parse YYYY-MM-DD format
                 const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
-                if (match) {
-                    const year = parseInt(match[1]);
-                    const month = parseInt(match[2]);
-                    const day = parseInt(match[3]);
-                    
+                if (!match) return null;
+                
+                const year = parseInt(match[1]);
+                const month = parseInt(match[2]);
+                const day = parseInt(match[3]);
+                
+                // For now, use a simpler approach: create date in local timezone
+                // The timezone conversion will happen when we extract date components
+                // This ensures we don't break if Intl APIs fail
+                try {
                     const timezone = getTimezoneForLocation(location);
                     
-                    // Create a date string and parse it, then adjust for timezone
-                    // We'll create a date at noon UTC, then format it in the target timezone
-                    // to find the offset, then adjust to get midnight in that timezone
-                    const noonUtc = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+                    // Create a date at midnight UTC first
+                    const utcMidnight = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
                     
-                    // Get the time in the target timezone
+                    // Get what time that is in the target timezone
                     const formatter = new Intl.DateTimeFormat('en-US', {
                         timeZone: timezone,
-                        year: 'numeric',
-                        month: '2-digit',
-                        day: '2-digit',
                         hour: '2-digit',
                         minute: '2-digit',
                         second: '2-digit',
                         hour12: false
                     });
                     
-                    const parts = formatter.formatToParts(noonUtc);
-                    const tzYear = parseInt(parts.find(p => p.type === 'year').value);
-                    const tzMonth = parseInt(parts.find(p => p.type === 'month').value);
-                    const tzDay = parseInt(parts.find(p => p.type === 'day').value);
-                    const tzHour = parseInt(parts.find(p => p.type === 'hour').value);
-                    const tzMinute = parseInt(parts.find(p => p.type === 'minute').value);
-                    const tzSecond = parseInt(parts.find(p => p.type === 'second').value);
+                    const timeParts = formatter.formatToParts(utcMidnight);
+                    const hourPart = timeParts.find(p => p.type === 'hour');
+                    const minutePart = timeParts.find(p => p.type === 'minute');
+                    const secondPart = timeParts.find(p => p.type === 'second');
                     
-                    // Calculate offset: if it's 12:00 UTC and 7:00 AM in timezone, offset is -5 hours
-                    const offsetHours = 12 - tzHour;
-                    const offsetMinutes = 0 - tzMinute;
-                    const offsetSeconds = 0 - tzSecond;
-                    const totalOffsetMs = (offsetHours * 60 + offsetMinutes) * 60 * 1000 + offsetSeconds * 1000;
-                    
-                    // Create midnight in the target timezone by adjusting from noon UTC
-                    const midnightInTimezone = new Date(noonUtc.getTime() + totalOffsetMs - (12 * 60 * 60 * 1000));
-                    
-                    return midnightInTimezone;
+                    if (hourPart && minutePart && secondPart) {
+                        const tzHour = parseInt(hourPart.value);
+                        const tzMinute = parseInt(minutePart.value);
+                        const tzSecond = parseInt(secondPart.value);
+                        
+                        // Calculate offset: if UTC midnight is 5:00 AM in timezone, we need to subtract 5 hours
+                        const offsetMs = (tzHour * 60 + tzMinute) * 60 * 1000 + tzSecond * 1000;
+                        return new Date(utcMidnight.getTime() - offsetMs);
+                    }
+                } catch (e) {
+                    console.warn('Error creating local midnight, using fallback:', e);
                 }
                 
-                return null;
+                // Fallback: create date string and parse (will use browser's local timezone)
+                const dateStrLocal = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T00:00:00`;
+                return new Date(dateStrLocal);
             };
             
             // Legacy function names for backward compatibility - now use location-aware functions
@@ -3321,25 +3325,33 @@
             const getLocationFromEvent = (event) => {
                 if (!event) return null;
                 
-                // Try to get location from site first
-                if (event.siteId) {
-                    const site = state.crc_sites?.find(s => s.id === event.siteId);
-                    if (site) {
-                        return {
-                            state: site.state,
-                            city: site.city,
-                            coordinates: site.coordinates,
-                            address: site.address || site.address1
-                        };
-                    }
-                }
+                // Safety check: ensure state is initialized
+                if (!state || typeof state !== 'object') return null;
                 
-                // Try to get location from CRC's home location
-                if (event.crcId) {
-                    const crc = state.crcs?.find(c => c.id === event.crcId);
-                    if (crc && crc.homeLocation) {
-                        return crc.homeLocation;
+                try {
+                    // Try to get location from site first
+                    if (event.siteId && state.crc_sites && Array.isArray(state.crc_sites)) {
+                        const site = state.crc_sites.find(s => s && s.id === event.siteId);
+                        if (site) {
+                            return {
+                                state: site.state,
+                                city: site.city,
+                                coordinates: site.coordinates,
+                                address: site.address || site.address1
+                            };
+                        }
                     }
+                    
+                    // Try to get location from CRC's home location
+                    if (event.crcId && state.crcs && Array.isArray(state.crcs)) {
+                        const crc = state.crcs.find(c => c && c.id === event.crcId);
+                        if (crc && crc.homeLocation) {
+                            return crc.homeLocation;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Error getting location from event:', e);
+                    return null;
                 }
                 
                 return null;
