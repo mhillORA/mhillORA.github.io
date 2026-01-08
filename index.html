@@ -4088,9 +4088,28 @@
             
             // Get ALL roles for an event, including empty ones (for planning grid display)
             const getAllEventRoles = (event) => {
-                // For Travel Day events, return empty array (they don't have roles)
+                // For Travel Day events, only return training roles (e.g., "Training, ICF")
                 if (event.type === 'Travel Day') {
-                    return [];
+                    const roleNames = [];
+                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                            if (Array.isArray(assignments) && assignments.filter(Boolean).length > 0) {
+                                const role = state.roles.find(r => r.id === roleId);
+                                if (role && isTrainingRoleName(role.name)) {
+                                    // For training roles, show "Training, [training type]"
+                                    if (event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                        const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                                        trainingTypes.forEach(trainingType => {
+                                            roleNames.push(`Training, ${trainingType}`);
+                                        });
+                                    } else {
+                                        roleNames.push(role.name);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    return roleNames;
                 }
                 
                 const roleNames = [];
@@ -8343,15 +8362,14 @@
                 
                 const nextShift = nextShifts[0];
                 
-                // Get upcoming shifts (next 7 days)
-                const nextWeek = new Date(today);
-                nextWeek.setDate(today.getDate() + 7);
+                // Get next 5 shifts (regardless of how far out they are)
                 const upcomingShifts = crcEvents
                     .filter(e => {
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        return e.type === 'Site Assignment' && eventDate >= today && eventDate <= nextWeek;
+                        return e.type === 'Site Assignment' && eventDate >= today;
                     })
-                    .sort((a, b) => new Date(a.date) - new Date(b.date));
+                    .sort((a, b) => new Date(a.date) - new Date(b.date))
+                    .slice(0, 5); // Get only the next 5 shifts
                 
                 // Get roles for next shift
                 const getEventRoles = (event) => {
@@ -8383,7 +8401,10 @@
                     const studies = (nextShift.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                     const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study assigned';
                     const roles = getEventRoles(nextShift);
-                    const roleNames = nextShift.type === 'Travel Day' ? 'Travel' : (roles.length > 0 ? roles.join(', ') : 'No roles assigned');
+                    // For travel days, show training roles if available, otherwise show "Travel"
+                    const roleNames = nextShift.type === 'Travel Day' 
+                        ? (roles.length > 0 ? roles.join(', ') : 'Travel') 
+                        : (roles.length > 0 ? roles.join(', ') : 'No roles assigned');
                     const period = nextShift.period || 'Full Day';
                     const hours = nextShift.hours || 8;
                     
@@ -8449,7 +8470,7 @@
                 if (upcomingShifts.length > 0) {
                     upcomingShiftsHTML = `
                         <div class="p-4 bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-700 rounded-lg">
-                            <h3 class="text-lg font-semibold text-indigo-900 dark:text-indigo-200 mb-3">Upcoming Shifts (Next 7 Days)</h3>
+                            <h3 class="text-lg font-semibold text-indigo-900 dark:text-indigo-200 mb-3">Upcoming Shifts (Next 5)</h3>
                             <div class="space-y-2">
                                 ${upcomingShifts.slice(0, 5).map(shift => {
                                     const site = state.crc_sites.find(s => s.id === shift.siteId);
@@ -8468,7 +8489,6 @@
                                         </div>
                                     `;
                                 }).join('')}
-                                ${upcomingShifts.length > 5 ? `<div class="text-xs text-gray-600 dark:text-gray-400 text-center mt-2">+${upcomingShifts.length - 5} more shifts</div>` : ''}
                             </div>
                         </div>
                     `;
@@ -8861,6 +8881,15 @@
                             <div>
                                 <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Site</div>
                                 <div class="text-gray-900 dark:text-white">${site.name}</div>
+                                ${site.city || site.state ? `
+                                    <div class="text-sm text-gray-600 dark:text-gray-400 mt-1">${[site.city, site.state].filter(Boolean).join(', ')}</div>
+                                ` : ''}
+                            </div>
+                        ` : ''}
+                        ${(event.principalInvestigator || (site && site.principalInvestigator)) ? `
+                            <div>
+                                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Principal Investigator</div>
+                                <div class="text-gray-900 dark:text-white">${event.principalInvestigator || site.principalInvestigator || 'N/A'}</div>
                             </div>
                         ` : ''}
                         <div>
@@ -26593,8 +26622,9 @@
                             const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
                             
                             if (isCrcUser) {
-                                if (statusKey !== 'pending') {
-                                    showNotification('You can only delete pending time off requests.', 'error');
+                                // CRCs can delete both pending and approved PTO requests (but not rejected)
+                                if (statusKey === 'rejected') {
+                                    showNotification('You cannot delete rejected time off requests.', 'error');
                                     return;
                                 }
                                 
@@ -26618,6 +26648,24 @@
                             const confirmMessage = `Are you sure you want to delete this ${request.status} time off request for ${employeeName}?`;
                             
                             if (confirm(confirmMessage)) {
+                                // Log the deletion before deleting
+                                const crc = state.crcs.find(c => c.id === request.crcId);
+                                const employeeName = crc ? crc.name : 'Unknown';
+                                const deletedBy = state.currentUser ? state.currentUser.username : 'Unknown';
+                                
+                                logChange('time_off_deleted', {
+                                    requestId: id,
+                                    crcId: request.crcId,
+                                    crcName: employeeName,
+                                    date: request.date || request.startDate,
+                                    endDate: request.endDate || request.date || request.startDate,
+                                    type: request.type || 'Unknown',
+                                    status: request.status,
+                                    deletedBy: deletedBy,
+                                    deletedByUserId: state.currentUser ? state.currentUser.id : null,
+                                    deletedAt: new Date().toISOString()
+                                });
+                                
                                 await apiService.deleteTimeOffRequest(id);
                                 
                                 // Remove from state
@@ -28623,10 +28671,21 @@
                                     }
                                 });
 
-                                // Travel Day events should not have roles assigned, but they DO need crcId preserved
+                                // Travel Day events can have training roles assigned (e.g., "Training, ICF"), but not regular roles
                                 const isTravelDay = data.eventType === 'Travel Day';
-                                // Only include roleAssignments if they have valid assignments (filter out empty ones)
-                                const finalRoleAssignments = isTravelDay ? {} : (Object.keys(filteredRoleAssignments).length > 0 ? filteredRoleAssignments : {});
+                                // For travel days, only allow training roles; for other events, allow all roles
+                                let finalRoleAssignments = {};
+                                if (isTravelDay) {
+                                    // Filter to only include training roles
+                                    const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                                    const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
+                                    if (filteredRoleAssignments[trainingRoleId]) {
+                                        finalRoleAssignments[trainingRoleId] = filteredRoleAssignments[trainingRoleId];
+                                    }
+                                } else {
+                                    // For non-travel days, include all roles with valid assignments
+                                    finalRoleAssignments = Object.keys(filteredRoleAssignments).length > 0 ? filteredRoleAssignments : {};
+                                }
                                 
                                 // For Travel Day events, preserve the crcId from the form or existing event
                                 let travelDayCrcId = null;
@@ -28643,7 +28702,8 @@
                                 
                                 // Ensure training assignments only reference roles that are in filteredRoleAssignments
                                 // This prevents orphaned training assignments for roles that were filtered out
-                                if (!isTravelDay && Object.keys(finalRoleAssignments).length > 0) {
+                                // For travel days, we still need to process training assignments
+                                if (Object.keys(finalRoleAssignments).length > 0) {
                                     Object.keys(trainingAssignments).forEach(roleId => {
                                         if (!finalRoleAssignments[roleId]) {
                                             delete trainingAssignments[roleId];
@@ -28653,11 +28713,13 @@
                                 
                                 // Always include trainingAssignments if there are any (even if some are null, to preserve structure)
                                 // This ensures training assignments are saved when a CRC is assigned to Training role
-                                const finalTrainingAssignments = isTravelDay ? undefined : (Object.keys(trainingAssignments).length > 0 ? trainingAssignments : (existingEvent?.trainingAssignments ? existingEvent.trainingAssignments : undefined));
+                                // Travel days can have training assignments (e.g., "Training, ICF")
+                                const finalTrainingAssignments = Object.keys(trainingAssignments).length > 0 ? trainingAssignments : (existingEvent?.trainingAssignments ? existingEvent.trainingAssignments : undefined);
                                 
                                 // Collect training modes (practicum, finalPracticum, observation) from checkboxes
+                                // Travel days can have training modes if they have training roles
                                 const trainingModes = {};
-                                if (!isTravelDay) {
+                                if (Object.keys(finalRoleAssignments).length > 0) {
                                     const { currentTrainingModes } = collectCurrentFormRoleAssignments(form);
                                     Object.keys(currentTrainingModes).forEach(key => {
                                         const mode = currentTrainingModes[key];
@@ -28666,7 +28728,8 @@
                                         }
                                     });
                                 }
-                                const finalTrainingModes = isTravelDay ? undefined : (Object.keys(trainingModes).length > 0 ? trainingModes : (existingEvent?.trainingModes ? existingEvent.trainingModes : undefined));
+                                // Travel days can have training modes if they have training roles
+                                const finalTrainingModes = Object.keys(trainingModes).length > 0 ? trainingModes : (existingEvent?.trainingModes ? existingEvent.trainingModes : undefined);
                                 
                                 // Always include roleQuantityOverrides if any were collected
                                 // This ensures role quantity changes are saved
@@ -28749,9 +28812,17 @@
                                             rolesForGroup.push(...legacyRoles);
                                         }
                                         
-                                        // Travel Day events should not have roles assigned
+                                        // Travel Day events can have training roles assigned (e.g., "Training, ICF")
                                         const isTravelDayEdit = data.eventType === 'Travel Day';
-                                        const finalRolesForGroup = isTravelDayEdit ? [] : rolesForGroup;
+                                        // For travel days, filter to only include training roles
+                                        let finalRolesForGroup = [];
+                                        if (isTravelDayEdit) {
+                                            const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                                            const trainingRoleName = trainingRoleEntry?.name || TRAINING_ROLE_NAME;
+                                            finalRolesForGroup = rolesForGroup.filter(role => role === trainingRoleName || isTrainingRoleName(role));
+                                        } else {
+                                            finalRolesForGroup = rolesForGroup;
+                                        }
                                         
                                         // Create new events for the new date range
                                         const newGroupId = crypto.randomUUID();
@@ -28799,16 +28870,26 @@
                                         const roles = crcIds.length > 0 ? formData.getAll(`roles-${crcIds[0]}`) : [];
                                         
                                         // Travel Day events should not have roles assigned
+                                        // Travel Day events can have training roles assigned (e.g., "Training, ICF")
                                         const isTravelDayEdit = data.eventType === 'Travel Day';
-                                        const finalRoles = isTravelDayEdit ? [] : roles;
+                                        // For travel days, filter to only include training roles
+                                        let finalRoles = [];
+                                        if (isTravelDayEdit) {
+                                            const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                                            const trainingRoleName = trainingRoleEntry?.name || TRAINING_ROLE_NAME;
+                                            finalRoles = roles.filter(role => role === trainingRoleName || isTrainingRoleName(role));
+                                        } else {
+                                            finalRoles = roles;
+                                        }
                                         
                                         // Collect training role assignments for single shift form
+                                        // Travel days can have training assignments
                                         const singleShiftTrainingAssignments = {};
-                                        if (crcIds.length > 0 && !isTravelDayEdit) {
+                                        if (crcIds.length > 0) {
                                             const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
                                             const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
                                             const trainingRoleSelect = form.querySelector(`select[name="trainingRole-${crcIds[0]}"]`);
-                                            if (trainingRoleSelect && trainingRoleSelect.value && roles.includes(TRAINING_ROLE_NAME)) {
+                                            if (trainingRoleSelect && trainingRoleSelect.value && finalRoles.includes(TRAINING_ROLE_NAME)) {
                                                 if (!singleShiftTrainingAssignments[trainingRoleId]) {
                                                     singleShiftTrainingAssignments[trainingRoleId] = [];
                                                 }
@@ -28827,7 +28908,7 @@
                                             crcId: isTravelDayEdit ? (existingEvent?.crcId || travelDayCrcId) : null, // For Travel Day, preserve crcId; for others use roleAssignments
                                             roles: [], // Legacy field - use roleAssignments instead
                                             roleAssignments: finalRoleAssignments,
-                                            trainingAssignments: isTravelDayEdit ? undefined : (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
+                                            trainingAssignments: (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
                                             groupNumber: groupNumberValue,
                                             date: newStartDateStr,
@@ -28901,15 +28982,24 @@
                                         
                                         // Update the remaining event to remove groupId and set endDate to same as date
                                         const roles = crcIds.length > 0 ? formData.getAll(`roles-${crcIds[0]}`) : [];
+                                        // Travel Day events can have training roles assigned (e.g., "Training, ICF")
                                         const isTravelDayEdit = data.eventType === 'Travel Day';
-                                        const finalRoles = isTravelDayEdit ? [] : roles;
+                                        // For travel days, filter to only include training roles
+                                        let finalRoles = [];
+                                        if (isTravelDayEdit) {
+                                            const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                                            const trainingRoleName = trainingRoleEntry?.name || TRAINING_ROLE_NAME;
+                                            finalRoles = roles.filter(role => role === trainingRoleName || isTrainingRoleName(role));
+                                        } else {
+                                            finalRoles = roles;
+                                        }
                                         
                                         const singleShiftTrainingAssignments = {};
-                                        if (crcIds.length > 0 && !isTravelDayEdit) {
+                                        if (crcIds.length > 0) {
                                             const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
                                             const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
                                             const trainingRoleSelect = form.querySelector(`select[name="trainingRole-${crcIds[0]}"]`);
-                                            if (trainingRoleSelect && trainingRoleSelect.value && roles.includes(TRAINING_ROLE_NAME)) {
+                                            if (trainingRoleSelect && trainingRoleSelect.value && finalRoles.includes(TRAINING_ROLE_NAME)) {
                                                 if (!singleShiftTrainingAssignments[trainingRoleId]) {
                                                     singleShiftTrainingAssignments[trainingRoleId] = [];
                                                 }
@@ -28923,7 +29013,7 @@
                                             crcId: isTravelDayEdit ? (existingEvent?.crcId || travelDayCrcId) : null, // For Travel Day, preserve crcId; for others use roleAssignments
                                             roles: [], // Legacy field - use roleAssignments instead
                                             roleAssignments: finalRoleAssignments,
-                                            trainingAssignments: isTravelDayEdit ? undefined : (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
+                                            trainingAssignments: (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
                                             groupNumber: groupNumberValue,
                                             date: newStartDateStr,
@@ -28952,16 +29042,26 @@
                                         const roles = crcIds.length > 0 ? formData.getAll(`roles-${crcIds[0]}`) : [];
                                         
                                         // Travel Day events should not have roles assigned
+                                        // Travel Day events can have training roles assigned (e.g., "Training, ICF")
                                         const isTravelDayEdit = data.eventType === 'Travel Day';
-                                        const finalRoles = isTravelDayEdit ? [] : roles;
+                                        // For travel days, filter to only include training roles
+                                        let finalRoles = [];
+                                        if (isTravelDayEdit) {
+                                            const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
+                                            const trainingRoleName = trainingRoleEntry?.name || TRAINING_ROLE_NAME;
+                                            finalRoles = roles.filter(role => role === trainingRoleName || isTrainingRoleName(role));
+                                        } else {
+                                            finalRoles = roles;
+                                        }
                                         
                                         // Collect training role assignments for single shift form
+                                        // Travel days can have training assignments
                                         const singleShiftTrainingAssignments = {};
-                                        if (crcIds.length > 0 && !isTravelDayEdit) {
+                                        if (crcIds.length > 0) {
                                             const trainingRoleEntry = state.roles.find(r => isTrainingRoleName(r.name));
                                             const trainingRoleId = trainingRoleEntry?.id || TRAINING_ROLE_ID;
                                             const trainingRoleSelect = form.querySelector(`select[name="trainingRole-${crcIds[0]}"]`);
-                                            if (trainingRoleSelect && trainingRoleSelect.value && roles.includes(TRAINING_ROLE_NAME)) {
+                                            if (trainingRoleSelect && trainingRoleSelect.value && finalRoles.includes(TRAINING_ROLE_NAME)) {
                                                 if (!singleShiftTrainingAssignments[trainingRoleId]) {
                                                     singleShiftTrainingAssignments[trainingRoleId] = [];
                                                 }
@@ -28976,7 +29076,7 @@
                                             crcId: isTravelDayEdit ? (existingEvent?.crcId || travelDayCrcId) : null, // For Travel Day, preserve crcId; for others use roleAssignments
                                             roles: [], // Legacy field - use roleAssignments instead
                                             roleAssignments: finalRoleAssignments, // Ensure roleAssignments are included in update
-                                            trainingAssignments: isTravelDayEdit ? undefined : (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
+                                            trainingAssignments: (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
                                             groupNumber: groupNumberValue,
                                             date: startDateStr,
