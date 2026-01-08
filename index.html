@@ -3148,44 +3148,253 @@
                 return date.getDay(); // Sunday=0, Monday=1, Tuesday=2, ..., Saturday=6
             };
             
-            const toDateOnlyString = (dateObj) => {
-                if (!(dateObj instanceof Date) || Number.isNaN(dateObj.getTime())) {
-                    return '';
+            // Helper to determine timezone based on location (state, city, coordinates, or site/CRC object)
+            // Returns IANA timezone string, defaults to Eastern Time (America/New_York)
+            const getTimezoneForLocation = (location) => {
+                // Default to Eastern Time
+                let timezone = 'America/New_York';
+                
+                if (!location) return timezone;
+                
+                let state = '';
+                let city = '';
+                let coordinates = null;
+                
+                // Handle different location formats
+                if (typeof location === 'string') {
+                    // Try to parse "City, State" or "State" format
+                    const parts = location.split(',').map(p => p.trim());
+                    if (parts.length >= 2) {
+                        city = parts[0];
+                        state = parts[1];
+                    } else if (parts.length === 1) {
+                        // Could be state or city
+                        const stateMatch = parts[0].match(/\b([A-Z]{2})\b/);
+                        if (stateMatch) {
+                            state = stateMatch[1];
+                        } else {
+                            city = parts[0];
+                        }
+                    }
+                } else if (typeof location === 'object') {
+                    // Could be a site or CRC object
+                    state = location.state || '';
+                    city = location.city || '';
+                    coordinates = location.coordinates || (location.latitude && location.longitude ? { lat: location.latitude, lon: location.longitude } : null);
                 }
-                const year = dateObj.getFullYear();
-                const month = String(dateObj.getMonth() + 1).padStart(2, '0');
-                const day = String(dateObj.getDate()).padStart(2, '0');
-                return `${year}-${month}-${day}`;
+                
+                // Map states to timezones
+                const stateTimezoneMap = {
+                    // Eastern Time (EST/EDT)
+                    'AL': 'America/New_York', 'CT': 'America/New_York', 'DE': 'America/New_York',
+                    'FL': 'America/New_York', 'GA': 'America/New_York', 'IN': 'America/Indiana/Indianapolis',
+                    'KY': 'America/New_York', 'ME': 'America/New_York', 'MD': 'America/New_York',
+                    'MA': 'America/New_York', 'MI': 'America/Detroit', 'NH': 'America/New_York',
+                    'NJ': 'America/New_York', 'NY': 'America/New_York', 'NC': 'America/New_York',
+                    'OH': 'America/New_York', 'PA': 'America/New_York', 'RI': 'America/New_York',
+                    'SC': 'America/New_York', 'TN': 'America/New_York', 'VT': 'America/New_York',
+                    'VA': 'America/New_York', 'WV': 'America/New_York', 'DC': 'America/New_York',
+                    
+                    // Central Time (CST/CDT)
+                    'AR': 'America/Chicago', 'IL': 'America/Chicago', 'IA': 'America/Chicago',
+                    'KS': 'America/Chicago', 'LA': 'America/Chicago', 'MN': 'America/Chicago',
+                    'MS': 'America/Chicago', 'MO': 'America/Chicago', 'NE': 'America/Chicago',
+                    'ND': 'America/Chicago', 'OK': 'America/Chicago', 'SD': 'America/Chicago',
+                    'TX': 'America/Chicago', 'WI': 'America/Chicago',
+                    
+                    // Mountain Time (MST/MDT)
+                    'AZ': 'America/Phoenix', 'CO': 'America/Denver', 'ID': 'America/Denver',
+                    'MT': 'America/Denver', 'NM': 'America/Denver', 'UT': 'America/Denver',
+                    'WY': 'America/Denver',
+                    
+                    // Pacific Time (PST/PDT)
+                    'CA': 'America/Los_Angeles', 'NV': 'America/Los_Angeles', 'OR': 'America/Los_Angeles',
+                    'WA': 'America/Los_Angeles',
+                    
+                    // Alaska Time
+                    'AK': 'America/Anchorage',
+                    
+                    // Hawaii Time
+                    'HI': 'Pacific/Honolulu'
+                };
+                
+                // Check state first
+                if (state && state.length === 2) {
+                    const stateUpper = state.toUpperCase();
+                    if (stateTimezoneMap[stateUpper]) {
+                        timezone = stateTimezoneMap[stateUpper];
+                    }
+                }
+                
+                // If we have coordinates, we could use them for more precise timezone detection
+                // For now, state-based mapping is sufficient
+                
+                return timezone;
             };
-
-            const parseDateOnly = (dateStr) => {
+            
+            // Helper to get date components in the appropriate timezone based on location
+            // Defaults to Eastern Time if no location provided
+            const getLocalDateComponents = (dateObj, location = null) => {
+                if (!(dateObj instanceof Date) || Number.isNaN(dateObj.getTime())) {
+                    return null;
+                }
+                const timezone = getTimezoneForLocation(location);
+                // Use Intl.DateTimeFormat to get date components in the appropriate timezone
+                const formatter = new Intl.DateTimeFormat('en-US', {
+                    timeZone: timezone,
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit'
+                });
+                const parts = formatter.formatToParts(dateObj);
+                const year = parseInt(parts.find(p => p.type === 'year').value);
+                const month = parseInt(parts.find(p => p.type === 'month').value);
+                const day = parseInt(parts.find(p => p.type === 'day').value);
+                return { year, month, day, timezone };
+            };
+            
+            // Helper to create a Date object representing midnight in the appropriate timezone
+            const createLocalMidnight = (dateStr, location = null) => {
                 if (!dateStr || typeof dateStr !== 'string') return null;
                 const trimmed = dateStr.trim();
                 if (!trimmed) return null;
-                const parsed = new Date(`${trimmed}T00:00:00`);
-                return Number.isNaN(parsed.getTime()) ? null : parsed;
+                
+                // Parse YYYY-MM-DD format
+                const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
+                if (match) {
+                    const year = parseInt(match[1]);
+                    const month = parseInt(match[2]);
+                    const day = parseInt(match[3]);
+                    
+                    const timezone = getTimezoneForLocation(location);
+                    
+                    // Create a date string and parse it, then adjust for timezone
+                    // We'll create a date at noon UTC, then format it in the target timezone
+                    // to find the offset, then adjust to get midnight in that timezone
+                    const noonUtc = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+                    
+                    // Get the time in the target timezone
+                    const formatter = new Intl.DateTimeFormat('en-US', {
+                        timeZone: timezone,
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: false
+                    });
+                    
+                    const parts = formatter.formatToParts(noonUtc);
+                    const tzYear = parseInt(parts.find(p => p.type === 'year').value);
+                    const tzMonth = parseInt(parts.find(p => p.type === 'month').value);
+                    const tzDay = parseInt(parts.find(p => p.type === 'day').value);
+                    const tzHour = parseInt(parts.find(p => p.type === 'hour').value);
+                    const tzMinute = parseInt(parts.find(p => p.type === 'minute').value);
+                    const tzSecond = parseInt(parts.find(p => p.type === 'second').value);
+                    
+                    // Calculate offset: if it's 12:00 UTC and 7:00 AM in timezone, offset is -5 hours
+                    const offsetHours = 12 - tzHour;
+                    const offsetMinutes = 0 - tzMinute;
+                    const offsetSeconds = 0 - tzSecond;
+                    const totalOffsetMs = (offsetHours * 60 + offsetMinutes) * 60 * 1000 + offsetSeconds * 1000;
+                    
+                    // Create midnight in the target timezone by adjusting from noon UTC
+                    const midnightInTimezone = new Date(noonUtc.getTime() + totalOffsetMs - (12 * 60 * 60 * 1000));
+                    
+                    return midnightInTimezone;
+                }
+                
+                return null;
+            };
+            
+            // Legacy function names for backward compatibility - now use location-aware functions
+            const getEasternDateComponents = (dateObj, location = null) => {
+                return getLocalDateComponents(dateObj, location);
+            };
+            
+            const createEasternMidnight = (dateStr, location = null) => {
+                return createLocalMidnight(dateStr, location);
+            };
+            
+            // Helper to get location from event (site or CRC)
+            const getLocationFromEvent = (event) => {
+                if (!event) return null;
+                
+                // Try to get location from site first
+                if (event.siteId) {
+                    const site = state.crc_sites?.find(s => s.id === event.siteId);
+                    if (site) {
+                        return {
+                            state: site.state,
+                            city: site.city,
+                            coordinates: site.coordinates,
+                            address: site.address || site.address1
+                        };
+                    }
+                }
+                
+                // Try to get location from CRC's home location
+                if (event.crcId) {
+                    const crc = state.crcs?.find(c => c.id === event.crcId);
+                    if (crc && crc.homeLocation) {
+                        return crc.homeLocation;
+                    }
+                }
+                
+                return null;
+            };
+            
+            const toDateOnlyString = (dateObj, location = null) => {
+                if (!(dateObj instanceof Date) || Number.isNaN(dateObj.getTime())) {
+                    return '';
+                }
+                // Get date components in the appropriate timezone (defaults to Eastern)
+                const components = getLocalDateComponents(dateObj, location);
+                if (!components) return '';
+                const year = components.year;
+                const month = String(components.month).padStart(2, '0');
+                const day = String(components.day).padStart(2, '0');
+                return `${year}-${month}-${day}`;
             };
 
-            const parseDateFlexible = (value) => {
+            const parseDateOnly = (dateStr, location = null) => {
+                if (!dateStr || typeof dateStr !== 'string') return null;
+                const trimmed = dateStr.trim();
+                if (!trimmed) return null;
+                // Create local timezone midnight for the date string (defaults to Eastern)
+                return createLocalMidnight(trimmed, location);
+            };
+
+            const parseDateFlexible = (value, location = null) => {
                 if (!value) return null;
                 if (value instanceof Date) {
+                    // Return a new Date object with the same time
                     return new Date(value.getTime());
                 }
                 if (typeof value === 'string') {
                     const trimmed = value.trim();
                     if (!trimmed) return null;
-                    // Handle YYYY-MM-DD format - create local midnight
+                    // Handle YYYY-MM-DD format - create local timezone midnight (defaults to Eastern)
                     if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-                        return new Date(`${trimmed}T00:00:00`);
+                        return createLocalMidnight(trimmed, location);
                     }
-                    // Handle ISO dates with Z (UTC) - convert to local date
-                    // This prevents timezone shift issues where 2026-01-01T00:00:00Z becomes 2025-12-31 in EST
+                    // Handle ISO dates with Z (UTC) - convert to local timezone (defaults to Eastern)
                     if (/^\d{4}-\d{2}-\d{2}T.*Z$/.test(trimmed) || trimmed.includes('+00:00')) {
-                        // Extract just the date part and create local midnight
+                        // Extract just the date part and create local timezone midnight
                         const datePart = trimmed.split('T')[0];
-                        return new Date(`${datePart}T00:00:00`);
+                        return createLocalMidnight(datePart, location);
                     }
-                    return new Date(trimmed);
+                    // Try to parse and convert to local timezone
+                    const parsed = new Date(trimmed);
+                    if (!Number.isNaN(parsed.getTime())) {
+                        // If it's a valid date, get the local date components and create a new date
+                        const components = getLocalDateComponents(parsed, location);
+                        if (components) {
+                            return createLocalMidnight(`${components.year}-${String(components.month).padStart(2, '0')}-${String(components.day).padStart(2, '0')}`, location);
+                        }
+                    }
+                    return parsed;
                 }
                 const result = new Date(value);
                 return Number.isNaN(result.getTime()) ? null : result;
@@ -3781,8 +3990,12 @@
             const getUnavailabilityPeriod = (crcId, date) => {
                 if (!crcId || !date) return null;
                 
-                // Normalize the date parameter to YYYY-MM-DD format for comparison
-                const normalizedDate = toDateOnlyString(parseDateFlexible(date));
+                // Get CRC's home location for timezone
+                const crc = state.crcs?.find(c => c.id === crcId);
+                const crcLocation = crc?.homeLocation || null;
+                
+                // Normalize the date parameter to YYYY-MM-DD format for comparison using CRC's timezone
+                const normalizedDate = toDateOnlyString(parseDateFlexible(date, crcLocation), crcLocation);
                 if (!normalizedDate) return null;
                 
                 // Get approved time off request IDs
@@ -3797,7 +4010,8 @@
                 
                 // Check for Unavailable events first (only if they have approved time off request or are manually created)
                 const ev = (state.crc_events || []).find(e => {
-                    const eventDate = toDateOnlyString(parseDateFlexible(e.date));
+                    const eventLocation = getLocationFromEvent(e) || crcLocation;
+                    const eventDate = toDateOnlyString(parseDateFlexible(e.date, eventLocation), eventLocation);
                     return e.crcId === crcId && 
                            e.type === 'Unavailable' && 
                            eventDate === normalizedDate &&
@@ -3807,7 +4021,8 @@
                 
                 // Check for Paid Time Off events (only if they have approved time off request or are manually created)
                 const ptoEv = (state.crc_events || []).find(e => {
-                    const eventDate = toDateOnlyString(parseDateFlexible(e.date));
+                    const eventLocation = getLocationFromEvent(e) || crcLocation;
+                    const eventDate = toDateOnlyString(parseDateFlexible(e.date, eventLocation), eventLocation);
                     return e.crcId === crcId && 
                            e.type === 'Paid Time Off' && 
                            eventDate === normalizedDate &&
@@ -3821,9 +4036,9 @@
                     const normalizedStatus = normalizeTimeOffStatus(req.status);
                     if (normalizedStatus !== 'approved') return false;
                     
-                    // Normalize request dates
-                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
-                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
+                    // Normalize request dates using CRC's timezone
+                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date, crcLocation), crcLocation);
+                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate, crcLocation), crcLocation);
                     
                     if (!reqStart) return false;
                     
@@ -3843,8 +4058,12 @@
             const isCRCUnavailable = (crcId, date, period, excludeEventId = null, excludeGroupId = null) => {
                 if (!crcId || !date) return false;
                 
-                // Normalize the date parameter to YYYY-MM-DD format for comparison
-                const normalizedDate = toDateOnlyString(parseDateFlexible(date));
+                // Get CRC's home location for timezone
+                const crc = state.crcs?.find(c => c.id === crcId);
+                const crcLocation = crc?.homeLocation || null;
+                
+                // Normalize the date parameter to YYYY-MM-DD format for comparison using CRC's timezone
+                const normalizedDate = toDateOnlyString(parseDateFlexible(date, crcLocation), crcLocation);
                 if (!normalizedDate) return false;
                 
                 // Check for rejected time off requests - if rejected, they should be available
@@ -3853,9 +4072,9 @@
                     const normalizedStatus = normalizeTimeOffStatus(req.status);
                     if (normalizedStatus !== 'rejected') return false;
                     
-                    // Normalize request dates
-                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
-                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
+                    // Normalize request dates using CRC's timezone
+                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date, crcLocation), crcLocation);
+                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate, crcLocation), crcLocation);
                     
                     if (!reqStart) return false;
                     
@@ -3879,8 +4098,9 @@
                     // Must be a Site Assignment
                     if (event.type !== 'Site Assignment') return false;
                     
-                    // Normalize event date for comparison
-                    const eventDate = toDateOnlyString(parseDateFlexible(event.date));
+                    // Normalize event date for comparison using event's site location or CRC's home location
+                    const eventLocation = getLocationFromEvent(event) || crcLocation;
+                    const eventDate = toDateOnlyString(parseDateFlexible(event.date, eventLocation), eventLocation);
                     if (!eventDate || eventDate !== normalizedDate) return false;
                     
                     // Check if this CRC is assigned to this event
@@ -3958,8 +4178,9 @@
                     // Exclude the current event being edited
                     if (excludeEventId && event.id === excludeEventId) return false;
                     
-                    // Normalize event date for comparison
-                    const eventDate = toDateOnlyString(parseDateFlexible(event.date));
+                    // Normalize event date for comparison using event's location or CRC's home location
+                    const eventLocation = getLocationFromEvent(event) || crcLocation;
+                    const eventDate = toDateOnlyString(parseDateFlexible(event.date, eventLocation), eventLocation);
                     if (!eventDate || eventDate !== normalizedDate) return false;
                     
                     // Check if this is an unavailability event
@@ -3995,11 +4216,23 @@
             
             // Helper function to get conflicting appointment info for display
             const getConflictingAppointmentInfo = (crcId, date, excludeEventId = null, excludeGroupId = null) => {
+                // Get CRC's home location for timezone
+                const crc = state.crcs?.find(c => c.id === crcId);
+                const crcLocation = crc?.homeLocation || null;
+                
+                // Normalize the date parameter using CRC's timezone (defaults to Eastern)
+                const normalizedDate = toDateOnlyString(parseDateFlexible(date, crcLocation), crcLocation);
+                if (!normalizedDate) return [];
+                
                 const conflictingEvents = state.crc_events.filter(event => {
                     if (excludeEventId && event.id === excludeEventId) return false;
                     // Also exclude all events in the same group (for multi-day shifts)
                     if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
-                    if (event.type !== 'Site Assignment' || event.date !== date) return false;
+                    if (event.type !== 'Site Assignment') return false;
+                    // Normalize event date using event's site location or CRC's home location
+                    const eventLocation = getLocationFromEvent(event) || crcLocation;
+                    const eventDate = toDateOnlyString(parseDateFlexible(event.date, eventLocation), eventLocation);
+                    if (!eventDate || eventDate !== normalizedDate) return false;
                     
                     if (event.crcId === crcId) return true;
                     if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
@@ -4249,12 +4482,14 @@
             };
             
             // Helper function to get CRCs assigned to an event from roleAssignments
-            const getEventCRCs = (event) => {
+            const getEventCRCs = (event, filterCrcId = null) => {
                 const crcs = [];
                 if (event.crcId) {
                     // Legacy: check top-level crcId
                     const crc = state.crcs.find(c => c.id === event.crcId);
-                    if (crc) crcs.push(crc);
+                    if (crc && (!filterCrcId || crc.id === filterCrcId)) {
+                        crcs.push(crc);
+                    }
                 }
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                     // New system: get CRCs from roleAssignments
@@ -4262,6 +4497,8 @@
                         if (Array.isArray(assignments)) {
                             assignments.forEach(crcId => {
                                 if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                    // If filtering by CRC, only include the selected CRC
+                                    if (filterCrcId && crcId !== filterCrcId) return;
                                     const crc = state.crcs.find(c => c.id === crcId);
                                     if (crc && !crcs.find(c => c.id === crc.id)) {
                                         crcs.push(crc);
@@ -10943,9 +11180,14 @@
                     const consolidatedEvents = todaysEvents;
                     
                     // Create one block per CRC per event - so a shift with 4 employees shows 4 blocks
+                    // Determine the CRC filter to apply
+                    const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                    const matchingCrcId = getLoggedInCrcId();
+                    const crcFilterId = (isCRCUser && matchingCrcId) ? matchingCrcId : (state.selectedCrcFilter !== 'all' ? state.selectedCrcFilter : null);
+                    
                     let eventTags = consolidatedEvents.flatMap(event => {
-                        // Get CRCs from both legacy crcId and new roleAssignments
-                        const eventCrcs = getEventCRCs(event);
+                        // Get CRCs from both legacy crcId and new roleAssignments, filtered by selected CRC
+                        const eventCrcs = getEventCRCs(event, crcFilterId);
                         // Only show CRCs if there are actual role assignments (not just legacy crcId)
                         const hasRoleAssignments = event.roleAssignments && Object.keys(event.roleAssignments).length > 0 && 
                                                    Object.values(event.roleAssignments).some(arr => Array.isArray(arr) && arr.length > 0);
@@ -11263,10 +11505,14 @@
                     const consolidatedEventsWeekly = todaysEvents;
                     
                     // Create one block per CRC per event - so a shift with 4 employees shows 4 blocks
+                    // Determine the CRC filter to apply
+                    const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                    const matchingCrcId = getLoggedInCrcId();
+                    const crcFilterId = (isCRCUser && matchingCrcId) ? matchingCrcId : (state.selectedCrcFilter !== 'all' ? state.selectedCrcFilter : null);
+                    
                     const eventTags = consolidatedEventsWeekly.flatMap(event => {
-                        // Get CRCs from both legacy crcId and new roleAssignments
-                        // But only show CRCs if there are actual role assignments
-                        const eventCrcs = getEventCRCs(event);
+                        // Get CRCs from both legacy crcId and new roleAssignments, filtered by selected CRC
+                        const eventCrcs = getEventCRCs(event, crcFilterId);
                         const hasRoleAssignments = event.roleAssignments && Object.keys(event.roleAssignments).length > 0 && 
                                                    Object.values(event.roleAssignments).some(arr => Array.isArray(arr) && arr.length > 0);
                         const site = state.crc_sites.find(s => s.id === event.siteId);
@@ -11715,7 +11961,12 @@
                     const individualEvents = todaysEvents.filter(e => e.type !== 'Site Assignment' || !e.siteId);
                     let individualBlocks = individualEvents.slice(0, 2).map(event => {
                         // Get CRCs from both legacy crcId and new roleAssignments
-                        const eventCrcs = getEventCRCs(event);
+                        // Determine the CRC filter to apply
+                        const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                        const matchingCrcId = getLoggedInCrcId();
+                        const crcFilterId = (isCRCUser && matchingCrcId) ? matchingCrcId : (state.selectedCrcFilter !== 'all' ? state.selectedCrcFilter : null);
+                        
+                        const eventCrcs = getEventCRCs(event, crcFilterId);
                         const primaryCrc = eventCrcs.length > 0 ? eventCrcs[0] : null;
                         const site = state.crc_sites.find(s => s.id === event.siteId);
                         const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
@@ -12053,7 +12304,12 @@
                     const individualEvents = todaysEvents.filter(e => e.type !== 'Site Assignment' || !e.siteId);
                     let individualBlocks = individualEvents.map(event => {
                         // Get CRCs from both legacy crcId and new roleAssignments
-                        const eventCrcs = getEventCRCs(event);
+                        // Determine the CRC filter to apply
+                        const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                        const matchingCrcId = getLoggedInCrcId();
+                        const crcFilterId = (isCRCUser && matchingCrcId) ? matchingCrcId : (state.selectedCrcFilter !== 'all' ? state.selectedCrcFilter : null);
+                        
+                        const eventCrcs = getEventCRCs(event, crcFilterId);
                         const primaryCrc = eventCrcs.length > 0 ? eventCrcs[0] : null;
                         const site = state.crc_sites.find(s => s.id === event.siteId);
                         const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
@@ -12780,8 +13036,16 @@
                                 if (event.groupNumber) visitGroupHeader.push(`G${event.groupNumber}`);
                                 const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join(' • ') : '';
                                 
-                                // Get all CRC names from the grouped shift
-                                const allCrcs = Array.from(group.allCrcIds).map(crcId => state.crcs.find(c => c.id === crcId)).filter(Boolean);
+                                // Get all CRC names from the grouped shift, filtered by selected CRC
+                                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                                const matchingCrcId = getLoggedInCrcId();
+                                const crcFilterId = (isCRCUser && matchingCrcId) ? matchingCrcId : (state.selectedCrcFilter !== 'all' ? state.selectedCrcFilter : null);
+                                
+                                let allCrcs = Array.from(group.allCrcIds).map(crcId => state.crcs.find(c => c.id === crcId)).filter(Boolean);
+                                // Filter to only show the selected CRC if filtering
+                                if (crcFilterId) {
+                                    allCrcs = allCrcs.filter(c => c.id === crcFilterId);
+                                }
                                 const crcNamesList = allCrcs.length > 0 ? allCrcs.map(c => c.name.split(' ')[0]).join(', ') : '';
                                 
                                 // Build tooltip
@@ -12833,6 +13097,9 @@
                                             
                                             if (Array.isArray(assignments)) {
                                                 assignments.forEach(crcId => {
+                                                    // If filtering by CRC, only include the selected CRC
+                                                    if (crcFilterId && crcId !== crcFilterId) return;
+                                                    
                                                     if (crcId === 'SITE_STAFF') {
                                                         if (!siteStaffRoles.includes(roleDisplayName)) {
                                                             siteStaffRoles.push(roleDisplayName);
@@ -12850,8 +13117,10 @@
                                         });
                                     }
                                     
-                                    // Also add CRCs from legacy crcId that might not have roles
+                                    // Also add CRCs from legacy crcId that might not have roles (filtered)
                                     allCrcs.forEach(crc => {
+                                        // If filtering by CRC, only include the selected CRC
+                                        if (crcFilterId && crc.id !== crcFilterId) return;
                                         if (!crcToRoles.has(crc.id)) {
                                             crcToRoles.set(crc.id, []);
                                         }
@@ -13824,8 +14093,16 @@
                                 if (event.hours) visitGroupHeader.push(`${event.hours}h`);
                                 const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join(' • ') : '';
                                 
-                                // Get all CRC names from the grouped shift
-                                const allCrcs = Array.from(group.allCrcIds).map(crcId => state.crcs.find(c => c.id === crcId)).filter(Boolean);
+                                // Get all CRC names from the grouped shift, filtered by selected CRC
+                                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                                const matchingCrcId = getLoggedInCrcId();
+                                const crcFilterId = (isCRCUser && matchingCrcId) ? matchingCrcId : (state.selectedCrcFilter !== 'all' ? state.selectedCrcFilter : null);
+                                
+                                let allCrcs = Array.from(group.allCrcIds).map(crcId => state.crcs.find(c => c.id === crcId)).filter(Boolean);
+                                // Filter to only show the selected CRC if filtering
+                                if (crcFilterId) {
+                                    allCrcs = allCrcs.filter(c => c.id === crcFilterId);
+                                }
                                 const crcNamesList = allCrcs.length > 0 ? allCrcs.map(c => c.name.split(' ')[0]).join(', ') : '';
                                 
                                 // Build tooltip
@@ -28198,7 +28475,13 @@
                                     if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') return;
                                     const existingEvents = state.crc_events.filter(event => {
                                         if (!event || event.crcId !== crcId) return false;
-                                        if (event.date !== dateStr) return false;
+                                        // Get CRC's home location for timezone
+                                        const crc = state.crcs?.find(c => c.id === crcId);
+                                        const crcLocation = crc?.homeLocation || null;
+                                        // Normalize both dates using location-aware timezone
+                                        const eventLocation = getLocationFromEvent(event) || crcLocation;
+                                        const eventDate = toDateOnlyString(parseDateFlexible(event.date, eventLocation), eventLocation);
+                                        if (!eventDate || eventDate !== dateStr) return false;
                                         // For Travel Day events, only check conflicts with Site Assignment and Open Shift (allow same day as shifts)
                                         if (eventType === 'Travel Day') {
                                             if (!['Site Assignment', 'Open Shift'].includes(event.type)) return false;
@@ -31732,8 +32015,15 @@
                             // Exclude events in the same group (for multi-day shifts)
                             if (excludeGroupIdForChange && event.groupId && event.groupId === excludeGroupIdForChange) return false;
                             
+                            // Get CRC's home location for timezone
+                            const crc = state.crcs?.find(c => c.id === selectedCrcId);
+                            const crcLocation = crc?.homeLocation || null;
+                            // Normalize both dates using location-aware timezone
+                            const eventLocation = getLocationFromEvent(event) || crcLocation;
+                            const eventDate = toDateOnlyString(parseDateFlexible(event.date, eventLocation), eventLocation);
+                            const normalizedDate = toDateOnlyString(parseDateFlexible(date, crcLocation), crcLocation);
                             return event.crcId === selectedCrcId &&
-                                event.date === date &&
+                                eventDate === normalizedDate &&
                                 event.type === 'Site Assignment' &&
                                 (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)));
                         });
