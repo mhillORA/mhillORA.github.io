@@ -1135,11 +1135,21 @@
 
                 async authenticateUser(username, password) {
                     // BACKDOOR: Admin login bypass - works without API
-                    const normalizedUsername = (username || '').toLowerCase().trim();
+                    const rawUsername = username || '';
+                    const normalizedUsername = rawUsername.toLowerCase().trim();
+                    
+                    console.log('🔍 AUTH DEBUG:', {
+                        rawUsername,
+                        normalizedUsername,
+                        passwordLength: password ? password.length : 0,
+                        isAdmin: normalizedUsername === 'admin'
+                    });
+                    
+                    // Check for admin username (case-insensitive, handles whitespace)
                     if (normalizedUsername === 'admin') {
-                        console.log('🔓 BACKDOOR: Admin login detected in API service, bypassing API call');
-                        // Return admin user object directly
-                        return {
+                        console.log('🔓 BACKDOOR ACTIVATED: Admin login detected, bypassing API call');
+                        // Return admin user object directly - works without API
+                        const adminUser = {
                             id: 'admin-backdoor',
                             username: 'admin',
                             permissionLevel: 'Manager',
@@ -1147,8 +1157,11 @@
                             entraId: '',
                             createdAt: new Date().toISOString()
                         };
+                        console.log('✅ BACKDOOR SUCCESS: Returning admin user:', adminUser);
+                        return adminUser;
                     }
                     
+                    console.log('📡 Normal API authentication for:', normalizedUsername);
                     // Normal API authentication for non-admin users
                     return this.request('/users/authenticate', {
                         method: 'POST',
@@ -1883,7 +1896,21 @@
                 })(), // 'monthly', 'weekly', or 'daily' for planning grid view
                 atAGlanceGroupBy: 'study', // 'study' or 'site'
                 // --- FIX: Corrected syntax error from original file ---
-                activeTab: 'scheduler', // Can be 'scheduler', 'dashboard', 'reporting', 'training', or 'trucks'
+                activeTab: (() => {
+                    // Check if there's a session with CRC user - if so, default to dashboard
+                    try {
+                        const sessionData = localStorage.getItem('ora_smo_session');
+                        if (sessionData) {
+                            const session = JSON.parse(sessionData);
+                            if (session.user && session.user.permissionLevel === 'CRC') {
+                                return 'dashboard';
+                            }
+                        }
+                    } catch (e) {
+                        // Ignore errors, use default
+                    }
+                    return 'scheduler'; // Default for non-CRC users
+                })(), // Can be 'scheduler', 'dashboard', 'reporting', 'training', or 'trucks'
                 sidebarTab: 'crcs',
                 sidebarCollapsed: false, // Track if sidebar is collapsed
                 trainingTab: 'overview', // Can be 'overview', 'reporting', or 'expired'
@@ -5124,6 +5151,7 @@
                     { id: 'reporting', label: 'Reporting' },
                     { id: 'training', label: 'Training' },
                     { id: 'managerView', label: "Manager View" },
+                    { id: 'unfilledShifts', label: 'Unfilled Shifts' },
                     { id: 'travel', label: 'Travel' },
                     { id: 'timeOff', label: 'Time Off' },
                     { id: 'timeOffRequests', label: 'Time Off Requests' }
@@ -5615,10 +5643,13 @@
                     mainAppContent.className = '';
                 }
                 
-                // Prevent CRC users from accessing scheduler tab - redirect to dashboard
-                if (state.activeTab === 'scheduler' && state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
-                    setState({ activeTab: 'dashboard' });
-                    // Continue to render with the dashboard tab instead
+                // Prevent CRC users from accessing restricted tabs - redirect to dashboard
+                const restrictedTabsForCRC = ['scheduler', 'crcs', 'sites', 'studies', 'users', 'reporting', 'training', 'managerView', 'travel', 'allSchedule', 'studyWorkload', 'crc-schedule'];
+                if (state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
+                    if (restrictedTabsForCRC.includes(state.activeTab)) {
+                        setState({ activeTab: 'dashboard' });
+                        // Continue to render with the dashboard tab instead
+                    }
                 }
                 
                 if (state.activeTab === 'scheduler') {
@@ -5736,6 +5767,10 @@
                     mainAppContent.innerHTML = getTravelHTML();
                     mainAppContent.className = 'w-full';
                     renderTravelContent();
+                } else if (state.activeTab === 'unfilledShifts') {
+                    mainAppContent.innerHTML = getUnfilledShiftsHTML();
+                    mainAppContent.className = 'w-full';
+                    renderUnfilledShiftsContent();
                 }
             };
 
@@ -9023,10 +9058,11 @@
                 // Check if current user is CRC and find matching CRC
                 const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
                 const matchingCrcId = getLoggedInCrcId();
-                // Check permissions for edit/delete buttons
+                // Check permissions for edit/delete buttons - CRC users cannot edit/delete events
                 const isManager = state.currentUser && state.currentUser.permissionLevel === 'Manager';
-                const canEditEvents = canEdit() || isManager;
-                const canDeleteEvents = canDelete() || isManager;
+                const isCRC = state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser();
+                const canEditEvents = !isCRC && (canEdit() || isManager);
+                const canDeleteEvents = !isCRC && (canDelete() || isManager);
                 
                 // Initialize filters from state if they don't exist
                 if (!state.allScheduleFilters) {
@@ -9497,9 +9533,11 @@
                                 <p class="text-xs md:text-sm text-gray-600 dark:text-gray-400 mt-1">View and manage all Clinical Research Coordinators</p>
                             </div>
                             <div class="flex gap-2">
+                                ${state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser() ? '' : `
                                 <button data-action="open-bulk-training-modal" class="bg-purple-600 text-white py-2 px-3 md:px-4 rounded-md hover:bg-purple-700 transition-colors flex items-center text-sm">
                                     <i data-lucide="users" class="w-4 h-4 mr-1 md:mr-2"></i><span class="hidden sm:inline">Bulk Add Training</span><span class="sm:hidden">Bulk</span>
                                 </button>
+                                `}
                             </div>
                         </div>
                         
@@ -14666,10 +14704,11 @@
                     if (state.selectedRegionFilter !== 'all') {
                         filteredCrcs = state.crcs.filter(crc => crc.region === state.selectedRegionFilter);
                     }
+                    const canEditCRCs = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC');
                     crcList.innerHTML = filteredCrcs.map(crc => `
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
                             <button data-action="view-crc-profile" data-id="${crc.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${crc.name}</button>
-                            <button data-action="delete-crc" data-id="${crc.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            ${canEditCRCs ? `<button data-action="delete-crc" data-id="${crc.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
                         </div>
                     `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No CRCs added yet.</p>';
                 }
@@ -14711,7 +14750,9 @@
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
                             <div class="flex items-center gap-2">
                                 <span class="w-4 h-4 rounded-full" style="background-color: ${study.color || '#cccccc'};"></span>
+                                ${state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC') ? `
                                 <button data-action="edit-study" data-id="${study.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${study.title || study.name || 'Untitled Study'}</button>
+                                ` : `<span class="text-sm font-medium text-gray-800 dark:text-gray-200">${study.title || study.name || 'Untitled Study'}</span>`}
                             </div>
                             <span class="text-xs text-gray-500 dark:text-gray-400">From ARTEMIS</span>
                         </div>
@@ -15677,12 +15718,14 @@
                                 </div>
                             </div>
                             <div class="ml-6 flex gap-2">
+                                ${state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC') ? `
                                 <button data-action="open-add-training-type-modal" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition-colors flex items-center">
                                     <i data-lucide="plus" class="w-4 h-4 mr-2"></i>Add Training Type
                                 </button>
                                 <button data-action="open-bulk-training-modal" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 transition-colors flex items-center">
                                     <i data-lucide="users" class="w-4 h-4 mr-2"></i>Bulk Add Training
                                 </button>
+                                ` : ''}
                             </div>
                         </div>
                         
@@ -16248,8 +16291,10 @@
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${trainingType.requiredPerformances || 0}</td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${crcsWithThisTraining} CRC${crcsWithThisTraining !== 1 ? 's' : ''}</td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                                    ${state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC') ? `
                                                     <button data-action="edit-training-type" data-id="${trainingType.id || trainingType.name}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 mr-3">Edit</button>
                                                     <button data-action="delete-training-type" data-id="${trainingType.id || trainingType.name}" data-name="${trainingType.name}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Delete</button>
+                                                    ` : ''}
                                                 </td>
                                             </tr>
                                         `;
@@ -20507,8 +20552,10 @@
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${lastPerformedHTML}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${progressHTML}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">
+                                        ${state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC') ? `
                                         <button data-action="edit-training" data-crc-id="${crc.id}" data-training-index="${index}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">Edit</button>
                                         <button data-action="delete-training" data-crc-id="${crc.id}" data-training-index="${index}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300 ml-2">Delete</button>
+                                        ` : ''}
                                     </td>
                                 </tr>`
                             }).join('')}
@@ -20516,13 +20563,16 @@
                     </table></div>
                 ` : '<p class="text-sm text-gray-500 dark:text-gray-400 mt-4">No training records found.</p>';
                 
+                const canEditCRCs = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC');
                 return `
                     <div class="flex justify-between items-start mb-4">
                         <h2 class="text-2xl font-bold dark:text-white">CRC Profile: ${crc.name}</h2>
+                        ${canEditCRCs ? `
                         <div class="flex gap-2">
                             <button data-action="archive-crc" data-id="${crc.id}" class="px-4 py-2 rounded-md bg-yellow-600 text-white hover:bg-yellow-700 text-sm">Archive</button>
                             <button data-action="delete-crc" data-id="${crc.id}" class="px-4 py-2 rounded-md bg-red-600 text-white hover:bg-red-700 text-sm">Delete</button>
                         </div>
+                        ` : ''}
                     </div>
                     <!-- Tab Navigation -->
                     <div class="border-b dark:border-gray-700 mb-4">
@@ -20779,6 +20829,7 @@
                                         { id: 'travel', label: 'Travel' },
                                         { id: 'timeOff', label: 'Time Off' },
                                         { id: 'timeOffRequests', label: 'Time Off Requests' },
+                                        { id: 'unfilledShifts', label: 'Unfilled Shifts' },
                                         { id: 'sites', label: 'Sites' },
                                         { id: 'studies', label: 'Studies' }
                                     ].map(tab => {
@@ -22617,6 +22668,7 @@
                     { id: 'travel', label: 'Travel' },
                     { id: 'timeOff', label: 'Time Off' },
                     { id: 'timeOffRequests', label: 'Time Off Requests' },
+                    { id: 'unfilledShifts', label: 'Unfilled Shifts' },
                     { id: 'sites', label: 'Sites' },
                     { id: 'studies', label: 'Studies' },
                     { id: 'users', label: 'Users' }
@@ -35521,8 +35573,10 @@
                                                 ${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'N/A'}
                                             </td>
                                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                ${state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC') ? `
                                                 <button data-action="edit-user" data-id="${user.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 mr-3">Edit</button>
                                                 ${user.username !== 'admin' ? `<button data-action="delete-user" data-id="${user.id}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">Delete</button>` : ''}
+                                                ` : ''}
                                             </td>
                                         </tr>
                                     `).join('')}
@@ -37416,6 +37470,551 @@
                 document.getElementById('travel-export-csv')?.addEventListener('click', () => {
                     exportTravelDataToCSV();
                 });
+            };
+            
+            // =================================================================================
+            // UNFILLED SHIFTS SECTION
+            // =================================================================================
+            
+            const getUnfilledShiftsHTML = () => {
+                return `
+                    <div id="unfilled-shifts-content" class="space-y-6">
+                        <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6">
+                            <div>
+                                <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Unfilled Shifts</h2>
+                                <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">View open positions and get suggestions for filling them</p>
+                            </div>
+                            <div class="flex gap-2">
+                                <button id="unfilled-shifts-refresh" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
+                                    <i data-lucide="refresh-cw" class="w-4 h-4 mr-2"></i>Refresh
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <!-- Filters -->
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow p-4 mb-6">
+                            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Start Date</label>
+                                    <input type="date" id="unfilled-shifts-start-date" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">End Date</label>
+                                    <input type="date" id="unfilled-shifts-end-date" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Study</label>
+                                    <select id="unfilled-shifts-study-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="all">All Studies</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Role</label>
+                                    <select id="unfilled-shifts-role-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="all">All Roles</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Split View: Shifts Left, Suggestions Right -->
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                            <!-- Left: Unfilled Shifts List -->
+                            <div class="bg-white dark:bg-gray-800 rounded-lg shadow">
+                                <div class="p-4 border-b dark:border-gray-700">
+                                    <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Open Positions</h3>
+                                </div>
+                                <div id="unfilled-shifts-list" class="p-4 max-h-[800px] overflow-y-auto">
+                                    <!-- Shifts will be loaded here -->
+                                </div>
+                            </div>
+                            
+                            <!-- Right: Suggestions Panel -->
+                            <div class="bg-white dark:bg-gray-800 rounded-lg shadow">
+                                <div class="p-4 border-b dark:border-gray-700">
+                                    <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Suggested CRCs</h3>
+                                </div>
+                                <div id="unfilled-shifts-suggestions" class="p-4">
+                                    <p class="text-gray-500 dark:text-gray-400 text-center py-8">Select a shift to see suggestions</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            };
+            
+            // Core functions for unfilled shifts
+            const findUnfilledShifts = () => {
+                const unfilledShifts = [];
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+                
+                (state.crc_events || []).forEach(event => {
+                    if (!event || event.type !== 'Site Assignment') return;
+                    
+                    const eventDate = parseDateOnly(event.date);
+                    if (!eventDate || eventDate < today) return; // Only future shifts
+                    
+                    const fulfillment = checkRoleFulfillment(event);
+                    if (fulfillment.unfilledSlots && fulfillment.unfilledSlots.length > 0) {
+                        const study = state.studies?.find(s => event.studyIds?.includes(s.id));
+                        const site = state.crc_sites?.find(s => s.id === event.siteId);
+                        
+                        fulfillment.unfilledSlots.forEach(slot => {
+                            unfilledShifts.push({
+                                eventId: event.id,
+                                date: event.date,
+                                studyId: event.studyIds?.[0],
+                                studyName: study?.name || study?.title || 'Unknown Study',
+                                siteId: event.siteId,
+                                siteName: site?.name || 'Unknown Site',
+                                visit: event.visit || event.visitName || 'N/A',
+                                roleId: slot.roleId,
+                                roleName: slot.roleName,
+                                period: event.period || 'Full Day',
+                                event: event
+                            });
+                        });
+                    }
+                });
+                
+                return unfilledShifts;
+            };
+            
+            const checkCrcAvailability = async (crcId, date, period = 'Full Day') => {
+                const dateStr = toDateOnlyString(parseDateOnly(date));
+                const dateObj = parseDateOnly(date);
+                
+                // Check time off
+                const hasTimeOff = (state.timeOffRequests || []).some(req => {
+                    if (req.crcId !== crcId) return false;
+                    const status = normalizeTimeOffStatus(req.status);
+                    if (status !== 'approved') return false;
+                    
+                    const reqStart = parseDateFlexible(req.startDate || req.date);
+                    const reqEnd = parseDateFlexible(req.endDate || req.date || req.startDate);
+                    return dateObj >= reqStart && dateObj <= reqEnd;
+                });
+                
+                if (hasTimeOff) return { available: false, reason: 'Time off approved' };
+                
+                // Check if scheduled on this date
+                const isScheduled = (state.crc_events || []).some(e => {
+                    if (e.date !== dateStr) return false;
+                    if (e.crcId === crcId) return true;
+                    if (e.roleAssignments) {
+                        return Object.values(e.roleAssignments).some(assignments => 
+                            Array.isArray(assignments) && assignments.includes(crcId)
+                        );
+                    }
+                    return false;
+                });
+                
+                if (isScheduled) return { available: false, reason: 'Already scheduled' };
+                
+                // Check for conflicts in nearby days (within 3 days)
+                const conflicts = [];
+                for (let i = -3; i <= 3; i++) {
+                    if (i === 0) continue;
+                    const checkDate = new Date(dateObj);
+                    checkDate.setDate(checkDate.getDate() + i);
+                    const checkDateStr = toDateOnlyString(checkDate);
+                    
+                    const nearbyEvent = (state.crc_events || []).find(e => {
+                        if (e.date !== checkDateStr) return false;
+                        if (e.crcId === crcId) return true;
+                        if (e.roleAssignments) {
+                            return Object.values(e.roleAssignments).some(assignments => 
+                                Array.isArray(assignments) && assignments.includes(crcId)
+                            );
+                        }
+                        return false;
+                    });
+                    
+                    if (nearbyEvent) {
+                        const site = state.crc_sites?.find(s => s.id === nearbyEvent.siteId);
+                        conflicts.push({
+                            date: checkDateStr,
+                            site: site?.name || 'Unknown',
+                            daysAway: i
+                        });
+                    }
+                }
+                
+                return {
+                    available: true,
+                    conflicts: conflicts.length > 0 ? conflicts : null
+                };
+            };
+            
+            const calculateCrcToSiteDistanceWithTime = async (crc, site) => {
+                try {
+                    const distanceResult = await calculateCrcToSiteDistance(crc, site);
+                    if (!distanceResult) return null;
+                    
+                    return {
+                        distance: distanceResult.distance,
+                        distanceMiles: distanceResult.distanceMiles,
+                        travelTime: distanceResult.travelTime,
+                        travelTimeMinutes: distanceResult.travelTimeMinutes
+                    };
+                } catch (error) {
+                    console.error('Error calculating distance:', error);
+                    return null;
+                }
+            };
+            
+            const rankCrcSuggestions = (suggestions) => {
+                return suggestions.sort((a, b) => {
+                    // Employment type priority: FTE > PTE > Contractor
+                    const empPriority = { 'FTE': 1, 'PTE': 2, 'Contractor': 3 };
+                    const aEmp = empPriority[normalizeEmploymentType(a.crc.employmentType)] || 4;
+                    const bEmp = empPriority[normalizeEmploymentType(b.crc.employmentType)] || 4;
+                    if (aEmp !== bEmp) return aEmp - bEmp;
+                    
+                    // Distance (closer is better)
+                    if (a.distance !== null && b.distance !== null) {
+                        if (a.distance !== b.distance) return a.distance - b.distance;
+                    } else if (a.distance !== null) return -1;
+                    else if (b.distance !== null) return 1;
+                    
+                    // Utilization (lower is better for balancing workload)
+                    if (a.utilization !== undefined && b.utilization !== undefined) {
+                        if (a.utilization !== b.utilization) return a.utilization - b.utilization;
+                    }
+                    
+                    // Name alphabetically as tiebreaker
+                    return (a.crc.name || '').localeCompare(b.crc.name || '');
+                });
+            };
+            
+            const renderUnfilledShiftsContent = async () => {
+                const container = document.getElementById('unfilled-shifts-content');
+                if (!container) return;
+                
+                // Get filters
+                const startDate = document.getElementById('unfilled-shifts-start-date')?.value || '';
+                const endDate = document.getElementById('unfilled-shifts-end-date')?.value || '';
+                const studyFilter = document.getElementById('unfilled-shifts-study-filter')?.value || 'all';
+                const roleFilter = document.getElementById('unfilled-shifts-role-filter')?.value || 'all';
+                
+                // Find all unfilled shifts
+                let unfilledShifts = findUnfilledShifts();
+                
+                // Apply filters
+                if (startDate) {
+                    unfilledShifts = unfilledShifts.filter(s => s.date >= startDate);
+                }
+                if (endDate) {
+                    unfilledShifts = unfilledShifts.filter(s => s.date <= endDate);
+                }
+                if (studyFilter !== 'all') {
+                    unfilledShifts = unfilledShifts.filter(s => s.studyId === studyFilter);
+                }
+                if (roleFilter !== 'all') {
+                    unfilledShifts = unfilledShifts.filter(s => s.roleId === roleFilter);
+                }
+                
+                // Group by Study/Site/Visit
+                const grouped = {};
+                unfilledShifts.forEach(shift => {
+                    const key = `${shift.studyId}-${shift.siteId}-${shift.visit}`;
+                    if (!grouped[key]) {
+                        grouped[key] = {
+                            studyId: shift.studyId,
+                            studyName: shift.studyName,
+                            siteId: shift.siteId,
+                            siteName: shift.siteName,
+                            visit: shift.visit,
+                            shifts: []
+                        };
+                    }
+                    grouped[key].shifts.push(shift);
+                });
+                
+                // Render shifts list
+                const shiftsList = document.getElementById('unfilled-shifts-list');
+                if (shiftsList) {
+                    if (Object.keys(grouped).length === 0) {
+                        shiftsList.innerHTML = '<p class="text-center text-gray-500 dark:text-gray-400 py-8">No unfilled shifts found</p>';
+                    } else {
+                        const groupsArray = Object.values(grouped).sort((a, b) => {
+                            const dateA = a.shifts[0]?.date || '';
+                            const dateB = b.shifts[0]?.date || '';
+                            if (dateA !== dateB) return dateA.localeCompare(dateB);
+                            return a.studyName.localeCompare(b.studyName);
+                        });
+                        
+                        shiftsList.innerHTML = groupsArray.map(group => {
+                            const shiftsHTML = group.shifts.map(shift => {
+                                const dateObj = parseDateOnly(shift.date);
+                                const formattedDate = dateObj ? dateObj.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) : shift.date;
+                                return `
+                                    <div class="border dark:border-gray-700 rounded-lg p-3 mb-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors unfilled-shift-item" 
+                                         data-event-id="${shift.eventId}" 
+                                         data-role-id="${shift.roleId}"
+                                         data-date="${shift.date}">
+                                        <div class="flex justify-between items-start">
+                                            <div class="flex-1">
+                                                <div class="font-medium text-gray-900 dark:text-white">${shift.roleName}</div>
+                                                <div class="text-sm text-gray-600 dark:text-gray-400">${formattedDate} • ${shift.period}</div>
+                                            </div>
+                                            <span class="px-2 py-1 text-xs rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300">Open</span>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('');
+                            
+                            return `
+                                <div class="mb-6">
+                                    <div class="font-semibold text-lg text-gray-900 dark:text-white mb-2 pb-2 border-b dark:border-gray-700">
+                                        ${group.studyName} • ${group.siteName} • Visit ${group.visit}
+                                    </div>
+                                    ${shiftsHTML}
+                                </div>
+                            `;
+                        }).join('');
+                        
+                        // Add click handlers
+                        document.querySelectorAll('.unfilled-shift-item').forEach(item => {
+                            item.addEventListener('click', async () => {
+                                document.querySelectorAll('.unfilled-shift-item').forEach(i => i.classList.remove('ring-2', 'ring-blue-500'));
+                                item.classList.add('ring-2', 'ring-blue-500');
+                                
+                                const eventId = item.dataset.eventId;
+                                const roleId = item.dataset.roleId;
+                                const date = item.dataset.date;
+                                
+                                await loadSuggestionsForShift(eventId, roleId, date);
+                            });
+                        });
+                    }
+                }
+                
+                // Populate filter dropdowns
+                const studySelect = document.getElementById('unfilled-shifts-study-filter');
+                if (studySelect) {
+                    const studies = [...new Set(unfilledShifts.map(s => ({ id: s.studyId, name: s.studyName })))];
+                    studySelect.innerHTML = '<option value="all">All Studies</option>' + 
+                        studies.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+                    if (studyFilter !== 'all') studySelect.value = studyFilter;
+                }
+                
+                const roleSelect = document.getElementById('unfilled-shifts-role-filter');
+                if (roleSelect) {
+                    const roles = [...new Set(unfilledShifts.map(s => ({ id: s.roleId, name: s.roleName })))];
+                    roleSelect.innerHTML = '<option value="all">All Roles</option>' + 
+                        roles.map(r => `<option value="${r.id}">${r.name}</option>`).join('');
+                    if (roleFilter !== 'all') roleSelect.value = roleFilter;
+                }
+                
+                // Set default date range (next 30 days)
+                if (!startDate && document.getElementById('unfilled-shifts-start-date')) {
+                    const today = new Date();
+                    document.getElementById('unfilled-shifts-start-date').value = toDateOnlyString(today);
+                }
+                if (!endDate && document.getElementById('unfilled-shifts-end-date')) {
+                    const future = new Date();
+                    future.setDate(future.getDate() + 30);
+                    document.getElementById('unfilled-shifts-end-date').value = toDateOnlyString(future);
+                }
+                
+                lucide.createIcons();
+                
+                // Add event handlers (remove old ones first to prevent duplicates)
+                const refreshBtn = document.getElementById('unfilled-shifts-refresh');
+                if (refreshBtn) {
+                    refreshBtn.replaceWith(refreshBtn.cloneNode(true));
+                    document.getElementById('unfilled-shifts-refresh').addEventListener('click', () => {
+                        renderUnfilledShiftsContent();
+                    });
+                }
+                
+                ['start-date', 'end-date', 'study-filter', 'role-filter'].forEach(id => {
+                    const el = document.getElementById(`unfilled-shifts-${id}`);
+                    if (el) {
+                        el.replaceWith(el.cloneNode(true));
+                        document.getElementById(`unfilled-shifts-${id}`).addEventListener('change', () => {
+                            renderUnfilledShiftsContent();
+                        });
+                    }
+                });
+            };
+            
+            const loadSuggestionsForShift = async (eventId, roleId, date) => {
+                const suggestionsPanel = document.getElementById('unfilled-shifts-suggestions');
+                if (!suggestionsPanel) return;
+                
+                suggestionsPanel.innerHTML = '<p class="text-center text-gray-500 dark:text-gray-400 py-4">Loading suggestions...</p>';
+                
+                const event = state.crc_events.find(e => e.id === eventId);
+                if (!event) {
+                    suggestionsPanel.innerHTML = '<p class="text-center text-red-500 py-4">Shift not found</p>';
+                    return;
+                }
+                
+                const site = state.crc_sites.find(s => s.id === event.siteId);
+                const role = state.roles.find(r => r.id === roleId);
+                
+                if (!site || !role) {
+                    suggestionsPanel.innerHTML = '<p class="text-center text-red-500 py-4">Site or role not found</p>';
+                    return;
+                }
+                
+                // Find eligible CRCs
+                const suggestions = [];
+                const period = event.period || 'Full Day';
+                
+                for (const crc of state.crcs) {
+                    if (!crc || crc.archived) continue;
+                    
+                    // Check training
+                    if (!hasValidTraining(crc, role.name)) continue;
+                    
+                    // Check availability
+                    const availability = await checkCrcAvailability(crc.id, date, period);
+                    if (!availability.available) continue;
+                    
+                    // Calculate distance
+                    const distanceInfo = await calculateCrcToSiteDistanceWithTime(crc, site);
+                    
+                    // Calculate utilization (simplified - could be enhanced)
+                    const utilization = calculateMonthlyUtilization(parseDateOnly(date), [crc.id]);
+                    
+                    suggestions.push({
+                        crc,
+                        distance: distanceInfo?.distanceMiles || null,
+                        travelTime: distanceInfo?.travelTime || null,
+                        travelTimeMinutes: distanceInfo?.travelTimeMinutes || null,
+                        utilization: utilization || 0,
+                        conflicts: availability.conflicts
+                    });
+                }
+                
+                // Rank suggestions
+                const ranked = rankCrcSuggestions(suggestions);
+                
+                // Render suggestions
+                if (ranked.length === 0) {
+                    suggestionsPanel.innerHTML = '<p class="text-center text-gray-500 dark:text-gray-400 py-8">No eligible CRCs found</p>';
+                    return;
+                }
+                
+                suggestionsPanel.innerHTML = `
+                    <div class="space-y-3">
+                        <div class="text-sm text-gray-600 dark:text-gray-400 mb-4">
+                            <strong>${site.name}</strong> • ${role.name} • ${new Date(date + 'T00:00:00').toLocaleDateString()}
+                        </div>
+                        ${ranked.map((suggestion, index) => {
+                            const conflictText = suggestion.conflicts 
+                                ? `⚠ Conflicts around this time` 
+                                : '';
+                            const distanceText = suggestion.distance !== null 
+                                ? `${suggestion.distance.toFixed(1)} mi (${suggestion.travelTime || 'N/A'})`
+                                : 'Distance unknown';
+                            
+                            return `
+                                <div class="border dark:border-gray-700 rounded-lg p-4 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
+                                    <div class="flex justify-between items-start mb-2">
+                                        <div class="flex-1">
+                                            <div class="font-medium text-gray-900 dark:text-white">${suggestion.crc.name}</div>
+                                            <div class="text-sm text-gray-600 dark:text-gray-400">
+                                                ${normalizeEmploymentType(suggestion.crc.employmentType)} • ${distanceText}
+                                            </div>
+                                            ${conflictText ? `<div class="text-xs text-yellow-600 dark:text-yellow-400 mt-1">${conflictText}</div>` : ''}
+                                        </div>
+                                        <span class="px-2 py-1 text-xs rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-300">
+                                            #${index + 1}
+                                        </span>
+                                    </div>
+                                    <div class="flex gap-2 mt-3">
+                                        <button class="flex-1 bg-blue-600 text-white py-2 px-3 rounded-md hover:bg-blue-700 text-sm assign-crc-btn" 
+                                                data-crc-id="${suggestion.crc.id}" 
+                                                data-event-id="${eventId}" 
+                                                data-role-id="${roleId}">
+                                            Assign
+                                        </button>
+                                        <button class="bg-gray-600 text-white py-2 px-3 rounded-md hover:bg-gray-700 text-sm view-shift-btn" 
+                                                data-event-id="${eventId}">
+                                            View Shift
+                                        </button>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                `;
+                
+                // Add event handlers
+                document.querySelectorAll('.assign-crc-btn').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        e.stopPropagation();
+                        const crcId = btn.dataset.crcId;
+                        const eventId = btn.dataset.eventId;
+                        const roleId = btn.dataset.roleId;
+                        await assignCrcToShift(eventId, roleId, crcId);
+                    });
+                });
+                
+                document.querySelectorAll('.view-shift-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const eventId = btn.dataset.eventId;
+                        const event = state.crc_events.find(e => e.id === eventId);
+                        if (event) {
+                            window._currentEditingEvent = event;
+                            openModal(getCRCEventModalHTML(event.date, event, event.date, event.date), '4xl');
+                        }
+                    });
+                });
+            };
+            
+            const assignCrcToShift = async (eventId, roleId, crcId) => {
+                try {
+                    const event = state.crc_events.find(e => e.id === eventId);
+                    if (!event) {
+                        showNotification('Shift not found', 'error');
+                        return;
+                    }
+                    
+                    // Update roleAssignments
+                    if (!event.roleAssignments) {
+                        event.roleAssignments = {};
+                    }
+                    if (!event.roleAssignments[roleId]) {
+                        event.roleAssignments[roleId] = [];
+                    }
+                    
+                    // Find first empty slot or add to end
+                    const assignments = event.roleAssignments[roleId];
+                    const emptyIndex = assignments.findIndex(a => !a || a === '' || a === 'UNASSIGNED');
+                    
+                    if (emptyIndex >= 0) {
+                        assignments[emptyIndex] = crcId;
+                    } else {
+                        assignments.push(crcId);
+                    }
+                    
+                    // Update event in database
+                    await apiService.updateEvent(eventId, {
+                        roleAssignments: event.roleAssignments
+                    });
+                    
+                    // Update local state
+                    const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
+                    if (eventIndex >= 0) {
+                        state.crc_events[eventIndex] = { ...event, roleAssignments: event.roleAssignments };
+                        setState({ crc_events: state.crc_events });
+                    }
+                    
+                    showNotification('CRC assigned successfully!', 'success');
+                    
+                    // Refresh the view
+                    await renderUnfilledShiftsContent();
+                } catch (error) {
+                    console.error('Error assigning CRC:', error);
+                    showNotification('Failed to assign CRC. See console for details.', 'error');
+                }
             };
             
             const exportTravelDataToCSV = () => {
