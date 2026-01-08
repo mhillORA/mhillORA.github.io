@@ -8950,12 +8950,46 @@
                                 <div class="space-y-1 max-h-60 overflow-y-auto">
                                     ${uniqueCrcs.map(({ crc, roles }) => {
                                         const isCurrentUser = crc.id === currentCrcId;
+                                        
+                                        // Get Navan records for this CRC if this is a Travel Day
+                                        let navanLinksHtml = '';
+                                        if (event.type === 'Travel Day' && event.navanRecords && event.navanRecords[crc.id]) {
+                                            const navanRecords = event.navanRecords[crc.id];
+                                            if (navanRecords && navanRecords.length > 0) {
+                                                navanLinksHtml = `
+                                                    <div class="mt-2 pt-2 border-t border-gray-200 dark:border-gray-600">
+                                                        <div class="text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Navan Bookings:</div>
+                                                        <div class="space-y-1">
+                                                            ${navanRecords.map(record => {
+                                                                const bookingType = record.bookingType || 'UNKNOWN';
+                                                                const displayText = record.flightNumber 
+                                                                    ? `Flight ${record.flightNumber}` 
+                                                                    : (record.origin && record.destination 
+                                                                        ? `${record.origin} → ${record.destination}` 
+                                                                        : bookingType);
+                                                                const navanUrl = `https://app.navan.com/bookings/${record.bookingId}`;
+                                                                return `
+                                                                    <a href="${navanUrl}" target="_blank" rel="noopener noreferrer" 
+                                                                       class="text-xs text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 underline flex items-center gap-1">
+                                                                        <i data-lucide="external-link" class="w-3 h-3"></i>
+                                                                        ${displayText}
+                                                                        ${record.confirmationNumber ? ` (${record.confirmationNumber})` : ''}
+                                                                    </a>
+                                                                `;
+                                                            }).join('')}
+                                                        </div>
+                                                    </div>
+                                                `;
+                                            }
+                                        }
+                                        
                                         return `
                                         <div class="p-2 ${isCurrentUser ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700' : 'bg-gray-50 dark:bg-gray-700'} rounded-md">
                                             <div class="font-medium ${isCurrentUser ? 'text-blue-900 dark:text-blue-200' : 'text-gray-700 dark:text-gray-300'}">
                                                 ${crc.name}${isCurrentUser ? ' (You)' : ''}
                                             </div>
                                             ${roles.length > 0 ? `<div class="text-xs text-gray-600 dark:text-gray-400 mt-1">${roles.join(', ')}</div>` : ''}
+                                            ${navanLinksHtml}
                                         </div>
                                     `;
                                     }).join('')}
@@ -8964,6 +8998,13 @@
                         ` : '<div class="text-sm text-gray-600 dark:text-gray-400">No staff assigned</div>'}
                     </div>
                 `, 'lg');
+                
+                // Initialize Lucide icons for external link icons
+                setTimeout(() => {
+                    if (typeof lucide !== 'undefined') {
+                        lucide.createIcons();
+                    }
+                }, 100);
             };
 
             const getReportingHTML = () => {
@@ -14286,6 +14327,50 @@
                         if (parsed) return parsed;
                     }
                     return null;
+                };
+                
+                // Find all matching Navan records for a CRC on a specific date
+                const findMatchingNavanRecords = (crcId, dateStr) => {
+                    if (!state.travel || !dateStr) return [];
+                    const crc = state.crcs.find(c => c.id === crcId);
+                    if (!crc) return [];
+                    
+                    const crcNameLower = (crc.name || '').toLowerCase();
+                    const matchingRecords = [];
+                    
+                    (state.travel || []).forEach(travel => {
+                        if (!travel) return;
+                        
+                        // Check if travel belongs to this CRC
+                        const travelCrcId = travel.crcId;
+                        const matchesCrc = travelCrcId === crcId || 
+                                         travelCrcId === crc.name ||
+                                         (travel.travelerName && travel.travelerName.toLowerCase() === crcNameLower);
+                        
+                        if (!matchesCrc) return;
+                        
+                        // Check if date matches
+                        const travelDate = getTravelPrimaryDate(travel);
+                        if (!travelDate) return;
+                        const travelDateOnly = toDateOnlyString(travelDate);
+                        if (travelDateOnly !== dateStr) return;
+                        
+                        // Store Navan booking info
+                        const bookingId = travel.navanBookingId || travel.navanBookingUuid || travel.bookingId;
+                        if (bookingId) {
+                            matchingRecords.push({
+                                bookingId: bookingId,
+                                bookingType: travel.bookingType || 'UNKNOWN',
+                                flightNumber: travel.flightNumber,
+                                origin: travel.origin,
+                                destination: travel.destination,
+                                confirmationNumber: travel.confirmationNumber,
+                                travelerName: travel.travelerName || crc.name
+                            });
+                        }
+                    });
+                    
+                    return matchingRecords;
                 };
 
                 // Get flights that are synced with shifts (same CRC name and date)
@@ -28385,6 +28470,14 @@
                                                 if (matchingFlight.bookingId) travelPayload.travelBookingId = matchingFlight.bookingId;
                                             }
                                             
+                                            // Find all matching Navan records for this CRC on this date
+                                            const matchingNavanRecords = findMatchingNavanRecords(crcId, startTravelDateStr);
+                                            if (matchingNavanRecords.length > 0) {
+                                                travelPayload.navanRecords = {
+                                                    [crcId]: matchingNavanRecords
+                                                };
+                                            }
+                                            
                                             await createAndStoreEvent(travelPayload);
                                         } else {
                                             console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation in duplicate schedule');
@@ -28445,6 +28538,14 @@
                                                 if (matchingFlight.arrivalTime) travelPayload.arrivalTime = matchingFlight.arrivalTime;
                                                 if (matchingFlight.confirmationNumber) travelPayload.confirmationNumber = matchingFlight.confirmationNumber;
                                                 if (matchingFlight.bookingId) travelPayload.travelBookingId = matchingFlight.bookingId;
+                                            }
+                                            
+                                            // Find all matching Navan records for this CRC on this date
+                                            const matchingNavanRecords = findMatchingNavanRecords(crcId, startTravelDateStr);
+                                            if (matchingNavanRecords.length > 0) {
+                                                travelPayload.navanRecords = {
+                                                    [crcId]: matchingNavanRecords
+                                                };
                                             }
                                             
                                             await createAndStoreEvent(travelPayload);
@@ -28889,6 +28990,41 @@
                                                 groupId: newGroupId
                                             };
                                             
+                                            // For Travel Day events, find and link matching Navan records
+                                            if (isTravelDay && dateStr) {
+                                                const navanRecordsByCrc = {};
+                                                
+                                                // Get all CRCs assigned to this travel day
+                                                const assignedCrcIds = new Set();
+                                                if (travelDayCrcId) {
+                                                    assignedCrcIds.add(travelDayCrcId);
+                                                }
+                                                if (finalRoleAssignments && Object.keys(finalRoleAssignments).length > 0) {
+                                                    Object.values(finalRoleAssignments).forEach(assignments => {
+                                                        if (Array.isArray(assignments)) {
+                                                            assignments.forEach(crcId => {
+                                                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                                    assignedCrcIds.add(crcId);
+                                                                }
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                                
+                                                // Find matching Navan records for each CRC
+                                                assignedCrcIds.forEach(crcId => {
+                                                    const matchingRecords = findMatchingNavanRecords(crcId, dateStr);
+                                                    if (matchingRecords.length > 0) {
+                                                        navanRecordsByCrc[crcId] = matchingRecords;
+                                                    }
+                                                });
+                                                
+                                                // Add Navan records to event payload if any found
+                                                if (Object.keys(navanRecordsByCrc).length > 0) {
+                                                    eventPayload.navanRecords = navanRecordsByCrc;
+                                                }
+                                            }
+                                            
                                             try {
                                                 const created = await apiService.createEvent(eventPayload);
                                                 if (created && created.id) {
@@ -28943,6 +29079,33 @@
                                         // Create a new groupId for the multi-day event
                                         const newGroupId = crypto.randomUUID();
                                         
+                                        // For Travel Day events, find and link matching Navan records
+                                        let navanRecordsByCrc = {};
+                                        if (isTravelDayEdit && newStartDateStr) {
+                                            const assignedCrcIds = new Set();
+                                            if (travelDayCrcId) {
+                                                assignedCrcIds.add(travelDayCrcId);
+                                            }
+                                            if (finalRoleAssignments && Object.keys(finalRoleAssignments).length > 0) {
+                                                Object.values(finalRoleAssignments).forEach(assignments => {
+                                                    if (Array.isArray(assignments)) {
+                                                        assignments.forEach(crcId => {
+                                                            if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                                assignedCrcIds.add(crcId);
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                            
+                                            assignedCrcIds.forEach(crcId => {
+                                                const matchingRecords = findMatchingNavanRecords(crcId, newStartDateStr);
+                                                if (matchingRecords.length > 0) {
+                                                    navanRecordsByCrc[crcId] = matchingRecords;
+                                                }
+                                            });
+                                        }
+                                        
                                         // Update the existing event to be part of the group
                                         const updatePayload = {
                                             ...baseEventData,
@@ -28958,6 +29121,11 @@
                                             endDate: newEndDateStr,
                                             groupId: newGroupId
                                         };
+                                        
+                                        // Add Navan records if any found
+                                        if (Object.keys(navanRecordsByCrc).length > 0) {
+                                            updatePayload.navanRecords = navanRecordsByCrc;
+                                        }
                                         
                                         // Update the existing event
                                         const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
@@ -28990,6 +29158,41 @@
                                                 endDate: newEndDateStr,
                                                 groupId: newGroupId
                                             };
+                                            
+                                            // For Travel Day events, find and link matching Navan records
+                                            if (isTravelDay && dateStr) {
+                                                const navanRecordsByCrc = {};
+                                                
+                                                // Get all CRCs assigned to this travel day
+                                                const assignedCrcIds = new Set();
+                                                if (travelDayCrcId) {
+                                                    assignedCrcIds.add(travelDayCrcId);
+                                                }
+                                                if (finalRoleAssignments && Object.keys(finalRoleAssignments).length > 0) {
+                                                    Object.values(finalRoleAssignments).forEach(assignments => {
+                                                        if (Array.isArray(assignments)) {
+                                                            assignments.forEach(crcId => {
+                                                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                                    assignedCrcIds.add(crcId);
+                                                                }
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                                
+                                                // Find matching Navan records for each CRC
+                                                assignedCrcIds.forEach(crcId => {
+                                                    const matchingRecords = findMatchingNavanRecords(crcId, dateStr);
+                                                    if (matchingRecords.length > 0) {
+                                                        navanRecordsByCrc[crcId] = matchingRecords;
+                                                    }
+                                                });
+                                                
+                                                // Add Navan records to event payload if any found
+                                                if (Object.keys(navanRecordsByCrc).length > 0) {
+                                                    eventPayload.navanRecords = navanRecordsByCrc;
+                                                }
+                                            }
                                             
                                             try {
                                                 const created = await apiService.createEvent(eventPayload);
@@ -29049,6 +29252,33 @@
                                             }
                                         }
                                         
+                                        // For Travel Day events, find and link matching Navan records
+                                        let navanRecordsByCrc = {};
+                                        if (isTravelDayEdit && newStartDateStr) {
+                                            const assignedCrcIds = new Set();
+                                            if (travelDayCrcId) {
+                                                assignedCrcIds.add(travelDayCrcId);
+                                            }
+                                            if (finalRoleAssignments && Object.keys(finalRoleAssignments).length > 0) {
+                                                Object.values(finalRoleAssignments).forEach(assignments => {
+                                                    if (Array.isArray(assignments)) {
+                                                        assignments.forEach(crcId => {
+                                                            if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                                assignedCrcIds.add(crcId);
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                            
+                                            assignedCrcIds.forEach(crcId => {
+                                                const matchingRecords = findMatchingNavanRecords(crcId, newStartDateStr);
+                                                if (matchingRecords.length > 0) {
+                                                    navanRecordsByCrc[crcId] = matchingRecords;
+                                                }
+                                            });
+                                        }
+                                        
                                         const updatePayload = {
                                             ...baseEventData,
                                             type: data.eventType,
@@ -29063,6 +29293,11 @@
                                             endDate: newStartDateStr, // Same as start date for single-day
                                             groupId: null // Remove groupId
                                         };
+                                        
+                                        // Add Navan records if any found
+                                        if (Object.keys(navanRecordsByCrc).length > 0) {
+                                            updatePayload.navanRecords = navanRecordsByCrc;
+                                        }
                                         
                                         const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
                                         
@@ -29294,6 +29529,14 @@
                                                                 if (matchingFlight.bookingId) startTravelEventData.travelBookingId = matchingFlight.bookingId;
                                                             }
                                                             
+                                                            // Find all matching Navan records for this CRC on this date
+                                                            const matchingNavanRecords = findMatchingNavanRecords(crcId, startTravelDateStr);
+                                                            if (matchingNavanRecords.length > 0) {
+                                                                startTravelEventData.navanRecords = {
+                                                                    [crcId]: matchingNavanRecords
+                                                                };
+                                                            }
+                                                            
                                                             try {
                                                                 const created = await apiService.createEvent(startTravelEventData);
                                                                 if (created && created.id) {
@@ -29356,6 +29599,14 @@
                                                                 if (matchingFlight.arrivalTime) endTravelEventData.arrivalTime = matchingFlight.arrivalTime;
                                                                 if (matchingFlight.confirmationNumber) endTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
                                                                 if (matchingFlight.bookingId) endTravelEventData.travelBookingId = matchingFlight.bookingId;
+                                                            }
+                                                            
+                                                            // Find all matching Navan records for this CRC on this date
+                                                            const matchingNavanRecords = findMatchingNavanRecords(crcId, endTravelDateStr);
+                                                            if (matchingNavanRecords.length > 0) {
+                                                                endTravelEventData.navanRecords = {
+                                                                    [crcId]: matchingNavanRecords
+                                                                };
                                                             }
                                                             
                                                             try {
