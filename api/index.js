@@ -1865,16 +1865,56 @@ app.http('usersAuthenticate', {
             }
             
             if (users.length === 0) {
-                return {
-                    status: 401,
-                    jsonBody: { error: 'Invalid username or password' },
-                    headers: { 'Content-Type': 'application/json' }
-                };
+                // Special handling for admin user - create it if it doesn't exist AND they're using the default password
+                if (username.toLowerCase().trim() === 'admin' && password === 'Password1!') {
+                    try {
+                        const adminUser = {
+                            id: generateId(),
+                            username: 'admin',
+                            password: hashPassword('Password1!'),
+                            permissionLevel: 'Manager',
+                            email: '',
+                            entraId: '',
+                            createdAt: new Date().toISOString()
+                        };
+                        const { resource: createdUser } = await container.items.create(adminUser);
+                        user = createdUser;
+                        context.log.info('Admin user created during authentication');
+                        // Password is already verified since we checked it matches 'Password1!'
+                    } catch (createError) {
+                        context.log.error('Error creating admin user:', createError);
+                        return {
+                            status: 401,
+                            jsonBody: { error: 'Invalid username or password' },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                } else {
+                    return {
+                        status: 401,
+                        jsonBody: { error: 'Invalid username or password' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+            } else {
+                user = users[0];
             }
             
-            let user = users[0];
+            // Check if user has a password field, if not and it's admin, set default password
+            // But only if they're using the default password
+            if (!user.password && username.toLowerCase().trim() === 'admin' && password === 'Password1!') {
+                context.log.warn('Admin user missing password, setting default password');
+                user.password = hashPassword('Password1!');
+                try {
+                    await container.items.upsert(user);
+                } catch (updateError) {
+                    context.log.error('Error updating admin password:', updateError);
+                }
+            }
             
-            if (!verifyPassword(password, user.password)) {
+            // Verify password (skip if we just created admin user with matching password)
+            const isNewlyCreatedAdmin = users.length === 0 && username.toLowerCase().trim() === 'admin' && password === 'Password1!';
+            if (!isNewlyCreatedAdmin && (!user.password || !verifyPassword(password, user.password))) {
                 return {
                     status: 401,
                     jsonBody: { error: 'Invalid username or password' },

