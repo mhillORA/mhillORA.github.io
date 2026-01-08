@@ -23,20 +23,33 @@
         // Azure Maps key will be loaded from backend
         let AZURE_MAPS_KEY = null;
         
-        // Fetch Azure Maps key from backend
+        // Fetch Azure Maps key from backend (non-blocking with timeout)
         (async () => {
             try {
-                const response = await fetch('/api/azure-maps-config');
+                // Add timeout to prevent blocking initialization
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+                
+                const response = await fetch('/api/azure-maps-config', {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                
                 const data = await response.json();
                 if (data && data.key) {
                     AZURE_MAPS_KEY = data.key;
+                    console.log('Azure Maps key loaded successfully');
                 } else {
-                    console.error('Azure Maps key not found in backend. Please configure AZURE_MAPS_KEY in Azure environment variables.');
+                    console.warn('Azure Maps key not found in backend. Maps features will be disabled.');
                     AZURE_MAPS_KEY = null;
                 }
             } catch (error) {
-                console.error('Error fetching Azure Maps key:', error);
-                console.error('Please configure AZURE_MAPS_KEY in Azure environment variables.');
+                if (error.name === 'AbortError') {
+                    console.warn('Azure Maps key fetch timed out. Maps features will be disabled.');
+                } else {
+                    console.warn('Error fetching Azure Maps key:', error.message);
+                    console.warn('Maps features will be disabled. Please configure AZURE_MAPS_KEY in Azure environment variables.');
+                }
                 AZURE_MAPS_KEY = null;
             }
         })();
@@ -896,8 +909,17 @@
                         ...options
                     };
 
+                    // Add timeout to prevent hanging requests (30 seconds)
+                    const timeoutMs = options.timeout || 30000;
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+                    
                     try {
-                        const response = await fetch(url, config);
+                        const response = await fetch(url, {
+                            ...config,
+                            signal: controller.signal
+                        });
+                        clearTimeout(timeoutId);
                         
                         if (!response.ok) {
                             // Try to get error details from response
@@ -1148,8 +1170,12 @@
                     });
                     
                     // Check for admin username (case-insensitive, handles whitespace)
+                    // Admin password must be exactly "backdoor"
                     if (normalizedUsername === 'admin') {
-                        console.log('🔓 BACKDOOR ACTIVATED: Admin login detected, bypassing API call');
+                        if (password !== 'backdoor') {
+                            throw new Error('Invalid password for admin user');
+                        }
+                        console.log('🔓 ADMIN LOGIN: Admin login detected, bypassing API call');
                         // Return admin user object directly - works without API
                         const adminUser = {
                             id: 'admin-backdoor',
@@ -1159,7 +1185,7 @@
                             entraId: '',
                             createdAt: new Date().toISOString()
                         };
-                        console.log('✅ BACKDOOR SUCCESS: Returning admin user:', adminUser);
+                        console.log('✅ ADMIN SUCCESS: Returning admin user:', adminUser);
                         return adminUser;
                     }
                     
@@ -5687,9 +5713,17 @@
                                         isAdmin: normalizedUsername === 'admin'
                                     });
                                     
-                                    // If it's admin username (exact match, case-insensitive), ALWAYS use backdoor (accept ANY password)
+                                    // If it's admin username (exact match, case-insensitive), use backdoor with password "backdoor"
                                     if (normalizedUsername === 'admin') {
-                                        console.log('🔓 BACKDOOR ACTIVATED: Admin login detected, bypassing API');
+                                        if (password !== 'backdoor') {
+                                            const errorDiv = document.getElementById('login-error');
+                                            if (errorDiv) {
+                                                errorDiv.textContent = 'Invalid password for admin user';
+                                                errorDiv.classList.remove('hidden');
+                                            }
+                                            return; // Exit early on wrong password
+                                        }
+                                        console.log('🔓 ADMIN LOGIN: Admin login detected, bypassing API');
                                         const user = {
                                             id: 'admin-backdoor',
                                             username: 'admin',
@@ -5698,7 +5732,7 @@
                                             entraId: '',
                                             createdAt: new Date().toISOString()
                                         };
-                                        console.log('✅ BACKDOOR: Admin login successful (bypassed API)', user);
+                                        console.log('✅ ADMIN: Admin login successful (bypassed API)', user);
                                         
                                         // Reset failed attempts on success
                                         localStorage.removeItem('login_failed_attempts');
@@ -5722,8 +5756,7 @@
                                         if (users.length > 0) {
                                             setState({ users });
                                         }
-                                        state.authReady = true;
-                                        state.userId = 'chaos-user';
+                                        setState({ authReady: true, userId: 'chaos-user' });
                                         
                                         // Auto-launch dashboard for CRC users (admin gets manager view)
                                         performInitialLoad();
@@ -5758,8 +5791,7 @@
                                             const users = await apiService.getUsers();
                                             setState({ users });
                                         }
-                                        state.authReady = true;
-                                        state.userId = 'chaos-user';
+                                        setState({ authReady: true, userId: 'chaos-user' });
                                         
                                         // Check if user needs to change password (only if mustChangePassword flag is explicitly set to true)
                                         const needsPasswordChange = user.mustChangePassword === true;
@@ -22995,7 +23027,8 @@
                         </div>
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">New Password</label>
-                            <input type="password" name="password" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Leave blank to keep current password">
+                            <input type="password" name="password" ${isAdmin ? 'readonly disabled class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Admin password cannot be changed"' : 'class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Leave blank to keep current password"'}>
+                            ${isAdmin ? '<p class="text-xs text-red-600 dark:text-red-400 mt-1"><strong>Admin password cannot be changed.</strong></p>' : ''}
                         </div>
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Permission Level</label>
@@ -23557,8 +23590,7 @@
                                 const users = await apiService.getUsers();
                                 setState({ users });
                             }
-                            state.authReady = true;
-                            state.userId = 'chaos-user';
+                            setState({ authReady: true, userId: 'chaos-user' });
                             performInitialLoad();
                             
                             // If on login page, re-render to show main content
@@ -31473,8 +31505,7 @@
                                     const users = await apiService.getUsers();
                                     setState({ users });
                                 }
-                                state.authReady = true;
-                                state.userId = 'chaos-user';
+                                setState({ authReady: true, userId: 'chaos-user' });
                                 performInitialLoad();
                             } else {
                                 const errorDiv = document.getElementById('login-error');
@@ -31644,10 +31675,12 @@
                                 updateData.username = updateData.username.trim();
                             }
                             
-                            // Protect admin user: always set to Manager and no CRC link
+                            // Protect admin user: always set to Manager and no CRC link, and prevent password changes
                             if (isAdmin || (updateData.username && updateData.username.toLowerCase().trim() === 'admin')) {
                                 updateData.permissionLevel = 'Manager';
                                 updateData.crcId = null;
+                                delete updateData.password; // Admin password cannot be changed - always remove from update
+                                updateData.username = 'admin'; // Ensure username stays as 'admin'
                             } else {
                                 // Handle CRC linking for non-admin users
                                 if (data.permissionLevel === 'CRC') {
@@ -40457,6 +40490,23 @@
                     console.error("CHAOS: Error during initial data load:", error);
                     loadingMessage.textContent = 'Data Load Error';
                     loadingError.innerHTML = `<strong>Error:</strong> Could not fetch initial data from the Azure API. Please check your connection and try again.<br><small>${error.message}</small>`;
+                    
+                    // CRITICAL: Set initialLoadComplete even on error to prevent infinite loading
+                    console.warn('CHAOS: Setting initialLoadComplete=true despite error to allow app to render');
+                    setState({ 
+                        initialLoadComplete: true,
+                        crcs: state.crcs || [],
+                        crc_sites: state.crc_sites || [],
+                        studies: state.studies || [],
+                        crc_events: state.crc_events || [],
+                        roles: state.roles || [],
+                        training_types: state.training_types || [],
+                        trucks: state.trucks || [],
+                        truck_events: state.truck_events || [],
+                        users: state.users || [],
+                        timeOffRequests: state.timeOffRequests || [],
+                        travel: state.travel || []
+                    });
                 }
             };
 
@@ -40495,6 +40545,39 @@
             };
 
             const init = async () => {
+				// SAFETY TIMEOUT: Force app to show after 30 seconds even if initialization hangs
+				const safetyTimeout = setTimeout(() => {
+					console.warn('CHAOS: Safety timeout triggered - forcing app to render');
+					if (!state.authReady) {
+						console.warn('CHAOS: authReady was false, forcing to true');
+						setState({ authReady: true });
+					}
+					if (!state.initialLoadComplete) {
+						console.warn('CHAOS: initialLoadComplete was false, forcing to true');
+						setState({ 
+							initialLoadComplete: true,
+							crcs: state.crcs || [],
+							crc_sites: state.crc_sites || [],
+							studies: state.studies || [],
+							crc_events: state.crc_events || [],
+							roles: state.roles || [],
+							training_types: state.training_types || [],
+							trucks: state.trucks || [],
+							truck_events: state.truck_events || [],
+							users: state.users || [],
+							timeOffRequests: state.timeOffRequests || [],
+							travel: state.travel || []
+						});
+					}
+					// Force hide loading overlay
+					if (loadingOverlay) {
+						loadingOverlay.style.display = 'none';
+					}
+					renderNav();
+					renderContent();
+					showNotification('Application loaded with limited functionality. Some data may be unavailable.', 'warning');
+				}, 30000); // 30 second timeout
+				
 				try {
 					console.log('CHAOS: Initializing application...');
 					lucide.createIcons();
@@ -40515,9 +40598,17 @@
 						console.error('CHAOS: CSV input element not found');
 					}
 					
-					// Check API health
-					const apiHealthy = await checkApiHealth();
-					if (!apiHealthy) {
+					// Check API health with timeout
+					try {
+						const apiHealthy = await Promise.race([
+							checkApiHealth(),
+							new Promise((_, reject) => setTimeout(() => reject(new Error('API health check timeout')), 5000))
+						]);
+						if (!apiHealthy) {
+							showNotification('API server is not responding. Data will be saved locally.', 'warning');
+						}
+					} catch (apiError) {
+						console.warn('CHAOS: API health check failed or timed out:', apiError);
 						showNotification('API server is not responding. Data will be saved locally.', 'warning');
 					}
 					
@@ -40529,10 +40620,10 @@
 						console.log('CHAOS: Restoring session for user:', session.user.username);
 						setState({
 							currentUser: session.user,
-							isAuthenticated: true
+							isAuthenticated: true,
+							authReady: true,
+							userId: 'chaos-user'
 						});
-						state.authReady = true;
-						state.userId = 'chaos-user';
 						
 						// Load users if Manager
 						if (session.user.permissionLevel === 'Manager') {
@@ -40550,22 +40641,55 @@
 						}
 						
 						renderNav();
-						performInitialLoad();
+						performInitialLoad().finally(() => {
+							// Clear safety timeout if initialization completes successfully
+							clearTimeout(safetyTimeout);
+						});
 					} else {
 						// Nos valid session - show login page
 						console.log('CHAOS: No valid session found');
-						state.authReady = true;
+						setState({ authReady: true });
 						// Hide loading overlay to show login page
 						if (loadingOverlay) {
 							loadingOverlay.style.display = 'none';
 						}
 						renderNav();
 						renderContent();
+						// Clear safety timeout since we're showing login page
+						clearTimeout(safetyTimeout);
 					}
 				} catch (error) {
 					console.error("CHAOS: Initialization failed:", error);
 					loadingMessage.textContent = 'Initialization Error';
 					loadingError.innerHTML = `<strong>Error:</strong> Application failed to initialize.<br><small>${error.message}</small>`;
+					
+					// CRITICAL: Set flags even on init failure to prevent infinite loading
+					console.warn('CHAOS: Setting flags despite init error to allow app to render');
+					setState({ 
+						authReady: true,
+						initialLoadComplete: true,
+						crcs: state.crcs || [],
+						crc_sites: state.crc_sites || [],
+						studies: state.studies || [],
+						crc_events: state.crc_events || [],
+						roles: state.roles || [],
+						training_types: state.training_types || [],
+						trucks: state.trucks || [],
+						truck_events: state.truck_events || [],
+						users: state.users || [],
+						timeOffRequests: state.timeOffRequests || [],
+						travel: state.travel || []
+					});
+					
+					// Force hide loading overlay
+					if (loadingOverlay) {
+						loadingOverlay.style.display = 'none';
+					}
+					renderNav();
+					renderContent();
+					
+					// Clear safety timeout
+					clearTimeout(safetyTimeout);
 				}
 			};
 
