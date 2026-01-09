@@ -1915,6 +1915,7 @@
                 sidebarCollapsed: false, // Track if sidebar is collapsed
                 sitesStudiesSubtab: 'sites', // Track which subtab is active in Sites/Studies tab
                 crcTabSubtab: 'crcs', // Track which subtab is active in CRC tab (crcs or roles)
+                crcDashboardView: 'mySchedule', // Track CRC dashboard view: 'mySchedule' (default) or 'entireSchedule'
                 trainingTab: 'overview', // Can be 'overview', 'reporting', or 'expired'
                 trucksTab: 'overview', // Can be 'overview', 'schedule', or 'maintenance'
                 truckCalendarDate: new Date(), // For truck calendar navigation
@@ -5721,6 +5722,9 @@
                     // Show CRC Dashboard for non-managers, regular dashboard for managers
                     if (state.currentUser && !isAdminUser() && getEffectivePermissionLevel() !== 'Manager') {
                         mainAppContent.innerHTML = getCRCDashboardHTML();
+                        setTimeout(() => {
+                            renderCRCDashboardCalendar();
+                        }, 100);
                     } else {
                         mainAppContent.innerHTML = getDashboardHTML();
                         // Initialize maps when dashboard is shown
@@ -8575,11 +8579,24 @@
                     `;
                 }
                 
+                const dashboardView = state.crcDashboardView || 'mySchedule';
+                
                 return `
                     <div class="w-full bg-white dark:bg-gray-800 p-4 md:p-6 rounded-lg shadow-md">
-                        <div class="mb-6">
-                            <h2 class="text-2xl font-bold text-gray-800 dark:text-white mb-2">CRC Dashboard</h2>
-                            <p class="text-gray-600 dark:text-gray-400">Welcome, ${crc.name}!</p>
+                        <div class="mb-6 flex justify-between items-center">
+                            <div>
+                                <h2 class="text-2xl font-bold text-gray-800 dark:text-white mb-2">CRC Dashboard</h2>
+                                <p class="text-gray-600 dark:text-gray-400">Welcome, ${crc.name}!</p>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span class="text-sm text-gray-600 dark:text-gray-400">View:</span>
+                                <button data-action="set-crc-dashboard-view" data-view="mySchedule" class="px-3 py-1 rounded-md text-sm ${dashboardView === 'mySchedule' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-600'} transition-colors">
+                                    My Schedule
+                                </button>
+                                <button data-action="set-crc-dashboard-view" data-view="entireSchedule" class="px-3 py-1 rounded-md text-sm ${dashboardView === 'entireSchedule' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-600'} transition-colors">
+                                    Entire Schedule
+                                </button>
+                            </div>
                         </div>
                         
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
@@ -8591,6 +8608,10 @@
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
                             ${upcomingShiftsHTML}
                             ${travelHTML}
+                        </div>
+                        
+                        <div id="crc-dashboard-calendar-container" class="mt-6">
+                            <!-- Calendar will be rendered here based on view selection -->
                         </div>
                         
                         <div class="mt-6 p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
@@ -8606,6 +8627,152 @@
                         </div>
                     </div>
                 `;
+            };
+            
+            const renderCRCDashboardCalendar = () => {
+                const container = document.getElementById('crc-dashboard-calendar-container');
+                if (!container) return;
+                
+                const matchingCrcId = getLoggedInCrcId();
+                if (!matchingCrcId) return;
+                
+                const dashboardView = state.crcDashboardView || 'mySchedule';
+                const now = state.crcCalendarDate || new Date();
+                const year = now.getFullYear();
+                const month = now.getMonth();
+                const daysInMonth = new Date(year, month + 1, 0).getDate();
+                const firstDayOfMonth = new Date(year, month, 1).getDay();
+                const monthName = new Date(year, month, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+                
+                // Get events based on view selection
+                let filteredEvents = [];
+                if (dashboardView === 'mySchedule') {
+                    // Only show this CRC's events
+                    filteredEvents = (state.crc_events || []).filter(e => {
+                        if (e.crcId === matchingCrcId) return true;
+                        if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
+                            return Object.values(e.roleAssignments).some(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    return assignments.includes(matchingCrcId);
+                                }
+                                return false;
+                            });
+                        }
+                        return false;
+                    });
+                } else {
+                    // Show all events (entire schedule)
+                    filteredEvents = state.crc_events || [];
+                }
+                
+                // Filter to current month
+                filteredEvents = filteredEvents.filter(e => {
+                    const eventDate = new Date(e.date + 'T00:00:00');
+                    return eventDate.getFullYear() === year && eventDate.getMonth() === month;
+                });
+                
+                // Group events by date
+                const eventsByDate = {};
+                filteredEvents.forEach(event => {
+                    if (!eventsByDate[event.date]) {
+                        eventsByDate[event.date] = [];
+                    }
+                    eventsByDate[event.date].push(event);
+                });
+                
+                // Build calendar HTML
+                let calendarHTML = `
+                    <div class="mb-4 flex items-center justify-between">
+                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-200">${dashboardView === 'mySchedule' ? 'My Schedule' : 'Entire Schedule'} - ${monthName}</h3>
+                        <div class="flex items-center gap-2">
+                            <button data-action="prev-crc-dashboard-month" class="p-2 rounded-md bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600">
+                                <i data-lucide="chevron-left" class="w-5 h-5"></i>
+                            </button>
+                            <button data-action="next-crc-dashboard-month" class="p-2 rounded-md bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600">
+                                <i data-lucide="chevron-right" class="w-5 h-5"></i>
+                            </button>
+                            <button data-action="today-crc-dashboard" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700 text-sm">
+                                Today
+                            </button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-7 gap-2 mb-2">
+                        ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => 
+                            `<div class="text-center font-semibold text-gray-700 dark:text-gray-300 py-2">${day}</div>`
+                        ).join('')}
+                    </div>
+                    <div class="grid grid-cols-7 gap-2">
+                `;
+                
+                // Empty cells for days before month starts
+                for (let i = 0; i < firstDayOfMonth; i++) {
+                    calendarHTML += `<div class="min-h-[100px] border border-gray-200 dark:border-gray-700 rounded-md bg-gray-50 dark:bg-gray-900/40"></div>`;
+                }
+                
+                // Days of the month
+                for (let day = 1; day <= daysInMonth; day++) {
+                    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                    const dayEvents = eventsByDate[dateStr] || [];
+                    const isToday = dateStr === toDateOnlyString(new Date());
+                    
+                    calendarHTML += `
+                        <div class="min-h-[100px] border ${isToday ? 'border-blue-500 border-2' : 'border-gray-200 dark:border-gray-700'} rounded-md bg-white dark:bg-gray-800 p-2 ${isToday ? 'bg-blue-50 dark:bg-blue-900/20' : ''}">
+                            <div class="text-sm font-semibold mb-1 ${isToday ? 'text-blue-600 dark:text-blue-400' : 'text-gray-700 dark:text-gray-300'}">${day}</div>
+                            <div class="space-y-1">
+                                ${dayEvents.slice(0, 3).map(event => {
+                                    const site = state.crc_sites.find(s => s.id === event.siteId);
+                                    const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
+                                    const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
+                                    const pi = event.principalInvestigator || (site && site.principalInvestigator) || '';
+                                    
+                                    // Get CRC names for entire schedule view
+                                    let crcNames = [];
+                                    if (dashboardView === 'entireSchedule') {
+                                        if (event.crcId) {
+                                            const crc = state.crcs.find(c => c.id === event.crcId);
+                                            if (crc) crcNames.push(crc.name.split(' ')[0]);
+                                        }
+                                        if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                                            Object.values(event.roleAssignments).forEach(assignments => {
+                                                if (Array.isArray(assignments)) {
+                                                    assignments.forEach(crcId => {
+                                                        if (crcId) {
+                                                            const crc = state.crcs.find(c => c.id === crcId);
+                                                            if (crc && !crcNames.includes(crc.name.split(' ')[0])) {
+                                                                crcNames.push(crc.name.split(' ')[0]);
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                        }
+                                    }
+                                    const crcNameDisplay = crcNames.length > 0 ? crcNames.join(', ') : '';
+                                    
+                                    const bgColor = event.type === 'Travel Day' ? '#3b82f6' : '#8b5cf6';
+                                    
+                                    return `
+                                        <div class="text-xs p-1 rounded cursor-pointer hover:opacity-80 transition-opacity" 
+                                             style="background-color: ${bgColor}; color: white;"
+                                             data-action="view-crc-event" 
+                                             data-event-id="${event.id}"
+                                             title="${event.type} - ${site ? site.name : 'Unknown Site'}${pi ? ' - PI: ' + pi : ''} - ${studyNames}${crcNameDisplay ? ' - ' + crcNameDisplay : ''}">
+                                            <div class="font-medium truncate">${event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown')}</div>
+                                            ${pi ? `<div class="text-[10px] opacity-90 truncate">PI: ${pi}</div>` : ''}
+                                            ${crcNameDisplay ? `<div class="text-[10px] opacity-90 truncate">${crcNameDisplay}</div>` : ''}
+                                            <div class="text-[10px] opacity-90 truncate">${studyNames}</div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                                ${dayEvents.length > 3 ? `<div class="text-[10px] text-gray-600 dark:text-gray-400 text-center">+${dayEvents.length - 3} more</div>` : ''}
+                            </div>
+                        </div>
+                    `;
+                }
+                
+                calendarHTML += `</div>`;
+                container.innerHTML = calendarHTML;
+                lucide.createIcons();
             };
 
             const getCRCScheduleHTML = () => {
@@ -8813,6 +8980,7 @@
                                     const site = state.crc_sites.find(s => s.id === event.siteId);
                                     const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                                     const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
+                                    const pi = event.principalInvestigator || (site && site.principalInvestigator) || '';
                                     // Use blue for Travel Day to distinguish from time off colors (amber/green/red)
                                     const bgColor = event.type === 'Travel Day' ? '#3b82f6' : '#8b5cf6';
                                     
@@ -8821,8 +8989,9 @@
                                              style="background-color: ${bgColor}; color: white;"
                                              data-action="view-crc-schedule-event" 
                                              data-event-id="${event.id}"
-                                             title="${event.type} - ${site ? site.name : 'Unknown Site'} - ${studyNames}">
+                                             title="${event.type} - ${site ? site.name : 'Unknown Site'}${pi ? ' - PI: ' + pi : ''} - ${studyNames}">
                                             <div class="font-medium truncate">${event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown')}</div>
+                                            ${pi ? `<div class="text-[10px] opacity-90 truncate">PI: ${pi}</div>` : ''}
                                             <div class="text-[10px] opacity-90 truncate">${studyNames}</div>
                                             ${event.period ? `<div class="text-[10px] opacity-75">${event.period}</div>` : ''}
                                         </div>
@@ -27823,6 +27992,26 @@
                         }
                         break;
                     }
+                    case 'set-crc-dashboard-view': {
+                        const view = actionButton.dataset.view;
+                        if (view && ['mySchedule', 'entireSchedule'].includes(view)) {
+                            setState({ crcDashboardView: view });
+                            renderCRCDashboardCalendar();
+                        }
+                        break;
+                    }
+                    case 'prev-crc-dashboard-month': 
+                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() - 1)) }); 
+                        renderCRCDashboardCalendar();
+                        break;
+                    case 'next-crc-dashboard-month': 
+                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() + 1)) }); 
+                        renderCRCDashboardCalendar();
+                        break;
+                    case 'today-crc-dashboard': 
+                        setState({ crcCalendarDate: new Date() }); 
+                        renderCRCDashboardCalendar();
+                        break;
                     case 'edit-role': {
                         const role = state.roles.find(r => r.id === id);
                         if (role) openModal(getEditRoleModalHTML(role), 'lg');
