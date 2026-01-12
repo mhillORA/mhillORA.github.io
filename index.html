@@ -6774,62 +6774,70 @@
                     let finalResult = null;
                     let lastError = null;
                     
-                    // If using default, try incremental approach: 30 days first, then 60 if successful
+                    // If using default, try incremental approach: 2 -> 5 -> 10 -> 20 -> 30 days
                     if (useDefaultPastDays && !options.createdFrom && !options.createdTo) {
-                        // First attempt: 30 days back
-                        updateProgress(30, `Fetching 30 days back and ${futureDays} days forward...`);
+                        const incrementalRanges = [2, 5, 10, 20, 30];
+                        let maxSuccessfulRange = 0;
                         
-                        try {
-                            const payload30 = {
-                                pastDays: 30,
-                                futureDays: futureDays
-                            };
-                            if (useBackdoorMode) {
-                                payload30.backdoorMode = true;
-                            }
-                            if (options.updateOnly === true) {
-                                payload30.updateOnly = true;
-                            }
-                            
-                            const importFn30 = useBackdoorMode ? apiService.importNavanBookingsRangeCacheOnly : apiService.importNavanBookingsRange;
-                            const result30 = await importFn30(payload30);
-                            finalResult = result30;
-                            
-                            // If successful, try 60 days back
-                            updateProgress(60, `Fetching 60 days back and ${futureDays} days forward...`);
+                        for (const range of incrementalRanges) {
+                            updateProgress(range, `Fetching ${range} days back and ${futureDays} days forward...`);
                             
                             try {
-                                const payload60 = {
-                                    pastDays: 60,
+                                const payload = {
+                                    pastDays: range,
                                     futureDays: futureDays
                                 };
                                 if (useBackdoorMode) {
-                                    payload60.backdoorMode = true;
+                                    payload.backdoorMode = true;
                                 }
                                 if (options.updateOnly === true) {
-                                    payload60.updateOnly = true;
+                                    payload.updateOnly = true;
                                 }
                                 
-                                const importFn60 = useBackdoorMode ? apiService.importNavanBookingsRangeCacheOnly : apiService.importNavanBookingsRange;
-                                const result60 = await importFn60(payload60);
-                                finalResult = result60; // Use the 60-day result
-                            } catch (error60) {
-                                console.warn('Failed to fetch 60 days, keeping 30-day result:', error60);
-                                // Keep the 30-day result, just log the warning
-                                lastError = error60;
+                                const importFn = useBackdoorMode ? apiService.importNavanBookingsRangeCacheOnly : apiService.importNavanBookingsRange;
+                                const result = await importFn(payload);
+                                finalResult = result;
+                                maxSuccessfulRange = range;
+                                
+                                console.log(`Successfully imported ${range} days of Navan bookings`);
+                                
+                                // If this is the last range, we're done
+                                if (range === incrementalRanges[incrementalRanges.length - 1]) {
+                                    break;
+                                }
+                                
+                                // Small delay between incremental imports to avoid overwhelming the API
+                                if (range < incrementalRanges[incrementalRanges.length - 1]) {
+                                    await new Promise(resolve => setTimeout(resolve, 500));
+                                }
+                            } catch (error) {
+                                console.warn(`Failed to fetch ${range} days:`, error);
+                                
+                                // If we had a successful smaller range, use that
+                                if (maxSuccessfulRange > 0) {
+                                    console.log(`Using ${maxSuccessfulRange}-day result (failed at ${range} days)`);
+                                    lastError = error;
+                                    break; // Stop trying larger ranges
+                                } else {
+                                    // Failed on the first attempt (2 days) - this is a real error
+                                    console.error('Navan range import error (failed at 2 days):', error);
+                                    if (!isSilent) {
+                                        showNotification(`Navan import failed: ${error.message || 'Unknown error'}`, 'error');
+                                    }
+                                    
+                                    // Re-render travel content even on error to show current state
+                                    if (travelContainer && !isSilent) {
+                                        await renderTravelContent();
+                                    }
+                                    
+                                    return false;
+                                }
                             }
-                        } catch (error30) {
-                            console.error('Navan range import error (30 days):', error30);
-                            if (!isSilent) {
-                                showNotification(`Navan import failed: ${error30.message || 'Unknown error'}`, 'error');
-                            }
-                            
-                            // Re-render travel content even on error to show current state
-                            if (travelContainer && !isSilent) {
-                                await renderTravelContent();
-                            }
-                            
-                            return false;
+                        }
+                        
+                        // If we successfully got some data but not the full 30 days, show a message
+                        if (maxSuccessfulRange > 0 && maxSuccessfulRange < 30 && !isSilent) {
+                            showNotification(`Navan import completed: ${maxSuccessfulRange} days (stopped at ${maxSuccessfulRange} days due to error)`, 'warning', 6000);
                         }
                     } else {
                         // Use explicit options or custom date range
@@ -6864,35 +6872,126 @@
                                 setTimeout(() => reject(new Error('Navan API request timed out after 15 minutes')), 15 * 60 * 1000);
                             });
                             
-                            finalResult = await Promise.race([
-                                useBackdoorMode 
-                                    ? apiService.importNavanBookingsRangeCacheOnly(payload)
-                                    : apiService.importNavanBookingsRange(payload),
-                                timeoutPromise
-                            ]);
-                            console.log('Navan import result received:', finalResult);
+                            // Retry logic for 500 errors (might be transient)
+                            let lastError = null;
+                            let retryCount = 0;
+                            const maxRetries = 2; // Try up to 3 times total (initial + 2 retries)
+                            
+                            while (retryCount <= maxRetries) {
+                                try {
+                                    if (retryCount > 0) {
+                                        console.log(`Navan import retry attempt ${retryCount}/${maxRetries}...`);
+                                        updateProgress(pastDays, `Retrying import (attempt ${retryCount + 1}/${maxRetries + 1})...`);
+                                        // Wait before retry (exponential backoff: 2s, 4s)
+                                        await new Promise(resolve => setTimeout(resolve, 2000 * retryCount));
+                                    }
+                                    
+                                    finalResult = await Promise.race([
+                                        useBackdoorMode 
+                                            ? apiService.importNavanBookingsRangeCacheOnly(payload)
+                                            : apiService.importNavanBookingsRange(payload),
+                                        timeoutPromise
+                                    ]);
+                                    console.log('Navan import result received:', finalResult);
+                                    break; // Success, exit retry loop
+                                } catch (retryError) {
+                                    lastError = retryError;
+                                    const retryStatus = retryError.status || (retryError.detail && retryError.detail.includes('500') ? 500 : null);
+                                    
+                                    // Only retry on 500 errors (server errors that might be transient)
+                                    if (retryStatus === 500 && retryCount < maxRetries) {
+                                        retryCount++;
+                                        continue; // Retry
+                                    } else {
+                                        // Not a retryable error or max retries reached
+                                        throw retryError;
+                                    }
+                                }
+                            }
+                            
+                            if (retryCount > 0 && finalResult) {
+                                console.log(`Navan import succeeded after ${retryCount} retry(ies)`);
+                                if (!isSilent) {
+                                    showNotification(`Navan import succeeded after retry (attempt ${retryCount + 1})`, 'success', 5000);
+                                }
+                            }
                         } catch (error) {
                             console.error('Navan import error caught:', error);
                             console.error('Navan range import error:', error);
+                            
+                            // Extract detailed error information
                             const errorMessage = error.message || 'Unknown error';
                             const errorStatus = error.status || (error.detail && error.detail.includes('404') ? 404 : null);
+                            const errorJson = error.jsonBody || error.errorJson || null;
+                            const errorText = error.rawResponse || error.errorText || '';
                             
-                            // Provide more helpful error messages
-                            let userMessage = `Navan import failed: ${errorMessage}`;
-                            if (errorStatus === 404) {
-                                userMessage = 'Navan import endpoint not found (404). The API route may not be deployed or there may be a routing issue. Please check Azure Functions deployment.';
-                            } else if (errorMessage.includes('timeout') || errorMessage.includes('timed out')) {
-                                userMessage = 'Navan import timed out. The API may be slow or overloaded. Try importing a smaller date range.';
-                            } else if (errorMessage.includes('429') || errorMessage.includes('rate limit')) {
-                                userMessage = 'Navan API rate limit exceeded. Please wait a few minutes and try again.';
-                            } else if (errorMessage.includes('401') || errorMessage.includes('unauthorized')) {
-                                userMessage = 'Navan API authentication failed. Please check API credentials.';
-                            } else if (errorStatus === 500) {
-                                userMessage = 'Navan import server error (500). The function may have timed out or encountered an error. Check Azure Functions logs for details.';
+                            // Try to extract more specific error details from the response
+                            let detailedError = errorMessage;
+                            if (errorJson) {
+                                if (errorJson.error) detailedError = errorJson.error;
+                                if (errorJson.message && errorJson.message !== errorJson.error) detailedError = errorJson.message;
+                                if (errorJson.detail) detailedError += ` - ${errorJson.detail}`;
+                            } else if (errorText && errorText.length < 500) {
+                                // If error text is short enough, include it
+                                try {
+                                    const parsed = JSON.parse(errorText);
+                                    if (parsed.error) detailedError = parsed.error;
+                                    if (parsed.message) detailedError = parsed.message;
+                                } catch (e) {
+                                    // Not JSON, use as-is if it's helpful
+                                    if (errorText !== errorMessage && !errorText.includes('Backend call failure')) {
+                                        detailedError = errorText;
+                                    }
+                                }
                             }
                             
+                            // Provide more helpful error messages based on error type
+                            let userMessage = `Navan import failed: ${detailedError}`;
+                            
+                            if (errorStatus === 404) {
+                                userMessage = 'Navan import endpoint not found (404). The API route may not be deployed or there may be a routing issue. Please check Azure Functions deployment.';
+                            } else if (errorStatus === 500) {
+                                // For 500 errors, provide more specific guidance
+                                if (detailedError.includes('timeout') || detailedError.includes('timed out')) {
+                                    userMessage = 'Navan import timed out. The Azure Function may have exceeded its timeout limit. Try importing a smaller date range (e.g., 7-14 days).';
+                                } else if (detailedError.includes('Backend call failure')) {
+                                    userMessage = 'Navan import failed: Backend service error. This could be due to:\n' +
+                                        '• Navan API connectivity issues\n' +
+                                        '• Invalid or expired Navan API credentials\n' +
+                                        '• Azure Function timeout or resource limits\n' +
+                                        '• Network connectivity problems\n\n' +
+                                        'Please check Navan API credentials and try again with a smaller date range.';
+                                } else {
+                                    userMessage = `Navan import server error (500): ${detailedError}\n\n` +
+                                        'Possible causes:\n' +
+                                        '• Azure Function timeout or crash\n' +
+                                        '• Navan API connectivity issues\n' +
+                                        '• Invalid API credentials\n' +
+                                        '• Database connection problems\n\n' +
+                                        'Try importing a smaller date range or check Azure Functions logs.';
+                                }
+                            } else if (errorMessage.includes('timeout') || errorMessage.includes('timed out')) {
+                                userMessage = 'Navan import timed out. The API may be slow or overloaded. Try importing a smaller date range (7-14 days).';
+                            } else if (errorMessage.includes('429') || errorMessage.includes('rate limit')) {
+                                userMessage = 'Navan API rate limit exceeded. Please wait a few minutes and try again.';
+                            } else if (errorMessage.includes('401') || errorMessage.includes('unauthorized') || detailedError.includes('authentication')) {
+                                userMessage = 'Navan API authentication failed. Please check that NAVAN_CLIENT_ID and NAVAN_SECRET_KEY are correctly configured in Azure environment variables.';
+                            } else if (errorMessage.includes('network') || errorMessage.includes('fetch')) {
+                                userMessage = 'Network error connecting to Navan API. Please check your internet connection and try again.';
+                            }
+                            
+                            // Log detailed error information for debugging
+                            console.error('Navan import error details:', {
+                                status: errorStatus,
+                                message: errorMessage,
+                                detailedError: detailedError,
+                                jsonBody: errorJson,
+                                rawResponse: errorText?.substring(0, 200),
+                                payload: payload
+                            });
+                            
                             if (!isSilent) {
-                                showNotification(userMessage, 'error', 8000);
+                                showNotification(userMessage, 'error', 12000);
                             }
                             
                             // Re-render travel content even on error to show current state
@@ -38349,9 +38448,9 @@
                     // Set flag to prevent multiple simultaneous imports
                     state.navanImportInProgress = true;
                     // Trigger import in background (don't await - let it run while we render the UI)
-                    // Use default range (30 days past, 60 days future)
+                    // Use incremental approach (2 -> 5 -> 10 -> 20 -> 30 days past, 60 days future)
                     runNavanImportRange(null, {
-                        pastDays: 30,
+                        // pastDays not specified = use incremental approach
                         futureDays: 60
                     }, {
                         closeModal: false,
