@@ -2128,6 +2128,7 @@
                 },
                 selectedCrcFilter: 'all',
                 selectedSiteFilter: 'all',
+                selectedStudyFilter: 'all',
                 selectedRegionFilter: 'all',
                 selectedEventTypeFilter: 'all',
                 selectedEmploymentTypeFilter: 'all',
@@ -4804,6 +4805,20 @@
                 }
                 
                 // Default for non-Managers: limited access
+                // Supervisors get scheduler access with read-only permissions
+                const userEffectiveLevel = getEffectivePermissionLevel(state.currentUser);
+                if (userEffectiveLevel === 'Supervisor') {
+                    return {
+                        tabs: ['scheduler', 'timeOff'],
+                        studiesAccess: 'all',
+                        studies: [],
+                        sitesAccess: 'all',
+                        sites: [],
+                        permissionLevel: 'read'
+                    };
+                }
+                
+                // Default for CRC users
                 return {
                     tabs: ['scheduler', 'timeOff'],
                     studiesAccess: 'all',
@@ -8430,43 +8445,121 @@
                 showNotification(`Template downloaded successfully!`, 'success');
             };
 
+            const getExportDateRangeModalHTML = () => {
+                const today = new Date();
+                const firstDayOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+                const lastDayOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+                
+                return `
+                    <h3 class="text-xl font-bold mb-4 dark:text-white">Export Schedule</h3>
+                    <p class="mb-4 text-gray-600 dark:text-gray-300">Select a date range to export. Only Site Assignments and Travel Day events will be included.</p>
+                    <form id="export-date-range-form" class="space-y-4">
+                        <div>
+                            <label for="export-start-date" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Start Date</label>
+                            <input type="date" id="export-start-date" name="startDate" value="${toDateOnlyString(firstDayOfMonth)}" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        </div>
+                        <div>
+                            <label for="export-end-date" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">End Date</label>
+                            <input type="date" id="export-end-date" name="endDate" value="${toDateOnlyString(lastDayOfMonth)}" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        </div>
+                        <div class="flex justify-end gap-2 pt-4">
+                            <button type="button" data-action="close-modal" class="px-4 py-2 bg-gray-300 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-400 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="submit" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">Export</button>
+                        </div>
+                    </form>
+                `;
+            };
+
             const exportCurrentMonthToCSV = () => {
+                // For supervisors, show date range modal first
+                const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                if (isSupervisor) {
+                    openModal(getExportDateRangeModalHTML(), 'lg');
+                    // Set up form handler
+                    setTimeout(() => {
+                        const form = document.getElementById('export-date-range-form');
+                        if (form) {
+                            form.addEventListener('submit', (e) => {
+                                e.preventDefault();
+                                const formData = new FormData(form);
+                                const startDate = formData.get('startDate');
+                                const endDate = formData.get('endDate');
+                                
+                                if (!startDate || !endDate) {
+                                    showNotification('Please select both start and end dates.', 'error');
+                                    return;
+                                }
+                                
+                                if (new Date(startDate) > new Date(endDate)) {
+                                    showNotification('Start date must be before or equal to end date.', 'error');
+                                    return;
+                                }
+                                
+                                performExportWithDateRange(startDate, endDate);
+                                closeModal();
+                            });
+                        }
+                    }, 100);
+                    return;
+                }
+                
+                // For non-supervisors, use existing behavior (current month)
                 const now = state.crcCalendarDate;
                 const year = now.getFullYear();
                 const month = now.getMonth();
+                const firstDayOfMonth = new Date(year, month, 1);
+                const lastDayOfMonth = new Date(year, month + 1, 0);
+                performExportWithDateRange(toDateOnlyString(firstDayOfMonth), toDateOnlyString(lastDayOfMonth));
+            };
 
-                // Start with all events for the current month
-                let eventsThisMonth = state.crc_events.filter(e => {
-                    const eventDate = new Date(e.date + "T00:00:00");
-                    return eventDate.getFullYear() === year && eventDate.getMonth() === month;
+            const performExportWithDateRange = (startDate, endDate) => {
+                // Filter events by date range
+                let eventsToExport = state.crc_events.filter(e => {
+                    const eventDate = e.date;
+                    return eventDate >= startDate && eventDate <= endDate;
                 });
+                
+                // For supervisors: ONLY export Site Assignment and Travel Day events
+                const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                if (isSupervisor) {
+                    eventsToExport = eventsToExport.filter(e => 
+                        e.type === 'Site Assignment' || e.type === 'Travel Day'
+                    );
+                }
                 
                 // Apply the same filters that are used in the calendar view
                 // CRC filter
                 if (state.selectedCrcFilter && state.selectedCrcFilter !== 'all') {
-                    eventsThisMonth = eventsThisMonth.filter(e => eventBelongsToCrc(e, state.selectedCrcFilter));
+                    eventsToExport = eventsToExport.filter(e => eventBelongsToCrc(e, state.selectedCrcFilter));
                 }
                 
                 // Site filter
                 if (state.selectedSiteFilter && state.selectedSiteFilter !== 'all') {
-                    eventsThisMonth = eventsThisMonth.filter(e => e.siteId === state.selectedSiteFilter);
+                    eventsToExport = eventsToExport.filter(e => e.siteId === state.selectedSiteFilter);
                 }
                 
-                // Event type filter
-                if (state.selectedEventTypeFilter && state.selectedEventTypeFilter !== 'all') {
-                    eventsThisMonth = eventsThisMonth.filter(e => e.type === state.selectedEventTypeFilter);
+                // Study filter
+                if (state.selectedStudyFilter && state.selectedStudyFilter !== 'all') {
+                    eventsToExport = eventsToExport.filter(e => 
+                        (e.studyIds || []).includes(state.selectedStudyFilter)
+                    );
+                }
+                
+                // Event type filter (only if not supervisor, as supervisors are already filtered)
+                if (!isSupervisor && state.selectedEventTypeFilter && state.selectedEventTypeFilter !== 'all') {
+                    eventsToExport = eventsToExport.filter(e => e.type === state.selectedEventTypeFilter);
                 }
                 
                 // Open shifts filter
-                eventsThisMonth = applyOpenShiftsFilter(eventsThisMonth);
+                eventsToExport = applyOpenShiftsFilter(eventsToExport);
                 
-                if (eventsThisMonth.length === 0) {
-                    showNotification('No events match the current filters to export.', 'info');
+                if (eventsToExport.length === 0) {
+                    showNotification('No events match the selected filters to export.', 'info');
                     return;
                 }
 
                 const headers = ['Date', 'EventType', 'CRCName', 'SiteName', 'StudyName', 'Roles', 'Hours', 'Period', 'Notes', 'VisitNumber', 'NumberOfPatients', 'PrincipalInvestigator', 'Mileage'];
-                const rows = eventsThisMonth.map(event => {
+                const rows = eventsToExport.map(event => {
                     const crc = state.crcs.find(c => c.id === event.crcId);
                     const site = state.crc_sites.find(s => s.id === event.siteId);
                     const studies = (event.studyIds || []).map(id => {
@@ -8500,11 +8593,13 @@
                 const encodedUri = encodeURI(csvContent);
                 const link = document.createElement("a");
                 link.setAttribute("href", encodedUri);
-                const monthName = now.toLocaleString('default', { month: 'long' });
-                link.setAttribute("download", `crc_schedule_${year}_${monthName}.csv`);
+                const startDateStr = startDate.replace(/-/g, '');
+                const endDateStr = endDate.replace(/-/g, '');
+                link.setAttribute("download", `crc_schedule_${startDateStr}_to_${endDateStr}.csv`);
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
+                showNotification(`Exported ${eventsToExport.length} events successfully!`, 'success');
             };
 
             // --- HTML GETTERS ---
@@ -11186,13 +11281,14 @@
                 
                 const crcOptions = state.crcs.map(crc => `<option value="${crc.id}">${crc.name}</option>`).join('');
                 const siteOptions = getFilteredSites().map(site => `<option value="${site.id}">${site.name}</option>`).join('');
+                const studyOptions = state.studies.map(study => `<option value="${study.id}">${study.title || study.name}</option>`).join('');
                 const regions = [...new Set(state.crcs.map(crc => crc.region).filter(Boolean))];
                 const regionOptions = regions.map(region => `<option value="${region}">${region}</option>`).join('');
                 const eventTypeOptions = ['Site Assignment', 'Travel Day', 'Paid Time Off', 'Unavailable'].map(type => `<option value="${type}">${type}</option>`).join('');
                 
                 container.innerHTML = `
                     <div class="p-4 bg-gray-50 dark:bg-gray-900/50 rounded-lg border dark:border-gray-700">
-                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4 mb-4">
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-7 gap-4 mb-4">
                             <div>
                                 <label for="crc-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Filter by CRC</label>
                                 <select id="crc-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
@@ -11205,6 +11301,13 @@
                                 <select id="site-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                     <option value="all">All Sites</option>
                                     ${siteOptions}
+                                </select>
+                            </div>
+                            <div>
+                                <label for="study-filter" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Filter by Study</label>
+                                <select id="study-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="all">All Studies</option>
+                                    ${studyOptions}
                                 </select>
                             </div>
                             <div>
@@ -11247,6 +11350,10 @@
                 `;
                 document.getElementById('crc-filter').value = state.selectedCrcFilter;
                 document.getElementById('site-filter').value = state.selectedSiteFilter;
+                const studyFilter = document.getElementById('study-filter');
+                if (studyFilter) {
+                    studyFilter.value = state.selectedStudyFilter || 'all';
+                }
                 document.getElementById('region-filter').value = state.selectedRegionFilter;
                 document.getElementById('employment-type-filter').value = state.selectedEmploymentTypeFilter;
                 document.getElementById('event-type-filter').value = state.selectedEventTypeFilter;
@@ -11567,6 +11674,11 @@
                 
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
+                }
+                if (state.selectedStudyFilter && state.selectedStudyFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => 
+                        (e.studyIds || []).includes(state.selectedStudyFilter)
+                    );
                 }
                 if (state.selectedRegionFilter !== 'all') {
                     const crcsInRegion = state.crcs.filter(c => c.region === state.selectedRegionFilter).map(c => c.id);
@@ -12208,6 +12320,11 @@
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
                 }
+                if (state.selectedStudyFilter && state.selectedStudyFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => 
+                        (e.studyIds || []).includes(state.selectedStudyFilter)
+                    );
+                }
                 if (state.selectedRegionFilter !== 'all') {
                     const crcsInRegion = state.crcs.filter(c => c.region === state.selectedRegionFilter).map(c => c.id);
                     filteredEvents = filteredEvents.filter(e => {
@@ -12551,6 +12668,11 @@
                 }
                 if (state.selectedSiteFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.siteId === state.selectedSiteFilter);
+                }
+                if (state.selectedStudyFilter && state.selectedStudyFilter !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => 
+                        (e.studyIds || []).includes(state.selectedStudyFilter)
+                    );
                 }
                 if (state.selectedRegionFilter !== 'all') {
                     const crcsInRegion = state.crcs.filter(c => c.region === state.selectedRegionFilter).map(c => c.id);
@@ -26331,6 +26453,13 @@
                         break;
                     }
                     case 'delete-crc-event': {
+                        // Block supervisors from deleting events
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors have read-only access. You cannot delete events.', 'error');
+                            return;
+                        }
+                        
                         if (groupId) {
                             openModal(`
                                 <h3 class="text-xl font-bold dark:text-white mb-4">Delete Event Series</h3>
@@ -26442,6 +26571,13 @@
                         break;
                     }
                     case 'delete-individual-crc-event': {
+                        // Block supervisors from deleting events
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors have read-only access. You cannot delete events.', 'error');
+                            return;
+                        }
+                        
                         const event = state.crc_events.find(e => e.id === eventId);
                         if (event) {
                             openModal(`
@@ -26460,6 +26596,14 @@
                         break;
                     }
                     case 'confirm-delete-individual-event': {
+                        // Block supervisors from deleting events
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors have read-only access. You cannot delete events.', 'error');
+                            closeModal();
+                            return;
+                        }
+                        
                         try {
                             saveStateToUndoHistory();
                             await apiService.deleteEvent(eventId);
@@ -26482,6 +26626,13 @@
                         break;
                     }
                     case 'bulk-delete-all-schedule-events': {
+                        // Block supervisors from deleting events
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors have read-only access. You cannot delete events.', 'error');
+                            return;
+                        }
+                        
                         const checkedBoxes = document.querySelectorAll('.event-checkbox:checked');
                         if (checkedBoxes.length === 0) {
                             showNotification('Please select at least one event to delete.', 'warning');
@@ -26516,6 +26667,14 @@
                         break;
                     }
                     case 'confirm-bulk-delete-all-schedule-events': {
+                        // Block supervisors from deleting events
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors have read-only access. You cannot delete events.', 'error');
+                            closeModal();
+                            return;
+                        }
+                        
                         const eventIdsStr = e.target.dataset.eventIds || '';
                         const ptoRequestIdsStr = e.target.dataset.ptoRequestIds || '';
                         const eventIds = eventIdsStr ? eventIdsStr.split(',').filter(id => id.trim()) : [];
@@ -28887,6 +29046,7 @@
                         try {
                             const crcFilterEl = document.getElementById('crc-filter');
                             const siteFilterEl = document.getElementById('site-filter');
+                            const studyFilterEl = document.getElementById('study-filter');
                             const regionFilterEl = document.getElementById('region-filter');
                             const employmentTypeFilterEl = document.getElementById('employment-type-filter');
                             const eventTypeFilterEl = document.getElementById('event-type-filter');
@@ -28896,6 +29056,7 @@
                             
                             if (crcFilterEl) filterUpdates.selectedCrcFilter = crcFilterEl.value || 'all';
                             if (siteFilterEl) filterUpdates.selectedSiteFilter = siteFilterEl.value || 'all';
+                            if (studyFilterEl) filterUpdates.selectedStudyFilter = studyFilterEl.value || 'all';
                             if (regionFilterEl) filterUpdates.selectedRegionFilter = regionFilterEl.value || 'all';
                             if (employmentTypeFilterEl) filterUpdates.selectedEmploymentTypeFilter = employmentTypeFilterEl.value || 'all';
                             if (eventTypeFilterEl) filterUpdates.selectedEventTypeFilter = eventTypeFilterEl.value || 'all';
@@ -29137,6 +29298,13 @@
                         break;
                     }
                     case 'crc-event-form': {
+                        // Block supervisors from creating/editing events
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors have read-only access. You cannot create or edit events.', 'error');
+                            return;
+                        }
+                        
                         let eventId = form.dataset.eventId;
                         // If this is a copied event (has _tempCopyId), clear the ID to create a new event
                         if (eventId && eventId.startsWith('copy-')) {
