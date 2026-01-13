@@ -967,10 +967,10 @@ async function crudHandler(context, request, containerName) {
                         const errorCode = error.code || error.statusCode;
                         const errorMessage = (error.message || '').toLowerCase();
                         
-                        // For travel container specifically, always return empty array on any error
+                        // For travel and announcements containers, always return empty array on any error
                         // This prevents launch failures
-                        if (containerName === 'travel') {
-                            context.log.warn(`Travel container does not exist yet or error occurred, returning empty array. Error: ${error.message}`);
+                        if (containerName === 'travel' || containerName === 'announcements') {
+                            context.log.warn(`${containerName} container does not exist yet or error occurred, returning empty array. Error: ${error.message}`);
                             return { 
                                 jsonBody: [],
                                 headers: { 'Content-Type': 'application/json' }
@@ -1085,15 +1085,38 @@ async function crudHandler(context, request, containerName) {
                 }
                 
                 const newItem = { ...body, id: generateId() };
-                const { resource: createdItem } = await container.items.create(newItem);
-                
-                // Calculate enrollment for studies
-                if (containerName === 'studies') {
-                    const enrollment = await calculateStudyEnrollment(createdItem.id);
-                    createdItem.enrolled = enrollment;
+                try {
+                    const { resource: createdItem } = await container.items.create(newItem);
+                    
+                    // Calculate enrollment for studies
+                    if (containerName === 'studies') {
+                        const enrollment = await calculateStudyEnrollment(createdItem.id);
+                        createdItem.enrolled = enrollment;
+                    }
+                    
+                    return { status: 201, jsonBody: createdItem };
+                } catch (createError) {
+                    // Handle case where container doesn't exist
+                    const errorCode = createError.code || createError.statusCode;
+                    const errorMessage = (createError.message || '').toLowerCase();
+                    
+                    if (errorCode === 404 || 
+                        errorMessage.includes('notfound') || 
+                        errorMessage.includes('not found') ||
+                        errorMessage.includes('container') ||
+                        errorMessage.includes('does not exist')) {
+                        context.log.error(`Container '${containerName}' does not exist. Please create it in Cosmos DB.`);
+                        return {
+                            status: 500,
+                            jsonBody: { 
+                                error: `Container '${containerName}' does not exist in Cosmos DB. Please create the container first.`,
+                                containerName: containerName
+                            },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                    throw createError;
                 }
-                
-                return { status: 201, jsonBody: createdItem };
             
             case 'PUT':
                 const requestBody = await request.json();
