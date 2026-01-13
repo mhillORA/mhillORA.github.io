@@ -1472,6 +1472,13 @@ app.http('travel', {
     handler: (request, context) => crudHandler(context, request, 'travel'),
 });
 
+app.http('announcements', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'announcements/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'announcements'),
+});
+
 app.http('time-off-requests', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
