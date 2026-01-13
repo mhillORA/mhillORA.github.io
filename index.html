@@ -6775,11 +6775,11 @@
                     
                     let finalResult = null;
                     let lastError = null;
+                    let maxSuccessfulRange = 0; // Track the maximum successful range (for both incremental and explicit)
                     
                     // If using default, try incremental approach: 2 -> 5 -> 10 -> 20 -> 30 days
                     if (useDefaultPastDays && !options.createdFrom && !options.createdTo) {
                         const incrementalRanges = [2, 5, 10, 20, 30];
-                        let maxSuccessfulRange = 0;
                         
                         for (const range of incrementalRanges) {
                             updateProgress(range, `Fetching ${range} days back and ${futureDays} days forward...`);
@@ -6895,6 +6895,8 @@
                                         timeoutPromise
                                     ]);
                                     console.log('Navan import result received:', finalResult);
+                                    // Set maxSuccessfulRange for explicit imports too
+                                    maxSuccessfulRange = pastDays;
                                     break; // Success, exit retry loop
                                 } catch (retryError) {
                                     lastError = retryError;
@@ -7024,10 +7026,8 @@
                     
                     // Show success message, noting if we only got partial days
                     let successMessage = 'Navan bookings synchronized successfully.';
-                    if (maxSuccessfulRange > 0 && maxSuccessfulRange < 30) {
+                    if (maxSuccessfulRange > 0) {
                         successMessage = `Navan bookings synchronized successfully (${maxSuccessfulRange} days).`;
-                    } else if (maxSuccessfulRange === 30) {
-                        successMessage = 'Navan bookings synchronized successfully (30 days).';
                     }
                     
                     // If we successfully imported data, ensure the result is treated as success
@@ -22173,7 +22173,7 @@
                         buttonClass = 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/30';
                     } else if (isPast && canSelectPastDates) {
                         // Past dates for managers - slightly muted but still selectable
-                        buttonClass = 'border-amber-300 dark:border-amber-600 bg-amber-50 dark:bg-amber-900/20 hover:border-amber-400 dark:hover:border-amber-500 hover:bg-amber-100 dark:hover:bg-amber-900/30 text-gray-700 dark:text-gray-300';
+                        buttonClass = 'cursor-pointer border-amber-300 dark:border-amber-600 bg-amber-50 dark:bg-amber-900/20 hover:border-amber-400 dark:hover:border-amber-500 hover:bg-amber-100 dark:hover:bg-amber-900/30 text-gray-700 dark:text-gray-300';
                     } else {
                         buttonClass = 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-700 hover:border-blue-300 dark:hover:border-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 text-gray-900 dark:text-gray-100';
                     }
@@ -22185,6 +22185,7 @@
                             data-pto-type="${ptoType}"
                             class="min-h-[60px] p-2 rounded-md border-2 transition-all ${buttonClass} font-medium"
                             ${isPastAndBlocked ? 'disabled' : ''}
+                            ${isPast && canSelectPastDates ? 'style="pointer-events: auto;"' : ''}
                             title="${isPast && canSelectPastDates ? dateStr + ' (Past date - Manager access)' : dateStr}"
                         >
                             ${day}
@@ -24692,15 +24693,19 @@
                             selectedDates.delete(dateStr);
                             actionButton.classList.remove('bg-blue-600', 'text-white', 'border-blue-500');
                             const isToday = dateStr === today;
+                            const isPast = dateStr < today;
                             if (isToday) {
                                 actionButton.classList.add('bg-blue-50', 'dark:bg-blue-900/20', 'border-blue-500', 'text-gray-900', 'dark:text-gray-100');
+                            } else if (isPast && canSelectPastDates) {
+                                // Restore past date styling for managers
+                                actionButton.classList.add('border-amber-300', 'dark:border-amber-600', 'bg-amber-50', 'dark:bg-amber-900/20', 'text-gray-700', 'dark:text-gray-300', 'cursor-pointer');
                             } else {
                                 actionButton.classList.add('bg-white', 'dark:bg-gray-700', 'border-gray-200', 'dark:border-gray-700', 'text-gray-900', 'dark:text-gray-100');
                             }
                         } else {
                             selectedDates.add(dateStr);
                             actionButton.classList.add('bg-blue-600', 'text-white', 'border-blue-500');
-                            actionButton.classList.remove('bg-white', 'dark:bg-gray-700', 'bg-blue-50', 'dark:bg-blue-900/20', 'border-gray-200', 'dark:border-gray-700', 'border-blue-500');
+                            actionButton.classList.remove('bg-white', 'dark:bg-gray-700', 'bg-blue-50', 'dark:bg-blue-900/20', 'border-gray-200', 'dark:border-gray-700', 'border-blue-500', 'border-amber-300', 'dark:border-amber-600', 'bg-amber-50', 'dark:bg-amber-900/20', 'text-gray-700', 'dark:text-gray-300');
                         }
                         window._ptoSelectedDates = selectedDates;
                         
@@ -30537,6 +30542,7 @@
                                                             const updateData = {
                                                                 name: 'Travel Day',
                                                                 type: 'Travel Day',
+                                                                crcId: crcId, // Ensure CRC ID is preserved
                                                                 date: startTravelDateStr,
                                                                 studyIds: updatedEvent.studyIds || [],
                                                                 siteId: updatedEvent.siteId || null,
@@ -30680,6 +30686,7 @@
                                                             const updateData = {
                                                                 name: 'Travel Day',
                                                                 type: 'Travel Day',
+                                                                crcId: crcId, // Ensure CRC ID is preserved
                                                                 date: endTravelDateStr,
                                                                 studyIds: updatedEvent.studyIds || [],
                                                                 siteId: updatedEvent.siteId || null,
@@ -41354,6 +41361,54 @@
                 // Use background polling to keep data fresh without disrupting the user
                 console.log('CHAOS: Starting background data refresh loop');
                 scheduleDataRefresh();
+                
+                // Schedule hourly Navan imports (7AM-9PM, every hour on the hour)
+                const scheduleHourlyNavanImport = () => {
+                    const checkAndRunImport = () => {
+                        const now = new Date();
+                        const currentHour = now.getHours();
+                        const currentMinute = now.getMinutes();
+                        
+                        // Only run between 7AM (7) and 9PM (21)
+                        if (currentHour >= 7 && currentHour <= 21) {
+                            // Run on the hour (when minutes are 0)
+                            if (currentMinute === 0) {
+                                // Check if import is already in progress or recently run
+                                const lastImportTime = state.navanImportLastRun || 0;
+                                const timeSinceLastImport = Date.now() - lastImportTime;
+                                const MIN_IMPORT_INTERVAL = 50 * 60 * 1000; // 50 minutes minimum between imports
+                                
+                                if (!state.navanImportInProgress && timeSinceLastImport > MIN_IMPORT_INTERVAL) {
+                                    // Check Navan connection status
+                                    const connectionDetails = state.navanConnectionStatus?.details || {};
+                                    if (connectionDetails.connected && connectionDetails.oauthToken && connectionDetails.apiCall) {
+                                        console.log(`CHAOS: Hourly Navan import triggered at ${currentHour}:00`);
+                                        runNavanImportRange(null, {
+                                            // pastDays not specified = use incremental approach
+                                            futureDays: 60
+                                        }, {
+                                            silent: true // Silent mode for scheduled imports
+                                        }).catch(error => {
+                                            console.warn('CHAOS: Scheduled Navan import failed:', error);
+                                        });
+                                    } else {
+                                        console.log('CHAOS: Skipping hourly Navan import - connection not available');
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Calculate milliseconds until next minute check
+                        const msUntilNextMinute = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
+                        setTimeout(checkAndRunImport, msUntilNextMinute);
+                    };
+                    
+                    // Run initial check
+                    checkAndRunImport();
+                };
+                
+                // Start hourly Navan import schedule
+                scheduleHourlyNavanImport();
             };
             
             // Sync approved time off requests with unavailability events
