@@ -5819,12 +5819,15 @@
                     }
                     mainAppContent.className = '';
                     
-                    // Render announcement banner at the top (only if mainAppContent exists and has a parent)
+                    // Render announcement banner at the very top of the page (above header/logo)
                     // Use requestAnimationFrame to prevent render loops
-                    if (mainAppContent && mainAppContent.parentElement && state.initialLoadComplete) {
+                    if (state.initialLoadComplete) {
                         window.requestAnimationFrame(() => {
                             const bannerHTML = renderAnnouncementBanner();
                             let bannerContainer = document.getElementById('announcement-banner-container');
+                            
+                            // Find the main content wrapper (div.p-4.sm:p-8) to insert banner before it
+                            const mainContentWrapper = document.querySelector('div.p-4.sm\\:p-8') || document.body.querySelector('div > div.p-4');
                             
                             if (bannerHTML) {
                                 // Banner should exist
@@ -5834,10 +5837,17 @@
                                     bannerContainer.id = 'announcement-banner-container';
                                     bannerContainer.className = 'w-full';
                                     bannerContainer.style.position = 'relative';
-                                    bannerContainer.style.zIndex = '10';
+                                    bannerContainer.style.zIndex = '50';
                                     bannerContainer.style.pointerEvents = 'none';
-                                    // Insert before mainAppContent
-                                    mainAppContent.parentElement.insertBefore(bannerContainer, mainAppContent);
+                                    
+                                    // Insert at the very top - before the main content wrapper or as first child of body
+                                    if (mainContentWrapper && mainContentWrapper.parentElement) {
+                                        mainContentWrapper.parentElement.insertBefore(bannerContainer, mainContentWrapper);
+                                    } else if (document.body.firstChild) {
+                                        document.body.insertBefore(bannerContainer, document.body.firstChild);
+                                    } else {
+                                        document.body.appendChild(bannerContainer);
+                                    }
                                 }
                                 
                                 // Only update innerHTML if content changed (prevent re-render loop)
@@ -24659,6 +24669,44 @@
                         }
                         break;
                     }
+                    case 'close-announcement-popup': {
+                        const announcementId = actionButton.dataset.announcementId;
+                        if (!announcementId) break;
+                        
+                        // Close the modal
+                        const modalContainer = document.getElementById('modal-container');
+                        if (modalContainer) {
+                            modalContainer.classList.add('hidden');
+                            modalContainer.innerHTML = '';
+                        }
+                        
+                        // Mark popup as shown (so banner will show instead)
+                        const userId = state.currentUser?.id || state.currentUser?.username;
+                        let announcementPopups = {};
+                        try {
+                            const stored = localStorage.getItem('chaos_announcementPopups');
+                            if (stored) {
+                                announcementPopups = JSON.parse(stored);
+                            }
+                        } catch (e) {
+                            announcementPopups = {};
+                        }
+                        
+                        if (!announcementPopups[userId]) {
+                            announcementPopups[userId] = {};
+                        }
+                        announcementPopups[userId][announcementId] = Date.now();
+                        
+                        try {
+                            localStorage.setItem('chaos_announcementPopups', JSON.stringify(announcementPopups));
+                        } catch (e) {
+                            console.warn('Failed to save announcement popup views:', e);
+                        }
+                        
+                        // Re-render to show banner if applicable
+                        render();
+                        break;
+                    }
                     case 'delete-announcement': {
                         const announcementId = actionButton.dataset.announcementId;
                         if (!announcementId) break;
@@ -35600,26 +35648,15 @@
                 
                 if (activeAnnouncements.length === 0) return;
                 
-                // Filter announcements user hasn't seen in last 12 hours
-                const twelveHoursAgo = now.getTime() - (12 * 60 * 60 * 1000);
-                const unseenAnnouncements = activeAnnouncements.filter(ann => {
-                    const userViews = announcementViews[userId] || {};
-                    const viewTime = userViews[ann.id] || 0;
-                    return viewTime < twelveHoursAgo;
-                });
-                
-                if (unseenAnnouncements.length === 0) return;
-                
-                // Get the first unseen announcement
-                const announcement = unseenAnnouncements[0];
-                const message = announcement.message || '';
-                
-                // Check if popup has already been shown for this announcement
+                // Check which announcements have NOT had their popup shown yet (popup shows only once)
                 const userPopups = announcementPopups[userId] || {};
-                if (userPopups[announcement.id]) {
-                    // Popup already shown, show banner instead
-                    return;
-                }
+                const unseenPopups = activeAnnouncements.filter(ann => !userPopups[ann.id]);
+                
+                if (unseenPopups.length === 0) return;
+                
+                // Get the first announcement that hasn't had its popup shown
+                const announcement = unseenPopups[0];
+                const message = announcement.message || '';
                 
                 // Show popup modal
                 const modalContainer = document.getElementById('modal-container');
@@ -35690,7 +35727,7 @@
                     announcementPopups = {};
                 }
                 
-                // Get active announcements (not expired)
+                // Get active announcements (not expired) - show for full duration until expiration
                 const activeAnnouncements = (state.announcements || []).filter(ann => {
                     if (!ann.expiresAt) return true;
                     const expiresDate = new Date(ann.expiresAt);
@@ -35699,40 +35736,19 @@
                 
                 if (activeAnnouncements.length === 0) return '';
                 
-                // Filter announcements user hasn't seen in last 12 hours
-                const twelveHoursAgo = now.getTime() - (12 * 60 * 60 * 1000);
-                const unseenAnnouncements = activeAnnouncements.filter(ann => {
-                    const userViews = announcementViews[userId] || {};
-                    const viewTime = userViews[ann.id] || 0;
-                    return viewTime < twelveHoursAgo;
-                });
-                
-                if (unseenAnnouncements.length === 0) return '';
-                
-                // Get the first unseen announcement
-                const announcement = unseenAnnouncements[0];
-                const message = announcement.message || '';
-                
-                // Only show banner if popup has already been shown
+                // Get the first active announcement that the user has seen the popup for
+                // Banner shows for full duration (until expiration), not just 12 hours
                 const userPopups = announcementPopups[userId] || {};
-                if (!userPopups[announcement.id]) {
-                    // Popup hasn't been shown yet, don't show banner
+                const announcement = activeAnnouncements.find(ann => userPopups[ann.id]);
+                
+                if (!announcement) {
+                    // No announcement with popup shown yet, don't show banner
                     return '';
                 }
                 
-                // Mark as viewed for banner (only if not already marked to prevent unnecessary localStorage writes)
-                if (!announcementViews[userId]) {
-                    announcementViews[userId] = {};
-                }
-                const wasAlreadyViewed = announcementViews[userId][announcement.id] && announcementViews[userId][announcement.id] > 0;
-                if (!wasAlreadyViewed) {
-                    announcementViews[userId][announcement.id] = now.getTime();
-                    try {
-                        localStorage.setItem('chaos_announcementViews', JSON.stringify(announcementViews));
-                    } catch (e) {
-                        console.warn('Failed to save announcement views:', e);
-                    }
-                }
+                const message = announcement.message || '';
+                
+                // Banner persists for full duration until expiration - no need to mark as viewed
                 
                 // Check if message is long enough for carousel (more than ~60 characters)
                 const needsCarousel = message.length > 60;
