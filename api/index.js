@@ -1012,9 +1012,10 @@ async function crudHandler(context, request, containerName) {
                         );
                     
                     // If it's a Site Assignment and has no CRC and no valid role assignments, it's an Open Shift (allowed)
+                    // Travel Day events are also allowed (they should have a crcId but may not have roleAssignments)
                     // Otherwise, if it has no CRC and no valid role assignments, reject it as an N/A entry
                     if (!hasCrcId && !hasValidRoleAssignments) {
-                        if (body.type !== 'Site Assignment' && body.type !== 'Open Shift') {
+                        if (body.type !== 'Site Assignment' && body.type !== 'Open Shift' && body.type !== 'Travel Day') {
                             return {
                                 status: 400,
                                 jsonBody: { 
@@ -1164,7 +1165,8 @@ async function crudHandler(context, request, containerName) {
                             // If updating would result in N/A (no CRC and no valid role assignments), delete the event instead
                             if (!hasCrcId && !hasValidRoleAssignments) {
                                 // Only delete if it's not an Open Shift (Site Assignment without CRC is allowed as Open Shift)
-                                if (requestBody.type !== 'Site Assignment' && requestBody.type !== 'Open Shift') {
+                                // Travel Day events are also allowed (they should have a crcId but may not have roleAssignments)
+                                if (requestBody.type !== 'Site Assignment' && requestBody.type !== 'Open Shift' && requestBody.type !== 'Travel Day') {
                                     await container.item(updateId, updateId).delete();
                                     return {
                                         status: 200,
