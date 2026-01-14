@@ -2386,13 +2386,21 @@ const initializeDefaultAdmin = async () => {
 // Call initialization
 initializeDefaultAdmin();
 
-// Cleanup endpoint to remove events with empty/invalid role assignments (N/A entries)
+// Cleanup endpoint removed - events with crcId are valid even if other fields are missing
+// This endpoint is no longer available
 app.http('cleanupEvents', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'events/cleanup',
     handler: async (request, context) => {
-        try {
+        return {
+            status: 410, // Gone - endpoint removed
+            jsonBody: {
+                error: 'Cleanup endpoint has been removed',
+                message: 'Events with CRC assigned are valid even if other fields are missing. This cleanup endpoint is no longer available.'
+            },
+            headers: { 'Content-Type': 'application/json' }
+        };
             const container = getContainer('events');
             
             // Get all events
@@ -2404,6 +2412,16 @@ app.http('cleanupEvents', {
             for (const event of allEvents) {
                 // Skip Travel Day events - they're supposed to have empty roleAssignments
                 if (event.type === 'Travel Day') {
+                    continue;
+                }
+                
+                // Skip Site Assignment and Open Shift events - Open Shifts are valid without CRC/role assignments
+                if (event.type === 'Site Assignment' || event.type === 'Open Shift') {
+                    continue;
+                }
+                
+                // Skip Time Off events - these are valid and should not be deleted
+                if (event.type === 'Time Off' || event.type === 'Paid Time Off' || event.type === 'PTO') {
                     continue;
                 }
                 
@@ -2439,8 +2457,9 @@ app.http('cleanupEvents', {
                         }
                     }
                     
-                    // If no valid assignments found, mark for deletion
-                    if (!hasValidAssignment) {
+                    // If no valid assignments found, only delete if event also has no crcId
+                    // Events with crcId are valid even if roleAssignments are empty/invalid
+                    if (!hasValidAssignment && !event.crcId) {
                         eventsToDelete.push(event.id);
                     }
                 } else if (!event.roleAssignments) {
@@ -2479,6 +2498,7 @@ app.http('cleanupEvents', {
         } catch (error) {
             return handleError(context, error, 'Cleanup events operation failed');
         }
+        */
     },
 });
 

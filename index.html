@@ -4385,6 +4385,60 @@
                 return roleNames;
             };
             
+            // Check if an event is understaffed (has fewer assigned people than required)
+            const isEventUnderstaffed = (event) => {
+                if (!event.studyIds || event.studyIds.length === 0 || !event.siteId) {
+                    return false; // Can't check requirements without study/site
+                }
+                
+                const study = state.studies.find(s => event.studyIds.includes(s.id));
+                if (!study) return false;
+                
+                const roleCounts = new Map();
+                
+                // Get role requirements from study
+                if (event.visitNumber && study.visitRoleRequirements) {
+                    const visitKey = `visit-${event.visitNumber}`;
+                    const visitReqs = study.visitRoleRequirements[visitKey] || study.visitRoleRequirements['default'];
+                    if (visitReqs) {
+                        Object.entries(visitReqs).forEach(([roleId, quantity]) => {
+                            roleCounts.set(roleId, { required: quantity, assigned: 0 });
+                        });
+                    }
+                } else if (study.visitRoleRequirements && study.visitRoleRequirements['default']) {
+                    Object.entries(study.visitRoleRequirements['default']).forEach(([roleId, quantity]) => {
+                        roleCounts.set(roleId, { required: quantity, assigned: 0 });
+                    });
+                } else if (study.siteRoleRequirements && study.siteRoleRequirements[event.siteId]) {
+                    Object.entries(study.siteRoleRequirements[event.siteId]).forEach(([roleId, quantity]) => {
+                        roleCounts.set(roleId, { required: quantity, assigned: 0 });
+                    });
+                } else if (study.requiredRoles && study.requiredRoles.length > 0) {
+                    study.requiredRoles.forEach(roleId => {
+                        roleCounts.set(roleId, { required: 1, assigned: 0 });
+                    });
+                }
+                
+                // Count assigned roles
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        const assignedCount = Array.isArray(assignments) ? assignments.filter(Boolean).length : 0;
+                        if (roleCounts.has(roleId)) {
+                            roleCounts.get(roleId).assigned = assignedCount;
+                        }
+                    });
+                }
+                
+                // Check if any role has assigned < required
+                for (const { required, assigned } of roleCounts.values()) {
+                    if (required > 0 && assigned < required) {
+                        return true;
+                    }
+                }
+                
+                return false;
+            };
+            
             // Helper function to get visit display name from study
             // Returns { display: string, isCustomName: boolean } to indicate if V prefix should be added
             const getVisitDisplayName = (visitNumber, studyIds) => {
@@ -9925,15 +9979,15 @@
                                     id: ptoEventId,
                                     crcId: request.crcId,
                                     date: dateStr,
-                                    type: request.type || 'Paid Time Off',
-                                    name: request.type || 'Paid Time Off',
+                                    type: 'Time Off', // Category is always 'Time Off'
+                                    name: request.type || 'Time Off',
                                     period: request.period || 'Full Day',
                                     hours: request.hours || 8,
                                     notes: request.reason || request.notes || '',
                                     ptoRequestId: request.id,
                                     ptoStatus: normalizeTimeOffStatus(request.status),
                                     ptoStatusLabel: formatTimeOffStatus(request.status),
-                                    ptoType: request.type || 'Paid Time Off',
+                                    ptoType: request.type || 'Time Off', // Subcategory like 'Vacation'
                                     isPTORequest: true
                                 };
                                 filteredEvents.push(ptoEvent);
@@ -10128,8 +10182,11 @@
                             const roles = getEventRoles(event);
                             
                             // Check if this is a PTO event
-                            const isPTO = event.isPTORequest || event.type === 'Paid Time Off';
-                            const timeOffType = event.ptoType || event.type || (isPTO ? 'Time Off' : null);
+                            const isPTO = event.isPTORequest || event.type === 'Time Off' || event.type === 'Paid Time Off';
+                            const timeOffSubcategory = event.ptoType || event.name || (isPTO ? 'Time Off' : null);
+                            
+                            // Check if event is understaffed
+                            const isUnderstaffed = !isPTO && event.type !== 'Travel Day' && isEventUnderstaffed(event);
                             
                             // Handle Site Staff and Unassigned display
                             let crcDisplayName = 'Open Shift';
@@ -10141,14 +10198,14 @@
                                 crcDisplayName = crc.name;
                             }
                             
-                            // Display site - show actual site name, only use fallback when site doesn't exist
-                            const siteDisplay = site ? site.name : (isPTO ? (event.type || 'Time Off') : (event.type === 'Travel Day' ? 'Travel' : (event.crcId === null ? 'Open Shift' : '')));
+                            // Display site - for PTO events, leave blank
+                            const siteDisplay = isPTO ? '' : (site ? site.name : (event.type === 'Travel Day' ? 'Travel' : (event.crcId === null ? 'Open Shift' : '')));
                             
-                            // Display study - show actual studies, only use fallback when studies don't exist
-                            const studyDisplay = studies !== 'None' ? studies : (isPTO ? (event.type || 'Time Off') : (event.type === 'Travel Day' ? 'Travel' : ''));
+                            // Display study - for PTO events, leave blank
+                            const studyDisplay = isPTO ? '' : (studies !== 'None' ? studies : (event.type === 'Travel Day' ? 'Travel' : ''));
                             
-                            // Display roles - show actual roles, only use fallback when roles don't exist
-                            const rolesDisplay = roles.length > 0 ? roles.join(', ') : (isPTO ? (event.type || 'Time Off') : (event.type === 'Travel Day' ? 'Travel' : (event.type === 'Site Assignment' && (!event.crcId || event.crcId === null) ? 'Open Shift' : '')));
+                            // Display roles - for PTO events, leave blank
+                            const rolesDisplay = isPTO ? '' : (roles.length > 0 ? roles.join(', ') : (event.type === 'Travel Day' ? 'Travel' : (event.type === 'Site Assignment' && (!event.crcId || event.crcId === null) ? 'Open Shift' : '')));
                             
                             // Display hours - show actual hours, only use fallback when hours don't exist
                             const hoursDisplay = event.hours ? `${event.hours}h` : (isPTO && event.period ? (event.period === 'Full Day' ? '8h' : (event.period === 'Half Day AM' || event.period === 'Half Day PM' ? '4h' : '')) : (event.type === 'Travel Day' ? '8h' : ''));
@@ -10164,7 +10221,7 @@
                                         ${index === 0 ? formattedDate : ''}
                                     </td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-4 py-3 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100 bg-white dark:bg-gray-900">
-                                        ${crcDisplayName}
+                                        ${isUnderstaffed ? '<i data-lucide="alert-triangle" class="w-4 h-4 inline text-yellow-500 mr-1" title="Visit is understaffed - fewer people assigned than required"></i>' : ''}${crcDisplayName}
                                     </td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-4 py-3 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-900">
                                         ${rolesDisplay || '—'}
@@ -10176,7 +10233,7 @@
                                         ${studyDisplay || '—'}
                                     </td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-4 py-3 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-900">
-                                        ${isPTO ? (timeOffType || event.type || 'Time Off') : '—'}
+                                        ${isPTO ? (timeOffSubcategory || 'Time Off') : '—'}
                                     </td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-4 py-3 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-900">
                                         ${hoursDisplay || '—'}
