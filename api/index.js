@@ -1001,6 +1001,32 @@ async function crudHandler(context, request, containerName) {
             case 'POST':
                 const body = await request.json();
                 
+                // For events, validate that we're not creating N/A entries
+                if (containerName === 'events') {
+                    // Check if this would result in an N/A entry (no CRC assigned and no valid role assignments)
+                    const hasCrcId = body.crcId && body.crcId.trim() !== '';
+                    const hasValidRoleAssignments = body.roleAssignments && 
+                        Object.keys(body.roleAssignments).length > 0 &&
+                        Object.values(body.roleAssignments).some(assignments => 
+                            Array.isArray(assignments) && assignments.some(crcId => crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED')
+                        );
+                    
+                    // If it's a Site Assignment and has no CRC and no valid role assignments, it's an Open Shift (allowed)
+                    // Otherwise, if it has no CRC and no valid role assignments, reject it as an N/A entry
+                    if (!hasCrcId && !hasValidRoleAssignments) {
+                        if (body.type !== 'Site Assignment' && body.type !== 'Open Shift') {
+                            return {
+                                status: 400,
+                                jsonBody: { 
+                                    error: 'Cannot create event with no CRC assigned and no valid role assignments. This would result in an N/A entry.',
+                                    details: 'Events must have either a crcId or valid roleAssignments with assigned CRCs.'
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                    }
+                }
+                
                 // Normalize cost fields for travel - convert empty strings to undefined
                 if (containerName === 'travel') {
                     if (body.flightCost === '' || body.flightCost === null) body.flightCost = undefined;
@@ -1121,6 +1147,42 @@ async function crudHandler(context, request, containerName) {
             case 'PUT':
                 const requestBody = await request.json();
                 const updateId = id || requestBody.id;
+                
+                // For events, check if update would result in N/A entry - if so, delete instead
+                if (containerName === 'events' && updateId) {
+                    try {
+                        const { resource: existingEvent } = await container.item(updateId, updateId).read();
+                        if (existingEvent) {
+                            // Check if this update would result in an N/A entry
+                            const hasCrcId = requestBody.crcId && requestBody.crcId.trim() !== '';
+                            const hasValidRoleAssignments = requestBody.roleAssignments && 
+                                Object.keys(requestBody.roleAssignments).length > 0 &&
+                                Object.values(requestBody.roleAssignments).some(assignments => 
+                                    Array.isArray(assignments) && assignments.some(crcId => crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED')
+                                );
+                            
+                            // If updating would result in N/A (no CRC and no valid role assignments), delete the event instead
+                            if (!hasCrcId && !hasValidRoleAssignments) {
+                                // Only delete if it's not an Open Shift (Site Assignment without CRC is allowed as Open Shift)
+                                if (requestBody.type !== 'Site Assignment' && requestBody.type !== 'Open Shift') {
+                                    await container.item(updateId, updateId).delete();
+                                    return {
+                                        status: 200,
+                                        jsonBody: { 
+                                            message: 'Event deleted because it would have resulted in an N/A entry',
+                                            deleted: true,
+                                            id: updateId
+                                        },
+                                        headers: { 'Content-Type': 'application/json' }
+                                    };
+                                }
+                            }
+                        }
+                    } catch (readError) {
+                        // If we can't read the existing event, continue with normal update
+                        context.log.warn(`Could not read existing event ${updateId} for N/A check:`, readError.message);
+                    }
+                }
                 
                 // For users, fetch existing user data to merge with update data for validation
                 let mergedRequestBody = requestBody;
