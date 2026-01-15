@@ -218,7 +218,7 @@ const buildScheduleCsv = ({ crcName, startDate, endDate, shifts = [], timeOff = 
     return lines.join('\n');
 };
 
-const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context) => {
+const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient = null, user = null }, context, lookups = {}) => {
     const start = toDateOnlyString(startDate) || toDateOnlyString(new Date());
     const end = toDateOnlyString(endDate) || start;
 
@@ -226,6 +226,10 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context
     const eventsContainer = getContainer('events');
     const timeOffContainer = getContainer('time-off-requests');
     const travelContainer = getContainer('travel');
+    const siteNameById = lookups.siteNameById || new Map();
+    const siteLocationById = lookups.siteLocationById || new Map();
+    const studyNameById = lookups.studyNameById || new Map();
+    const roleNameById = lookups.roleNameById || new Map();
 
     let crc = null;
     try {
@@ -252,6 +256,26 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context
         context?.log?.warn?.(`Failed to query events: ${e.message}`);
     }
     const myEvents = crcId ? events.filter(e => eventBelongsToCrc(e, crcId)) : [];
+
+    const getEventRoleNamesForCrc = (event) => {
+        const names = new Set();
+        if (!event || !crcId) return [];
+        if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+            for (const [roleId, assignments] of Object.entries(event.roleAssignments)) {
+                if (Array.isArray(assignments) && assignments.includes(crcId)) {
+                    const roleName = roleNameById.get(roleId) || null;
+                    if (roleName) names.add(roleName);
+                }
+            }
+        }
+        if (Array.isArray(event.roles)) {
+            event.roles.forEach(r => {
+                if (r) names.add(String(r));
+            });
+        }
+        return Array.from(names.values()).sort();
+    };
+
     const shifts = myEvents
         .filter(e => String(e.type || '').toLowerCase() === 'site assignment')
         .map(e => ({
@@ -261,7 +285,28 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context
             period: e.period || 'Full Day',
             hours: e.hours ?? null,
             siteId: e.siteId || null,
-            summary: `${toDateOnlyString(e.date) || ''} • ${e.period || 'Full Day'}`
+            siteName: (e.siteId && siteNameById.get(e.siteId)) ? siteNameById.get(e.siteId) : null,
+            siteLocation: (e.siteId && siteLocationById.get(e.siteId)) ? siteLocationById.get(e.siteId) : null,
+            studies: Array.isArray(e.studyIds) ? e.studyIds.map(id => studyNameById.get(id) || id).filter(Boolean) : [],
+            roles: getEventRoleNamesForCrc(e),
+            visitNumber: e.visitNumber || null,
+            groupNumber: e.groupNumber || null,
+            summary: (() => {
+                const dateStr = toDateOnlyString(e.date) || '';
+                const site = (e.siteId && siteNameById.get(e.siteId)) ? siteNameById.get(e.siteId) : '';
+                const siteLoc = (e.siteId && siteLocationById.get(e.siteId)) ? siteLocationById.get(e.siteId) : '';
+                const studies = Array.isArray(e.studyIds) ? e.studyIds.map(id => studyNameById.get(id) || '').filter(Boolean).join(', ') : '';
+                const roles = getEventRoleNamesForCrc(e).join(', ');
+                const parts = [
+                    dateStr,
+                    e.period || 'Full Day',
+                    site,
+                    siteLoc,
+                    studies,
+                    roles
+                ].filter(Boolean);
+                return parts.join(' • ');
+            })()
         }))
         .sort((a, b) => String(a.date).localeCompare(String(b.date)));
 
@@ -271,9 +316,10 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context
             id: e.id,
             date: toDateOnlyString(e.date),
             type: e.type,
+            name: e.name || null,
             period: e.period || 'Full Day',
             hours: e.hours ?? null,
-            summary: `${toDateOnlyString(e.date) || ''} • ${e.type || 'Time Off'} • ${e.period || 'Full Day'}`
+            summary: `${toDateOnlyString(e.date) || ''} • ${e.name || e.type || 'Time Off'} • ${e.period || 'Full Day'}`
         }))
         .sort((a, b) => String(a.date).localeCompare(String(b.date)));
 
@@ -300,7 +346,7 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context
         period: r.period || 'Full Day',
         status: r.status || 'pending',
         hours: r.hours ?? null,
-        summary: `${toDateOnlyString(r.date || r.startDate) || ''} • ${r.type || 'Time Off'} • ${r.period || 'Full Day'} • ${r.status || ''}`
+        summary: `${toDateOnlyString(r.date || r.startDate) || ''} • ${r.type || 'Time Off'} • ${r.period || 'Full Day'} • ${(r.status || '').toString()}`
     }));
 
     let travel = [];
@@ -322,16 +368,18 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context
         date: toDateOnlyString(t.date || t.departureDate || t.startDate),
         type: t.bookingType || 'Travel',
         route: t.origin && t.destination ? `${t.origin} → ${t.destination}` : '',
-        summary: `${toDateOnlyString(t.date || t.departureDate || t.startDate) || ''} • ${(t.origin && t.destination) ? `${t.origin} → ${t.destination}` : (t.bookingType || 'Travel')}`
+        flightNumber: t.flightNumber || null,
+        confirmationNumber: t.confirmationNumber || null,
+        summary: `${toDateOnlyString(t.date || t.departureDate || t.startDate) || ''} • ${(t.origin && t.destination) ? `${t.origin} → ${t.destination}` : (t.bookingType || 'Travel')}${t.flightNumber ? ` • ${t.flightNumber}` : ''}`
     }));
 
-    const scheduleText = shifts.map(s => `- ${s.date} (${s.period})`).join('\n');
-    const timeOffText = [...timeOffRequestEntries, ...timeOffEvents].map(t => `- ${t.date} ${t.type} (${t.period})`).join('\n');
+    const scheduleText = shifts.map(s => `- ${s.summary || `${s.date} (${s.period})`}`).join('\n');
+    const timeOffText = [...timeOffRequestEntries, ...timeOffEvents].map(t => `- ${t.summary || `${t.date} ${t.type} (${t.period})`}`).join('\n');
     const travelText = travelEntries.map(t => `- ${t.date} ${t.route || t.type}`).join('\n');
 
     // Provide some simple HTML chunks that templates can drop in.
     const scheduleHtml = shifts.length
-        ? `<ul>${shifts.map(s => `<li>${htmlEscape(s.date)} • ${htmlEscape(s.period)}</li>`).join('')}</ul>`
+        ? `<ul>${shifts.map(s => `<li>${htmlEscape(s.summary || '')}</li>`).join('')}</ul>`
         : `<p>No shifts in range.</p>`;
     const timeOffHtml = (timeOffRequestEntries.length || timeOffEvents.length)
         ? `<ul>${[...timeOffRequestEntries, ...timeOffEvents].map(t => `<li>${htmlEscape(t.date)} • ${htmlEscape(t.type)} • ${htmlEscape(t.period)}${t.status ? ` • ${htmlEscape(t.status)}` : ''}</li>`).join('')}</ul>`
@@ -340,14 +388,25 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context
         ? `<ul>${travelEntries.map(t => `<li>${htmlEscape(t.date)} • ${htmlEscape(t.route || t.type)}</li>`).join('')}</ul>`
         : `<p>No travel in range.</p>`;
 
+    const resolvedCrcName = (crc && crc.name) ? crc.name : '';
+    const totals = {
+        shiftCount: shifts.length,
+        timeOffRequestCount: timeOffRequestEntries.length,
+        timeOffEventCount: timeOffEvents.length,
+        travelCount: travelEntries.length
+    };
+
     return {
-        crc: crc || { id: crcId || null, name: '' },
+        recipient: recipient || {},
+        user: user || {},
+        crc: crc || { id: crcId || null, name: resolvedCrcName },
         range: { start, end },
         schedule: { shifts, text: scheduleText, html: scheduleHtml },
         timeOff: { requests: timeOffRequestEntries, events: timeOffEvents, text: timeOffText, html: timeOffHtml },
         travel: { records: travelEntries, text: travelText, html: travelHtml },
+        totals,
         // Shorthand vars for "simple stupid" templates
-        crcName: (crc && crc.name) ? crc.name : '',
+        crcName: resolvedCrcName,
         rangeStart: start,
         rangeEnd: end,
         scheduleText,
@@ -1921,6 +1980,52 @@ app.http('send-email', {
             const crcsContainer = getContainer('crcs');
             const { resources: crcList } = await crcsContainer.items.readAll().fetchAll();
             const crcResolver = buildCrcResolver(crcList || []);
+            // Lookups for sites/studies/roles so template variables can include names/locations
+            const siteNameById = new Map();
+            const siteLocationById = new Map();
+            const studyNameById = new Map();
+            const roleNameById = new Map();
+            try {
+                const sitesContainer = getContainer('sites');
+                const { resources: sites } = await sitesContainer.items.readAll().fetchAll();
+                (sites || []).forEach(s => {
+                    if (!s || !s.id) return;
+                    const name = s.name || s.siteName || s.title || s.id;
+                    siteNameById.set(s.id, name);
+                    const location = [
+                        s.address1,
+                        s.city,
+                        s.state,
+                        s.zipCode || s.zip,
+                        s.country
+                    ].filter(Boolean).join(', ');
+                    const fallbackLocation = [s.city, s.state].filter(Boolean).join(', ');
+                    siteLocationById.set(s.id, location || fallbackLocation || '');
+                });
+            } catch (e) {
+                context?.log?.warn?.(`Failed to load sites for email lookups: ${e.message}`);
+            }
+            try {
+                const studiesContainer = getContainer('studies');
+                const { resources: studies } = await studiesContainer.items.readAll().fetchAll();
+                (studies || []).forEach(st => {
+                    if (!st || !st.id) return;
+                    const title = st.title || st.name || st.protocolNumber || st.id;
+                    studyNameById.set(st.id, title);
+                });
+            } catch (e) {
+                context?.log?.warn?.(`Failed to load studies for email lookups: ${e.message}`);
+            }
+            try {
+                const rolesContainer = getContainer('roles');
+                const { resources: roles } = await rolesContainer.items.readAll().fetchAll();
+                (roles || []).forEach(r => {
+                    if (!r || !r.id) return;
+                    roleNameById.set(r.id, r.name || r.id);
+                });
+            } catch (e) {
+                context?.log?.warn?.(`Failed to load roles for email lookups: ${e.message}`);
+            }
 
             const emailClient = getEmailClient();
 
@@ -1959,7 +2064,11 @@ app.http('send-email', {
                         throw new Error('Recipient email missing');
                     }
 
-                    const ctx = await buildRecipientEmailContext({ crcId, startDate: rangeStart, endDate: rangeEnd }, context);
+                    const ctx = await buildRecipientEmailContext(
+                        { crcId, startDate: rangeStart, endDate: rangeEnd, recipient: r, user: { id: r.userId || null, email, name: displayName, crcId } },
+                        context,
+                        { siteNameById, siteLocationById, studyNameById, roleNameById }
+                    );
                     const subjectTpl = template.subject || template.title || 'Message';
                     const htmlTpl = template.html || template.bodyHtml || template.body || '';
                     const plainTpl = template.plainText || template.text || '';
