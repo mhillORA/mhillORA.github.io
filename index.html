@@ -7953,7 +7953,16 @@
                     refreshDuplicateAssignments();
                 }
                 if (modalContainer.querySelector('#unavailability-calendar-container')) {
-                    renderUnavailabilityCalendar();
+                    // Refresh time off requests before rendering calendar to show latest data
+                    (async () => {
+                        try {
+                            const updatedRequests = await apiService.getTimeOffRequests();
+                            setState({ timeOffRequests: Array.isArray(updatedRequests) ? updatedRequests : [] });
+                        } catch (error) {
+                            console.warn('Failed to refresh time off requests when rendering calendar:', error);
+                        }
+                        renderUnavailabilityCalendar();
+                    })();
                 }
                 const printButton = modalContainer.querySelector('[data-action="print-report"]');
                 if (printButton) {
@@ -7973,6 +7982,8 @@
             };
 
             const closeModal = () => {
+                // Clear selected dates when modal closes
+                window._ptoSelectedDates = new Set();
                 // Clear the stored editing event when modal closes
                 window._currentEditingEvent = null;
                 if (!modalContainer) {
@@ -22862,21 +22873,61 @@
                 // Managers can select past dates for retroactive time off tracking
                 const canSelectPastDates = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
                 
+                // Get CRC ID for checking existing time off
+                const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const loggedInCrcId = getLoggedInCrcId();
+                const crcId = isCrcUser && loggedInCrcId ? loggedInCrcId : state.selectedCrcForUnavailability;
+                
+                // Build maps of existing time off requests (exclude rejected)
+                const approvedDates = new Set();
+                const pendingDates = new Set();
+                if (crcId) {
+                    (state.timeOffRequests || []).forEach(req => {
+                        if (req.crcId !== crcId) return;
+                        const status = String(req?.status || '').toLowerCase().trim();
+                        if (status === 'rejected') return; // Ignore rejected
+                        const reqDate = toDateOnlyString(parseDateFlexible(req.date || req.startDate));
+                        const reqEndDate = toDateOnlyString(parseDateFlexible(req.endDate || req.startDate || req.date)) || reqDate;
+                        if (!reqDate) return;
+                        const start = new Date(reqDate + 'T00:00:00');
+                        const end = new Date(reqEndDate + 'T00:00:00');
+                        const cursor = new Date(start);
+                        while (cursor <= end) {
+                            const d = toDateOnlyString(cursor);
+                            if (status === 'approved') {
+                                approvedDates.add(d);
+                            } else if (status === 'pending') {
+                                pendingDates.add(d);
+                            }
+                            cursor.setDate(cursor.getDate() + 1);
+                        }
+                    });
+                }
+                
                 for (let day = 1; day <= daysInMonth; day++) {
                     const dateStr = `${calendarYear}-${String(calendarMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                     const isPast = dateStr < today;
                     const isToday = dateStr === today;
                     const isSelected = selectedDates.has(dateStr);
+                    const isApproved = approvedDates.has(dateStr);
+                    const isPending = pendingDates.has(dateStr);
                     
                     // For managers, past dates are selectable (shown with different style)
                     // For regular users, past dates are disabled
                     const isPastAndBlocked = isPast && !canSelectPastDates;
                     
                     let buttonClass = '';
+                    let statusLabel = '';
                     if (isPastAndBlocked) {
                         buttonClass = 'opacity-50 cursor-not-allowed bg-gray-100 dark:bg-gray-800 border-gray-300 dark:border-gray-600';
                     } else if (isSelected) {
                         buttonClass = 'bg-blue-600 text-white border-blue-500';
+                    } else if (isApproved) {
+                        buttonClass = 'bg-blue-100 dark:bg-blue-900/40 border-blue-300 dark:border-blue-600 cursor-not-allowed';
+                        statusLabel = '<div class="text-[10px] text-blue-700 dark:text-blue-300">Approved</div>';
+                    } else if (isPending) {
+                        buttonClass = 'bg-yellow-100 dark:bg-yellow-900/40 border-yellow-300 dark:border-yellow-600 cursor-not-allowed';
+                        statusLabel = '<div class="text-[10px] text-yellow-700 dark:text-yellow-300">Pending</div>';
                     } else if (isToday) {
                         buttonClass = 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/30';
                     } else if (isPast && canSelectPastDates) {
@@ -22891,12 +22942,13 @@
                             data-action="pto-date-selected" 
                             data-date="${dateStr}" 
                             data-pto-type="${ptoType}"
-                            class="min-h-[60px] p-2 rounded-md border-2 transition-all ${buttonClass} font-medium"
-                            ${isPastAndBlocked ? 'disabled' : ''}
-                            ${isPast && canSelectPastDates ? 'style="pointer-events: auto;"' : ''}
-                            title="${isPast && canSelectPastDates ? dateStr + ' (Past date - Manager access)' : dateStr}"
+                            class="min-h-[60px] p-2 rounded-md border-2 transition-all ${buttonClass} font-medium flex flex-col items-center justify-center"
+                            ${isPastAndBlocked || isApproved || isPending ? 'disabled' : ''}
+                            ${isPast && canSelectPastDates && !isApproved && !isPending ? 'style="pointer-events: auto;"' : ''}
+                            title="${isApproved ? dateStr + ' (Already approved)' : isPending ? dateStr + ' (Pending approval)' : isPast && canSelectPastDates ? dateStr + ' (Past date - Manager access)' : dateStr}"
                         >
-                            ${day}
+                            <span>${day}</span>
+                            ${statusLabel}
                         </button>
                     `;
                 }
@@ -23003,76 +23055,28 @@
                     let timeOffRequestsCreated = 0;
                     const createdTimeOffRequests = [];
                     
-                    // Check if this CRC already has time off on any of these dates
-                    const conflictingDates = [];
-                    for (const dateStr of sortedDates) {
-                        const existingPto = state.crc_events.find(e => 
-                            e.crcId === crcId && 
-                            e.date === dateStr && 
-                            (e.type === 'Unavailable' || e.type === 'Paid Time Off' || e.type === 'PTO')
-                        );
-                        
-                        const existingTimeOffRequest = (state.timeOffRequests || []).find(req => 
-                            req.crcId === crcId && 
-                            (req.date === dateStr || 
-                             (req.startDate === dateStr) ||
-                             (req.startDate && req.endDate && 
-                              new Date(dateStr) >= new Date(req.startDate) && 
-                              new Date(dateStr) <= new Date(req.endDate)))
-                        );
-                        
-                        if (existingPto || existingTimeOffRequest) {
-                            conflictingDates.push(dateStr);
-                        }
-                    }
-                    
-                    if (conflictingDates.length > 0) {
-                        const dateList = conflictingDates.slice(0, 3).map(d => new Date(d + 'T00:00:00').toLocaleDateString()).join(', ');
-                        const more = conflictingDates.length > 3 ? ` and ${conflictingDates.length - 3} more` : '';
-                        showNotification(`Time off already exists for: ${dateList}${more}. Skipping those dates.`, 'warning');
-                    }
-                    
-                    // Create requests for non-conflicting dates
-                    // In this flow, every selectable type is a time off type.
+                    // Let backend handle duplicate checking - it's the source of truth
+                    // Frontend state can be stale, so we just try to create and handle errors
                     const isTimeOffType = true;
+                    const conflictingDates = [];
                     
                     for (const dateStr of sortedDates) {
-                        // Skip if conflict exists
-                        const existingPto = state.crc_events.find(e => 
-                            e.crcId === crcId && 
-                            e.date === dateStr && 
-                            (e.type === 'Unavailable' || e.type === 'Paid Time Off' || e.type === 'PTO')
-                        );
-                        
-                        const existingTimeOffRequest = (state.timeOffRequests || []).find(req => 
-                            req.crcId === crcId && 
-                            (req.date === dateStr || 
-                             (req.startDate === dateStr) ||
-                             (req.startDate && req.endDate && 
-                              new Date(dateStr) >= new Date(req.startDate) && 
-                              new Date(dateStr) <= new Date(req.endDate)))
-                        );
-                        
-                        if (existingPto || existingTimeOffRequest) {
-                            continue;
-                        }
-                                                
                         // Create time off request (one per day)
                         if (isTimeOffType) {
+                            const timeOffRequest = {
+                                crcId: crcId,
+                                requestedBy: state.currentUser?.id || crcId,
+                                date: dateStr,
+                                startDate: dateStr,
+                                endDate: dateStr,
+                                type: ptoType,
+                                hours: hours,
+                                period: period,
+                                notes: undefined,
+                                status: 'pending'
+                            };
+                            
                             try {
-                                const timeOffRequest = {
-                                    crcId: crcId,
-                                    requestedBy: state.currentUser?.id || crcId,
-                                    date: dateStr,
-                                    startDate: dateStr,
-                                    endDate: dateStr,
-                                    type: ptoType,
-                                    hours: hours,
-                                    period: period,
-                                    notes: undefined,
-                                    status: 'pending'
-                                };
-                                
                                 const createdRequest = await apiService.createTimeOffRequest(timeOffRequest);
                                 // Some backends return the created entity without an `id` (or return a 204).
                                 // Treat creation as successful if we didn't throw; create a local ID so the UI can render immediately.
@@ -23085,46 +23089,59 @@
                                 timeOffRequestsCreated++;
                                 createdCount++;
                             } catch (error) {
-                                console.error('Error creating time off request:', error);
-                                // Don't increment counter on error
+                                // Check if it's a duplicate error (409)
+                                const isDuplicate = error?.response?.status === 409 || 
+                                                   error?.message?.includes('Duplicate') || 
+                                                   error?.message?.includes('already exists');
+                                if (isDuplicate) {
+                                    conflictingDates.push(dateStr);
+                                } else {
+                                    console.error('Error creating time off request:', error);
+                                    showNotification(`Failed to create request for ${dateStr}: ${error?.message || error}`, 'error');
+                                }
                             }
                         }
                     }
                     
-                    // Refresh data immediately
-                    if (timeOffRequestsCreated > 0 || createdCount > 0) {
-                        // Update state immediately with created requests/events
-                        setState({ 
-                            timeOffRequests: state.timeOffRequests || [],
-                            crc_events: state.crc_events || []
-                        });
-                        
-                        // Also refresh from server after a short delay and merge in any locally created requests
-                        setTimeout(async () => {
-                            try {
-                                let updatedRequests = await apiService.getTimeOffRequests();
-                                // Do NOT create "Unavailable" events on request; approved requests will be turned into events by the
-                                // existing approval/sync logic.
-                                const updatedEvents = state.crc_events || [];
-                                
-                                if (createdTimeOffRequests.length > 0) {
-                                    const existingIds = new Set((updatedRequests || []).map(r => r.id));
-                                    const missing = createdTimeOffRequests.filter(r => r.id && !existingIds.has(r.id));
-                                    if (missing.length > 0) {
-                                        updatedRequests = [...(updatedRequests || []), ...missing];
-                                    }
-                                }
-                                
-                                setState({ 
-                                    timeOffRequests: updatedRequests,
-                                    crc_events: updatedEvents
-                                });
-                            } catch (error) {
-                                console.error('Error refreshing data:', error);
-                            }
-                        }, 500);
+                    // Show conflicts if any
+                    if (conflictingDates.length > 0) {
+                        const dateList = conflictingDates.slice(0, 3).map(d => new Date(d + 'T00:00:00').toLocaleDateString()).join(', ');
+                        const more = conflictingDates.length > 3 ? ` and ${conflictingDates.length - 3} more` : '';
+                        showNotification(`Time off already exists for: ${dateList}${more}. Skipped those dates.`, 'warning');
                     }
                     
+                    // Refresh data IMMEDIATELY before closing modal so calendar shows new requests
+                    if (timeOffRequestsCreated > 0 || createdCount > 0) {
+                        try {
+                            // Refresh from server immediately (await, don't setTimeout)
+                            let updatedRequests = await apiService.getTimeOffRequests();
+                            
+                            // Merge with locally created requests in case API hasn't returned them yet
+                            if (createdTimeOffRequests.length > 0) {
+                                const existingIds = new Set((updatedRequests || []).map(r => r.id));
+                                const missing = createdTimeOffRequests.filter(r => r.id && !existingIds.has(r.id));
+                                if (missing.length > 0) {
+                                    updatedRequests = [...(updatedRequests || []), ...missing];
+                                }
+                            }
+                            
+                            // Update state immediately
+                            setState({ 
+                                timeOffRequests: updatedRequests,
+                                crc_events: state.crc_events || []
+                            });
+                        } catch (error) {
+                            console.error('Error refreshing time off requests:', error);
+                            // Still update with local data
+                            setState({ 
+                                timeOffRequests: state.timeOffRequests || [],
+                                crc_events: state.crc_events || []
+                            });
+                        }
+                    }
+                    
+                    // Clear selected dates after submission
+                    window._ptoSelectedDates = new Set();
                     closeModal();
                     if (createdCount === 0) {
                         showNotification('No new time off days were created (they may already exist for those dates).', 'warning');
@@ -23353,29 +23370,10 @@
                             const uniquePtoDates = new Set(existingPtoInstances.map(e => e.date));
                             let currentYearPtoCount = uniquePtoDates.size;
                             
+                            // Let backend handle duplicate checking - frontend state can be stale
+                            const conflictingDates = [];
+                            
                             for (const day of days) {
-                                // Check if this CRC already has an Unavailable or Paid Time Off event on this date
-                                // Only ONE PTO instance per day per person is allowed
-                                const existingPto = state.crc_events.find(e => 
-                                    e.crcId === crcId && 
-                                    e.date === day.date && 
-                                    (e.type === 'Unavailable' || e.type === 'Paid Time Off' || e.type === 'PTO')
-                                );
-                                
-                                // Also check time off requests for this date
-                                const existingTimeOffRequest = (state.timeOffRequests || []).find(req => 
-                                    req.crcId === crcId && 
-                                    (req.date === day.date || 
-                                     (req.startDate === day.date) ||
-                                     (req.startDate && req.endDate && 
-                                      new Date(day.date) >= new Date(req.startDate) && 
-                                      new Date(day.date) <= new Date(req.endDate)))
-                                );
-                                
-                                if (existingPto || existingTimeOffRequest) {
-                                    console.log(`Skipping ${day.date} - PTO already exists for this person on this date`);
-                                    continue; // Skip this day, don't create duplicate
-                                }
                                 
                                 // Check if adding this day would exceed 365 PTO instances per calendar year
                                 if (currentYearPtoCount >= 365) {
@@ -23414,27 +23412,29 @@
                                         timeOffRequestsCreated++;
                                         createdCount++;
                                     } catch (error) {
-                                        console.error('Error creating time off request for', day.date, error);
-                                        // Check if it's a duplicate error (409)
-                                        let errorMessage = error?.message || error?.toString() || 'Unknown error';
-                                        if (error?.response?.jsonBody?.message) {
-                                            errorMessage = error.response.jsonBody.message;
-                                        } else if (error?.message?.includes('Duplicate') || error?.message?.includes('409')) {
-                                            errorMessage = 'A time off request already exists for this employee on this date.';
+                                        // Check if it's a duplicate error (409) - backend is source of truth
+                                        const isDuplicate = error?.response?.status === 409 || 
+                                                           error?.message?.includes('Duplicate') || 
+                                                           error?.message?.includes('already exists') ||
+                                                           error?.response?.jsonBody?.error === 'Duplicate time off request';
+                                        if (isDuplicate) {
+                                            conflictingDates.push(day.date);
+                                            console.log(`Skipping ${day.date} - duplicate detected by backend`);
+                                        } else {
+                                            console.error('Error creating time off request for', day.date, error);
+                                            const errorMessage = error?.response?.jsonBody?.message || error?.message || 'Unknown error';
+                                            showNotification(`Failed to create time off request for ${day.date}. ${errorMessage}`, 'error');
                                         }
-                                        showNotification(`Failed to create time off request for ${day.date}. ${errorMessage}`, 'error');
                                     }
                                 } else {
                                     console.log('Skipping time off request creation - not time off type. ptoType:', ptoType, 'isTimeOffType:', isTimeOffType);
                                 }
                             }
                             
-                            // Refresh time off requests immediately
+                            // Refresh time off requests IMMEDIATELY (no delay)
                             if (timeOffRequestsCreated > 0) {
                                 try {
                                     console.log(`Refreshing time off requests after creating ${timeOffRequestsCreated} request(s)...`);
-                                    // Small delay to ensure backend has processed the requests
-                                    await new Promise(resolve => setTimeout(resolve, 500));
                                     let updatedRequests = await apiService.getTimeOffRequests();
                                     console.log('Refreshed time off requests:', updatedRequests.length, 'total requests', updatedRequests);
                                     
@@ -23448,8 +23448,8 @@
                                         }
                                     }
                                     
-                                    // Update state directly to ensure it's available immediately
-                                    state.timeOffRequests = updatedRequests;
+                                    // Update state using setState to trigger re-renders
+                                    setState({ timeOffRequests: updatedRequests });
                                     
                                     // For CRCs (non-managers), don't redirect to Time Off Requests tab
                                     // Just refresh their current view showing only their own requests
@@ -23512,6 +23512,12 @@
                                 : `${createdCount} day(s) requested successfully!`;
                             
                             showNotification(message, 'success');
+                            // Clear selected dates after submission
+                            window._ptoSelectedDates = new Set();
+                            // Re-render calendar if modal is still open
+                            if (document.getElementById('unavailability-calendar-container')) {
+                                renderUnavailabilityCalendar();
+                            }
                             closeModal();
                             // If time off requests were created, the tab switch above will handle rendering
                             // Otherwise, refresh the current views
@@ -25068,22 +25074,20 @@
                     let dayClass = 'bg-white dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700';
                     let statusHTML = '';
                     
-                    // If there's a rejected time off request, show as available
-                    if (rejectedRequest) {
-                        dayClass = 'bg-green-100 dark:bg-green-900/40 hover:bg-green-200 dark:hover:bg-green-900/60';
-                        statusHTML = `<div class="unavailability-status text-green-800 dark:text-green-200" title="Time off request rejected - Available">Available (Rejected)</div>`;
-                    } else if (pendingRequest) {
-                        // If there's a pending time off request, show as pending
-                        const period = pendingRequest.period || 'Full Day';
-                        const typeLabel = pendingRequest.type || 'Time Off';
-                        dayClass = 'bg-yellow-100 dark:bg-yellow-900/40 hover:bg-yellow-200 dark:hover:bg-yellow-900/60';
-                        statusHTML = `<div class="unavailability-status text-yellow-800 dark:text-yellow-200" title="Time Off (Pending Approval)">Time Off (${typeLabel}) - ${period} (Pending)</div>`;
-                    } else if (approvedRequest) {
-                        // If there's an approved time off request, show as unavailable
+                    // Priority: Approved > Pending > Legacy Events > Available
+                    // Rejected requests are ignored (show as Available)
+                    if (approvedRequest) {
+                        // Approved time off - show as taken/unavailable
                         const period = approvedRequest.period || 'Full Day';
                         const typeLabel = approvedRequest.type || 'Time Off';
                         dayClass = 'bg-blue-100 dark:bg-blue-900/40 hover:bg-blue-200 dark:hover:bg-blue-900/60';
-                        statusHTML = `<div class="unavailability-status text-blue-800 dark:text-blue-200" title="Time Off (Approved)">Time Off (${typeLabel}) - ${period}</div>`;
+                        statusHTML = `<div class="unavailability-status text-blue-800 dark:text-blue-200" title="Time Off (Approved)">${typeLabel} - ${period}</div>`;
+                    } else if (pendingRequest) {
+                        // Pending time off request - show as pending
+                        const period = pendingRequest.period || 'Full Day';
+                        const typeLabel = pendingRequest.type || 'Time Off';
+                        dayClass = 'bg-yellow-100 dark:bg-yellow-900/40 hover:bg-yellow-200 dark:hover:bg-yellow-900/60';
+                        statusHTML = `<div class="unavailability-status text-yellow-800 dark:text-yellow-200" title="Time Off (Pending Approval)">${typeLabel} - ${period} (Pending)</div>`;
                     } else if (event) {
                         const period = event.period || 'Full Day';
                         const eventName = normalizeTimeOffTypeLabel(event.name || event.type);
@@ -25631,9 +25635,17 @@
                         renderTimeOffRequestsContent();
                         break;
                     }
-            // ... rest of the switch statement
                     case 'view-availability': openModal(getAvailabilityModalHTML(), '7xl'); break;
                     case 'manage-unavailability': {
+                        // Refresh time off requests when opening modal to ensure calendar shows latest data
+                        (async () => {
+                            try {
+                                const updatedRequests = await apiService.getTimeOffRequests();
+                                setState({ timeOffRequests: Array.isArray(updatedRequests) ? updatedRequests : [] });
+                            } catch (error) {
+                                console.warn('Failed to refresh time off requests when opening modal:', error);
+                            }
+                        })();
                         // If clicking from Time Off tab and user is viewing their own requests, pre-select their CRC
                         const isFromTimeOffTab = state.activeTab === 'timeOff' && state.currentUser;
                         if (isFromTimeOffTab && state.currentUser && !state.selectedCrcForUnavailability) {
@@ -25693,6 +25705,8 @@
                             showNotification('Please select a PTO type.', 'warning');
                             return;
                         }
+                        // Clear any previously selected dates
+                        window._ptoSelectedDates = new Set();
                         openModal(getPTOCalendarSelectionModalHTML(ptoType), '4xl');
                         setTimeout(() => {
                             setupPTOCalendarSelection(ptoType);
@@ -25706,10 +25720,38 @@
                         const ptoType = actionButton.dataset.ptoType;
                         if (!dateStr || !ptoType) return;
                         
+                        // Check if date is disabled (approved/pending/rejected)
+                        if (actionButton.disabled) {
+                            showNotification('This date already has a time off request (approved or pending).', 'info');
+                            return;
+                        }
+                        
                         // Check if date is in the past - managers can select past dates
                         const today = toDateOnlyString(new Date());
                         const canSelectPastDates = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
                         if (dateStr < today && !canSelectPastDates) return; // Non-managers can't select past dates
+                        
+                        // Check if date already has approved/pending time off
+                        const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                        const loggedInCrcId = getLoggedInCrcId();
+                        const crcId = isCrcUser && loggedInCrcId ? loggedInCrcId : state.selectedCrcForUnavailability;
+                        if (crcId) {
+                            const existingRequest = (state.timeOffRequests || []).find(req => {
+                                if (req.crcId !== crcId) return false;
+                                const status = String(req?.status || '').toLowerCase().trim();
+                                if (status === 'rejected') return false; // Rejected don't block
+                                const reqDate = toDateOnlyString(parseDateFlexible(req.date || req.startDate));
+                                const reqEndDate = toDateOnlyString(parseDateFlexible(req.endDate || req.startDate || req.date)) || reqDate;
+                                return dateStr >= reqDate && dateStr <= reqEndDate;
+                            });
+                            if (existingRequest) {
+                                const status = String(existingRequest.status || '').toLowerCase().trim();
+                                if (status === 'approved' || status === 'pending') {
+                                    showNotification(`This date already has a ${status} time off request.`, 'info');
+                                    return;
+                                }
+                            }
+                        }
                         
                         // Toggle selection state for this date
                         const selectedDates = window._ptoSelectedDates || new Set();
@@ -33876,6 +33918,8 @@
                         const notesField = document.getElementById('multiple-notes-field');
                         if (notesField) notesField.value = '';
                     }
+                    // Clear selected dates when switching employees
+                    window._ptoSelectedDates = new Set();
                     renderUnavailabilityCalendar();
                 }
                 if (target.id === 'month-selector') {
@@ -44487,6 +44531,4 @@
     })(); // Close the async IIFE
     </script>
 	</body>
-</html>
-
 </html>

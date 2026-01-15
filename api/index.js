@@ -2476,21 +2476,30 @@ app.http('timeOffRequestsDedupe', {
 
             const container = getContainer('time-off-requests');
 
-            // Pull all for this CRC (cross-partition) then filter in JS; for a single CRC/month this is manageable.
-            const { resources: allForCrc } = await container.items
-                .query({
-                    query: "SELECT * FROM c WHERE c.crcId = @crcId",
-                    parameters: [{ name: "@crcId", value: crcId }]
-                })
-                .fetchAll();
-
-            const inWindow = (req) => {
-                const d = toDateOnlyString(req?.date || req?.startDate);
-                if (!d) return false;
-                return d >= startDate && d <= endDate;
-            };
-
-            const candidates = (Array.isArray(allForCrc) ? allForCrc : []).filter(inWindow);
+            // Simple approach: query by CRC, filter in JS (more reliable than complex Cosmos queries)
+            let candidates = [];
+            try {
+                const { resources: allForCrc } = await container.items
+                    .query({
+                        query: "SELECT * FROM c WHERE c.crcId = @crcId",
+                        parameters: [{ name: "@crcId", value: crcId }]
+                    })
+                    .fetchAll();
+                
+                // Filter to date range in JS
+                candidates = (Array.isArray(allForCrc) ? allForCrc : []).filter(req => {
+                    const d = toDateOnlyString(req?.date || req?.startDate);
+                    if (!d) return false;
+                    return d >= startDate && d <= endDate;
+                });
+            } catch (queryError) {
+                context?.log?.error?.(`Failed to query time off requests: ${queryError.message}`);
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Failed to query time off requests', detail: queryError.message },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
 
             const groups = new Map(); // dateStr -> array
             const rangeLike = [];
@@ -2611,26 +2620,27 @@ app.http('timeOffRequestsDedupe', {
                 changes.push({ date: dateStr, keptId: primary.id, mergedCount: arr.length });
 
                 if (!dryRun) {
-                    await container.items.upsert(merged);
-                    // Delete the duplicates (info preserved in mergedFrom)
-                    const idsToDelete = others.map(o => o.id).filter(Boolean);
-                    const concurrency = 25;
-                    let idx = 0;
-                    const worker = async () => {
-                        while (idx < idsToDelete.length) {
-                            const current = idsToDelete[idx++];
+                    try {
+                        // Upsert the merged record
+                        await container.items.upsert(merged);
+                        
+                        // Delete duplicates one at a time (simpler, more reliable)
+                        const idsToDelete = others.map(o => o.id).filter(Boolean);
+                        for (const idToDelete of idsToDelete) {
                             try {
-                                await container.item(current, current).delete();
+                                await container.item(idToDelete, idToDelete).delete();
                                 deleted += 1;
-                            } catch (e) {
-                                const code = e.code || e.statusCode;
+                            } catch (deleteError) {
+                                const code = deleteError.code || deleteError.statusCode;
                                 if (code !== 404) {
-                                    context?.log?.warn?.(`Failed to delete duplicate time off request ${current}: ${e.message}`);
+                                    context?.log?.warn?.(`Failed to delete duplicate ${idToDelete}: ${deleteError.message}`);
                                 }
                             }
                         }
-                    };
-                    await Promise.all(Array.from({ length: Math.min(concurrency, idsToDelete.length) }, () => worker()));
+                    } catch (upsertError) {
+                        context?.log?.error?.(`Failed to upsert merged request for ${dateStr}: ${upsertError.message}`);
+                        // Continue with other dates even if one fails
+                    }
                 }
             }
 
@@ -2650,7 +2660,17 @@ app.http('timeOffRequestsDedupe', {
                 headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
             };
         } catch (error) {
-            return handleError(context, error, 'Dedupe time off requests failed');
+            context?.log?.error?.(`Dedupe failed: ${error.message}`);
+            context?.log?.error?.(`Stack: ${error.stack}`);
+            return {
+                status: 500,
+                jsonBody: { 
+                    error: 'Dedupe time off requests failed',
+                    message: error.message || 'Unknown error',
+                    detail: error.stack || 'No stack trace'
+                },
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+            };
         }
     }
 });
@@ -2696,46 +2716,62 @@ app.http('time-off-requests', {
                         body.date = body.startDate;
                     }
 
-                    // Force date-only strings to prevent timezone variants creating "duplicates"
-                    body.date = toDateOnlyString(body.date);
-                    if (body.startDate) body.startDate = toDateOnlyString(body.startDate);
-                    if (body.endDate) body.endDate = toDateOnlyString(body.endDate);
-                    if (body.date && !body.startDate) body.startDate = body.date;
-                    if (body.date && !body.endDate) body.endDate = body.date;
-                    
-                    validateTimeOffRequestsSchema(body);
-                    
-                    // Enforce: only ONE time off request per CRC per day.
-                    const normalizedDate = body.date;
-                    const { resources: existingRequests } = await container.items
-                        .query({
-                            query: "SELECT c.id, c.date, c.startDate, c.endDate FROM c WHERE c.crcId = @crcId AND (c.date = @date OR c.startDate = @date)",
-                            parameters: [
-                                { name: "@crcId", value: body.crcId },
-                                { name: "@date", value: normalizedDate }
-                            ]
-                        })
-                        .fetchAll();
-                    const duplicateRequest = (existingRequests || [])[0];
-                    
-                    if (duplicateRequest) {
+                    // Normalize dates to date-only strings (prevents timezone issues)
+                    const normalizedDate = toDateOnlyString(body.date || body.startDate);
+                    if (!normalizedDate) {
                         return {
-                            status: 409,
-                            jsonBody: { 
-                                error: 'Duplicate time off request',
-                                message: 'A time off request already exists for this employee on the selected date.',
-                                existingRequestId: duplicateRequest.id
-                            },
+                            status: 400,
+                            jsonBody: { error: 'date or startDate is required' },
                             headers: { 'Content-Type': 'application/json' }
                         };
                     }
                     
-                    // Set default status to pending if not provided
+                    body.date = normalizedDate;
+                    body.startDate = toDateOnlyString(body.startDate || body.date);
+                    body.endDate = toDateOnlyString(body.endDate || body.startDate || body.date);
+                    
+                    validateTimeOffRequestsSchema(body);
+                    
+                    // Simple duplicate check: ONE request per CRC per day (rejected don't count)
+                    try {
+                        const { resources: existingRequests } = await container.items
+                            .query({
+                                query: "SELECT c.id, c.status FROM c WHERE c.crcId = @crcId AND (c.date = @date OR c.startDate = @date)",
+                                parameters: [
+                                    { name: "@crcId", value: body.crcId },
+                                    { name: "@date", value: normalizedDate }
+                                ]
+                            })
+                            .fetchAll();
+                        
+                        // Only block if there's a non-rejected request
+                        const duplicateRequest = (existingRequests || []).find(req => {
+                            const status = String(req?.status || '').toLowerCase().trim();
+                            return status !== 'rejected';
+                        });
+                        
+                        if (duplicateRequest) {
+                            return {
+                                status: 409,
+                                jsonBody: { 
+                                    error: 'Duplicate time off request',
+                                    message: 'A time off request already exists for this employee on the selected date.',
+                                    existingRequestId: duplicateRequest.id
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                    } catch (checkError) {
+                        context?.log?.warn?.(`Duplicate check failed, proceeding anyway: ${checkError.message}`);
+                        // Continue - better to allow creation than block due to query error
+                    }
+                    
+                    // Create the request
                     const newRequest = { 
                         ...body,
-                        date: body.date || body.startDate, // Ensure date is set
-                        startDate: body.startDate || body.date, // Also include startDate for compatibility
-                        endDate: body.endDate || body.date, // Use endDate if provided, otherwise use date
+                        date: normalizedDate,
+                        startDate: body.startDate,
+                        endDate: body.endDate,
                         id: generateId(),
                         status: body.status || 'pending',
                         createdAt: new Date().toISOString(),
@@ -2743,6 +2779,7 @@ app.http('time-off-requests', {
                         approvedBy: null,
                         approvedAt: null
                     };
+                    
                     const { resource: createdRequest } = await container.items.create(newRequest);
                     return { status: 201, jsonBody: createdRequest };
                 
