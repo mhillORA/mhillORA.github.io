@@ -1,5 +1,17 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
+const { EmailClient } = require("@azure/communication-email");
+
+// Lazy initialization for the Email Client
+let emailClient = null;
+const getEmailClient = () => {
+    if (!emailClient) {
+        const connectionString = process.env.COMMUNICATION_SERVICES_CONNECTION_STRING;
+        if (!connectionString) throw new Error("Email connection string missing.");
+        emailClient = new EmailClient(connectionString);
+    }
+    return emailClient;
+};
 
 // Use node-fetch instead of native fetch for Azure Functions compatibility
 // Native fetch is broken in Azure Functions environment
@@ -99,6 +111,252 @@ const getCosmosClient = () => {
 const getContainer = (containerName) => {
     const { database } = getCosmosClient();
     return database.container(containerName);
+};
+
+// ---------------------------------------------------------------------------------
+// EMAIL TEMPLATE RENDERING + SEND
+// ---------------------------------------------------------------------------------
+const toDateOnlyString = (value) => {
+    if (!value) return null;
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        const datePart = trimmed.split('T')[0];
+        if (/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return datePart;
+        const d = new Date(trimmed);
+        if (!Number.isNaN(d.getTime())) {
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const dd = String(d.getDate()).padStart(2, '0');
+            return `${y}-${m}-${dd}`;
+        }
+        return null;
+    }
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${dd}`;
+};
+
+const getByPath = (obj, path) => {
+    if (!obj || !path) return undefined;
+    const parts = String(path).split('.').map(p => p.trim()).filter(Boolean);
+    let cur = obj;
+    for (const part of parts) {
+        if (cur == null) return undefined;
+        cur = cur[part];
+    }
+    return cur;
+};
+
+const htmlEscape = (s) => {
+    return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+};
+
+// Very simple mustache-ish renderer: replaces {{path.to.value}} with a string value.
+// Arrays become comma-joined; objects become JSON.
+const renderTemplateString = (template, context) => {
+    if (template == null) return '';
+    const input = String(template);
+    return input.replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (_, key) => {
+        const value = getByPath(context, key);
+        if (value === undefined || value === null) return '';
+        if (Array.isArray(value)) return value.map(v => (v == null ? '' : String(v))).filter(Boolean).join(', ');
+        if (typeof value === 'object') return JSON.stringify(value);
+        return String(value);
+    });
+};
+
+const eventBelongsToCrc = (event, crcId) => {
+    if (!event || !crcId) return false;
+    if (event.crcId === crcId) return true;
+    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+        return Object.values(event.roleAssignments).some(assignments => Array.isArray(assignments) && assignments.includes(crcId));
+    }
+    return false;
+};
+
+const isTimeOffLikeType = (type) => {
+    const t = String(type || '').trim().toLowerCase();
+    return [
+        'time off',
+        'unavailable',
+        'paid time off',
+        'pto',
+        'sick time',
+        'sick',
+        'vacation',
+        'holiday',
+        'bereavement',
+        'jury duty',
+        'per diem'
+    ].includes(t);
+};
+
+const buildScheduleCsv = ({ crcName, startDate, endDate, shifts = [], timeOff = [], travel = [] }) => {
+    const lines = [];
+    const header = ['CRC', 'Range Start', 'Range End'];
+    lines.push(header.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
+    lines.push([crcName || '', startDate || '', endDate || ''].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
+    lines.push('');
+
+    lines.push('"Section","Date","Type","Details"');
+    const addRow = (section, date, type, details) => {
+        lines.push([section, date, type, details].map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(','));
+    };
+
+    shifts.forEach(s => addRow('Shift', s.date || '', s.type || 'Site Assignment', s.summary || s.siteName || ''));
+    timeOff.forEach(t => addRow('Time Off', t.date || '', t.type || 'Time Off', t.summary || t.period || ''));
+    travel.forEach(t => addRow('Travel', t.date || '', t.type || 'Travel', t.summary || t.route || ''));
+
+    return lines.join('\n');
+};
+
+const buildRecipientEmailContext = async ({ crcId, startDate, endDate }, context) => {
+    const start = toDateOnlyString(startDate) || toDateOnlyString(new Date());
+    const end = toDateOnlyString(endDate) || start;
+
+    const crcsContainer = getContainer('crcs');
+    const eventsContainer = getContainer('events');
+    const timeOffContainer = getContainer('time-off-requests');
+    const travelContainer = getContainer('travel');
+
+    let crc = null;
+    try {
+        if (crcId) {
+            const { resource } = await crcsContainer.item(crcId, crcId).read();
+            crc = resource || null;
+        }
+    } catch (e) {
+        context?.log?.warn?.(`Failed to read CRC ${crcId}: ${e.message}`);
+    }
+
+    // Query events by date window (broad), then filter to recipient membership (crcId or roleAssignments).
+    let events = [];
+    try {
+        const { resources } = await eventsContainer.items.query({
+            query: "SELECT * FROM c WHERE c.date >= @start AND c.date <= @end",
+            parameters: [
+                { name: "@start", value: start },
+                { name: "@end", value: end }
+            ]
+        }).fetchAll();
+        events = Array.isArray(resources) ? resources : [];
+    } catch (e) {
+        context?.log?.warn?.(`Failed to query events: ${e.message}`);
+    }
+    const myEvents = crcId ? events.filter(e => eventBelongsToCrc(e, crcId)) : [];
+    const shifts = myEvents
+        .filter(e => String(e.type || '').toLowerCase() === 'site assignment')
+        .map(e => ({
+            id: e.id,
+            date: toDateOnlyString(e.date),
+            type: e.type,
+            period: e.period || 'Full Day',
+            hours: e.hours ?? null,
+            siteId: e.siteId || null,
+            summary: `${toDateOnlyString(e.date) || ''} • ${e.period || 'Full Day'}`
+        }))
+        .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+    const timeOffEvents = myEvents
+        .filter(e => isTimeOffLikeType(e.type))
+        .map(e => ({
+            id: e.id,
+            date: toDateOnlyString(e.date),
+            type: e.type,
+            period: e.period || 'Full Day',
+            hours: e.hours ?? null,
+            summary: `${toDateOnlyString(e.date) || ''} • ${e.type || 'Time Off'} • ${e.period || 'Full Day'}`
+        }))
+        .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+    let timeOffRequests = [];
+    try {
+        if (crcId) {
+            const { resources } = await timeOffContainer.items.query({
+                query: "SELECT * FROM c WHERE c.crcId = @crcId AND c.date >= @start AND c.date <= @end",
+                parameters: [
+                    { name: "@crcId", value: crcId },
+                    { name: "@start", value: start },
+                    { name: "@end", value: end }
+                ]
+            }).fetchAll();
+            timeOffRequests = Array.isArray(resources) ? resources : [];
+        }
+    } catch (e) {
+        context?.log?.warn?.(`Failed to query time off requests: ${e.message}`);
+    }
+    const timeOffRequestEntries = timeOffRequests.map(r => ({
+        id: r.id,
+        date: toDateOnlyString(r.date || r.startDate),
+        type: r.type || 'Time Off',
+        period: r.period || 'Full Day',
+        status: r.status || 'pending',
+        hours: r.hours ?? null,
+        summary: `${toDateOnlyString(r.date || r.startDate) || ''} • ${r.type || 'Time Off'} • ${r.period || 'Full Day'} • ${r.status || ''}`
+    }));
+
+    let travel = [];
+    try {
+        const { resources } = await travelContainer.items.query({
+            query: "SELECT * FROM c WHERE c.date >= @start AND c.date <= @end",
+            parameters: [
+                { name: "@start", value: start },
+                { name: "@end", value: end }
+            ]
+        }).fetchAll();
+        const allTravel = Array.isArray(resources) ? resources : [];
+        travel = crcId ? allTravel.filter(t => t && (t.crcId === crcId)) : [];
+    } catch (e) {
+        context?.log?.warn?.(`Failed to query travel: ${e.message}`);
+    }
+    const travelEntries = travel.map(t => ({
+        id: t.id,
+        date: toDateOnlyString(t.date || t.departureDate || t.startDate),
+        type: t.bookingType || 'Travel',
+        route: t.origin && t.destination ? `${t.origin} → ${t.destination}` : '',
+        summary: `${toDateOnlyString(t.date || t.departureDate || t.startDate) || ''} • ${(t.origin && t.destination) ? `${t.origin} → ${t.destination}` : (t.bookingType || 'Travel')}`
+    }));
+
+    const scheduleText = shifts.map(s => `- ${s.date} (${s.period})`).join('\n');
+    const timeOffText = [...timeOffRequestEntries, ...timeOffEvents].map(t => `- ${t.date} ${t.type} (${t.period})`).join('\n');
+    const travelText = travelEntries.map(t => `- ${t.date} ${t.route || t.type}`).join('\n');
+
+    // Provide some simple HTML chunks that templates can drop in.
+    const scheduleHtml = shifts.length
+        ? `<ul>${shifts.map(s => `<li>${htmlEscape(s.date)} • ${htmlEscape(s.period)}</li>`).join('')}</ul>`
+        : `<p>No shifts in range.</p>`;
+    const timeOffHtml = (timeOffRequestEntries.length || timeOffEvents.length)
+        ? `<ul>${[...timeOffRequestEntries, ...timeOffEvents].map(t => `<li>${htmlEscape(t.date)} • ${htmlEscape(t.type)} • ${htmlEscape(t.period)}${t.status ? ` • ${htmlEscape(t.status)}` : ''}</li>`).join('')}</ul>`
+        : `<p>No time off in range.</p>`;
+    const travelHtml = travelEntries.length
+        ? `<ul>${travelEntries.map(t => `<li>${htmlEscape(t.date)} • ${htmlEscape(t.route || t.type)}</li>`).join('')}</ul>`
+        : `<p>No travel in range.</p>`;
+
+    return {
+        crc: crc || { id: crcId || null, name: '' },
+        range: { start, end },
+        schedule: { shifts, text: scheduleText, html: scheduleHtml },
+        timeOff: { requests: timeOffRequestEntries, events: timeOffEvents, text: timeOffText, html: timeOffHtml },
+        travel: { records: travelEntries, text: travelText, html: travelHtml },
+        // Shorthand vars for "simple stupid" templates
+        crcName: (crc && crc.name) ? crc.name : '',
+        rangeStart: start,
+        rangeEnd: end,
+        scheduleText,
+        scheduleHtml,
+        timeOffText,
+        timeOffHtml,
+        travelText,
+        travelHtml
+    };
 };
 
 // Helper function to handle errors
@@ -1564,6 +1822,212 @@ app.http('announcements', {
     authLevel: 'anonymous',
     route: 'announcements/{id?}',
     handler: (request, context) => crudHandler(context, request, 'announcements'),
+});
+
+app.http('templates', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'templates/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'templates'),
+});
+
+app.http('send-email', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'send-email',
+    handler: async (request, context) => {
+        // Handle OPTIONS request for CORS
+        if (request.method === 'OPTIONS') {
+            return {
+                status: 200,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                }
+            };
+        }
+
+        try {
+            const body = await request.json();
+
+            const senderAddress = process.env.EMAIL_SENDER_ADDRESS;
+            if (!senderAddress) {
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Email sender address missing. Set EMAIL_SENDER_ADDRESS in app settings.' },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+
+            // Payload shape:
+            // {
+            //   templateId?: string,
+            //   template?: { subject?: string, html?: string, plainText?: string },
+            //   recipients: [{ userId?: string, email?: string, crcId?: string, name?: string }],
+            //   range?: { startDate?: string, endDate?: string },
+            //   attachments?: [{ name, contentType, contentInBase64, contentId? }],
+            //   attachPersonalizedCsv?: boolean
+            // }
+            const recipients = Array.isArray(body.recipients) ? body.recipients : [];
+            if (recipients.length === 0) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'recipients is required' },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+
+            const rangeStart = body.range?.startDate || body.startDate || null;
+            const rangeEnd = body.range?.endDate || body.endDate || null;
+
+            let template = body.template && typeof body.template === 'object' ? body.template : null;
+            if (!template && body.templateId) {
+                try {
+                    const templatesContainer = getContainer('templates');
+                    const { resource } = await templatesContainer.item(body.templateId, body.templateId).read();
+                    template = resource || null;
+                } catch (e) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'Template not found', detail: e.message },
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    };
+                }
+            }
+            if (!template) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'templateId or template is required' },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+
+            // Normalize attachments (applies to all recipients)
+            const baseAttachments = Array.isArray(body.attachments) ? body.attachments : [];
+            const attachments = baseAttachments
+                .filter(a => a && a.name && a.contentType && a.contentInBase64)
+                .map(a => ({
+                    name: String(a.name),
+                    contentType: String(a.contentType),
+                    contentInBase64: String(a.contentInBase64),
+                    ...(a.contentId ? { contentId: String(a.contentId) } : {})
+                }));
+
+            const attachPersonalizedCsv = !!body.attachPersonalizedCsv;
+
+            // Resolve user → email/crcId if needed
+            const usersContainer = getContainer('users');
+            const crcsContainer = getContainer('crcs');
+            const { resources: crcList } = await crcsContainer.items.readAll().fetchAll();
+            const crcResolver = buildCrcResolver(crcList || []);
+
+            const emailClient = getEmailClient();
+
+            const results = [];
+            let sent = 0;
+            let failed = 0;
+
+            for (const r of recipients) {
+                try {
+                    let email = r.email ? String(r.email).trim() : '';
+                    let crcId = r.crcId ? String(r.crcId).trim() : '';
+                    let displayName = r.name ? String(r.name) : '';
+
+                    if (r.userId && (!email || !crcId || !displayName)) {
+                        try {
+                            const userId = String(r.userId);
+                            const { resource: user } = await usersContainer.item(userId, userId).read();
+                            if (user) {
+                                if (!email && user.email) email = String(user.email).trim();
+                                if (!crcId && user.crcId) crcId = String(user.crcId).trim();
+                                if (!displayName) displayName = user.name || user.username || user.email || '';
+                            }
+                        } catch (e) {
+                            // continue; we can still send if email provided
+                        }
+                    }
+
+                    if (!crcId && email) {
+                        const key = email.toLowerCase();
+                        if (crcResolver.byEmail.has(key)) {
+                            crcId = crcResolver.byEmail.get(key).id;
+                        }
+                    }
+
+                    if (!email) {
+                        throw new Error('Recipient email missing');
+                    }
+
+                    const ctx = await buildRecipientEmailContext({ crcId, startDate: rangeStart, endDate: rangeEnd }, context);
+                    const subjectTpl = template.subject || template.title || 'Message';
+                    const htmlTpl = template.html || template.bodyHtml || template.body || '';
+                    const plainTpl = template.plainText || template.text || '';
+
+                    const subject = renderTemplateString(subjectTpl, ctx);
+                    const html = renderTemplateString(htmlTpl, ctx);
+                    const plainText = renderTemplateString(plainTpl, ctx);
+
+                    const perRecipientAttachments = [...attachments];
+                    if (attachPersonalizedCsv) {
+                        const csv = buildScheduleCsv({
+                            crcName: ctx.crc?.name || ctx.crcName,
+                            startDate: ctx.range?.start,
+                            endDate: ctx.range?.end,
+                            shifts: (ctx.schedule?.shifts || []).map(s => ({ ...s, summary: s.summary })),
+                            timeOff: [
+                                ...(ctx.timeOff?.requests || []),
+                                ...(ctx.timeOff?.events || [])
+                            ],
+                            travel: (ctx.travel?.records || [])
+                        });
+                        perRecipientAttachments.push({
+                            name: `schedule_${(ctx.crc?.name || 'recipient').replace(/[^a-z0-9]+/gi, '_')}_${ctx.range?.start || ''}_${ctx.range?.end || ''}.csv`,
+                            contentType: 'text/csv',
+                            contentInBase64: Buffer.from(csv, 'utf8').toString('base64')
+                        });
+                    }
+
+                    const message = {
+                        senderAddress,
+                        content: {
+                            subject,
+                            ...(plainText ? { plainText } : {}),
+                            ...(html ? { html } : {})
+                        },
+                        recipients: {
+                            to: [{ address: email, displayName: displayName || undefined }]
+                        },
+                        ...(perRecipientAttachments.length > 0 ? { attachments: perRecipientAttachments } : {})
+                    };
+
+                    const poller = await emailClient.beginSend(message);
+                    const sendResult = await poller.pollUntilDone();
+                    sent += 1;
+                    results.push({
+                        recipient: { email, crcId: crcId || null, name: displayName || null },
+                        status: 'sent',
+                        messageId: sendResult?.id || null
+                    });
+                } catch (e) {
+                    failed += 1;
+                    results.push({
+                        recipient: { email: r.email || null, crcId: r.crcId || null, userId: r.userId || null },
+                        status: 'failed',
+                        error: e.message || String(e)
+                    });
+                }
+            }
+
+            return {
+                status: 200,
+                jsonBody: { sent, failed, results },
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+            };
+        } catch (error) {
+            return handleError(context, error, 'Send email failed');
+        }
+    }
 });
 
 app.http('time-off-requests', {

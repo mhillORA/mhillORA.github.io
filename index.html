@@ -1395,7 +1395,21 @@
 
                 // Time Off Request methods
                 async getTimeOffRequests() {
-                    return this.request('/time-off-requests');
+                    const result = await this.request('/time-off-requests');
+                    const requests = Array.isArray(result) ? result : [];
+                    // Normalize date fields to date-only strings to keep comparisons/rendering consistent across the app.
+                    return requests.map(r => {
+                        if (!r || typeof r !== 'object') return r;
+                        const date = toDateOnlyString(parseDateFlexible(r.date));
+                        const startDate = toDateOnlyString(parseDateFlexible(r.startDate || r.date));
+                        const endDate = toDateOnlyString(parseDateFlexible(r.endDate || r.startDate || r.date));
+                        return {
+                            ...r,
+                            ...(date ? { date } : {}),
+                            ...(startDate ? { startDate } : {}),
+                            ...(endDate ? { endDate } : {})
+                        };
+                    });
                 }
 
                 async getTimeOffRequest(id) {
@@ -1500,6 +1514,39 @@
                 async deleteTravel(id) {
                     return this.request(`/travel/${id}`, {
                         method: 'DELETE'
+                    });
+                }
+
+                // Email templates
+                async getTemplates() {
+                    return this.request('/templates');
+                }
+                async getTemplate(id) {
+                    return this.request(`/templates/${id}`);
+                }
+                async createTemplate(data) {
+                    return this.request('/templates', {
+                        method: 'POST',
+                        body: JSON.stringify(data)
+                    });
+                }
+                async updateTemplate(id, data) {
+                    return this.request(`/templates/${id}`, {
+                        method: 'PUT',
+                        body: JSON.stringify(data)
+                    });
+                }
+                async deleteTemplate(id) {
+                    return this.request(`/templates/${id}`, {
+                        method: 'DELETE'
+                    });
+                }
+
+                // Send email (Azure Communication Email backend proxy)
+                async sendEmail(payload) {
+                    return this.request('/send-email', {
+                        method: 'POST',
+                        body: JSON.stringify(payload)
                     });
                 }
 
@@ -5449,7 +5496,8 @@
                     { id: 'unfilledShifts', label: 'Unfilled Shifts' },
                     { id: 'travel', label: 'Travel' },
                     { id: 'timeOff', label: 'Time Off' },
-                    { id: 'timeOffRequests', label: 'Time Off Requests' }
+                    { id: 'timeOffRequests', label: 'Time Off Requests' },
+                    { id: 'emailTemplates', label: 'Email Templates' }
                 ];
                 
                 // Filter tabs based on permissions
@@ -5469,7 +5517,7 @@
                         // - dashboard (replaced with CRC Dashboard)
                         // - managerView (manager only)
                         // - reporting (manager/supervisor only)
-                        tabs = tabs.filter(tab => !['dashboard', 'scheduler', 'timeOffRequests', 'managerView', 'reporting'].includes(tab.id));
+                        tabs = tabs.filter(tab => !['dashboard', 'scheduler', 'timeOffRequests', 'managerView', 'reporting', 'emailTemplates'].includes(tab.id));
                         // Add CRC Dashboard and My Schedule at the beginning
                         tabs.unshift({ id: 'dashboard', label: 'CRC Dashboard' });
                         tabs.splice(1, 0, { id: 'crc-schedule', label: 'My Schedule' });
@@ -5478,7 +5526,7 @@
                     // For Supervisor users, remove restricted tabs
                     if (state.currentUser && getEffectivePermissionLevel() === 'Supervisor') {
                         // Remove: CRC, Dashboard, Reporting, Training, Manager view, Travel, Users, Backend
-                        tabs = tabs.filter(tab => !['crcs', 'dashboard', 'reporting', 'training', 'managerView', 'travel', 'users', 'allSchedule'].includes(tab.id));
+                        tabs = tabs.filter(tab => !['crcs', 'dashboard', 'reporting', 'training', 'managerView', 'travel', 'users', 'allSchedule', 'emailTemplates'].includes(tab.id));
                     }
                     
                     if (state.currentUser && getEffectivePermissionLevel() === 'Manager') {
@@ -6128,6 +6176,12 @@
                     // Small delay to ensure DOM is ready
                     setTimeout(() => {
                     renderTimeOffRequestsContent();
+                    }, 50);
+                } else if (state.activeTab === 'emailTemplates') {
+                    mainAppContent.innerHTML = getEmailTemplatesHTML();
+                    mainAppContent.className = 'w-full';
+                    setTimeout(() => {
+                        renderEmailTemplatesContent();
                     }, 50);
                 } else if (state.activeTab === 'travel') {
                     mainAppContent.innerHTML = getTravelHTML();
@@ -10031,7 +10085,22 @@
                 }
                 if (state.allScheduleFilters.eventType !== 'all') {
                     if (state.allScheduleFilters.eventType === 'Time Off') {
-                        filteredEvents = filteredEvents.filter(e => ['Time Off', 'Unavailable', 'Paid Time Off'].includes(e.type));
+                        filteredEvents = filteredEvents.filter(e => {
+                            if (e.isPTORequest) return true;
+                            const t = (e.type || '').toString().trim().toLowerCase();
+                            return [
+                                'time off',
+                                'unavailable',
+                                'paid time off',
+                                'pto',
+                                'sick time',
+                                'vacation',
+                                'per diem',
+                                'holiday',
+                                'bereavement',
+                                'jury duty'
+                            ].includes(t);
+                        });
                     } else {
                         filteredEvents = filteredEvents.filter(e => e.type === state.allScheduleFilters.eventType);
                     }
@@ -24835,24 +24904,47 @@
                 const year = now.getFullYear();
                 const month = now.getMonth();
                 const monthName = now.toLocaleString('default', { month: 'long', year: 'numeric' });
-                // Get approved time off request IDs
+                const allRequests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
+                const requestIdsInState = new Set(allRequests.map(r => r?.id).filter(Boolean));
+                // Get approved time off request IDs (normalized)
                 const approvedRequestIds = new Set(
-                    state.timeOffRequests
-                        .filter(req => req.status === 'approved' && req.crcId === state.selectedCrcForUnavailability)
+                    allRequests
+                        .filter(req => normalizeTimeOffStatus(req?.status) === 'approved' && req?.crcId === state.selectedCrcForUnavailability)
                         .map(req => req.id)
+                        .filter(Boolean)
                 );
+                const isTimeOffLikeEvent = (type) => {
+                    const t = (type || '').toString().trim().toLowerCase();
+                    if (!t) return false;
+                    // Canonical + legacy + common subcategories we treat as "Time Off" category.
+                    return [
+                        'time off',
+                        'unavailable',
+                        'paid time off',
+                        'pto',
+                        'sick time',
+                        'vacation',
+                        'per diem',
+                        'holiday',
+                        'bereavement',
+                        'jury duty'
+                    ].includes(t);
+                };
                 
                 // Only show Unavailable/Paid Time Off events that:
                 // 1. Have a timeOffRequestId matching an approved request, OR
                 // 2. Don't have a timeOffRequestId (manually created)
                 const unavailableEventsThisMonth = (state.crc_events || []).filter(e => {
                     if (e.crcId !== state.selectedCrcForUnavailability) return false;
-                    if (e.type !== 'Unavailable' && e.type !== 'Paid Time Off' && e.type !== 'Time Off') return false;
+                    if (!isTimeOffLikeEvent(e.type)) return false;
                     const eventDate = toDateOnlyString(parseDateFlexible(e.date));
                     if (!eventDate) return false;
                     const d = new Date(eventDate + 'T00:00:00');
                     if (d.getFullYear() !== year || d.getMonth() !== month) return false;
-                    return !e.timeOffRequestId || approvedRequestIds.has(e.timeOffRequestId);
+                    // If we don't have the request loaded locally, still show the event to avoid "invisible blockers".
+                    if (!e.timeOffRequestId) return true;
+                    if (!requestIdsInState.has(e.timeOffRequestId)) return true;
+                    return approvedRequestIds.has(e.timeOffRequestId);
                 });
                 const eventsMap = new Map(
                     unavailableEventsThisMonth
@@ -24861,12 +24953,13 @@
                 );
 
                 // Get time off requests for this month (including multi-day ranges)
-                const timeOffRequestsThisMonth = state.timeOffRequests.filter(req => {
-                    if (req.crcId !== state.selectedCrcForUnavailability || !(req.date || req.startDate)) return false;
-                    const reqDate = req.date || req.startDate;
-                    const reqEndDate = req.endDate || reqDate;
+                const timeOffRequestsThisMonth = allRequests.filter(req => {
+                    if (req?.crcId !== state.selectedCrcForUnavailability || !(req?.date || req?.startDate)) return false;
+                    const reqDate = toDateOnlyString(parseDateFlexible(req.date || req.startDate));
+                    const reqEndDate = toDateOnlyString(parseDateFlexible(req.endDate || req.startDate || req.date));
+                    if (!reqDate) return false;
                     const reqStart = new Date(reqDate + 'T00:00:00');
-                    const reqEnd = new Date(reqEndDate + 'T00:00:00');
+                    const reqEnd = new Date((reqEndDate || reqDate) + 'T00:00:00');
                     
                     // Check if request overlaps with this month
                     const monthStart = new Date(year, month, 1);
@@ -24885,16 +24978,18 @@
                     const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                     
                     timeOffRequestsThisMonth.forEach(req => {
-                        const reqDate = req.date || req.startDate;
-                        const reqEndDate = req.endDate || reqDate;
+                        const reqDate = toDateOnlyString(parseDateFlexible(req.date || req.startDate));
+                        const reqEndDate = toDateOnlyString(parseDateFlexible(req.endDate || req.startDate || req.date)) || reqDate;
+                        if (!reqDate) return;
                         
                         // Check if this date falls within the request range
                         if (dateStr >= reqDate && dateStr <= reqEndDate) {
-                            if (req.status === 'rejected') {
+                            const statusKey = normalizeTimeOffStatus(req.status);
+                            if (statusKey === 'rejected') {
                                 rejectedRequestsMap.set(dateStr, req);
-                            } else if (req.status === 'approved') {
+                            } else if (statusKey === 'approved') {
                                 approvedRequestsMap.set(dateStr, req);
-                            } else if (req.status === 'pending') {
+                            } else if (statusKey === 'pending') {
                                 pendingRequestsMap.set(dateStr, req);
                             }
                         }
@@ -25092,6 +25187,184 @@
                 
                 switch(action) {
                 // ... inside the main event listener
+                    case 'refresh-email-templates': {
+                        try {
+                            const templates = await apiService.getTemplates();
+                            state.emailTemplates = Array.isArray(templates) ? templates : [];
+                            state.emailTemplatesLoadedOnce = true;
+                            state.emailEditorDirty = false;
+                            await renderEmailTemplatesContent();
+                            showNotification('Email templates refreshed', 'success');
+                        } catch (error) {
+                            console.error('Failed to refresh templates:', error);
+                            showNotification(`Failed to refresh templates: ${error.message}`, 'error');
+                        }
+                        break;
+                    }
+                    case 'select-email-template': {
+                        const templateId = actionButton.dataset.templateId;
+                        if (!templateId) break;
+                        state.emailTemplateSelectedId = templateId;
+                        state.emailEditorDirty = false;
+                        await renderEmailTemplatesContent();
+                        break;
+                    }
+                    case 'new-email-template': {
+                        state.emailTemplateSelectedId = null;
+                        state.emailEditorDirty = true;
+                        const nameInput = document.getElementById('email-template-name');
+                        const subjInput = document.getElementById('email-template-subject');
+                        const htmlInput = document.getElementById('email-template-html');
+                        const textInput = document.getElementById('email-template-text');
+                        if (nameInput) nameInput.value = '';
+                        if (subjInput) subjInput.value = '';
+                        if (htmlInput) htmlInput.value = '';
+                        if (textInput) textInput.value = '';
+                        showNotification('New template draft created', 'info');
+                        break;
+                    }
+                    case 'save-email-template': {
+                        const name = document.getElementById('email-template-name')?.value?.trim() || '';
+                        const subject = document.getElementById('email-template-subject')?.value || '';
+                        const html = document.getElementById('email-template-html')?.value || '';
+                        const plainText = document.getElementById('email-template-text')?.value || '';
+                        if (!name && !subject) {
+                            showNotification('Please enter at least a Template Name or Subject.', 'warning');
+                            break;
+                        }
+                        try {
+                            const payload = {
+                                name,
+                                subject,
+                                html,
+                                plainText,
+                                updatedAt: new Date().toISOString()
+                            };
+                            if (state.emailTemplateSelectedId) {
+                                await apiService.updateTemplate(state.emailTemplateSelectedId, payload);
+                                showNotification('Template updated', 'success');
+                            } else {
+                                const id = crypto.randomUUID();
+                                const created = await apiService.createTemplate({ id, createdAt: new Date().toISOString(), ...payload });
+                                state.emailTemplateSelectedId = created?.id || id;
+                                showNotification('Template created', 'success');
+                            }
+                            // Refresh list
+                            const templates = await apiService.getTemplates();
+                            state.emailTemplates = Array.isArray(templates) ? templates : [];
+                            state.emailTemplatesLoadedOnce = true;
+                            state.emailEditorDirty = false;
+                            await renderEmailTemplatesContent();
+                        } catch (error) {
+                            console.error('Failed to save template:', error);
+                            showNotification(`Failed to save template: ${error.message}`, 'error');
+                        }
+                        break;
+                    }
+                    case 'delete-email-template': {
+                        const id = state.emailTemplateSelectedId;
+                        if (!id) {
+                            showNotification('No template selected.', 'warning');
+                            break;
+                        }
+                        if (!confirm('Delete this email template?')) break;
+                        try {
+                            await apiService.deleteTemplate(id);
+                            state.emailTemplateSelectedId = null;
+                            state.emailEditorDirty = false;
+                            const templates = await apiService.getTemplates();
+                            state.emailTemplates = Array.isArray(templates) ? templates : [];
+                            state.emailTemplatesLoadedOnce = true;
+                            await renderEmailTemplatesContent();
+                            showNotification('Template deleted', 'success');
+                        } catch (error) {
+                            console.error('Failed to delete template:', error);
+                            showNotification(`Failed to delete template: ${error.message}`, 'error');
+                        }
+                        break;
+                    }
+                    case 'insert-email-var': {
+                        const varText = actionButton.dataset.var || '';
+                        if (!varText) break;
+                        const active = document.activeElement;
+                        const candidateIds = new Set(['email-template-subject', 'email-template-html', 'email-template-text']);
+                        const targetEl = (active && candidateIds.has(active.id)) ? active : document.getElementById('email-template-html');
+                        if (!targetEl) break;
+                        const start = targetEl.selectionStart ?? targetEl.value.length;
+                        const end = targetEl.selectionEnd ?? targetEl.value.length;
+                        const before = targetEl.value.slice(0, start);
+                        const after = targetEl.value.slice(end);
+                        targetEl.value = `${before}${varText}${after}`;
+                        targetEl.focus();
+                        const cursor = start + varText.length;
+                        if (typeof targetEl.setSelectionRange === 'function') {
+                            targetEl.setSelectionRange(cursor, cursor);
+                        }
+                        state.emailEditorDirty = true;
+                        break;
+                    }
+                    case 'remove-email-attachment': {
+                        const idx = parseInt(actionButton.dataset.idx, 10);
+                        if (!Number.isFinite(idx)) break;
+                        state.emailAttachments = Array.isArray(state.emailAttachments) ? state.emailAttachments : [];
+                        state.emailAttachments.splice(idx, 1);
+                        await renderEmailTemplatesContent();
+                        break;
+                    }
+                    case 'preview-email-template': {
+                        renderEmailPreview();
+                        break;
+                    }
+                    case 'send-email-template': {
+                        try {
+                            const users = Array.isArray(state.users) ? state.users : [];
+                            const selectedIds = state.emailSelectedRecipientIds ? Array.from(state.emailSelectedRecipientIds) : [];
+                            if (selectedIds.length === 0) {
+                                showNotification('Select at least one recipient.', 'warning');
+                                break;
+                            }
+                            const recipients = selectedIds.map(rid => {
+                                const u = users.find(x => (x.id || x.userId || x.username || x.email) === rid);
+                                return {
+                                    userId: u?.id || undefined,
+                                    email: u?.email || (typeof rid === 'string' && rid.includes('@') ? rid : undefined),
+                                    crcId: u?.crcId || undefined,
+                                    name: u?.name || u?.username || undefined
+                                };
+                            }).filter(r => r.email || r.userId);
+
+                            const startDate = document.getElementById('email-range-start')?.value || toDateOnlyString(new Date());
+                            const endDate = document.getElementById('email-range-end')?.value || startDate;
+
+                            const subject = document.getElementById('email-template-subject')?.value || '';
+                            const html = document.getElementById('email-template-html')?.value || '';
+                            const plainText = document.getElementById('email-template-text')?.value || '';
+                            const attachCsv = !!document.getElementById('email-attach-csv')?.checked;
+                            const attachments = Array.isArray(state.emailAttachments) ? state.emailAttachments : [];
+
+                            const payload = {
+                                ...(state.emailTemplateSelectedId ? { templateId: state.emailTemplateSelectedId } : { template: { subject, html, plainText } }),
+                                recipients,
+                                range: { startDate, endDate },
+                                attachments,
+                                attachPersonalizedCsv: attachCsv
+                            };
+
+                            const result = await apiService.sendEmail(payload);
+                            const sent = result?.sent ?? 0;
+                            const failed = result?.failed ?? 0;
+                            if (failed > 0) {
+                                showNotification(`Email send completed: ${sent} sent, ${failed} failed (see console).`, 'warning');
+                                console.warn('Send email results:', result);
+                            } else {
+                                showNotification(`Email sent to ${sent} recipient(s).`, 'success');
+                            }
+                        } catch (error) {
+                            console.error('Failed to send email:', error);
+                            showNotification(`Failed to send email: ${error.message}`, 'error');
+                        }
+                        break;
+                    }
                     case 'refresh-manager-view': {
                         renderManagerViewContent();
                         showNotification('Dashboard refreshed', 'success');
@@ -33496,6 +33769,49 @@
 
             document.addEventListener('change', (e) => {
                 const target = e.target;
+                // Email Templates page handlers
+                if (target && state.activeTab === 'emailTemplates') {
+                    if (target.classList && target.classList.contains('email-recipient-checkbox')) {
+                        if (!state.emailSelectedRecipientIds) state.emailSelectedRecipientIds = new Set();
+                        const rid = target.dataset.recipientId;
+                        if (rid) {
+                            if (target.checked) state.emailSelectedRecipientIds.add(rid);
+                            else state.emailSelectedRecipientIds.delete(rid);
+                        }
+                    }
+                    if (target.id === 'email-attachment-input') {
+                        const files = Array.from(target.files || []);
+                        if (!Array.isArray(state.emailAttachments)) state.emailAttachments = [];
+                        const readFileAsBase64 = (file) => new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                                const result = String(reader.result || '');
+                                const parts = result.split(',');
+                                resolve(parts.length > 1 ? parts[1] : '');
+                            };
+                            reader.onerror = () => reject(new Error('Failed to read file'));
+                            reader.readAsDataURL(file);
+                        });
+                        (async () => {
+                            for (const f of files) {
+                                try {
+                                    const contentInBase64 = await readFileAsBase64(f);
+                                    if (!contentInBase64) continue;
+                                    state.emailAttachments.push({
+                                        name: f.name,
+                                        contentType: f.type || 'application/octet-stream',
+                                        contentInBase64
+                                    });
+                                } catch (err) {
+                                    console.warn('Failed to read attachment:', f?.name, err);
+                                }
+                            }
+                            // Clear input so selecting same file again works
+                            target.value = '';
+                            renderEmailTemplatesContent();
+                        })();
+                    }
+                }
                 if (target.id === 'crc-event-type') handleEventTypeChange(target);
                 // Removed immediate state updates for calendar filters - now only apply on button click
                 // Filters: crc-filter, site-filter, region-filter, employment-type-filter, event-type-filter, open-shifts-filter
@@ -33699,6 +34015,15 @@
             // Also listen for input events for better responsiveness
             document.addEventListener('input', (e) => {
                 const target = e.target;
+                // Email Templates page handlers
+                if (target && state.activeTab === 'emailTemplates') {
+                    if (target.id === 'email-template-search') {
+                        renderEmailTemplatesContent();
+                    }
+                    if (target.id === 'email-template-name' || target.id === 'email-template-subject' || target.id === 'email-template-html' || target.id === 'email-template-text') {
+                        state.emailEditorDirty = true;
+                    }
+                }
                 if (target.name === 'studyIds' || target.name === 'siteId') {
                     console.log('Study or site input changed:', target.name, target.value);
                     setTimeout(() => {
@@ -36619,7 +36944,16 @@
                                 <p class="text-3xl font-bold">${activeCRCs}</p>
                                 <p class="text-blue-100 text-xs mt-1">of ${totalCRCs} total</p>
                             </div>
-                            <i data-lucide="users" class="w-12 h-12 text-blue-200"></i>
+                            <button
+                                type="button"
+                                data-action="set-main-tab"
+                                data-tab-id="crcs"
+                                class="p-2 rounded-lg hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-white/60"
+                                title="Go to CRCs"
+                                aria-label="Go to CRCs"
+                            >
+                                <i data-lucide="users" class="w-12 h-12 text-blue-200"></i>
+                            </button>
                         </div>
                     </div>
                     <div class="bg-gradient-to-br from-green-500 to-green-600 text-white p-4 rounded-lg shadow-md">
@@ -36629,7 +36963,16 @@
                                 <p class="text-3xl font-bold">${upcomingEvents}</p>
                                 <p class="text-green-100 text-xs mt-1">Next 30 days</p>
                             </div>
-                            <i data-lucide="calendar" class="w-12 h-12 text-green-200"></i>
+                            <button
+                                type="button"
+                                data-action="set-main-tab"
+                                data-tab-id="scheduler"
+                                class="p-2 rounded-lg hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-white/60"
+                                title="Go to Scheduler"
+                                aria-label="Go to Scheduler"
+                            >
+                                <i data-lucide="calendar" class="w-12 h-12 text-green-200"></i>
+                            </button>
                         </div>
                     </div>
                     <div class="bg-gradient-to-br from-purple-500 to-purple-600 text-white p-4 rounded-lg shadow-md">
@@ -36639,7 +36982,16 @@
                                 <p class="text-3xl font-bold">${pendingTimeOff}</p>
                                 <p class="text-purple-100 text-xs mt-1">Awaiting approval</p>
                             </div>
-                            <i data-lucide="clock" class="w-12 h-12 text-purple-200"></i>
+                            <button
+                                type="button"
+                                data-action="set-main-tab"
+                                data-tab-id="timeOffRequests"
+                                class="p-2 rounded-lg hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-white/60"
+                                title="Go to Time Off Requests"
+                                aria-label="Go to Time Off Requests"
+                            >
+                                <i data-lucide="clock" class="w-12 h-12 text-purple-200"></i>
+                            </button>
                         </div>
                     </div>
                     <div class="bg-gradient-to-br from-orange-500 to-orange-600 text-white p-4 rounded-lg shadow-md">
@@ -36649,7 +37001,16 @@
                                 <p class="text-3xl font-bold">${upcomingTravel}</p>
                                 <p class="text-orange-100 text-xs mt-1">Next 30 days</p>
                             </div>
-                            <i data-lucide="plane" class="w-12 h-12 text-orange-200"></i>
+                            <button
+                                type="button"
+                                data-action="set-main-tab"
+                                data-tab-id="travel"
+                                class="p-2 rounded-lg hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-white/60"
+                                title="Go to Travel"
+                                aria-label="Go to Travel"
+                            >
+                                <i data-lucide="plane" class="w-12 h-12 text-orange-200"></i>
+                            </button>
                         </div>
                     </div>
                 `;
@@ -38988,8 +39349,406 @@
                 `;
             };
 
-            const exportDailyTimeOffRequests = () => {
+            // -------------------------------------------------------------------------
+            // Email Templates (Manager/Admin)
+            // -------------------------------------------------------------------------
+            const getEmailTemplatesHTML = () => {
+                return `
+                    <div id="email-templates-page" class="w-full bg-white dark:bg-gray-800 p-4 md:p-6 rounded-lg shadow-md">
+                        <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4">
+                            <div>
+                                <h2 class="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
+                                    <i data-lucide="mail" class="w-6 h-6"></i>
+                                    Email Templates
+                                </h2>
+                                <p class="text-sm text-gray-600 dark:text-gray-400">Load templates from `/api/templates`, edit, and send personalized emails.</p>
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <button data-action="refresh-email-templates" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 flex items-center text-sm">
+                                    <i data-lucide="refresh-cw" class="w-4 h-4 mr-2"></i>Refresh
+                                </button>
+                                <button data-action="new-email-template" class="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-md hover:bg-gray-300 dark:hover:bg-gray-600 flex items-center text-sm">
+                                    <i data-lucide="file-plus" class="w-4 h-4 mr-2"></i>New
+                                </button>
+                                <button data-action="save-email-template" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 flex items-center text-sm">
+                                    <i data-lucide="save" class="w-4 h-4 mr-2"></i>Save
+                                </button>
+                                <button data-action="delete-email-template" class="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 flex items-center text-sm">
+                                    <i data-lucide="trash-2" class="w-4 h-4 mr-2"></i>Delete
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                            <!-- Templates list -->
+                            <div class="lg:col-span-3 border border-gray-200 dark:border-gray-700 rounded-lg p-3 bg-gray-50 dark:bg-gray-900/40">
+                                <div class="mb-2">
+                                    <input id="email-template-search" type="text" placeholder="Search templates..." class="w-full px-3 py-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white text-sm">
+                                </div>
+                                <div id="email-templates-list" class="space-y-2 max-h-[520px] overflow-y-auto custom-scrollbar"></div>
+                            </div>
+
+                            <!-- Editor -->
+                            <div class="lg:col-span-6 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+                                <div class="grid grid-cols-1 gap-3">
+                                    <div>
+                                        <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Template Name</label>
+                                        <input id="email-template-name" type="text" class="w-full px-3 py-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white" placeholder="e.g., Weekly Schedule Email">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Subject</label>
+                                        <input id="email-template-subject" type="text" class="w-full px-3 py-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white" placeholder="e.g., Your schedule for {{rangeStart}} - {{rangeEnd}}">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">HTML Body</label>
+                                        <textarea id="email-template-html" rows="12" class="w-full px-3 py-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white font-mono text-xs" placeholder="<p>Hi {{crcName}},</p>{{scheduleHtml}}"></textarea>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Plain Text (optional)</label>
+                                        <textarea id="email-template-text" rows="6" class="w-full px-3 py-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white font-mono text-xs" placeholder="Hi {{crcName}}\n\n{{scheduleText}}"></textarea>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Variables + Send -->
+                            <div class="lg:col-span-3 border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-gray-50 dark:bg-gray-900/40">
+                                <div class="mb-3">
+                                    <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Variables</h3>
+                                    <div class="flex flex-wrap gap-2">
+                                        ${[
+                                            { key: 'crcName', label: '{{crcName}}' },
+                                            { key: 'rangeStart', label: '{{rangeStart}}' },
+                                            { key: 'rangeEnd', label: '{{rangeEnd}}' },
+                                            { key: 'scheduleHtml', label: '{{scheduleHtml}}' },
+                                            { key: 'scheduleText', label: '{{scheduleText}}' },
+                                            { key: 'timeOffHtml', label: '{{timeOffHtml}}' },
+                                            { key: 'timeOffText', label: '{{timeOffText}}' },
+                                            { key: 'travelHtml', label: '{{travelHtml}}' },
+                                            { key: 'travelText', label: '{{travelText}}' }
+                                        ].map(v => `
+                                            <button data-action="insert-email-var" data-var="${v.label}" class="px-2 py-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700">
+                                                ${v.label}
+                                            </button>
+                                        `).join('')}
+                                    </div>
+                                </div>
+
+                                <div class="mb-3">
+                                    <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Recipients</h3>
+                                    <div class="text-xs text-gray-600 dark:text-gray-400 mb-2">Select users to send to. If a user has a linked 'crcId', emails will be personalized to that CRC automatically.</div>
+                                    <div id="email-recipients-list" class="space-y-1 max-h-[180px] overflow-y-auto custom-scrollbar"></div>
+                                </div>
+
+                                <div class="mb-3">
+                                    <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Date Range</h3>
+                                    <div class="grid grid-cols-2 gap-2">
+                                        <input id="email-range-start" type="date" class="px-3 py-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white text-sm">
+                                        <input id="email-range-end" type="date" class="px-3 py-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white text-sm">
+                                    </div>
+                                </div>
+
+                                <div class="mb-3">
+                                    <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Attachments</h3>
+                                    <label class="block text-xs text-gray-600 dark:text-gray-400 mb-1">Upload files (sent to everyone)</label>
+                                    <input id="email-attachment-input" type="file" multiple class="w-full text-xs">
+                                    <div class="mt-2 flex items-center gap-2">
+                                        <input id="email-attach-csv" type="checkbox" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                        <label for="email-attach-csv" class="text-xs text-gray-700 dark:text-gray-300">Attach personalized schedule CSV</label>
+                                    </div>
+                                    <div id="email-attachments-list" class="mt-2 space-y-1 text-xs"></div>
+                                </div>
+
+                                <div class="flex flex-col gap-2">
+                                    <button data-action="preview-email-template" class="w-full px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-md hover:bg-gray-300 dark:hover:bg-gray-600 flex items-center justify-center text-sm">
+                                        <i data-lucide="eye" class="w-4 h-4 mr-2"></i>Preview (sample)
+                                    </button>
+                                    <button data-action="send-email-template" class="w-full px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 flex items-center justify-center text-sm">
+                                        <i data-lucide="send" class="w-4 h-4 mr-2"></i>Send Email
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="email-preview" class="mt-6 hidden border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
+                            <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Preview</h3>
+                            <div class="text-xs text-gray-600 dark:text-gray-400 mb-3">This preview uses local state data and the first selected recipient (if any). Actual send uses the backend DB context.</div>
+                            <div class="mb-2">
+                                <div class="text-xs font-medium text-gray-700 dark:text-gray-300">Subject</div>
+                                <div id="email-preview-subject" class="text-sm text-gray-900 dark:text-gray-100"></div>
+                            </div>
+                            <div class="text-xs font-medium text-gray-700 dark:text-gray-300">HTML</div>
+                            <div id="email-preview-html" class="prose dark:prose-invert max-w-none border border-gray-200 dark:border-gray-700 rounded p-3 mt-1"></div>
+                            <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mt-4">Plain Text</div>
+                            <pre id="email-preview-text" class="text-xs whitespace-pre-wrap border border-gray-200 dark:border-gray-700 rounded p-3 mt-1 bg-gray-50 dark:bg-gray-900/40"></pre>
+                        </div>
+                    </div>
+                `;
+            };
+
+            const renderEmailTemplatesContent = async () => {
+                const listEl = document.getElementById('email-templates-list');
+                const recipientsEl = document.getElementById('email-recipients-list');
+                if (!listEl || !recipientsEl) return;
+
+                // Init date range defaults
+                const startInput = document.getElementById('email-range-start');
+                const endInput = document.getElementById('email-range-end');
+                if (startInput && endInput && (!startInput.value || !endInput.value)) {
+                    const today = new Date();
+                    const start = new Date(today);
+                    const end = new Date(today);
+                    end.setDate(end.getDate() + 14);
+                    startInput.value = toDateOnlyString(start);
+                    endInput.value = toDateOnlyString(end);
+                }
+
+                // Load templates once if not present
+                if (!Array.isArray(state.emailTemplates)) {
+                    state.emailTemplates = [];
+                }
+                if (!state.emailTemplatesLoadedOnce) {
+                    try {
+                        const templates = await apiService.getTemplates();
+                        state.emailTemplates = Array.isArray(templates) ? templates : [];
+                        state.emailTemplatesLoadedOnce = true;
+                    } catch (e) {
+                        showNotification(`Failed to load templates: ${e.message}`, 'error');
+                    }
+                }
+
+                const search = (document.getElementById('email-template-search')?.value || '').toLowerCase().trim();
+                const templates = (state.emailTemplates || [])
+                    .filter(t => {
+                        if (!search) return true;
+                        const name = (t.name || t.title || t.id || '').toLowerCase();
+                        const subject = (t.subject || '').toLowerCase();
+                        return name.includes(search) || subject.includes(search);
+                    })
+                    .sort((a, b) => String(a.name || a.title || a.id).localeCompare(String(b.name || b.title || b.id)));
+
+                const selectedId = state.emailTemplateSelectedId || (templates[0] && templates[0].id) || null;
+                if (!state.emailTemplateSelectedId && selectedId) {
+                    state.emailTemplateSelectedId = selectedId;
+                }
+
+                listEl.innerHTML = templates.length === 0
+                    ? `<div class="text-sm text-gray-500 dark:text-gray-400 p-2">No templates yet.</div>`
+                    : templates.map(t => {
+                        const isActive = t.id === state.emailTemplateSelectedId;
+                        return `
+                            <button data-action="select-email-template" data-template-id="${t.id}" class="w-full text-left px-3 py-2 rounded-md border ${isActive ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'} hover:border-blue-400">
+                                <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">${t.name || t.title || t.id}</div>
+                                <div class="text-xs text-gray-600 dark:text-gray-400 truncate">${t.subject || ''}</div>
+                            </button>
+                        `;
+                    }).join('');
+
+                // Render recipients (users list)
+                const users = Array.isArray(state.users) ? state.users : [];
+                const eligible = users
+                    .filter(u => u && u.email && String(u.email).includes('@'))
+                    .sort((a, b) => String(a.name || a.username || a.email).localeCompare(String(b.name || b.username || b.email)));
+                if (!state.emailSelectedRecipientIds) state.emailSelectedRecipientIds = new Set();
+
+                recipientsEl.innerHTML = eligible.length === 0
+                    ? `<div class="text-xs text-gray-500 dark:text-gray-400">No users with email loaded. (Manager needs `/api/users` access.)</div>`
+                    : eligible.map(u => {
+                        const id = u.id || u.userId || u.username || u.email;
+                        const checked = state.emailSelectedRecipientIds.has(id);
+                        const label = u.name || u.username || u.email;
+                        const crcHint = u.crcId ? ` • crcId: ${u.crcId}` : '';
+                        return `
+                            <label class="flex items-center gap-2 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer">
+                                <input type="checkbox" class="email-recipient-checkbox rounded border-gray-300 text-blue-600 focus:ring-blue-500" data-recipient-id="${id}" ${checked ? 'checked' : ''}>
+                                <span class="text-xs text-gray-800 dark:text-gray-200 truncate" title="${u.email}${crcHint}">${label}</span>
+                            </label>
+                        `;
+                    }).join('');
+
+                // Load selected template into editor if not already “dirty”
+                const selected = (state.emailTemplates || []).find(t => t.id === state.emailTemplateSelectedId) || null;
+                const nameInput = document.getElementById('email-template-name');
+                const subjInput = document.getElementById('email-template-subject');
+                const htmlInput = document.getElementById('email-template-html');
+                const textInput = document.getElementById('email-template-text');
+                if (selected && nameInput && subjInput && htmlInput && textInput) {
+                    if (!state.emailEditorDirty) {
+                        nameInput.value = selected.name || selected.title || '';
+                        subjInput.value = selected.subject || '';
+                        htmlInput.value = selected.html || selected.bodyHtml || selected.body || '';
+                        textInput.value = selected.plainText || selected.text || '';
+                    }
+                }
+
+                // Render attachments list
+                if (!Array.isArray(state.emailAttachments)) state.emailAttachments = [];
+                const attachmentsList = document.getElementById('email-attachments-list');
+                if (attachmentsList) {
+                    attachmentsList.innerHTML = state.emailAttachments.length === 0
+                        ? `<div class="text-gray-500 dark:text-gray-400">No files attached.</div>`
+                        : state.emailAttachments.map((a, idx) => `
+                            <div class="flex items-center justify-between gap-2 px-2 py-1 border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-800">
+                                <div class="truncate" title="${a.name}">
+                                    <span class="font-medium">${a.name}</span>
+                                    <span class="text-gray-500 dark:text-gray-400">(${a.contentType || 'unknown'})</span>
+                                </div>
+                                <button data-action="remove-email-attachment" data-idx="${idx}" class="text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300" title="Remove">
+                                    <i data-lucide="x" class="w-4 h-4"></i>
+                                </button>
+                            </div>
+                        `).join('');
+                }
+
+                lucide.createIcons();
+            };
+
+            const renderEmailPreview = () => {
+                const preview = document.getElementById('email-preview');
+                if (!preview) return;
+
+                const name = document.getElementById('email-template-name')?.value || '';
+                const subjectTpl = document.getElementById('email-template-subject')?.value || '';
+                const htmlTpl = document.getElementById('email-template-html')?.value || '';
+                const textTpl = document.getElementById('email-template-text')?.value || '';
+
+                const start = document.getElementById('email-range-start')?.value || toDateOnlyString(new Date());
+                const end = document.getElementById('email-range-end')?.value || start;
+
+                // Pick first selected recipient to preview against
+                const users = Array.isArray(state.users) ? state.users : [];
+                const firstRecipientId = state.emailSelectedRecipientIds && state.emailSelectedRecipientIds.size > 0
+                    ? Array.from(state.emailSelectedRecipientIds)[0]
+                    : null;
+                const recipientUser = firstRecipientId ? users.find(u => (u.id || u.userId || u.username || u.email) === firstRecipientId) : null;
+                const crcId = recipientUser?.crcId || null;
+                const crc = crcId ? (state.crcs || []).find(c => c.id === crcId) : null;
+
+                // Build a simple local context (preview only)
+                const ctx = {
+                    crcName: crc?.name || recipientUser?.name || recipientUser?.username || '',
+                    rangeStart: start,
+                    rangeEnd: end,
+                    scheduleText: '',
+                    scheduleHtml: '<p>No shifts in range.</p>',
+                    timeOffText: '',
+                    timeOffHtml: '<p>No time off in range.</p>',
+                    travelText: '',
+                    travelHtml: '<p>No travel in range.</p>'
+                };
+                if (crcId) {
+                    const s = new Date(start + 'T00:00:00');
+                    const e = new Date(end + 'T00:00:00');
+                    const inRange = (d) => {
+                        const dd = new Date(d + 'T00:00:00');
+                        return dd >= s && dd <= e;
+                    };
+                    const myEvents = (state.crc_events || []).filter(ev => {
+                        if (!ev) return false;
+                        const dateStr = toDateOnlyString(parseDateFlexible(ev.date));
+                        if (!dateStr || !inRange(dateStr)) return false;
+                        if (ev.crcId === crcId) return true;
+                        if (ev.roleAssignments && Object.keys(ev.roleAssignments).length > 0) {
+                            return Object.values(ev.roleAssignments).some(arr => Array.isArray(arr) && arr.includes(crcId));
+                        }
+                        return false;
+                    });
+                    const shifts = myEvents.filter(ev => String(ev.type || '').toLowerCase() === 'site assignment');
+                    if (shifts.length) {
+                        ctx.scheduleText = shifts.map(ev => `- ${toDateOnlyString(parseDateFlexible(ev.date))} (${ev.period || 'Full Day'})`).join('\n');
+                        ctx.scheduleHtml = `<ul>${shifts.map(ev => `<li>${toDateOnlyString(parseDateFlexible(ev.date))} • ${ev.period || 'Full Day'}</li>`).join('')}</ul>`;
+                    }
+                    const timeOff = myEvents.filter(ev => ['time off','unavailable','paid time off','pto','sick time','vacation','holiday','bereavement','jury duty','per diem'].includes(String(ev.type||'').toLowerCase()));
+                    if (timeOff.length) {
+                        ctx.timeOffText = timeOff.map(ev => `- ${toDateOnlyString(parseDateFlexible(ev.date))} ${ev.type} (${ev.period || 'Full Day'})`).join('\n');
+                        ctx.timeOffHtml = `<ul>${timeOff.map(ev => `<li>${toDateOnlyString(parseDateFlexible(ev.date))} • ${ev.type} • ${ev.period || 'Full Day'}</li>`).join('')}</ul>`;
+                    }
+                    const travel = (state.travel || []).filter(t => t && (t.crcId === crcId));
+                    if (travel.length) {
+                        ctx.travelText = travel.map(t => `- ${toDateOnlyString(parseDateFlexible(getTravelPrimaryDate(t)))} ${t.origin && t.destination ? `${t.origin} → ${t.destination}` : (t.bookingType || 'Travel')}`).join('\n');
+                        ctx.travelHtml = `<ul>${travel.map(t => `<li>${toDateOnlyString(parseDateFlexible(getTravelPrimaryDate(t)))} • ${t.origin && t.destination ? `${t.origin} → ${t.destination}` : (t.bookingType || 'Travel')}</li>`).join('')}</ul>`;
+                    }
+                }
+
+                const render = (tpl) => String(tpl || '').replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (_, k) => (ctx[k] ?? ''));
+                const subject = render(subjectTpl);
+                const html = render(htmlTpl);
+                const text = render(textTpl);
+
+                preview.classList.remove('hidden');
+                document.getElementById('email-preview-subject').textContent = subject || '(no subject)';
+                document.getElementById('email-preview-html').innerHTML = html || '<p>(no html)</p>';
+                document.getElementById('email-preview-text').textContent = text || '(no text)';
+            };
+
+            // Merge DB-backed time off requests with legacy time off events so ALL time off types
+            // (Per Diem, Bereavement, Sick, etc.) are visible in the Time Off Requests tab.
+            // Legacy events are display-only and marked as "Approved (Legacy Event)".
+            const getTimeOffRequestsWithLegacyEvents = () => {
                 const allRequests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
+
+                // Build keys for all dates already covered by requests to avoid duplicates
+                const requestKeys = new Set(
+                    allRequests.flatMap(req => {
+                        if (!req || !req.crcId) return [];
+                        const start = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
+                        const end = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
+                        if (!start) return [];
+                        const out = [];
+                        const cursor = new Date(start + 'T00:00:00');
+                        const limit = new Date((end || start) + 'T00:00:00');
+                        while (cursor <= limit) {
+                            out.push(`${req.crcId}_${toDateOnlyString(cursor)}`);
+                            cursor.setDate(cursor.getDate() + 1);
+                        }
+                        return out;
+                    })
+                );
+
+                const legacyRequests = [];
+                const timeOffEventTypes = new Set([
+                    'Unavailable',
+                    'Paid Time Off',
+                    'Time Off',
+                    'PTO',
+                    'Sick Time',
+                    'Sick',
+                    'Vacation',
+                    'Holiday',
+                    'Bereavement',
+                    'Jury Duty',
+                    'Per Diem'
+                ]);
+
+                (state.crc_events || []).forEach(ev => {
+                    if (!ev || !ev.crcId) return;
+                    if (!timeOffEventTypes.has(ev.type)) return;
+                    const dateStr = toDateOnlyString(parseDateFlexible(ev.date));
+                    if (!dateStr) return;
+                    const key = `${ev.crcId}_${dateStr}`;
+                    if (requestKeys.has(key)) return;
+
+                    legacyRequests.push({
+                        id: `legacy-timeoff-event-${ev.id || crypto.randomUUID()}`,
+                        crcId: ev.crcId,
+                        requestedBy: ev.crcId,
+                        date: dateStr,
+                        startDate: dateStr,
+                        endDate: dateStr,
+                        type: normalizeTimeOffTypeLabel(ev.name || ev.ptoType || ev.type),
+                        hours: ev.hours || (ev.period === 'Full Day' ? 8 : 4),
+                        period: ev.period || 'Full Day',
+                        status: 'approved',
+                        statusLabel: 'Approved (Legacy Event)',
+                        createdAt: ev.createdAt || null,
+                        legacyEventId: ev.id
+                    });
+                });
+
+                return legacyRequests.length > 0 ? [...allRequests, ...legacyRequests] : allRequests;
+            };
+
+            const exportDailyTimeOffRequests = () => {
+                const allRequests = getTimeOffRequestsWithLegacyEvents();
                 if (!allRequests.length) {
                     showNotification('No time off requests available to export.', 'info');
                     return;
@@ -39100,7 +39859,7 @@
                 const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
                 
                 // Get current view mode (default to list)
-                let allRequests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
+                let allRequests = getTimeOffRequestsWithLegacyEvents();
                 
                 // If user is a CRC, filter to only show their own requests
                 const loggedInCrcId = getLoggedInCrcId();
