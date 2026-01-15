@@ -33869,6 +33869,13 @@
                 // Filters: crc-filter, site-filter, region-filter, employment-type-filter, event-type-filter, open-shifts-filter
                 if (target.id === 'unavailability-crc-select') {
                     setState({ selectedCrcForUnavailability: target.value });
+                    // Clear any cached form data when switching employees
+                    const form = document.getElementById('add-multiple-unavailable-form');
+                    if (form) {
+                        form.reset();
+                        const notesField = document.getElementById('multiple-notes-field');
+                        if (notesField) notesField.value = '';
+                    }
                     renderUnavailabilityCalendar();
                 }
                 if (target.id === 'month-selector') {
@@ -40151,6 +40158,10 @@
                                         <i data-lucide="layers" class="w-4 h-4"></i>
                                         Combine Duplicates (Employee + Month)
                                     </button>
+                                    <button id="fix-all-duplicates-btn" class="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors">
+                                        <i data-lucide="wrench" class="w-4 h-4"></i>
+                                        Fix All Duplicates (All Employees)
+                                    </button>
                                 `;
                             })()}
                         </div>
@@ -40659,6 +40670,104 @@
                     } catch (error) {
                         console.error('Dedupe time off requests failed:', error);
                         showNotification(`Combine failed: ${error.message}`, 'error');
+                    }
+                });
+
+                document.getElementById('fix-all-duplicates-btn')?.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    try {
+                        const isManagerLike = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
+                        const isSupervisor = state.currentUser && getEffectivePermissionLevel() === 'Supervisor';
+                        if (!isManagerLike || isSupervisor) {
+                            showNotification('Only Managers/Admins can fix all duplicates.', 'error');
+                            return;
+                        }
+
+                        const monthValue = state.timeOffRequestsMonth;
+                        if (!monthValue || !/^\d{4}-\d{2}$/.test(monthValue)) {
+                            showNotification('Select a valid month first.', 'warning');
+                            return;
+                        }
+                        const [yy, mm] = monthValue.split('-').map(Number);
+                        const monthStart = new Date(yy, mm - 1, 1);
+                        const monthEnd = new Date(yy, mm, 0);
+                        const startDate = toDateOnlyString(monthStart);
+                        const endDate = toDateOnlyString(monthEnd);
+
+                        const typed = prompt(
+                            `This will COMBINE duplicate time off requests for ALL employees in ${monthValue}.\n\nIt keeps one request per day per employee and preserves merged details.\n\nType FIX ALL to confirm.`
+                        );
+                        if (typed !== 'FIX ALL') {
+                            showNotification('Fix all cancelled.', 'info');
+                            return;
+                        }
+
+                        const allCrcs = state.crcs || [];
+                        let totalCombined = 0;
+                        let totalRemoved = 0;
+                        let totalSkipped = 0;
+                        let processed = 0;
+
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-2">Fixing All Duplicates</h3>
+                            <p class="text-sm text-gray-600 dark:text-gray-300 mb-3">Processing all employees for <strong>${monthValue}</strong>.</p>
+                            <div id="fix-all-progress" class="text-sm dark:text-gray-300 mb-4">Starting…</div>
+                            <div class="flex justify-end gap-2">
+                                <button data-action="close-modal" class="px-4 py-2 bg-gray-300 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-400 dark:hover:bg-gray-500">Close</button>
+                            </div>
+                        `, 'md');
+
+                        const progressEl = document.getElementById('fix-all-progress');
+                        const updateProgress = () => {
+                            if (progressEl) {
+                                progressEl.textContent = `Processed ${processed}/${allCrcs.length} employees. Combined ${totalCombined} day(s), removed ${totalRemoved} duplicate(s), skipped ${totalSkipped} range-like.`;
+                            }
+                        };
+
+                        for (const crc of allCrcs) {
+                            if (!crc || !crc.id) continue;
+                            try {
+                                const resp = await apiService.dedupeTimeOffRequests({
+                                    crcId: crc.id,
+                                    startDate,
+                                    endDate,
+                                    dryRun: false
+                                });
+                                totalCombined += Number(resp?.groupsWithDuplicates || 0);
+                                totalRemoved += Number(resp?.deleted || 0);
+                                totalSkipped += Number(resp?.rangeLikeSkipped || 0);
+                                processed++;
+                                updateProgress();
+                                await new Promise(r => setTimeout(r, 100));
+                            } catch (error) {
+                                console.warn(`Failed to dedupe for ${crc.name}:`, error);
+                                processed++;
+                                updateProgress();
+                            }
+                        }
+
+                        if (progressEl) {
+                            progressEl.textContent = `Complete! Processed ${processed} employees. Combined ${totalCombined} day(s), removed ${totalRemoved} duplicate(s), skipped ${totalSkipped} range-like request(s).`;
+                        }
+
+                        showNotification(`Fixed all duplicates: ${totalCombined} days combined, ${totalRemoved} duplicates removed.`, 'success');
+
+                        try {
+                            const updated = await apiService.getTimeOffRequests();
+                            setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
+                            if (typeof syncApprovedTimeOffRequests === 'function') {
+                                syncApprovedTimeOffRequests(Array.isArray(updated) ? updated : []);
+                            }
+                        } catch (refreshErr) {
+                            console.warn('Failed to refresh time off requests after fix all:', refreshErr);
+                        }
+                        renderTimeOffRequestsContent();
+                        if (state.activeTab === 'unavailability') {
+                            try { renderUnavailabilityCalendar(); } catch (e) {}
+                        }
+                    } catch (error) {
+                        console.error('Fix all duplicates failed:', error);
+                        showNotification(`Fix all failed: ${error.message}`, 'error');
                     }
                 });
                 
