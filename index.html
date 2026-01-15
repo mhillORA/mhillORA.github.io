@@ -1436,6 +1436,20 @@
                     });
                 }
 
+                async bulkDeleteTimeOffRequests(payload) {
+                    return this.request('/time-off-requests/bulk-delete', {
+                        method: 'POST',
+                        body: JSON.stringify(payload)
+                    });
+                }
+
+                async dedupeTimeOffRequests(payload) {
+                    return this.request('/time-off-requests/dedupe', {
+                        method: 'POST',
+                        body: JSON.stringify(payload)
+                    });
+                }
+
                 // Announcement methods
                 async getAnnouncements() {
                     return this.request('/announcements');
@@ -39527,6 +39541,12 @@
                                             { key: 'rangeEnd', label: '{{rangeEnd}}' },
                                             { key: 'scheduleHtml', label: '{{scheduleHtml}}' },
                                             { key: 'scheduleText', label: '{{scheduleText}}' },
+                                            { key: 'scheduleDetailsHtml', label: '{{scheduleDetailsHtml}}' },
+                                            { key: 'scheduleDetailsText', label: '{{scheduleDetailsText}}' },
+                                            { key: 'scheduleBasicHtml', label: '{{scheduleBasicHtml}}' },
+                                            { key: 'scheduleBasicText', label: '{{scheduleBasicText}}' },
+                                            { key: 'scheduleFullHtml', label: '{{scheduleFullHtml}}' },
+                                            { key: 'scheduleFullText', label: '{{scheduleFullText}}' },
                                             { key: 'timeOffHtml', label: '{{timeOffHtml}}' },
                                             { key: 'timeOffText', label: '{{timeOffText}}' },
                                             { key: 'travelHtml', label: '{{travelHtml}}' },
@@ -40117,6 +40137,22 @@
                                 <i data-lucide="download" class="w-4 h-4"></i>
                                 Export Daily CSV
                             </button>
+                            ${(() => {
+                                const isManagerLike = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
+                                const isSupervisor = state.currentUser && getEffectivePermissionLevel() === 'Supervisor';
+                                // Managers/Admin only (never supervisors/CRCs)
+                                if (!isManagerLike || isSupervisor || loggedInCrcId) return '';
+                                return `
+                                    <button id="bulk-delete-timeoff-month-btn" class="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors">
+                                        <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                        Bulk Delete (Employee + Month)
+                                    </button>
+                                    <button id="dedupe-timeoff-month-btn" class="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 transition-colors">
+                                        <i data-lucide="layers" class="w-4 h-4"></i>
+                                        Combine Duplicates (Employee + Month)
+                                    </button>
+                                `;
+                            })()}
                         </div>
                     </div>
                 `;
@@ -40430,6 +40466,200 @@
                 document.getElementById('export-timeoff-daily-btn')?.addEventListener('click', (e) => {
                     e.preventDefault();
                     exportDailyTimeOffRequests();
+                });
+
+                document.getElementById('bulk-delete-timeoff-month-btn')?.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    try {
+                        const isManagerLike = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
+                        const isSupervisor = state.currentUser && getEffectivePermissionLevel() === 'Supervisor';
+                        if (!isManagerLike || isSupervisor) {
+                            showNotification('Only Managers/Admins can bulk delete time off requests.', 'error');
+                            return;
+                        }
+
+                        const employeeName = state.timeOffRequestsEmployeeFilter || 'all';
+                        if (!employeeName || employeeName === 'all') {
+                            showNotification('Select a specific employee first.', 'warning');
+                            return;
+                        }
+
+                        const crc = state.crcs.find(c => c.name === employeeName);
+                        if (!crc || !crc.id) {
+                            showNotification('Could not resolve CRC for selected employee.', 'error');
+                            return;
+                        }
+
+                        const monthValue = state.timeOffRequestsMonth;
+                        if (!monthValue || !/^\d{4}-\d{2}$/.test(monthValue)) {
+                            showNotification('Select a valid month first.', 'warning');
+                            return;
+                        }
+                        const [yy, mm] = monthValue.split('-').map(Number);
+                        const monthStart = new Date(yy, mm - 1, 1);
+                        const monthEnd = new Date(yy, mm, 0);
+                        const startDate = toDateOnlyString(monthStart);
+                        const endDate = toDateOnlyString(monthEnd);
+
+                        const statusFilter = (state.timeOffRequestsStatusFilter || 'all').toLowerCase();
+                        const statuses = statusFilter !== 'all' ? [statusFilter] : null;
+
+                        const confirmText = `This will delete ALL ${statusFilter === 'all' ? '' : statusFilter + ' '}time off requests for ${employeeName} in ${monthValue}.\n\nType DELETE to confirm.`;
+                        const typed = prompt(confirmText);
+                        if (typed !== 'DELETE') {
+                            showNotification('Bulk delete cancelled.', 'info');
+                            return;
+                        }
+
+                        // Progress modal with cancel support
+                        window._cancelBulkTimeOffDelete = false;
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-2">Bulk Delete Time Off Requests</h3>
+                            <p class="text-sm text-gray-600 dark:text-gray-300 mb-3">Deleting requests for <strong>${employeeName}</strong> (${monthValue}).</p>
+                            <div id="bulk-timeoff-delete-progress" class="text-sm dark:text-gray-300 mb-4">Starting…</div>
+                            <div class="flex justify-end gap-2">
+                                <button data-action="close-modal" class="px-4 py-2 bg-gray-300 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-400 dark:hover:bg-gray-500">Close</button>
+                                <button id="bulk-timeoff-delete-cancel" class="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700">Cancel</button>
+                            </div>
+                        `, 'md');
+                        setTimeout(() => {
+                            document.getElementById('bulk-timeoff-delete-cancel')?.addEventListener('click', () => {
+                                window._cancelBulkTimeOffDelete = true;
+                                const el = document.getElementById('bulk-timeoff-delete-progress');
+                                if (el) el.textContent = 'Cancelling…';
+                            });
+                        }, 0);
+
+                        let totalDeleted = 0;
+                        const maxLoops = 200; // safety
+                        for (let i = 0; i < maxLoops; i++) {
+                            if (window._cancelBulkTimeOffDelete) break;
+                            const resp = await apiService.bulkDeleteTimeOffRequests({
+                                crcId: crc.id,
+                                startDate,
+                                endDate,
+                                statuses,
+                                limit: 200
+                            });
+                            const batchDeleted = Number(resp?.deleted || 0);
+                            const attempted = Number(resp?.attempted || 0);
+                            totalDeleted += batchDeleted;
+
+                            const el = document.getElementById('bulk-timeoff-delete-progress');
+                            if (el) el.textContent = `Deleted ${totalDeleted} so far… (last batch: ${batchDeleted}/${attempted})`;
+
+                            if (attempted === 0 || batchDeleted === 0) break;
+                            // Yield a bit to keep UI responsive
+                            await new Promise(r => setTimeout(r, 150));
+                        }
+
+                        if (window._cancelBulkTimeOffDelete) {
+                            showNotification(`Bulk delete cancelled. Deleted ${totalDeleted}.`, 'warning');
+                        } else {
+                            showNotification(`Bulk delete complete. Deleted ${totalDeleted} time off request(s).`, 'success');
+                        }
+
+                        // Refresh time off requests and sync approved events cleanup
+                        try {
+                            const updated = await apiService.getTimeOffRequests();
+                            setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
+                            if (typeof syncApprovedTimeOffRequests === 'function') {
+                                syncApprovedTimeOffRequests(Array.isArray(updated) ? updated : []);
+                            }
+                        } catch (refreshErr) {
+                            console.warn('Failed to refresh time off requests after bulk delete:', refreshErr);
+                        }
+                        renderTimeOffRequestsContent();
+                    } catch (error) {
+                        console.error('Bulk delete time off requests failed:', error);
+                        showNotification(`Bulk delete failed: ${error.message}`, 'error');
+                    }
+                });
+
+                document.getElementById('dedupe-timeoff-month-btn')?.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    try {
+                        const isManagerLike = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
+                        const isSupervisor = state.currentUser && getEffectivePermissionLevel() === 'Supervisor';
+                        if (!isManagerLike || isSupervisor) {
+                            showNotification('Only Managers/Admins can combine duplicate time off requests.', 'error');
+                            return;
+                        }
+
+                        const employeeName = state.timeOffRequestsEmployeeFilter || 'all';
+                        if (!employeeName || employeeName === 'all') {
+                            showNotification('Select a specific employee first.', 'warning');
+                            return;
+                        }
+
+                        const crc = state.crcs.find(c => c.name === employeeName);
+                        if (!crc || !crc.id) {
+                            showNotification('Could not resolve CRC for selected employee.', 'error');
+                            return;
+                        }
+
+                        const monthValue = state.timeOffRequestsMonth;
+                        if (!monthValue || !/^\d{4}-\d{2}$/.test(monthValue)) {
+                            showNotification('Select a valid month first.', 'warning');
+                            return;
+                        }
+                        const [yy, mm] = monthValue.split('-').map(Number);
+                        const monthStart = new Date(yy, mm - 1, 1);
+                        const monthEnd = new Date(yy, mm, 0);
+                        const startDate = toDateOnlyString(monthStart);
+                        const endDate = toDateOnlyString(monthEnd);
+
+                        const typed = prompt(
+                            `This will COMBINE duplicate time off requests for ${employeeName} in ${monthValue}.\n\nIt keeps one request per day and preserves merged details on the kept record.\n\nType COMBINE to confirm.`
+                        );
+                        if (typed !== 'COMBINE') {
+                            showNotification('Combine cancelled.', 'info');
+                            return;
+                        }
+
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-2">Combine Duplicate Time Off Requests</h3>
+                            <p class="text-sm text-gray-600 dark:text-gray-300 mb-3">Combining duplicates for <strong>${employeeName}</strong> (${monthValue}).</p>
+                            <div id="timeoff-dedupe-progress" class="text-sm dark:text-gray-300 mb-4">Working…</div>
+                            <div class="flex justify-end gap-2">
+                                <button data-action="close-modal" class="px-4 py-2 bg-gray-300 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-400 dark:hover:bg-gray-500">Close</button>
+                            </div>
+                        `, 'md');
+
+                        const resp = await apiService.dedupeTimeOffRequests({
+                            crcId: crc.id,
+                            startDate,
+                            endDate,
+                            dryRun: false
+                        });
+
+                        const el = document.getElementById('timeoff-dedupe-progress');
+                        if (el) {
+                            const groups = Number(resp?.groupsWithDuplicates || 0);
+                            const removed = Number(resp?.deleted || 0);
+                            const skipped = Number(resp?.rangeLikeSkipped || 0);
+                            el.textContent = `Done. Combined ${groups} day(s). Removed ${removed} duplicate record(s). Skipped ${skipped} range-like request(s).`;
+                        }
+
+                        showNotification('Duplicate time off requests combined.', 'success');
+
+                        try {
+                            const updated = await apiService.getTimeOffRequests();
+                            setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
+                            if (typeof syncApprovedTimeOffRequests === 'function') {
+                                syncApprovedTimeOffRequests(Array.isArray(updated) ? updated : []);
+                            }
+                        } catch (refreshErr) {
+                            console.warn('Failed to refresh time off requests after dedupe:', refreshErr);
+                        }
+                        renderTimeOffRequestsContent();
+                        if (state.activeTab === 'unavailability') {
+                            try { renderUnavailabilityCalendar(); } catch (e) {}
+                        }
+                    } catch (error) {
+                        console.error('Dedupe time off requests failed:', error);
+                        showNotification(`Combine failed: ${error.message}`, 'error');
+                    }
                 });
                 
                 document.getElementById('time-off-month-selector')?.addEventListener('change', (e) => {

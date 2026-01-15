@@ -228,7 +228,9 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
     const travelContainer = getContainer('travel');
     const siteNameById = lookups.siteNameById || new Map();
     const siteLocationById = lookups.siteLocationById || new Map();
+    const siteDetailsById = lookups.siteDetailsById || new Map();
     const studyNameById = lookups.studyNameById || new Map();
+    const studyDetailsById = lookups.studyDetailsById || new Map();
     const roleNameById = lookups.roleNameById || new Map();
 
     let crc = null;
@@ -287,7 +289,9 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
             siteId: e.siteId || null,
             siteName: (e.siteId && siteNameById.get(e.siteId)) ? siteNameById.get(e.siteId) : null,
             siteLocation: (e.siteId && siteLocationById.get(e.siteId)) ? siteLocationById.get(e.siteId) : null,
+            site: (e.siteId && siteDetailsById.get(e.siteId)) ? siteDetailsById.get(e.siteId) : null,
             studies: Array.isArray(e.studyIds) ? e.studyIds.map(id => studyNameById.get(id) || id).filter(Boolean) : [],
+            studyDetails: Array.isArray(e.studyIds) ? e.studyIds.map(id => studyDetailsById.get(id) || null).filter(Boolean) : [],
             roles: getEventRoleNamesForCrc(e),
             visitNumber: e.visitNumber || null,
             groupNumber: e.groupNumber || null,
@@ -377,9 +381,184 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
     const timeOffText = [...timeOffRequestEntries, ...timeOffEvents].map(t => `- ${t.summary || `${t.date} ${t.type} (${t.period})`}`).join('\n');
     const travelText = travelEntries.map(t => `- ${t.date} ${t.route || t.type}`).join('\n');
 
-    // Provide some simple HTML chunks that templates can drop in.
+    // Provide HTML/text chunks that templates can drop in.
     const scheduleHtml = shifts.length
         ? `<ul>${shifts.map(s => `<li>${htmlEscape(s.summary || '')}</li>`).join('')}</ul>`
+        : `<p>No shifts in range.</p>`;
+
+    // Detailed schedule rendering (explicit columns)
+    const scheduleDetailsText = shifts.length
+        ? shifts.map(s => {
+            const studies = (s.studies || []).join(', ');
+            const roles = (s.roles || []).join(', ');
+            const visit = s.visitNumber ? `Visit: ${s.visitNumber}` : '';
+            const group = s.groupNumber ? `Group: ${s.groupNumber}` : '';
+            const parts = [
+                s.date,
+                s.period,
+                s.siteName || s.siteId || '',
+                s.siteLocation || '',
+                studies ? `Study: ${studies}` : '',
+                roles ? `Roles: ${roles}` : '',
+                visit,
+                group
+            ].filter(Boolean);
+            return `- ${parts.join(' | ')}`;
+        }).join('\n')
+        : 'No shifts in range.';
+
+    const scheduleDetailsHtml = shifts.length
+        ? `
+            <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;">
+                <thead>
+                    <tr>
+                        <th align="left">Date</th>
+                        <th align="left">Period</th>
+                        <th align="left">Site</th>
+                        <th align="left">Location</th>
+                        <th align="left">Study</th>
+                        <th align="left">Roles</th>
+                        <th align="left">Visit</th>
+                        <th align="left">Group</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${shifts.map(s => `
+                        <tr>
+                            <td>${htmlEscape(s.date || '')}</td>
+                            <td>${htmlEscape(s.period || '')}</td>
+                            <td>${htmlEscape(s.siteName || s.siteId || '')}</td>
+                            <td>${htmlEscape(s.siteLocation || '')}</td>
+                            <td>${htmlEscape((s.studies || []).join(', '))}</td>
+                            <td>${htmlEscape((s.roles || []).join(', '))}</td>
+                            <td>${htmlEscape(s.visitNumber || '')}</td>
+                            <td>${htmlEscape(s.groupNumber || '')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `
+        : `<p>No shifts in range.</p>`;
+
+    // "Basic" schedule: Date, Period/Time, Role(s), Study, Visit, Site (most common use)
+    const scheduleBasicText = shifts.length
+        ? shifts.map(s => {
+            const studies = (s.studies || []).join(', ');
+            const roles = (s.roles || []).join(', ') || 'No roles';
+            const visit = s.visitNumber ? `Visit ${s.visitNumber}` : '';
+            const site = s.siteName || s.siteId || '';
+            const parts = [
+                s.date,
+                s.period || 'Full Day',
+                roles,
+                studies ? `Study: ${studies}` : '',
+                visit,
+                site
+            ].filter(Boolean);
+            return `- ${parts.join(' • ')}`;
+        }).join('\n')
+        : 'No shifts in range.';
+
+    const scheduleBasicHtml = shifts.length
+        ? `
+            <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;">
+                <thead>
+                    <tr>
+                        <th align="left">Date</th>
+                        <th align="left">Time/Period</th>
+                        <th align="left">Role(s)</th>
+                        <th align="left">Study</th>
+                        <th align="left">Visit</th>
+                        <th align="left">Site</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${shifts.map(s => `
+                        <tr>
+                            <td>${htmlEscape(s.date || '')}</td>
+                            <td>${htmlEscape(s.period || '')}</td>
+                            <td>${htmlEscape((s.roles || []).join(', '))}</td>
+                            <td>${htmlEscape((s.studies || []).join(', '))}</td>
+                            <td>${htmlEscape(s.visitNumber || '')}</td>
+                            <td>${htmlEscape(s.siteName || s.siteId || '')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `
+        : `<p>No shifts in range.</p>`;
+
+    // "Full/Artemis" schedule: includes site address + emails/phones + study metadata when available.
+    const scheduleFullText = shifts.length
+        ? shifts.map(s => {
+            const studies = (s.studies || []).join(', ');
+            const roles = (s.roles || []).join(', ');
+            const site = s.site || {};
+            const siteName = s.siteName || site.name || s.siteId || '';
+            const addr = [site.address1, site.address2, site.city, site.state, site.zipCode || site.zip, site.country].filter(Boolean).join(', ');
+            const contacts = [
+                site.phoneNumber || site.phone ? `Phone: ${site.phoneNumber || site.phone}` : '',
+                site.pi || site.principalInvestigator ? `PI: ${site.pi || site.principalInvestigator}` : '',
+                site.piEmail ? `PI Email: ${site.piEmail}` : '',
+                site.siteCoordinator ? `Coordinator: ${site.siteCoordinator}` : '',
+                site.siteCoordinatorEmail ? `Coordinator Email: ${site.siteCoordinatorEmail}` : ''
+            ].filter(Boolean).join(' | ');
+            const visit = s.visitNumber ? `Visit ${s.visitNumber}` : '';
+            const group = s.groupNumber ? `Group ${s.groupNumber}` : '';
+            const parts = [
+                `${s.date} (${s.period || 'Full Day'})`,
+                roles ? `Roles: ${roles}` : '',
+                studies ? `Study: ${studies}` : '',
+                visit,
+                group,
+                siteName ? `Site: ${siteName}` : '',
+                addr ? `Address: ${addr}` : '',
+                contacts
+            ].filter(Boolean);
+            return `- ${parts.join(' • ')}`;
+        }).join('\n')
+        : 'No shifts in range.';
+
+    const scheduleFullHtml = shifts.length
+        ? `
+            <div style="font-family:Arial,sans-serif;font-size:12px;">
+                ${shifts.map(s => {
+                    const site = s.site || {};
+                    const siteName = s.siteName || site.name || s.siteId || '';
+                    const addrLines = [
+                        site.address1,
+                        site.address2,
+                        [site.city, site.state, site.zipCode || site.zip].filter(Boolean).join(', '),
+                        site.country
+                    ].filter(Boolean);
+                    const studyLines = (s.studyDetails || []).map(st => {
+                        const title = st.title || st.name || st.protocolNumber || st.id || '';
+                        const proto = st.protocolNumber ? `Protocol: ${st.protocolNumber}` : '';
+                        const phase = st.phase ? `Phase: ${st.phase}` : '';
+                        const status = st.status || st.state ? `Status: ${st.status || st.state}` : '';
+                        return [title, proto, phase, status].filter(Boolean).join(' • ');
+                    }).filter(Boolean);
+                    const roleStr = (s.roles || []).join(', ');
+                    return `
+                        <div style="border:1px solid #ddd;border-radius:6px;padding:10px;margin:0 0 10px 0;">
+                            <div style="font-weight:bold;margin-bottom:6px;">
+                                ${htmlEscape(s.date || '')} • ${htmlEscape(s.period || '')}
+                            </div>
+                            <div><strong>Role(s):</strong> ${htmlEscape(roleStr || '')}</div>
+                            <div><strong>Study:</strong> ${htmlEscape((s.studies || []).join(', '))}</div>
+                            <div><strong>Visit:</strong> ${htmlEscape(s.visitNumber || '')} ${s.groupNumber ? ` • <strong>Group:</strong> ${htmlEscape(s.groupNumber)}` : ''}</div>
+                            <hr style="border:none;border-top:1px solid #eee;margin:8px 0;" />
+                            <div><strong>Site:</strong> ${htmlEscape(siteName)}</div>
+                            ${addrLines.length ? `<div><strong>Address:</strong><br/>${addrLines.map(l => htmlEscape(l)).join('<br/>')}</div>` : ''}
+                            ${site.phoneNumber || site.phone ? `<div><strong>Phone:</strong> ${htmlEscape(site.phoneNumber || site.phone)}</div>` : ''}
+                            ${(site.pi || site.principalInvestigator) ? `<div><strong>PI:</strong> ${htmlEscape(site.pi || site.principalInvestigator)}${site.piEmail ? ` • <a href="mailto:${htmlEscape(site.piEmail)}">${htmlEscape(site.piEmail)}</a>` : ''}</div>` : (site.piEmail ? `<div><strong>PI Email:</strong> <a href="mailto:${htmlEscape(site.piEmail)}">${htmlEscape(site.piEmail)}</a></div>` : '')}
+                            ${site.siteCoordinator ? `<div><strong>Coordinator:</strong> ${htmlEscape(site.siteCoordinator)}${site.siteCoordinatorEmail ? ` • <a href="mailto:${htmlEscape(site.siteCoordinatorEmail)}">${htmlEscape(site.siteCoordinatorEmail)}</a>` : ''}</div>` : (site.siteCoordinatorEmail ? `<div><strong>Coordinator Email:</strong> <a href="mailto:${htmlEscape(site.siteCoordinatorEmail)}">${htmlEscape(site.siteCoordinatorEmail)}</a></div>` : '')}
+                            ${studyLines.length ? `<div style="margin-top:8px;"><strong>Study details:</strong><ul style="margin:4px 0 0 18px;padding:0;">${studyLines.map(l => `<li>${htmlEscape(l)}</li>`).join('')}</ul></div>` : ''}
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `
         : `<p>No shifts in range.</p>`;
     const timeOffHtml = (timeOffRequestEntries.length || timeOffEvents.length)
         ? `<ul>${[...timeOffRequestEntries, ...timeOffEvents].map(t => `<li>${htmlEscape(t.date)} • ${htmlEscape(t.type)} • ${htmlEscape(t.period)}${t.status ? ` • ${htmlEscape(t.status)}` : ''}</li>`).join('')}</ul>`
@@ -411,6 +590,12 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
         rangeEnd: end,
         scheduleText,
         scheduleHtml,
+        scheduleDetailsText,
+        scheduleDetailsHtml,
+        scheduleBasicText,
+        scheduleBasicHtml,
+        scheduleFullText,
+        scheduleFullHtml,
         timeOffText,
         timeOffHtml,
         travelText,
@@ -1980,10 +2165,12 @@ app.http('send-email', {
             const crcsContainer = getContainer('crcs');
             const { resources: crcList } = await crcsContainer.items.readAll().fetchAll();
             const crcResolver = buildCrcResolver(crcList || []);
-            // Lookups for sites/studies/roles so template variables can include names/locations
+            // Lookups for sites/studies/roles so template variables can include names/locations/details
             const siteNameById = new Map();
             const siteLocationById = new Map();
+            const siteDetailsById = new Map();
             const studyNameById = new Map();
+            const studyDetailsById = new Map();
             const roleNameById = new Map();
             try {
                 const sitesContainer = getContainer('sites');
@@ -1992,6 +2179,7 @@ app.http('send-email', {
                     if (!s || !s.id) return;
                     const name = s.name || s.siteName || s.title || s.id;
                     siteNameById.set(s.id, name);
+                    siteDetailsById.set(s.id, s);
                     const location = [
                         s.address1,
                         s.city,
@@ -2012,6 +2200,7 @@ app.http('send-email', {
                     if (!st || !st.id) return;
                     const title = st.title || st.name || st.protocolNumber || st.id;
                     studyNameById.set(st.id, title);
+                    studyDetailsById.set(st.id, st);
                 });
             } catch (e) {
                 context?.log?.warn?.(`Failed to load studies for email lookups: ${e.message}`);
@@ -2067,7 +2256,7 @@ app.http('send-email', {
                     const ctx = await buildRecipientEmailContext(
                         { crcId, startDate: rangeStart, endDate: rangeEnd, recipient: r, user: { id: r.userId || null, email, name: displayName, crcId } },
                         context,
-                        { siteNameById, siteLocationById, studyNameById, roleNameById }
+                        { siteNameById, siteLocationById, siteDetailsById, studyNameById, studyDetailsById, roleNameById }
                     );
                     const subjectTpl = template.subject || template.title || 'Message';
                     const htmlTpl = template.html || template.bodyHtml || template.body || '';
@@ -2139,6 +2328,333 @@ app.http('send-email', {
     }
 });
 
+app.http('timeOffRequestsBulkDelete', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'time-off-requests/bulk-delete',
+    handler: async (request, context) => {
+        // Handle OPTIONS request for CORS
+        if (request.method === 'OPTIONS') {
+            return {
+                status: 200,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                }
+            };
+        }
+
+        try {
+            const body = await request.json();
+            const crcId = body?.crcId ? String(body.crcId).trim() : '';
+            const startDate = toDateOnlyString(body?.startDate || body?.range?.startDate);
+            const endDate = toDateOnlyString(body?.endDate || body?.range?.endDate);
+            const statuses = Array.isArray(body?.statuses) ? body.statuses.map(s => String(s || '').toLowerCase()) : null;
+            const limitRaw = Number(body?.limit);
+            const limit = Number.isFinite(limitRaw) ? Math.max(25, Math.min(limitRaw, 500)) : 200;
+
+            if (!crcId || !startDate || !endDate) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'crcId, startDate, and endDate are required' },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+            if (startDate > endDate) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'startDate must be <= endDate' },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+
+            const container = getContainer('time-off-requests');
+
+            // Cosmos doesn't allow parametrized TOP; embed the validated number.
+            const querySpec = {
+                query:
+                    `SELECT TOP ${limit} c.id, c.status, c.date, c.startDate ` +
+                    `FROM c WHERE c.crcId = @crcId ` +
+                    `AND ((c.date >= @start AND c.date <= @end) OR (c.startDate >= @start AND c.startDate <= @end))`,
+                parameters: [
+                    { name: '@crcId', value: crcId },
+                    { name: '@start', value: startDate },
+                    { name: '@end', value: endDate }
+                ]
+            };
+
+            const { resources } = await container.items.query(querySpec, { maxItemCount: limit }).fetchAll();
+            let candidates = Array.isArray(resources) ? resources : [];
+
+            if (statuses && statuses.length > 0 && !statuses.includes('all')) {
+                const allowed = new Set(statuses.map(s => String(s).toLowerCase()));
+                candidates = candidates.filter(r => {
+                    const st = String(r?.status || '').toLowerCase();
+                    return allowed.has(st);
+                });
+            }
+
+            const ids = candidates.map(r => r.id).filter(Boolean);
+            if (ids.length === 0) {
+                return {
+                    status: 200,
+                    jsonBody: { deleted: 0, attempted: 0, done: true },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+
+            // Delete with limited concurrency to avoid timeouts/RU spikes
+            const concurrency = 25;
+            let deleted = 0;
+            let idx = 0;
+            const worker = async () => {
+                while (idx < ids.length) {
+                    const current = ids[idx++];
+                    try {
+                        await container.item(current, current).delete();
+                        deleted += 1;
+                    } catch (e) {
+                        // Ignore not-found to be idempotent
+                        const code = e.code || e.statusCode;
+                        if (code !== 404) {
+                            context?.log?.warn?.(`Failed to delete time off request ${current}: ${e.message}`);
+                        }
+                    }
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(concurrency, ids.length) }, () => worker()));
+
+            return {
+                status: 200,
+                jsonBody: { deleted, attempted: ids.length, done: ids.length < limit },
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+            };
+        } catch (error) {
+            return handleError(context, error, 'Bulk delete time off requests failed');
+        }
+    }
+});
+
+app.http('timeOffRequestsDedupe', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'time-off-requests/dedupe',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return {
+                status: 200,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                }
+            };
+        }
+
+        try {
+            const body = await request.json();
+            const crcId = body?.crcId ? String(body.crcId).trim() : '';
+            const startDate = toDateOnlyString(body?.startDate || body?.range?.startDate);
+            const endDate = toDateOnlyString(body?.endDate || body?.range?.endDate);
+            const dryRun = !!body?.dryRun;
+
+            if (!crcId || !startDate || !endDate) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'crcId, startDate, and endDate are required' },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+            if (startDate > endDate) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'startDate must be <= endDate' },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+
+            const container = getContainer('time-off-requests');
+
+            // Pull all for this CRC (cross-partition) then filter in JS; for a single CRC/month this is manageable.
+            const { resources: allForCrc } = await container.items
+                .query({
+                    query: "SELECT * FROM c WHERE c.crcId = @crcId",
+                    parameters: [{ name: "@crcId", value: crcId }]
+                })
+                .fetchAll();
+
+            const inWindow = (req) => {
+                const d = toDateOnlyString(req?.date || req?.startDate);
+                if (!d) return false;
+                return d >= startDate && d <= endDate;
+            };
+
+            const candidates = (Array.isArray(allForCrc) ? allForCrc : []).filter(inWindow);
+
+            const groups = new Map(); // dateStr -> array
+            const rangeLike = [];
+            candidates.forEach(r => {
+                const d = toDateOnlyString(r?.date || r?.startDate);
+                const sd = toDateOnlyString(r?.startDate || r?.date);
+                const ed = toDateOnlyString(r?.endDate || r?.startDate || r?.date);
+                if (sd && ed && sd !== ed) {
+                    rangeLike.push(r);
+                }
+                if (!d) return;
+                if (!groups.has(d)) groups.set(d, []);
+                groups.get(d).push(r);
+            });
+
+            const statusRank = (s) => {
+                const v = String(s || '').toLowerCase();
+                if (v === 'approved') return 3;
+                if (v === 'pending') return 2;
+                if (v === 'rejected') return 1;
+                return 0;
+            };
+
+            const pickPrimary = (arr) => {
+                return [...arr].sort((a, b) => {
+                    const sr = statusRank(b.status) - statusRank(a.status);
+                    if (sr !== 0) return sr;
+                    const aT = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+                    const bT = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+                    return bT - aT;
+                })[0];
+            };
+
+            const uniqueJoin = (vals) => {
+                const out = [];
+                const seen = new Set();
+                vals.forEach(v => {
+                    const s = String(v || '').trim();
+                    if (!s) return;
+                    const key = s.toLowerCase();
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    out.push(s);
+                });
+                return out;
+            };
+
+            const mergeType = (arr) => {
+                // Prefer any non-empty, and prefer non-generic types if present
+                const types = arr.map(r => r.type).filter(Boolean);
+                const uniq = uniqueJoin(types);
+                if (uniq.length === 0) return 'Time Off';
+                const preferred = uniq.find(t => t.toLowerCase() !== 'time off');
+                return preferred || uniq[0];
+            };
+
+            const mergePeriod = (arr) => {
+                const periods = uniqueJoin(arr.map(r => r.period));
+                if (periods.includes('Full Day')) return 'Full Day';
+                return periods[0] || 'Full Day';
+            };
+
+            const mergeHours = (arr) => {
+                const nums = arr.map(r => r.hours).filter(v => typeof v === 'number' && Number.isFinite(v));
+                if (nums.length === 0) return undefined;
+                return Math.max(...nums);
+            };
+
+            const mergeStatus = (arr) => {
+                const ranks = arr.map(r => statusRank(r.status));
+                const max = Math.max(...ranks, 0);
+                if (max === 3) return 'approved';
+                if (max === 2) return 'pending';
+                if (max === 1) return 'rejected';
+                return undefined;
+            };
+
+            let mergedGroups = 0;
+            let deleted = 0;
+            let updated = 0;
+            const changes = [];
+
+            for (const [dateStr, arr] of groups.entries()) {
+                if (!arr || arr.length <= 1) continue;
+
+                const primary = pickPrimary(arr);
+                const others = arr.filter(r => r.id !== primary.id);
+
+                const merged = {
+                    ...primary,
+                    date: dateStr,
+                    startDate: dateStr,
+                    endDate: dateStr,
+                    type: mergeType(arr),
+                    period: mergePeriod(arr),
+                    ...(mergeHours(arr) !== undefined ? { hours: mergeHours(arr) } : {}),
+                    status: mergeStatus(arr) || primary.status || 'pending',
+                    // Preserve sources so we're "combining" not losing info
+                    mergedAt: new Date().toISOString(),
+                    mergedFromIds: [primary.id, ...others.map(o => o.id)].filter(Boolean),
+                    mergedFrom: arr.map(r => ({
+                        id: r.id,
+                        status: r.status,
+                        type: r.type,
+                        period: r.period,
+                        hours: r.hours,
+                        notes: r.notes,
+                        createdAt: r.createdAt
+                    })),
+                    notes: (() => {
+                        const notes = uniqueJoin(arr.map(r => r.notes));
+                        return notes.length ? notes.join(' | ') : (primary.notes || undefined);
+                    })()
+                };
+
+                mergedGroups += 1;
+                updated += 1;
+                changes.push({ date: dateStr, keptId: primary.id, mergedCount: arr.length });
+
+                if (!dryRun) {
+                    await container.items.upsert(merged);
+                    // Delete the duplicates (info preserved in mergedFrom)
+                    const idsToDelete = others.map(o => o.id).filter(Boolean);
+                    const concurrency = 25;
+                    let idx = 0;
+                    const worker = async () => {
+                        while (idx < idsToDelete.length) {
+                            const current = idsToDelete[idx++];
+                            try {
+                                await container.item(current, current).delete();
+                                deleted += 1;
+                            } catch (e) {
+                                const code = e.code || e.statusCode;
+                                if (code !== 404) {
+                                    context?.log?.warn?.(`Failed to delete duplicate time off request ${current}: ${e.message}`);
+                                }
+                            }
+                        }
+                    };
+                    await Promise.all(Array.from({ length: Math.min(concurrency, idsToDelete.length) }, () => worker()));
+                }
+            }
+
+            return {
+                status: 200,
+                jsonBody: {
+                    crcId,
+                    startDate,
+                    endDate,
+                    dryRun,
+                    rangeLikeSkipped: rangeLike.length,
+                    groupsWithDuplicates: mergedGroups,
+                    updated,
+                    deleted,
+                    changes: changes.slice(0, 200) // cap payload
+                },
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+            };
+        } catch (error) {
+            return handleError(context, error, 'Dedupe time off requests failed');
+        }
+    }
+});
+
 app.http('time-off-requests', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
@@ -2179,54 +2695,35 @@ app.http('time-off-requests', {
                     if (!body.date && body.startDate) {
                         body.date = body.startDate;
                     }
+
+                    // Force date-only strings to prevent timezone variants creating "duplicates"
+                    body.date = toDateOnlyString(body.date);
+                    if (body.startDate) body.startDate = toDateOnlyString(body.startDate);
+                    if (body.endDate) body.endDate = toDateOnlyString(body.endDate);
+                    if (body.date && !body.startDate) body.startDate = body.date;
+                    if (body.date && !body.endDate) body.endDate = body.date;
                     
                     validateTimeOffRequestsSchema(body);
                     
-                    // Check for duplicate time off requests for the same CRC and date(s)
-                    const normalizedDate = body.date || body.startDate;
-                    const normalizedStartDate = body.startDate || body.date;
-                    const normalizedEndDate = body.endDate || body.date || body.startDate;
-                    
+                    // Enforce: only ONE time off request per CRC per day.
+                    const normalizedDate = body.date;
                     const { resources: existingRequests } = await container.items
                         .query({
-                            query: "SELECT * FROM c WHERE c.crcId = @crcId",
-                            parameters: [{ name: "@crcId", value: body.crcId }]
+                            query: "SELECT c.id, c.date, c.startDate, c.endDate FROM c WHERE c.crcId = @crcId AND (c.date = @date OR c.startDate = @date)",
+                            parameters: [
+                                { name: "@crcId", value: body.crcId },
+                                { name: "@date", value: normalizedDate }
+                            ]
                         })
                         .fetchAll();
-                    
-                    // Check if there's already a time off request for this CRC on the same date(s)
-                    const duplicateRequest = existingRequests.find(req => {
-                        if (!req.date && !req.startDate) return false;
-                        
-                        const reqDate = req.date || req.startDate;
-                        const reqStartDate = req.startDate || req.date;
-                        const reqEndDate = req.endDate || req.date || req.startDate;
-                        
-                        // Check for exact date match
-                        if (reqDate === normalizedDate || reqStartDate === normalizedStartDate) {
-                            return true;
-                        }
-                        
-                        // Check for date range overlap
-                        const reqStart = new Date(reqStartDate);
-                        const reqEnd = new Date(reqEndDate);
-                        const newStart = new Date(normalizedStartDate);
-                        const newEnd = new Date(normalizedEndDate);
-                        
-                        // Check if date ranges overlap
-                        if (newStart <= reqEnd && newEnd >= reqStart) {
-                            return true;
-                        }
-                        
-                        return false;
-                    });
+                    const duplicateRequest = (existingRequests || [])[0];
                     
                     if (duplicateRequest) {
                         return {
                             status: 409,
                             jsonBody: { 
                                 error: 'Duplicate time off request',
-                                message: 'A time off request already exists for this employee on the selected date(s).',
+                                message: 'A time off request already exists for this employee on the selected date.',
                                 existingRequestId: duplicateRequest.id
                             },
                             headers: { 'Content-Type': 'application/json' }
