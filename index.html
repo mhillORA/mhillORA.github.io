@@ -4274,35 +4274,45 @@
             };
 
             const getEventRoles = (event) => {
+                if (!event) return [];
                 let roleNames = [];
-                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                    // New role assignment system - show all roles with their assignments
+                
+                // New role assignment system - show all roles with their assignments
+                if (event.roleAssignments && typeof event.roleAssignments === 'object' && Object.keys(event.roleAssignments).length > 0) {
                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                        const role = state.roles.find(r => r.id === roleId);
-                        if (role) {
-                            // Check if this is a training role and if there's a training assignment
-                            if (isTrainingRoleName(role.name) && event.trainingAssignments && event.trainingAssignments[roleId]) {
-                                // For training roles, show "Training - RoleName"
-                                const trainingAssignments = event.trainingAssignments[roleId];
-                                if (Array.isArray(trainingAssignments) && trainingAssignments.length > 0) {
-                                    // Get unique training role names
-                                    const trainingRoleNames = [...new Set(trainingAssignments.filter(Boolean))];
-                                    trainingRoleNames.forEach(trainingRoleName => {
-                                        roleNames.push(`Training, ${trainingRoleName}`);
-                                    });
+                        // Only show roles that have at least one assignment (not empty arrays)
+                        if (Array.isArray(assignments) && assignments.length > 0 && assignments.some(a => a && a.trim() !== '')) {
+                            const role = (state.roles || []).find(r => r && r.id === roleId);
+                            if (role && role.name) {
+                                // Check if this is a training role and if there's a training assignment
+                                if (isTrainingRoleName(role.name) && event.trainingAssignments && event.trainingAssignments[roleId]) {
+                                    // For training roles, show "Training - RoleName"
+                                    const trainingAssignments = event.trainingAssignments[roleId];
+                                    if (Array.isArray(trainingAssignments) && trainingAssignments.length > 0) {
+                                        // Get unique training role names
+                                        const trainingRoleNames = [...new Set(trainingAssignments.filter(Boolean))];
+                                        trainingRoleNames.forEach(trainingRoleName => {
+                                            if (trainingRoleName && trainingRoleName.trim() !== '') {
+                                                roleNames.push(`Training, ${trainingRoleName}`);
+                                            }
+                                        });
+                                    } else {
+                                        roleNames.push(role.name);
+                                    }
                                 } else {
+                                    // For non-training roles, or if no training assignment, just show the role name
                                     roleNames.push(role.name);
                                 }
-                            } else {
-                                // For non-training roles, or if no training assignment, just show the role name
-                                roleNames.push(role.name);
                             }
                         }
                     });
-                } else if (event.roles && event.roles.length > 0) {
-                    // Legacy roles system - ensure we get role names properly
-                    roleNames = event.roles.filter(role => role && role.trim() !== '');
                 }
+                
+                // Legacy roles system - ensure we get role names properly
+                if (roleNames.length === 0 && event.roles && Array.isArray(event.roles) && event.roles.length > 0) {
+                    roleNames = event.roles.filter(role => role && typeof role === 'string' && role.trim() !== '');
+                }
+                
                 return roleNames;
             };
             
@@ -21496,8 +21506,15 @@
                     const shiftCrcs = getAllAssignedCRCs(shiftEvent);
                     shiftCrcs.forEach(crc => group.allCrcs.add(crc.id));
                     
+                    // Get roles for this shift - use getEventRoles which handles both roleAssignments and legacy roles
                     const shiftRoles = getEventRoles(shiftEvent);
-                    shiftRoles.forEach(role => group.allRoles.add(role));
+                    if (shiftRoles && shiftRoles.length > 0) {
+                        shiftRoles.forEach(role => {
+                            if (role && role.trim() !== '') {
+                                group.allRoles.add(role);
+                            }
+                        });
+                    }
                     
                     if (shiftEvent.notes && !group.allNotes.includes(shiftEvent.notes)) {
                         group.allNotes.push(shiftEvent.notes);
@@ -25344,48 +25361,51 @@
                     case 'insert-email-var': {
                         const varText = (target.dataset.var || actionButton?.dataset?.var || '').trim();
                         if (!varText) break;
+                        // Get fresh reference to textarea each time (in case it was replaced)
                         const textInput = document.getElementById('email-template-text');
-                        if (textInput) {
-                            // Get cursor position - prefer stored position, fallback to current selection, then end of text
-                            const storedPos = textInput.dataset.lastCursorPos ? parseInt(textInput.dataset.lastCursorPos, 10) : null;
-                            let start, end;
-                            
-                            if (storedPos !== null && storedPos >= 0) {
-                                // Use stored position
-                                start = storedPos;
-                                end = storedPos;
-                            } else {
-                                // Fallback to current selection
-                                start = textInput.selectionStart ?? textInput.value.length;
-                                end = textInput.selectionEnd ?? textInput.value.length;
-                            }
-                            
-                            // Ensure positions are valid
-                            start = Math.max(0, Math.min(start, textInput.value.length));
-                            end = Math.max(0, Math.min(end, textInput.value.length));
-                            
-                            // Insert the variable at cursor position
-                            const before = textInput.value.slice(0, start);
-                            const after = textInput.value.slice(end);
-                            textInput.value = `${before}${varText}${after}`;
-                            
-                            // Set cursor position after inserted text
-                            const cursor = start + varText.length;
-                            
-                            // Focus and set cursor position
-                            requestAnimationFrame(() => {
-                                textInput.focus();
-                                if (typeof textInput.setSelectionRange === 'function') {
-                                    textInput.setSelectionRange(cursor, cursor);
-                                }
-                                // Update stored cursor position
-                                textInput.dataset.lastCursorPos = cursor.toString();
-                            });
-                            
-                            // Trigger input event to ensure any listeners are notified
-                            textInput.dispatchEvent(new Event('input', { bubbles: true }));
-                            state.emailEditorDirty = true;
+                        if (!textInput) {
+                            console.warn('Email template textarea not found');
+                            break;
                         }
+                        
+                        // Focus the textarea first to ensure it's active
+                        textInput.focus();
+                        
+                        // Get cursor position - prefer stored position, fallback to current selection, then end of text
+                        const storedPos = textInput.dataset.lastCursorPos ? parseInt(textInput.dataset.lastCursorPos, 10) : null;
+                        let start, end;
+                        
+                        if (storedPos !== null && storedPos >= 0 && storedPos <= textInput.value.length) {
+                            // Use stored position
+                            start = storedPos;
+                            end = storedPos;
+                        } else {
+                            // Fallback to current selection
+                            start = textInput.selectionStart ?? textInput.value.length;
+                            end = textInput.selectionEnd ?? textInput.value.length;
+                        }
+                        
+                        // Ensure positions are valid
+                        start = Math.max(0, Math.min(start, textInput.value.length));
+                        end = Math.max(0, Math.min(end, textInput.value.length));
+                        
+                        // Insert the variable at cursor position
+                        const before = textInput.value.slice(0, start);
+                        const after = textInput.value.slice(end);
+                        textInput.value = `${before}${varText}${after}`;
+                        
+                        // Set cursor position after inserted text
+                        const cursor = start + varText.length;
+                        
+                        // Set cursor position immediately and update stored position
+                        if (typeof textInput.setSelectionRange === 'function') {
+                            textInput.setSelectionRange(cursor, cursor);
+                        }
+                        textInput.dataset.lastCursorPos = cursor.toString();
+                        
+                        // Trigger input event to ensure any listeners are notified
+                        textInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        state.emailEditorDirty = true;
                         break;
                     }
                     case 'remove-email-attachment': {
