@@ -25505,32 +25505,70 @@
                         // Insert the variable at cursor position
                         const before = textInput.value.slice(0, start);
                         const after = textInput.value.slice(end);
+                        const newValue = `${before}${varText}${after}`;
                         
                         // Set cursor position after inserted text
                         const cursor = start + varText.length;
                         
-                        // Insert the value first
-                        textInput.value = `${before}${varText}${after}`;
+                        // CRITICAL: Set the value directly - this should work immediately
+                        console.log('Inserting email variable:', {
+                            varText,
+                            start,
+                            end,
+                            beforeLength: before.length,
+                            afterLength: after.length,
+                            newValueLength: newValue.length,
+                            currentValueLength: textInput.value.length
+                        });
                         
-                        // Set cursor position immediately
+                        // Set the value
+                        textInput.value = newValue;
+                        
+                        // Force a re-focus and set cursor position
                         textInput.focus();
-                        if (typeof textInput.setSelectionRange === 'function') {
-                            textInput.setSelectionRange(cursor, cursor);
-                        }
+                        
+                        // Use requestAnimationFrame to ensure DOM is updated before setting cursor
+                        requestAnimationFrame(() => {
+                            // Get fresh reference in case textarea was replaced
+                            const freshTextInput = document.getElementById('email-template-text');
+                            if (freshTextInput) {
+                                freshTextInput.focus();
+                                if (typeof freshTextInput.setSelectionRange === 'function') {
+                                    try {
+                                        freshTextInput.setSelectionRange(cursor, cursor);
+                                        freshTextInput.dataset.lastCursorPos = cursor.toString();
+                                        console.log('Cursor set to position:', cursor);
+                                    } catch (err) {
+                                        console.warn('Error setting cursor position:', err);
+                                        // Fallback: set cursor to end
+                                        const endPos = freshTextInput.value.length;
+                                        freshTextInput.setSelectionRange(endPos, endPos);
+                                    }
+                                }
+                                
+                                // Trigger events to notify listeners
+                                freshTextInput.dispatchEvent(new Event('input', { bubbles: true }));
+                                freshTextInput.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                        });
+                        
+                        // Also use setTimeout as additional fallback
+                        setTimeout(() => {
+                            const freshTextInput = document.getElementById('email-template-text');
+                            if (freshTextInput && freshTextInput.value !== newValue) {
+                                // If value wasn't set, try again
+                                console.warn('Value not set, retrying...');
+                                freshTextInput.value = newValue;
+                                freshTextInput.focus();
+                                if (typeof freshTextInput.setSelectionRange === 'function') {
+                                    freshTextInput.setSelectionRange(cursor, cursor);
+                                }
+                                freshTextInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            }
+                        }, 10);
+                        
                         // Update stored cursor position
                         textInput.dataset.lastCursorPos = cursor.toString();
-                        
-                        // Also use setTimeout as fallback to ensure cursor is set
-                        setTimeout(() => {
-                            textInput.focus();
-                            if (typeof textInput.setSelectionRange === 'function') {
-                                textInput.setSelectionRange(cursor, cursor);
-                            }
-                        }, 0);
-                        
-                        // Trigger input event to ensure any listeners are notified
-                        textInput.dispatchEvent(new Event('input', { bubbles: true }));
-                        textInput.dispatchEvent(new Event('change', { bubbles: true }));
                         state.emailEditorDirty = true;
                         break;
                     }
@@ -35207,9 +35245,16 @@
                 const visitNumber = visitNumberSelectForRoles ? visitNumberSelectForRoles.value : (visitNumberInput ? visitNumberInput.value : null);
                 const hasVisitSelected = visitNumber && visitNumber !== '' && visitNumber !== 'Select Visit';
                 
+                // CRITICAL: Only render roles when a visit is selected (or use default if no visit selected)
+                // If no visit is selected, we'll use default visit requirements if available
+                // If a visit is selected, we'll use that visit's specific requirements
+                // Don't render roles when only study/site is selected (unless using default)
+                
                 // If a visit is selected, we need to clear requiredRoles and only use visit-specific requirements
                 // This prevents accumulation from multiple studies when a visit is selected
                 let visitSpecificMode = false;
+                let shouldUseDefault = false;
+                
                 if (hasVisitSelected) {
                     // Check if any study has visitRoleRequirements
                     const hasAnyVisitRequirements = selectedStudyIds.some(studyId => {
@@ -35220,6 +35265,24 @@
                         visitSpecificMode = true;
                         // Clear the map to start fresh for visit-specific requirements
                         requiredRoles.clear();
+                    }
+                } else {
+                    // No visit selected - check if we should use default visit requirements
+                    const hasDefaultRequirements = selectedStudyIds.some(studyId => {
+                        const study = state.studies.find(s => s.id === studyId);
+                        return study && study.visitRoleRequirements && study.visitRoleRequirements['default'] && Object.keys(study.visitRoleRequirements['default']).length > 0;
+                    });
+                    if (hasDefaultRequirements) {
+                        shouldUseDefault = true;
+                        visitSpecificMode = true;
+                        requiredRoles.clear();
+                        // Treat as if "default" visit is selected
+                        console.log('No visit selected, but default visit requirements exist - using default');
+                    } else {
+                        // No visit selected and no default - don't render roles yet
+                        console.log('No visit selected and no default requirements - not rendering roles yet');
+                        roleAssignmentContainer.innerHTML = '<div class="text-sm text-gray-500 dark:text-gray-400 p-4">Please select a visit to see role requirements.</div>';
+                        return; // Exit early - don't render roles
                     }
                 }
                 
@@ -35239,25 +35302,34 @@
                         hasVisitSelected
                     });
                     
-                    // If a visit is selected, try to use visit-specific requirements first
+                    // If a visit is selected (or we're using default), try to use visit-specific requirements first
                     let visitReqsUsed = false;
-                    if (hasVisitSelected && study && study.visitRoleRequirements) {
+                    if ((hasVisitSelected || shouldUseDefault) && study && study.visitRoleRequirements) {
                         let visitReqs = null;
                         
-                        // Try to get visit-specific requirements
-                        if (visitNumber && visitNumber !== 'default' && visitNumber !== '') {
+                        // Determine which visit requirements to use
+                        if (shouldUseDefault) {
+                            // No visit selected, but default exists - use default
+                            visitReqs = study.visitRoleRequirements['default'];
+                            console.log('✓ Using default visit requirements (no visit selected):', visitReqs);
+                        } else if (visitNumber && visitNumber !== 'default' && visitNumber !== '') {
+                            // Specific visit selected - try to get visit-specific requirements
                             const visitKey = `visit-${visitNumber}`;
                             visitReqs = study.visitRoleRequirements[visitKey];
                             console.log(`✓ Checking visit-specific requirements for visit ${visitNumber} (key: ${visitKey}):`, visitReqs);
                             console.log(`✓ Available visit keys:`, Object.keys(study.visitRoleRequirements));
-                        }
-                        
-                        // Use default if explicitly selected or if no visit-specific requirements found
-                        if (visitNumber === 'default' || !visitReqs || (visitReqs && Object.keys(visitReqs).length === 0)) {
-                            if (study.visitRoleRequirements['default']) {
-                                visitReqs = study.visitRoleRequirements['default'];
-                                console.log('✓ Using default visit requirements:', visitReqs);
+                            
+                            // If no visit-specific requirements, fall back to default
+                            if (!visitReqs || (visitReqs && Object.keys(visitReqs).length === 0)) {
+                                if (study.visitRoleRequirements['default']) {
+                                    visitReqs = study.visitRoleRequirements['default'];
+                                    console.log('✓ No visit-specific requirements found, using default:', visitReqs);
+                                }
                             }
+                        } else if (visitNumber === 'default') {
+                            // Default explicitly selected
+                            visitReqs = study.visitRoleRequirements['default'];
+                            console.log('✓ Using default visit requirements (explicitly selected):', visitReqs);
                         }
                         
                         // If visit requirements exist, use them
@@ -35286,9 +35358,10 @@
                         }
                     }
                     
-                    // Use fallbacks if NO visit is selected, OR if visit was selected but has no visitRoleRequirements, OR if visit requirements were incomplete
-                    // This ensures roles always populate when study and site are selected
-                    if (!hasVisitSelected || !study?.visitRoleRequirements || !visitReqsUsed || requiredRoles.size === 0) {
+                    // Use fallbacks ONLY if visit was selected but has no visitRoleRequirements, OR if visit requirements were incomplete
+                    // DO NOT use fallbacks if no visit is selected (we already handled default above)
+                    // Only use fallbacks if we tried to use visit requirements but they were empty
+                    if ((hasVisitSelected || shouldUseDefault) && (!study?.visitRoleRequirements || !visitReqsUsed || requiredRoles.size === 0)) {
                         // Fallback: check for site-specific role requirements (legacy support)
                         if (study && study.siteRoleRequirements && study.siteRoleRequirements[selectedSiteId]) {
                             console.log('✓ Found site role requirements (legacy):', study.siteRoleRequirements[selectedSiteId]);
@@ -40411,14 +40484,14 @@
                         textInput.dataset.lastCursorPos = pos.toString();
                     };
                     
-                    // Remove existing listeners to avoid duplicates
-                    const newTextInput = textInput.cloneNode(true);
-                    textInput.parentNode.replaceChild(newTextInput, textInput);
-                    
-                    // Add event listeners to track cursor position
-                    newTextInput.addEventListener('click', updateCursorPosition);
-                    newTextInput.addEventListener('keyup', updateCursorPosition);
-                    newTextInput.addEventListener('keydown', updateCursorPosition);
+                    // Only add listeners if they haven't been added yet (check for a marker)
+                    if (!textInput.dataset.cursorTrackingSetup) {
+                        // Add event listeners to track cursor position
+                        ['click', 'keyup', 'keydown', 'select', 'focus', 'input', 'mouseup'].forEach(eventType => {
+                            textInput.addEventListener(eventType, updateCursorPosition);
+                        });
+                        textInput.dataset.cursorTrackingSetup = 'true';
+                    }
                     newTextInput.addEventListener('select', updateCursorPosition);
                     newTextInput.addEventListener('focus', updateCursorPosition);
                     newTextInput.addEventListener('input', updateCursorPosition);
