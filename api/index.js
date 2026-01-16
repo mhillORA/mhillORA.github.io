@@ -829,6 +829,67 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
     const sites = Array.from(sitesMap.values());
     const studies = Array.from(studiesMap.values());
 
+    // Build formatted "all site info" and "all study info" text
+    const buildAllSitesInfo = (sitesArray) => {
+        if (!sitesArray || sitesArray.length === 0) return 'No sites in schedule.';
+        return sitesArray.map(site => {
+            const lines = [];
+            lines.push(`SITE: ${site.name || site.id || 'Unknown'}`);
+            if (site.studies && site.studies.length > 0) {
+                lines.push(`Studies: ${site.studies.join(', ')}`);
+            }
+            if (site.address1 || site.city || site.state) {
+                const addrParts = [
+                    site.address1,
+                    site.address2,
+                    [site.city, site.state, site.zipCode].filter(Boolean).join(', '),
+                    site.country
+                ].filter(Boolean);
+                if (addrParts.length > 0) {
+                    lines.push(`Address: ${addrParts.join('\n         ')}`);
+                }
+            }
+            if (site.phoneNumber) {
+                lines.push(`Phone: ${site.phoneNumber}`);
+            }
+            if (site.pi) {
+                lines.push(`Principal Investigator: ${site.pi}${site.piEmail ? ` (${site.piEmail})` : ''}`);
+            } else if (site.piEmail) {
+                lines.push(`PI Email: ${site.piEmail}`);
+            }
+            if (site.siteCoordinator) {
+                lines.push(`Site Coordinator: ${site.siteCoordinator}${site.siteCoordinatorEmail ? ` (${site.siteCoordinatorEmail})` : ''}`);
+            } else if (site.siteCoordinatorEmail) {
+                lines.push(`Coordinator Email: ${site.siteCoordinatorEmail}`);
+            }
+            return lines.join('\n');
+        }).join('\n\n');
+    };
+
+    const buildAllStudiesInfo = (studiesArray) => {
+        if (!studiesArray || studiesArray.length === 0) return 'No studies in schedule.';
+        return studiesArray.map(study => {
+            const lines = [];
+            lines.push(`STUDY: ${study.name || study.title || 'Unknown'}`);
+            if (study.title && study.title !== study.name) {
+                lines.push(`Title: ${study.title}`);
+            }
+            if (study.protocolNumber) {
+                lines.push(`Protocol: ${study.protocolNumber}`);
+            }
+            if (study.phase) {
+                lines.push(`Phase: ${study.phase}`);
+            }
+            if (study.status) {
+                lines.push(`Status: ${study.status}`);
+            }
+            return lines.join('\n');
+        }).join('\n\n');
+    };
+
+    const allSitesInfo = buildAllSitesInfo(sites);
+    const allStudiesInfo = buildAllStudiesInfo(studies);
+
     return {
         recipient: recipient || {},
         user: user || {},
@@ -857,7 +918,9 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
         timeOffText,
         timeOffHtml,
         travelText,
-        travelHtml
+        travelHtml,
+        allSitesInfo,
+        allStudiesInfo
     };
 };
 
@@ -2517,11 +2580,9 @@ app.http('send-email', {
                         { siteNameById, siteLocationById, siteDetailsById, studyNameById, studyDetailsById, roleNameById }
                     );
                     const subjectTpl = template.subject || template.title || 'Message';
-                    const htmlTpl = template.html || template.bodyHtml || template.body || '';
-                    const plainTpl = template.plainText || template.text || '';
+                    const plainTpl = template.plainText || template.text || template.html || template.bodyHtml || template.body || '';
 
                     const subject = renderTemplateString(subjectTpl, ctx);
-                    const html = renderTemplateString(htmlTpl, ctx);
                     const plainText = renderTemplateString(plainTpl, ctx);
 
                     const perRecipientAttachments = [...attachments];
@@ -2548,8 +2609,7 @@ app.http('send-email', {
                         senderAddress,
                         content: {
                             subject,
-                            ...(plainText ? { plainText } : {}),
-                            ...(html ? { html } : {})
+                            ...(plainText ? { plainText } : {})
                         },
                         recipients: {
                             to: [{ address: email, displayName: displayName || undefined }]
