@@ -905,6 +905,8 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
         crcName: resolvedCrcName,
         crcFirstName: crcFirstName,
         crcLastName: crcLastName,
+        allSitesInfo: buildAllSitesInfo(sites),
+        allStudiesInfo: buildAllStudiesInfo(studies),
         rangeStart: start,
         rangeEnd: end,
         scheduleText,
