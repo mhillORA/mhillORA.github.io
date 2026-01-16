@@ -738,7 +738,33 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
         ? `<ul>${travelEntries.map(t => `<li>${htmlEscape(t.date)} • ${htmlEscape(t.route || t.type)}</li>`).join('')}</ul>`
         : `<p>No travel in range.</p>`;
 
+    // Parse CRC name into first and last name
+    const parseCrcName = (fullName) => {
+        if (!fullName || typeof fullName !== 'string') {
+            return { firstName: '', lastName: '', fullName: '' };
+        }
+        const trimmed = fullName.trim();
+        if (!trimmed) {
+            return { firstName: '', lastName: '', fullName: '' };
+        }
+        const parts = trimmed.split(/\s+/).filter(Boolean);
+        if (parts.length === 0) {
+            return { firstName: '', lastName: '', fullName: trimmed };
+        }
+        if (parts.length === 1) {
+            return { firstName: parts[0], lastName: '', fullName: trimmed };
+        }
+        // First name is first part, last name is everything else joined
+        const firstName = parts[0];
+        const lastName = parts.slice(1).join(' ');
+        return { firstName, lastName, fullName: trimmed };
+    };
+
     const resolvedCrcName = (crc && crc.name) ? crc.name : '';
+    const nameParts = parseCrcName(resolvedCrcName);
+    const crcFirstName = nameParts.firstName;
+    const crcLastName = nameParts.lastName;
+    
     const totals = {
         shiftCount: shifts.length,
         timeOffRequestCount: timeOffRequestEntries.length,
@@ -746,17 +772,78 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
         travelCount: travelEntries.length
     };
 
+    // Build deduplicated sites and studies arrays for direct template access
+    const sitesMap = new Map();
+    const studiesMap = new Map();
+    
+    shifts.forEach(s => {
+        // Collect unique sites
+        if (s.siteId && s.site) {
+            if (!sitesMap.has(s.siteId)) {
+                const site = s.site;
+                const siteStudies = new Set();
+                shifts.forEach(sh => {
+                    if (sh.siteId === s.siteId && sh.studies) {
+                        sh.studies.forEach(study => siteStudies.add(study));
+                    }
+                });
+                
+                sitesMap.set(s.siteId, {
+                    id: s.siteId,
+                    name: s.siteName || site.name || s.siteId,
+                    location: s.siteLocation || site.location || '',
+                    address1: site.address1 || '',
+                    address2: site.address2 || '',
+                    city: site.city || '',
+                    state: site.state || '',
+                    zipCode: site.zipCode || site.zip || '',
+                    country: site.country || '',
+                    phoneNumber: site.phoneNumber || site.phone || '',
+                    pi: site.pi || site.principalInvestigator || '',
+                    piEmail: site.piEmail || '',
+                    siteCoordinator: site.siteCoordinator || '',
+                    siteCoordinatorEmail: site.siteCoordinatorEmail || '',
+                    studies: Array.from(siteStudies)
+                });
+            }
+        }
+        
+        // Collect unique studies
+        if (s.studies && s.studyDetails) {
+            s.studies.forEach((studyName, idx) => {
+                if (!studiesMap.has(studyName)) {
+                    const studyDetail = s.studyDetails[idx] || {};
+                    studiesMap.set(studyName, {
+                        name: studyName,
+                        title: studyDetail.title || studyDetail.name || studyName,
+                        protocolNumber: studyDetail.protocolNumber || '',
+                        phase: studyDetail.phase || '',
+                        status: studyDetail.status || studyDetail.state || '',
+                        id: studyDetail.id || ''
+                    });
+                }
+            });
+        }
+    });
+    
+    const sites = Array.from(sitesMap.values());
+    const studies = Array.from(studiesMap.values());
+
     return {
         recipient: recipient || {},
         user: user || {},
-        crc: crc || { id: crcId || null, name: resolvedCrcName },
+        crc: crc || { id: crcId || null, name: resolvedCrcName, firstName: crcFirstName, lastName: crcLastName },
         range: { start, end },
         schedule: { shifts, text: scheduleText, html: scheduleHtml },
         timeOff: { requests: timeOffRequestEntries, events: timeOffEvents, text: timeOffText, html: timeOffHtml },
         travel: { records: travelEntries, text: travelText, html: travelHtml },
+        sites,
+        studies,
         totals,
         // Shorthand vars for "simple stupid" templates
         crcName: resolvedCrcName,
+        crcFirstName: crcFirstName,
+        crcLastName: crcLastName,
         rangeStart: start,
         rangeEnd: end,
         scheduleText,
