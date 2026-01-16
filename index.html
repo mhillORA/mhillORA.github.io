@@ -28771,12 +28771,14 @@
                                     // Check if user can delete this request
                                     const loggedInCrcId = getLoggedInCrcId();
                                     const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                                    const isAdmin = state.currentUser && state.currentUser.permissionLevel === 'Admin';
                                     const isOwnRequest = state.currentUser && (
                                         (loggedInCrcId && (request.crcId === loggedInCrcId || request.requestedBy === loggedInCrcId)) ||
                                         request.requestedBy === state.currentUser.id ||
                                         request.crcId === state.currentUser.id
                                     );
-                                    const canDelete = !isSupervisor && isOwnRequest && (statusKey === 'pending' || statusKey === 'approved');
+                                    // Admin can delete any request (except rejected), CRC users can delete their own pending/approved, supervisors cannot delete
+                                    const canDelete = isAdmin ? (statusKey !== 'rejected') : (!isSupervisor && isOwnRequest && (statusKey === 'pending' || statusKey === 'approved'));
                                     
                                     const modalHTML = `
                                         <div class="space-y-4">
@@ -28852,12 +28854,20 @@
                                 return;
                             }
                             
-                            // Permission check: CRC users can only delete their own pending requests
+                            // Permission check
                             const statusKey = normalizeTimeOffStatus(request.status);
                             const loggedInCrcId = getLoggedInCrcId();
                             const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                            const isAdmin = state.currentUser && state.currentUser.permissionLevel === 'Admin';
+                            const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
                             
-                            if (isCrcUser) {
+                            // Admin can delete any request (except rejected)
+                            if (isAdmin) {
+                                if (statusKey === 'rejected') {
+                                    showNotification('You cannot delete rejected time off requests.', 'error');
+                                    return;
+                                }
+                            } else if (isCrcUser) {
                                 // CRCs can delete both pending and approved PTO requests (but not rejected)
                                 if (statusKey === 'rejected') {
                                     showNotification('You cannot delete rejected time off requests.', 'error');
@@ -28876,6 +28886,9 @@
                                     showNotification('You can only delete your own time off requests.', 'error');
                                     return;
                                 }
+                            } else if (isSupervisor) {
+                                showNotification('Supervisors cannot delete time off requests.', 'error');
+                                return;
                             }
                             
                             // Confirm deletion
@@ -31081,7 +31094,31 @@
                                 // If no overrides were collected but there are existing ones, preserve them
                                 const finalRoleQuantityOverrides = isTravelDay ? undefined : (Object.keys(roleQuantityOverrides).length > 0 ? roleQuantityOverrides : (existingEvent?.roleQuantityOverrides && Object.keys(existingEvent.roleQuantityOverrides).length > 0 ? existingEvent.roleQuantityOverrides : undefined));
                                 
-                                const baseEventData = {
+                                // When editing, start with existing event data to preserve all fields
+                                // Then merge in form data to update only what changed
+                                const baseEventData = isEditing && existingEvent ? {
+                                    // Preserve all existing fields first
+                                    ...existingEvent,
+                                    // Then override with form data
+                                    siteId: data.siteId || existingEvent.siteId || null,
+                                    studyIds: studyIds.length > 0 ? studyIds : (existingEvent.studyIds || []),
+                                    hours: parseFloat(data.hours) || existingEvent.hours || state.settings[data.eventType] || 8,
+                                    notes: data.notes !== undefined ? data.notes : (existingEvent.notes || ''),
+                                    period: data.period || existingEvent.period || null,
+                                    visitNumber: (data.visitNumber && data.visitNumber !== 'default') ? data.visitNumber : (data.visitNumberText || existingEvent.visitNumber || null),
+                                    principalInvestigator: data.principalInvestigator !== undefined ? data.principalInvestigator : (existingEvent.principalInvestigator || null),
+                                    mileage: data.mileage !== undefined ? (data.mileage ? parseFloat(data.mileage) : null) : (existingEvent.mileage || null),
+                                    numberOfPatients: data.numberOfPatients !== undefined ? (data.numberOfPatients ? parseInt(data.numberOfPatients) : null) : (existingEvent.numberOfPatients || null),
+                                    isOverridden: confirmedOverride !== undefined ? confirmedOverride : (existingEvent.isOverridden || false),
+                                    roleAssignments: Object.keys(finalRoleAssignments).length > 0 ? finalRoleAssignments : (existingEvent.roleAssignments || {}),
+                                    trainingAssignments: Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : (existingEvent.trainingAssignments || undefined),
+                                    trainingModes: Object.keys(finalTrainingModes || {}).length > 0 ? finalTrainingModes : (existingEvent.trainingModes || undefined),
+                                    roleQuantityOverrides: finalRoleQuantityOverrides || existingEvent.roleQuantityOverrides || undefined,
+                                    groupNumber: groupNumberValue !== null ? groupNumberValue : (existingEvent.groupNumber || null),
+                                    // Preserve travelDayPreferences if they exist
+                                    travelDayPreferences: existingEvent.travelDayPreferences || undefined,
+                                } : {
+                                    // For new events, create from scratch
                                     siteId: data.siteId || null,
                                     studyIds: studyIds,
                                     hours: parseFloat(data.hours) || state.settings[data.eventType] || 8,
@@ -31091,7 +31128,7 @@
                                     principalInvestigator: data.principalInvestigator || null,
                                     mileage: data.mileage ? parseFloat(data.mileage) : null,
                                     numberOfPatients: data.numberOfPatients ? parseInt(data.numberOfPatients) : null,
-                                    isOverridden: confirmedOverride !== undefined ? confirmedOverride : (existingEvent?.isOverridden || false),
+                                    isOverridden: confirmedOverride !== undefined ? confirmedOverride : false,
                                     roleAssignments: finalRoleAssignments,
                                     trainingAssignments: finalTrainingAssignments,
                                     trainingModes: finalTrainingModes,
@@ -31527,9 +31564,14 @@
                                             };
                                         }
                                         
+                                        // CRITICAL: When editing, we MUST preserve the original shift
+                                        // This updatePayload will UPDATE the existing shift, NOT delete it
+                                        // Travel days will be created as SEPARATE events below
                                         const updatePayload = {
                                             ...baseEventData,
-                                            type: data.eventType,
+                                            // CRITICAL: Preserve the event ID and type to ensure it's an UPDATE, not a delete
+                                            id: eventId, // Explicitly preserve the ID
+                                            type: data.eventType, // Preserve the shift type (Site Assignment)
                                             crcId: isTravelDayEdit ? (existingEvent?.crcId || travelDayCrcId) : null, // For Travel Day, preserve crcId; for others use roleAssignments
                                             roles: [], // Legacy field - use roleAssignments instead
                                             roleAssignments: finalRoleAssignments, // Ensure roleAssignments are included in update
@@ -31541,31 +31583,47 @@
                                             endDate: toDateOnlyString(endDateObj),
                                             travelDayPreferences: Object.keys(travelDayPreferences).length > 0 ? travelDayPreferences : undefined
                                         };
+                                        
+                                        // CRITICAL: This UPDATE preserves the existing shift - it does NOT delete it
+                                        // The shift will remain on the schedule with all its data intact
+                                        console.log('UPDATING existing shift (preserving it):', eventId, updatePayload.type);
                                         const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
                                         
-                                        // Update the event in state with the response from the server
+                                        // CRITICAL: Update the shift in state - this PRESERVES the shift on the schedule
+                                        // The shift is NOT deleted - it's updated with new data (including travel preferences)
                                         if (updatedEvent && updatedEvent.id) {
                                             const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
                                             if (eventIndex >= 0) {
-                                                // Fully replace the event with server response to ensure all updates are reflected
+                                                // CRITICAL: Replace the event in place - this preserves it, doesn't delete it
+                                                console.log('PRESERVING shift in state at index:', eventIndex, 'Event ID:', updatedEvent.id);
                                                 state.crc_events[eventIndex] = updatedEvent;
                                             } else {
+                                                // If not found, add it (shouldn't happen, but safe fallback)
+                                                console.warn('Shift not found in state, adding it:', updatedEvent.id);
                                                 state.crc_events.push(updatedEvent);
                                             }
                                             // Force a refresh of the UI to show the updated data
                                             setState({ crc_events: [...state.crc_events] }, { skipRender: false });
                                             // Refresh the view to show updated data immediately
                                             renderContent();
+                                        } else {
+                                            console.error('CRITICAL ERROR: Shift update failed - updatedEvent is missing or has no ID!', updatedEvent);
+                                            showNotification('Error: Failed to update shift. The shift may not have been saved correctly.', 'error');
                                         }
                                         
+                                        // CRITICAL: The shift has been UPDATED above and is preserved on the schedule
+                                        // Now we ADD travel days as SEPARATE events - they do NOT replace the shift
                                         // Handle travel day creation for edited events (only for Site Assignment)
-                                        console.log('Travel day creation check:', {
+                                        console.log('Travel day creation check (shift is preserved):', {
                                             eventType: data.eventType,
                                             hasUpdatedEvent: !!updatedEvent,
-                                            updatedEventRoleAssignments: updatedEvent?.roleAssignments
+                                            updatedEventId: updatedEvent?.id,
+                                            updatedEventRoleAssignments: updatedEvent?.roleAssignments,
+                                            note: 'The shift above has been UPDATED and preserved. Travel days will be ADDED as separate events.'
                                         });
                                         
                                         if (data.eventType === 'Site Assignment' && updatedEvent) {
+                                            // CRITICAL: Travel days are ADDED as new events - the original shift remains intact
                                             // Collect all assigned CRCs from roleAssignments
                                             const assignedCrcsForTravel = new Set();
                                             if (updatedEvent.roleAssignments) {
@@ -31771,14 +31829,22 @@
                                                         const isLinkedToThisShift = !!linkedTravelDay;
                                                         
                                                         if (!existingTravelDay) {
-                                                            console.log('CREATING START TRAVEL DAY for', crcId, 'on', startTravelDateStr);
+                                                            // CRITICAL: Each person gets their OWN individual travel day
+                                                            // Ensure crcId is properly set - this creates a separate travel day for this specific CRC
+                                                            if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
+                                                                console.warn('Skipping travel day creation - invalid crcId:', crcId);
+                                                                continue; // Skip this iteration if crcId is invalid
+                                                            }
+                                                            
+                                                            console.log('CREATING START TRAVEL DAY for', crcId, 'on', startTravelDateStr, '- This is an INDIVIDUAL travel day for this CRC');
                                                             const matchingFlight = findFlightWithinBusinessDay(crcId, eventStartDate, true);
                                                             const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                             
+                                                            // CRITICAL: Each travel day is created with a specific crcId - this ensures each person has their own block
                                                             const startTravelEventData = { 
                                                                 // Travel days inherit study/site from parent shift for proper grid display
                                                                 name: 'Travel Day', 
-                                                                crcId, 
+                                                                crcId: crcId, // CRITICAL: Explicitly set crcId to ensure this travel day is assigned to this specific CRC
                                                                 roles: [], 
                                                                 date: startTravelDateStr, 
                                                                 groupId: eventGroupId, 
@@ -31789,7 +31855,7 @@
                                                                 // Inherit study/site from parent event for grid display
                                                                 studyIds: updatedEvent.studyIds || [],
                                                                 siteId: updatedEvent.siteId || null,
-                                                                roleAssignments: {}
+                                                                roleAssignments: {} // Travel days don't have role assignments - they're assigned to a specific CRC
                                                             };
                                                             
                                                             if (matchingFlight) {
@@ -31820,15 +31886,22 @@
                                                             const matchingFlight = findFlightWithinBusinessDay(crcId, eventStartDate, true);
                                                             const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                             
+                                                            // CRITICAL: When updating, ensure crcId is explicitly set for this individual travel day
+                                                            if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
+                                                                console.warn('Skipping travel day update - invalid crcId:', crcId);
+                                                                continue; // Skip this iteration if crcId is invalid
+                                                            }
+                                                            
                                                             const updateData = {
                                                                 name: 'Travel Day',
                                                                 type: 'Travel Day',
-                                                                crcId: crcId, // Ensure CRC ID is preserved
+                                                                crcId: crcId, // CRITICAL: Explicitly preserve CRC ID - this ensures the travel day is assigned to this specific CRC
                                                                 date: startTravelDateStr,
                                                                 studyIds: updatedEvent.studyIds || [],
                                                                 siteId: updatedEvent.siteId || null,
                                                                 hours: travelHours,
-                                                                groupId: eventGroupId
+                                                                groupId: eventGroupId,
+                                                                roleAssignments: {} // Travel days don't have role assignments
                                                             };
                                                             
                                                             if (matchingFlight) {
@@ -31915,14 +31988,22 @@
                                                         const isLinkedToThisShift = !!linkedTravelDay;
                                                         
                                                         if (!existingTravelDay) {
-                                                            console.log('CREATING END TRAVEL DAY for', crcId, 'on', endTravelDateStr);
+                                                            // CRITICAL: Each person gets their OWN individual travel day
+                                                            // Ensure crcId is properly set - this creates a separate travel day for this specific CRC
+                                                            if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
+                                                                console.warn('Skipping travel day creation - invalid crcId:', crcId);
+                                                                continue; // Skip this iteration if crcId is invalid
+                                                            }
+                                                            
+                                                            console.log('CREATING END TRAVEL DAY for', crcId, 'on', endTravelDateStr, '- This is an INDIVIDUAL travel day for this CRC');
                                                             const matchingFlight = findFlightWithinBusinessDay(crcId, eventEndDate, false);
                                                             const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                             
+                                                            // CRITICAL: Each travel day is created with a specific crcId - this ensures each person has their own block
                                                             const endTravelEventData = { 
                                                                 // Travel days inherit study/site from parent shift for proper grid display
                                                                 name: 'Travel Day', 
-                                                                crcId, 
+                                                                crcId: crcId, // CRITICAL: Explicitly set crcId to ensure this travel day is assigned to this specific CRC
                                                                 roles: [], 
                                                                 date: endTravelDateStr, 
                                                                 groupId: eventGroupId, 
@@ -31933,7 +32014,7 @@
                                                                 // Inherit study/site from parent event for grid display
                                                                 studyIds: updatedEvent.studyIds || [],
                                                                 siteId: updatedEvent.siteId || null,
-                                                                roleAssignments: {}
+                                                                roleAssignments: {} // Travel days don't have role assignments - they're assigned to a specific CRC
                                                             };
                                                             
                                                             if (matchingFlight) {
@@ -31959,20 +32040,27 @@
                                                                 console.error('Error creating end travel day:', error);
                                                             }
                                                         } else if (isLinkedToThisShift) {
+                                                            // CRITICAL: When updating, ensure crcId is explicitly set for this individual travel day
+                                                            if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
+                                                                console.warn('Skipping travel day update - invalid crcId:', crcId);
+                                                                continue; // Skip this iteration if crcId is invalid
+                                                            }
+                                                            
                                                             // Update existing travel day linked to this shift
-                                                            console.log('UPDATING existing end travel day:', existingTravelDay.id);
+                                                            console.log('UPDATING existing end travel day:', existingTravelDay.id, 'for CRC:', crcId);
                                                             const matchingFlight = findFlightWithinBusinessDay(crcId, eventEndDate, false);
                                                             const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
                                                             
                                                             const updateData = {
                                                                 name: 'Travel Day',
                                                                 type: 'Travel Day',
-                                                                crcId: crcId, // Ensure CRC ID is preserved
+                                                                crcId: crcId, // CRITICAL: Explicitly preserve CRC ID - this ensures the travel day is assigned to this specific CRC
                                                                 date: endTravelDateStr,
                                                                 studyIds: updatedEvent.studyIds || [],
                                                                 siteId: updatedEvent.siteId || null,
                                                                 hours: travelHours,
-                                                                groupId: eventGroupId
+                                                                groupId: eventGroupId,
+                                                                roleAssignments: {} // Travel days don't have role assignments
                                                             };
                                                             
                                                             if (matchingFlight) {
@@ -34567,9 +34655,22 @@
                 const period = periodSelect ? periodSelect.value : 'Full Day';
                 
                 if (!studySelect || !siteSelect || !roleAssignmentContainer) {
-                    console.log('Missing elements, returning early');
+                    console.log('Missing elements, returning early', { studySelect: !!studySelect, siteSelect: !!siteSelect, roleAssignmentContainer: !!roleAssignmentContainer });
                     return;
                 }
+                
+                // CRITICAL: Check if visit is selected - if so, we should render roles immediately
+                // Visit selection is independent of travel - roles should display as soon as visit is selected
+                const visitSelectCheck = form.querySelector('select[name="visitNumber"]') || document.getElementById('visitNumberSelect');
+                const visitNumberCheck = visitSelectCheck ? visitSelectCheck.value : null;
+                const hasVisitSelectedCheck = visitNumberCheck && visitNumberCheck !== '' && visitNumberCheck !== 'Select Visit';
+                console.log('=== handleShiftStudySiteSelection called ===', {
+                    hasVisitSelected: hasVisitSelectedCheck,
+                    visitNumber: visitNumberCheck,
+                    selectedStudyIds: Array.from(studySelect.selectedOptions).map(o => o.value),
+                    selectedSiteId: siteSelect.value,
+                    note: 'If visit is selected, roles should render immediately - this is independent of travel selection'
+                });
                 
                 // Check if we're editing an existing event
                 const isEditing = form && form.dataset.eventId;
@@ -35075,9 +35176,14 @@
                                 refreshedVisitSelect.value = currentSelectedValue;
                             }
                             refreshedVisitSelect.addEventListener('change', (e) => {
-                                // Update role quantities when visit changes
+                                // CRITICAL: When visit is selected, immediately trigger role rendering
+                                // This is independent of travel selection - roles should display right away
                                 console.log('Visit number changed to:', refreshedVisitSelect.value);
-                                handleShiftStudySiteSelection();
+                                console.log('Immediately triggering role rendering - visit selection is independent of travel');
+                                // Use setTimeout to ensure DOM is ready, but make it immediate
+                                setTimeout(() => {
+                                    handleShiftStudySiteSelection();
+                                }, 0);
                             });
                         }
                     } else {
@@ -35420,9 +35526,11 @@
 
                     // If we have requiredRoles with quantities > 0, skip the fallback and go directly to role rendering
                     if (requiredRoles.size > 0 && !allQuantitiesZero) {
-                        // Skip the fallback section and continue to role rendering code below (line ~35760)
+                        // Skip the fallback section and continue to role rendering code below
                         console.log('Skipping fallback - we have requiredRoles, will render them directly');
+                        console.log('Required roles to render:', Array.from(requiredRoles.entries()));
                         // Don't enter the else block - continue to role rendering
+                        // Explicitly break out of any potential early returns by ensuring we reach role rendering
                     } else {
                         // No specific roles found - show all available roles for manual assignment
                         console.log('No specific roles found, showing all available roles for manual assignment');
@@ -35897,6 +36005,9 @@
                 }
                 
                 // Generate role assignment interface
+                console.log('=== ROLE RENDERING START ===');
+                console.log('Required roles size:', requiredRoles.size);
+                console.log('Required roles entries:', Array.from(requiredRoles.entries()));
                 let roleAssignmentHTML = '<div class="space-y-4">';
                 console.log('Generating role assignment interface for', requiredRoles.size, 'roles');
                 
@@ -39817,6 +39928,8 @@
                                                     ${(() => {
                                                         // Check if user can edit/delete this request
                                                         // CRC users can edit pending requests and delete their own pending/approved requests
+                                                        const isAdmin = state.currentUser && state.currentUser.permissionLevel === 'Admin';
+                                                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
                                                         const isOwnRequest = state.currentUser && (
                                                             (isCrcUser && loggedInCrcId && (request.crcId === loggedInCrcId || request.requestedBy === loggedInCrcId)) ||
                                                             request.requestedBy === state.currentUser.id ||
@@ -39826,8 +39939,9 @@
                                                         // Legacy items are display-only; no actions.
                                                         if (request.legacyEventId) return '';
                                                         
-                                                        const canEdit = statusKey === 'pending' && isOwnRequest;
-                                                        const canDelete = isOwnRequest && (statusKey === 'pending' || statusKey === 'approved');
+                                                        const canEdit = statusKey === 'pending' && isOwnRequest && !isSupervisor;
+                                                        // Admin can delete any request (except rejected), CRC users can delete their own pending/approved, supervisors cannot delete
+                                                        const canDelete = isAdmin ? (statusKey !== 'rejected') : (!isSupervisor && isOwnRequest && (statusKey === 'pending' || statusKey === 'approved'));
                                                         
                                                         if (canEdit || canDelete) {
                                                             return `
