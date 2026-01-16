@@ -29947,11 +29947,15 @@
                         break;
                     }
                     case 'prev-crc-dashboard-month': 
-                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() - 1)) }); 
+                        const prevDate = new Date(state.crcCalendarDate || new Date());
+                        prevDate.setMonth(prevDate.getMonth() - 1);
+                        setState({ crcCalendarDate: prevDate }); 
                         renderCRCDashboardCalendar();
                         break;
                     case 'next-crc-dashboard-month': 
-                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() + 1)) }); 
+                        const nextDate = new Date(state.crcCalendarDate || new Date());
+                        nextDate.setMonth(nextDate.getMonth() + 1);
+                        setState({ crcCalendarDate: nextDate }); 
                         renderCRCDashboardCalendar();
                         break;
                     case 'today-crc-dashboard': 
@@ -31849,6 +31853,11 @@
                                                 updatedEvent.travelDayPreferences = {};
                                             }
                                             
+                                            // Group CRCs by travel date to create shared travel days
+                                            // Map: dateStr -> { start: Set of crcIds, end: Set of crcIds }
+                                            const travelDaysByDate = new Map();
+                                            
+                                            // First pass: collect all travel preferences and group by date
                                             for (const crcId of assignedCrcsForTravel) {
                                                 // Check per-CRC travel checkboxes
                                                 // Check both in form and in travel-selection-container (in case checkboxes are nested)
@@ -31917,347 +31926,257 @@
                                                     endTravelDate: endTravelDateStr
                                                 };
                                                 
-                                                // Create start travel day if checkbox is checked
-                                                console.log('Start travel checkbox status:', { crcId, includeStartTravelForCrc, eventStartDate });
-                                                if (includeStartTravelForCrc) {
-                                                    let startTravelDateStr = '';
-                                                    if (startTravelDateInput && startTravelDateInput.value) {
-                                                        // Use custom date from input (allows same-day travel)
-                                                        startTravelDateStr = startTravelDateInput.value;
-                                                    } else if (eventStartDate) {
-                                                        // Default to same day as shift (allows same-day travel)
-                                                        const startDateObj = parseDateOnly(eventStartDate);
-                                                        if (startDateObj) {
-                                                            startTravelDateStr = toDateOnlyString(startDateObj);
-                                                        }
+                                                // Group by date for shared travel days
+                                                if (includeStartTravelForCrc && startTravelDateStr) {
+                                                    if (!travelDaysByDate.has(startTravelDateStr)) {
+                                                        travelDaysByDate.set(startTravelDateStr, { start: new Set(), end: new Set() });
+                                                    }
+                                                    travelDaysByDate.get(startTravelDateStr).start.add(crcId);
+                                                }
+                                                
+                                                if (includeEndTravelForCrc && endTravelDateStr) {
+                                                    if (!travelDaysByDate.has(endTravelDateStr)) {
+                                                        travelDaysByDate.set(endTravelDateStr, { start: new Set(), end: new Set() });
+                                                    }
+                                                    travelDaysByDate.get(endTravelDateStr).end.add(crcId);
+                                                }
+                                            }
+                                            
+                                            // Second pass: create/update travel days grouped by date
+                                            for (const [travelDateStr, { start: startCrcIds, end: endCrcIds }] of travelDaysByDate.entries()) {
+                                                // Handle start travel days
+                                                if (startCrcIds.size > 0) {
+                                                    const crcIdsArray = Array.from(startCrcIds);
+                                                    console.log('Creating/updating START travel day for date:', travelDateStr, 'with CRCs:', crcIdsArray);
+                                                    
+                                                    // Find existing travel day for this date and groupId (start travel)
+                                                    const existingStartTravelDay = state.crc_events.find(e => 
+                                                        e.type === 'Travel Day' && 
+                                                        e.groupId === eventGroupId &&
+                                                        e.date === travelDateStr &&
+                                                        // Check if it's a start travel day (not end) - we can distinguish by checking if it has end CRCs
+                                                        (!e.crcIds || !e.crcIds.some(id => endCrcIds.has(id)))
+                                                    );
+                                                    
+                                                    // Calculate average travel hours from all CRCs (or use first CRC's flight)
+                                                    let travelHours = 8; // default
+                                                    const firstCrcId = crcIdsArray[0];
+                                                    const matchingFlight = findFlightWithinBusinessDay(firstCrcId, eventStartDate, true);
+                                                    if (matchingFlight) {
+                                                        travelHours = matchingFlight.flightDuration || matchingFlight.hours || 8;
                                                     }
                                                     
-                                                    console.log('Start travel date calculated:', startTravelDateStr);
-                                                    
-                                                    if (startTravelDateStr) {
+                                                    if (!existingStartTravelDay) {
+                                                        // Create new shared travel day
+                                                        const startTravelEventData = { 
+                                                            name: 'Travel Day', 
+                                                            crcId: firstCrcId, // Keep for backward compatibility
+                                                            crcIds: crcIdsArray, // NEW: Array of all CRCs on this travel day
+                                                            roles: [], 
+                                                            date: travelDateStr, 
+                                                            groupId: eventGroupId, 
+                                                            type: 'Travel Day',
+                                                            hours: travelHours,
+                                                            notes: '',
+                                                            period: null,
+                                                            studyIds: updatedEvent.studyIds || [],
+                                                            siteId: updatedEvent.siteId || null,
+                                                            roleAssignments: {} // Travel days don't have role assignments
+                                                        };
                                                         
-                                                        // First, find travel day linked to this shift (by groupId) - this is the one we should update
-                                                        const linkedTravelDay = state.crc_events.find(e => 
-                                                            e.type === 'Travel Day' && 
-                                                            e.crcId === crcId && 
-                                                            e.groupId === eventGroupId &&
-                                                            e.date !== endTravelDateStr // Make sure it's not the end travel day
-                                                        );
-                                                        
-                                                        // Also check if a travel day already exists on the target date (for duplicate prevention)
-                                                        const existingTravelDayOnDate = state.crc_events.find(e => 
-                                                            e.type === 'Travel Day' && 
-                                                            e.crcId === crcId && 
-                                                            e.date === startTravelDateStr &&
-                                                            e.id !== linkedTravelDay?.id // Exclude the linked one if it exists
-                                                        );
-                                                        
-                                                        console.log('Start travel day check:', { 
-                                                            linkedTravelDay: linkedTravelDay ? { id: linkedTravelDay.id, date: linkedTravelDay.date } : null,
-                                                            existingTravelDayOnDate: existingTravelDayOnDate ? { id: existingTravelDayOnDate.id, date: existingTravelDayOnDate.date } : null,
-                                                            targetDate: startTravelDateStr,
-                                                            crcId
-                                                        });
-                                                        
-                                                        // If there's already a travel day on the target date (not linked to this shift), skip
-                                                        if (existingTravelDayOnDate && existingTravelDayOnDate.groupId !== eventGroupId) {
-                                                            console.log('SKIPPING - travel day already exists on target date for different shift:', existingTravelDayOnDate.id);
-                                                        } else {
-                                                        
-                                                        // Use the linked travel day if it exists, otherwise use the one on the target date
-                                                        const existingTravelDay = linkedTravelDay || existingTravelDayOnDate;
-                                                        const isLinkedToThisShift = !!linkedTravelDay;
-                                                        
-                                                        if (!existingTravelDay) {
-                                                            // CRITICAL: Each person gets their OWN individual travel day
-                                                            // Ensure crcId is properly set - this creates a separate travel day for this specific CRC
-                                                            if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
-                                                                console.warn('Skipping travel day creation - invalid crcId:', crcId);
-                                                                continue; // Skip this iteration if crcId is invalid
-                                                            }
-                                                            
-                                                            console.log('CREATING START TRAVEL DAY for', crcId, 'on', startTravelDateStr, '- This is an INDIVIDUAL travel day for this CRC');
-                                                            const matchingFlight = findFlightWithinBusinessDay(crcId, eventStartDate, true);
-                                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
-                                                            
-                                                            // CRITICAL: Each travel day is created with a specific crcId - this ensures each person has their own block
-                                                            const startTravelEventData = { 
-                                                                // Travel days inherit study/site from parent shift for proper grid display
-                                                                name: 'Travel Day', 
-                                                                crcId: crcId, // CRITICAL: Explicitly set crcId to ensure this travel day is assigned to this specific CRC
-                                                                roles: [], 
-                                                                date: startTravelDateStr, 
-                                                                groupId: eventGroupId, 
-                                                                type: 'Travel Day',
-                                                                hours: travelHours,
-                                                                notes: '',
-                                                                period: null,
-                                                                // Inherit study/site from parent event for grid display
-                                                                studyIds: updatedEvent.studyIds || [],
-                                                                siteId: updatedEvent.siteId || null,
-                                                                roleAssignments: {} // Travel days don't have role assignments - they're assigned to a specific CRC
-                                                            };
-                                                            
-                                                            if (matchingFlight) {
-                                                                if (matchingFlight.flightNumber) startTravelEventData.flightNumber = matchingFlight.flightNumber;
-                                                                if (matchingFlight.airline) startTravelEventData.airline = matchingFlight.airline;
-                                                                if (matchingFlight.origin) startTravelEventData.origin = matchingFlight.origin;
-                                                                if (matchingFlight.destination) startTravelEventData.destination = matchingFlight.destination;
-                                                                if (matchingFlight.departureTime) startTravelEventData.departureTime = matchingFlight.departureTime;
-                                                                if (matchingFlight.arrivalTime) startTravelEventData.arrivalTime = matchingFlight.arrivalTime;
-                                                                if (matchingFlight.confirmationNumber) startTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
-                                                                if (matchingFlight.bookingId) startTravelEventData.travelBookingId = matchingFlight.bookingId;
-                                                            }
-                                                            
-                                                            try {
-                                                                console.log('Creating start travel event with data:', startTravelEventData);
-                                                                const created = await apiService.createEvent(startTravelEventData);
-                                                                console.log('Start travel day created:', created);
-                                                                if (created && created.id) {
-                                                                    state.crc_events = [...state.crc_events, created];
-                                                                    console.log('Start travel day added to state');
-                                                                }
-                                                            } catch (error) {
-                                                                console.error('Error creating start travel day:', error);
-                                                            }
-                                                        } else if (isLinkedToThisShift) {
-                                                            // Update existing travel day linked to this shift
-                                                            console.log('UPDATING existing start travel day:', existingTravelDay.id);
-                                                            const matchingFlight = findFlightWithinBusinessDay(crcId, eventStartDate, true);
-                                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
-                                                            
-                                                            // CRITICAL: When updating, ensure crcId is explicitly set for this individual travel day
-                                                            if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
-                                                                console.warn('Skipping travel day update - invalid crcId:', crcId);
-                                                                continue; // Skip this iteration if crcId is invalid
-                                                            }
-                                                            
-                                                            // CRITICAL: Start with existing travel day data to preserve all fields
-                                                            // Then override only the fields that changed
-                                                            const updateData = {
-                                                                ...existingTravelDay, // Preserve all existing fields
-                                                                // CRITICAL: Explicitly include ID to ensure it's an UPDATE operation
-                                                                id: existingTravelDay.id,
-                                                                name: 'Travel Day',
-                                                                type: 'Travel Day',
-                                                                crcId: crcId, // CRITICAL: Explicitly preserve CRC ID - this ensures the travel day is assigned to this specific CRC
-                                                                date: startTravelDateStr,
-                                                                studyIds: updatedEvent.studyIds || existingTravelDay.studyIds || [],
-                                                                siteId: updatedEvent.siteId || existingTravelDay.siteId || null,
-                                                                hours: travelHours,
-                                                                groupId: eventGroupId,
-                                                                roleAssignments: {} // Travel days don't have role assignments
-                                                            };
-                                                            
-                                                            if (matchingFlight) {
-                                                                if (matchingFlight.flightNumber) updateData.flightNumber = matchingFlight.flightNumber;
-                                                                if (matchingFlight.airline) updateData.airline = matchingFlight.airline;
-                                                                if (matchingFlight.origin) updateData.origin = matchingFlight.origin;
-                                                                if (matchingFlight.destination) updateData.destination = matchingFlight.destination;
-                                                                if (matchingFlight.departureTime) updateData.departureTime = matchingFlight.departureTime;
-                                                                if (matchingFlight.arrivalTime) updateData.arrivalTime = matchingFlight.arrivalTime;
-                                                                if (matchingFlight.confirmationNumber) updateData.confirmationNumber = matchingFlight.confirmationNumber;
-                                                                if (matchingFlight.bookingId) updateData.travelBookingId = matchingFlight.bookingId;
-                                                            }
-                                                            
-                                                            try {
-                                                                console.log('Updating start travel day with data:', updateData);
-                                                                const updated = await apiService.updateEvent(existingTravelDay.id, updateData);
-                                                                console.log('Start travel day updated:', updated);
-                                                                if (updated && updated.id) {
-                                                                    const index = state.crc_events.findIndex(e => e.id === existingTravelDay.id);
-                                                                    if (index !== -1) {
-                                                                        state.crc_events[index] = updated;
-                                                                        console.log('Start travel day updated in state');
-                                                                    } else {
-                                                                        // If not found, add it
-                                                                        state.crc_events.push(updated);
-                                                                        console.log('Start travel day added to state (not found in update)');
-                                                                    }
-                                                                } else {
-                                                                    console.error('ERROR: Travel day update failed - no ID returned:', updated);
-                                                                    showNotification('Error updating travel day. Please check the console for details.', 'error');
-                                                                }
-                                                            } catch (error) {
-                                                                console.error('Error updating start travel day:', error);
-                                                                showNotification(`Error updating travel day: ${error.message || 'Unknown error'}`, 'error');
-                                                            }
-                                                        } else {
-                                                            console.log('SKIPPING start travel day - exists but not linked to this shift:', existingTravelDay.id);
+                                                        if (matchingFlight) {
+                                                            if (matchingFlight.flightNumber) startTravelEventData.flightNumber = matchingFlight.flightNumber;
+                                                            if (matchingFlight.airline) startTravelEventData.airline = matchingFlight.airline;
+                                                            if (matchingFlight.origin) startTravelEventData.origin = matchingFlight.origin;
+                                                            if (matchingFlight.destination) startTravelEventData.destination = matchingFlight.destination;
+                                                            if (matchingFlight.departureTime) startTravelEventData.departureTime = matchingFlight.departureTime;
+                                                            if (matchingFlight.arrivalTime) startTravelEventData.arrivalTime = matchingFlight.arrivalTime;
+                                                            if (matchingFlight.confirmationNumber) startTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                            if (matchingFlight.bookingId) startTravelEventData.travelBookingId = matchingFlight.bookingId;
                                                         }
-                                                        } // Close the else block for duplicate check
+                                                        
+                                                        try {
+                                                            console.log('Creating shared start travel day with data:', startTravelEventData);
+                                                            const created = await apiService.createEvent(startTravelEventData);
+                                                            console.log('Shared start travel day created:', created);
+                                                            if (created && created.id) {
+                                                                state.crc_events = [...state.crc_events, created];
+                                                                console.log('Shared start travel day added to state');
+                                                            }
+                                                        } catch (error) {
+                                                            console.error('Error creating shared start travel day:', error);
+                                                            showNotification(`Error creating travel day: ${error.message || 'Unknown error'}`, 'error');
+                                                        }
+                                                    } else {
+                                                        // Update existing travel day - add CRCs that aren't already in it
+                                                        const existingCrcIds = existingStartTravelDay.crcIds || (existingStartTravelDay.crcId ? [existingStartTravelDay.crcId] : []);
+                                                        const updatedCrcIds = Array.from(new Set([...existingCrcIds, ...crcIdsArray]));
+                                                        
+                                                        const updateData = {
+                                                            ...existingStartTravelDay,
+                                                            id: existingStartTravelDay.id,
+                                                            name: 'Travel Day',
+                                                            type: 'Travel Day',
+                                                            crcId: updatedCrcIds[0], // Keep first for backward compatibility
+                                                            crcIds: updatedCrcIds, // Update with all CRCs
+                                                            date: travelDateStr,
+                                                            studyIds: updatedEvent.studyIds || existingStartTravelDay.studyIds || [],
+                                                            siteId: updatedEvent.siteId || existingStartTravelDay.siteId || null,
+                                                            hours: travelHours,
+                                                            groupId: eventGroupId,
+                                                            roleAssignments: {}
+                                                        };
+                                                        
+                                                        if (matchingFlight) {
+                                                            if (matchingFlight.flightNumber) updateData.flightNumber = matchingFlight.flightNumber;
+                                                            if (matchingFlight.airline) updateData.airline = matchingFlight.airline;
+                                                            if (matchingFlight.origin) updateData.origin = matchingFlight.origin;
+                                                            if (matchingFlight.destination) updateData.destination = matchingFlight.destination;
+                                                            if (matchingFlight.departureTime) updateData.departureTime = matchingFlight.departureTime;
+                                                            if (matchingFlight.arrivalTime) updateData.arrivalTime = matchingFlight.arrivalTime;
+                                                            if (matchingFlight.confirmationNumber) updateData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                            if (matchingFlight.bookingId) updateData.travelBookingId = matchingFlight.bookingId;
+                                                        }
+                                                        
+                                                        try {
+                                                            console.log('Updating shared start travel day with data:', updateData);
+                                                            const updated = await apiService.updateEvent(existingStartTravelDay.id, updateData);
+                                                            console.log('Shared start travel day updated:', updated);
+                                                            if (updated && updated.id) {
+                                                                const index = state.crc_events.findIndex(e => e.id === existingStartTravelDay.id);
+                                                                if (index !== -1) {
+                                                                    state.crc_events[index] = updated;
+                                                                    console.log('Shared start travel day updated in state');
+                                                                } else {
+                                                                    state.crc_events.push(updated);
+                                                                    console.log('Shared start travel day added to state (not found in update)');
+                                                                }
+                                                            } else {
+                                                                console.error('ERROR: Travel day update failed - no ID returned:', updated);
+                                                                showNotification('Error updating travel day. Please check the console for details.', 'error');
+                                                            }
+                                                        } catch (error) {
+                                                            console.error('Error updating shared start travel day:', error);
+                                                            showNotification(`Error updating travel day: ${error.message || 'Unknown error'}`, 'error');
+                                                        }
                                                     }
                                                 }
                                                 
-                                                // Create end travel day if checkbox is checked
-                                                console.log('End travel checkbox status:', { crcId, includeEndTravelForCrc, eventEndDate });
-                                                if (includeEndTravelForCrc) {
-                                                    let endTravelDateStr = '';
-                                                    if (endTravelDateInput && endTravelDateInput.value) {
-                                                        // Use custom date from input (allows same-day travel)
-                                                        endTravelDateStr = endTravelDateInput.value;
-                                                    } else if (eventEndDate) {
-                                                        // Default to same day as shift (allows same-day travel)
-                                                        const endDateObj = parseDateOnly(eventEndDate);
-                                                        if (endDateObj) {
-                                                            endTravelDateStr = toDateOnlyString(endDateObj);
-                                                        }
+                                                // Handle end travel days
+                                                if (endCrcIds.size > 0) {
+                                                    const crcIdsArray = Array.from(endCrcIds);
+                                                    console.log('Creating/updating END travel day for date:', travelDateStr, 'with CRCs:', crcIdsArray);
+                                                    
+                                                    // Find existing travel day for this date and groupId (end travel)
+                                                    const existingEndTravelDay = state.crc_events.find(e => 
+                                                        e.type === 'Travel Day' && 
+                                                        e.groupId === eventGroupId &&
+                                                        e.date === travelDateStr &&
+                                                        // Check if it's an end travel day - we can distinguish by checking if it has start CRCs
+                                                        (!e.crcIds || !e.crcIds.some(id => startCrcIds.has(id)))
+                                                    );
+                                                    
+                                                    // Calculate average travel hours from all CRCs (or use first CRC's flight)
+                                                    let travelHours = 8; // default
+                                                    const firstCrcId = crcIdsArray[0];
+                                                    const matchingFlight = findFlightWithinBusinessDay(firstCrcId, eventEndDate, false);
+                                                    if (matchingFlight) {
+                                                        travelHours = matchingFlight.flightDuration || matchingFlight.hours || 8;
                                                     }
                                                     
-                                                    console.log('End travel date calculated:', endTravelDateStr);
-                                                    
-                                                    if (endTravelDateStr) {
+                                                    if (!existingEndTravelDay) {
+                                                        // Create new shared travel day
+                                                        const endTravelEventData = { 
+                                                            name: 'Travel Day', 
+                                                            crcId: firstCrcId, // Keep for backward compatibility
+                                                            crcIds: crcIdsArray, // NEW: Array of all CRCs on this travel day
+                                                            roles: [], 
+                                                            date: travelDateStr, 
+                                                            groupId: eventGroupId, 
+                                                            type: 'Travel Day',
+                                                            hours: travelHours,
+                                                            notes: '',
+                                                            period: null,
+                                                            studyIds: updatedEvent.studyIds || [],
+                                                            siteId: updatedEvent.siteId || null,
+                                                            roleAssignments: {} // Travel days don't have role assignments
+                                                        };
                                                         
-                                                        // First, find travel day linked to this shift (by groupId) - this is the one we should update
-                                                        const linkedTravelDay = state.crc_events.find(e => 
-                                                            e.type === 'Travel Day' && 
-                                                            e.crcId === crcId && 
-                                                            e.groupId === eventGroupId &&
-                                                            e.date !== startTravelDateStr // Make sure it's not the start travel day
-                                                        );
-                                                        
-                                                        // Also check if a travel day already exists on the target date (for duplicate prevention)
-                                                        const existingTravelDayOnDate = state.crc_events.find(e => 
-                                                            e.type === 'Travel Day' && 
-                                                            e.crcId === crcId && 
-                                                            e.date === endTravelDateStr &&
-                                                            e.id !== linkedTravelDay?.id // Exclude the linked one if it exists
-                                                        );
-                                                        
-                                                        console.log('End travel day check:', { 
-                                                            linkedTravelDay: linkedTravelDay ? { id: linkedTravelDay.id, date: linkedTravelDay.date } : null,
-                                                            existingTravelDayOnDate: existingTravelDayOnDate ? { id: existingTravelDayOnDate.id, date: existingTravelDayOnDate.date } : null,
-                                                            targetDate: endTravelDateStr,
-                                                            crcId
-                                                        });
-                                                        
-                                                        // If there's already a travel day on the target date (not linked to this shift), skip
-                                                        if (existingTravelDayOnDate && existingTravelDayOnDate.groupId !== eventGroupId) {
-                                                            console.log('SKIPPING - travel day already exists on target date for different shift:', existingTravelDayOnDate.id);
-                                                        } else {
-                                                        
-                                                        // Use the linked travel day if it exists, otherwise use the one on the target date
-                                                        const existingTravelDay = linkedTravelDay || existingTravelDayOnDate;
-                                                        const isLinkedToThisShift = !!linkedTravelDay;
-                                                        
-                                                        if (!existingTravelDay) {
-                                                            // CRITICAL: Each person gets their OWN individual travel day
-                                                            // Ensure crcId is properly set - this creates a separate travel day for this specific CRC
-                                                            if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
-                                                                console.warn('Skipping travel day creation - invalid crcId:', crcId);
-                                                                continue; // Skip this iteration if crcId is invalid
-                                                            }
-                                                            
-                                                            console.log('CREATING END TRAVEL DAY for', crcId, 'on', endTravelDateStr, '- This is an INDIVIDUAL travel day for this CRC');
-                                                            const matchingFlight = findFlightWithinBusinessDay(crcId, eventEndDate, false);
-                                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
-                                                            
-                                                            // CRITICAL: Each travel day is created with a specific crcId - this ensures each person has their own block
-                                                            const endTravelEventData = { 
-                                                                // Travel days inherit study/site from parent shift for proper grid display
-                                                                name: 'Travel Day', 
-                                                                crcId: crcId, // CRITICAL: Explicitly set crcId to ensure this travel day is assigned to this specific CRC
-                                                                roles: [], 
-                                                                date: endTravelDateStr, 
-                                                                groupId: eventGroupId, 
-                                                                type: 'Travel Day',
-                                                                hours: travelHours,
-                                                                notes: '',
-                                                                period: null,
-                                                                // Inherit study/site from parent event for grid display
-                                                                studyIds: updatedEvent.studyIds || [],
-                                                                siteId: updatedEvent.siteId || null,
-                                                                roleAssignments: {} // Travel days don't have role assignments - they're assigned to a specific CRC
-                                                            };
-                                                            
-                                                            if (matchingFlight) {
-                                                                if (matchingFlight.flightNumber) endTravelEventData.flightNumber = matchingFlight.flightNumber;
-                                                                if (matchingFlight.airline) endTravelEventData.airline = matchingFlight.airline;
-                                                                if (matchingFlight.origin) endTravelEventData.origin = matchingFlight.origin;
-                                                                if (matchingFlight.destination) endTravelEventData.destination = matchingFlight.destination;
-                                                                if (matchingFlight.departureTime) endTravelEventData.departureTime = matchingFlight.departureTime;
-                                                                if (matchingFlight.arrivalTime) endTravelEventData.arrivalTime = matchingFlight.arrivalTime;
-                                                                if (matchingFlight.confirmationNumber) endTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
-                                                                if (matchingFlight.bookingId) endTravelEventData.travelBookingId = matchingFlight.bookingId;
-                                                            }
-                                                            
-                                                            try {
-                                                                console.log('Creating end travel event with data:', endTravelEventData);
-                                                                const created = await apiService.createEvent(endTravelEventData);
-                                                                console.log('End travel day created:', created);
-                                                                if (created && created.id) {
-                                                                    state.crc_events = [...state.crc_events, created];
-                                                                    console.log('End travel day added to state');
-                                                                }
-                                                            } catch (error) {
-                                                                console.error('Error creating end travel day:', error);
-                                                            }
-                                                        } else if (isLinkedToThisShift) {
-                                                            // CRITICAL: When updating, ensure crcId is explicitly set for this individual travel day
-                                                            if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
-                                                                console.warn('Skipping travel day update - invalid crcId:', crcId);
-                                                                continue; // Skip this iteration if crcId is invalid
-                                                            }
-                                                            
-                                                            // Update existing travel day linked to this shift
-                                                            console.log('UPDATING existing end travel day:', existingTravelDay.id, 'for CRC:', crcId);
-                                                            const matchingFlight = findFlightWithinBusinessDay(crcId, eventEndDate, false);
-                                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
-                                                            
-                                                            // CRITICAL: Start with existing travel day data to preserve all fields
-                                                            // Then override only the fields that changed
-                                                            const updateData = {
-                                                                ...existingTravelDay, // Preserve all existing fields
-                                                                // CRITICAL: Explicitly include ID to ensure it's an UPDATE operation
-                                                                id: existingTravelDay.id,
-                                                                name: 'Travel Day',
-                                                                type: 'Travel Day',
-                                                                crcId: crcId, // CRITICAL: Explicitly preserve CRC ID - this ensures the travel day is assigned to this specific CRC
-                                                                date: endTravelDateStr,
-                                                                studyIds: updatedEvent.studyIds || existingTravelDay.studyIds || [],
-                                                                siteId: updatedEvent.siteId || existingTravelDay.siteId || null,
-                                                                hours: travelHours,
-                                                                groupId: eventGroupId,
-                                                                roleAssignments: {} // Travel days don't have role assignments
-                                                            };
-                                                            
-                                                            if (matchingFlight) {
-                                                                if (matchingFlight.flightNumber) updateData.flightNumber = matchingFlight.flightNumber;
-                                                                if (matchingFlight.airline) updateData.airline = matchingFlight.airline;
-                                                                if (matchingFlight.origin) updateData.origin = matchingFlight.origin;
-                                                                if (matchingFlight.destination) updateData.destination = matchingFlight.destination;
-                                                                if (matchingFlight.departureTime) updateData.departureTime = matchingFlight.departureTime;
-                                                                if (matchingFlight.arrivalTime) updateData.arrivalTime = matchingFlight.arrivalTime;
-                                                                if (matchingFlight.confirmationNumber) updateData.confirmationNumber = matchingFlight.confirmationNumber;
-                                                                if (matchingFlight.bookingId) updateData.travelBookingId = matchingFlight.bookingId;
-                                                            }
-                                                            
-                                                            try {
-                                                                console.log('Updating end travel day with data:', updateData);
-                                                                const updated = await apiService.updateEvent(existingTravelDay.id, updateData);
-                                                                console.log('End travel day updated:', updated);
-                                                                if (updated && updated.id) {
-                                                                    const index = state.crc_events.findIndex(e => e.id === existingTravelDay.id);
-                                                                    if (index !== -1) {
-                                                                        state.crc_events[index] = updated;
-                                                                        console.log('End travel day updated in state');
-                                                                    } else {
-                                                                        // If not found, add it
-                                                                        state.crc_events.push(updated);
-                                                                        console.log('End travel day added to state (not found in update)');
-                                                                    }
-                                                                } else {
-                                                                    console.error('ERROR: Travel day update failed - no ID returned:', updated);
-                                                                    showNotification('Error updating travel day. Please check the console for details.', 'error');
-                                                                }
-                                                            } catch (error) {
-                                                                console.error('Error updating end travel day:', error);
-                                                                showNotification(`Error updating travel day: ${error.message || 'Unknown error'}`, 'error');
-                                                            }
-                                                        } else {
-                                                            console.log('SKIPPING end travel day - exists but not linked to this shift:', existingTravelDay.id);
+                                                        if (matchingFlight) {
+                                                            if (matchingFlight.flightNumber) endTravelEventData.flightNumber = matchingFlight.flightNumber;
+                                                            if (matchingFlight.airline) endTravelEventData.airline = matchingFlight.airline;
+                                                            if (matchingFlight.origin) endTravelEventData.origin = matchingFlight.origin;
+                                                            if (matchingFlight.destination) endTravelEventData.destination = matchingFlight.destination;
+                                                            if (matchingFlight.departureTime) endTravelEventData.departureTime = matchingFlight.departureTime;
+                                                            if (matchingFlight.arrivalTime) endTravelEventData.arrivalTime = matchingFlight.arrivalTime;
+                                                            if (matchingFlight.confirmationNumber) endTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                            if (matchingFlight.bookingId) endTravelEventData.travelBookingId = matchingFlight.bookingId;
                                                         }
-                                                        } // Close the else block for duplicate check
+                                                        
+                                                        try {
+                                                            console.log('Creating shared end travel day with data:', endTravelEventData);
+                                                            const created = await apiService.createEvent(endTravelEventData);
+                                                            console.log('Shared end travel day created:', created);
+                                                            if (created && created.id) {
+                                                                state.crc_events = [...state.crc_events, created];
+                                                                console.log('Shared end travel day added to state');
+                                                            }
+                                                        } catch (error) {
+                                                            console.error('Error creating shared end travel day:', error);
+                                                            showNotification(`Error creating travel day: ${error.message || 'Unknown error'}`, 'error');
+                                                        }
+                                                    } else {
+                                                        // Update existing travel day - add CRCs that aren't already in it
+                                                        const existingCrcIds = existingEndTravelDay.crcIds || (existingEndTravelDay.crcId ? [existingEndTravelDay.crcId] : []);
+                                                        const updatedCrcIds = Array.from(new Set([...existingCrcIds, ...crcIdsArray]));
+                                                        
+                                                        const updateData = {
+                                                            ...existingEndTravelDay,
+                                                            id: existingEndTravelDay.id,
+                                                            name: 'Travel Day',
+                                                            type: 'Travel Day',
+                                                            crcId: updatedCrcIds[0], // Keep first for backward compatibility
+                                                            crcIds: updatedCrcIds, // Update with all CRCs
+                                                            date: travelDateStr,
+                                                            studyIds: updatedEvent.studyIds || existingEndTravelDay.studyIds || [],
+                                                            siteId: updatedEvent.siteId || existingEndTravelDay.siteId || null,
+                                                            hours: travelHours,
+                                                            groupId: eventGroupId,
+                                                            roleAssignments: {}
+                                                        };
+                                                        
+                                                        if (matchingFlight) {
+                                                            if (matchingFlight.flightNumber) updateData.flightNumber = matchingFlight.flightNumber;
+                                                            if (matchingFlight.airline) updateData.airline = matchingFlight.airline;
+                                                            if (matchingFlight.origin) updateData.origin = matchingFlight.origin;
+                                                            if (matchingFlight.destination) updateData.destination = matchingFlight.destination;
+                                                            if (matchingFlight.departureTime) updateData.departureTime = matchingFlight.departureTime;
+                                                            if (matchingFlight.arrivalTime) updateData.arrivalTime = matchingFlight.arrivalTime;
+                                                            if (matchingFlight.confirmationNumber) updateData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                            if (matchingFlight.bookingId) updateData.travelBookingId = matchingFlight.bookingId;
+                                                        }
+                                                        
+                                                        try {
+                                                            console.log('Updating shared end travel day with data:', updateData);
+                                                            const updated = await apiService.updateEvent(existingEndTravelDay.id, updateData);
+                                                            console.log('Shared end travel day updated:', updated);
+                                                            if (updated && updated.id) {
+                                                                const index = state.crc_events.findIndex(e => e.id === existingEndTravelDay.id);
+                                                                if (index !== -1) {
+                                                                    state.crc_events[index] = updated;
+                                                                    console.log('Shared end travel day updated in state');
+                                                                } else {
+                                                                    state.crc_events.push(updated);
+                                                                    console.log('Shared end travel day added to state (not found in update)');
+                                                                }
+                                                            } else {
+                                                                console.error('ERROR: Travel day update failed - no ID returned:', updated);
+                                                                showNotification('Error updating travel day. Please check the console for details.', 'error');
+                                                            }
+                                                        } catch (error) {
+                                                            console.error('Error updating shared end travel day:', error);
+                                                            showNotification(`Error updating travel day: ${error.message || 'Unknown error'}`, 'error');
+                                                        }
                                                     }
                                                 }
                                             }
@@ -32431,6 +32350,10 @@
                                         
                                         // If we have assigned CRCs, create separate events for each
                                         if (assignedCrcs.size > 0) {
+                                            // Group CRCs by travel date to create shared travel days
+                                            // Map: dateStr -> { start: Set of crcIds, end: Set of crcIds }
+                                            const travelDaysByDate = new Map();
+                                            
                                             for (const crcId of assignedCrcs) {
                                                 const roles = [];
                                                 Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
@@ -32440,95 +32363,274 @@
                                                     }
                                                 });
                                                 
-                                                // Check per-CRC travel checkboxes - only create travel days if explicitly checked
-                                                const startCheckbox = form.querySelector(`input[name="travel-start-${crcId}"]`);
-                                                const endCheckbox = form.querySelector(`input[name="travel-end-${crcId}"]`);
+                                                // Collect travel preferences (will be grouped by date later)
+                                                // Check both in form and in travel-selection-container
+                                                const startCheckboxSelector = `input[name="travel-start-${crcId}"]`;
+                                                const endCheckboxSelector = `input[name="travel-end-${crcId}"]`;
+                                                let startCheckbox = form.querySelector(startCheckboxSelector);
+                                                let endCheckbox = form.querySelector(endCheckboxSelector);
+                                                
+                                                // If not found in form, try travel-selection-container
+                                                if (!startCheckbox || !endCheckbox) {
+                                                    const travelContainer = document.getElementById('travel-selection-container');
+                                                    if (travelContainer) {
+                                                        if (!startCheckbox) startCheckbox = travelContainer.querySelector(startCheckboxSelector);
+                                                        if (!endCheckbox) endCheckbox = travelContainer.querySelector(endCheckboxSelector);
+                                                    }
+                                                }
+                                                
                                                 const includeStartTravelForCrc = startCheckbox?.checked === true;
                                                 const includeEndTravelForCrc = endCheckbox?.checked === true;
                                                 
-                                                console.log('Travel day check for CRC:', crcId, {
-                                                    startCheckboxFound: !!startCheckbox,
-                                                    endCheckboxFound: !!endCheckbox,
-                                                    includeStartTravel: includeStartTravelForCrc,
-                                                    includeEndTravel: includeEndTravelForCrc
-                                                });
+                                                // Get travel dates
+                                                const startTravelDateInput = form.querySelector(`input[name="travel-start-date-${crcId}"]`);
+                                                const endTravelDateInput = form.querySelector(`input[name="travel-end-date-${crcId}"]`);
                                                 
-                                                // Create start travel day only if checkbox is checked for this CRC
-                                                if (includeStartTravelForCrc) {
-                                                    // Get custom travel date if provided, otherwise use same day as shift
-                                                    const startTravelDateInput = form.querySelector(`input[name="travel-start-date-${crcId}"]`);
-                                                    let startTravelDateStr = '';
-                                                    
-                                                    if (startTravelDateInput && startTravelDateInput.value) {
-                                                        // Use custom date from input (allows same-day travel)
-                                                        startTravelDateStr = startTravelDateInput.value;
-                                                    } else {
-                                                        // Default to same day as shift (allows same-day travel)
-                                                        const startDateObj = startDate instanceof Date ? startDate : parseDateOnly(startDate);
-                                                        if (startDateObj) {
-                                                            startTravelDateStr = toDateOnlyString(startDateObj);
-                                                        }
+                                                let startTravelDateStr = '';
+                                                if (startTravelDateInput && startTravelDateInput.value) {
+                                                    startTravelDateStr = startTravelDateInput.value;
+                                                } else if (includeStartTravelForCrc) {
+                                                    const startDateObj = startDate instanceof Date ? startDate : parseDateOnly(startDate);
+                                                    if (startDateObj) {
+                                                        startTravelDateStr = toDateOnlyString(startDateObj);
                                                     }
+                                                }
+                                                
+                                                let endTravelDateStr = '';
+                                                if (endTravelDateInput && endTravelDateInput.value) {
+                                                    endTravelDateStr = endTravelDateInput.value;
+                                                } else if (includeEndTravelForCrc) {
+                                                    const endDateObj = endDate instanceof Date ? endDate : parseDateOnly(endDate);
+                                                    if (endDateObj) {
+                                                        endTravelDateStr = toDateOnlyString(endDateObj);
+                                                    }
+                                                }
+                                                
+                                                // Group by date for shared travel days
+                                                if (includeStartTravelForCrc && startTravelDateStr) {
+                                                    if (!travelDaysByDate.has(startTravelDateStr)) {
+                                                        travelDaysByDate.set(startTravelDateStr, { start: new Set(), end: new Set() });
+                                                    }
+                                                    travelDaysByDate.get(startTravelDateStr).start.add(crcId);
+                                                }
+                                                
+                                                if (includeEndTravelForCrc && endTravelDateStr) {
+                                                    if (!travelDaysByDate.has(endTravelDateStr)) {
+                                                        travelDaysByDate.set(endTravelDateStr, { start: new Set(), end: new Set() });
+                                                    }
+                                                    travelDaysByDate.get(endTravelDateStr).end.add(crcId);
+                                                }
+                                            }
+                                            
+                                            // Second pass: create/update travel days grouped by date
+                                            for (const [travelDateStr, { start: startCrcIds, end: endCrcIds }] of travelDaysByDate.entries()) {
+                                                // Handle start travel days
+                                                if (startCrcIds.size > 0) {
+                                                    const crcIdsArray = Array.from(startCrcIds);
+                                                    console.log('Creating/updating START travel day for date:', travelDateStr, 'with CRCs:', crcIdsArray);
                                                     
-                                                    if (startTravelDateStr) {
-                                                        // Check if travel day already exists for this CRC on this date
-                                                        const existingTravelDay = state.crc_events.find(e => 
-                                                        e.crcId === crcId && 
-                                                        e.date === startTravelDateStr && 
-                                                        e.type === 'Travel Day'
+                                                    // Check if travel day already exists for this date and groupId
+                                                    const existingStartTravelDay = state.crc_events.find(e => 
+                                                        e.type === 'Travel Day' && 
+                                                        e.groupId === groupId &&
+                                                        e.date === travelDateStr
                                                     );
                                                     
-                                                    // Only create if it doesn't already exist
-                                                    if (!existingTravelDay) {
-                                                        // Find matching flight
-                                                        const matchingFlight = findFlightWithinBusinessDay(crcId, startDate, true);
-                                                        const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
-                                                        
-                                                        const startTravelEventData = { 
-                                                        // Travel days inherit study/site from parent shift for grid display
-                                                        name: 'Travel Day', 
-                                                        crcId, 
-                                                        roles: [], 
-                                                        date: startTravelDateStr, 
-                                                        groupId, 
-                                                        type: 'Travel Day',
-                                                        hours: travelHours,
-                                                        notes: '',
-                                                        period: null,
-                                                        studyIds: selectedStudyIds || [],
-                                                        siteId: selectedSiteId || null,
-                                                        roleAssignments: {}
-                                                    };
-                                                    
-                                                    // Add flight information if found
+                                                    // Calculate average travel hours from all CRCs (or use first CRC's flight)
+                                                    let travelHours = 8; // default
+                                                    const firstCrcId = crcIdsArray[0];
+                                                    const matchingFlight = findFlightWithinBusinessDay(firstCrcId, startDate, true);
                                                     if (matchingFlight) {
-                                                        if (matchingFlight.flightNumber) startTravelEventData.flightNumber = matchingFlight.flightNumber;
-                                                        if (matchingFlight.airline) startTravelEventData.airline = matchingFlight.airline;
-                                                        if (matchingFlight.origin) startTravelEventData.origin = matchingFlight.origin;
-                                                        if (matchingFlight.destination) startTravelEventData.destination = matchingFlight.destination;
-                                                        if (matchingFlight.departureTime) startTravelEventData.departureTime = matchingFlight.departureTime;
-                                                        if (matchingFlight.arrivalTime) startTravelEventData.arrivalTime = matchingFlight.arrivalTime;
-                                                        if (matchingFlight.confirmationNumber) startTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
-                                                        if (matchingFlight.bookingId) startTravelEventData.travelBookingId = matchingFlight.bookingId;
+                                                        travelHours = matchingFlight.flightDuration || matchingFlight.hours || 8;
                                                     }
                                                     
-                                                        console.log('Creating start travel day for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
+                                                    if (!existingStartTravelDay) {
+                                                        // Create new shared travel day
+                                                        const startTravelEventData = { 
+                                                            name: 'Travel Day', 
+                                                            crcId: firstCrcId, // Keep for backward compatibility
+                                                            crcIds: crcIdsArray, // NEW: Array of all CRCs on this travel day
+                                                            roles: [], 
+                                                            date: travelDateStr, 
+                                                            groupId, 
+                                                            type: 'Travel Day',
+                                                            hours: travelHours,
+                                                            notes: '',
+                                                            period: null,
+                                                            studyIds: selectedStudyIds || [],
+                                                            siteId: selectedSiteId || null,
+                                                            roleAssignments: {} // Travel days don't have role assignments
+                                                        };
+                                                        
+                                                        if (matchingFlight) {
+                                                            if (matchingFlight.flightNumber) startTravelEventData.flightNumber = matchingFlight.flightNumber;
+                                                            if (matchingFlight.airline) startTravelEventData.airline = matchingFlight.airline;
+                                                            if (matchingFlight.origin) startTravelEventData.origin = matchingFlight.origin;
+                                                            if (matchingFlight.destination) startTravelEventData.destination = matchingFlight.destination;
+                                                            if (matchingFlight.departureTime) startTravelEventData.departureTime = matchingFlight.departureTime;
+                                                            if (matchingFlight.arrivalTime) startTravelEventData.arrivalTime = matchingFlight.arrivalTime;
+                                                            if (matchingFlight.confirmationNumber) startTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                            if (matchingFlight.bookingId) startTravelEventData.travelBookingId = matchingFlight.bookingId;
+                                                        }
+                                                        
+                                                        console.log('Creating shared start travel day with data:', startTravelEventData);
                                                         const created = await apiService.createEvent(startTravelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
                                                         state.crc_events = [...state.crc_events, createdEvent];
+                                                        console.log('Shared start travel day created');
                                                     } else {
-                                                        console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation');
+                                                        // Update existing travel day - add CRCs that aren't already in it
+                                                        const existingCrcIds = existingStartTravelDay.crcIds || (existingStartTravelDay.crcId ? [existingStartTravelDay.crcId] : []);
+                                                        const updatedCrcIds = Array.from(new Set([...existingCrcIds, ...crcIdsArray]));
+                                                        
+                                                        const updateData = {
+                                                            ...existingStartTravelDay,
+                                                            id: existingStartTravelDay.id,
+                                                            name: 'Travel Day',
+                                                            type: 'Travel Day',
+                                                            crcId: updatedCrcIds[0], // Keep first for backward compatibility
+                                                            crcIds: updatedCrcIds, // Update with all CRCs
+                                                            date: travelDateStr,
+                                                            studyIds: selectedStudyIds || existingStartTravelDay.studyIds || [],
+                                                            siteId: selectedSiteId || existingStartTravelDay.siteId || null,
+                                                            hours: travelHours,
+                                                            groupId: groupId,
+                                                            roleAssignments: {}
+                                                        };
+                                                        
+                                                        if (matchingFlight) {
+                                                            if (matchingFlight.flightNumber) updateData.flightNumber = matchingFlight.flightNumber;
+                                                            if (matchingFlight.airline) updateData.airline = matchingFlight.airline;
+                                                            if (matchingFlight.origin) updateData.origin = matchingFlight.origin;
+                                                            if (matchingFlight.destination) updateData.destination = matchingFlight.destination;
+                                                            if (matchingFlight.departureTime) updateData.departureTime = matchingFlight.departureTime;
+                                                            if (matchingFlight.arrivalTime) updateData.arrivalTime = matchingFlight.arrivalTime;
+                                                            if (matchingFlight.confirmationNumber) updateData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                            if (matchingFlight.bookingId) updateData.travelBookingId = matchingFlight.bookingId;
+                                                        }
+                                                        
+                                                        console.log('Updating shared start travel day with data:', updateData);
+                                                        const updated = await apiService.updateEvent(existingStartTravelDay.id, updateData);
+                                                        if (updated && updated.id) {
+                                                            const index = state.crc_events.findIndex(e => e.id === existingStartTravelDay.id);
+                                                            if (index !== -1) {
+                                                                state.crc_events[index] = updated;
+                                                            } else {
+                                                                state.crc_events.push(updated);
+                                                            }
+                                                            console.log('Shared start travel day updated');
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                // Handle end travel days
+                                                if (endCrcIds.size > 0) {
+                                                    const crcIdsArray = Array.from(endCrcIds);
+                                                    console.log('Creating/updating END travel day for date:', travelDateStr, 'with CRCs:', crcIdsArray);
+                                                    
+                                                    // Check if travel day already exists for this date and groupId
+                                                    const existingEndTravelDay = state.crc_events.find(e => 
+                                                        e.type === 'Travel Day' && 
+                                                        e.groupId === groupId &&
+                                                        e.date === travelDateStr
+                                                    );
+                                                    
+                                                    // Calculate average travel hours from all CRCs (or use first CRC's flight)
+                                                    let travelHours = 8; // default
+                                                    const firstCrcId = crcIdsArray[0];
+                                                    const matchingFlight = findFlightWithinBusinessDay(firstCrcId, endDate, false);
+                                                    if (matchingFlight) {
+                                                        travelHours = matchingFlight.flightDuration || matchingFlight.hours || 8;
+                                                    }
+                                                    
+                                                    if (!existingEndTravelDay) {
+                                                        // Create new shared travel day
+                                                        const endTravelEventData = { 
+                                                            name: 'Travel Day', 
+                                                            crcId: firstCrcId, // Keep for backward compatibility
+                                                            crcIds: crcIdsArray, // NEW: Array of all CRCs on this travel day
+                                                            roles: [], 
+                                                            date: travelDateStr, 
+                                                            groupId, 
+                                                            type: 'Travel Day',
+                                                            hours: travelHours,
+                                                            notes: '',
+                                                            period: null,
+                                                            studyIds: selectedStudyIds || [],
+                                                            siteId: selectedSiteId || null,
+                                                            roleAssignments: {} // Travel days don't have role assignments
+                                                        };
+                                                        
+                                                        if (matchingFlight) {
+                                                            if (matchingFlight.flightNumber) endTravelEventData.flightNumber = matchingFlight.flightNumber;
+                                                            if (matchingFlight.airline) endTravelEventData.airline = matchingFlight.airline;
+                                                            if (matchingFlight.origin) endTravelEventData.origin = matchingFlight.origin;
+                                                            if (matchingFlight.destination) endTravelEventData.destination = matchingFlight.destination;
+                                                            if (matchingFlight.departureTime) endTravelEventData.departureTime = matchingFlight.departureTime;
+                                                            if (matchingFlight.arrivalTime) endTravelEventData.arrivalTime = matchingFlight.arrivalTime;
+                                                            if (matchingFlight.confirmationNumber) endTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                            if (matchingFlight.bookingId) endTravelEventData.travelBookingId = matchingFlight.bookingId;
+                                                        }
+                                                        
+                                                        console.log('Creating shared end travel day with data:', endTravelEventData);
+                                                        const created = await apiService.createEvent(endTravelEventData);
+                                                        const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
+                                                        state.crc_events = [...state.crc_events, createdEvent];
+                                                        console.log('Shared end travel day created');
+                                                    } else {
+                                                        // Update existing travel day - add CRCs that aren't already in it
+                                                        const existingCrcIds = existingEndTravelDay.crcIds || (existingEndTravelDay.crcId ? [existingEndTravelDay.crcId] : []);
+                                                        const updatedCrcIds = Array.from(new Set([...existingCrcIds, ...crcIdsArray]));
+                                                        
+                                                        const updateData = {
+                                                            ...existingEndTravelDay,
+                                                            id: existingEndTravelDay.id,
+                                                            name: 'Travel Day',
+                                                            type: 'Travel Day',
+                                                            crcId: updatedCrcIds[0], // Keep first for backward compatibility
+                                                            crcIds: updatedCrcIds, // Update with all CRCs
+                                                            date: travelDateStr,
+                                                            studyIds: selectedStudyIds || existingEndTravelDay.studyIds || [],
+                                                            siteId: selectedSiteId || existingEndTravelDay.siteId || null,
+                                                            hours: travelHours,
+                                                            groupId: groupId,
+                                                            roleAssignments: {}
+                                                        };
+                                                        
+                                                        if (matchingFlight) {
+                                                            if (matchingFlight.flightNumber) updateData.flightNumber = matchingFlight.flightNumber;
+                                                            if (matchingFlight.airline) updateData.airline = matchingFlight.airline;
+                                                            if (matchingFlight.origin) updateData.origin = matchingFlight.origin;
+                                                            if (matchingFlight.destination) updateData.destination = matchingFlight.destination;
+                                                            if (matchingFlight.departureTime) updateData.departureTime = matchingFlight.departureTime;
+                                                            if (matchingFlight.arrivalTime) updateData.arrivalTime = matchingFlight.arrivalTime;
+                                                            if (matchingFlight.confirmationNumber) updateData.confirmationNumber = matchingFlight.confirmationNumber;
+                                                            if (matchingFlight.bookingId) updateData.travelBookingId = matchingFlight.bookingId;
+                                                        }
+                                                        
+                                                        console.log('Updating shared end travel day with data:', updateData);
+                                                        const updated = await apiService.updateEvent(existingEndTravelDay.id, updateData);
+                                                        if (updated && updated.id) {
+                                                            const index = state.crc_events.findIndex(e => e.id === existingEndTravelDay.id);
+                                                            if (index !== -1) {
+                                                                state.crc_events[index] = updated;
+                                                            } else {
+                                                                state.crc_events.push(updated);
+                                                            }
+                                                            console.log('Shared end travel day updated');
+                                                        }
                                                     }
                                                 }
                                             }
                                             
-                                            // Create main assignment events
-                                            // Ensure startDate and endDate are Date objects (they should already be from parseDateOnly)
-                                            const startDateObjLoop = startDate instanceof Date ? startDate : parseDateOnly(startDate);
-                                            const endDateObjLoop = endDate instanceof Date ? endDate : parseDateOnly(endDate);
-                                            if (!startDateObjLoop || !endDateObjLoop) continue;
-                                            
-                                            for (let d = new Date(startDateObjLoop); d <= endDateObjLoop; d.setDate(d.getDate() + 1)) {
+                                            // Create main assignment events for each CRC
+                                            for (const crcId of assignedCrcs) {
+                                                // Ensure startDate and endDate are Date objects (they should already be from parseDateOnly)
+                                                const startDateObjLoop = startDate instanceof Date ? startDate : parseDateOnly(startDate);
+                                                const endDateObjLoop = endDate instanceof Date ? endDate : parseDateOnly(endDate);
+                                                if (!startDateObjLoop || !endDateObjLoop) continue;
+                                                
+                                                for (let d = new Date(startDateObjLoop); d <= endDateObjLoop; d.setDate(d.getDate() + 1)) {
                                                 const dateStr = toDateOnlyString(d);
                                                 const newEventRef = null;
                                                 // Get role assignments for this specific CRC
@@ -32602,76 +32704,7 @@
                                                 console.log('Event created, roleAssignments in response:', createdEvent.roleAssignments);
                                                 state.crc_events = [...state.crc_events, createdEvent];
                                             }
-                                            
-                                            // Create end travel day only if checkbox is checked for this CRC
-                                            if (includeEndTravelForCrc) {
-                                                // Get custom travel date if provided, otherwise use same day as shift
-                                                const endTravelDateInput = form.querySelector(`input[name="travel-end-date-${crcId}"]`);
-                                                let endTravelDateStr = '';
-                                                
-                                                if (endTravelDateInput && endTravelDateInput.value) {
-                                                    // Use custom date from input (allows same-day travel)
-                                                    endTravelDateStr = endTravelDateInput.value;
-                                                } else {
-                                                    // Default to same day as shift (allows same-day travel)
-                                                    const endDateObj = endDate instanceof Date ? endDate : parseDateOnly(endDate);
-                                                    if (endDateObj) {
-                                                        endTravelDateStr = toDateOnlyString(endDateObj);
-                                                    }
-                                                }
-                                                
-                                                if (endTravelDateStr) {
-                                                    // Check if travel day already exists for this CRC on this date
-                                                    const existingTravelDay = state.crc_events.find(e => 
-                                                        e.crcId === crcId && 
-                                                        e.date === endTravelDateStr && 
-                                                        e.type === 'Travel Day'
-                                                    );
-                                                    
-                                                    // Only create if it doesn't already exist
-                                                    if (!existingTravelDay) {
-                                                        // Find matching flight
-                                                        const matchingFlight = findFlightWithinBusinessDay(crcId, endDate, false);
-                                                        const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
-                                                        
-                                                        const endTravelEventData = { 
-                                                            // Travel days inherit study/site from parent shift for grid display
-                                                            name: 'Travel Day', 
-                                                            crcId, 
-                                                            roles: [], 
-                                                            date: endTravelDateStr, 
-                                                            groupId, 
-                                                            type: 'Travel Day',
-                                                            hours: travelHours,
-                                                            notes: '',
-                                                            period: null,
-                                                            studyIds: selectedStudyIds || [],
-                                                            siteId: selectedSiteId || null,
-                                                            roleAssignments: {}
-                                                        };
-                                                        
-                                                        // Add flight information if found
-                                                        if (matchingFlight) {
-                                                            if (matchingFlight.flightNumber) endTravelEventData.flightNumber = matchingFlight.flightNumber;
-                                                            if (matchingFlight.airline) endTravelEventData.airline = matchingFlight.airline;
-                                                            if (matchingFlight.origin) endTravelEventData.origin = matchingFlight.origin;
-                                                            if (matchingFlight.destination) endTravelEventData.destination = matchingFlight.destination;
-                                                            if (matchingFlight.departureTime) endTravelEventData.departureTime = matchingFlight.departureTime;
-                                                            if (matchingFlight.arrivalTime) endTravelEventData.arrivalTime = matchingFlight.arrivalTime;
-                                                            if (matchingFlight.confirmationNumber) endTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
-                                                            if (matchingFlight.bookingId) endTravelEventData.travelBookingId = matchingFlight.bookingId;
-                                                        }
-                                                        
-                                                        console.log('Creating end travel day for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
-                                                        const created = await apiService.createEvent(endTravelEventData);
-                                                        const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
-                                                        state.crc_events = [...state.crc_events, createdEvent];
-                                                    } else {
-                                                        console.log('Travel day already exists for CRC:', crcId, 'on date:', endTravelDateStr, '- skipping creation');
-                                                    }
-                                                }
                                             }
-                                        }
                                         } else {
                                             // No CRCs assigned, but we have role requirements - create a shift with role requirements only
                                             // This allows creating empty shifts that show role requirements in the Roles view

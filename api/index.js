@@ -176,6 +176,11 @@ const renderTemplateString = (template, context) => {
 const eventBelongsToCrc = (event, crcId) => {
     if (!event || !crcId) return false;
     if (event.crcId === crcId) return true;
+    // Check crcIds array (for travel days with multiple CRCs)
+    if (event.crcIds && Array.isArray(event.crcIds)) {
+        if (event.crcIds.includes(crcId)) return true;
+    }
+    // Check roleAssignments (for shifts and travel days using roleAssignments)
     if (event.roleAssignments && typeof event.roleAssignments === 'object') {
         return Object.values(event.roleAssignments).some(assignments => Array.isArray(assignments) && assignments.includes(crcId));
     }
