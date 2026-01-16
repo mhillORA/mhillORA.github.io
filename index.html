@@ -25346,16 +25346,44 @@
                         if (!varText) break;
                         const textInput = document.getElementById('email-template-text');
                         if (textInput) {
-                            const start = textInput.selectionStart ?? textInput.value.length;
-                            const end = textInput.selectionEnd ?? textInput.value.length;
+                            // Get cursor position - prefer stored position, fallback to current selection, then end of text
+                            const storedPos = textInput.dataset.lastCursorPos ? parseInt(textInput.dataset.lastCursorPos, 10) : null;
+                            let start, end;
+                            
+                            if (storedPos !== null && storedPos >= 0) {
+                                // Use stored position
+                                start = storedPos;
+                                end = storedPos;
+                            } else {
+                                // Fallback to current selection
+                                start = textInput.selectionStart ?? textInput.value.length;
+                                end = textInput.selectionEnd ?? textInput.value.length;
+                            }
+                            
+                            // Ensure positions are valid
+                            start = Math.max(0, Math.min(start, textInput.value.length));
+                            end = Math.max(0, Math.min(end, textInput.value.length));
+                            
+                            // Insert the variable at cursor position
                             const before = textInput.value.slice(0, start);
                             const after = textInput.value.slice(end);
                             textInput.value = `${before}${varText}${after}`;
-                            textInput.focus();
+                            
+                            // Set cursor position after inserted text
                             const cursor = start + varText.length;
-                            if (typeof textInput.setSelectionRange === 'function') {
-                                textInput.setSelectionRange(cursor, cursor);
-                            }
+                            
+                            // Focus and set cursor position
+                            requestAnimationFrame(() => {
+                                textInput.focus();
+                                if (typeof textInput.setSelectionRange === 'function') {
+                                    textInput.setSelectionRange(cursor, cursor);
+                                }
+                                // Update stored cursor position
+                                textInput.dataset.lastCursorPos = cursor.toString();
+                            });
+                            
+                            // Trigger input event to ensure any listeners are notified
+                            textInput.dispatchEvent(new Event('input', { bubbles: true }));
                             state.emailEditorDirty = true;
                         }
                         break;
@@ -29515,6 +29543,49 @@
                         } catch (error) {
                             console.error('Error deleting user:', error);
                             showNotification('Failed to delete user. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'toggle-user-active': {
+                        try {
+                            const userId = actionButton.dataset.userId || target.dataset.userId;
+                            if (!userId) break;
+                            
+                            const user = state.users.find(u => u.id === userId);
+                            if (!user) {
+                                showNotification('User not found', 'error');
+                                break;
+                            }
+                            
+                            // Prevent deactivating admin
+                            if (user.username === 'admin') {
+                                showNotification('Cannot deactivate admin user', 'warning');
+                                // Reset checkbox
+                                if (target.type === 'checkbox') {
+                                    target.checked = true;
+                                }
+                                break;
+                            }
+                            
+                            const newActiveStatus = target.checked;
+                            const updatedUser = { ...user, active: newActiveStatus };
+                            
+                            await apiService.updateUser(userId, updatedUser);
+                            
+                            // Update local state
+                            setState({
+                                users: state.users.map(u => u.id === userId ? updatedUser : u)
+                            });
+                            
+                            showNotification(`User ${newActiveStatus ? 'activated' : 'deactivated'} successfully!`, 'success');
+                            renderUsersContent();
+                        } catch (error) {
+                            console.error('Error toggling user active status:', error);
+                            showNotification('Failed to update user status. See console for details.', 'error');
+                            // Reset checkbox on error
+                            if (target.type === 'checkbox') {
+                                target.checked = !target.checked;
+                            }
                         }
                         break;
                     }
@@ -34771,8 +34842,33 @@
                 if (visitNumberSelect) {
                     if (selectedStudyIds.length > 0) {
                         const study = state.studies.find(s => s.id === selectedStudyIds[0]); // Use first selected study
-                        const numberOfVisits = study?.numberOfVisits || 0;
                         const visitRoleRequirements = study?.visitRoleRequirements || {};
+                        
+                        // Derive numberOfVisits from visitRoleRequirements if not set or 0
+                        // This handles cases where visits are added with roles but numberOfVisits wasn't updated
+                        // Parse as integer to handle string values
+                        let numberOfVisits = parseInt(study?.numberOfVisits || study?.visitCount || 0, 10) || 0;
+                        
+                        // If numberOfVisits is 0 or not set, try to derive from visitRoleRequirements
+                        if (numberOfVisits === 0 && Object.keys(visitRoleRequirements).length > 0) {
+                            // Find the maximum visit number from visitRoleRequirements keys
+                            const visitKeys = Object.keys(visitRoleRequirements).filter(key => key.startsWith('visit-'));
+                            if (visitKeys.length > 0) {
+                                const visitNumbers = visitKeys.map(key => {
+                                    const match = key.match(/^visit-(\d+)$/);
+                                    return match ? parseInt(match[1], 10) : 0;
+                                }).filter(num => num > 0);
+                                if (visitNumbers.length > 0) {
+                                    numberOfVisits = Math.max(...visitNumbers);
+                                }
+                            }
+                        }
+                        
+                        // Ensure we have at least 1 visit if visitRoleRequirements exist (even if just default)
+                        // This handles edge cases where numberOfVisits might be 0 but requirements exist
+                        if (numberOfVisits === 0 && Object.keys(visitRoleRequirements).length > 0) {
+                            numberOfVisits = 1; // At least show one visit option
+                        }
                         
                         // Preserve the currently selected value before repopulating
                         const currentSelectedValue = visitNumberSelect.value || '';
@@ -34780,7 +34876,7 @@
                         
                         let visitOptions = '<option value="">Select Visit</option>';
                         
-                        // Add default option
+                        // Add default option - always show it, even if no default requirements
                         const defaultReqs = visitRoleRequirements['default'] || {};
                         const defaultTotal = Object.values(defaultReqs).reduce((sum, qty) => sum + (parseInt(qty) || 0), 0);
                         const isDefaultSelected = currentSelectedValue === 'default' || (existingEvent?.visitNumber === 'default');
@@ -34790,6 +34886,7 @@
                         const visitNames = study?.visitNames || {};
                         
                         // Add per-visit options with custom names
+                        // Always show visits 1 through numberOfVisits, even if no specific requirements exist
                         for (let visitNum = 1; visitNum <= numberOfVisits; visitNum++) {
                             const visitKey = `visit-${visitNum}`;
                             const visitReqs = visitRoleRequirements[visitKey] || defaultReqs;
@@ -39125,6 +39222,7 @@
                                 <thead class="bg-gray-50 dark:bg-gray-700">
                                     <tr>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Username</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Active</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Permission Level</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Linked CRC</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Permission Set</th>
@@ -39135,10 +39233,23 @@
                                     </tr>
                                 </thead>
                                 <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                    ${state.users.map(user => `
-                                        <tr>
+                                    ${state.users.map(user => {
+                                        const isActive = user.active !== undefined ? user.active : true;
+                                        return `
+                                        <tr class="${!isActive ? 'opacity-60' : ''}">
                                             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
                                                 ${user.username}
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap">
+                                                <label class="flex items-center">
+                                                    <input type="checkbox" 
+                                                           data-action="toggle-user-active" 
+                                                           data-user-id="${user.id}" 
+                                                           ${isActive ? 'checked' : ''} 
+                                                           ${user.username === 'admin' ? 'disabled' : ''}
+                                                           class="rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer">
+                                                    <span class="ml-2 text-xs text-gray-600 dark:text-gray-400">${isActive ? 'Active' : 'Inactive'}</span>
+                                                </label>
                                             </td>
                                             <td class="px-6 py-4 whitespace-nowrap">
                                                 <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${permissionLevelColors[user.permissionLevel] || 'bg-gray-100 text-gray-800'}">
@@ -39167,7 +39278,8 @@
                                                 ` : ''}
                                             </td>
                                         </tr>
-                                    `).join('')}
+                                    `;
+                                    }).join('')}
                                 </tbody>
                             </table>
                         </div>
@@ -39884,7 +39996,7 @@
                         `;
                     }).join('');
 
-                // Load selected template into editor if not already “dirty”
+                // Load selected template into editor if not already "dirty"
                 const selected = (state.emailTemplates || []).find(t => t.id === state.emailTemplateSelectedId) || null;
                 const nameInput = document.getElementById('email-template-name');
                 const subjInput = document.getElementById('email-template-subject');
@@ -39895,6 +40007,30 @@
                         subjInput.value = selected.subject || '';
                         textInput.value = selected.plainText || selected.text || selected.html || selected.bodyHtml || selected.body || '';
                     }
+                }
+                
+                // Set up cursor position tracking for the textarea
+                if (textInput) {
+                    // Track cursor position on any interaction
+                    const updateCursorPosition = () => {
+                        const pos = textInput.selectionStart ?? textInput.value.length;
+                        textInput.dataset.lastCursorPos = pos.toString();
+                    };
+                    
+                    // Remove existing listeners to avoid duplicates
+                    const newTextInput = textInput.cloneNode(true);
+                    textInput.parentNode.replaceChild(newTextInput, textInput);
+                    
+                    // Add event listeners to track cursor position
+                    newTextInput.addEventListener('click', updateCursorPosition);
+                    newTextInput.addEventListener('keyup', updateCursorPosition);
+                    newTextInput.addEventListener('keydown', updateCursorPosition);
+                    newTextInput.addEventListener('select', updateCursorPosition);
+                    newTextInput.addEventListener('focus', updateCursorPosition);
+                    newTextInput.addEventListener('input', updateCursorPosition);
+                    
+                    // Also track on mouseup (for text selection)
+                    newTextInput.addEventListener('mouseup', updateCursorPosition);
                 }
 
                 // Render attachments list

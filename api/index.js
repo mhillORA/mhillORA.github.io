@@ -1514,6 +1514,11 @@ const validateUsersSchema = (data) => {
         errors.push('email must be a string');
     }
     
+    // active field is optional boolean, defaults to true if not provided
+    if (data.active !== undefined && typeof data.active !== 'boolean') {
+        errors.push('active must be a boolean');
+    }
+    
     if (errors.length > 0) {
         throw new Error(`VALIDATION_ERROR: Users validation failed: ${errors.join(', ')}`);
     }
@@ -3303,6 +3308,7 @@ app.http('usersAuthenticateEntra', {
                         email: email || '',
                         name: name || email || 'User',
                         permissionLevel: 'CRC', // Default permission level
+                        active: true, // Default to active
                         createdAt: new Date().toISOString()
                     };
                     
@@ -3312,6 +3318,16 @@ app.http('usersAuthenticateEntra', {
 
                 // Correct admin user if needed
                 user = await correctAdminUser(user, container, context);
+                
+                // Check if user is active (default to true if not set)
+                const isActive = user.active !== undefined ? user.active : true;
+                if (!isActive) {
+                    return {
+                        status: 403,
+                        jsonBody: { error: 'User account is deactivated. Please contact an administrator.' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
 
                 // Return user without sensitive data
                 const { password: _, ...userWithoutPassword } = user;
@@ -3416,6 +3432,7 @@ app.http('usersAuthenticate', {
                             permissionLevel: 'Manager',
                             email: '',
                             entraId: '',
+                            active: true, // Admin is always active
                             createdAt: new Date().toISOString()
                         };
                         const { resource: createdUser } = await container.items.create(adminUser);
@@ -3465,6 +3482,16 @@ app.http('usersAuthenticate', {
             
             // Correct admin user if needed
             user = await correctAdminUser(user, container, context);
+            
+            // Check if user is active (default to true if not set)
+            const isActive = user.active !== undefined ? user.active : true;
+            if (!isActive) {
+                return {
+                    status: 403,
+                    jsonBody: { error: 'User account is deactivated. Please contact an administrator.' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
             
             // Return user without password
             const { password: _, ...userWithoutPassword } = user;
@@ -3695,7 +3722,8 @@ app.http('usersList', {
                     id: generateId(),
                     password: hashedPassword,
                     createdAt: new Date().toISOString(),
-                    mustChangePassword: body.mustChangePassword !== undefined ? body.mustChangePassword : true // Default to true for new users
+                    mustChangePassword: body.mustChangePassword !== undefined ? body.mustChangePassword : true, // Default to true for new users
+                    active: body.active !== undefined ? body.active : true // Default to active for new users
                 };
                 const { resource: createdUser } = await container.items.create(newUser);
                 const { password: _, ...userWithoutPassword } = createdUser;
