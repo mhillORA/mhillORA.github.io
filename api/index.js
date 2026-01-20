@@ -2102,6 +2102,19 @@ async function crudHandler(context, request, containerName) {
                     }
                 }
                 
+                // For studies PUT: merge with existing so partial updates (e.g. studyType) don't wipe the document
+                if (containerName === 'studies' && updateId) {
+                    try {
+                        const { resource: existingStudy } = await container.item(updateId, updateId).read();
+                        if (existingStudy) {
+                            requestBody = { ...existingStudy, ...requestBody };
+                            requestBody.id = updateId;
+                        }
+                    } catch (e) {
+                        context.log.warn('Could not read existing study for merge:', e.message);
+                    }
+                }
+                
                 // Validate schema based on container
                 try {
                     switch (containerName) {
