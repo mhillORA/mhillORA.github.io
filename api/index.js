@@ -1042,6 +1042,33 @@ const validateStudiesSchema = (data) => {
         return true;
     }
     
+    // CHAOS-configured study (has requiredRoles or visitRoleRequirements): minimal validation so edits always save
+    const hasChaosConfig = (data.requiredRoles && Array.isArray(data.requiredRoles)) || (data.visitRoleRequirements && typeof data.visitRoleRequirements === 'object' && data.visitRoleRequirements !== null);
+    if (hasChaosConfig) {
+        const nameOrTitle = (data.title || data.name || '').toString().trim();
+        if (!nameOrTitle) {
+            errors.push('title or name is required');
+        }
+        if (data.requiredRoles !== undefined && !Array.isArray(data.requiredRoles)) {
+            errors.push('requiredRoles must be an array');
+        }
+        if (data.siteIds !== undefined && !Array.isArray(data.siteIds)) {
+            errors.push('siteIds must be an array');
+        }
+        if (data.siteRoleRequirements !== undefined && (typeof data.siteRoleRequirements !== 'object' || data.siteRoleRequirements === null)) {
+            errors.push('siteRoleRequirements must be an object');
+        }
+        if (data.visitRoleRequirements !== undefined && (typeof data.visitRoleRequirements !== 'object' || data.visitRoleRequirements === null)) {
+            errors.push('visitRoleRequirements must be an object');
+        }
+        if (errors.length > 0) {
+            console.error('Study validation errors (CHAOS-configured):', errors);
+            throw new Error(`VALIDATION_ERROR: Studies validation failed: ${errors.join(', ')}`);
+        }
+        console.log('Study validation passed (CHAOS-configured minimal)');
+        return true;
+    }
+    
     const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
     console.log('Is CHAOS format:', isChaosFormat);
     
@@ -1075,8 +1102,10 @@ const validateStudiesSchema = (data) => {
             errors.push('description must be a string');
         }
         
-        if (data.status && !['active', 'inactive', 'completed', 'suspended'].includes(data.status.toLowerCase())) {
-            errors.push('status must be one of: active, inactive, completed, suspended');
+        // Allow both CHAOS and ARTEMIS status (studies from ARTEMIS can be configured in CHAOS)
+        const allowedStatus = ['active', 'inactive', 'completed', 'suspended', 'recruiting', 'enrolling'];
+        if (data.status && !allowedStatus.includes((data.status + '').toLowerCase())) {
+            errors.push('status must be one of: active, inactive, completed, suspended, recruiting, enrolling');
         }
         
         if (data.phase && typeof data.phase !== 'string') {
@@ -1969,10 +1998,14 @@ async function crudHandler(context, request, containerName) {
                 try {
                     const { resource: createdItem } = await container.items.create(newItem);
                     
-                    // Calculate enrollment for studies
+                    // Calculate enrollment for studies (non-fatal)
                     if (containerName === 'studies') {
-                        const enrollment = await calculateStudyEnrollment(createdItem.id);
-                        createdItem.enrolled = enrollment;
+                        try {
+                            createdItem.enrolled = await calculateStudyEnrollment(createdItem.id);
+                        } catch (e) {
+                            context.log.warn('Study enrollment calc failed:', e?.message || e);
+                            createdItem.enrolled = 0;
+                        }
                     }
                     
                     return { status: 201, jsonBody: createdItem };
@@ -2109,6 +2142,8 @@ async function crudHandler(context, request, containerName) {
                         if (existingStudy) {
                             requestBody = { ...existingStudy, ...requestBody };
                             requestBody.id = updateId;
+                            // Strip Cosmos system fields before upsert (can cause rejections or odd behavior)
+                            ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => { delete requestBody[k]; });
                         }
                     } catch (e) {
                         context.log.warn('Could not read existing study for merge:', e.message);
@@ -2229,10 +2264,14 @@ async function crudHandler(context, request, containerName) {
                         return { jsonBody: correctedResult };
                     }
                     
-                    // Calculate enrollment for studies
+                    // Calculate enrollment for studies (non-fatal: never cause 500)
                     if (containerName === 'studies') {
-                        const enrollment = await calculateStudyEnrollment(result.id);
-                        result.enrolled = enrollment;
+                        try {
+                            result.enrolled = await calculateStudyEnrollment(result.id);
+                        } catch (e) {
+                            context.log.warn('Study enrollment calc failed:', e?.message || e);
+                            result.enrolled = result.enrolled ?? 0;
+                        }
                     }
                     
                     return { jsonBody: result };
