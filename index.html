@@ -4580,13 +4580,22 @@
                 return visitNumber;
             };
             
-            // Helper function to get CRCs assigned to an event from roleAssignments
+            // Helper function to get CRCs assigned to an event from roleAssignments, crcId, or crcIds
             const getEventCRCs = (event) => {
                 const crcs = [];
                 if (event.crcId) {
                     // Legacy: check top-level crcId
                     const crc = state.crcs.find(c => c.id === event.crcId);
                     if (crc) crcs.push(crc);
+                }
+                // Travel Day and shared travel: crcIds can include multiple CRCs
+                if (event.crcIds && Array.isArray(event.crcIds)) {
+                    event.crcIds.forEach(crcId => {
+                        if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                            const c = state.crcs.find(c => c.id === crcId);
+                            if (c && !crcs.find(x => x.id === c.id)) crcs.push(c);
+                        }
+                    });
                 }
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                     // New system: get CRCs from roleAssignments (includes regular roles and training roles)
@@ -7523,7 +7532,9 @@
                     if (siteSelect) {
                         siteSelect.addEventListener('change', handleShiftStudySiteSelection);
                     }
-                     if(crcSelect) crcSelect.addEventListener('change', (e) => {
+                    const overrideCb = form.querySelector('input[name="overrideCrcRestrictions"]');
+                    if (overrideCb) overrideCb.addEventListener('change', handleShiftStudySiteSelection);
+                    if(crcSelect) crcSelect.addEventListener('change', (e) => {
                         updateCrcHoursDisplay(e.target.value, startDateInput.value);
                         handleShiftStudySiteSelection();
                         // Render role assignments when CRCs are selected (for Travel Day with training roles)
@@ -21345,6 +21356,10 @@
                         <!-- Role Assignment (Step 2) -->
                         <div id="role-assignment-section" class="${show.role ? '' : 'hidden'} space-y-4 border-t dark:border-gray-700 pt-4">
                             <h3 class="text-lg font-semibold dark:text-white">Step 2: Assign Staff to Roles</h3>
+                            <label class="flex items-center gap-2 ${isSupervisor ? 'hidden' : ''}">
+                                <input type="checkbox" name="overrideCrcRestrictions" class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
+                                <span class="text-sm text-gray-600 dark:text-gray-400">Override: allow selecting anyone (ignore availability &amp; training)</span>
+                            </label>
                             ${isEditing && event ? `
                                 <div id="current-assignments-preview" class="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
                                     <h4 class="text-sm font-semibold text-blue-900 dark:text-blue-200 mb-2">Currently Assigned Staff:</h4>
@@ -25831,6 +25846,10 @@
                     case 'refresh-studies': {
                         renderStudiesContent();
                         showNotification('Studies refreshed!', 'success');
+                        break;
+                    }
+                    case 'add-training': {
+                        openModal(getAddTrainingModalHTML(), '4xl');
                         break;
                     }
                     case 'configure-study-roles': {
@@ -31422,6 +31441,11 @@
                                         
                                         // Get travel day preferences from checkboxes
                                         for (const crcId of assignedCrcsForTravelPrefsMulti) {
+                                            const tnEl = form.querySelector(`input[name="travel-not-needed-${crcId}"]`) || document.getElementById('travel-selection-container')?.querySelector(`input[name="travel-not-needed-${crcId}"]`);
+                                            if (tnEl && tnEl.checked) {
+                                                travelDayPreferencesMulti[crcId] = { includeStartTravel: false, includeEndTravel: false, startTravelDate: '', endTravelDate: '', travelNotNeeded: true };
+                                                continue;
+                                            }
                                             const includeStartTravelForCrc = form.querySelector(`input[name="travel-start-${crcId}"]`)?.checked === true;
                                             const includeEndTravelForCrc = form.querySelector(`input[name="travel-end-${crcId}"]`)?.checked === true;
                                             const startTravelDateInput = form.querySelector(`input[name="travel-start-date-${crcId}"]`);
@@ -31655,6 +31679,11 @@
                                         // Get travel day preferences from checkboxes
                                         // Check both in form and in travel-selection-container (in case checkboxes are nested)
                                         for (const crcId of assignedCrcsForTravelPrefs) {
+                                            const tnEl = form.querySelector(`input[name="travel-not-needed-${crcId}"]`) || document.getElementById('travel-selection-container')?.querySelector(`input[name="travel-not-needed-${crcId}"]`);
+                                            if (tnEl && tnEl.checked) {
+                                                travelDayPreferences[crcId] = { includeStartTravel: false, includeEndTravel: false, startTravelDate: '', endTravelDate: '', travelNotNeeded: true };
+                                                continue;
+                                            }
                                             let startCheckbox = form.querySelector(`input[name="travel-start-${crcId}"]`);
                                             let endCheckbox = form.querySelector(`input[name="travel-end-${crcId}"]`);
                                             let startTravelDateInput = form.querySelector(`input[name="travel-start-date-${crcId}"]`);
@@ -31898,6 +31927,12 @@
                                             
                                             // First pass: collect all travel preferences and group by date
                                             for (const crcId of assignedCrcsForTravel) {
+                                                const travelNotNeededEl = form.querySelector(`input[name="travel-not-needed-${crcId}"]`) || document.getElementById('travel-selection-container')?.querySelector(`input[name="travel-not-needed-${crcId}"]`);
+                                                if (travelNotNeededEl && travelNotNeededEl.checked) {
+                                                    if (!updatedEvent.travelDayPreferences) updatedEvent.travelDayPreferences = {};
+                                                    updatedEvent.travelDayPreferences[crcId] = { includeStartTravel: false, includeEndTravel: false, startTravelDate: '', endTravelDate: '', travelNotNeeded: true };
+                                                    continue;
+                                                }
                                                 // Check per-CRC travel checkboxes
                                                 // Check both in form and in travel-selection-container (in case checkboxes are nested)
                                                 const startCheckboxSelector = `input[name="travel-start-${crcId}"]`;
@@ -32394,6 +32429,9 @@
                                             const travelDaysByDate = new Map();
                                             
                                             for (const crcId of assignedCrcs) {
+                                                const travelNotNeededEl = form.querySelector(`input[name="travel-not-needed-${crcId}"]`) || document.getElementById('travel-selection-container')?.querySelector(`input[name="travel-not-needed-${crcId}"]`);
+                                                if (travelNotNeededEl && travelNotNeededEl.checked) continue;
+                                                
                                                 const roles = [];
                                                 Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
                                                     if (assignments.includes(crcId)) {
@@ -32813,8 +32851,9 @@
                                             }
                                             
                                             // Check per-CRC travel checkboxes - only create travel days if explicitly checked
-                                            const includeStartTravelForCrc = crcId ? (form.querySelector(`input[name="travel-start-${crcId}"]`)?.checked === true) : false;
-                                            const includeEndTravelForCrc = crcId ? (form.querySelector(`input[name="travel-end-${crcId}"]`)?.checked === true) : false;
+                                            const travelNotNeededLegacy = crcId ? (form.querySelector(`input[name="travel-not-needed-${crcId}"]`) || document.getElementById('travel-selection-container')?.querySelector(`input[name="travel-not-needed-${crcId}"]`))?.checked : false;
+                                            const includeStartTravelForCrc = !travelNotNeededLegacy && crcId ? (form.querySelector(`input[name="travel-start-${crcId}"]`)?.checked === true) : false;
+                                            const includeEndTravelForCrc = !travelNotNeededLegacy && crcId ? (form.querySelector(`input[name="travel-end-${crcId}"]`)?.checked === true) : false;
                                             
                                             // Create start travel day only if checkbox is checked for this CRC
                                             if (eventType === 'Site Assignment' && includeStartTravelForCrc && crcId) {
@@ -34256,6 +34295,30 @@
                         }
                         break;
                     }
+                    case 'add-training-form': {
+                        try {
+                            const title = (data.title || '').trim();
+                            if (!title) {
+                                showNotification('Training title is required.', 'error');
+                                break;
+                            }
+                            const siteIds = formData.getAll('siteIds').filter(Boolean);
+                            const payload = {
+                                title,
+                                studyType: 'training',
+                                source: 'CHAOS',
+                                siteIds: siteIds.length > 0 ? siteIds : []
+                            };
+                            const created = await apiService.createStudy(payload);
+                            setState({ studies: [...(state.studies || []), created] });
+                            showNotification('Training created. You can schedule it like a study and configure roles in Studies.', 'success');
+                            closeModal();
+                            if (state.activeTab === 'studies') renderStudiesContent();
+                        } catch (error) {
+                            showNotification(error.message || 'Failed to create training.', 'error');
+                        }
+                        break;
+                    }
                     case 'add-travel-form': {
                         try {
                             const newTravel = await apiService.createTravel(data);
@@ -35091,13 +35154,23 @@
                         const study = state.studies.find(s => s.id === studyId);
                         
                         // Prioritize siteIds from ARTEMIS, then check siteRoleRequirements, then fallback to sites
+                        // Newer/Artemis studies may key siteRoleRequirements by site name; resolve to site IDs so they match legacy behavior
                         let studySites = [];
                         if (study?.siteIds && Array.isArray(study.siteIds) && study.siteIds.length > 0) {
                             studySites = study.siteIds;
                         } else if (study?.siteRoleRequirements && Object.keys(study.siteRoleRequirements).length > 0) {
-                            studySites = Object.keys(study.siteRoleRequirements);
+                            const resolved = [];
+                            Object.keys(study.siteRoleRequirements).forEach(k => {
+                                if (state.crc_sites && state.crc_sites.some(s => s.id === k)) {
+                                    resolved.push(k);
+                                    return;
+                                }
+                                const s = state.crc_sites && state.crc_sites.find(s => (s.name || '').trim() === String(k).trim());
+                                if (s) resolved.push(s.id);
+                            });
+                            studySites = [...new Set(resolved)];
                         } else if (study?.sites && Array.isArray(study.sites) && study.sites.length > 0) {
-                            studySites = study.sites;
+                            studySites = study.sites.map(s => (typeof s === 'object' && s && s.id) ? s.id : s).filter(Boolean);
                         }
                         
                         if (studySites.length > 0) {
@@ -35152,10 +35225,9 @@
                                                 const role = state.roles.find(r => r.id === roleId);
                                                 const roleName = role ? role.name : '';
                                                 
-                                                // Only show CRCs who have valid training for this role
-                                                const qualifiedCrcs = state.crcs.filter(c => hasValidTraining(c, roleName))
+                                                const allowOverrideEdit = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
+                                                const qualifiedCrcs = state.crcs.filter(c => allowOverrideEdit ? true : hasValidTraining(c, roleName))
                                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                                                // Get training type and mode from merged data (form state takes precedence)
                                                 const trainingTypeValue = (mergedTrainingAssignments[roleId] && mergedTrainingAssignments[roleId][index]) || getExistingTrainingType(roleId, index);
                                                 const trainingModeKey = `${roleId}-${index}`;
                                                 const trainingMode = mergedTrainingModes[trainingModeKey] || getExistingTrainingMode(roleId, index);
@@ -35170,10 +35242,9 @@
                                                                 <option value="SITE_STAFF" ${crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
                                                                 <option value="UNASSIGNED" ${crcId === 'UNASSIGNED' ? 'selected' : ''} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>
                                                                 ${qualifiedCrcs.map(c => {
-                                                                    // Pass excludeEventId and excludeGroupId to avoid showing CRCs on this shift as unavailable
                                                                     const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
                                                                     const excludeGroupIdForEdit = existingEvent ? existingEvent.groupId : null;
-                                                                    const isUnavailable = isCRCUnavailable(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
+                                                                    const isUnavailable = allowOverrideEdit ? false : isCRCUnavailable(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
                                                                     const unavailPeriod = getUnavailabilityPeriod(c.id, date);
                                                                     let statusText = '';
                                                                     if (isUnavailable) {
@@ -35464,6 +35535,16 @@
                 // Get required roles for the selected studies at the selected site
                 const requiredRoles = new Map();
                 
+                // Helper: resolve role by ID or name so newer/Artemis studies using names are treated like legacy (by ID)
+                const resolveRoleId = (roleIdOrName) => {
+                    if (!roleIdOrName || !state.roles || !state.roles.length) return null;
+                    const s = String(roleIdOrName).trim();
+                    let r = state.roles.find(r => r && r.id === s);
+                    if (r) return r.id;
+                    r = state.roles.find(r => r && (r.name || '').trim() === s);
+                    return r ? r.id : null;
+                };
+                
                 // Get visit number FIRST, before looping through studies
                 // Try multiple ways to get the visit number since the element might be recreated
                 const visitNumberSelectForRoles = form.querySelector('select[name="visitNumber"]') || document.getElementById('visitNumberSelect');
@@ -35527,12 +35608,22 @@
                             visitReqs = study.visitRoleRequirements['default'];
                             console.log('✓ Using default visit requirements (no visit selected):', visitReqs);
                         } else if (visitNumber && visitNumber !== 'default' && visitNumber !== '') {
-                            // Specific visit selected - try to get visit-specific requirements
-                            const visitKey = `visit-${visitNumber}`;
-                            visitReqs = study.visitRoleRequirements[visitKey];
-                            console.log(`✓ Checking visit-specific requirements for visit ${visitNumber} (key: ${visitKey}):`, visitReqs);
-                            console.log(`✓ Available visit keys:`, Object.keys(study.visitRoleRequirements));
-                            
+                            // Specific visit selected - try keys used by legacy and newer/Artemis studies
+                            const keysToTry = [
+                                `visit-${visitNumber}`,
+                                String(visitNumber),
+                                (study.visitNames && study.visitNames[`visit-${visitNumber}`]) || null,
+                                (study.visitNames && study.visitNames[visitNumber]) || null
+                            ].filter(Boolean);
+                            for (const k of keysToTry) {
+                                const v = study.visitRoleRequirements[k];
+                                if (v && typeof v === 'object' && Object.keys(v).length > 0) {
+                                    visitReqs = v;
+                                    console.log(`✓ Using visit-specific requirements for key "${k}":`, visitReqs);
+                                    break;
+                                }
+                            }
+                            console.log(`✓ Checked visit keys: ${keysToTry.join(', ')}; available:`, Object.keys(study.visitRoleRequirements));
                             // If no visit-specific requirements, fall back to default
                             if (!visitReqs || (visitReqs && Object.keys(visitReqs).length === 0)) {
                                 if (study.visitRoleRequirements['default']) {
@@ -35556,13 +35647,13 @@
                                 console.log('✓ Applying visit-specific role requirements');
                             }
                             Object.entries(visitReqs).forEach(([roleId, quantity]) => {
-                                const role = state.roles.find(r => r.id === roleId);
-                                if (role) {
-                                    // For visit-specific, use the visit's quantity directly (don't accumulate)
-                                    requiredRoles.set(roleId, quantity);
-                                    console.log(`  → Set role ${role.name} with quantity ${quantity} from visitRoleRequirements`);
+                                const resolvedId = resolveRoleId(roleId);
+                                if (resolvedId) {
+                                    const role = state.roles.find(r => r.id === resolvedId);
+                                    requiredRoles.set(resolvedId, quantity);
+                                    console.log(`  → Set role ${(role && role.name) || roleId} with quantity ${quantity} from visitRoleRequirements`);
                                 } else {
-                                    console.log(`  ✗ Role not found for ID: ${roleId}`);
+                                    console.log(`  ✗ Role not found for ID or name: ${roleId}`);
                                 }
                             });
                             visitReqsUsed = true;
@@ -35576,15 +35667,24 @@
                     // DO NOT use fallbacks if no visit is selected (we already handled default above)
                     // Only use fallbacks if we tried to use visit requirements but they were empty
                     if ((hasVisitSelected || shouldUseDefault) && (!study?.visitRoleRequirements || !visitReqsUsed || requiredRoles.size === 0)) {
-                        // Fallback: check for site-specific role requirements (legacy support)
-                        if (study && study.siteRoleRequirements && study.siteRoleRequirements[selectedSiteId]) {
-                            console.log('✓ Found site role requirements (legacy):', study.siteRoleRequirements[selectedSiteId]);
-                            Object.entries(study.siteRoleRequirements[selectedSiteId]).forEach(([roleId, quantity]) => {
-                                const role = state.roles.find(r => r.id === roleId);
-                                if (role) {
-                                    const currentQuantity = requiredRoles.get(roleId) || 0;
-                                    requiredRoles.set(roleId, currentQuantity + quantity);
-                                    console.log(`  → Added role ${role.name} with quantity ${quantity} from siteRoleRequirements`);
+                        // Fallback: check for site-specific role requirements (legacy and newer/Artemis)
+                        // Try selectedSiteId first, then site name (newer studies may key by name)
+                        let siteReqs = study && study.siteRoleRequirements ? study.siteRoleRequirements[selectedSiteId] : null;
+                        if (!siteReqs && study && study.siteRoleRequirements && selectedSiteId) {
+                            const site = state.crc_sites.find(s => s.id === selectedSiteId);
+                            if (site) siteReqs = study.siteRoleRequirements[(site.name || '').trim()] || study.siteRoleRequirements[site.name];
+                        }
+                        if (siteReqs && typeof siteReqs === 'object' && Object.keys(siteReqs).length > 0) {
+                            console.log('✓ Found site role requirements (legacy/Artemis):', siteReqs);
+                            Object.entries(siteReqs).forEach(([roleId, quantity]) => {
+                                const resolvedId = resolveRoleId(roleId);
+                                if (resolvedId) {
+                                    const role = state.roles.find(r => r.id === resolvedId);
+                                    const currentQuantity = requiredRoles.get(resolvedId) || 0;
+                                    requiredRoles.set(resolvedId, currentQuantity + quantity);
+                                    console.log(`  → Added role ${(role && role.name) || roleId} with quantity ${quantity} from siteRoleRequirements`);
+                                } else {
+                                    console.log(`  ✗ Role not found for ID or name: ${roleId}`);
                                 }
                             });
                         }
@@ -35592,13 +35692,14 @@
                         else if (study && study.requiredRoles && study.requiredRoles.length > 0) {
                             console.log('✓ Using general requiredRoles from study:', study.requiredRoles);
                             study.requiredRoles.forEach(roleId => {
-                                const role = state.roles.find(r => r.id === roleId);
-                                if (role) {
-                                    const currentQuantity = requiredRoles.get(roleId) || 0;
-                                    requiredRoles.set(roleId, currentQuantity + 1); // Default to 1 if no specific quantity
-                                    console.log(`  → Added role ${role.name} with default quantity 1 from requiredRoles`);
+                                const resolvedId = resolveRoleId(roleId);
+                                if (resolvedId) {
+                                    const role = state.roles.find(r => r.id === resolvedId);
+                                    const currentQuantity = requiredRoles.get(resolvedId) || 0;
+                                    requiredRoles.set(resolvedId, currentQuantity + 1); // Default to 1 if no specific quantity
+                                    console.log(`  → Added role ${(role && role.name) || roleId} with default quantity 1 from requiredRoles`);
                                 } else {
-                                    console.log(`  ✗ Role not found for ID: ${roleId}`);
+                                    console.log(`  ✗ Role not found for ID or name: ${roleId}`);
                                 }
                             });
                         }
@@ -35677,18 +35778,23 @@
                     const buildRoleOptionsHtml = (roleName, assignedCrcId = '') => {
                             const excludeEventId = existingEvent ? existingEvent.id : null;
                             const excludeGroupId = existingEvent ? existingEvent.groupId : null;
+                            const allowOverride = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
 
-                            const qualifiedCrcs = (state.crcs || [])
-                                .filter(crc => hasValidTraining(crc, roleName))
+                            let qualifiedCrcs = (state.crcs || [])
+                                .filter(crc => allowOverride ? true : hasValidTraining(crc, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
-                            const available = [];
-                            const unavailable = [];
-                            qualifiedCrcs.forEach(crc => {
-                                const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
-                                if (isUnavailable) unavailable.push(crc);
-                                else available.push(crc);
-                            });
+                            let available = [];
+                            let unavailable = [];
+                            if (allowOverride) {
+                                available = qualifiedCrcs;
+                            } else {
+                                qualifiedCrcs.forEach(crc => {
+                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
+                                    if (isUnavailable) unavailable.push(crc);
+                                    else available.push(crc);
+                                });
+                            }
 
                             let optionsHtml = '';
                             optionsHtml += `<option value="SITE_STAFF" ${assignedCrcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
@@ -35892,8 +35998,9 @@
                             : [])).filter(Boolean);
                         const existingCrcId = existingAssignments[0] || '';
                         
-                        // Only show CRCs who have valid training for this role
-                        let qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, roleName))
+                        const allowOverrideRole = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
+                        // Only show CRCs who have valid training for this role (or all if override)
+                        let qualifiedCrcs = state.crcs.filter(crc => allowOverrideRole ? true : hasValidTraining(crc, roleName))
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         
                         // IMPORTANT: If editing, include assigned CRCs even if they don't have training
@@ -35932,7 +36039,7 @@
                         const excludeEventId = existingEvent ? existingEvent.id : null;
                         const excludeGroupId = existingEvent ? existingEvent.groupId : null;
                         const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                            const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
+                            const isUnavailable = allowOverrideRole ? false : isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                             const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
                             const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                             let distance = null;
@@ -36219,30 +36326,26 @@
                                 const roleForSlot = state.roles.find(r => r.id === roleId);
                                 if (!roleForSlot) return;
                                 
-                                const qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, roleForSlot.name))
+                                const allowOverrideQty = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
+                                const qualifiedCrcs = state.crcs.filter(crc => allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
                                 const date = dateInput ? dateInput.value : toDateOnlyString(new Date());
                                 const period = periodSelect ? periodSelect.value : 'Full Day';
                                 
-                                // Build options for new slots
                                 let optionsHtml = '<option value="">Select Staff</option>';
                                 optionsHtml += `<option value="SITE_STAFF" class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
                                 optionsHtml += `<option value="UNASSIGNED" class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>`;
                                 const excludeEventIdForDynamic = existingEvent ? existingEvent.id : null;
                                 const excludeGroupIdForDynamic = existingEvent ? existingEvent.groupId : null;
                                 
-                                // Separate available and unavailable CRCs
                                 const availableCrcs = [];
                                 const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
-                                    if (isUnavailable) {
-                                        unavailableCrcs.push(crc);
-                                    } else {
-                                        availableCrcs.push(crc);
-                                    }
+                                    const isUnavailable = allowOverrideQty ? false : isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
+                                    if (isUnavailable) unavailableCrcs.push(crc);
+                                    else availableCrcs.push(crc);
                                 });
                                 
                                 // Add available CRCs first
@@ -36376,19 +36479,17 @@
                     // Get existing assignments for this role if editing - use mergedRoleAssignments which has converted legacy data
                     let existingAssignments = (mergedRoleAssignments[roleId] || []).filter(Boolean);
                     
-                    // Get CRCs who can fill this role (only show those with valid training)
-                    let qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, role.name))
+                    const allowOverrideReq = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
+                    // Get CRCs who can fill this role (only show those with valid training, or all if override)
+                    let qualifiedCrcs = state.crcs.filter(crc => allowOverrideReq ? true : hasValidTraining(crc, role.name))
                         .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     
-                    // IMPORTANT: If editing, track assigned CRCs that don't have training
-                    // These will only appear in the dropdown if they're currently assigned (to preserve existing assignments)
                     const untrainedAssignedCrcs = [];
                     if (isEditing && existingAssignments.length > 0) {
                         existingAssignments.forEach(assignedCrcId => {
                             if (assignedCrcId && assignedCrcId !== 'SITE_STAFF') {
                                 const assignedCrc = state.crcs.find(c => c.id === assignedCrcId);
                                 if (assignedCrc && !qualifiedCrcs.find(c => c.id === assignedCrcId)) {
-                                    // This CRC is assigned but doesn't have training - track separately
                                     untrainedAssignedCrcs.push(assignedCrc);
                                     console.log(`Tracking assigned CRC ${assignedCrc.name} who doesn't have training for ${role.name}`);
                                 }
@@ -36396,24 +36497,19 @@
                         });
                     }
                     
-                    // Check if this role requires training - if not, allow all CRCs (including new ones without training)
                     const requiredTrainingNames = getTrainingNamesForRole(role.name);
                     const roleRequiresTraining = requiredTrainingNames.length > 0;
                     
-                    // If role doesn't require training, include all CRCs (for new CRCs without training records)
                     if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
                         qualifiedCrcs = state.crcs.filter(crc => crc && crc.id)
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     }
                     
-                    // Get site for distance calculation
                     const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
-                    
-                    // Calculate availability and distance for each CRC, then sort
                     const excludeEventId = existingEvent ? existingEvent.id : null;
                     const excludeGroupId = existingEvent ? existingEvent.groupId : null;
                     const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                        const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
+                        const isUnavailable = allowOverrideReq ? false : isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                         const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
                         const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                         let distance = null;
@@ -36799,49 +36895,33 @@
                             if (!role) return;
                             
                             if (newQuantity > currentSlots) {
-                                // Add more slots
-                                const qualifiedCrcs = state.crcs.filter(crc => hasValidTraining(crc, role.name))
+                                const allowOverrideInc = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
+                                const qualifiedCrcs = state.crcs.filter(crc => allowOverrideInc ? true : hasValidTraining(crc, role.name))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
                                 const date = dateInput ? dateInput.value : toDateOnlyString(new Date());
                                 const period = periodSelect ? periodSelect.value : 'Full Day';
                                 
-                                // Build options for new slots
                                 let optionsHtml = '<option value="">Select Staff</option>';
                                 optionsHtml += `<option value="SITE_STAFF" class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
                                 optionsHtml += `<option value="UNASSIGNED" class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>`;
                                 const excludeEventIdForDynamic = existingEvent ? existingEvent.id : null;
                                 const excludeGroupIdForDynamic = existingEvent ? existingEvent.groupId : null;
                                 
-                                // Separate available and unavailable CRCs
                                 const availableCrcs = [];
                                 const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
-                                    if (isUnavailable) {
-                                        unavailableCrcs.push(crc);
-                                    } else {
-                                        availableCrcs.push(crc);
-                                    }
+                                    const isUnavailable = allowOverrideInc ? false : isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
+                                    if (isUnavailable) unavailableCrcs.push(crc);
+                                    else availableCrcs.push(crc);
                                 });
                                 
-                                // Add available CRCs first
-                                availableCrcs.forEach(crc => {
-                                    optionsHtml += `<option value="${crc.id}">${crc.name}</option>`;
-                                });
-                                
-                                // Add unavailable CRCs at the bottom (grayed out but selectable)
+                                availableCrcs.forEach(crc => { optionsHtml += `<option value="${crc.id}">${crc.name}</option>`; });
                                 unavailableCrcs.forEach(crc => {
                                     const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
                                     const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic, excludeGroupIdForDynamic);
-                                    let statusText = '';
-                                    if (conflictInfo) {
-                                        statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
-                                    } else {
-                                        const periodText = unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Unavailable';
-                                        statusText = ` (Time Off - ${periodText})`;
-                                    }
+                                    let statusText = conflictInfo ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})` : ` (Time Off - ${unavailPeriod || 'Full Day'})`;
                                     optionsHtml += `<option value="${crc.id}" class="text-gray-400 dark:text-gray-500">${crc.name}${statusText}</option>`;
                                 });
                                 
@@ -37118,11 +37198,17 @@
                 };
                 
                 let html = '<div class="space-y-3">';
-                html += '<p class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-2">Select which staff need travel days:</p>';
+                html += '<p class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-2">Select which staff need travel days. Check "Travel not needed" for local staff (or when &le;50 mi from site, this is auto-checked).</p>';
+                
+                const siteIdForDistance = (form && form.querySelector('select[name="siteId"]')) ? form.querySelector('select[name="siteId"]').value : null;
+                const siteForDistance = siteIdForDistance && state.crc_sites ? state.crc_sites.find(s => s.id === siteIdForDistance) : null;
                 
                 Array.from(assignedCrcs).sort().forEach(crcId => {
                     const crc = state.crcs.find(c => c.id === crcId);
                     if (!crc) return;
+                    
+                    // Travel not needed: from saved preferences or explicit user choice
+                    let hasTravelNotNeeded = !!(event && event.travelDayPreferences && event.travelDayPreferences[crcId] && event.travelDayPreferences[crcId].travelNotNeeded);
                     
                     // Calculate travel dates (only if dates are provided)
                     let startTravelDate = null;
@@ -37131,58 +37217,41 @@
                     let endTravelDateStr = '';
                     
                     if (startDate) {
-                        // Default to same day as shift (allows same-day travel)
                         const startDateObj = new Date(startDate + 'T00:00:00');
                         startTravelDate = startDateObj;
                         startTravelDateStr = toDateOnlyString(startTravelDate);
                     }
                     if (endDate) {
-                        // Default to same day as shift (allows same-day travel)
                         const endDateObj = new Date(endDate + 'T00:00:00');
                         endTravelDate = endDateObj;
                         endTravelDateStr = toDateOnlyString(endTravelDate);
                     }
                     
-                    // Check if travel days already exist (only if we have dates)
-                    // Also check stored preferences on the event
                     let hasStartTravel = false;
                     let hasEndTravel = false;
                     
-                    // Use existing travel day preferences if available
                     if (event && event.travelDayPreferences && event.travelDayPreferences[crcId]) {
                         const prefs = event.travelDayPreferences[crcId];
-                        if (prefs.startTravelDate) {
-                            startTravelDateStr = prefs.startTravelDate;
-                        }
-                        if (prefs.endTravelDate) {
-                            endTravelDateStr = prefs.endTravelDate;
-                        }
+                        if (prefs.startTravelDate) startTravelDateStr = prefs.startTravelDate;
+                        if (prefs.endTravelDate) endTravelDateStr = prefs.endTravelDate;
                         hasStartTravel = prefs.includeStartTravel === true;
                         hasEndTravel = prefs.includeEndTravel === true;
                     }
                     
-                    if (startTravelDateStr && !hasStartTravel) {
-                        hasStartTravel = checkExistingTravelDays(crcId, startTravelDateStr);
-                    }
+                    if (startTravelDateStr && !hasStartTravel) hasStartTravel = checkExistingTravelDays(crcId, startTravelDateStr);
+                    if (endTravelDateStr && !hasEndTravel) hasEndTravel = checkExistingTravelDays(crcId, endTravelDateStr);
                     
-                    if (endTravelDateStr && !hasEndTravel) {
-                        hasEndTravel = checkExistingTravelDays(crcId, endTravelDateStr);
-                    }
-                    
-                    // Get travel hours from Navan (only if we have dates)
                     const startTravelHours = startTravelDateStr ? getTravelHoursForCrc(crcId, startTravelDateStr) : null;
                     const endTravelHours = endTravelDateStr ? getTravelHoursForCrc(crcId, endTravelDateStr) : null;
                     
-                    const startHoursText = startTravelHours ? ` (${startTravelHours} hrs from Navan)` : '';
-                    const endHoursText = endTravelHours ? ` (${endTravelHours} hrs from Navan)` : '';
-                    
-                    const startDateLabel = startDate ? `Start travel day (${startTravelDateStr})` : 'Start travel day';
-                    const endDateLabel = endDate ? `End travel day (${endTravelDateStr})` : 'End travel day';
-                    
                     html += `
-                        <div class="border dark:border-gray-600 rounded p-3 bg-gray-50 dark:bg-gray-800">
+                        <div class="border dark:border-gray-600 rounded p-3 bg-gray-50 dark:bg-gray-800" data-travel-crc-id="${crcId}" data-travel-site-id="${siteIdForDistance || ''}">
                             <p class="text-sm font-medium dark:text-white mb-2">${crc.name}</p>
-                            <div class="space-y-3">
+                            <label class="flex items-center mb-2">
+                                <input type="checkbox" name="travel-not-needed-${crcId}" ${hasTravelNotNeeded ? 'checked' : ''} ${isSupervisor ? 'disabled' : ''} class="mr-2 rounded border-gray-300 text-amber-600 focus:ring-amber-500 travel-not-needed-cb ${isSupervisor ? 'opacity-50 cursor-not-allowed' : ''}">
+                                <span class="text-xs text-gray-700 dark:text-gray-300">Travel not needed</span>
+                            </label>
+                            <div class="travel-dates-for-crc space-y-3">
                                 <div class="space-y-2">
                                     <label class="flex items-center">
                                         <input type="checkbox" name="travel-start-${crcId}" ${hasStartTravel ? 'checked' : ''} ${isSupervisor ? 'disabled' : ''} class="mr-2 rounded border-gray-300 text-blue-600 focus:ring-blue-500 ${isSupervisor ? 'opacity-50 cursor-not-allowed' : ''}">
@@ -37313,6 +37382,56 @@
                             });
                         });
                     }
+                    
+                    // Travel not needed: when checked, uncheck start/end so it's clear no travel will be created
+                    container.querySelectorAll('.travel-not-needed-cb').forEach(cb => {
+                        cb.addEventListener('change', function() {
+                            const crcId = this.name.replace('travel-not-needed-', '');
+                            const row = container.querySelector(`[data-travel-crc-id="${crcId}"]`);
+                            if (!row) return;
+                            const startCb = row.querySelector(`input[name="travel-start-${crcId}"]`);
+                            const endCb = row.querySelector(`input[name="travel-end-${crcId}"]`);
+                            const startDate = row.querySelector(`input[name="travel-start-date-${crcId}"]`);
+                            const endDate = row.querySelector(`input[name="travel-end-date-${crcId}"]`);
+                            if (this.checked) {
+                                if (startCb) { startCb.checked = false; startCb.disabled = true; }
+                                if (endCb) { endCb.checked = false; endCb.disabled = true; }
+                                if (startDate) { startDate.value = ''; startDate.disabled = true; }
+                                if (endDate) { endDate.value = ''; endDate.disabled = true; }
+                            } else {
+                                if (startCb) startCb.disabled = false;
+                                if (endCb) endCb.disabled = false;
+                                if (startDate) startDate.disabled = false;
+                                if (endDate) endDate.disabled = false;
+                            }
+                        });
+                        // Set initial state
+                        if (cb.checked) cb.dispatchEvent(new Event('change'));
+                    });
+                    
+                    // Auto "Travel not needed" when CRC is within 50 miles of site
+                    (async () => {
+                        if (typeof calculateCrcToSiteDistance !== 'function') return;
+                        const siteId = (form.querySelector('select[name="siteId"]') || {}).value;
+                        const site = siteId && state.crc_sites ? state.crc_sites.find(s => s.id === siteId) : null;
+                        if (!site) return;
+                        const rows = container.querySelectorAll('[data-travel-crc-id]');
+                        for (const row of rows) {
+                            const crcId = row.getAttribute('data-travel-crc-id');
+                            const crc = state.crcs.find(c => c.id === crcId);
+                            if (!crc) continue;
+                            try {
+                                const mi = await calculateCrcToSiteDistance(crc, site);
+                                if (mi != null && mi <= 50) {
+                                    const tn = container.querySelector(`input[name="travel-not-needed-${crcId}"]`);
+                                    if (tn && !tn.checked) {
+                                        tn.checked = true;
+                                        tn.dispatchEvent(new Event('change'));
+                                    }
+                                }
+                            } catch (e) { /* ignore */ }
+                        }
+                    })();
                 }, 100);
             };
 
@@ -39347,11 +39466,16 @@
 
             // Studies Tab HTML Generation
             const getStudiesHTML = () => {
+                const canAddTraining = state.currentUser && ['Manager','Admin'].includes((state.currentUser.permissionLevel || '').trim());
                 return `
                     <div class="space-y-6">
                         <div class="flex justify-between items-center">
                             <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Studies from ARTEMIS</h2>
                             <div class="flex gap-2">
+                                ${canAddTraining ? `<button data-action="add-training" class="bg-amber-600 text-white px-4 py-2 rounded-md hover:bg-amber-700 flex items-center">
+                                    <i data-lucide="graduation-cap" class="w-4 h-4 mr-2"></i>
+                                    Add Training
+                                </button>` : ''}
                                 <button data-action="refresh-studies" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 flex items-center">
                                     <i data-lucide="refresh-cw" class="w-4 h-4 mr-2"></i>
                                     Refresh
@@ -39583,11 +39707,11 @@
                                         `}
                                     </div>
                                     <div class="ml-4 flex flex-col gap-2">
-                                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-300">
-                                            ARTEMIS
+                                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${study.studyType === 'training' ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/20 dark:text-amber-300' : 'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-300'}">
+                                            ${study.studyType === 'training' ? 'Training' : 'ARTEMIS'}
                                         </span>
-                                        <button data-action="edit-study" data-id="${study.id}" class="text-xs bg-green-600 text-white px-2 py-1 rounded hover:bg-green-700 transition-colors" onclick="event.stopPropagation();">
-                                            Edit Study
+                                        <button data-action="configure-study-roles" data-study-id="${study.id}" class="text-xs bg-green-600 text-white px-2 py-1 rounded hover:bg-green-700 transition-colors" onclick="event.stopPropagation();">
+                                            Configure
                                         </button>
                                     </div>
                                 </div>
@@ -39599,7 +39723,7 @@
                         <div class="flex items-center">
                             <i data-lucide="info" class="w-5 h-5 text-blue-600 dark:text-blue-400 mr-2"></i>
                             <p class="text-sm text-blue-800 dark:text-blue-200">
-                                Showing ${ongoingStudies.length} studies loaded from ARTEMIS. Click on a study to edit it or configure role requirements.
+                                Showing ${ongoingStudies.length} studies and trainings. Click Configure to set role requirements. Trainings are created in CHAOS and scheduled like studies.
                             </p>
                         </div>
                     </div>
@@ -44068,6 +44192,32 @@
                 document.body.removeChild(link);
                 
                 showNotification(`Exported ${filteredTravel.length} travel record(s) to CSV!`, 'success');
+            };
+
+            // Add Training (CHAOS-created, schedulable like a study)
+            const getAddTrainingModalHTML = () => {
+                const siteOpts = (state.crc_sites || []).map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">Add Training</h2>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Create a training in CHAOS that can be scheduled like a study. Assign sites and roles when creating shifts.</p>
+                    <form id="add-training-form" class="space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Training Title <span class="text-red-500">*</span></label>
+                            <input type="text" name="title" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., ICF Training, GCP Refresh">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Sites (optional)</label>
+                            <select name="siteIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white h-32">
+                                ${siteOpts || '<option value="" disabled>No sites available</option>'}
+                            </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hold Ctrl/Cmd to select multiple. You can also configure roles and sites later from the Studies list.</p>
+                        </div>
+                        <div class="flex justify-end gap-2 pt-4 border-t dark:border-gray-700">
+                            <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="submit" class="px-4 py-2 rounded-md bg-amber-600 text-white hover:bg-amber-700">Create Training</button>
+                        </div>
+                    </form>
+                `;
             };
 
             // Travel Modal Functions
