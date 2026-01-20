@@ -2135,19 +2135,11 @@ async function crudHandler(context, request, containerName) {
                     }
                 }
                 
-                // For studies PUT: merge with existing so partial updates (e.g. studyType) don't wipe the document
+                // For studies PUT: use request body as-is (no Cosmos read/merge) so saves always succeed.
+                // The configure-study form sends a full study; we ensure id and strip Cosmos system fields.
                 if (containerName === 'studies' && updateId) {
-                    try {
-                        const { resource: existingStudy } = await container.item(updateId, updateId).read();
-                        if (existingStudy) {
-                            requestBody = { ...existingStudy, ...requestBody };
-                            requestBody.id = updateId;
-                            // Strip Cosmos system fields before upsert (can cause rejections or odd behavior)
-                            ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => { delete requestBody[k]; });
-                        }
-                    } catch (e) {
-                        context.log.warn('Could not read existing study for merge:', e.message);
-                    }
+                    requestBody.id = updateId;
+                    ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => { delete requestBody[k]; });
                 }
                 
                 // Validate schema based on container
