@@ -1018,12 +1018,31 @@ const safeStringify = (value, space = 2) => {
 const validateStudiesSchema = (data) => {
     const errors = [];
     
-    // Debug logging
     console.log('Validating study data:', safeStringify(data));
     
-    // Check if this is CHAOS format (has name, color, requiredRoles, sites)
-    const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
+    // CHAOS-created Training: minimal validation (title required; siteIds, siteRoleRequirements, visitRoleRequirements optional)
+    if (data.studyType === 'training' && data.source === 'CHAOS') {
+        if (!data.title || typeof data.title !== 'string') {
+            errors.push('title is required and must be a string');
+        }
+        if (data.siteIds !== undefined && !Array.isArray(data.siteIds)) {
+            errors.push('siteIds must be an array');
+        }
+        if (data.siteRoleRequirements !== undefined && (typeof data.siteRoleRequirements !== 'object' || data.siteRoleRequirements === null)) {
+            errors.push('siteRoleRequirements must be an object');
+        }
+        if (data.visitRoleRequirements !== undefined && (typeof data.visitRoleRequirements !== 'object' || data.visitRoleRequirements === null)) {
+            errors.push('visitRoleRequirements must be an object');
+        }
+        if (errors.length > 0) {
+            console.error('Study validation errors (Training):', errors);
+            throw new Error(`VALIDATION_ERROR: Studies validation failed: ${errors.join(', ')}`);
+        }
+        console.log('Study validation passed (Training)');
+        return true;
+    }
     
+    const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
     console.log('Is CHAOS format:', isChaosFormat);
     
     if (isChaosFormat) {
