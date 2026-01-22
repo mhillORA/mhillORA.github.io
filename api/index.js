@@ -1829,6 +1829,21 @@ async function crudHandler(context, request, containerName) {
                         // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
                         const { resource } = await container.item(id, id).read(); 
                         if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
+                        // Normalize Travel Day events to ensure they display correctly (not as open shifts)
+                        if (containerName === 'events' && resource && resource.type === 'Travel Day') {
+                            // If crcId is missing/null but crcIds array exists, set crcId from first CRC
+                            if ((!resource.crcId || resource.crcId === null || resource.crcId === '') && 
+                                resource.crcIds && Array.isArray(resource.crcIds) && resource.crcIds.length > 0) {
+                                const firstValidCrcId = resource.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                if (firstValidCrcId) {
+                                    resource.crcId = firstValidCrcId;
+                                }
+                            }
+                            // Ensure crcIds is an array if crcId exists but crcIds doesn't
+                            if (resource.crcId && (!resource.crcIds || !Array.isArray(resource.crcIds))) {
+                                resource.crcIds = [resource.crcId];
+                            }
+                        }
                         return { jsonBody: resource };
                     } catch (error) {
                         // If container doesn't exist, return 404
@@ -1840,6 +1855,28 @@ async function crudHandler(context, request, containerName) {
                 } else {
                     try {
                         const { resources } = await container.items.readAll().fetchAll();
+                        // Normalize Travel Day events to ensure they display correctly (not as open shifts)
+                        if (containerName === 'events' && Array.isArray(resources)) {
+                            const normalizedResources = resources.map(event => {
+                                // Fix Travel Day events: ensure they have crcId set from crcIds if available
+                                if (event && event.type === 'Travel Day') {
+                                    // If crcId is missing/null but crcIds array exists, set crcId from first CRC
+                                    if ((!event.crcId || event.crcId === null || event.crcId === '') && 
+                                        event.crcIds && Array.isArray(event.crcIds) && event.crcIds.length > 0) {
+                                        const firstValidCrcId = event.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                        if (firstValidCrcId) {
+                                            event.crcId = firstValidCrcId;
+                                        }
+                                    }
+                                    // Ensure crcIds is an array if crcId exists but crcIds doesn't
+                                    if (event.crcId && (!event.crcIds || !Array.isArray(event.crcIds))) {
+                                        event.crcIds = [event.crcId];
+                                    }
+                                }
+                                return event;
+                            });
+                            return { jsonBody: normalizedResources };
+                        }
                         return { jsonBody: resources };
                     } catch (error) {
                         // If container doesn't exist yet, return empty array
@@ -1888,6 +1925,8 @@ async function crudHandler(context, request, containerName) {
                 if (containerName === 'events') {
                     // Check if this would result in an N/A entry (no CRC assigned and no valid role assignments)
                     const hasCrcId = body.crcId && body.crcId.trim() !== '';
+                    const hasCrcIds = body.crcIds && Array.isArray(body.crcIds) && body.crcIds.length > 0 && 
+                                      body.crcIds.some(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
                     const hasValidRoleAssignments = body.roleAssignments && 
                         Object.keys(body.roleAssignments).length > 0 &&
                         Object.values(body.roleAssignments).some(assignments => 
@@ -1895,15 +1934,15 @@ async function crudHandler(context, request, containerName) {
                         );
                     
                     // If it's a Site Assignment and has no CRC and no valid role assignments, it's an Open Shift (allowed)
-                    // Travel Day events are also allowed (they should have a crcId but may not have roleAssignments)
+                    // Travel Day events are also allowed (they should have crcId or crcIds array, but may not have roleAssignments)
                     // Otherwise, if it has no CRC and no valid role assignments, reject it as an N/A entry
-                    if (!hasCrcId && !hasValidRoleAssignments) {
+                    if (!hasCrcId && !hasCrcIds && !hasValidRoleAssignments) {
                         if (body.type !== 'Site Assignment' && body.type !== 'Open Shift' && body.type !== 'Travel Day') {
                             return {
                                 status: 400,
                                 jsonBody: { 
                                     error: 'Cannot create event with no CRC assigned and no valid role assignments. This would result in an N/A entry.',
-                                    details: 'Events must have either a crcId or valid roleAssignments with assigned CRCs.'
+                                    details: 'Events must have either a crcId, crcIds array, or valid roleAssignments with assigned CRCs.'
                                 },
                                 headers: { 'Content-Type': 'application/json' }
                             };
