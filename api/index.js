@@ -1856,26 +1856,31 @@ async function crudHandler(context, request, containerName) {
                     try {
                         const { resources } = await container.items.readAll().fetchAll();
                         // Normalize Travel Day events to ensure they display correctly (not as open shifts)
-                        if (containerName === 'events' && Array.isArray(resources)) {
-                            const normalizedResources = resources.map(event => {
-                                // Fix Travel Day events: ensure they have crcId set from crcIds if available
-                                if (event && event.type === 'Travel Day') {
-                                    // If crcId is missing/null but crcIds array exists, set crcId from first CRC
-                                    if ((!event.crcId || event.crcId === null || event.crcId === '') && 
-                                        event.crcIds && Array.isArray(event.crcIds) && event.crcIds.length > 0) {
-                                        const firstValidCrcId = event.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
-                                        if (firstValidCrcId) {
-                                            event.crcId = firstValidCrcId;
+                        // Only normalize if we have events and they're Travel Day type (optimization)
+                        if (containerName === 'events' && Array.isArray(resources) && resources.length > 0) {
+                            // Quick check: only process if there are any Travel Day events
+                            const hasTravelDays = resources.some(e => e && e.type === 'Travel Day');
+                            if (hasTravelDays) {
+                                const normalizedResources = resources.map(event => {
+                                    // Fix Travel Day events: ensure they have crcId set from crcIds if available
+                                    if (event && event.type === 'Travel Day') {
+                                        // If crcId is missing/null but crcIds array exists, set crcId from first CRC
+                                        if ((!event.crcId || event.crcId === null || event.crcId === '') && 
+                                            event.crcIds && Array.isArray(event.crcIds) && event.crcIds.length > 0) {
+                                            const firstValidCrcId = event.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                            if (firstValidCrcId) {
+                                                event.crcId = firstValidCrcId;
+                                            }
+                                        }
+                                        // Ensure crcIds is an array if crcId exists but crcIds doesn't
+                                        if (event.crcId && (!event.crcIds || !Array.isArray(event.crcIds))) {
+                                            event.crcIds = [event.crcId];
                                         }
                                     }
-                                    // Ensure crcIds is an array if crcId exists but crcIds doesn't
-                                    if (event.crcId && (!event.crcIds || !Array.isArray(event.crcIds))) {
-                                        event.crcIds = [event.crcId];
-                                    }
-                                }
-                                return event;
-                            });
-                            return { jsonBody: normalizedResources };
+                                    return event;
+                                });
+                                return { jsonBody: normalizedResources };
+                            }
                         }
                         return { jsonBody: resources };
                     } catch (error) {

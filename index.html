@@ -32342,13 +32342,33 @@
                                             });
                                         });
                                         
-                                        // If we have assigned CRCs, create separate events for each
-                                        if (assignedCrcs.size > 0) {
+                                        // CRITICAL: Also collect CRCs from travel checkboxes (they might be selected before roles are assigned)
+                                        // This ensures travel days can be created even if roles aren't assigned yet
+                                        const travelCrcsFromCheckboxes = new Set();
+                                        const travelCheckboxes = form.querySelectorAll('input[name^="travel-start-"], input[name^="travel-end-"]');
+                                        travelCheckboxes.forEach(checkbox => {
+                                            if (checkbox.checked) {
+                                                // Extract CRC ID from checkbox name: "travel-start-{crcId}" or "travel-end-{crcId}"
+                                                const nameParts = checkbox.name.split('-');
+                                                if (nameParts.length >= 3) {
+                                                    const crcId = nameParts.slice(2).join('-'); // Handle CRC IDs with dashes
+                                                    if (crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                        travelCrcsFromCheckboxes.add(crcId);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        
+                                        // Combine CRCs from role assignments and travel checkboxes
+                                        const allAssignedCrcs = new Set([...assignedCrcs, ...travelCrcsFromCheckboxes]);
+                                        
+                                        // If we have assigned CRCs (from roles or travel), create events
+                                        if (allAssignedCrcs.size > 0) {
                                             // Group CRCs by travel date to create shared travel days
                                             // Map: dateStr -> { start: Set of crcIds, end: Set of crcIds }
                                             const travelDaysByDate = new Map();
                                             
-                                            for (const crcId of assignedCrcs) {
+                                            for (const crcId of allAssignedCrcs) {
                                                 const travelNotNeededEl = form.querySelector(`input[name="travel-not-needed-${crcId}"]`) || document.getElementById('travel-selection-container')?.querySelector(`input[name="travel-not-needed-${crcId}"]`);
                                                 if (travelNotNeededEl && travelNotNeededEl.checked) continue;
                                                 
@@ -32527,11 +32547,18 @@
                                             }
                                             
                                             // Create main assignment events for each CRC
-                                            for (const crcId of assignedCrcs) {
+                                            // Use allAssignedCrcs to include CRCs from both role assignments and travel checkboxes
+                                            // This ensures shifts are created even if travel was selected before roles were assigned
+                                            console.log('Creating shifts for CRCs:', Array.from(allAssignedCrcs), 'from roleAssignments:', Array.from(assignedCrcs), 'from travel:', Array.from(travelCrcsFromCheckboxes));
+                                            for (const crcId of allAssignedCrcs) {
+                                                console.log('Processing shift creation for CRC:', crcId);
                                                 // Ensure startDate and endDate are Date objects (they should already be from parseDateOnly)
                                                 const startDateObjLoop = startDate instanceof Date ? startDate : parseDateOnly(startDate);
                                                 const endDateObjLoop = endDate instanceof Date ? endDate : parseDateOnly(endDate);
-                                                if (!startDateObjLoop || !endDateObjLoop) continue;
+                                                if (!startDateObjLoop || !endDateObjLoop) {
+                                                    console.log('Skipping CRC', crcId, '- invalid dates');
+                                                    continue;
+                                                }
                                                 
                                                 for (let d = new Date(startDateObjLoop); d <= endDateObjLoop; d.setDate(d.getDate() + 1)) {
                                                 const dateStr = toDateOnlyString(d);
@@ -32573,11 +32600,18 @@
                                                 const hasValidCrc = crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED';
                                                 const hasValidRoleAssignments = Object.keys(crcRoleAssignments).length > 0;
                                                 
-                                                // Skip creating this event if it would be an N/A entry
-                                                if (!hasValidCrc && !hasValidRoleAssignments) {
+                                                // CRITICAL: If CRC is valid but no role assignments, use finalRoleAssignments instead
+                                                // This ensures shifts are created even if crcRoleAssignments is empty (CRC might be in a different role)
+                                                const roleAssignmentsToUse = hasValidRoleAssignments ? crcRoleAssignments : (finalRoleAssignments || {});
+                                                
+                                                // Skip creating this event only if both CRC and role assignments are invalid
+                                                // CRITICAL: If CRC is valid, always create the shift (even with empty roleAssignments)
+                                                // This ensures shifts are created for CRCs selected for travel, even if not assigned to roles yet
+                                                if (!hasValidCrc && Object.keys(roleAssignmentsToUse).length === 0) {
                                                     console.log('Skipping event creation - would result in N/A entry:', dateStr, crcId);
                                                     continue;
                                                 }
+                                                console.log('Creating shift for CRC:', crcId, 'date:', dateStr, 'hasValidCrc:', hasValidCrc, 'roleAssignments:', Object.keys(roleAssignmentsToUse).length);
                                                 
                                                 // CRITICAL: Use finalRoleAssignments (the full structure) instead of crcRoleAssignments
                                                 // The per-CRC filtering was causing roleAssignments to be lost
@@ -32589,8 +32623,8 @@
                                                     crcId, 
                                                     roles: [], // Legacy field - use roleAssignments instead
                                                     // CRITICAL: Always include roleAssignments from baseEventData or finalRoleAssignments
-                                                    // Don't use crcRoleAssignments which filters out other CRCs
-                                                    roleAssignments: baseEventData.roleAssignments || finalRoleAssignments || {},
+                                                    // Use roleAssignmentsToUse (which falls back to finalRoleAssignments if crcRoleAssignments is empty)
+                                                    roleAssignments: baseEventData.roleAssignments || roleAssignmentsToUse || finalRoleAssignments || {},
                                                     trainingAssignments: Object.keys(crcTrainingAssignments).length > 0 ? crcTrainingAssignments : (baseEventData.trainingAssignments || undefined),
                                                     trainingModes: Object.keys(crcTrainingModes).length > 0 ? crcTrainingModes : (baseEventData.trainingModes || undefined),
                                                     roleQuantityOverrides: baseEventData.roleQuantityOverrides || undefined,
