@@ -1435,7 +1435,10 @@
                     // Include user permission headers so backend knows if user is a manager
                     const headers = {};
                     if (state.currentUser) {
-                        const permissionLevel = getEffectivePermissionLevel(state.currentUser);
+                        const permissions = getUserPermissions();
+                        const permissionLevel = permissions?.userPermissionLevel ||
+                            (permissions?.permissionLevel === 'full' ? 'Manager' : null) ||
+                            getEffectivePermissionLevel(state.currentUser);
                         if (permissionLevel) {
                             headers['x-user-permission'] = permissionLevel;
                         }
@@ -4012,12 +4015,31 @@
                 if (requiredTrainingNames.length === 0) return true;
                 // If training is required but CRC has no trainings, they're not eligible
                 if (!crc.trainings || !Array.isArray(crc.trainings)) return false;
-                // Check if CRC has at least one valid (non-expired) required training
-                const today = new Date();
-                return crc.trainings.some(training => {
-                    const isExpired = new Date(training.expirationDate) < today;
-                    return !isExpired && requiredTrainingNames.some(req => (training.name || '').trim().toLowerCase() === req.trim().toLowerCase());
+                // Training is considered valid if completed (expiration is no longer enforced)
+                return crc.trainings.some(training =>
+                    requiredTrainingNames.some(req => (training.name || '').trim().toLowerCase() === req.trim().toLowerCase())
+                );
+            };
+
+            const getRetrainingSuggestion = (crcId, roleName) => {
+                if (!crcId || !roleName || isTrainingRoleName(roleName)) return null;
+                const requiredTrainingNames = getTrainingNamesForRole(roleName);
+                if (requiredTrainingNames.length === 0) return null;
+                const sixMonthsAgo = new Date();
+                sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+                let lastPerformed = null;
+                requiredTrainingNames.forEach(trainingName => {
+                    const lastDate = getLastPerformedDate(crcId, trainingName);
+                    if (lastDate && (!lastPerformed || lastDate > lastPerformed)) {
+                        lastPerformed = lastDate;
+                    }
                 });
+
+                if (!lastPerformed || lastPerformed < sixMonthsAgo) {
+                    return lastPerformed;
+                }
+                return null;
             };
 
             const getUnavailabilityPeriod = (crcId, date) => {
@@ -21034,7 +21056,7 @@
                 
                 container.classList.remove('hidden');
                 let html = '<label class="block text-sm font-medium dark:text-gray-300 mb-2">Assign Roles</label>';
-                html += '<p class="text-xs text-gray-500 dark:text-gray-400 mb-3">Only roles with valid, non-expired training are shown for each CRC. If no roles appear, the CRC needs to complete required training.</p>';
+                html += '<p class="text-xs text-gray-500 dark:text-gray-400 mb-3">Roles are shown based on required training completion. If someone hasn\'t performed a required training in 6 months, a retraining suggestion will appear when scheduling.</p>';
                 const allRoles = getAllRoles(state.crc_events, state.roles);
 
                 // Get all available roles for training dropdown (excluding Training role itself)
@@ -22310,7 +22332,6 @@
                             <tr>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Training</th>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Training Date</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Expiration Date</th>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Last Performed</th>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Progress</th>
                                 <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th>
@@ -22318,10 +22339,7 @@
                         </thead>
                         <tbody class="bg-white dark:bg-gray-900 divide-y divide-gray-200 dark:divide-gray-700">
                             ${crc.trainings.map((t, index) => {
-                                const expirationDate = new Date(t.expirationDate);
                                 let rowClass = '';
-                                if (expirationDate < today) rowClass = 'bg-red-100 dark:bg-red-900/50';
-                                else if (expirationDate < thirtyDaysFromNow) rowClass = 'bg-yellow-100 dark:bg-yellow-900/50';
                                 
                                 // Get training type requirements
                                 const trainingType = state.training_types?.find(tt => tt.name === t.name);
@@ -22368,7 +22386,6 @@
                                 return `<tr class="${rowClass}">
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${t.name}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${formatDateInputValue(t.completionDate)}</td>
-                                    <td class="px-4 py-2 whitespace-nowrap text-sm">${formatDateInputValue(t.expirationDate)}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${lastPerformedHTML}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">${progressHTML}</td>
                                     <td class="px-4 py-2 whitespace-nowrap text-sm">
@@ -22777,10 +22794,6 @@
                                 </div>
                             </div>
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <div>
-                                    <label class="block text-sm font-medium dark:text-gray-300 mb-1">Expiration Date (Optional)</label>
-                                    <input type="text" name="expirationDate" data-date-input autocomplete="off" placeholder="MM/DD/YYYY or leave blank" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Notes (Optional)</label>
                                     <input type="text" name="trainingNotes" placeholder="Additional notes about this training" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
@@ -24319,10 +24332,6 @@
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Completion Date</label>
                                 <input type="text" name="completionDate" value="${formatDateInputValue(training.completionDate)}" data-date-input autocomplete="off" placeholder="MM/DD/YYYY" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                             </div>
-                            <div>
-                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Expiration Date (Optional)</label>
-                                <input type="text" name="expirationDate" value="${formatDateInputValue(training.expirationDate)}" data-date-input autocomplete="off" placeholder="MM/DD/YYYY or leave blank" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                            </div>
                         </div>
                         
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -25140,10 +25149,6 @@
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Completion Date</label>
                                 <input type="text" name="completionDate" value="${todayDisplay}" data-date-input autocomplete="off" placeholder="MM/DD/YYYY" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Expiration Date (Optional)</label>
-                                <input type="text" name="expirationDate" value="${defaultExpirationDisplay}" data-date-input autocomplete="off" placeholder="MM/DD/YYYY or leave blank" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                             </div>
                         </div>
                         
@@ -29079,10 +29084,14 @@
                             if (request) {
                                 const statusKey = normalizeTimeOffStatus(request.status);
                                 const loggedInCrcId = getLoggedInCrcId();
-                                const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
-                                const isAdmin = state.currentUser && state.currentUser.permissionLevel === 'Admin';
-                                const isManager = state.currentUser && state.currentUser.permissionLevel === 'Manager';
-                                const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                                const permissions = getUserPermissions();
+                                const effectivePermissionLevel = permissions?.userPermissionLevel ||
+                                    (permissions?.permissionLevel === 'full' ? 'Manager' : null) ||
+                                    getEffectivePermissionLevel(state.currentUser);
+                                const isAdmin = isAdminUser();
+                                const isManager = effectivePermissionLevel === 'Manager';
+                                const isSupervisor = effectivePermissionLevel === 'Supervisor';
+                                const isCrcUser = effectivePermissionLevel === 'CRC';
                                 
                                 // Admin, Manager, and Supervisor can delete any request (except rejected)
                                 if (isAdmin || isManager || isSupervisor) {
@@ -36868,6 +36877,23 @@
                             checkForDuplicateAssignments();
                             // Update travel selection immediately
                             updateTravelSelectionContainer();
+
+                            const selectedCrcId = e.target.value;
+                            if (!selectedCrcId || selectedCrcId === 'SITE_STAFF' || selectedCrcId === 'UNASSIGNED') return;
+                            const nameWithoutPrefix = e.target.name.replace('role-', '');
+                            const lastDashIndex = nameWithoutPrefix.lastIndexOf('-');
+                            if (lastDashIndex === -1) return;
+                            const roleId = nameWithoutPrefix.substring(0, lastDashIndex);
+                            const role = state.roles.find(r => r.id === roleId);
+                            if (!role) return;
+                            const lastPerformedDate = getRetrainingSuggestion(selectedCrcId, role.name);
+                            if (lastPerformedDate !== null) {
+                                const warnKey = `${selectedCrcId}-${roleId}-${lastPerformedDate ? lastPerformedDate.toISOString().split('T')[0] : 'never'}`;
+                                if (e.target.dataset.retrainingWarned === warnKey) return;
+                                e.target.dataset.retrainingWarned = warnKey;
+                                const displayDate = lastPerformedDate ? formatDateInputValue(lastPerformedDate.toISOString().split('T')[0]) : 'Never';
+                                alert(`Retraining suggested, last performed - ${displayDate}`);
+                            }
                         });
                     }
                 });
