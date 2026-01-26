@@ -2402,15 +2402,34 @@ async function crudHandler(context, request, containerName) {
                                     delete requestBody.isOverridden;
                                 }
                             }
-                            // Merge existing crcIds if not provided in requestBody
-                            // This ensures we don't lose data when updating
-                            if (!requestBody.crcIds && existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
-                                requestBody.crcIds = existingEvent.crcIds;
-                            }
-                            
-                            // For Travel Days, don't merge roleAssignments - they don't use them
-                            // For other event types, merge roleAssignments if not provided
-                            if (existingEvent.type !== 'Travel Day' && requestBody.type !== 'Travel Day') {
+                            // CRITICAL: Preserve Travel Day type - never let it be overwritten
+                            if (existingEvent.type === 'Travel Day') {
+                                // Force the type to remain Travel Day
+                                requestBody.type = 'Travel Day';
+                                // Preserve crcIds array
+                                if (!requestBody.crcIds && existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
+                                    requestBody.crcIds = existingEvent.crcIds;
+                                }
+                                // Ensure crcId is set from crcIds
+                                if (requestBody.crcIds && Array.isArray(requestBody.crcIds) && requestBody.crcIds.length > 0) {
+                                    if (!requestBody.crcId || requestBody.crcId.trim() === '') {
+                                        const firstValidCrcId = requestBody.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                        if (firstValidCrcId) {
+                                            requestBody.crcId = firstValidCrcId;
+                                        }
+                                    }
+                                }
+                                // Remove roleAssignments - Travel Days don't use them
+                                if (requestBody.roleAssignments !== undefined) {
+                                    delete requestBody.roleAssignments;
+                                }
+                            } else {
+                                // For non-Travel Day events, merge crcIds if not provided
+                                if (!requestBody.crcIds && existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
+                                    requestBody.crcIds = existingEvent.crcIds;
+                                }
+                                
+                                // Merge roleAssignments if not provided
                                 if (!requestBody.roleAssignments && existingEvent.roleAssignments && typeof existingEvent.roleAssignments === 'object') {
                                     requestBody.roleAssignments = existingEvent.roleAssignments;
                                 }
@@ -2567,12 +2586,33 @@ async function crudHandler(context, request, containerName) {
                         try {
                             const { resource: existingEvent } = await container.item(updateId, updateId).read();
                             if (existingEvent) {
+                                // CRITICAL: Preserve the type of existing event if it's a Travel Day
+                                // Don't let the request body overwrite Travel Day type
+                                const preservedType = existingEvent.type === 'Travel Day' ? 'Travel Day' : requestBody.type;
+                                
                                 // Merge existing event with request body to preserve all fields
                                 // This ensures crcIds, roleAssignments, and other fields are not lost
                                 updatedItem = { ...existingEvent, ...requestBody, id: updateId };
-                                // Ensure type is preserved if it's a Travel Day
-                                if (existingEvent.type === 'Travel Day' && !requestBody.type) {
+                                
+                                // Force preserve Travel Day type if the existing event was a Travel Day
+                                if (existingEvent.type === 'Travel Day') {
                                     updatedItem.type = 'Travel Day';
+                                    // Also ensure crcIds is preserved if it exists
+                                    if (existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
+                                        updatedItem.crcIds = existingEvent.crcIds;
+                                    }
+                                    // Ensure crcId is set from crcIds if needed
+                                    if (updatedItem.crcIds && Array.isArray(updatedItem.crcIds) && updatedItem.crcIds.length > 0) {
+                                        if (!updatedItem.crcId || updatedItem.crcId.trim() === '') {
+                                            const firstValidCrcId = updatedItem.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                            if (firstValidCrcId) {
+                                                updatedItem.crcId = firstValidCrcId;
+                                            }
+                                        }
+                                    }
+                                } else if (preservedType) {
+                                    // For non-Travel Day events, use the preserved type (or requestBody type)
+                                    updatedItem.type = preservedType;
                                 }
                             }
                         } catch (mergeError) {
