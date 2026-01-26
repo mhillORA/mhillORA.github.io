@@ -1686,8 +1686,8 @@ const validateTimeOffRequestsSchema = (data) => {
         errors.push('hours must be a non-negative number');
     }
     
-    if (data.status && !['pending', 'approved', 'rejected'].includes(data.status)) {
-        errors.push('status must be one of: pending, approved, rejected');
+    if (data.status && !['pending', 'approved', 'rejected', 'cancelled'].includes(data.status)) {
+        errors.push('status must be one of: pending, approved, rejected, cancelled');
     }
     
     if (errors.length > 0) {
@@ -1928,6 +1928,20 @@ async function crudHandler(context, request, containerName) {
                 
                 // For events, validate that we're not creating N/A entries
                 if (containerName === 'events') {
+                    // Normalize Travel Day events: ensure type is set correctly
+                    if (body.type === 'Travel Day' || body.type === 'travel day' || body.type === 'travel' || 
+                        (body.type === 'Site Assignment' && body.isTravelDay === true)) {
+                        body.type = 'Travel Day';
+                        // Ensure Travel Day events have proper structure
+                        if (!body.crcIds || !Array.isArray(body.crcIds)) {
+                            if (body.crcId) {
+                                body.crcIds = [body.crcId];
+                            } else {
+                                body.crcIds = [];
+                            }
+                        }
+                    }
+                    
                     // Check if this would result in an N/A entry (no CRC assigned and no valid role assignments)
                     const hasCrcId = body.crcId && body.crcId.trim() !== '';
                     const hasCrcIds = body.crcIds && Array.isArray(body.crcIds) && body.crcIds.length > 0 && 
@@ -1937,6 +1951,19 @@ async function crudHandler(context, request, containerName) {
                         Object.values(body.roleAssignments).some(assignments => 
                             Array.isArray(assignments) && assignments.some(crcId => crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED')
                         );
+                    
+                    // Ensure crcIds array is set if crcId is provided
+                    if (body.crcId && (!body.crcIds || !Array.isArray(body.crcIds) || body.crcIds.length === 0)) {
+                        body.crcIds = [body.crcId];
+                    }
+                    // If crcIds is provided but crcId is not, set crcId from first valid CRC
+                    if (body.crcIds && Array.isArray(body.crcIds) && body.crcIds.length > 0 && 
+                        (!body.crcId || body.crcId.trim() === '')) {
+                        const firstValidCrcId = body.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                        if (firstValidCrcId) {
+                            body.crcId = firstValidCrcId;
+                        }
+                    }
                     
                     // If it's a Site Assignment and has no CRC and no valid role assignments, it's an Open Shift (allowed)
                     // Travel Day events are also allowed (they should have crcId or crcIds array, but may not have roleAssignments)
@@ -2087,6 +2114,8 @@ async function crudHandler(context, request, containerName) {
                         if (existingEvent) {
                             // Check if this update would result in an N/A entry
                             const hasCrcId = requestBody.crcId && requestBody.crcId.trim() !== '';
+                            const hasCrcIds = requestBody.crcIds && Array.isArray(requestBody.crcIds) && requestBody.crcIds.length > 0 && 
+                                              requestBody.crcIds.some(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
                             const hasValidRoleAssignments = requestBody.roleAssignments && 
                                 Object.keys(requestBody.roleAssignments).length > 0 &&
                                 Object.values(requestBody.roleAssignments).some(assignments => 
@@ -2094,9 +2123,9 @@ async function crudHandler(context, request, containerName) {
                                 );
                             
                             // If updating would result in N/A (no CRC and no valid role assignments), delete the event instead
-                            if (!hasCrcId && !hasValidRoleAssignments) {
+                            if (!hasCrcId && !hasCrcIds && !hasValidRoleAssignments) {
                                 // Only delete if it's not an Open Shift (Site Assignment without CRC is allowed as Open Shift)
-                                // Travel Day events are also allowed (they should have a crcId but may not have roleAssignments)
+                                // Travel Day events are also allowed (they should have a crcId or crcIds but may not have roleAssignments)
                                 if (requestBody.type !== 'Site Assignment' && requestBody.type !== 'Open Shift' && requestBody.type !== 'Travel Day') {
                                     await container.item(updateId, updateId).delete();
                                     return {
@@ -2114,6 +2143,49 @@ async function crudHandler(context, request, containerName) {
                     } catch (readError) {
                         // If we can't read the existing event, continue with normal update
                         context.log.warn(`Could not read existing event ${updateId} for N/A check:`, readError.message);
+                    }
+                }
+                
+                // For events, ensure crcIds and roleAssignments are properly preserved when updating
+                if (containerName === 'events' && updateId) {
+                    // Normalize Travel Day events: ensure type is set correctly
+                    if (requestBody.type === 'Travel Day' || requestBody.type === 'travel day' || requestBody.type === 'travel' || 
+                        (requestBody.type === 'Site Assignment' && requestBody.isTravelDay === true)) {
+                        requestBody.type = 'Travel Day';
+                    }
+                    
+                    try {
+                        const { resource: existingEvent } = await container.item(updateId, updateId).read();
+                        if (existingEvent) {
+                            // Merge existing crcIds and roleAssignments if not provided in requestBody
+                            // This ensures we don't lose data when updating
+                            if (!requestBody.crcIds && existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
+                                requestBody.crcIds = existingEvent.crcIds;
+                            }
+                            if (!requestBody.roleAssignments && existingEvent.roleAssignments && typeof existingEvent.roleAssignments === 'object') {
+                                requestBody.roleAssignments = existingEvent.roleAssignments;
+                            }
+                            // If crcId is provided but crcIds is not, ensure crcIds array is set
+                            if (requestBody.crcId && (!requestBody.crcIds || !Array.isArray(requestBody.crcIds) || requestBody.crcIds.length === 0)) {
+                                requestBody.crcIds = [requestBody.crcId];
+                            }
+                            // If crcIds is provided but crcId is not, set crcId from first valid CRC
+                            if (requestBody.crcIds && Array.isArray(requestBody.crcIds) && requestBody.crcIds.length > 0 && 
+                                (!requestBody.crcId || requestBody.crcId.trim() === '')) {
+                                const firstValidCrcId = requestBody.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                if (firstValidCrcId) {
+                                    requestBody.crcId = firstValidCrcId;
+                                }
+                            }
+                            
+                            // For Travel Day events, ensure type is preserved
+                            if (existingEvent.type === 'Travel Day' && !requestBody.type) {
+                                requestBody.type = 'Travel Day';
+                            }
+                        }
+                    } catch (readError) {
+                        // If we can't read the existing event, continue with normal update
+                        context.log.warn(`Could not read existing event ${updateId} for data merge:`, readError.message);
                     }
                 }
                 
@@ -2239,8 +2311,27 @@ async function crudHandler(context, request, containerName) {
                 }
                 
                 try {
-                    // For users, ensure we preserve all existing fields when updating
+                    // For events, ensure we preserve all fields when updating (merge with existing event)
                     let updatedItem = { ...requestBody, id: updateId };
+                    if (containerName === 'events' && updateId) {
+                        try {
+                            const { resource: existingEvent } = await container.item(updateId, updateId).read();
+                            if (existingEvent) {
+                                // Merge existing event with request body to preserve all fields
+                                // This ensures crcIds, roleAssignments, and other fields are not lost
+                                updatedItem = { ...existingEvent, ...requestBody, id: updateId };
+                                // Ensure type is preserved if it's a Travel Day
+                                if (existingEvent.type === 'Travel Day' && !requestBody.type) {
+                                    updatedItem.type = 'Travel Day';
+                                }
+                            }
+                        } catch (mergeError) {
+                            // If we can't read existing event, use requestBody only
+                            context.log.warn(`Could not read existing event ${updateId} for merge, using request body only:`, mergeError.message);
+                        }
+                    }
+                    
+                    // For users, ensure we preserve all existing fields when updating
                     if (containerName === 'users' && updateId) {
                         try {
                             const { resource: existingUser } = await container.item(updateId, updateId).read();
@@ -3181,10 +3272,10 @@ app.http('time-off-requests', {
                             })
                             .fetchAll();
                         
-                        // Only block if there's a non-rejected request
+                        // Only block if there's a non-rejected and non-cancelled request
                         const duplicateRequest = (existingRequests || []).find(req => {
                             const status = String(req?.status || '').toLowerCase().trim();
-                            return status !== 'rejected';
+                            return status !== 'rejected' && status !== 'cancelled';
                         });
                         
                         if (duplicateRequest) {
@@ -3292,18 +3383,90 @@ app.http('time-off-requests', {
 
                 case 'DELETE':
                     if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
+                    
+                    // Authorization: Get user info from request headers
+                    let userPermissionLevel = null;
+                    let userCrcId = null;
+                    
+                    try {
+                        // Try to get user info from request headers (frontend should send this)
+                        // Check both standard and custom header formats
+                        const headers = request.headers || {};
+                        const authHeader = headers.get?.('x-user-permission') || 
+                                         headers.get?.('user-permission') ||
+                                         headers['x-user-permission'] ||
+                                         headers['user-permission'];
+                        const userCrcHeader = headers.get?.('x-user-crcid') || 
+                                             headers.get?.('user-crcid') ||
+                                             headers['x-user-crcid'] ||
+                                             headers['user-crcid'];
+                        
+                        if (authHeader) {
+                            userPermissionLevel = String(authHeader).trim();
+                        }
+                        if (userCrcHeader) {
+                            userCrcId = String(userCrcHeader).trim();
+                        }
+                    } catch (authError) {
+                        context.log.warn('Could not extract user info for authorization:', authError.message);
+                    }
+                    
                     try {
                         // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
                         const { resource } = await container.item(id, id).read();
                         if (!resource) {
                             return { status: 204 };
                         }
+                        
+                        // Authorization check: Managers can delete any PTO request, CRCs can only cancel their own
+                        const isManager = userPermissionLevel && userPermissionLevel.toLowerCase() === 'manager';
+                        const isOwnRequest = resource.crcId && userCrcId && resource.crcId === userCrcId;
+                        
+                        // If no user info provided, allow deletion (backward compatibility, but log warning)
+                        if (!userPermissionLevel && !userCrcId) {
+                            context.log.warn(`PTO deletion without user info for request ${id} - allowing for backward compatibility`);
+                            // Delete the request
+                            await container.item(id, id).delete();
+                            return { status: 204 };
+                        }
+                        
+                        // If CRC is canceling their own request, mark as cancelled instead of deleting
+                        if (!isManager && isOwnRequest) {
+                            // Update status to cancelled so managers can track total time requested
+                            const cancelledRequest = {
+                                ...resource,
+                                status: 'cancelled',
+                                cancelledAt: new Date().toISOString()
+                            };
+                            const { resource: updatedRequest } = await container.items.upsert(cancelledRequest);
+                            return { 
+                                status: 200,
+                                jsonBody: { 
+                                    ...updatedRequest,
+                                    message: 'Time off request cancelled (not deleted)'
+                                }
+                            };
+                        }
+                        
+                        // If not authorized, return forbidden
+                        if (!isManager && !isOwnRequest) {
+                            return {
+                                status: 403,
+                                jsonBody: { 
+                                    error: 'Forbidden',
+                                    message: 'You do not have permission to delete this time off request. Managers can delete any request, CRCs can only cancel their own requests.'
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                        
+                        // Manager can delete the request
+                        await container.item(id, id).delete();
+                        return { status: 204 };
                     } catch (e) {
+                        // If we can't read the resource, it might already be deleted, return 204
                         return { status: 204 };
                     }
-                    // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
-                    await container.item(id, id).delete();
-                    return { status: 204 };
 
                 case 'OPTIONS':
                     return { status: 200 };
