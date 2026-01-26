@@ -1926,12 +1926,86 @@ async function crudHandler(context, request, containerName) {
             case 'POST':
                 const body = await request.json();
                 
-                // For events, validate that we're not creating N/A entries
+                // For events, validate that we're not creating N/A entries and prevent overriding training
                 if (containerName === 'events') {
+                    // Prevent creating overridden training events
+                    // Check if this is a training event and prevent isOverridden from being set
+                    if (body.studyId) {
+                        try {
+                            const studiesContainer = getContainer('studies');
+                            const { resource: study } = await studiesContainer.item(body.studyId, body.studyId).read();
+                            if (study && study.studyType === 'training') {
+                                if (body.isOverridden === true) {
+                                    return {
+                                        status: 400,
+                                        jsonBody: { 
+                                            error: 'Cannot override training events',
+                                            message: 'Training events cannot be overridden. Please contact an administrator if changes are needed.'
+                                        },
+                                        headers: { 'Content-Type': 'application/json' }
+                                    };
+                                }
+                                // Remove isOverridden if it's set
+                                if (body.isOverridden !== undefined) {
+                                    delete body.isOverridden;
+                                }
+                            }
+                        } catch (studyError) {
+                            // If we can't read the study, log but continue (don't block creation)
+                            context.log.warn(`Could not read study ${body.studyId} to check if training:`, studyError.message);
+                        }
+                    }
+                    
+                    // Also check if the event type itself indicates training
+                    const eventType = String(body.type || '').toLowerCase().trim();
+                    if (eventType === 'training' || eventType.includes('training')) {
+                        if (body.isOverridden === true) {
+                            return {
+                                status: 400,
+                                jsonBody: { 
+                                    error: 'Cannot override training events',
+                                    message: 'Training events cannot be overridden. Please contact an administrator if changes are needed.'
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
+                        if (body.isOverridden !== undefined) {
+                            delete body.isOverridden;
+                        }
+                    }
                     // Normalize Travel Day events: ensure type is set correctly
                     if (body.type === 'Travel Day' || body.type === 'travel day' || body.type === 'travel' || 
                         (body.type === 'Site Assignment' && body.isTravelDay === true)) {
                         body.type = 'Travel Day';
+                        
+                        // Travel Days should use crcId/crcIds, not roleAssignments
+                        // If roleAssignments are provided, extract CRC IDs from them
+                        if (body.roleAssignments && typeof body.roleAssignments === 'object') {
+                            const crcIdsFromRoles = [];
+                            Object.values(body.roleAssignments).forEach(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    assignments.forEach(crcId => {
+                                        if (crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED' && crcId !== 'SITE_STAFF') {
+                                            if (!crcIdsFromRoles.includes(crcId)) {
+                                                crcIdsFromRoles.push(crcId);
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                            
+                            // If we found CRCs in roleAssignments, use them for crcIds
+                            if (crcIdsFromRoles.length > 0) {
+                                body.crcIds = crcIdsFromRoles;
+                                if (!body.crcId || body.crcId.trim() === '') {
+                                    body.crcId = crcIdsFromRoles[0];
+                                }
+                            }
+                            
+                            // Remove roleAssignments from Travel Days - they don't need them
+                            delete body.roleAssignments;
+                        }
+                        
                         // Ensure Travel Day events have proper structure
                         if (!body.crcIds || !Array.isArray(body.crcIds)) {
                             if (body.crcId) {
@@ -2152,18 +2226,107 @@ async function crudHandler(context, request, containerName) {
                     if (requestBody.type === 'Travel Day' || requestBody.type === 'travel day' || requestBody.type === 'travel' || 
                         (requestBody.type === 'Site Assignment' && requestBody.isTravelDay === true)) {
                         requestBody.type = 'Travel Day';
+                        
+                        // Travel Days should use crcId/crcIds, not roleAssignments
+                        // If roleAssignments are provided, extract CRC IDs from them
+                        if (requestBody.roleAssignments && typeof requestBody.roleAssignments === 'object') {
+                            const crcIdsFromRoles = [];
+                            Object.values(requestBody.roleAssignments).forEach(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    assignments.forEach(crcId => {
+                                        if (crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED' && crcId !== 'SITE_STAFF') {
+                                            if (!crcIdsFromRoles.includes(crcId)) {
+                                                crcIdsFromRoles.push(crcId);
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                            
+                            // If we found CRCs in roleAssignments, use them for crcIds
+                            if (crcIdsFromRoles.length > 0) {
+                                requestBody.crcIds = crcIdsFromRoles;
+                                if (!requestBody.crcId || requestBody.crcId.trim() === '') {
+                                    requestBody.crcId = crcIdsFromRoles[0];
+                                }
+                            }
+                            
+                            // Remove roleAssignments from Travel Days - they don't need them
+                            delete requestBody.roleAssignments;
+                        }
                     }
                     
                     try {
                         const { resource: existingEvent } = await container.item(updateId, updateId).read();
                         if (existingEvent) {
-                            // Merge existing crcIds and roleAssignments if not provided in requestBody
+                            // For Travel Days, remove roleAssignments if they exist
+                            if (existingEvent.type === 'Travel Day' || requestBody.type === 'Travel Day') {
+                                if (requestBody.roleAssignments !== undefined) {
+                                    delete requestBody.roleAssignments;
+                                }
+                                // Also remove from existing event if we're merging
+                                if (existingEvent.roleAssignments) {
+                                    delete existingEvent.roleAssignments;
+                                }
+                            }
+                            // Prevent overriding training events
+                            // Check if this event is linked to a training study
+                            if (existingEvent.studyId) {
+                                try {
+                                    const studiesContainer = getContainer('studies');
+                                    const { resource: study } = await studiesContainer.item(existingEvent.studyId, existingEvent.studyId).read();
+                                    if (study && study.studyType === 'training') {
+                                        // If trying to set isOverridden, reject it
+                                        if (requestBody.isOverridden === true) {
+                                            return {
+                                                status: 400,
+                                                jsonBody: { 
+                                                    error: 'Cannot override training events',
+                                                    message: 'Training events cannot be overridden. Please contact an administrator if changes are needed.'
+                                                },
+                                                headers: { 'Content-Type': 'application/json' }
+                                            };
+                                        }
+                                        // If isOverridden is being set in the request, remove it
+                                        if (requestBody.isOverridden !== undefined) {
+                                            delete requestBody.isOverridden;
+                                        }
+                                    }
+                                } catch (studyError) {
+                                    // If we can't read the study, log but continue (don't block the update)
+                                    context.log.warn(`Could not read study ${existingEvent.studyId} to check if training:`, studyError.message);
+                                }
+                            }
+                            
+                            // Also check if the event type itself indicates training
+                            const eventType = String(existingEvent.type || '').toLowerCase().trim();
+                            if (eventType === 'training' || eventType.includes('training')) {
+                                if (requestBody.isOverridden === true) {
+                                    return {
+                                        status: 400,
+                                        jsonBody: { 
+                                            error: 'Cannot override training events',
+                                            message: 'Training events cannot be overridden. Please contact an administrator if changes are needed.'
+                                        },
+                                        headers: { 'Content-Type': 'application/json' }
+                                    };
+                                }
+                                if (requestBody.isOverridden !== undefined) {
+                                    delete requestBody.isOverridden;
+                                }
+                            }
+                            // Merge existing crcIds if not provided in requestBody
                             // This ensures we don't lose data when updating
                             if (!requestBody.crcIds && existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
                                 requestBody.crcIds = existingEvent.crcIds;
                             }
-                            if (!requestBody.roleAssignments && existingEvent.roleAssignments && typeof existingEvent.roleAssignments === 'object') {
-                                requestBody.roleAssignments = existingEvent.roleAssignments;
+                            
+                            // For Travel Days, don't merge roleAssignments - they don't use them
+                            // For other event types, merge roleAssignments if not provided
+                            if (existingEvent.type !== 'Travel Day' && requestBody.type !== 'Travel Day') {
+                                if (!requestBody.roleAssignments && existingEvent.roleAssignments && typeof existingEvent.roleAssignments === 'object') {
+                                    requestBody.roleAssignments = existingEvent.roleAssignments;
+                                }
                             }
                             // If crcId is provided but crcIds is not, ensure crcIds array is set
                             if (requestBody.crcId && (!requestBody.crcIds || !Array.isArray(requestBody.crcIds) || requestBody.crcIds.length === 0)) {
