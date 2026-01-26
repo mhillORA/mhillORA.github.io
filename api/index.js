@@ -2748,6 +2748,11 @@ async function crudHandler(context, request, containerName) {
                                     if (preservedType) {
                                         updatedItem.type = preservedType;
                                     }
+                                    // CRITICAL: Preserve travelDayPreferences if not explicitly provided in requestBody
+                                    // This ensures travel day checkbox state is maintained when updating shifts
+                                    if (requestBody.travelDayPreferences === undefined && existingEvent.travelDayPreferences) {
+                                        updatedItem.travelDayPreferences = existingEvent.travelDayPreferences;
+                                    }
                                 }
                             }
                         } catch (mergeError) {
