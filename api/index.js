@@ -1930,7 +1930,59 @@ async function crudHandler(context, request, containerName) {
                             if (resource.crcId && (!resource.crcIds || !Array.isArray(resource.crcIds))) {
                                 resource.crcIds = [resource.crcId];
                             }
+                            // CRITICAL: Ensure Travel Day type is preserved and never shows as open shift
+                            // If somehow type got lost, restore it
+                            if (resource.type !== 'Travel Day') {
+                                resource.type = 'Travel Day';
+                            }
+                            // Remove roleAssignments from Travel Days - they cause them to show as open shifts
+                            if (resource.roleAssignments) {
+                                delete resource.roleAssignments;
+                            }
                         }
+                        
+                        // For shifts (Site Assignment), also return related Travel Day events on the same date
+                        // This helps the frontend show travel day checkboxes
+                        if (containerName === 'events' && resource && resource.type === 'Site Assignment' && resource.date) {
+                            try {
+                                const eventsContainer = getContainer('events');
+                                const { resources: relatedEvents } = await eventsContainer.items.query({
+                                    query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
+                                    parameters: [
+                                        { name: "@date", value: resource.date }
+                                    ]
+                                }).fetchAll();
+                                
+                                // Add related travel days to the response
+                                if (relatedEvents && relatedEvents.length > 0) {
+                                    // Normalize travel days
+                                    const normalizedTravelDays = relatedEvents.map(td => {
+                                        if (td.type === 'Travel Day') {
+                                            if ((!td.crcId || td.crcId === null || td.crcId === '') && 
+                                                td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length > 0) {
+                                                const firstValidCrcId = td.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                                if (firstValidCrcId) {
+                                                    td.crcId = firstValidCrcId;
+                                                }
+                                            }
+                                            if (td.crcId && (!td.crcIds || !Array.isArray(td.crcIds))) {
+                                                td.crcIds = [td.crcId];
+                                            }
+                                            if (td.roleAssignments) {
+                                                delete td.roleAssignments;
+                                            }
+                                        }
+                                        return td;
+                                    });
+                                    
+                                    resource.relatedTravelDays = normalizedTravelDays;
+                                }
+                            } catch (relatedError) {
+                                // If we can't fetch related events, continue without them
+                                context.log.warn(`Could not fetch related travel days for shift ${resource.id}: ${relatedError.message}`);
+                            }
+                        }
+                        
                         return { jsonBody: resource };
                     } catch (error) {
                         // If container doesn't exist, return 404
@@ -1951,6 +2003,8 @@ async function crudHandler(context, request, containerName) {
                                 const normalizedResources = resources.map(event => {
                                     // Fix Travel Day events: ensure they have crcId set from crcIds if available
                                     if (event && event.type === 'Travel Day') {
+                                        // CRITICAL: Ensure Travel Day type is preserved
+                                        event.type = 'Travel Day';
                                         // If crcId is missing/null but crcIds array exists, set crcId from first CRC
                                         if ((!event.crcId || event.crcId === null || event.crcId === '') && 
                                             event.crcIds && Array.isArray(event.crcIds) && event.crcIds.length > 0) {
@@ -1962,6 +2016,10 @@ async function crudHandler(context, request, containerName) {
                                         // Ensure crcIds is an array if crcId exists but crcIds doesn't
                                         if (event.crcId && (!event.crcIds || !Array.isArray(event.crcIds))) {
                                             event.crcIds = [event.crcId];
+                                        }
+                                        // Remove roleAssignments - Travel Days don't use them and they cause open shift display
+                                        if (event.roleAssignments) {
+                                            delete event.roleAssignments;
                                         }
                                     }
                                     return event;
@@ -2404,13 +2462,30 @@ async function crudHandler(context, request, containerName) {
                             }
                             // CRITICAL: Preserve Travel Day type - never let it be overwritten
                             if (existingEvent.type === 'Travel Day') {
-                                // Force the type to remain Travel Day
+                                // Force the type to remain Travel Day - this is non-negotiable
                                 requestBody.type = 'Travel Day';
-                                // Preserve crcIds array
-                                if (!requestBody.crcIds && existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
+                                
+                                // Preserve ALL travel day specific fields from existing event
+                                // Don't let shift updates overwrite travel day data
+                                if (existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
                                     requestBody.crcIds = existingEvent.crcIds;
                                 }
-                                // Ensure crcId is set from crcIds
+                                if (existingEvent.crcId) {
+                                    requestBody.crcId = existingEvent.crcId;
+                                }
+                                
+                                // Preserve travel day linking fields
+                                if (existingEvent.navanBookingId) {
+                                    requestBody.navanBookingId = existingEvent.navanBookingId;
+                                }
+                                if (existingEvent.navanBookingUuid) {
+                                    requestBody.navanBookingUuid = existingEvent.navanBookingUuid;
+                                }
+                                if (existingEvent.travelRecordId) {
+                                    requestBody.travelRecordId = existingEvent.travelRecordId;
+                                }
+                                
+                                // Ensure crcId is set from crcIds if missing
                                 if (requestBody.crcIds && Array.isArray(requestBody.crcIds) && requestBody.crcIds.length > 0) {
                                     if (!requestBody.crcId || requestBody.crcId.trim() === '') {
                                         const firstValidCrcId = requestBody.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
@@ -2419,10 +2494,13 @@ async function crudHandler(context, request, containerName) {
                                         }
                                     }
                                 }
-                                // Remove roleAssignments - Travel Days don't use them
+                                
+                                // CRITICAL: Remove roleAssignments - Travel Days don't use them and they cause open shift display
                                 if (requestBody.roleAssignments !== undefined) {
                                     delete requestBody.roleAssignments;
                                 }
+                                // Also ensure it's removed from the merged object
+                                delete existingEvent.roleAssignments;
                             } else {
                                 // For non-Travel Day events, merge crcIds if not provided
                                 if (!requestBody.crcIds && existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
@@ -2590,17 +2668,23 @@ async function crudHandler(context, request, containerName) {
                                 // Don't let the request body overwrite Travel Day type
                                 const preservedType = existingEvent.type === 'Travel Day' ? 'Travel Day' : requestBody.type;
                                 
-                                // Merge existing event with request body to preserve all fields
-                                // This ensures crcIds, roleAssignments, and other fields are not lost
-                                updatedItem = { ...existingEvent, ...requestBody, id: updateId };
-                                
-                                // Force preserve Travel Day type if the existing event was a Travel Day
+                                // CRITICAL: If existing event is a Travel Day, preserve it completely
+                                // Don't let shift updates overwrite travel day data
                                 if (existingEvent.type === 'Travel Day') {
-                                    updatedItem.type = 'Travel Day';
-                                    // Also ensure crcIds is preserved if it exists
-                                    if (existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
-                                        updatedItem.crcIds = existingEvent.crcIds;
-                                    }
+                                    // For Travel Days, only update non-critical fields, preserve all travel day specific data
+                                    updatedItem = {
+                                        ...existingEvent, // Start with existing travel day data
+                                        ...requestBody,  // Apply updates
+                                        id: updateId,
+                                        type: 'Travel Day', // Force type
+                                        crcId: existingEvent.crcId || requestBody.crcId, // Preserve existing crcId
+                                        crcIds: existingEvent.crcIds || requestBody.crcIds, // Preserve existing crcIds
+                                        navanBookingId: existingEvent.navanBookingId || requestBody.navanBookingId,
+                                        navanBookingUuid: existingEvent.navanBookingUuid || requestBody.navanBookingUuid,
+                                        travelRecordId: existingEvent.travelRecordId || requestBody.travelRecordId
+                                    };
+                                    // Remove roleAssignments - Travel Days don't use them
+                                    delete updatedItem.roleAssignments;
                                     // Ensure crcId is set from crcIds if needed
                                     if (updatedItem.crcIds && Array.isArray(updatedItem.crcIds) && updatedItem.crcIds.length > 0) {
                                         if (!updatedItem.crcId || updatedItem.crcId.trim() === '') {
@@ -2610,9 +2694,12 @@ async function crudHandler(context, request, containerName) {
                                             }
                                         }
                                     }
-                                } else if (preservedType) {
-                                    // For non-Travel Day events, use the preserved type (or requestBody type)
-                                    updatedItem.type = preservedType;
+                                } else {
+                                    // For non-Travel Day events, normal merge
+                                    updatedItem = { ...existingEvent, ...requestBody, id: updateId };
+                                    if (preservedType) {
+                                        updatedItem.type = preservedType;
+                                    }
                                 }
                             }
                         } catch (mergeError) {
