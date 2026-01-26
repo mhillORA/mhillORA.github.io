@@ -2073,6 +2073,12 @@ async function crudHandler(context, request, containerName) {
                 
                 // For events, validate that we're not creating N/A entries and prevent overriding training
                 if (containerName === 'events') {
+                    // CRITICAL: Normalize Travel Day events FIRST (before any other processing)
+                    // Check for isTravelDay flag - this is the most reliable indicator from frontend
+                    if (body.isTravelDay === true || body.isTravelDay === 'true' || body.travelDay === true) {
+                        body.type = 'Travel Day';
+                    }
+                    
                     // Prevent creating overridden training events
                     // Check if this is a training event and prevent isOverridden from being set
                     if (body.studyId) {
@@ -2119,7 +2125,11 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     // Normalize Travel Day events: ensure type is set correctly
-                    if (body.type === 'Travel Day' || body.type === 'travel day' || body.type === 'travel' || 
+                    // Check for isTravelDay flag FIRST (before checking type) - this is the most reliable indicator
+                    const isTravelDayFlag = body.isTravelDay === true || body.isTravelDay === 'true' || body.travelDay === true;
+                    const isTravelDayType = body.type === 'Travel Day' || body.type === 'travel day' || body.type === 'travel';
+                    
+                    if (isTravelDayFlag || isTravelDayType || 
                         (body.type === 'Site Assignment' && body.isTravelDay === true)) {
                         body.type = 'Travel Day';
                         
@@ -2368,7 +2378,11 @@ async function crudHandler(context, request, containerName) {
                 // For events, ensure crcIds and roleAssignments are properly preserved when updating
                 if (containerName === 'events' && updateId) {
                     // Normalize Travel Day events: ensure type is set correctly
-                    if (requestBody.type === 'Travel Day' || requestBody.type === 'travel day' || requestBody.type === 'travel' || 
+                    // Check for isTravelDay flag FIRST (before checking type) - this is the most reliable indicator
+                    const isTravelDayFlag = requestBody.isTravelDay === true || requestBody.isTravelDay === 'true' || requestBody.travelDay === true;
+                    const isTravelDayType = requestBody.type === 'Travel Day' || requestBody.type === 'travel day' || requestBody.type === 'travel';
+                    
+                    if (isTravelDayFlag || isTravelDayType || 
                         (requestBody.type === 'Site Assignment' && requestBody.isTravelDay === true)) {
                         requestBody.type = 'Travel Day';
                         
@@ -2404,8 +2418,17 @@ async function crudHandler(context, request, containerName) {
                     try {
                         const { resource: existingEvent } = await container.item(updateId, updateId).read();
                         if (existingEvent) {
+                            // CRITICAL: Check for isTravelDay flag - if set, force type to Travel Day
+                            if (requestBody.isTravelDay === true || requestBody.isTravelDay === 'true' || requestBody.travelDay === true) {
+                                requestBody.type = 'Travel Day';
+                            }
+                            
                             // For Travel Days, remove roleAssignments if they exist
                             if (existingEvent.type === 'Travel Day' || requestBody.type === 'Travel Day') {
+                                // Force type to Travel Day if existing event is Travel Day
+                                if (existingEvent.type === 'Travel Day') {
+                                    requestBody.type = 'Travel Day';
+                                }
                                 if (requestBody.roleAssignments !== undefined) {
                                     delete requestBody.roleAssignments;
                                 }
@@ -2668,23 +2691,41 @@ async function crudHandler(context, request, containerName) {
                                 // Don't let the request body overwrite Travel Day type
                                 const preservedType = existingEvent.type === 'Travel Day' ? 'Travel Day' : requestBody.type;
                                 
-                                // CRITICAL: If existing event is a Travel Day, preserve it completely
+                                // CRITICAL: Check for isTravelDay flag in requestBody - if set, this IS a Travel Day
+                                const isTravelDayRequest = requestBody.isTravelDay === true || requestBody.isTravelDay === 'true' || requestBody.travelDay === true;
+                                
+                                // CRITICAL: If existing event is a Travel Day OR request has isTravelDay flag, preserve it completely
                                 // Don't let shift updates overwrite travel day data
-                                if (existingEvent.type === 'Travel Day') {
+                                if (existingEvent.type === 'Travel Day' || isTravelDayRequest) {
+                                    // Force type to Travel Day
+                                    const finalType = 'Travel Day';
+                                    
                                     // For Travel Days, only update non-critical fields, preserve all travel day specific data
                                     updatedItem = {
-                                        ...existingEvent, // Start with existing travel day data
+                                        ...existingEvent, // Start with existing travel day data (if it exists)
                                         ...requestBody,  // Apply updates
                                         id: updateId,
-                                        type: 'Travel Day', // Force type
-                                        crcId: existingEvent.crcId || requestBody.crcId, // Preserve existing crcId
-                                        crcIds: existingEvent.crcIds || requestBody.crcIds, // Preserve existing crcIds
-                                        navanBookingId: existingEvent.navanBookingId || requestBody.navanBookingId,
-                                        navanBookingUuid: existingEvent.navanBookingUuid || requestBody.navanBookingUuid,
-                                        travelRecordId: existingEvent.travelRecordId || requestBody.travelRecordId
+                                        type: finalType, // ALWAYS force type to Travel Day
+                                        // Preserve existing travel day fields, but allow updates if provided
+                                        crcId: requestBody.crcId || existingEvent.crcId,
+                                        crcIds: requestBody.crcIds || existingEvent.crcIds,
+                                        navanBookingId: requestBody.navanBookingId || existingEvent.navanBookingId,
+                                        navanBookingUuid: requestBody.navanBookingUuid || existingEvent.navanBookingUuid,
+                                        travelRecordId: requestBody.travelRecordId || existingEvent.travelRecordId
                                     };
+                                    
                                     // Remove roleAssignments - Travel Days don't use them
                                     delete updatedItem.roleAssignments;
+                                    
+                                    // Ensure crcIds is an array
+                                    if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
+                                        if (updatedItem.crcId) {
+                                            updatedItem.crcIds = [updatedItem.crcId];
+                                        } else {
+                                            updatedItem.crcIds = [];
+                                        }
+                                    }
+                                    
                                     // Ensure crcId is set from crcIds if needed
                                     if (updatedItem.crcIds && Array.isArray(updatedItem.crcIds) && updatedItem.crcIds.length > 0) {
                                         if (!updatedItem.crcId || updatedItem.crcId.trim() === '') {
@@ -2694,6 +2735,13 @@ async function crudHandler(context, request, containerName) {
                                             }
                                         }
                                     }
+                                    
+                                    // Remove null/undefined fields
+                                    Object.keys(updatedItem).forEach(key => {
+                                        if (updatedItem[key] === null || updatedItem[key] === undefined) {
+                                            delete updatedItem[key];
+                                        }
+                                    });
                                 } else {
                                     // For non-Travel Day events, normal merge
                                     updatedItem = { ...existingEvent, ...requestBody, id: updateId };
