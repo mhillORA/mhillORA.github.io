@@ -223,6 +223,93 @@ const buildScheduleCsv = ({ crcName, startDate, endDate, shifts = [], timeOff = 
     return lines.join('\n');
 };
 
+// Build iCal format for calendar export
+const buildScheduleIcal = ({ crcName, startDate, endDate, shifts = [], timeOff = [], travel = [] }) => {
+    const lines = [];
+    const now = new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    
+    lines.push('BEGIN:VCALENDAR');
+    lines.push('VERSION:2.0');
+    lines.push('PRODID:-//CHAOS Scheduler//Schedule Export//EN');
+    lines.push('CALSCALE:GREGORIAN');
+    lines.push('METHOD:PUBLISH');
+    
+    // Helper to format date for iCal (YYYYMMDDTHHMMSSZ)
+    const formatIcalDate = (dateStr, timeStr = null) => {
+        if (!dateStr) return now;
+        const date = new Date(dateStr);
+        if (isNaN(date.getTime())) return now;
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        if (timeStr) {
+            const [hours, minutes] = timeStr.split(':');
+            return `${year}${month}${day}T${(hours || '00').padStart(2, '0')}${(minutes || '00').padStart(2, '0')}00Z`;
+        }
+        return `${year}${month}${day}T000000Z`;
+    };
+    
+    // Helper to escape text for iCal
+    const escapeIcal = (text) => {
+        return String(text || '').replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
+    };
+    
+    // Add shifts
+    shifts.forEach((shift, index) => {
+        const start = formatIcalDate(shift.date);
+        const end = formatIcalDate(shift.date, '23:59');
+        const summary = escapeIcal(`${shift.type || 'Site Assignment'} - ${shift.siteName || ''}`);
+        const description = escapeIcal(shift.summary || '');
+        
+        lines.push('BEGIN:VEVENT');
+        lines.push(`UID:shift-${shift.id || index}-${now}@chaos-scheduler`);
+        lines.push(`DTSTART:${start}`);
+        lines.push(`DTEND:${end}`);
+        lines.push(`SUMMARY:${summary}`);
+        if (description) lines.push(`DESCRIPTION:${description}`);
+        lines.push(`LOCATION:${escapeIcal(shift.siteLocation || '')}`);
+        lines.push(`DTSTAMP:${now}`);
+        lines.push('END:VEVENT');
+    });
+    
+    // Add time off
+    [...timeOff].forEach((to, index) => {
+        const start = formatIcalDate(to.date || to.startDate);
+        const end = formatIcalDate(to.endDate || to.date || to.startDate, '23:59');
+        const summary = escapeIcal(`${to.type || 'Time Off'} - ${to.period || 'Full Day'}`);
+        const description = escapeIcal(to.summary || '');
+        
+        lines.push('BEGIN:VEVENT');
+        lines.push(`UID:timeoff-${to.id || index}-${now}@chaos-scheduler`);
+        lines.push(`DTSTART:${start}`);
+        lines.push(`DTEND:${end}`);
+        lines.push(`SUMMARY:${summary}`);
+        if (description) lines.push(`DESCRIPTION:${description}`);
+        lines.push(`DTSTAMP:${now}`);
+        lines.push('END:VEVENT');
+    });
+    
+    // Add travel
+    travel.forEach((t, index) => {
+        const start = formatIcalDate(t.date);
+        const end = formatIcalDate(t.date, '23:59');
+        const summary = escapeIcal(`Travel - ${t.route || t.type || 'Travel'}`);
+        const description = escapeIcal(t.summary || '');
+        
+        lines.push('BEGIN:VEVENT');
+        lines.push(`UID:travel-${t.id || index}-${now}@chaos-scheduler`);
+        lines.push(`DTSTART:${start}`);
+        lines.push(`DTEND:${end}`);
+        lines.push(`SUMMARY:${summary}`);
+        if (description) lines.push(`DESCRIPTION:${description}`);
+        lines.push(`DTSTAMP:${now}`);
+        lines.push('END:VEVENT');
+    });
+    
+    lines.push('END:VCALENDAR');
+    return lines.join('\r\n');
+};
+
 const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient = null, user = null }, context, lookups = {}) => {
     const start = toDateOnlyString(startDate) || toDateOnlyString(new Date());
     const end = toDateOnlyString(endDate) || start;
@@ -2762,6 +2849,235 @@ app.http('announcements', {
     handler: (request, context) => crudHandler(context, request, 'announcements'),
 });
 
+// Announcement reactions endpoint - allows CRCs to mark announcements as read/reacted
+app.http('announcementReactions', {
+    methods: ['POST', 'PUT', 'GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'announcements/{id}/reactions',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return { status: 200 };
+        }
+        
+        try {
+            const announcementsContainer = getContainer('announcements');
+            const id = getIdFromRequest(request);
+            
+            if (!id) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'Announcement ID is required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Get the announcement
+            let announcement;
+            try {
+                const { resource } = await announcementsContainer.item(id, id).read();
+                if (!resource) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'Announcement not found' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                announcement = resource;
+            } catch (readError) {
+                return {
+                    status: 404,
+                    jsonBody: { error: 'Announcement not found' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Initialize reactions if not present
+            if (!announcement.reactions) {
+                announcement.reactions = {};
+            }
+            
+            if (request.method === 'GET') {
+                // Return current reactions
+                return {
+                    jsonBody: {
+                        announcementId: id,
+                        reactions: announcement.reactions || {}
+                    }
+                };
+            }
+            
+            // POST/PUT: Add or update reaction
+            const body = await request.json();
+            const userId = body.userId || body.crcId || body.user || null;
+            const reaction = body.reaction || 'read'; // Default to 'read', can be 'thumbsup', 'read', etc.
+            
+            if (!userId) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'userId or crcId is required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Store reaction with timestamp
+            if (!announcement.reactions[userId]) {
+                announcement.reactions[userId] = [];
+            }
+            
+            // Check if user already reacted with this reaction type
+            const existingReactionIndex = announcement.reactions[userId].findIndex(r => r.type === reaction);
+            const reactionData = {
+                type: reaction,
+                timestamp: new Date().toISOString()
+            };
+            
+            if (existingReactionIndex >= 0) {
+                // Update existing reaction
+                announcement.reactions[userId][existingReactionIndex] = reactionData;
+            } else {
+                // Add new reaction
+                announcement.reactions[userId].push(reactionData);
+            }
+            
+            // Update announcement
+            const { resource: updatedAnnouncement } = await announcementsContainer.items.upsert(announcement);
+            
+            return {
+                jsonBody: {
+                    announcementId: id,
+                    userId: userId,
+                    reaction: reaction,
+                    reactions: updatedAnnouncement.reactions || {}
+                }
+            };
+        } catch (error) {
+            return handleError(context, error, 'Announcement reaction operation failed');
+        }
+    },
+});
+
+// Schedule export endpoints - for CRC dashboard "Print my schedule" buttons
+app.http('scheduleExport', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'schedule-export/{crcId}',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return { status: 200 };
+        }
+        
+        try {
+            const crcId = getIdFromRequest(request);
+            if (!crcId) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'CRC ID is required' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            
+            // Get query parameters
+            const query = request.query || {};
+            const period = (typeof query.get === 'function' ? query.get('period') : query.period) || 'weekly'; // 'weekly' or 'monthly'
+            const format = (typeof query.get === 'function' ? query.get('format') : query.format) || 'excel'; // 'excel' or 'ical'
+            
+            // Calculate date range
+            const today = new Date();
+            let startDate, endDate;
+            
+            if (period === 'monthly') {
+                // First day of current month to last day of current month
+                startDate = new Date(today.getFullYear(), today.getMonth(), 1);
+                endDate = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+            } else {
+                // Weekly: Monday to Sunday of current week
+                const dayOfWeek = today.getDay();
+                const diff = today.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1); // Adjust when day is Sunday
+                startDate = new Date(today.setDate(diff));
+                startDate.setHours(0, 0, 0, 0);
+                endDate = new Date(startDate);
+                endDate.setDate(endDate.getDate() + 6);
+                endDate.setHours(23, 59, 59, 999);
+            }
+            
+            const startDateStr = toDateOnlyString(startDate);
+            const endDateStr = toDateOnlyString(endDate);
+            
+            // Get CRC name
+            const crcsContainer = getContainer('crcs');
+            let crcName = crcId;
+            try {
+                const { resource: crc } = await crcsContainer.item(crcId, crcId).read();
+                if (crc && crc.name) {
+                    crcName = crc.name;
+                }
+            } catch (e) {
+                context.log.warn(`Could not load CRC ${crcId} for schedule export: ${e.message}`);
+            }
+            
+            // Build schedule context
+            const scheduleContext = await buildRecipientEmailContext({
+                crcId: crcId,
+                startDate: startDateStr,
+                endDate: endDateStr
+            }, context);
+            
+            const shifts = scheduleContext.schedule?.shifts || [];
+            const timeOff = [
+                ...(scheduleContext.timeOff?.requests || []),
+                ...(scheduleContext.timeOff?.events || [])
+            ];
+            const travel = scheduleContext.travel?.records || [];
+            
+            // Generate export based on format
+            if (format === 'ical') {
+                const icalContent = buildScheduleIcal({
+                    crcName: crcName,
+                    startDate: startDateStr,
+                    endDate: endDateStr,
+                    shifts: shifts,
+                    timeOff: timeOff,
+                    travel: travel
+                });
+                
+                const filename = `schedule_${crcName.replace(/[^a-z0-9]+/gi, '_')}_${period}_${startDateStr}_${endDateStr}.ics`;
+                
+                return {
+                    status: 200,
+                    body: icalContent,
+                    headers: {
+                        'Content-Type': 'text/calendar; charset=utf-8',
+                        'Content-Disposition': `attachment; filename="${filename}"`
+                    }
+                };
+            } else {
+                // Excel format (CSV)
+                const csvContent = buildScheduleCsv({
+                    crcName: crcName,
+                    startDate: startDateStr,
+                    endDate: endDateStr,
+                    shifts: shifts,
+                    timeOff: timeOff,
+                    travel: travel
+                });
+                
+                const filename = `schedule_${crcName.replace(/[^a-z0-9]+/gi, '_')}_${period}_${startDateStr}_${endDateStr}.csv`;
+                
+                return {
+                    status: 200,
+                    body: csvContent,
+                    headers: {
+                        'Content-Type': 'text/csv; charset=utf-8',
+                        'Content-Disposition': `attachment; filename="${filename}"`
+                    }
+                };
+            }
+        } catch (error) {
+            return handleError(context, error, 'Schedule export failed');
+        }
+    },
+});
+
 app.http('templates', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
@@ -4838,6 +5154,158 @@ const createTravelRecordFromNavanBooking = (booking, bookingId, bookingUuid, crc
     return travelRecord;
 };
 
+// Sync travel record to Travel Day event
+// This ensures that when Navan imports create travel records, corresponding Travel Day events are created/updated
+const syncTravelRecordToTravelDayEvent = async (context, travelRecord, action = 'created') => {
+    try {
+        const eventsContainer = getContainer('events');
+        const travelDate = travelRecord.date || travelRecord.departureDate || travelRecord.startDate;
+        
+        if (!travelDate || !travelRecord.crcId) {
+            context.log.warn(`Cannot sync travel record to Travel Day event: missing date or crcId. Travel record ID: ${travelRecord.id}`);
+            return null;
+        }
+        
+        // Normalize date to date-only string
+        const normalizedDate = toDateOnlyString(travelDate);
+        if (!normalizedDate) {
+            context.log.warn(`Cannot sync travel record to Travel Day event: invalid date. Travel record ID: ${travelRecord.id}`);
+            return null;
+        }
+        
+        // Find existing Travel Day event linked to this travel record
+        let existingEvent = null;
+        try {
+            let query = null;
+            let parameters = [];
+            
+            // First try to find by Navan booking IDs (most reliable)
+            if (travelRecord.navanBookingId || travelRecord.navanBookingUuid) {
+                query = "SELECT * FROM c WHERE c.type = 'Travel Day' AND (c.navanBookingId = @bookingId OR c.navanBookingUuid = @bookingUuid)";
+                parameters = [
+                    { name: "@bookingId", value: travelRecord.navanBookingId || '' },
+                    { name: "@bookingUuid", value: travelRecord.navanBookingUuid || '' }
+                ];
+            }
+            // If no Navan IDs, try to find by travelRecordId
+            else if (travelRecord.id) {
+                query = "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.travelRecordId = @travelRecordId";
+                parameters = [
+                    { name: "@travelRecordId", value: travelRecord.id }
+                ];
+            }
+            // Last resort: find by date and crcId (less reliable, might match wrong event)
+            else if (normalizedDate && travelRecord.crcId) {
+                query = "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date AND c.crcId = @crcId";
+                parameters = [
+                    { name: "@date", value: normalizedDate },
+                    { name: "@crcId", value: travelRecord.crcId }
+                ];
+            }
+            
+            if (query) {
+                const { resources } = await eventsContainer.items.query({
+                    query: query,
+                    parameters: parameters
+                }).fetchAll();
+                
+                if (resources && resources.length > 0) {
+                    existingEvent = resources[0];
+                }
+            }
+        } catch (queryError) {
+            context.log.warn(`Error querying for existing Travel Day event: ${queryError.message}`);
+        }
+        
+        // If travel record is cancelled, remove or mark the Travel Day event as cancelled
+        if (travelRecord.status === 'cancelled') {
+            if (existingEvent) {
+                try {
+                    await eventsContainer.item(existingEvent.id, existingEvent.id).delete();
+                    context.log.info(`Deleted Travel Day event ${existingEvent.id} because travel record ${travelRecord.id} was cancelled`);
+                    return { action: 'deleted', eventId: existingEvent.id };
+                } catch (deleteError) {
+                    context.log.warn(`Error deleting cancelled Travel Day event: ${deleteError.message}`);
+                }
+            }
+            return null;
+        }
+        
+        // Create or update Travel Day event
+        const travelDayEvent = {
+            type: 'Travel Day',
+            date: normalizedDate,
+            crcId: travelRecord.crcId,
+            crcIds: [travelRecord.crcId], // Travel Days use crcIds array
+            navanBookingId: travelRecord.navanBookingId || null,
+            navanBookingUuid: travelRecord.navanBookingUuid || null,
+            travelRecordId: travelRecord.id, // Link back to travel record
+            name: travelRecord.origin && travelRecord.destination 
+                ? `${travelRecord.origin} → ${travelRecord.destination}` 
+                : travelRecord.bookingType || 'Travel Day',
+            notes: travelRecord.confirmationNumber 
+                ? `Confirmation: ${travelRecord.confirmationNumber}` 
+                : null,
+            // Store travel details for reference
+            bookingType: travelRecord.bookingType || null,
+            origin: travelRecord.origin || null,
+            destination: travelRecord.destination || null,
+            flightNumber: travelRecord.flightNumber || null,
+            status: travelRecord.status || 'scheduled'
+        };
+        
+        // Remove null/undefined fields
+        Object.keys(travelDayEvent).forEach(key => {
+            if (travelDayEvent[key] === null || travelDayEvent[key] === undefined) {
+                delete travelDayEvent[key];
+            }
+        });
+        
+        if (existingEvent) {
+            // Only LINK to Navan - don't overwrite existing event data
+            // Just add/update the Navan linking fields
+            const linkedEvent = {
+                ...existingEvent,
+                navanBookingId: travelRecord.navanBookingId || existingEvent.navanBookingId || null,
+                navanBookingUuid: travelRecord.navanBookingUuid || existingEvent.navanBookingUuid || null,
+                travelRecordId: travelRecord.id || existingEvent.travelRecordId || null
+            };
+            
+            // Remove null fields
+            Object.keys(linkedEvent).forEach(key => {
+                if (linkedEvent[key] === null) {
+                    delete linkedEvent[key];
+                }
+            });
+            
+            try {
+                const { resource: updatedEvent } = await eventsContainer.items.upsert(linkedEvent);
+                context.log.info(`Linked Travel Day event ${updatedEvent.id} to Navan travel record ${travelRecord.id}`);
+                return { action: 'linked', eventId: updatedEvent.id, event: updatedEvent };
+            } catch (updateError) {
+                context.log.error(`Error linking Travel Day event: ${updateError.message}`);
+                throw updateError;
+            }
+        } else {
+            // Create new event only if one doesn't exist
+            travelDayEvent.id = generateId();
+            try {
+                const { resource: createdEvent } = await eventsContainer.items.create(travelDayEvent);
+                context.log.info(`Created Travel Day event ${createdEvent.id} from travel record ${travelRecord.id}`);
+                return { action: 'created', eventId: createdEvent.id, event: createdEvent };
+            } catch (createError) {
+                context.log.error(`Error creating Travel Day event: ${createError.message}`);
+                throw createError;
+            }
+        }
+    } catch (error) {
+        // Log error but don't fail the travel record creation/update
+        context.log.error(`Error syncing travel record to Travel Day event: ${error.message}`);
+        context.log.error(`Travel record ID: ${travelRecord.id}, Error stack: ${error.stack}`);
+        return null;
+    }
+};
+
 const upsertNavanBooking = async (context, booking, {
     bookingId,
     bookingUuid = null,
@@ -4909,6 +5377,15 @@ const upsertNavanBooking = async (context, booking, {
         try {
             await travelContainer.items.upsert(updatedTravel);
             context.log.info(`Updated existing travel record for Navan booking ${bookingIdentifier}`);
+            
+            // Sync to Travel Day event
+            try {
+                await syncTravelRecordToTravelDayEvent(context, updatedTravel, 'updated');
+            } catch (syncError) {
+                // Log but don't fail - travel record was updated successfully
+                context.log.warn(`Failed to sync travel record to Travel Day event: ${syncError.message}`);
+            }
+            
             return { travelRecord: updatedTravel, action: 'updated', saved: true, matched };
         } catch (upsertError) {
             // Check if this is a container missing error
@@ -4932,6 +5409,15 @@ const upsertNavanBooking = async (context, booking, {
         try {
             await travelContainer.items.create(newTravel);
             context.log.info(`Created new travel record for Navan booking ${bookingIdentifier}`);
+            
+            // Sync to Travel Day event
+            try {
+                await syncTravelRecordToTravelDayEvent(context, newTravel, 'created');
+            } catch (syncError) {
+                // Log but don't fail - travel record was created successfully
+                context.log.warn(`Failed to sync travel record to Travel Day event: ${syncError.message}`);
+            }
+            
             return { travelRecord: newTravel, action: 'created', saved: true, matched };
         } catch (createError) {
             // Check if this is a container missing error (in case query didn't catch it)
