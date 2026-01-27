@@ -32795,9 +32795,10 @@
 
                                             const upsertTravelDay = async ({ crcId, travelDateStr, isBefore }) => {
                                                 if (!travelDateStr) return;
+                                                // CRITICAL: Check for existing travel days across ALL dates and groupIds, not just the current groupId
+                                                // This prevents duplicates when the same CRC has travel days from different shifts
                                                 const existingTravelDay = state.crc_events.find(e =>
                                                     e.type === 'Travel Day' &&
-                                                    e.groupId === eventGroupId &&
                                                     e.date === travelDateStr &&
                                                     matchesCrcId(e, crcId)
                                                 );
@@ -32977,8 +32978,81 @@
                                                 }
                                             }
                                             
+                                            // CRITICAL: Delete travel days for CRCs that were removed from the shift
+                                            // Check existing event's roleAssignments to find CRCs that are no longer assigned
+                                            const previousCrcs = new Set();
+                                            if (existingEvent) {
+                                                // Collect CRCs from previous roleAssignments
+                                                if (existingEvent.roleAssignments) {
+                                                    Object.values(existingEvent.roleAssignments).forEach(assignments => {
+                                                        if (Array.isArray(assignments)) {
+                                                            assignments.forEach(crcId => {
+                                                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                                    previousCrcs.add(crcId);
+                                                                }
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                                // Also check legacy crcId
+                                                if (existingEvent.crcId && existingEvent.crcId !== 'SITE_STAFF' && existingEvent.crcId !== 'UNASSIGNED') {
+                                                    previousCrcs.add(existingEvent.crcId);
+                                                }
+                                            }
+                                            
+                                            // Find CRCs that were in the previous event but are not in the current assignment
+                                            const removedCrcs = Array.from(previousCrcs).filter(crcId => !assignedCrcsForTravel.has(crcId));
+                                            
+                                            // Delete travel days for removed CRCs
+                                            if (removedCrcs.length > 0) {
+                                                const eventDateRange = [];
+                                                if (eventStartDate) {
+                                                    const startDateObj = parseDateOnly(eventStartDate);
+                                                    if (startDateObj) {
+                                                        const startTravelDate = new Date(startDateObj);
+                                                        startTravelDate.setDate(startTravelDate.getDate() - 1);
+                                                        eventDateRange.push(toDateOnlyString(startTravelDate));
+                                                    }
+                                                }
+                                                if (eventEndDate) {
+                                                    const endDateObj = parseDateOnly(eventEndDate);
+                                                    if (endDateObj) {
+                                                        const endTravelDate = new Date(endDateObj);
+                                                        endTravelDate.setDate(endTravelDate.getDate() + 1);
+                                                        eventDateRange.push(toDateOnlyString(endTravelDate));
+                                                    }
+                                                }
+                                                // Also check the event date itself
+                                                if (updatedEvent.date) {
+                                                    eventDateRange.push(updatedEvent.date);
+                                                }
+                                                
+                                                for (const removedCrcId of removedCrcs) {
+                                                    // Find and delete travel days for this CRC on dates related to this shift
+                                                    const travelDaysToDelete = state.crc_events.filter(e =>
+                                                        e.type === 'Travel Day' &&
+                                                        matchesCrcId(e, removedCrcId) &&
+                                                        (eventDateRange.length === 0 || eventDateRange.includes(e.date))
+                                                    );
+                                                    
+                                                    for (const travelDay of travelDaysToDelete) {
+                                                        try {
+                                                            await apiService.deleteEvent(travelDay.id);
+                                                            // Remove from state
+                                                            const index = state.crc_events.findIndex(e => e.id === travelDay.id);
+                                                            if (index !== -1) {
+                                                                state.crc_events.splice(index, 1);
+                                                            }
+                                                            console.log(`Deleted travel day ${travelDay.id} for removed CRC ${removedCrcId}`);
+                                                        } catch (deleteError) {
+                                                            console.error(`Error deleting travel day ${travelDay.id} for removed CRC ${removedCrcId}:`, deleteError);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
                                             // Refresh state after travel days are updated
-                                            if (assignedCrcsForTravel.size > 0) {
+                                            if (assignedCrcsForTravel.size > 0 || removedCrcs.length > 0) {
                                                 setState({ crc_events: [...state.crc_events] }, { skipRender: false });
                                                 renderContent();
                                             }
