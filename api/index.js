@@ -2683,6 +2683,16 @@ async function crudHandler(context, request, containerName) {
                 try {
                     // For events, ensure we preserve all fields when updating (merge with existing event)
                     let updatedItem = { ...requestBody, id: updateId };
+                    if (containerName === 'studies' && updateId) {
+                        try {
+                            const { resource: existingStudy } = await container.item(updateId, updateId).read();
+                            if (existingStudy) {
+                                updatedItem = { ...existingStudy, ...requestBody, id: updateId };
+                            }
+                        } catch (readError) {
+                            context.log.warn(`Could not read existing study ${updateId} for merge, proceeding with update:`, readError.message);
+                        }
+                    }
                     if (containerName === 'events' && updateId) {
                         try {
                             const { resource: existingEvent } = await container.item(updateId, updateId).read();

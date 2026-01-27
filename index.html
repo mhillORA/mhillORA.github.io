@@ -1492,6 +1492,13 @@
                     });
                 }
 
+                async reactToAnnouncement(id, data) {
+                    return this.request(`/announcements/${id}/reactions`, {
+                        method: 'POST',
+                        body: JSON.stringify(data)
+                    });
+                }
+
                 // Travel methods
                 async getTravel() {
                     const dbTravel = await this.request('/travel');
@@ -9043,28 +9050,55 @@
                     if (!startDateIcs || !startDateObj) return;
                     const endDateIcs = formatIcsDate(addDays(startDateObj, 1));
 
-                    const crc = state.crcs.find(c => c.id === event.crcId);
                     const site = state.crc_sites.find(s => s.id === event.siteId);
                     const studies = (event.studyIds || []).map(id => {
                         const study = state.studies?.find(s => s.id === id);
                         return study?.name || '';
                     }).filter(Boolean);
 
-                    const summaryParts = [event.type];
-                    if (crc?.name) summaryParts.push(crc.name);
+                    const crcNames = [];
+                    if (event.crcId) {
+                        const crc = state.crcs.find(c => c.id === event.crcId);
+                        if (crc?.name) crcNames.push(crc.name);
+                    }
+                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                        Object.values(event.roleAssignments).forEach(assignments => {
+                            if (!Array.isArray(assignments)) return;
+                            assignments.forEach(crcId => {
+                                if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') return;
+                                const crc = state.crcs.find(c => c.id === crcId);
+                                if (crc?.name && !crcNames.includes(crc.name)) {
+                                    crcNames.push(crc.name);
+                                }
+                            });
+                        });
+                    }
+                    const crcDisplay = crcNames.length > 0 ? crcNames.join(', ') : 'Unassigned';
+
+                    const summaryParts = [event.type, `CRC: ${crcDisplay}`];
                     if (site?.name) summaryParts.push(`@ ${site.name}`);
                     const summary = escapeIcsText(summaryParts.join(' - '));
 
                     const descriptionLines = [];
+                    descriptionLines.push(`CRC: ${crcDisplay}`);
+                    if (site?.name) descriptionLines.push(`Site: ${site.name}`);
                     if (studies.length) descriptionLines.push(`Studies: ${studies.join('; ')}`);
                     if (event.roles?.length) descriptionLines.push(`Roles: ${event.roles.join('; ')}`);
                     if (event.period) descriptionLines.push(`Period: ${event.period}`);
                     if (event.hours) descriptionLines.push(`Hours: ${event.hours}`);
                     if (event.visitNumber) descriptionLines.push(`Visit: ${event.visitNumber}`);
                     if (event.numberOfPatients) descriptionLines.push(`Patients: ${event.numberOfPatients}`);
-                    if (event.principalInvestigator) descriptionLines.push(`PI: ${event.principalInvestigator}`);
+                    const pi = event.principalInvestigator || site?.principalInvestigator;
+                    if (pi) descriptionLines.push(`PI: ${pi}`);
                     if (event.mileage) descriptionLines.push(`Mileage: ${event.mileage}`);
                     if (event.notes) descriptionLines.push(`Notes: ${event.notes}`);
+                    if (site) {
+                        const siteAddressParts = [site.address1 || site.address || '', site.address2 || '', site.city || '', site.state || '', site.zipCode || site.zip || '']
+                            .filter(Boolean);
+                        if (siteAddressParts.length > 0) {
+                            descriptionLines.push(`Location: ${siteAddressParts.join(', ')}`);
+                        }
+                    }
                     const description = escapeIcsText(descriptionLines.join('\n'));
 
                     lines.push('BEGIN:VEVENT');
@@ -9074,7 +9108,12 @@
                     lines.push(`DTEND;VALUE=DATE:${endDateIcs}`);
                     lines.push(`SUMMARY:${summary}`);
                     if (description) lines.push(`DESCRIPTION:${description}`);
-                    if (site?.name) lines.push(`LOCATION:${escapeIcsText(site.name)}`);
+                    if (site) {
+                        const locationParts = [site.address1 || site.address || '', site.address2 || '', site.city || '', site.state || '', site.zipCode || site.zip || '']
+                            .filter(Boolean);
+                        const locationText = locationParts.length > 0 ? locationParts.join(', ') : site.name;
+                        if (locationText) lines.push(`LOCATION:${escapeIcsText(locationText)}`);
+                    }
                     lines.push('END:VEVENT');
                 });
 
@@ -9092,6 +9131,45 @@
                 link.click();
                 document.body.removeChild(link);
                 URL.revokeObjectURL(url);
+            };
+
+            const exportCurrentCrcMonthToIcal = () => {
+                const matchingCrcId = getLoggedInCrcId();
+                if (!matchingCrcId) {
+                    showNotification('Unable to identify your CRC profile.', 'error');
+                    return;
+                }
+                const now = state.crcCalendarDate || new Date();
+                const year = now.getFullYear();
+                const month = now.getMonth();
+                const startDateStr = toDateOnlyString(new Date(year, month, 1));
+                const endDateStr = toDateOnlyString(new Date(year, month + 1, 0));
+
+                const isCrcEvent = (event) => {
+                    if (event.crcId === matchingCrcId) return true;
+                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                        return Object.values(event.roleAssignments).some(assignments => {
+                            if (Array.isArray(assignments)) {
+                                return assignments.includes(matchingCrcId);
+                            }
+                            return false;
+                        });
+                    }
+                    return false;
+                };
+
+                const monthEvents = (state.crc_events || []).filter(e => {
+                    if (!e.date) return false;
+                    return e.date >= startDateStr && e.date <= endDateStr && isCrcEvent(e);
+                });
+
+                if (monthEvents.length === 0) {
+                    showNotification('No events this month to export.', 'info');
+                    return;
+                }
+
+                exportEventsToIcal(monthEvents, startDateStr, endDateStr);
+                showNotification(`Exported ${monthEvents.length} events successfully!`, 'success');
             };
 
             // --- HTML GETTERS ---
@@ -9708,19 +9786,21 @@
                                         }
                                     }
                                     const crcNameDisplay = crcNames.length > 0 ? crcNames.join(', ') : '';
+                                    const timeOffTypes = new Set(['Unavailable', 'Paid Time Off', 'Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty']);
+                                    const isTimeOff = timeOffTypes.has(event.type) || timeOffTypes.has(event.name);
                                     
-                                    const bgColor = event.type === 'Travel Day' ? '#3b82f6' : '#8b5cf6';
+                                    const bgColor = isTimeOff ? '#10b981' : (event.type === 'Travel Day' ? '#3b82f6' : '#8b5cf6');
                                     
                                     return `
                                         <div class="text-xs p-1 rounded cursor-pointer hover:opacity-80 transition-opacity" 
                                              style="background-color: ${bgColor}; color: white;"
                                              data-action="view-crc-event" 
                                              data-event-id="${event.id}"
-                                             title="${event.type} - ${site ? site.name : 'Unknown Site'}${pi ? ' - PI: ' + pi : ''} - ${studyNames}${crcNameDisplay ? ' - ' + crcNameDisplay : ''}">
-                                            <div class="font-medium truncate">${event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown')}</div>
+                                             title="${isTimeOff ? 'Time Off' : `${event.type} - ${site ? site.name : 'Unknown Site'}${pi ? ' - PI: ' + pi : ''} - ${studyNames}`}${crcNameDisplay ? ' - ' + crcNameDisplay : ''}">
+                                            <div class="font-medium truncate">${isTimeOff ? '🏖 Time Off' : (event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown'))}</div>
                                             ${pi ? `<div class="text-[10px] opacity-90 truncate">PI: ${pi}</div>` : ''}
                                             ${crcNameDisplay ? `<div class="text-[10px] opacity-90 truncate">${crcNameDisplay}</div>` : ''}
-                                            <div class="text-[10px] opacity-90 truncate">${studyNames}</div>
+                                            ${isTimeOff ? '' : `<div class="text-[10px] opacity-90 truncate">${studyNames}</div>`}
                                         </div>
                                     `;
                                 }).join('')}
@@ -9759,6 +9839,9 @@
                                 <p class="text-gray-600 dark:text-gray-400">${crc.name}</p>
                             </div>
                             <div class="flex items-center gap-2">
+                                <button data-action="export-crc-ical" class="px-3 py-2 rounded-md bg-green-600 text-white hover:bg-green-700 text-sm">
+                                    Export iCal
+                                </button>
                                 <button data-action="prev-crc-schedule-month" class="p-2 rounded-md bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600">
                                     <i data-lucide="chevron-left" class="w-5 h-5"></i>
                                 </button>
@@ -25979,6 +26062,30 @@
                         showNotification('Dashboard data exported', 'success');
                         break;
                     }
+                    case 'react-announcement': {
+                        const announcementId = actionButton.dataset.announcementId;
+                        const reaction = actionButton.dataset.reaction;
+                        const userId = state.currentUser?.id || getLoggedInCrcId() || state.currentUser?.username;
+                        if (!announcementId || !reaction || !userId) {
+                            showNotification('Unable to save reaction.', 'error');
+                            break;
+                        }
+                        try {
+                            const result = await apiService.reactToAnnouncement(announcementId, { userId, reaction });
+                            if (result?.reactions) {
+                                setState({
+                                    announcements: (state.announcements || []).map(a =>
+                                        a.id === announcementId ? { ...a, reactions: result.reactions } : a
+                                    )
+                                });
+                                renderAnnouncementsList();
+                            }
+                        } catch (error) {
+                            console.error('Error saving reaction:', error);
+                            showNotification('Failed to save reaction.', 'error');
+                        }
+                        break;
+                    }
                     case 'dismiss-announcement': {
                         const announcementId = actionButton.dataset.announcementId;
                         if (!announcementId) break;
@@ -30376,6 +30483,10 @@
                         setState({ crcCalendarDate: new Date() }); 
                         renderCRCDashboardCalendar();
                         break;
+                    case 'export-crc-ical': {
+                        exportCurrentCrcMonthToIcal();
+                        break;
+                    }
                     case 'edit-role': {
                         const role = state.roles.find(r => r.id === id);
                         if (role) openModal(getEditRoleModalHTML(role), 'lg');
@@ -37866,6 +37977,42 @@
                 setupAnnouncementHandlers();
             };
 
+            const ANNOUNCEMENT_REACTIONS = [
+                { id: 'thumbsup', label: '👍', title: 'Thumbs up' },
+                { id: 'smile', label: '😊', title: 'Smile' },
+                { id: 'heart', label: '❤️', title: 'Heart' },
+                { id: 'fire', label: '🔥', title: 'Fire' },
+                { id: 'volcano', label: '🌋', title: 'Volcano' }
+            ];
+
+            const getAnnouncementReactionSummary = (announcement) => {
+                const reactions = announcement?.reactions || {};
+                const counts = {};
+                const usersByReaction = {};
+
+                Object.entries(reactions).forEach(([userId, userReactions]) => {
+                    if (!Array.isArray(userReactions)) return;
+                    userReactions.forEach(reaction => {
+                        const type = reaction?.type;
+                        if (!type) return;
+                        counts[type] = (counts[type] || 0) + 1;
+                        if (!usersByReaction[type]) usersByReaction[type] = [];
+                        usersByReaction[type].push(userId);
+                    });
+                });
+
+                return { counts, usersByReaction };
+            };
+
+            const getAnnouncementUserDisplay = (userId) => {
+                if (!userId) return 'Unknown';
+                const crc = (state.crcs || []).find(c => c.id === userId || c.name === userId);
+                if (crc?.name) return crc.name;
+                const user = (state.users || []).find(u => u.id === userId || u.username === userId);
+                if (user?.username) return user.username;
+                return userId;
+            };
+
             // Check and show announcement popup if needed
             const checkAndShowAnnouncementPopup = () => {
                 if (!state.currentUser || !state.isAuthenticated) return;
@@ -37930,7 +38077,15 @@
                             <div class="mb-6">
                                 <p class="text-lg text-gray-700 dark:text-gray-300 whitespace-pre-wrap">${message}</p>
                             </div>
-                            <div class="flex justify-end">
+                            <div class="flex items-center justify-between gap-4">
+                                <div class="flex items-center gap-2">
+                                    <span class="text-xs text-gray-500 dark:text-gray-400">React:</span>
+                                    ${ANNOUNCEMENT_REACTIONS.map(reaction => `
+                                        <button data-action="react-announcement" data-announcement-id="${announcement.id}" data-reaction="${reaction.id}" class="px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700" title="${reaction.title}">
+                                            ${reaction.label}
+                                        </button>
+                                    `).join('')}
+                                </div>
                                 <button data-action="close-announcement-popup" data-announcement-id="${announcement.id}" class="bg-yellow-400 dark:bg-yellow-600 text-yellow-900 dark:text-yellow-100 px-6 py-2 rounded-md hover:bg-yellow-500 dark:hover:bg-yellow-700 font-medium">
                                     Got it
                                 </button>
@@ -37999,6 +38154,12 @@
                     return '';
                 }
                 
+                // If dismissed recently, keep banner hidden for 12 hours
+                const dismissedAt = announcementViews[userId]?.[announcement.id];
+                if (dismissedAt && (now.getTime() - dismissedAt) < (12 * 60 * 60 * 1000)) {
+                    return '';
+                }
+                
                 const message = announcement.message || '';
                 
                 // Banner persists for full duration until expiration - no need to mark as viewed
@@ -38006,6 +38167,11 @@
                 // Check if message is long enough for carousel (more than ~60 characters)
                 const needsCarousel = message.length > 60;
                 const carouselMessage = message;
+                const reactionsHtml = ANNOUNCEMENT_REACTIONS.map(reaction => `
+                    <button data-action="react-announcement" data-announcement-id="${announcement.id}" data-reaction="${reaction.id}" class="px-1.5 py-0.5 rounded hover:bg-yellow-300/50 dark:hover:bg-yellow-700/40 text-yellow-900 dark:text-yellow-100" title="${reaction.title}" style="pointer-events: auto;">
+                        ${reaction.label}
+                    </button>
+                `).join('');
                 
                 if (needsCarousel) {
                     // Calculate animation duration based on message length (readable pace: ~10 chars per second)
@@ -38024,6 +38190,9 @@
                                 <span class="text-lg font-bold text-yellow-900 dark:text-yellow-100 px-4" style="pointer-events: none;">${carouselMessage}</span>
                                 <span class="text-lg font-bold text-yellow-900 dark:text-yellow-100 px-4" style="pointer-events: none;">${carouselMessage}</span>
                             </div>
+                            <div class="absolute right-10 top-1/2 transform -translate-y-1/2 flex items-center gap-1 z-20" style="pointer-events: auto;">
+                                ${reactionsHtml}
+                            </div>
                             <button data-action="dismiss-announcement" data-announcement-id="${announcement.id}" class="absolute right-2 top-1/2 transform -translate-y-1/2 text-yellow-900 dark:text-yellow-100 hover:text-yellow-700 dark:hover:text-yellow-200 z-20" style="pointer-events: auto;" title="Dismiss">
                                 <i data-lucide="x" class="w-5 h-5"></i>
                             </button>
@@ -38039,6 +38208,9 @@
                     return `
                         <div id="announcement-banner" class="w-full bg-yellow-400 dark:bg-yellow-600 border-b-2 border-yellow-600 dark:border-yellow-700 shadow-lg flex items-center justify-center px-4 py-2 relative" style="pointer-events: auto;">
                             <span class="text-lg font-bold text-yellow-900 dark:text-yellow-100 text-center" style="pointer-events: none;">${message}</span>
+                            <div class="absolute right-10 top-1/2 transform -translate-y-1/2 flex items-center gap-1" style="pointer-events: auto;">
+                                ${reactionsHtml}
+                            </div>
                             <button data-action="dismiss-announcement" data-announcement-id="${announcement.id}" class="absolute right-2 top-1/2 transform -translate-y-1/2 text-yellow-900 dark:text-yellow-100 hover:text-yellow-700 dark:hover:text-yellow-200 z-20" style="pointer-events: auto;" title="Dismiss">
                                 <i data-lucide="x" class="w-5 h-5"></i>
                             </button>
@@ -38073,6 +38245,17 @@
                     const expiresText = expiresDate ? expiresDate.toLocaleDateString() : 'No expiration';
                     const createdDate = ann.createdAt ? new Date(ann.createdAt) : null;
                     const createdText = createdDate ? createdDate.toLocaleDateString() : 'Unknown';
+                    const { counts, usersByReaction } = getAnnouncementReactionSummary(ann);
+                    const reactionCountsText = ANNOUNCEMENT_REACTIONS
+                        .filter(r => counts[r.id])
+                        .map(r => `${r.label} ${counts[r.id]}`)
+                        .join(' ');
+                    const reactionsDetail = ANNOUNCEMENT_REACTIONS
+                        .filter(r => Array.isArray(usersByReaction[r.id]) && usersByReaction[r.id].length > 0)
+                        .map(r => {
+                            const names = usersByReaction[r.id].map(getAnnouncementUserDisplay).join(', ');
+                            return `<div class="text-xs text-gray-600 dark:text-gray-400">${r.label} ${names}</div>`;
+                        }).join('');
                     
                     return `
                         <div class="border dark:border-gray-700 rounded-lg p-3 bg-white dark:bg-gray-800">
@@ -38083,6 +38266,10 @@
                                         <span>Created: ${createdText}</span>
                                         <span>Expires: ${expiresText}</span>
                                     </div>
+                                    <div class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                                        ${reactionCountsText ? `Reactions: ${reactionCountsText}` : 'Reactions: none yet'}
+                                    </div>
+                                    ${reactionsDetail ? `<div class="mt-1">${reactionsDetail}</div>` : ''}
                                 </div>
                                 <button data-action="delete-announcement" data-announcement-id="${ann.id}" class="text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300" title="Delete">
                                     <i data-lucide="trash-2" class="w-4 h-4"></i>
@@ -40010,6 +40197,9 @@
                                         <button data-action="configure-study-roles" data-study-id="${study.id}" class="text-xs bg-green-600 text-white px-2 py-1 rounded hover:bg-green-700 transition-colors" onclick="event.stopPropagation();">
                                             Configure
                                         </button>
+                                            <button data-action="edit-study" data-id="${study.id}" class="text-xs bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-700 transition-colors" onclick="event.stopPropagation();">
+                                                Edit
+                                            </button>
                                     </div>
                                 </div>
                             </div>
@@ -40224,6 +40414,9 @@
                                             ` : ''}
                                             <button data-action="configure-study-roles" data-study-id="${study.id}" class="text-xs bg-green-600 text-white px-2 py-1 rounded hover:bg-green-700 transition-colors" onclick="event.stopPropagation();">
                                                 Configure
+                                            </button>
+                                            <button data-action="edit-study" data-id="${study.id}" class="text-xs bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-700 transition-colors" onclick="event.stopPropagation();">
+                                                Edit
                                             </button>
                                         </div>
                                     </div>
@@ -40443,7 +40636,7 @@
                     if (!tableBody) return;
                     const searchTerm = (searchFilter?.value || '').toLowerCase();
                     const activeValue = activeFilter?.value || 'all';
-                    const permissionValue = permissionFilter?.value || 'all';
+                    const permissionValue = (permissionFilter?.value || 'all').toLowerCase();
                     
                     const rows = tableBody.querySelectorAll('.user-row');
                     rows.forEach(row => {
