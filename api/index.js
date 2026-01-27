@@ -1020,17 +1020,31 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
 
 // Helper function to handle errors
 const handleError = (context, error, message) => {
-    context.log.error(`${message}:`, error.message);
-    context.log.error(`Stack:`, error.stack);
+    const rawMessage = (typeof error?.message === 'string' && error.message.trim() !== '')
+        ? error.message
+        : (typeof error === 'string' && error.trim() !== '' ? error : 'Unknown error');
+    const errorStack = (typeof error?.stack === 'string' && error.stack.trim() !== '')
+        ? error.stack
+        : "No stack trace";
+
+    try {
+        context.log.error(`${message}:`, rawMessage);
+        context.log.error(`Stack:`, errorStack);
+        if (error && typeof error === 'object' && Object.keys(error).length > 0) {
+            context.log.error(`Error object:`, safeStringify(error));
+        }
+    } catch (logError) {
+        console.error(`${message}:`, rawMessage);
+        console.error(`Stack:`, errorStack);
+    }
 
     let errorMessage;
-    let errorDetail = error.message || "Unknown error";
-    let errorStack = error.stack || "No stack trace";
+    const errorDetail = rawMessage;
 
-    if (error.message.includes('COSMOS_DB_CONFIG_MISSING')) {
+    if (rawMessage.includes('COSMOS_DB_CONFIG_MISSING')) {
         errorMessage = "API Configuration Error: Database secrets not set in Azure Configuration.";
-    } else if (error.message.includes('VALIDATION_ERROR')) {
-        errorMessage = error.message.replace('VALIDATION_ERROR: ', '');
+    } else if (rawMessage.includes('VALIDATION_ERROR')) {
+        errorMessage = rawMessage.replace('VALIDATION_ERROR: ', '');
     } else {
         errorMessage = "Internal Server Error during data processing.";
     }
