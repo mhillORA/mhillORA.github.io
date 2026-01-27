@@ -3094,7 +3094,12 @@ async function crudHandler(context, request, containerName) {
                             const eventsContainer = getContainer('events');
                             const shiftDate = toDateOnlyString(result.date);
                             
-                            // Collect all CRCs assigned to this shift
+                            // Skip if date is invalid
+                            if (!shiftDate) {
+                                context.log.warn(`Invalid date for travel day processing: ${result.date}`);
+                                // Continue without processing travel days
+                            } else {
+                                // Collect all CRCs assigned to this shift
                             const shiftCrcIds = new Set();
                             if (result.crcId && result.crcId.trim() !== '' && result.crcId !== 'SITE_STAFF' && result.crcId !== 'UNASSIGNED') {
                                 shiftCrcIds.add(result.crcId);
@@ -3119,12 +3124,20 @@ async function crudHandler(context, request, containerName) {
                             }
                             
                             // Get existing travel days for this shift date - check ALL travel days, not just from this shift
-                            const { resources: existingTravelDays } = await eventsContainer.items.query({
-                                query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
-                                parameters: [
-                                    { name: "@date", value: shiftDate }
-                                ]
-                            }).fetchAll();
+                            let existingTravelDays = [];
+                            try {
+                                const queryResult = await eventsContainer.items.query({
+                                    query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
+                                    parameters: [
+                                        { name: "@date", value: shiftDate }
+                                    ]
+                                }).fetchAll();
+                                existingTravelDays = queryResult.resources || [];
+                            } catch (queryError) {
+                                context.log.error(`Error querying existing travel days for date ${shiftDate}:`, queryError);
+                                // Continue with empty array - don't fail the shift update
+                                existingTravelDays = [];
+                            }
                             
                             // Process travelDayPreferences
                             if (result.travelDayPreferences && typeof result.travelDayPreferences === 'object') {
@@ -3246,6 +3259,7 @@ async function crudHandler(context, request, containerName) {
                                 // If travelDayPreferences is removed entirely, check if we should clean up travel days
                                 // Only delete travel days that were created for this specific shift (we can't easily track this, so we'll be conservative)
                                 // Actually, let's not delete automatically - let the user manage travel days explicitly
+                            }
                             }
                         } catch (travelDayError) {
                             // Log but don't fail the shift update if travel day creation fails
