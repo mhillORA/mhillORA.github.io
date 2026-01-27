@@ -1943,6 +1943,115 @@ async function crudHandler(context, request, containerName) {
                         // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
                         const { resource } = await container.item(id, id).read(); 
                         if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
+                        
+                        // Auto-migrate legacy events to modern format
+                        if (containerName === 'events' && resource) {
+                            const needsMigration = (event) => {
+                                if (!event || typeof event !== 'object') return false;
+                                
+                                // Check for legacy studyId (string instead of studyIds array)
+                                if (event.studyId && typeof event.studyId === 'string' && (!event.studyIds || !Array.isArray(event.studyIds))) {
+                                    return true;
+                                }
+                                
+                                // Check for legacy crcId without crcIds array
+                                if (event.crcId && typeof event.crcId === 'string' && (!event.crcIds || !Array.isArray(event.crcIds))) {
+                                    return true;
+                                }
+                                
+                                // Check for legacy roleAssignments (non-string values)
+                                if (event.roleAssignments && typeof event.roleAssignments === 'object' && !Array.isArray(event.roleAssignments)) {
+                                    const hasLegacy = Object.values(event.roleAssignments).some(assignments => {
+                                        if (Array.isArray(assignments)) {
+                                            return assignments.some(entry => entry !== null && typeof entry !== 'string');
+                                        }
+                                        return assignments !== null && typeof assignments !== 'string';
+                                    });
+                                    if (hasLegacy) return true;
+                                }
+                                
+                                // Check for legacy crcIds (non-string values)
+                                if (Array.isArray(event.crcIds) && event.crcIds.some(entry => entry !== null && typeof entry !== 'string')) {
+                                    return true;
+                                }
+                                
+                                return false;
+                            };
+                            
+                            if (needsMigration(resource)) {
+                                // Create a copy to normalize
+                                const normalized = JSON.parse(JSON.stringify(resource));
+                                
+                                // Normalize studyId -> studyIds
+                                if (normalized.studyId && typeof normalized.studyId === 'string' && (!normalized.studyIds || !Array.isArray(normalized.studyIds))) {
+                                    normalized.studyIds = [normalized.studyId];
+                                    delete normalized.studyId;
+                                }
+                                
+                                // Normalize crcId -> crcIds
+                                if (normalized.crcId && typeof normalized.crcId === 'string' && (!normalized.crcIds || !Array.isArray(normalized.crcIds))) {
+                                    normalized.crcIds = [normalized.crcId];
+                                }
+                                
+                                // Normalize roleAssignments and crcIds (using same helpers as PUT)
+                                const isValidCrcId = (value) =>
+                                    typeof value === 'string' &&
+                                    value.trim() !== '' &&
+                                    value.trim() !== 'SITE_STAFF' &&
+                                    value.trim() !== 'UNASSIGNED';
+                                const extractCrcId = (value) => {
+                                    if (typeof value === 'string') return value;
+                                    if (value && typeof value === 'object') {
+                                        const candidate = value.crcId || value.id || value.userId || value.value || value.key;
+                                        if (typeof candidate === 'string') return candidate;
+                                    }
+                                    return null;
+                                };
+                                const normalizeRoleAssignments = (roleAssignments) => {
+                                    if (!roleAssignments || typeof roleAssignments !== 'object' || Array.isArray(roleAssignments)) {
+                                        return roleAssignments;
+                                    }
+                                    const normalized = {};
+                                    Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                                        if (Array.isArray(assignments)) {
+                                            normalized[roleId] = assignments.map(entry => {
+                                                const id = extractCrcId(entry);
+                                                return isValidCrcId(id) ? id : null;
+                                            });
+                                        } else {
+                                            const id = extractCrcId(assignments);
+                                            normalized[roleId] = isValidCrcId(id) ? [id] : [null];
+                                        }
+                                    });
+                                    return normalized;
+                                };
+                                
+                                if (Array.isArray(normalized.crcIds)) {
+                                    normalized.crcIds = normalized.crcIds
+                                        .map(extractCrcId)
+                                        .filter(id => isValidCrcId(id));
+                                }
+                                
+                                if (normalized.roleAssignments !== undefined) {
+                                    normalized.roleAssignments = normalizeRoleAssignments(normalized.roleAssignments);
+                                }
+                                
+                                // Remove Cosmos DB system fields
+                                ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => {
+                                    if (k in normalized) delete normalized[k];
+                                });
+                                
+                                // Save migrated version back to database (async, don't wait)
+                                container.items.upsert(normalized).catch(err => {
+                                    context.log.warn(`Failed to auto-migrate legacy event ${id}:`, err.message);
+                                });
+                                
+                                // Return normalized version
+                                resource = normalized;
+                                context.log.info(`Auto-migrated legacy event ${id} to modern format`);
+                            }
+                        }
+                        
                         // Normalize Travel Day events to ensure they display correctly (not as open shifts)
                         if (containerName === 'events' && resource && resource.type === 'Travel Day') {
                             // If crcId is missing/null but crcIds array exists, set crcId from first CRC
@@ -2068,38 +2177,112 @@ async function crudHandler(context, request, containerName) {
                 } else {
                     try {
                         const { resources } = await container.items.readAll().fetchAll();
-                        // Normalize Travel Day events to ensure they display correctly (not as open shifts)
-                        // Only normalize if we have events and they're Travel Day type (optimization)
+                        
+                        // Auto-migrate legacy events to modern format
                         if (containerName === 'events' && Array.isArray(resources) && resources.length > 0) {
-                            // Quick check: only process if there are any Travel Day events
-                            const hasTravelDays = resources.some(e => e && e.type === 'Travel Day');
+                            const needsMigration = (event) => {
+                                if (!event || typeof event !== 'object') return false;
+                                if (event.studyId && typeof event.studyId === 'string' && (!event.studyIds || !Array.isArray(event.studyIds))) return true;
+                                if (event.crcId && typeof event.crcId === 'string' && (!event.crcIds || !Array.isArray(event.crcIds))) return true;
+                                if (event.roleAssignments && typeof event.roleAssignments === 'object' && !Array.isArray(event.roleAssignments)) {
+                                    const hasLegacy = Object.values(event.roleAssignments).some(assignments => {
+                                        if (Array.isArray(assignments)) {
+                                            return assignments.some(entry => entry !== null && typeof entry !== 'string');
+                                        }
+                                        return assignments !== null && typeof assignments !== 'string';
+                                    });
+                                    if (hasLegacy) return true;
+                                }
+                                if (Array.isArray(event.crcIds) && event.crcIds.some(entry => entry !== null && typeof entry !== 'string')) return true;
+                                return false;
+                            };
+                            
+                            const isValidCrcId = (value) => typeof value === 'string' && value.trim() !== '' && value.trim() !== 'SITE_STAFF' && value.trim() !== 'UNASSIGNED';
+                            const extractCrcId = (value) => {
+                                if (typeof value === 'string') return value;
+                                if (value && typeof value === 'object') {
+                                    const candidate = value.crcId || value.id || value.userId || value.value || value.key;
+                                    if (typeof candidate === 'string') return candidate;
+                                }
+                                return null;
+                            };
+                            const normalizeRoleAssignments = (roleAssignments) => {
+                                if (!roleAssignments || typeof roleAssignments !== 'object' || Array.isArray(roleAssignments)) return roleAssignments;
+                                const normalized = {};
+                                Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                                    if (Array.isArray(assignments)) {
+                                        normalized[roleId] = assignments.map(entry => {
+                                            const id = extractCrcId(entry);
+                                            return isValidCrcId(id) ? id : null;
+                                        });
+                                    } else {
+                                        const id = extractCrcId(assignments);
+                                        normalized[roleId] = isValidCrcId(id) ? [id] : [null];
+                                    }
+                                });
+                                return normalized;
+                            };
+                            
+                            const migratedEvents = [];
+                            const normalizedResources = resources.map(event => {
+                                if (!needsMigration(event)) return event;
+                                
+                                const normalized = JSON.parse(JSON.stringify(event));
+                                if (normalized.studyId && typeof normalized.studyId === 'string' && (!normalized.studyIds || !Array.isArray(normalized.studyIds))) {
+                                    normalized.studyIds = [normalized.studyId];
+                                    delete normalized.studyId;
+                                }
+                                if (normalized.crcId && typeof normalized.crcId === 'string' && (!normalized.crcIds || !Array.isArray(normalized.crcIds))) {
+                                    normalized.crcIds = [normalized.crcId];
+                                }
+                                if (Array.isArray(normalized.crcIds)) {
+                                    normalized.crcIds = normalized.crcIds.map(extractCrcId).filter(id => isValidCrcId(id));
+                                }
+                                if (normalized.roleAssignments !== undefined) {
+                                    normalized.roleAssignments = normalizeRoleAssignments(normalized.roleAssignments);
+                                }
+                                ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => {
+                                    if (k in normalized) delete normalized[k];
+                                });
+                                
+                                migratedEvents.push(normalized);
+                                return normalized;
+                            });
+                            
+                            // Save migrated events asynchronously (don't wait)
+                            if (migratedEvents.length > 0) {
+                                context.log.info(`Auto-migrating ${migratedEvents.length} legacy events to modern format`);
+                                Promise.all(migratedEvents.map(event => 
+                                    container.items.upsert(event).catch(err => 
+                                        context.log.warn(`Failed to auto-migrate legacy event ${event.id}:`, err.message)
+                                    )
+                                )).catch(() => {
+                                    // Ignore batch errors
+                                });
+                            }
+                            
+                            // Normalize Travel Day events to ensure they display correctly (not as open shifts)
+                            const hasTravelDays = normalizedResources.some(e => e && e.type === 'Travel Day');
                             if (hasTravelDays) {
-                                const normalizedResources = resources.map(event => {
-                                    // Fix Travel Day events: ensure they have crcId set from crcIds if available
+                                const finalResources = normalizedResources.map(event => {
                                     if (event && event.type === 'Travel Day') {
-                                        // CRITICAL: Ensure Travel Day type is preserved
                                         event.type = 'Travel Day';
-                                        // If crcId is missing/null but crcIds array exists, set crcId from first CRC
                                         if ((!event.crcId || event.crcId === null || event.crcId === '') && 
                                             event.crcIds && Array.isArray(event.crcIds) && event.crcIds.length > 0) {
                                             const firstValidCrcId = event.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
-                                            if (firstValidCrcId) {
-                                                event.crcId = firstValidCrcId;
-                                            }
+                                            if (firstValidCrcId) event.crcId = firstValidCrcId;
                                         }
-                                        // Ensure crcIds is an array if crcId exists but crcIds doesn't
                                         if (event.crcId && (!event.crcIds || !Array.isArray(event.crcIds))) {
                                             event.crcIds = [event.crcId];
                                         }
-                                        // Remove roleAssignments - Travel Days don't use them and they cause open shift display
-                                        if (event.roleAssignments) {
-                                            delete event.roleAssignments;
-                                        }
+                                        if (event.roleAssignments) delete event.roleAssignments;
                                     }
                                     return event;
                                 });
-                                return { jsonBody: normalizedResources };
+                                return { jsonBody: finalResources };
                             }
+                            
+                            return { jsonBody: normalizedResources };
                         }
                         return { jsonBody: resources };
                     } catch (error) {
