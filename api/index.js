@@ -1018,6 +1018,32 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
     };
 };
 
+// Ensure context.log has error/info/warn helpers in all environments
+function ensureContextLogger(context) {
+    if (!context) {
+        return;
+    }
+    if (!context.log) {
+        context.log = (...args) => console.log(...args);
+    }
+    if (typeof context.log === 'function') {
+        const base = (...args) => {
+            try {
+                context.log.apply(context, args);
+            } catch (err) {
+                console.log(...args);
+            }
+        };
+        context.log.info = context.log.info || base;
+        context.log.warn = context.log.warn || base;
+        context.log.error = context.log.error || base;
+        return;
+    }
+    context.log.info = context.log.info || console.log.bind(console);
+    context.log.warn = context.log.warn || console.warn.bind(console);
+    context.log.error = context.log.error || console.error.bind(console);
+}
+
 // Helper function to handle errors
 const handleError = (context, error, message) => {
     ensureContextLogger(context);
@@ -1069,32 +1095,6 @@ const handleError = (context, error, message) => {
 // Helper to get ID from V4 route parameter
 const getIdFromRequest = (request) => {
     return request.params.id;
-};
-
-// Ensure context.log has error/info/warn helpers in all environments
-const ensureContextLogger = (context) => {
-    if (!context) {
-        return;
-    }
-    if (!context.log) {
-        context.log = (...args) => console.log(...args);
-    }
-    if (typeof context.log === 'function') {
-        const base = (...args) => {
-            try {
-                context.log.apply(context, args);
-            } catch (err) {
-                console.log(...args);
-            }
-        };
-        context.log.info = context.log.info || base;
-        context.log.warn = context.log.warn || base;
-        context.log.error = context.log.error || base;
-        return;
-    }
-    context.log.info = context.log.info || console.log.bind(console);
-    context.log.warn = context.log.warn || console.warn.bind(console);
-    context.log.error = context.log.error || console.error.bind(console);
 };
 
 // Safely stringify objects (especially Error instances) for logging without throwing
