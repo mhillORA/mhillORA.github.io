@@ -2476,6 +2476,11 @@ async function crudHandler(context, request, containerName) {
             case 'PUT':
                 const requestBody = await request.json();
                 const updateId = id || requestBody.id;
+                const isValidCrcId = (value) =>
+                    typeof value === 'string' &&
+                    value.trim() !== '' &&
+                    value.trim() !== 'SITE_STAFF' &&
+                    value.trim() !== 'UNASSIGNED';
                 
                 // For events, check if update would result in N/A entry - if so, delete instead
                 if (containerName === 'events' && updateId) {
@@ -2483,13 +2488,13 @@ async function crudHandler(context, request, containerName) {
                         const { resource: existingEvent } = await container.item(updateId, updateId).read();
                         if (existingEvent) {
                             // Check if this update would result in an N/A entry
-                            const hasCrcId = requestBody.crcId && requestBody.crcId.trim() !== '';
+                            const hasCrcId = isValidCrcId(requestBody.crcId);
                             const hasCrcIds = requestBody.crcIds && Array.isArray(requestBody.crcIds) && requestBody.crcIds.length > 0 && 
-                                              requestBody.crcIds.some(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                              requestBody.crcIds.some(id => isValidCrcId(id));
                             const hasValidRoleAssignments = requestBody.roleAssignments && 
                                 Object.keys(requestBody.roleAssignments).length > 0 &&
                                 Object.values(requestBody.roleAssignments).some(assignments => 
-                                    Array.isArray(assignments) && assignments.some(crcId => crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED')
+                                    Array.isArray(assignments) && assignments.some(crcId => isValidCrcId(crcId))
                                 );
                             
                             // If updating would result in N/A (no CRC and no valid role assignments), delete the event instead
@@ -2534,7 +2539,7 @@ async function crudHandler(context, request, containerName) {
                             Object.values(requestBody.roleAssignments).forEach(assignments => {
                                 if (Array.isArray(assignments)) {
                                     assignments.forEach(crcId => {
-                                        if (crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED' && crcId !== 'SITE_STAFF') {
+                                        if (isValidCrcId(crcId)) {
                                             if (!crcIdsFromRoles.includes(crcId)) {
                                                 crcIdsFromRoles.push(crcId);
                                             }
@@ -2546,7 +2551,7 @@ async function crudHandler(context, request, containerName) {
                             // If we found CRCs in roleAssignments, use them for crcIds
                             if (crcIdsFromRoles.length > 0) {
                                 requestBody.crcIds = crcIdsFromRoles;
-                                if (!requestBody.crcId || requestBody.crcId.trim() === '') {
+                                if (!isValidCrcId(requestBody.crcId)) {
                                     requestBody.crcId = crcIdsFromRoles[0];
                                 }
                             }
@@ -2651,8 +2656,8 @@ async function crudHandler(context, request, containerName) {
                                 
                                 // Ensure crcId is set from crcIds if missing
                                 if (requestBody.crcIds && Array.isArray(requestBody.crcIds) && requestBody.crcIds.length > 0) {
-                                    if (!requestBody.crcId || requestBody.crcId.trim() === '') {
-                                        const firstValidCrcId = requestBody.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                    if (!isValidCrcId(requestBody.crcId)) {
+                                        const firstValidCrcId = requestBody.crcIds.find(id => isValidCrcId(id));
                                         if (firstValidCrcId) {
                                             requestBody.crcId = firstValidCrcId;
                                         }
@@ -2682,8 +2687,8 @@ async function crudHandler(context, request, containerName) {
                             }
                             // If crcIds is provided but crcId is not, set crcId from first valid CRC
                             if (requestBody.crcIds && Array.isArray(requestBody.crcIds) && requestBody.crcIds.length > 0 && 
-                                (!requestBody.crcId || requestBody.crcId.trim() === '')) {
-                                const firstValidCrcId = requestBody.crcIds.find(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                                (!requestBody.crcId || !isValidCrcId(requestBody.crcId))) {
+                                const firstValidCrcId = requestBody.crcIds.find(id => isValidCrcId(id));
                                 if (firstValidCrcId) {
                                     requestBody.crcId = firstValidCrcId;
                                 }
