@@ -7665,7 +7665,12 @@
                         siteSelect.addEventListener('change', handleShiftStudySiteSelection);
                     }
                     const overrideCb = form.querySelector('input[name="overrideCrcRestrictions"]');
-                    if (overrideCb) overrideCb.addEventListener('change', handleShiftStudySiteSelection);
+                    if (overrideCb) {
+                        overrideCb.addEventListener('change', () => {
+                            handleShiftStudySiteSelection();
+                            updateCrcDropdownAvailability(); // Update CRC dropdown to enable/disable unavailable options
+                        });
+                    }
                     if(crcSelect) crcSelect.addEventListener('change', (e) => {
                         updateCrcHoursDisplay(e.target.value, startDateInput.value);
                         handleShiftStudySiteSelection();
@@ -21210,8 +21215,13 @@
                 const endDateInput = form.querySelector('input[name="endDate"]');
                 const crcSelect = form.querySelector('select[name="crcId"]');
                 const periodSelect = form.querySelector('select[name="period"]');
+                const eventTypeSelect = form.querySelector('select[name="eventType"]');
                 const eventId = form.dataset.eventId;
                 const originalEvent = eventId ? state.crc_events.find(e => e.id === eventId) : null;
+                const overrideCheckbox = form.querySelector('input[name="overrideCrcRestrictions"]');
+                const allowOverride = overrideCheckbox?.checked || false;
+                const eventType = eventTypeSelect?.value || (originalEvent?.type || '');
+                const isTravelDay = eventType === 'Travel Day';
                 
                 if (!startDateInput || !endDateInput || !crcSelect || !periodSelect) return;
 
@@ -21240,7 +21250,7 @@
                         const crcId = option.value;
                         const crc = state.crcs.find(c => c.id === crcId);
                         option.textContent = crc ? crc.name : 'Unknown CRC';
-                        option.classList.remove('text-red-500', 'font-bold');
+                        option.classList.remove('text-red-500', 'font-bold', 'text-gray-400', 'dark:text-gray-500');
 
                         const scheduledEvents = scheduledPeriodsByCrc[crcId] || [];
                         const scheduledPeriods = scheduledEvents.map(e => e.period || 'Full Day');
@@ -21284,10 +21294,23 @@
                             }
                         }
                         
-                        // Disable if already scheduled, but allow selection if only time off (override will be handled)
-                        option.disabled = !isAvailable;
-                        if (!isAvailable || hasTimeOff) {
-                            option.textContent += ` ${availabilityText}`;
+                        // For Travel Day events or when override is checked, allow selecting unavailable people
+                        // They should be selectable but marked as unavailable
+                        if (isTravelDay || allowOverride) {
+                            // Don't disable - allow selection but show warning
+                            option.disabled = false;
+                            if (!isAvailable || hasTimeOff) {
+                                option.textContent += ` ${availabilityText}`;
+                                // Style as warning but still selectable
+                                option.classList.add('text-orange-600', 'dark:text-orange-400');
+                            }
+                        } else {
+                            // For other event types without override, disable if already scheduled
+                            // But still allow selection if only time off (override will be handled)
+                            option.disabled = !isAvailable;
+                            if (!isAvailable || hasTimeOff) {
+                                option.textContent += ` ${availabilityText}`;
+                            }
                         }
                     }
                 }
@@ -27205,6 +27228,123 @@
                         }
                         break;
                     }
+                    case 'view-shift-roles': {
+                        // Clicking on a shift in site/study block - auto-populate site and study
+                        const siteId = actionButton.dataset.siteId;
+                        const studyId = actionButton.dataset.studyId;
+                        const shiftDate = actionButton.dataset.date || toDateOnlyString(new Date());
+                        
+                        // Find existing events for this site/study/date combination
+                        const existingEvents = state.crc_events.filter(e => 
+                            e.date === shiftDate &&
+                            e.siteId === siteId &&
+                            e.studyIds && Array.isArray(e.studyIds) && e.studyIds.includes(studyId)
+                        );
+                        
+                        let mergedEvent = null;
+                        if (existingEvents.length > 0) {
+                            // Aggregate events similar to view-crc-event
+                            const aggregatedRoleAssignments = {};
+                            const aggregatedTrainingAssignments = {};
+                            const aggregatedTravelDayPreferences = {};
+                            
+                            existingEvents.forEach(shiftEvent => {
+                                if (shiftEvent.roleAssignments && typeof shiftEvent.roleAssignments === 'object') {
+                                    Object.entries(shiftEvent.roleAssignments).forEach(([roleId, crcIds]) => {
+                                        if (!aggregatedRoleAssignments[roleId]) {
+                                            aggregatedRoleAssignments[roleId] = [];
+                                        }
+                                        const crcArray = Array.isArray(crcIds) ? crcIds : [crcIds];
+                                        crcArray.forEach(crcId => {
+                                            if (crcId && !aggregatedRoleAssignments[roleId].includes(crcId)) {
+                                                aggregatedRoleAssignments[roleId].push(crcId);
+                                            }
+                                        });
+                                    });
+                                }
+                                
+                                if (shiftEvent.trainingAssignments && typeof shiftEvent.trainingAssignments === 'object') {
+                                    Object.entries(shiftEvent.trainingAssignments).forEach(([roleId, assignments]) => {
+                                        if (!aggregatedTrainingAssignments[roleId]) {
+                                            aggregatedTrainingAssignments[roleId] = [];
+                                        }
+                                        const assignmentArray = Array.isArray(assignments) ? assignments : [assignments];
+                                        assignmentArray.forEach(assignment => {
+                                            if (assignment && !aggregatedTrainingAssignments[roleId].includes(assignment)) {
+                                                aggregatedTrainingAssignments[roleId].push(assignment);
+                                            }
+                                        });
+                                    });
+                                }
+                                
+                                if (shiftEvent.travelDayPreferences && typeof shiftEvent.travelDayPreferences === 'object') {
+                                    Object.entries(shiftEvent.travelDayPreferences).forEach(([crcId, prefs]) => {
+                                        if (!aggregatedTravelDayPreferences[crcId]) {
+                                            aggregatedTravelDayPreferences[crcId] = { ...prefs };
+                                        } else {
+                                            aggregatedTravelDayPreferences[crcId] = {
+                                                ...aggregatedTravelDayPreferences[crcId],
+                                                ...prefs
+                                            };
+                                        }
+                                    });
+                                }
+                            });
+                            
+                            mergedEvent = {
+                                ...existingEvents[0],
+                                roleAssignments: aggregatedRoleAssignments,
+                                trainingAssignments: aggregatedTrainingAssignments,
+                                travelDayPreferences: Object.keys(aggregatedTravelDayPreferences).length > 0
+                                    ? aggregatedTravelDayPreferences
+                                    : (existingEvents[0].travelDayPreferences || undefined)
+                            };
+                        } else {
+                            // No existing event - create new one with site and study pre-populated
+                            mergedEvent = {
+                                date: shiftDate,
+                                siteId: siteId,
+                                studyIds: [studyId],
+                                type: 'Site Assignment'
+                            };
+                        }
+                        
+                        // Store the merged event object on window so handleShiftStudySiteSelection can access it
+                        window._currentEditingEvent = mergedEvent;
+                        
+                        // Open the modal with pre-populated site and study
+                        openModal(getCRCEventModalHTML(shiftDate, mergedEvent), '4xl');
+                        
+                        // Initialize the role assignment interface after modal opens
+                        setTimeout(() => {
+                            console.log('Initializing role assignment after view-shift-roles modal open');
+                            const form = document.getElementById('crc-event-form');
+                            if (form) {
+                                const studySelect = form.querySelector('select[name="studyIds"]');
+                                const siteSelect = form.querySelector('select[name="siteId"]');
+                                
+                                // Auto-populate study
+                                if (studySelect && studyId) {
+                                    Array.from(studySelect.options).forEach(option => {
+                                        if (option.value === studyId) {
+                                            option.selected = true;
+                                        }
+                                    });
+                                    studySelect.dispatchEvent(new Event('change', { bubbles: true }));
+                                }
+                                
+                                // Auto-populate site
+                                if (siteSelect && siteId) {
+                                    siteSelect.value = siteId;
+                                    siteSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                                }
+                                
+                                // Trigger role assignment initialization
+                                handleShiftStudySiteSelection();
+                            }
+                        }, 300);
+                        break;
+                    }
                     case 'edit-crc-event': {
                         const clickedEvent = state.crc_events.find(e => e.id === eventId);
                         if (clickedEvent) {
@@ -31280,6 +31420,32 @@
                                 if (crcId) assignedCrcs.add(crcId);
                             }));
                             const createAndStoreEvent = async (payload) => {
+                                // Check for duplicate event before creating
+                                // Check for same date, visitNumber, groupNumber, and type
+                                const existingEvent = state.crc_events.find(e => 
+                                    e.date === payload.date &&
+                                    e.type === payload.type &&
+                                    e.visitNumber === payload.visitNumber &&
+                                    e.groupNumber === payload.groupNumber &&
+                                    (payload.crcId ? e.crcId === payload.crcId : (!e.crcId || e.crcId === null)) &&
+                                    (payload.siteId ? e.siteId === payload.siteId : true) &&
+                                    (payload.studyIds && payload.studyIds.length > 0 
+                                        ? (e.studyIds && Array.isArray(e.studyIds) && 
+                                           payload.studyIds.some(sid => e.studyIds.includes(sid)))
+                                        : true)
+                                );
+                                
+                                if (existingEvent) {
+                                    console.log('Skipping duplicate event creation:', {
+                                        date: payload.date,
+                                        visitNumber: payload.visitNumber,
+                                        groupNumber: payload.groupNumber,
+                                        type: payload.type,
+                                        existingId: existingEvent.id
+                                    });
+                                    return; // Skip creating duplicate
+                                }
+                                
                                 const created = await apiService.createEvent(payload);
                                 const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...payload };
                                 state.crc_events = [...state.crc_events, createdEvent];
@@ -31573,6 +31739,17 @@
                                 const roleAssignments = {};
                                 // Reduced logging for performance
                                 
+                                // CRITICAL: First, initialize ad hoc roles from form._adhocRoleConfig
+                                // This ensures ad hoc roles are included even if they don't have assignments yet
+                                const adhocRoleConfigForInit = form._adhocRoleConfig || {};
+                                Object.entries(adhocRoleConfigForInit).forEach(([roleId, qty]) => {
+                                    const parsedQty = parseInt(qty) || 0;
+                                    if (parsedQty > 0 && !roleAssignments[roleId]) {
+                                        // Initialize with empty array of correct length
+                                        roleAssignments[roleId] = new Array(parsedQty).fill(null);
+                                    }
+                                });
+                                
                                 // Always try to collect from form inputs first (most reliable)
                                 // This ensures we get the current state of the form, even if _deduplicatedRoleAssignments is stale
                                 roleAssignmentInputs.forEach(input => {
@@ -31597,6 +31774,22 @@
                                     const value = input.value && input.value.trim() !== '' ? input.value : null;
                                     roleAssignments[roleId][index] = value;
                                     // Reduced logging for performance
+                                });
+                                
+                                // CRITICAL: After collecting from inputs, ensure ad hoc roles maintain their quantity
+                                // This ensures ad hoc roles are preserved even if they don't have assignments yet
+                                Object.entries(adhocRoleConfigForInit).forEach(([roleId, qty]) => {
+                                    const parsedQty = parseInt(qty) || 0;
+                                    if (parsedQty > 0) {
+                                        if (!roleAssignments[roleId]) {
+                                            roleAssignments[roleId] = [];
+                                        }
+                                        // Ensure array matches the ad hoc quantity
+                                        while (roleAssignments[roleId].length < parsedQty) {
+                                            roleAssignments[roleId].push(null);
+                                        }
+                                        roleAssignments[roleId].length = parsedQty;
+                                    }
                                 });
                                 
                                 // If we got assignments from inputs, use those; otherwise try _deduplicatedRoleAssignments
@@ -31698,7 +31891,15 @@
 
                                 // Filter out role assignments that have no valid CRC assignments (all null/empty)
                                 // This prevents creating events with empty role assignments that show as "N/A"
+                                // CRITICAL: Always include ad hoc roles even if they have no assignments yet (they may be added later)
                                 const filteredRoleAssignments = {};
+                                
+                                // Get ad hoc roles from config to ensure they're always included
+                                const adhocRoleConfig = form._adhocRoleConfig || {};
+                                const adhocRoleIds = Object.keys(adhocRoleConfig).filter(roleId => {
+                                    const qty = parseInt(adhocRoleConfig[roleId]) || 0;
+                                    return qty > 0;
+                                });
                                 
                                 Object.keys(roleAssignments).forEach(roleId => {
                                     const assignmentsArray = roleAssignments[roleId] || [];
@@ -31710,8 +31911,20 @@
                                         crcId !== 'SITE_STAFF' && 
                                         crcId !== 'UNASSIGNED'
                                     );
-                                    if (hasValidAssignment) {
+                                    
+                                    // Always include if it has valid assignments OR if it's an ad hoc role
+                                    if (hasValidAssignment || adhocRoleIds.includes(roleId)) {
                                         filteredRoleAssignments[roleId] = assignmentsArray;
+                                    }
+                                });
+                                
+                                // CRITICAL: Also include ad hoc roles that might not have been collected from form yet
+                                // This ensures ad hoc roles are saved even if they don't have assignments yet
+                                adhocRoleIds.forEach(roleId => {
+                                    if (!filteredRoleAssignments[roleId]) {
+                                        // Initialize with empty array of correct length
+                                        const qty = parseInt(adhocRoleConfig[roleId]) || 0;
+                                        filteredRoleAssignments[roleId] = new Array(qty).fill(null);
                                     }
                                 });
                                 
@@ -33389,6 +33602,32 @@
                                                     currentEventData.type = 'Site Assignment';
                                                 } else {
                                                     currentEventData.type = eventType;
+                                                }
+                                                
+                                                // Check for duplicate event before creating
+                                                // Check for same date, visitNumber, groupNumber, type, siteId, and studyIds
+                                                const existingEvent = state.crc_events.find(e => 
+                                                    e.date === dateStr &&
+                                                    e.type === currentEventData.type &&
+                                                    e.visitNumber === currentEventData.visitNumber &&
+                                                    e.groupNumber === currentEventData.groupNumber &&
+                                                    (currentEventData.siteId ? e.siteId === currentEventData.siteId : (!e.siteId || e.siteId === null)) &&
+                                                    (currentEventData.studyIds && currentEventData.studyIds.length > 0 
+                                                        ? (e.studyIds && Array.isArray(e.studyIds) && 
+                                                           currentEventData.studyIds.some(sid => e.studyIds.includes(sid)))
+                                                        : (!e.studyIds || !Array.isArray(e.studyIds) || e.studyIds.length === 0)) &&
+                                                    (currentEventData.crcId ? e.crcId === currentEventData.crcId : (!e.crcId || e.crcId === null))
+                                                );
+                                                
+                                                if (existingEvent) {
+                                                    console.log('Skipping duplicate event creation:', {
+                                                        date: dateStr,
+                                                        visitNumber: currentEventData.visitNumber,
+                                                        groupNumber: currentEventData.groupNumber,
+                                                        type: currentEventData.type,
+                                                        existingId: existingEvent.id
+                                                    });
+                                                    continue; // Skip creating duplicate
                                                 }
                                                 
                                                 console.log('=== CREATING MAIN EVENT ===');
