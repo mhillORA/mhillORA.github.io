@@ -2911,12 +2911,10 @@ async function crudHandler(context, request, containerName) {
                                     });
                                     
                                     // CRITICAL: Normalize legacy studyId to studyIds array for compatibility
-                                    // Legacy shifts may have studyId (string) instead of studyIds (array)
+                                    // Only normalize if studyIds is missing or invalid - preserve existing valid arrays
                                     if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
-                                        if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
-                                            // Convert legacy studyId to studyIds array
-                                            updatedItem.studyIds = [updatedItem.studyId];
-                                        } else if (requestBody.studyIds && Array.isArray(requestBody.studyIds)) {
+                                        // Priority: requestBody.studyIds > requestBody.studyId > existingEvent.studyIds > existingEvent.studyId > updatedItem.studyId
+                                        if (requestBody.studyIds && Array.isArray(requestBody.studyIds)) {
                                             updatedItem.studyIds = requestBody.studyIds;
                                         } else if (requestBody.studyId && typeof requestBody.studyId === 'string' && requestBody.studyId.trim() !== '') {
                                             updatedItem.studyIds = [requestBody.studyId];
@@ -2924,10 +2922,16 @@ async function crudHandler(context, request, containerName) {
                                             updatedItem.studyIds = existingEvent.studyIds;
                                         } else if (existingEvent.studyId && typeof existingEvent.studyId === 'string' && existingEvent.studyId.trim() !== '') {
                                             updatedItem.studyIds = [existingEvent.studyId];
-                                        } else {
+                                        } else if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
+                                            updatedItem.studyIds = [updatedItem.studyId];
+                                        }
+                                        // Only set to empty array as last resort - don't overwrite if we have any study data
+                                        if (!updatedItem.studyIds) {
                                             updatedItem.studyIds = [];
                                         }
-                                        // Remove legacy studyId field if it exists
+                                    }
+                                    // Always remove legacy studyId field after ensuring studyIds is set
+                                    if (updatedItem.studyId && updatedItem.studyIds) {
                                         delete updatedItem.studyId;
                                     }
                                     
@@ -2942,8 +2946,9 @@ async function crudHandler(context, request, containerName) {
                                     }
                                     
                                     // Ensure crcIds is an array (legacy shifts might only have crcId)
+                                    // Only normalize if crcIds is missing or invalid - preserve existing valid arrays
                                     if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
-                                        if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '') {
+                                        if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
                                             updatedItem.crcIds = [updatedItem.crcId];
                                         } else if (requestBody.crcIds && Array.isArray(requestBody.crcIds)) {
                                             updatedItem.crcIds = requestBody.crcIds;
@@ -3124,31 +3129,34 @@ async function crudHandler(context, request, containerName) {
                         if (k in updatedItem) delete updatedItem[k]; 
                     });
                     
-                    // CRITICAL: Final normalization for legacy fields before upsert
-                    // Ensure studyIds is always an array (normalize from legacy studyId)
+                    // Ensure id is set
+                    if (!updatedItem.id) {
+                        updatedItem.id = updateId;
+                    }
+                    
+                    // Final safety check: ensure studyIds and crcIds are arrays for events (only if missing)
+                    // This is a minimal check - most normalization happens in the merge logic above
                     if (containerName === 'events') {
                         if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
+                            // Only normalize if we have a legacy studyId to convert
                             if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
                                 updatedItem.studyIds = [updatedItem.studyId];
-                                delete updatedItem.studyId; // Remove legacy field
-                            } else {
+                                delete updatedItem.studyId;
+                            } else if (!updatedItem.hasOwnProperty('studyIds')) {
+                                // Only set to empty array if studyIds doesn't exist at all
                                 updatedItem.studyIds = [];
                             }
                         }
                         
-                        // Ensure crcIds is always an array (normalize from legacy crcId)
                         if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
+                            // Only normalize if we have a legacy crcId to convert
                             if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
                                 updatedItem.crcIds = [updatedItem.crcId];
-                            } else {
+                            } else if (!updatedItem.hasOwnProperty('crcIds')) {
+                                // Only set to empty array if crcIds doesn't exist at all
                                 updatedItem.crcIds = [];
                             }
                         }
-                    }
-                    
-                    // Ensure id is set
-                    if (!updatedItem.id) {
-                        updatedItem.id = updateId;
                     }
                     
                     // Log the update attempt for debugging
