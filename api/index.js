@@ -2481,6 +2481,74 @@ async function crudHandler(context, request, containerName) {
                     value.trim() !== '' &&
                     value.trim() !== 'SITE_STAFF' &&
                     value.trim() !== 'UNASSIGNED';
+                const extractCrcId = (value) => {
+                    if (typeof value === 'string') return value;
+                    if (value && typeof value === 'object') {
+                        const candidate =
+                            value.crcId ||
+                            value.id ||
+                            value.userId ||
+                            value.value ||
+                            value.key;
+                        if (typeof candidate === 'string') return candidate;
+                    }
+                    return null;
+                };
+                const normalizeRoleAssignments = (roleAssignments) => {
+                    if (!roleAssignments || typeof roleAssignments !== 'object' || Array.isArray(roleAssignments)) {
+                        return roleAssignments;
+                    }
+                    const normalized = {};
+                    Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                        if (Array.isArray(assignments)) {
+                            normalized[roleId] = assignments.map(entry => {
+                                const id = extractCrcId(entry);
+                                return isValidCrcId(id) ? id : null;
+                            });
+                        } else {
+                            const id = extractCrcId(assignments);
+                            normalized[roleId] = isValidCrcId(id) ? [id] : [null];
+                        }
+                    });
+                    return normalized;
+                };
+                const hasLegacyAssignmentShape = (roleAssignments) => {
+                    if (!roleAssignments || typeof roleAssignments !== 'object' || Array.isArray(roleAssignments)) {
+                        return false;
+                    }
+                    return Object.values(roleAssignments).some(assignments => {
+                        if (Array.isArray(assignments)) {
+                            return assignments.some(entry => entry !== null && typeof entry !== 'string');
+                        }
+                        return assignments !== null && typeof assignments !== 'string';
+                    });
+                };
+                const normalizeEventAssignments = (event) => {
+                    if (!event || typeof event !== 'object') return;
+                    if (event.roleAssignments !== undefined && hasLegacyAssignmentShape(event.roleAssignments)) {
+                        if (!event.legacyRoleAssignmentsRaw) {
+                            event.legacyRoleAssignmentsRaw = event.roleAssignments;
+                        }
+                    }
+                    if (event.crcId !== undefined) {
+                        const id = extractCrcId(event.crcId);
+                        event.crcId = isValidCrcId(id) ? id : null;
+                    }
+                    if (Array.isArray(event.crcIds)) {
+                        if (event.crcIds.some(entry => entry !== null && typeof entry !== 'string')) {
+                            if (!event.legacyCrcIdsRaw) {
+                                event.legacyCrcIdsRaw = event.crcIds;
+                            }
+                        }
+                        event.crcIds = event.crcIds
+                            .map(extractCrcId)
+                            .filter(id => isValidCrcId(id));
+                    }
+                    if (event.roleAssignments !== undefined) {
+                        event.roleAssignments = normalizeRoleAssignments(event.roleAssignments);
+                    }
+                };
+                normalizeEventAssignments(requestBody);
                 
                 // For events, check if update would result in N/A entry - if so, delete instead
                 if (containerName === 'events' && updateId) {
@@ -2499,20 +2567,8 @@ async function crudHandler(context, request, containerName) {
                             
                             // If updating would result in N/A (no CRC and no valid role assignments), delete the event instead
                             if (!hasCrcId && !hasCrcIds && !hasValidRoleAssignments) {
-                                // Only delete if it's not an Open Shift (Site Assignment without CRC is allowed as Open Shift)
-                                // Travel Day events are also allowed (they should have a crcId or crcIds but may not have roleAssignments)
-                                if (requestBody.type !== 'Site Assignment' && requestBody.type !== 'Open Shift' && requestBody.type !== 'Travel Day') {
-                                    await container.item(updateId, updateId).delete();
-                                    return {
-                                        status: 200,
-                                        jsonBody: { 
-                                            message: 'Event deleted because it would have resulted in an N/A entry',
-                                            deleted: true,
-                                            id: updateId
-                                        },
-                                        headers: { 'Content-Type': 'application/json' }
-                                    };
-                                }
+                                // Never delete on update: preserve data even if it's effectively N/A
+                                context.log.warn(`Skipping auto-delete for event ${updateId} (would be N/A). Preserving data.`);
                             }
                         }
                     } catch (readError) {
@@ -2564,6 +2620,7 @@ async function crudHandler(context, request, containerName) {
                     try {
                         const { resource: existingEvent } = await container.item(updateId, updateId).read();
                         if (existingEvent) {
+                            normalizeEventAssignments(existingEvent);
                             // CRITICAL: Check for isTravelDay flag - if set, force type to Travel Day
                             if (requestBody.isTravelDay === true || requestBody.isTravelDay === 'true' || requestBody.travelDay === true) {
                                 requestBody.type = 'Travel Day';
@@ -2843,6 +2900,7 @@ async function crudHandler(context, request, containerName) {
                         try {
                             const { resource: existingEvent } = await container.item(updateId, updateId).read();
                             if (existingEvent) {
+                                normalizeEventAssignments(existingEvent);
                                 // CRITICAL: Preserve the type of existing event if it's a Travel Day
                                 // Don't let the request body overwrite Travel Day type
                                 const preservedType = existingEvent.type === 'Travel Day' ? 'Travel Day' : requestBody.type;
@@ -2901,6 +2959,7 @@ async function crudHandler(context, request, containerName) {
                                 } else {
                                     // For non-Travel Day events, normal merge
                                     updatedItem = { ...existingEvent, ...requestBody, id: updateId };
+                                    normalizeEventAssignments(updatedItem);
                                     if (preservedType) {
                                         updatedItem.type = preservedType;
                                     }
@@ -3143,6 +3202,7 @@ async function crudHandler(context, request, containerName) {
                     // This is a minimal check - most normalization happens in the merge logic above
                     if (containerName === 'events') {
                         try {
+                            normalizeEventAssignments(updatedItem);
                             if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
                                 // Only normalize if we have a legacy studyId to convert
                                 if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
