@@ -1020,6 +1020,7 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
 
 // Helper function to handle errors
 const handleError = (context, error, message) => {
+    ensureContextLogger(context);
     const rawMessage = (typeof error?.message === 'string' && error.message.trim() !== '')
         ? error.message
         : (typeof error === 'string' && error.trim() !== '' ? error : 'Unknown error');
