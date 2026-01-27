@@ -3137,25 +3137,47 @@ async function crudHandler(context, request, containerName) {
                     // Final safety check: ensure studyIds and crcIds are arrays for events (only if missing)
                     // This is a minimal check - most normalization happens in the merge logic above
                     if (containerName === 'events') {
-                        if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
-                            // Only normalize if we have a legacy studyId to convert
-                            if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
-                                updatedItem.studyIds = [updatedItem.studyId];
-                                delete updatedItem.studyId;
-                            } else if (!updatedItem.hasOwnProperty('studyIds')) {
-                                // Only set to empty array if studyIds doesn't exist at all
-                                updatedItem.studyIds = [];
+                        try {
+                            if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
+                                // Only normalize if we have a legacy studyId to convert
+                                if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
+                                    updatedItem.studyIds = [updatedItem.studyId];
+                                    delete updatedItem.studyId;
+                                } else if (updatedItem.studyIds === undefined || updatedItem.studyIds === null) {
+                                    // Only set to empty array if studyIds doesn't exist at all
+                                    updatedItem.studyIds = [];
+                                }
                             }
-                        }
-                        
-                        if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
-                            // Only normalize if we have a legacy crcId to convert
-                            if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
-                                updatedItem.crcIds = [updatedItem.crcId];
-                            } else if (!updatedItem.hasOwnProperty('crcIds')) {
-                                // Only set to empty array if crcIds doesn't exist at all
-                                updatedItem.crcIds = [];
+                            
+                            if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
+                                // Only normalize if we have a legacy crcId to convert
+                                if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
+                                    updatedItem.crcIds = [updatedItem.crcId];
+                                } else if (updatedItem.crcIds === undefined || updatedItem.crcIds === null) {
+                                    // Only set to empty array if crcIds doesn't exist at all
+                                    updatedItem.crcIds = [];
+                                }
                             }
+                            
+                            // Validate the merged and normalized event before upsert
+                            try {
+                                validateEventsSchema(updatedItem);
+                            } catch (validationError) {
+                                context.log.error(`Validation error for merged event ${updateId}:`, validationError.message);
+                                context.log.error(`UpdatedItem structure:`, {
+                                    type: updatedItem.type,
+                                    hasStudyIds: !!updatedItem.studyIds,
+                                    studyIdsType: typeof updatedItem.studyIds,
+                                    studyIdsIsArray: Array.isArray(updatedItem.studyIds),
+                                    hasCrcIds: !!updatedItem.crcIds,
+                                    crcIdsType: typeof updatedItem.crcIds,
+                                    crcIdsIsArray: Array.isArray(updatedItem.crcIds)
+                                });
+                                throw new Error(`Validation failed for merged event: ${validationError.message}`);
+                            }
+                        } catch (normalizeError) {
+                            context.log.error(`Error in final normalization/validation for event ${updateId}:`, normalizeError);
+                            throw normalizeError; // Re-throw to be caught by outer catch
                         }
                     }
                     
@@ -3166,6 +3188,36 @@ async function crudHandler(context, request, containerName) {
                     
                     let result;
                     try {
+                        // Validate updatedItem structure before upsert
+                        if (containerName === 'events') {
+                            // Ensure required fields exist
+                            if (!updatedItem.type) {
+                                throw new Error('Event type is required');
+                            }
+                            if (!updatedItem.id) {
+                                throw new Error('Event id is required');
+                            }
+                            // Ensure studyIds is an array (final check)
+                            if (updatedItem.studyIds !== undefined && !Array.isArray(updatedItem.studyIds)) {
+                                context.log.warn(`studyIds is not an array for event ${updateId}, normalizing...`);
+                                if (updatedItem.studyId && typeof updatedItem.studyId === 'string') {
+                                    updatedItem.studyIds = [updatedItem.studyId];
+                                    delete updatedItem.studyId;
+                                } else {
+                                    updatedItem.studyIds = [];
+                                }
+                            }
+                            // Ensure crcIds is an array (final check)
+                            if (updatedItem.crcIds !== undefined && !Array.isArray(updatedItem.crcIds)) {
+                                context.log.warn(`crcIds is not an array for event ${updateId}, normalizing...`);
+                                if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
+                                    updatedItem.crcIds = [updatedItem.crcId];
+                                } else {
+                                    updatedItem.crcIds = [];
+                                }
+                            }
+                        }
+                        
                         const upsertResult = await container.items.upsert(updatedItem);
                         result = upsertResult.resource;
                     } catch (upsertError) {
@@ -3177,7 +3229,9 @@ async function crudHandler(context, request, containerName) {
                             stack: upsertError.stack
                         });
                         context.log.error(`UpdatedItem keys:`, Object.keys(updatedItem));
-                        context.log.error(`UpdatedItem type:`, updatedItem.type);
+                        context.log.error(`UpdatedItem type:`, updatedItem?.type);
+                        context.log.error(`UpdatedItem studyIds:`, updatedItem?.studyIds);
+                        context.log.error(`UpdatedItem crcIds:`, updatedItem?.crcIds);
                         // Re-throw to be caught by outer catch
                         throw upsertError;
                     }
