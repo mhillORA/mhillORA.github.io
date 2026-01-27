@@ -2393,7 +2393,8 @@ async function crudHandler(context, request, containerName) {
                                     // 2. CRC is assigned to this shift
                                     // 3. CRC ID is valid
                                     if (hasTravel === true && shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                        // Check if travel day already exists for this CRC on this date
+                                        // Check if travel day already exists for this CRC on this date (from ANY source)
+                                        // This prevents duplicates even if travel day was created from a different shift or source
                                         const { resources: allTravelDaysOnDate } = await eventsContainer.items.query({
                                             query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
                                             parameters: [
@@ -2401,15 +2402,17 @@ async function crudHandler(context, request, containerName) {
                                             ]
                                         }).fetchAll();
                                         
-                                        // Filter to find travel days for this specific CRC
+                                        // Filter to find travel days for this specific CRC - check ALL travel days on this date
                                         const existingTravelDay = (allTravelDaysOnDate || []).find(td => {
-                                            if (td.type !== 'Travel Day') return false;
+                                            if (!td || td.type !== 'Travel Day') return false;
+                                            // Check single-CRC travel days
                                             if (td.crcId === crcId) return true;
+                                            // Check multi-CRC travel days that include this CRC
                                             if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
                                             return false;
                                         });
                                         
-                                        // Only create if no travel day exists
+                                        // Only create if no travel day exists for this CRC on this date
                                         if (!existingTravelDay) {
                                             const travelDayEvent = {
                                                 id: generateId(),
@@ -3107,7 +3110,7 @@ async function crudHandler(context, request, containerName) {
                                 });
                             }
                             
-                            // Get existing travel days for this shift date
+                            // Get existing travel days for this shift date - check ALL travel days, not just from this shift
                             const { resources: existingTravelDays } = await eventsContainer.items.query({
                                 query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
                                 parameters: [
@@ -3117,18 +3120,45 @@ async function crudHandler(context, request, containerName) {
                             
                             // Process travelDayPreferences
                             if (result.travelDayPreferences && typeof result.travelDayPreferences === 'object') {
-                                // Create travel days for CRCs that have travel checked
+                                // First, clean up travel days for CRCs that are no longer in the shift
+                                // This handles the case where someone is removed from a shift
+                                for (const [crcId, hasTravel] of Object.entries(result.travelDayPreferences)) {
+                                    // If CRC is not in the shift anymore, delete their travel day (even if travelDayPreferences still has them checked)
+                                    if (!shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                        const travelDayToDelete = (existingTravelDays || []).find(td => {
+                                            if (!td || td.type !== 'Travel Day') return false;
+                                            // Only delete single-CRC travel days (not multi-CRC ones, unless all CRCs are removed)
+                                            if (td.crcId === crcId) return true;
+                                            if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length === 1 && td.crcIds[0] === crcId) return true;
+                                            return false;
+                                        });
+                                        
+                                        if (travelDayToDelete && travelDayToDelete.id) {
+                                            try {
+                                                await eventsContainer.item(travelDayToDelete.id, travelDayToDelete.id).delete();
+                                                context.log.info(`Deleted travel day ${travelDayToDelete.id} for CRC ${crcId} because they were removed from the shift`);
+                                            } catch (deleteTravelError) {
+                                                context.log.warn(`Failed to delete travel day ${travelDayToDelete.id}: ${deleteTravelError.message}`);
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Now create/check travel days for CRCs that are in the shift
                                 for (const [crcId, hasTravel] of Object.entries(result.travelDayPreferences)) {
                                     if (hasTravel === true && shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                        // Check if travel day already exists for this CRC
+                                        // Check if travel day already exists for this CRC on this date (from ANY source)
+                                        // This prevents duplicates even if travel day was created from a different shift or source
                                         const existingTravelDay = (existingTravelDays || []).find(td => {
-                                            if (td.type !== 'Travel Day') return false;
+                                            if (!td || td.type !== 'Travel Day') return false;
+                                            // Check single-CRC travel days
                                             if (td.crcId === crcId) return true;
+                                            // Check multi-CRC travel days that include this CRC
                                             if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
                                             return false;
                                         });
                                         
-                                        // Only create if no travel day exists
+                                        // Only create if no travel day exists for this CRC on this date
                                         if (!existingTravelDay) {
                                             const travelDayEvent = {
                                                 id: generateId(),
@@ -3147,11 +3177,13 @@ async function crudHandler(context, request, containerName) {
                                             } catch (createTravelError) {
                                                 context.log.warn(`Failed to create travel day for CRC ${crcId}: ${createTravelError.message}`);
                                             }
+                                        } else {
+                                            context.log.info(`Skipped creating travel day for CRC ${crcId} on ${shiftDate} - travel day already exists (ID: ${existingTravelDay.id})`);
                                         }
                                     } else if (hasTravel === false || hasTravel === undefined) {
                                         // If travel is unchecked or removed, delete travel day for this CRC
                                         const travelDayToDelete = (existingTravelDays || []).find(td => {
-                                            if (td.type !== 'Travel Day') return false;
+                                            if (!td || td.type !== 'Travel Day') return false;
                                             // Only delete single-CRC travel days (not multi-CRC ones)
                                             if (td.crcId === crcId) return true;
                                             if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length === 1 && td.crcIds[0] === crcId) return true;
