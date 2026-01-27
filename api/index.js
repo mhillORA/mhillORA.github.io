@@ -1022,20 +1022,28 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
 function ensureContextLogger(context) {
     if (!context) return;
 
+    // If context.log doesn't exist, create it as an object
     if (!context.log) {
-        context.log = (...args) => console.log(...args);
+        context.log = {};
     }
 
+    // If context.log is a function (not an object), wrap it
+    if (typeof context.log === 'function') {
+        const originalLog = context.log;
+        context.log = {
+            info: (...args) => originalLog('[INFO]', ...args),
+            warn: (...args) => originalLog('[WARN]', ...args),
+            error: (...args) => originalLog('[ERROR]', ...args)
+        };
+    }
+
+    // Explicitly ensure all levels are functions
     const levels = ['info', 'warn', 'error'];
     levels.forEach((level) => {
         if (typeof context.log[level] !== 'function') {
             context.log[level] = (...args) => {
-                if (typeof context.log === 'function') {
-                    context.log(`[${level.toUpperCase()}]`, ...args);
-                } else {
-                    const fallback = level === 'error' ? console.error : console.log;
-                    fallback(...args);
-                }
+                const fallback = level === 'error' ? console.error : (level === 'warn' ? console.warn : console.log);
+                fallback(`[${level.toUpperCase()}]`, ...args);
             };
         }
     });
@@ -1906,6 +1914,9 @@ const validateSiteStudyRelationship = async (siteId, studyId) => {
 // =================================================================================
 
 async function crudHandler(context, request, containerName) {
+    // CRITICAL: Ensure logger is initialized before ANY logging calls
+    ensureContextLogger(context);
+    
     let container;
     try {
         container = getContainer(containerName);
@@ -3219,23 +3230,21 @@ async function crudHandler(context, request, containerName) {
                     if (containerName === 'events') {
                         try {
                             normalizeEventAssignments(updatedItem);
-                            if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
-                                // Only normalize if we have a legacy studyId to convert
+                            // CRITICAL: Always ensure studyIds is an array (handle legacy studyId string)
+                            if (!Array.isArray(updatedItem.studyIds)) {
                                 if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
                                     updatedItem.studyIds = [updatedItem.studyId];
                                     delete updatedItem.studyId;
-                                } else if (updatedItem.studyIds === undefined || updatedItem.studyIds === null) {
-                                    // Only set to empty array if studyIds doesn't exist at all
+                                } else {
                                     updatedItem.studyIds = [];
                                 }
                             }
                             
-                            if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
-                                // Only normalize if we have a legacy crcId to convert
+                            // CRITICAL: Always ensure crcIds is an array (handle legacy crcId string)
+                            if (!Array.isArray(updatedItem.crcIds)) {
                                 if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
                                     updatedItem.crcIds = [updatedItem.crcId];
-                                } else if (updatedItem.crcIds === undefined || updatedItem.crcIds === null) {
-                                    // Only set to empty array if crcIds doesn't exist at all
+                                } else {
                                     updatedItem.crcIds = [];
                                 }
                             }
