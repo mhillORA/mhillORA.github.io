@@ -1020,28 +1020,25 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
 
 // Ensure context.log has error/info/warn helpers in all environments
 function ensureContextLogger(context) {
-    if (!context) {
-        return;
-    }
+    if (!context) return;
+
     if (!context.log) {
         context.log = (...args) => console.log(...args);
     }
-    if (typeof context.log === 'function') {
-        const base = (...args) => {
-            try {
-                context.log.apply(context, args);
-            } catch (err) {
-                console.log(...args);
-            }
-        };
-        context.log.info = context.log.info || base;
-        context.log.warn = context.log.warn || base;
-        context.log.error = context.log.error || base;
-        return;
-    }
-    context.log.info = context.log.info || console.log.bind(console);
-    context.log.warn = context.log.warn || console.warn.bind(console);
-    context.log.error = context.log.error || console.error.bind(console);
+
+    const levels = ['info', 'warn', 'error'];
+    levels.forEach((level) => {
+        if (typeof context.log[level] !== 'function') {
+            context.log[level] = (...args) => {
+                if (typeof context.log === 'function') {
+                    context.log(`[${level.toUpperCase()}]`, ...args);
+                } else {
+                    const fallback = level === 'error' ? console.error : console.log;
+                    fallback(...args);
+                }
+            };
+        }
+    });
 }
 
 // Helper function to handle errors
@@ -1054,15 +1051,19 @@ const handleError = (context, error, message) => {
         ? error.stack
         : "No stack trace";
 
-    try {
-        context.log.error(`${message}:`, rawMessage);
-        context.log.error(`Stack:`, errorStack);
-        if (error && typeof error === 'object' && Object.keys(error).length > 0) {
-            context.log.error(`Error object:`, safeStringify(error));
+    const logIt = (level, ...args) => {
+        if (context?.log && typeof context.log[level] === 'function') {
+            context.log[level](...args);
+        } else {
+            const fallback = level === 'error' ? console.error : console.log;
+            fallback(...args);
         }
-    } catch (logError) {
-        console.error(`${message}:`, rawMessage);
-        console.error(`Stack:`, errorStack);
+    };
+
+    logIt('error', `${message}:`, rawMessage);
+    logIt('error', `Stack:`, errorStack);
+    if (error && typeof error === 'object' && Object.keys(error).length > 0) {
+        logIt('error', `Error object:`, safeStringify(error));
     }
 
     let errorMessage;
