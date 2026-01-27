@@ -3145,8 +3145,20 @@ async function crudHandler(context, request, containerName) {
                                 }
                                 
                                 // Now create/check travel days for CRCs that are in the shift
-                                for (const [crcId, hasTravel] of Object.entries(result.travelDayPreferences)) {
-                                    if (hasTravel === true && shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                for (const [crcId, travelPrefs] of Object.entries(result.travelDayPreferences)) {
+                                    // Check if this CRC should have travel days
+                                    // travelPrefs can be:
+                                    // - true (legacy boolean format)
+                                    // - an object with includeStartTravel/includeEndTravel properties
+                                    // - an object with travelNotNeeded: true
+                                    const shouldHaveTravel = (
+                                        travelPrefs === true || 
+                                        (typeof travelPrefs === 'object' && travelPrefs !== null && 
+                                         (travelPrefs.includeStartTravel === true || travelPrefs.includeEndTravel === true) &&
+                                         !travelPrefs.travelNotNeeded)
+                                    );
+                                    
+                                    if (shouldHaveTravel && shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                         // Check if travel day already exists for this CRC on this date (from ANY source)
                                         // This prevents duplicates even if travel day was created from a different shift or source
                                         const existingTravelDay = (existingTravelDays || []).find(td => {
@@ -3180,7 +3192,10 @@ async function crudHandler(context, request, containerName) {
                                         } else {
                                             context.log.info(`Skipped creating travel day for CRC ${crcId} on ${shiftDate} - travel day already exists (ID: ${existingTravelDay.id})`);
                                         }
-                                    } else if (hasTravel === false || hasTravel === undefined) {
+                                    } else if (travelPrefs === false || travelPrefs === undefined || 
+                                               (typeof travelPrefs === 'object' && travelPrefs !== null && 
+                                                travelPrefs.travelNotNeeded === true &&
+                                                !travelPrefs.includeStartTravel && !travelPrefs.includeEndTravel)) {
                                         // If travel is unchecked or removed, delete travel day for this CRC
                                         const travelDayToDelete = (existingTravelDays || []).find(td => {
                                             if (!td || td.type !== 'Travel Day') return false;
