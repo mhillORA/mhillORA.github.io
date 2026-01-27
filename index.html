@@ -8783,6 +8783,7 @@
                 const firstDayOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
                 const lastDayOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0);
                 const isSupervisor = state.currentUser && getEffectivePermissionLevel() === 'Supervisor';
+                const canExportIcal = true;
                 
                 return `
                     <h3 class="text-xl font-bold mb-4 dark:text-white">Export Schedule</h3>
@@ -8816,6 +8817,21 @@
                             </div>
                             ${isSupervisor ? '<p class="text-xs text-gray-500 dark:text-gray-400 mt-2">Note: Supervisors can only export Site Assignments and Travel Days.</p>' : ''}
                         </div>
+                        ${canExportIcal ? `
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Export Format</label>
+                                <div class="space-y-2">
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="radio" name="exportFormat" value="csv" checked class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                        <span class="text-sm text-gray-700 dark:text-gray-300">CSV</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="radio" name="exportFormat" value="ical" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                        <span class="text-sm text-gray-700 dark:text-gray-300">iCal (.ics)</span>
+                                    </label>
+                                </div>
+                            </div>
+                        ` : ''}
                         <div class="flex justify-end gap-2 pt-4">
                             <button type="button" data-action="close-modal" class="px-4 py-2 bg-gray-300 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-400 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">Export</button>
@@ -8841,6 +8857,7 @@
                             const startDate = formData.get('startDate');
                             const endDate = formData.get('endDate');
                             let selectedEventTypes = formData.getAll('eventTypes');
+                            const exportFormat = formData.get('exportFormat') || 'csv';
                             const isSupervisor = state.currentUser && getEffectivePermissionLevel() === 'Supervisor';
                             if (isSupervisor) {
                                 // Enforce supervisor export restriction even if someone manipulates the DOM
@@ -8865,14 +8882,14 @@
                                 return;
                             }
                             
-                            performExportWithDateRange(startDate, endDate, selectedEventTypes);
+                            performExportWithDateRange(startDate, endDate, selectedEventTypes, exportFormat);
                             closeModal();
                         });
                     }
                 }, 100);
             };
 
-            const performExportWithDateRange = (startDate, endDate, selectedEventTypes = []) => {
+            const performExportWithDateRange = (startDate, endDate, selectedEventTypes = [], exportFormat = 'csv') => {
                 // Filter events by date range
                 let eventsToExport = state.crc_events.filter(e => {
                     const eventDate = e.date;
@@ -8936,6 +8953,12 @@
                     return;
                 }
 
+                if (exportFormat === 'ical') {
+                    exportEventsToIcal(eventsToExport, startDate, endDate);
+                    showNotification(`Exported ${eventsToExport.length} events successfully!`, 'success');
+                    return;
+                }
+
                 const headers = ['Date', 'EventType', 'CRCName', 'SiteName', 'StudyName', 'Roles', 'Hours', 'Period', 'Notes', 'VisitNumber', 'NumberOfPatients', 'PrincipalInvestigator', 'Mileage'];
                 const rows = eventsToExport.map(event => {
                     const crc = state.crcs.find(c => c.id === event.crcId);
@@ -8978,6 +9001,97 @@
                 link.click();
                 document.body.removeChild(link);
                 showNotification(`Exported ${eventsToExport.length} events successfully!`, 'success');
+            };
+
+            const exportEventsToIcal = (events, startDate, endDate) => {
+                const escapeIcsText = (value) => {
+                    return (value || '')
+                        .toString()
+                        .replace(/\\/g, '\\\\')
+                        .replace(/\n/g, '\\n')
+                        .replace(/,/g, '\\,')
+                        .replace(/;/g, '\\;');
+                };
+
+                const formatIcsDate = (dateValue) => {
+                    const dateObj = parseDateFlexible(dateValue);
+                    if (!dateObj) return null;
+                    const year = dateObj.getFullYear();
+                    const month = `${dateObj.getMonth() + 1}`.padStart(2, '0');
+                    const day = `${dateObj.getDate()}`.padStart(2, '0');
+                    return `${year}${month}${day}`;
+                };
+
+                const addDays = (dateObj, days) => {
+                    const next = new Date(dateObj);
+                    next.setDate(next.getDate() + days);
+                    return next;
+                };
+
+                const nowStamp = new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+                const lines = [
+                    'BEGIN:VCALENDAR',
+                    'VERSION:2.0',
+                    'PRODID:-//CHAOS Scheduler//EN',
+                    'CALSCALE:GREGORIAN'
+                ];
+
+                events.forEach((event, index) => {
+                    const dateValue = event.date || event.startDate || event.endDate;
+                    const startDateIcs = formatIcsDate(dateValue);
+                    const startDateObj = parseDateFlexible(dateValue);
+                    if (!startDateIcs || !startDateObj) return;
+                    const endDateIcs = formatIcsDate(addDays(startDateObj, 1));
+
+                    const crc = state.crcs.find(c => c.id === event.crcId);
+                    const site = state.crc_sites.find(s => s.id === event.siteId);
+                    const studies = (event.studyIds || []).map(id => {
+                        const study = state.studies?.find(s => s.id === id);
+                        return study?.name || '';
+                    }).filter(Boolean);
+
+                    const summaryParts = [event.type];
+                    if (crc?.name) summaryParts.push(crc.name);
+                    if (site?.name) summaryParts.push(`@ ${site.name}`);
+                    const summary = escapeIcsText(summaryParts.join(' - '));
+
+                    const descriptionLines = [];
+                    if (studies.length) descriptionLines.push(`Studies: ${studies.join('; ')}`);
+                    if (event.roles?.length) descriptionLines.push(`Roles: ${event.roles.join('; ')}`);
+                    if (event.period) descriptionLines.push(`Period: ${event.period}`);
+                    if (event.hours) descriptionLines.push(`Hours: ${event.hours}`);
+                    if (event.visitNumber) descriptionLines.push(`Visit: ${event.visitNumber}`);
+                    if (event.numberOfPatients) descriptionLines.push(`Patients: ${event.numberOfPatients}`);
+                    if (event.principalInvestigator) descriptionLines.push(`PI: ${event.principalInvestigator}`);
+                    if (event.mileage) descriptionLines.push(`Mileage: ${event.mileage}`);
+                    if (event.notes) descriptionLines.push(`Notes: ${event.notes}`);
+                    const description = escapeIcsText(descriptionLines.join('\n'));
+
+                    lines.push('BEGIN:VEVENT');
+                    lines.push(`UID:${escapeIcsText(event.id || `${startDateIcs}-${index}`)}@chaos`);
+                    lines.push(`DTSTAMP:${nowStamp}`);
+                    lines.push(`DTSTART;VALUE=DATE:${startDateIcs}`);
+                    lines.push(`DTEND;VALUE=DATE:${endDateIcs}`);
+                    lines.push(`SUMMARY:${summary}`);
+                    if (description) lines.push(`DESCRIPTION:${description}`);
+                    if (site?.name) lines.push(`LOCATION:${escapeIcsText(site.name)}`);
+                    lines.push('END:VEVENT');
+                });
+
+                lines.push('END:VCALENDAR');
+
+                const icsContent = lines.join('\r\n');
+                const blob = new Blob([icsContent], { type: 'text/calendar;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.setAttribute('href', url);
+                const startDateStr = startDate.replace(/-/g, '');
+                const endDateStr = endDate.replace(/-/g, '');
+                link.setAttribute('download', `crc_schedule_${startDateStr}_to_${endDateStr}.ics`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
             };
 
             // --- HTML GETTERS ---
@@ -9507,8 +9621,8 @@
                         return false;
                     });
                 } else {
-                    // Show all events (entire schedule)
-                    filteredEvents = state.crc_events || [];
+                    // Show all shifts only (entire schedule)
+                    filteredEvents = (state.crc_events || []).filter(e => e.type === 'Site Assignment');
                 }
                 
                 // Filter to current month
@@ -17254,6 +17368,7 @@
                     container.innerHTML = getTrainingReportingHTML();
                 } else if (state.trainingTab === 'role-history') {
                     container.innerHTML = getRoleHistoryHTML();
+                    setupRoleHistoryFilters();
                 } else if (state.trainingTab === 'manage') {
                     container.innerHTML = getManageTrainingTypesHTML();
                     lucide.createIcons();
@@ -17270,52 +17385,96 @@
                     return '<p class="text-sm text-gray-500 dark:text-gray-400">No roles found.</p>';
                 }
 
+                const roleCards = roles.map(role => {
+                    const rows = crcs.map(crc => {
+                        const lastDate = getLastPerformedRoleDate(crc.id, role.id);
+                        if (!lastDate) return '';
+                        const lastDisplay = formatDisplayDate(lastDate);
+                        return `
+                            <tr data-crc-name="${(crc.name || crc.id || '').toLowerCase()}">
+                                <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-800 dark:text-gray-200">${crc.name || crc.id}</td>
+                                <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${lastDisplay}</td>
+                            </tr>
+                        `;
+                    }).filter(Boolean).join('');
+
+                    if (!rows) return '';
+
+                    return `
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow role-history-card" data-role-name="${role.name.toLowerCase()}">
+                            <div class="px-4 py-3 border-b dark:border-gray-700 font-semibold">${role.name}</div>
+                            <div class="overflow-x-auto">
+                                <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                    <thead class="bg-gray-50 dark:bg-gray-700">
+                                        <tr>
+                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">CRC</th>
+                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Last Performed</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="bg-white dark:bg-gray-900 divide-y divide-gray-200 dark:divide-gray-700">
+                                        ${rows}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    `;
+                }).filter(Boolean).join('');
+
                 return `
                     <div class="space-y-6">
                         <div class="flex items-center justify-between">
                             <h4 class="text-lg font-semibold">Role History</h4>
-                            <p class="text-xs text-gray-500 dark:text-gray-400">Shows CRCs who have completed the required training. Last performed is based on the most recent site assignment.</p>
+                            <p class="text-xs text-gray-500 dark:text-gray-400">Only shows CRCs with role history in the schedule.</p>
                         </div>
-                        ${roles.map(role => {
-                            const eligibleCrcs = crcs.filter(crc => hasCompletedTrainingForRole(crc, role.name));
-                            const rows = eligibleCrcs.map(crc => {
-                                const lastDate = getLastPerformedRoleDate(crc.id, role.id);
-                                const lastDisplay = lastDate ? formatDisplayDate(lastDate) : 'Never';
-                                return `
-                                    <tr>
-                                        <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-800 dark:text-gray-200">${crc.name || crc.id}</td>
-                                        <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${lastDisplay}</td>
-                                    </tr>
-                                `;
-                            }).join('');
-
-                            const emptyRow = `
-                                <tr>
-                                    <td colspan="2" class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">No CRCs with completed training.</td>
-                                </tr>
-                            `;
-
-                            return `
-                                <div class="bg-white dark:bg-gray-800 rounded-lg shadow">
-                                    <div class="px-4 py-3 border-b dark:border-gray-700 font-semibold">${role.name}</div>
-                                    <div class="overflow-x-auto">
-                                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                                            <thead class="bg-gray-50 dark:bg-gray-700">
-                                                <tr>
-                                                    <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">CRC</th>
-                                                    <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Last Performed</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody class="bg-white dark:bg-gray-900 divide-y divide-gray-200 dark:divide-gray-700">
-                                                ${rows || emptyRow}
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                </div>
-                            `;
-                        }).join('')}
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Filter by Role</label>
+                                <input type="text" id="role-history-role-filter" placeholder="Role name..." class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Filter by CRC</label>
+                                <input type="text" id="role-history-crc-filter" placeholder="CRC name..." class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                        </div>
+                        <div id="role-history-list" class="space-y-6">
+                            ${roleCards || '<p class="text-sm text-gray-500 dark:text-gray-400">No role history found.</p>'}
+                        </div>
                     </div>
                 `;
+            };
+
+            const setupRoleHistoryFilters = () => {
+                const roleInput = document.getElementById('role-history-role-filter');
+                const crcInput = document.getElementById('role-history-crc-filter');
+                const listContainer = document.getElementById('role-history-list');
+                if (!roleInput || !crcInput || !listContainer) return;
+
+                const applyFilters = () => {
+                    const roleQuery = roleInput.value.trim().toLowerCase();
+                    const crcQuery = crcInput.value.trim().toLowerCase();
+                    const cards = Array.from(listContainer.querySelectorAll('.role-history-card'));
+
+                    cards.forEach(card => {
+                        const roleName = card.dataset.roleName || '';
+                        const roleMatches = !roleQuery || roleName.includes(roleQuery);
+                        const rows = Array.from(card.querySelectorAll('tbody tr'));
+                        let anyRowVisible = false;
+
+                        rows.forEach(row => {
+                            const crcName = row.dataset.crcName || '';
+                            const crcMatches = !crcQuery || crcName.includes(crcQuery);
+                            const showRow = roleMatches && crcMatches;
+                            row.classList.toggle('hidden', !showRow);
+                            if (showRow) anyRowVisible = true;
+                        });
+
+                        card.classList.toggle('hidden', !roleMatches || !anyRowVisible);
+                    });
+                };
+
+                roleInput.addEventListener('input', applyFilters);
+                crcInput.addEventListener('input', applyFilters);
+                applyFilters();
             };
 
             const getTrainingOverviewHTML = () => {
