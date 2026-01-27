@@ -2355,6 +2355,89 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
+                    // For Site Assignment shifts, create travel days from travelDayPreferences
+                    if (containerName === 'events' && createdItem && createdItem.type === 'Site Assignment' && createdItem.date && createdItem.travelDayPreferences) {
+                        try {
+                            const eventsContainer = getContainer('events');
+                            const shiftDate = toDateOnlyString(createdItem.date);
+                            
+                            // Collect all CRCs assigned to this shift
+                            const shiftCrcIds = new Set();
+                            if (createdItem.crcId && createdItem.crcId.trim() !== '' && createdItem.crcId !== 'SITE_STAFF' && createdItem.crcId !== 'UNASSIGNED') {
+                                shiftCrcIds.add(createdItem.crcId);
+                            }
+                            if (createdItem.crcIds && Array.isArray(createdItem.crcIds)) {
+                                createdItem.crcIds.forEach(crcId => {
+                                    if (crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                        shiftCrcIds.add(crcId);
+                                    }
+                                });
+                            }
+                            if (createdItem.roleAssignments && typeof createdItem.roleAssignments === 'object') {
+                                Object.values(createdItem.roleAssignments).forEach(assignments => {
+                                    if (Array.isArray(assignments)) {
+                                        assignments.forEach(crcId => {
+                                            if (crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                shiftCrcIds.add(crcId);
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            
+                            // Check travelDayPreferences and create travel days for CRCs that have travel checked
+                            if (createdItem.travelDayPreferences && typeof createdItem.travelDayPreferences === 'object') {
+                                for (const [crcId, hasTravel] of Object.entries(createdItem.travelDayPreferences)) {
+                                    // Only create travel day if:
+                                    // 1. Travel is checked (hasTravel === true)
+                                    // 2. CRC is assigned to this shift
+                                    // 3. CRC ID is valid
+                                    if (hasTravel === true && shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                        // Check if travel day already exists for this CRC on this date
+                                        const { resources: allTravelDaysOnDate } = await eventsContainer.items.query({
+                                            query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
+                                            parameters: [
+                                                { name: "@date", value: shiftDate }
+                                            ]
+                                        }).fetchAll();
+                                        
+                                        // Filter to find travel days for this specific CRC
+                                        const existingTravelDay = (allTravelDaysOnDate || []).find(td => {
+                                            if (td.type !== 'Travel Day') return false;
+                                            if (td.crcId === crcId) return true;
+                                            if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
+                                            return false;
+                                        });
+                                        
+                                        // Only create if no travel day exists
+                                        if (!existingTravelDay) {
+                                            const travelDayEvent = {
+                                                id: generateId(),
+                                                type: 'Travel Day',
+                                                date: shiftDate,
+                                                crcId: crcId,
+                                                crcIds: [crcId],
+                                                name: 'Travel Day',
+                                                siteId: createdItem.siteId || null,
+                                                studyId: createdItem.studyId || null
+                                            };
+                                            
+                                            try {
+                                                await eventsContainer.items.create(travelDayEvent);
+                                                context.log.info(`Created travel day ${travelDayEvent.id} for CRC ${crcId} on ${shiftDate} from travelDayPreferences`);
+                                            } catch (createTravelError) {
+                                                context.log.warn(`Failed to create travel day for CRC ${crcId}: ${createTravelError.message}`);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (travelDayError) {
+                            // Log but don't fail the shift creation if travel day creation fails
+                            context.log.warn(`Error creating travel days from travelDayPreferences:`, travelDayError.message);
+                        }
+                    }
+                    
                     return { status: 201, jsonBody: createdItem };
                 } catch (createError) {
                     // Handle case where container doesn't exist
@@ -2991,6 +3074,108 @@ async function crudHandler(context, request, containerName) {
                         } catch (e) {
                             context.log.warn('Study enrollment calc failed:', e?.message || e);
                             result.enrolled = result.enrolled ?? 0;
+                        }
+                    }
+                    
+                    // For Site Assignment shifts, handle travel days from travelDayPreferences
+                    if (containerName === 'events' && result && result.type === 'Site Assignment' && result.date) {
+                        try {
+                            const eventsContainer = getContainer('events');
+                            const shiftDate = toDateOnlyString(result.date);
+                            
+                            // Collect all CRCs assigned to this shift
+                            const shiftCrcIds = new Set();
+                            if (result.crcId && result.crcId.trim() !== '' && result.crcId !== 'SITE_STAFF' && result.crcId !== 'UNASSIGNED') {
+                                shiftCrcIds.add(result.crcId);
+                            }
+                            if (result.crcIds && Array.isArray(result.crcIds)) {
+                                result.crcIds.forEach(crcId => {
+                                    if (crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                        shiftCrcIds.add(crcId);
+                                    }
+                                });
+                            }
+                            if (result.roleAssignments && typeof result.roleAssignments === 'object') {
+                                Object.values(result.roleAssignments).forEach(assignments => {
+                                    if (Array.isArray(assignments)) {
+                                        assignments.forEach(crcId => {
+                                            if (crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                shiftCrcIds.add(crcId);
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            
+                            // Get existing travel days for this shift date
+                            const { resources: existingTravelDays } = await eventsContainer.items.query({
+                                query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
+                                parameters: [
+                                    { name: "@date", value: shiftDate }
+                                ]
+                            }).fetchAll();
+                            
+                            // Process travelDayPreferences
+                            if (result.travelDayPreferences && typeof result.travelDayPreferences === 'object') {
+                                // Create travel days for CRCs that have travel checked
+                                for (const [crcId, hasTravel] of Object.entries(result.travelDayPreferences)) {
+                                    if (hasTravel === true && shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                        // Check if travel day already exists for this CRC
+                                        const existingTravelDay = (existingTravelDays || []).find(td => {
+                                            if (td.type !== 'Travel Day') return false;
+                                            if (td.crcId === crcId) return true;
+                                            if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
+                                            return false;
+                                        });
+                                        
+                                        // Only create if no travel day exists
+                                        if (!existingTravelDay) {
+                                            const travelDayEvent = {
+                                                id: generateId(),
+                                                type: 'Travel Day',
+                                                date: shiftDate,
+                                                crcId: crcId,
+                                                crcIds: [crcId],
+                                                name: 'Travel Day',
+                                                siteId: result.siteId || null,
+                                                studyId: result.studyId || null
+                                            };
+                                            
+                                            try {
+                                                await eventsContainer.items.create(travelDayEvent);
+                                                context.log.info(`Created travel day ${travelDayEvent.id} for CRC ${crcId} on ${shiftDate} from travelDayPreferences`);
+                                            } catch (createTravelError) {
+                                                context.log.warn(`Failed to create travel day for CRC ${crcId}: ${createTravelError.message}`);
+                                            }
+                                        }
+                                    } else if (hasTravel === false || hasTravel === undefined) {
+                                        // If travel is unchecked or removed, delete travel day for this CRC
+                                        const travelDayToDelete = (existingTravelDays || []).find(td => {
+                                            if (td.type !== 'Travel Day') return false;
+                                            // Only delete single-CRC travel days (not multi-CRC ones)
+                                            if (td.crcId === crcId) return true;
+                                            if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length === 1 && td.crcIds[0] === crcId) return true;
+                                            return false;
+                                        });
+                                        
+                                        if (travelDayToDelete && travelDayToDelete.id) {
+                                            try {
+                                                await eventsContainer.item(travelDayToDelete.id, travelDayToDelete.id).delete();
+                                                context.log.info(`Deleted travel day ${travelDayToDelete.id} for CRC ${crcId} because travel was unchecked`);
+                                            } catch (deleteTravelError) {
+                                                context.log.warn(`Failed to delete travel day ${travelDayToDelete.id}: ${deleteTravelError.message}`);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if (result.travelDayPreferences === null || result.travelDayPreferences === undefined) {
+                                // If travelDayPreferences is removed entirely, check if we should clean up travel days
+                                // Only delete travel days that were created for this specific shift (we can't easily track this, so we'll be conservative)
+                                // Actually, let's not delete automatically - let the user manage travel days explicitly
+                            }
+                        } catch (travelDayError) {
+                            // Log but don't fail the shift update if travel day creation fails
+                            context.log.warn(`Error handling travel days from travelDayPreferences:`, travelDayError.message);
                         }
                     }
                     
@@ -4385,6 +4570,33 @@ app.http('time-off-requests', {
                         // Manager can delete the request
                         const partitionKey = resource.partitionKey || resource.crcId || resource.id || id;
                         await container.item(resource.id || id, partitionKey).delete();
+                        
+                        // Also delete any related time off events that reference this PTO request
+                        try {
+                            const eventsContainer = getContainer('events');
+                            const { resources: relatedEvents } = await eventsContainer.items.query({
+                                query: "SELECT * FROM c WHERE c.timeOffRequestId = @ptoId",
+                                parameters: [
+                                    { name: "@ptoId", value: id }
+                                ]
+                            }).fetchAll();
+                            
+                            // Delete all related events
+                            for (const event of (relatedEvents || [])) {
+                                if (event && event.id) {
+                                    try {
+                                        await eventsContainer.item(event.id, event.id).delete();
+                                        context.log.info(`Deleted time off event ${event.id} because PTO request ${id} was deleted`);
+                                    } catch (deleteEventError) {
+                                        context.log.warn(`Failed to delete time off event ${event.id}: ${deleteEventError.message}`);
+                                    }
+                                }
+                            }
+                        } catch (eventDeleteError) {
+                            // Log but don't fail the PTO deletion if event deletion fails
+                            context.log.warn(`Error deleting related time off events for PTO request ${id}:`, eventDeleteError.message);
+                        }
+                        
                         return { status: 204 };
                     } catch (e) {
                         // If we can't read the resource, it might already be deleted, return 204
