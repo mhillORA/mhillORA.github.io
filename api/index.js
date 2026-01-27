@@ -2905,6 +2905,55 @@ async function crudHandler(context, request, containerName) {
                                         updatedItem.travelDayPreferences = existingEvent.travelDayPreferences;
                                     }
                                     
+                                    // Remove Cosmos DB system fields that shouldn't be in the update
+                                    ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => { 
+                                        if (k in updatedItem) delete updatedItem[k]; 
+                                    });
+                                    
+                                    // CRITICAL: Normalize legacy studyId to studyIds array for compatibility
+                                    // Legacy shifts may have studyId (string) instead of studyIds (array)
+                                    if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
+                                        if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
+                                            // Convert legacy studyId to studyIds array
+                                            updatedItem.studyIds = [updatedItem.studyId];
+                                        } else if (requestBody.studyIds && Array.isArray(requestBody.studyIds)) {
+                                            updatedItem.studyIds = requestBody.studyIds;
+                                        } else if (requestBody.studyId && typeof requestBody.studyId === 'string' && requestBody.studyId.trim() !== '') {
+                                            updatedItem.studyIds = [requestBody.studyId];
+                                        } else if (existingEvent.studyIds && Array.isArray(existingEvent.studyIds)) {
+                                            updatedItem.studyIds = existingEvent.studyIds;
+                                        } else if (existingEvent.studyId && typeof existingEvent.studyId === 'string' && existingEvent.studyId.trim() !== '') {
+                                            updatedItem.studyIds = [existingEvent.studyId];
+                                        } else {
+                                            updatedItem.studyIds = [];
+                                        }
+                                        // Remove legacy studyId field if it exists
+                                        delete updatedItem.studyId;
+                                    }
+                                    
+                                    // Ensure roleAssignments is valid - if it's an empty object, keep it (for Open Shifts)
+                                    // But if it's null/undefined and we have roleAssignments in requestBody, use that
+                                    if (updatedItem.roleAssignments === null || updatedItem.roleAssignments === undefined) {
+                                        if (requestBody.roleAssignments && typeof requestBody.roleAssignments === 'object') {
+                                            updatedItem.roleAssignments = requestBody.roleAssignments;
+                                        } else if (existingEvent.roleAssignments && typeof existingEvent.roleAssignments === 'object') {
+                                            updatedItem.roleAssignments = existingEvent.roleAssignments;
+                                        }
+                                    }
+                                    
+                                    // Ensure crcIds is an array (legacy shifts might only have crcId)
+                                    if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
+                                        if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '') {
+                                            updatedItem.crcIds = [updatedItem.crcId];
+                                        } else if (requestBody.crcIds && Array.isArray(requestBody.crcIds)) {
+                                            updatedItem.crcIds = requestBody.crcIds;
+                                        } else if (existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
+                                            updatedItem.crcIds = existingEvent.crcIds;
+                                        } else {
+                                            updatedItem.crcIds = [];
+                                        }
+                                    }
+                                    
                                     // If updating a Site Assignment shift, check if any CRCs were removed
                                     // and delete their travel days for this shift date
                                     if (existingEvent.type === 'Site Assignment' && existingEvent.date) {
@@ -3070,7 +3119,60 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
-                    const { resource: result } = await container.items.upsert(updatedItem);
+                    // Remove Cosmos DB system fields before upsert to avoid validation issues
+                    ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => { 
+                        if (k in updatedItem) delete updatedItem[k]; 
+                    });
+                    
+                    // CRITICAL: Final normalization for legacy fields before upsert
+                    // Ensure studyIds is always an array (normalize from legacy studyId)
+                    if (containerName === 'events') {
+                        if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
+                            if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
+                                updatedItem.studyIds = [updatedItem.studyId];
+                                delete updatedItem.studyId; // Remove legacy field
+                            } else {
+                                updatedItem.studyIds = [];
+                            }
+                        }
+                        
+                        // Ensure crcIds is always an array (normalize from legacy crcId)
+                        if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
+                            if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
+                                updatedItem.crcIds = [updatedItem.crcId];
+                            } else {
+                                updatedItem.crcIds = [];
+                            }
+                        }
+                    }
+                    
+                    // Ensure id is set
+                    if (!updatedItem.id) {
+                        updatedItem.id = updateId;
+                    }
+                    
+                    // Log the update attempt for debugging
+                    if (containerName === 'events') {
+                        context.log.info(`Updating event ${updateId}: type=${updatedItem.type}, hasRoleAssignments=${!!updatedItem.roleAssignments}, hasTravelDayPreferences=${!!updatedItem.travelDayPreferences}`);
+                    }
+                    
+                    let result;
+                    try {
+                        const upsertResult = await container.items.upsert(updatedItem);
+                        result = upsertResult.resource;
+                    } catch (upsertError) {
+                        context.log.error(`Error upserting ${containerName} ${updateId}:`, upsertError);
+                        context.log.error(`Upsert error details:`, {
+                            message: upsertError.message,
+                            code: upsertError.code,
+                            statusCode: upsertError.statusCode,
+                            stack: upsertError.stack
+                        });
+                        context.log.error(`UpdatedItem keys:`, Object.keys(updatedItem));
+                        context.log.error(`UpdatedItem type:`, updatedItem.type);
+                        // Re-throw to be caught by outer catch
+                        throw upsertError;
+                    }
                     
                     // For users, ensure admin is corrected after upsert
                     if (containerName === 'users') {
