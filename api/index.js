@@ -4081,8 +4081,22 @@ app.http('time-off-requests', {
                     }
                     
                     try {
-                        // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
-                        const { resource } = await container.item(id, id).read();
+                        let resource = null;
+                        try {
+                            // Cosmos DB requires both id and partitionKey - legacy assumes id is the partition key
+                            const result = await container.item(id, id).read();
+                            resource = result.resource || null;
+                        } catch (readError) {
+                            resource = null;
+                        }
+                        if (!resource) {
+                            // Fallback: query by id in case partition key isn't the id
+                            const { resources } = await container.items.query({
+                                query: "SELECT * FROM c WHERE c.id = @id",
+                                parameters: [{ name: "@id", value: id }]
+                            }).fetchAll();
+                            resource = resources && resources.length > 0 ? resources[0] : null;
+                        }
                         if (!resource) {
                             return { status: 204 };
                         }
@@ -4130,7 +4144,8 @@ app.http('time-off-requests', {
                         }
                         
                         // Manager can delete the request
-                        await container.item(id, id).delete();
+                        const partitionKey = resource.partitionKey || resource.crcId || resource.id || id;
+                        await container.item(resource.id || id, partitionKey).delete();
                         return { status: 204 };
                     } catch (e) {
                         // If we can't read the resource, it might already be deleted, return 204
