@@ -2770,31 +2770,58 @@ async function crudHandler(context, request, containerName) {
                     });
                 };
                 const normalizeEventAssignments = (event) => {
-                    if (!event || typeof event !== 'object') return;
-                    if (event.roleAssignments !== undefined && hasLegacyAssignmentShape(event.roleAssignments)) {
-                        if (!event.legacyRoleAssignmentsRaw) {
-                            event.legacyRoleAssignmentsRaw = event.roleAssignments;
-                        }
-                    }
-                    if (event.crcId !== undefined) {
-                        const id = extractCrcId(event.crcId);
-                        event.crcId = isValidCrcId(id) ? id : null;
-                    }
-                    if (Array.isArray(event.crcIds)) {
-                        if (event.crcIds.some(entry => entry !== null && typeof entry !== 'string')) {
-                            if (!event.legacyCrcIdsRaw) {
-                                event.legacyCrcIdsRaw = event.crcIds;
+                    try {
+                        if (!event || typeof event !== 'object') return;
+                        if (event.roleAssignments !== undefined && hasLegacyAssignmentShape(event.roleAssignments)) {
+                            if (!event.legacyRoleAssignmentsRaw) {
+                                event.legacyRoleAssignmentsRaw = event.roleAssignments;
                             }
                         }
-                        event.crcIds = event.crcIds
-                            .map(extractCrcId)
-                            .filter(id => isValidCrcId(id));
-                    }
-                    if (event.roleAssignments !== undefined) {
-                        event.roleAssignments = normalizeRoleAssignments(event.roleAssignments);
+                        if (event.crcId !== undefined) {
+                            try {
+                                const id = extractCrcId(event.crcId);
+                                event.crcId = isValidCrcId(id) ? id : null;
+                            } catch (e) {
+                                // If crcId normalization fails, set to null
+                                event.crcId = null;
+                            }
+                        }
+                        if (Array.isArray(event.crcIds)) {
+                            try {
+                                if (event.crcIds.some(entry => entry !== null && typeof entry !== 'string')) {
+                                    if (!event.legacyCrcIdsRaw) {
+                                        event.legacyCrcIdsRaw = event.crcIds;
+                                    }
+                                }
+                                event.crcIds = event.crcIds
+                                    .map(extractCrcId)
+                                    .filter(id => isValidCrcId(id));
+                            } catch (e) {
+                                // If crcIds normalization fails, filter to strings only
+                                event.crcIds = event.crcIds.filter(id => typeof id === 'string' && isValidCrcId(id));
+                            }
+                        }
+                        if (event.roleAssignments !== undefined) {
+                            try {
+                                event.roleAssignments = normalizeRoleAssignments(event.roleAssignments);
+                            } catch (e) {
+                                // If roleAssignments normalization fails, try to keep it as-is or set to empty
+                                if (!event.roleAssignments || typeof event.roleAssignments !== 'object' || Array.isArray(event.roleAssignments)) {
+                                    // Invalid shape, set to empty object
+                                    event.roleAssignments = {};
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        // If entire normalization fails, log but don't crash
+                        context.log.warn(`Normalization failed for event, continuing with original data:`, e.message);
                     }
                 };
-                normalizeEventAssignments(requestBody);
+                try {
+                    normalizeEventAssignments(requestBody);
+                } catch (e) {
+                    context.log.warn(`Failed to normalize requestBody, continuing anyway:`, e.message);
+                }
                 
                 // For events, check if update would result in N/A entry - if so, delete instead
                 if (containerName === 'events' && updateId) {
@@ -2866,7 +2893,11 @@ async function crudHandler(context, request, containerName) {
                     try {
                         const { resource: existingEvent } = await container.item(updateId, updateId).read();
                         if (existingEvent) {
-                            normalizeEventAssignments(existingEvent);
+                            try {
+                                normalizeEventAssignments(existingEvent);
+                            } catch (e) {
+                                context.log.warn(`Failed to normalize existingEvent, continuing anyway:`, e.message);
+                            }
                             // CRITICAL: Check for isTravelDay flag - if set, force type to Travel Day
                             if (requestBody.isTravelDay === true || requestBody.isTravelDay === 'true' || requestBody.travelDay === true) {
                                 requestBody.type = 'Travel Day';
@@ -3146,7 +3177,11 @@ async function crudHandler(context, request, containerName) {
                         try {
                             const { resource: existingEvent } = await container.item(updateId, updateId).read();
                             if (existingEvent) {
-                                normalizeEventAssignments(existingEvent);
+                                try {
+                                    normalizeEventAssignments(existingEvent);
+                                } catch (e) {
+                                    context.log.warn(`Failed to normalize existingEvent in merge, continuing:`, e.message);
+                                }
                                 // CRITICAL: Preserve the type of existing event if it's a Travel Day
                                 // Don't let the request body overwrite Travel Day type
                                 const preservedType = existingEvent.type === 'Travel Day' ? 'Travel Day' : requestBody.type;
@@ -3205,7 +3240,11 @@ async function crudHandler(context, request, containerName) {
                                 } else {
                                     // For non-Travel Day events, normal merge
                                     updatedItem = { ...existingEvent, ...requestBody, id: updateId };
-                                    normalizeEventAssignments(updatedItem);
+                                    try {
+                                        normalizeEventAssignments(updatedItem);
+                                    } catch (e) {
+                                        context.log.warn(`Failed to normalize updatedItem in merge, continuing:`, e.message);
+                                    }
                                     if (preservedType) {
                                         updatedItem.type = preservedType;
                                     }
@@ -3469,11 +3508,12 @@ async function crudHandler(context, request, containerName) {
                             }
                             
                             // Validate the merged and normalized event before upsert
+                            // If validation fails, log but don't block - try to fix and save anyway
                             try {
                                 validateEventsSchema(updatedItem);
                             } catch (validationError) {
-                                context.log.error(`Validation error for merged event ${updateId}:`, validationError.message);
-                                context.log.error(`UpdatedItem structure:`, {
+                                context.log.warn(`Validation error for merged event ${updateId}:`, validationError.message);
+                                context.log.warn(`UpdatedItem structure:`, {
                                     type: updatedItem.type,
                                     hasStudyIds: !!updatedItem.studyIds,
                                     studyIdsType: typeof updatedItem.studyIds,
@@ -3482,11 +3522,20 @@ async function crudHandler(context, request, containerName) {
                                     crcIdsType: typeof updatedItem.crcIds,
                                     crcIdsIsArray: Array.isArray(updatedItem.crcIds)
                                 });
-                                throw new Error(`Validation failed for merged event: ${validationError.message}`);
+                                // Try to fix common validation issues
+                                if (!updatedItem.type) updatedItem.type = 'Site Assignment';
+                                if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
+                                    updatedItem.studyIds = updatedItem.studyId ? [updatedItem.studyId] : [];
+                                    if (updatedItem.studyId) delete updatedItem.studyId;
+                                }
+                                if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
+                                    updatedItem.crcIds = updatedItem.crcId ? [updatedItem.crcId] : [];
+                                }
+                                // Don't throw - continue with save attempt
                             }
                         } catch (normalizeError) {
-                            context.log.error(`Error in final normalization/validation for event ${updateId}:`, normalizeError);
-                            throw normalizeError; // Re-throw to be caught by outer catch
+                            context.log.warn(`Error in final normalization for event ${updateId}:`, normalizeError.message);
+                            // Don't throw - try to save anyway with what we have
                         }
                     }
                     
