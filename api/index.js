@@ -3239,12 +3239,33 @@ async function crudHandler(context, request, containerName) {
                                     });
                                 } else {
                                     // For non-Travel Day events, normal merge
-                                    updatedItem = { ...existingEvent, ...requestBody, id: updateId };
+                                    // CRITICAL: Normalize existingEvent FIRST to convert legacy fields before merging
+                                    const normalizedExisting = { ...existingEvent };
+                                    try {
+                                        normalizeEventAssignments(normalizedExisting);
+                                        // Convert legacy studyId to studyIds if needed
+                                        if (normalizedExisting.studyId && typeof normalizedExisting.studyId === 'string' && (!normalizedExisting.studyIds || !Array.isArray(normalizedExisting.studyIds))) {
+                                            normalizedExisting.studyIds = [normalizedExisting.studyId];
+                                            delete normalizedExisting.studyId;
+                                        }
+                                        // Convert legacy crcId to crcIds if needed
+                                        if (normalizedExisting.crcId && typeof normalizedExisting.crcId === 'string' && (!normalizedExisting.crcIds || !Array.isArray(normalizedExisting.crcIds))) {
+                                            normalizedExisting.crcIds = [normalizedExisting.crcId];
+                                        }
+                                    } catch (e) {
+                                        context.log.warn(`Failed to normalize existingEvent before merge:`, e.message);
+                                    }
+                                    
+                                    // Now merge normalized existing with requestBody (requestBody is already normalized)
+                                    updatedItem = { ...normalizedExisting, ...requestBody, id: updateId };
+                                    
+                                    // Final normalization pass on merged result
                                     try {
                                         normalizeEventAssignments(updatedItem);
                                     } catch (e) {
                                         context.log.warn(`Failed to normalize updatedItem in merge, continuing:`, e.message);
                                     }
+                                    
                                     if (preservedType) {
                                         updatedItem.type = preservedType;
                                     }
@@ -3259,50 +3280,65 @@ async function crudHandler(context, request, containerName) {
                                         if (k in updatedItem) delete updatedItem[k]; 
                                     });
                                     
-                                    // CRITICAL: Normalize legacy studyId to studyIds array for compatibility
-                                    // Only normalize if studyIds is missing or invalid - preserve existing valid arrays
-                                    if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
-                                        // Priority: requestBody.studyIds > requestBody.studyId > existingEvent.studyIds > existingEvent.studyId > updatedItem.studyId
-                                        if (requestBody.studyIds && Array.isArray(requestBody.studyIds)) {
-                                            updatedItem.studyIds = requestBody.studyIds;
-                                        } else if (requestBody.studyId && typeof requestBody.studyId === 'string' && requestBody.studyId.trim() !== '') {
-                                            updatedItem.studyIds = [requestBody.studyId];
-                                        } else if (existingEvent.studyIds && Array.isArray(existingEvent.studyIds)) {
-                                            updatedItem.studyIds = existingEvent.studyIds;
-                                        } else if (existingEvent.studyId && typeof existingEvent.studyId === 'string' && existingEvent.studyId.trim() !== '') {
-                                            updatedItem.studyIds = [existingEvent.studyId];
-                                        } else if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
-                                            updatedItem.studyIds = [updatedItem.studyId];
-                                        }
-                                        // Only set to empty array as last resort - don't overwrite if we have any study data
-                                        if (!updatedItem.studyIds) {
+                                    // CRITICAL: Normalize studyIds - requestBody takes precedence
+                                    if (requestBody.studyIds !== undefined && Array.isArray(requestBody.studyIds)) {
+                                        // User provided studyIds - use it
+                                        updatedItem.studyIds = requestBody.studyIds;
+                                    } else if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
+                                        // Fall back to normalized existing or convert legacy
+                                        if (normalizedExisting.studyIds && Array.isArray(normalizedExisting.studyIds)) {
+                                            updatedItem.studyIds = normalizedExisting.studyIds;
+                                        } else if (normalizedExisting.studyId && typeof normalizedExisting.studyId === 'string') {
+                                            updatedItem.studyIds = [normalizedExisting.studyId];
+                                        } else {
                                             updatedItem.studyIds = [];
                                         }
                                     }
-                                    // Always remove legacy studyId field after ensuring studyIds is set
-                                    if (updatedItem.studyId && updatedItem.studyIds) {
+                                    // Always remove legacy studyId field
+                                    if (updatedItem.studyId) {
                                         delete updatedItem.studyId;
                                     }
                                     
-                                    // Ensure roleAssignments is valid - if it's an empty object, keep it (for Open Shifts)
-                                    // But if it's null/undefined and we have roleAssignments in requestBody, use that
-                                    if (updatedItem.roleAssignments === null || updatedItem.roleAssignments === undefined) {
-                                        if (requestBody.roleAssignments && typeof requestBody.roleAssignments === 'object') {
-                                            updatedItem.roleAssignments = requestBody.roleAssignments;
-                                        } else if (existingEvent.roleAssignments && typeof existingEvent.roleAssignments === 'object') {
-                                            updatedItem.roleAssignments = existingEvent.roleAssignments;
+                                    // CRITICAL: requestBody.roleAssignments always wins - it's what the user is saving
+                                    // Only fall back to existingEvent if requestBody doesn't have it
+                                    if (requestBody.roleAssignments !== undefined) {
+                                        // User provided roleAssignments - use it (already normalized)
+                                        updatedItem.roleAssignments = requestBody.roleAssignments;
+                                    } else if (updatedItem.roleAssignments === null || updatedItem.roleAssignments === undefined) {
+                                        // No roleAssignments from user, try to use normalized existing
+                                        if (normalizedExisting.roleAssignments && typeof normalizedExisting.roleAssignments === 'object') {
+                                            updatedItem.roleAssignments = normalizedExisting.roleAssignments;
+                                        } else {
+                                            // No roleAssignments at all - set to empty object for Open Shifts
+                                            updatedItem.roleAssignments = {};
                                         }
                                     }
                                     
-                                    // Ensure crcIds is an array (legacy shifts might only have crcId)
-                                    // Only normalize if crcIds is missing or invalid - preserve existing valid arrays
-                                    if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
-                                        if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
-                                            updatedItem.crcIds = [updatedItem.crcId];
-                                        } else if (requestBody.crcIds && Array.isArray(requestBody.crcIds)) {
-                                            updatedItem.crcIds = requestBody.crcIds;
-                                        } else if (existingEvent.crcIds && Array.isArray(existingEvent.crcIds)) {
-                                            updatedItem.crcIds = existingEvent.crcIds;
+                                    // CRITICAL: Normalize crcIds - requestBody takes precedence, but derive from roleAssignments if needed
+                                    // If requestBody has roleAssignments, extract crcIds from it
+                                    if (requestBody.roleAssignments && typeof requestBody.roleAssignments === 'object') {
+                                        const crcIdsFromRoles = new Set();
+                                        Object.values(requestBody.roleAssignments).forEach(assignments => {
+                                            if (Array.isArray(assignments)) {
+                                                assignments.forEach(crcId => {
+                                                    if (isValidCrcId(crcId)) {
+                                                        crcIdsFromRoles.add(crcId);
+                                                    }
+                                                });
+                                            }
+                                        });
+                                        if (crcIdsFromRoles.size > 0) {
+                                            updatedItem.crcIds = Array.from(crcIdsFromRoles);
+                                        }
+                                    } else if (requestBody.crcIds !== undefined && Array.isArray(requestBody.crcIds)) {
+                                        // User provided crcIds directly - use it
+                                        updatedItem.crcIds = requestBody.crcIds;
+                                    } else if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
+                                        // Fall back to normalized existing or convert legacy
+                                        if (normalizedExisting.crcIds && Array.isArray(normalizedExisting.crcIds)) {
+                                            updatedItem.crcIds = normalizedExisting.crcIds;
+                                        } else if (normalizedExisting.crcId && typeof normalizedExisting.crcId === 'string' && isValidCrcId(normalizedExisting.crcId)) {
+                                            updatedItem.crcIds = [normalizedExisting.crcId];
                                         } else {
                                             updatedItem.crcIds = [];
                                         }
