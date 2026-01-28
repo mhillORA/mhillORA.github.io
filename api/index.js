@@ -2656,37 +2656,39 @@ async function crudHandler(context, request, containerName) {
                             
                             // Check travelDayPreferences and create travel days for CRCs that have travel checked
                             if (createdItem.travelDayPreferences && typeof createdItem.travelDayPreferences === 'object') {
-                                for (const [crcId, hasTravel] of Object.entries(createdItem.travelDayPreferences)) {
-                                    // Only create travel day if:
-                                    // 1. Travel is checked (hasTravel === true)
-                                    // 2. CRC is assigned to this shift
-                                    // 3. CRC ID is valid
-                                    if (hasTravel === true && shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                        // Check if travel day already exists for this CRC on this date (from ANY source)
-                                        // This prevents duplicates even if travel day was created from a different shift or source
+                                for (const [crcId, prefs] of Object.entries(createdItem.travelDayPreferences)) {
+                                    if (!crcId || crcId.trim() === '' || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') continue;
+                                    if (!shiftCrcIds.has(crcId)) continue;
+                                    if (prefs && typeof prefs === 'object' && prefs.travelNotNeeded) continue;
+                                    
+                                    const includeStart = prefs === true || (prefs && typeof prefs === 'object' && prefs.includeStartTravel === true);
+                                    const includeEnd = prefs === true || (prefs && typeof prefs === 'object' && prefs.includeEndTravel === true);
+                                    const startDate = (prefs && typeof prefs === 'object' && prefs.startTravelDate) ? prefs.startTravelDate : shiftDate;
+                                    const endDate = (prefs && typeof prefs === 'object' && prefs.endTravelDate) ? prefs.endTravelDate : shiftDate;
+                                    const datesToCreate = [];
+                                    if (includeStart && startDate) datesToCreate.push(startDate);
+                                    if (includeEnd && endDate && endDate !== startDate) datesToCreate.push(endDate);
+                                    
+                                    for (const travelDate of datesToCreate) {
                                         const { resources: allTravelDaysOnDate } = await eventsContainer.items.query({
                                             query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
                                             parameters: [
-                                                { name: "@date", value: shiftDate }
+                                                { name: "@date", value: travelDate }
                                             ]
                                         }).fetchAll();
                                         
-                                        // Filter to find travel days for this specific CRC - check ALL travel days on this date
                                         const existingTravelDay = (allTravelDaysOnDate || []).find(td => {
                                             if (!td || td.type !== 'Travel Day') return false;
-                                            // Check single-CRC travel days
                                             if (td.crcId === crcId) return true;
-                                            // Check multi-CRC travel days that include this CRC
                                             if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
                                             return false;
                                         });
                                         
-                                        // Only create if no travel day exists for this CRC on this date
                                         if (!existingTravelDay) {
                                             const travelDayEvent = {
                                                 id: generateId(),
                                                 type: 'Travel Day',
-                                                date: shiftDate,
+                                                date: travelDate,
                                                 crcId: crcId,
                                                 crcIds: [crcId],
                                                 name: 'Travel Day',
@@ -2694,7 +2696,6 @@ async function crudHandler(context, request, containerName) {
                                                 studyIds: Array.isArray(createdItem.studyIds) ? createdItem.studyIds : (createdItem.studyId ? [createdItem.studyId] : [])
                                             };
                                             
-                                            // Remove null/undefined fields to avoid validation issues
                                             Object.keys(travelDayEvent).forEach(key => {
                                                 if (travelDayEvent[key] === null || travelDayEvent[key] === undefined) {
                                                     delete travelDayEvent[key];
@@ -2703,10 +2704,9 @@ async function crudHandler(context, request, containerName) {
                                             
                                             try {
                                                 await eventsContainer.items.create(travelDayEvent);
-                                                context.log.info(`Created travel day ${travelDayEvent.id} for CRC ${crcId} on ${shiftDate} from travelDayPreferences`);
+                                                context.log.info(`Created travel day ${travelDayEvent.id} for CRC ${crcId} on ${travelDate} from travelDayPreferences`);
                                             } catch (createTravelError) {
                                                 context.log.error(`Failed to create travel day for CRC ${crcId}:`, createTravelError);
-                                                // Don't throw - let the shift creation succeed even if travel day creation fails
                                             }
                                         }
                                     }
