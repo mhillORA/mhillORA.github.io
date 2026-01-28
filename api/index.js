@@ -1019,35 +1019,24 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
 };
 
 // Ensure context.log has error/info/warn helpers in all environments
-function ensureContextLogger(context) {
+const ensureContextLogger = (context) => {
     if (!context) return;
-
-    // If context.log doesn't exist, create it as an object
-    if (!context.log) {
-        context.log = {};
+    
+    // Ensure the base log function exists
+    if (typeof context.log !== 'function') {
+        context.log = (...args) => console.log(...args);
     }
 
-    // If context.log is a function (not an object), wrap it
-    if (typeof context.log === 'function') {
-        const originalLog = context.log;
-        context.log = {
-            info: (...args) => originalLog('[INFO]', ...args),
-            warn: (...args) => originalLog('[WARN]', ...args),
-            error: (...args) => originalLog('[ERROR]', ...args)
-        };
-    }
-
-    // Explicitly ensure all levels are functions
-    const levels = ['info', 'warn', 'error'];
-    levels.forEach((level) => {
+    // Explicitly ensure 'info', 'warn', and 'error' are functions
+    ['info', 'warn', 'error'].forEach(level => {
         if (typeof context.log[level] !== 'function') {
             context.log[level] = (...args) => {
-                const fallback = level === 'error' ? console.error : (level === 'warn' ? console.warn : console.log);
-                fallback(`[${level.toUpperCase()}]`, ...args);
+                const method = level === 'error' ? 'error' : 'log';
+                console[method](`[${level.toUpperCase()}]`, ...args);
             };
         }
     });
-}
+};
 
 // Helper function to handle errors
 const handleError = (context, error, message) => {
@@ -3281,6 +3270,11 @@ async function crudHandler(context, request, containerName) {
                                         }
                                     }
                                     
+                                    // Force roleAssignments into object shape for validation safety
+                                    if (!updatedItem.roleAssignments || typeof updatedItem.roleAssignments !== 'object' || Array.isArray(updatedItem.roleAssignments)) {
+                                        updatedItem.roleAssignments = {};
+                                    }
+                                    
                                     // Final normalization pass on merged result
                                     try {
                                         normalizeEventAssignments(updatedItem);
@@ -3536,6 +3530,12 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
+                    // Remove internal-only fields before upsert
+                    const skipTravelDayProcessing = updatedItem.skipTravelDayProcessing === true;
+                    if (updatedItem.skipTravelDayProcessing !== undefined) {
+                        delete updatedItem.skipTravelDayProcessing;
+                    }
+                    
                     // Remove Cosmos DB system fields before upsert to avoid validation issues
                     ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => { 
                         if (k in updatedItem) delete updatedItem[k]; 
@@ -3674,7 +3674,7 @@ async function crudHandler(context, request, containerName) {
                     }
                     
                     // For Site Assignment shifts, handle travel days from travelDayPreferences
-                    if (containerName === 'events' && result && result.type === 'Site Assignment' && result.date) {
+                    if (!skipTravelDayProcessing && containerName === 'events' && result && result.type === 'Site Assignment' && result.date) {
                         try {
                             const eventsContainer = getContainer('events');
                             const shiftDate = toDateOnlyString(result.date);
