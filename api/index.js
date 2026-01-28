@@ -3746,21 +3746,20 @@ async function crudHandler(context, request, containerName) {
                                 });
                             }
                             
-                            // Get existing travel days for this shift date - check ALL travel days, not just from this shift
-                            let existingTravelDays = [];
-                            try {
-                                const queryResult = await eventsContainer.items.query({
-                                    query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
-                                    parameters: [
-                                        { name: "@date", value: shiftDate }
-                                    ]
-                                }).fetchAll();
-                                existingTravelDays = queryResult.resources || [];
-                            } catch (queryError) {
-                                context.log.error(`Error querying existing travel days for date ${shiftDate}:`, queryError);
-                                // Continue with empty array - don't fail the shift update
-                                existingTravelDays = [];
-                            }
+                            const getTravelDaysForDate = async (travelDate) => {
+                                try {
+                                    const queryResult = await eventsContainer.items.query({
+                                        query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
+                                        parameters: [
+                                            { name: "@date", value: travelDate }
+                                        ]
+                                    }).fetchAll();
+                                    return queryResult.resources || [];
+                                } catch (queryError) {
+                                    context.log.error(`Error querying existing travel days for date ${travelDate}:`, queryError);
+                                    return [];
+                                }
+                            };
                             
                             // Process travelDayPreferences
                             if (result.travelDayPreferences && typeof result.travelDayPreferences === 'object') {
@@ -3769,20 +3768,25 @@ async function crudHandler(context, request, containerName) {
                                 for (const [crcId, hasTravel] of Object.entries(result.travelDayPreferences)) {
                                     // If CRC is not in the shift anymore, delete their travel day (even if travelDayPreferences still has them checked)
                                     if (!shiftCrcIds.has(crcId) && crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                        const travelDayToDelete = (existingTravelDays || []).find(td => {
-                                            if (!td || td.type !== 'Travel Day') return false;
-                                            // Only delete single-CRC travel days (not multi-CRC ones, unless all CRCs are removed)
-                                            if (td.crcId === crcId) return true;
-                                            if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length === 1 && td.crcIds[0] === crcId) return true;
-                                            return false;
-                                        });
-                                        
-                                        if (travelDayToDelete && travelDayToDelete.id) {
-                                            try {
-                                                await eventsContainer.item(travelDayToDelete.id, travelDayToDelete.id).delete();
-                                                context.log.info(`Deleted travel day ${travelDayToDelete.id} for CRC ${crcId} because they were removed from the shift`);
-                                            } catch (deleteTravelError) {
-                                                context.log.warn(`Failed to delete travel day ${travelDayToDelete.id}: ${deleteTravelError.message}`);
+                                        const prefs = hasTravel && typeof hasTravel === 'object' ? hasTravel : {};
+                                        const startDate = prefs.startTravelDate || shiftDate;
+                                        const endDate = prefs.endTravelDate || shiftDate;
+                                        const datesToCheck = Array.from(new Set([startDate, endDate].filter(Boolean)));
+                                        for (const travelDate of datesToCheck) {
+                                            const travelDaysOnDate = await getTravelDaysForDate(travelDate);
+                                            const travelDayToDelete = (travelDaysOnDate || []).find(td => {
+                                                if (!td || td.type !== 'Travel Day') return false;
+                                                if (td.crcId === crcId) return true;
+                                                if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length === 1 && td.crcIds[0] === crcId) return true;
+                                                return false;
+                                            });
+                                            if (travelDayToDelete && travelDayToDelete.id) {
+                                                try {
+                                                    await eventsContainer.item(travelDayToDelete.id, travelDayToDelete.id).delete();
+                                                    context.log.info(`Deleted travel day ${travelDayToDelete.id} for CRC ${crcId} because they were removed from the shift`);
+                                                } catch (deleteTravelError) {
+                                                    context.log.warn(`Failed to delete travel day ${travelDayToDelete.id}: ${deleteTravelError.message}`);
+                                                }
                                             }
                                         }
                                     }
@@ -3809,67 +3813,75 @@ async function crudHandler(context, request, containerName) {
                                         );
                                         
                                         if (shouldHaveTravel && shiftCrcIds.has(crcId)) {
-                                            // Check if travel day already exists for this CRC on this date (from ANY source)
-                                            // This prevents duplicates even if travel day was created from a different shift or source
-                                            const existingTravelDay = (existingTravelDays || []).find(td => {
-                                                if (!td || td.type !== 'Travel Day') return false;
-                                                // Check single-CRC travel days
-                                                if (td.crcId === crcId) return true;
-                                                // Check multi-CRC travel days that include this CRC
-                                                if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
-                                                return false;
-                                            });
+                                            const includeStart = travelPrefs === true || (typeof travelPrefs === 'object' && travelPrefs.includeStartTravel === true);
+                                            const includeEnd = travelPrefs === true || (typeof travelPrefs === 'object' && travelPrefs.includeEndTravel === true);
+                                            const startDate = (typeof travelPrefs === 'object' && travelPrefs.startTravelDate) ? travelPrefs.startTravelDate : shiftDate;
+                                            const endDate = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : shiftDate;
+                                            const datesToCreate = [];
+                                            if (includeStart && startDate) datesToCreate.push(startDate);
+                                            if (includeEnd && endDate && endDate !== startDate) datesToCreate.push(endDate);
                                             
-                                            // Only create if no travel day exists for this CRC on this date
-                                            if (!existingTravelDay) {
-                                                const travelDayEvent = {
-                                                    id: generateId(),
-                                                    type: 'Travel Day',
-                                                    date: shiftDate,
-                                                    crcId: crcId,
-                                                    crcIds: [crcId],
-                                                    name: 'Travel Day',
-                                                    siteId: result.siteId || null,
-                                                    studyIds: Array.isArray(result.studyIds) ? result.studyIds : (result.studyId ? [result.studyId] : [])
-                                                };
-                                                
-                                                // Remove null/undefined fields to avoid validation issues
-                                                Object.keys(travelDayEvent).forEach(key => {
-                                                    if (travelDayEvent[key] === null || travelDayEvent[key] === undefined) {
-                                                        delete travelDayEvent[key];
-                                                    }
+                                            for (const travelDate of datesToCreate) {
+                                                const travelDaysOnDate = await getTravelDaysForDate(travelDate);
+                                                const existingTravelDay = (travelDaysOnDate || []).find(td => {
+                                                    if (!td || td.type !== 'Travel Day') return false;
+                                                    if (td.crcId === crcId) return true;
+                                                    if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
+                                                    return false;
                                                 });
                                                 
-                                                try {
-                                                    await eventsContainer.items.create(travelDayEvent);
-                                                    context.log.info(`Created travel day ${travelDayEvent.id} for CRC ${crcId} on ${shiftDate} from travelDayPreferences`);
-                                                } catch (createTravelError) {
-                                                    context.log.error(`Failed to create travel day for CRC ${crcId}:`, createTravelError);
-                                                    // Don't throw - let the shift update succeed even if travel day creation fails
+                                                if (!existingTravelDay) {
+                                                    const travelDayEvent = {
+                                                        id: generateId(),
+                                                        type: 'Travel Day',
+                                                        date: travelDate,
+                                                        crcId: crcId,
+                                                        crcIds: [crcId],
+                                                        name: 'Travel Day',
+                                                        siteId: result.siteId || null,
+                                                        studyIds: Array.isArray(result.studyIds) ? result.studyIds : (result.studyId ? [result.studyId] : [])
+                                                    };
+                                                    
+                                                    Object.keys(travelDayEvent).forEach(key => {
+                                                        if (travelDayEvent[key] === null || travelDayEvent[key] === undefined) {
+                                                            delete travelDayEvent[key];
+                                                        }
+                                                    });
+                                                    
+                                                    try {
+                                                        await eventsContainer.items.create(travelDayEvent);
+                                                        context.log.info(`Created travel day ${travelDayEvent.id} for CRC ${crcId} on ${travelDate} from travelDayPreferences`);
+                                                    } catch (createTravelError) {
+                                                        context.log.error(`Failed to create travel day for CRC ${crcId}:`, createTravelError);
+                                                    }
+                                                } else {
+                                                    context.log.info(`Skipped creating travel day for CRC ${crcId} on ${travelDate} - travel day already exists (ID: ${existingTravelDay.id})`);
                                                 }
-                                            } else {
-                                                context.log.info(`Skipped creating travel day for CRC ${crcId} on ${shiftDate} - travel day already exists (ID: ${existingTravelDay.id})`);
                                             }
                                         } else if (travelPrefs === false || travelPrefs === undefined || 
                                                    (typeof travelPrefs === 'object' && travelPrefs !== null && 
                                                     travelPrefs.travelNotNeeded === true &&
                                                     !travelPrefs.includeStartTravel && !travelPrefs.includeEndTravel)) {
                                             // If travel is unchecked or removed, delete travel day for this CRC
-                                            const travelDayToDelete = (existingTravelDays || []).find(td => {
-                                                if (!td || td.type !== 'Travel Day') return false;
-                                                // Only delete single-CRC travel days (not multi-CRC ones)
-                                                if (td.crcId === crcId) return true;
-                                                if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length === 1 && td.crcIds[0] === crcId) return true;
-                                                return false;
-                                            });
-                                            
-                                            if (travelDayToDelete && travelDayToDelete.id) {
-                                                try {
-                                                    await eventsContainer.item(travelDayToDelete.id, travelDayToDelete.id).delete();
-                                                    context.log.info(`Deleted travel day ${travelDayToDelete.id} for CRC ${crcId} because travel was unchecked`);
-                                                } catch (deleteTravelError) {
-                                                    context.log.error(`Failed to delete travel day ${travelDayToDelete.id}:`, deleteTravelError);
-                                                    // Don't throw - continue processing other CRCs
+                                            const startDate = (typeof travelPrefs === 'object' && travelPrefs.startTravelDate) ? travelPrefs.startTravelDate : shiftDate;
+                                            const endDate = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : shiftDate;
+                                            const datesToCheck = Array.from(new Set([startDate, endDate].filter(Boolean)));
+                                            for (const travelDate of datesToCheck) {
+                                                const travelDaysOnDate = await getTravelDaysForDate(travelDate);
+                                                const travelDayToDelete = (travelDaysOnDate || []).find(td => {
+                                                    if (!td || td.type !== 'Travel Day') return false;
+                                                    if (td.crcId === crcId) return true;
+                                                    if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length === 1 && td.crcIds[0] === crcId) return true;
+                                                    return false;
+                                                });
+                                                
+                                                if (travelDayToDelete && travelDayToDelete.id) {
+                                                    try {
+                                                        await eventsContainer.item(travelDayToDelete.id, travelDayToDelete.id).delete();
+                                                        context.log.info(`Deleted travel day ${travelDayToDelete.id} for CRC ${crcId} because travel was unchecked`);
+                                                    } catch (deleteTravelError) {
+                                                        context.log.error(`Failed to delete travel day ${travelDayToDelete.id}:`, deleteTravelError);
+                                                    }
                                                 }
                                             }
                                         }
