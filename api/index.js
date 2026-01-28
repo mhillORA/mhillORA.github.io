@@ -3259,11 +3259,38 @@ async function crudHandler(context, request, containerName) {
                                     // Now merge normalized existing with requestBody (requestBody is already normalized)
                                     updatedItem = { ...normalizedExisting, ...requestBody, id: updateId };
                                     
+                                    // Legacy field migration and normalization BEFORE final validation
+                                    // Force legacy studyId -> studyIds and remove the old field
+                                    if (!updatedItem.studyIds || !Array.isArray(updatedItem.studyIds)) {
+                                        if (updatedItem.studyId && typeof updatedItem.studyId === 'string' && updatedItem.studyId.trim() !== '') {
+                                            updatedItem.studyIds = [updatedItem.studyId];
+                                        } else {
+                                            updatedItem.studyIds = [];
+                                        }
+                                    }
+                                    if (updatedItem.studyId !== undefined) {
+                                        delete updatedItem.studyId;
+                                    }
+                                    
+                                    // Force legacy crcId -> crcIds if needed
+                                    if (!updatedItem.crcIds || !Array.isArray(updatedItem.crcIds)) {
+                                        if (updatedItem.crcId && typeof updatedItem.crcId === 'string' && updatedItem.crcId.trim() !== '' && updatedItem.crcId !== 'SITE_STAFF' && updatedItem.crcId !== 'UNASSIGNED') {
+                                            updatedItem.crcIds = [updatedItem.crcId];
+                                        } else {
+                                            updatedItem.crcIds = [];
+                                        }
+                                    }
+                                    
                                     // Final normalization pass on merged result
                                     try {
                                         normalizeEventAssignments(updatedItem);
                                     } catch (e) {
                                         context.log.warn(`Failed to normalize updatedItem in merge, continuing:`, e.message);
+                                    }
+                                    
+                                    // Ensure roleAssignments is initialized for Site Assignment edits
+                                    if (updatedItem.type === 'Site Assignment' && !updatedItem.roleAssignments) {
+                                        updatedItem.roleAssignments = {};
                                     }
                                     
                                     if (preservedType) {

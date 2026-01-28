@@ -21512,8 +21512,20 @@
 
                     let selectedRoles = new Set();
                     let selectedTrainingRole = '';
-                    if (event && event.crcId === crcId) {
-                        selectedRoles = new Set(event.roles || []);
+                    if (event) {
+                        // Prefer new roleAssignments structure if present
+                        if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                            Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                if (!Array.isArray(assignments)) return;
+                                if (assignments.includes(crcId)) {
+                                    const role = state.roles.find(r => r.id === roleId);
+                                    if (role?.name) selectedRoles.add(role.name);
+                                }
+                            });
+                        } else if (event.crcId === crcId) {
+                            // Legacy roles list (single CRC)
+                            selectedRoles = new Set(event.roles || []);
+                        }
                         // Get existing training role assignment if any
                         selectedTrainingRole = getExistingTrainingForCrc(crcId);
                     }
@@ -32007,6 +32019,29 @@
                                     // to allow the shift to be created (it will be an Open Shift)
                                 }
                                 
+                                // Legacy safety: if editing and no roleAssignments made it through, migrate from legacy roles/crcId
+                                if (!isTravelDay && isEditing && Object.keys(finalRoleAssignments).length === 0 && existingEvent) {
+                                    const legacyCrcId = existingEvent.crcId && typeof existingEvent.crcId === 'string'
+                                        ? existingEvent.crcId
+                                        : (Array.isArray(existingEvent.crcIds) ? existingEvent.crcIds.find(id => id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') : null);
+                                    if (legacyCrcId && Array.isArray(existingEvent.roles) && existingEvent.roles.length > 0) {
+                                        const migratedRoleAssignments = {};
+                                        existingEvent.roles.forEach(roleName => {
+                                            if (!roleName) return;
+                                            const role = state.roles.find(r => (r.name || '').toLowerCase() === roleName.toLowerCase());
+                                            if (role?.id) {
+                                                migratedRoleAssignments[role.id] = [legacyCrcId];
+                                            }
+                                        });
+                                        if (Object.keys(migratedRoleAssignments).length > 0) {
+                                            finalRoleAssignments = migratedRoleAssignments;
+                                        }
+                                    }
+                                    if (legacyCrcId && (!crcIds || crcIds.length === 0)) {
+                                        crcIds = [legacyCrcId];
+                                    }
+                                }
+                                
                                 // For Travel Day events, preserve the crcId from the form or existing event
                                 let travelDayCrcId = null;
                                 if (isTravelDay) {
@@ -35846,9 +35881,34 @@
                     // Reduced logging for performance
                 }
                 
-                // Use ONLY the existing event's roleAssignments - do NOT convert legacy data
-                // Legacy events should be saved with roleAssignments structure when edited
+                // Build roleAssignments, converting legacy roles/crcId when needed
+                const buildLegacyRoleAssignments = (event) => {
+                    if (!event) return {};
+                    const legacyCrcId = (() => {
+                        if (event.crcId && typeof event.crcId === 'string') return event.crcId;
+                        if (Array.isArray(event.crcIds)) {
+                            return event.crcIds.find(id => id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') || null;
+                        }
+                        return null;
+                    })();
+                    if (!legacyCrcId || !Array.isArray(event.roles) || event.roles.length === 0) {
+                        return {};
+                    }
+                    const roleAssignments = {};
+                    event.roles.forEach(roleName => {
+                        if (!roleName) return;
+                        const role = state.roles.find(r => (r.name || '').toLowerCase() === roleName.toLowerCase());
+                        if (role?.id) {
+                            roleAssignments[role.id] = [legacyCrcId];
+                        }
+                    });
+                    return roleAssignments;
+                };
+                
                 let mergedRoleAssignments = existingEvent?.roleAssignments ? JSON.parse(JSON.stringify(existingEvent.roleAssignments)) : {};
+                if (Object.keys(mergedRoleAssignments).length === 0 && existingEvent) {
+                    mergedRoleAssignments = buildLegacyRoleAssignments(existingEvent);
+                }
                 let mergedTrainingAssignments = existingEvent?.trainingAssignments ? JSON.parse(JSON.stringify(existingEvent.trainingAssignments)) : {};
                 let mergedTrainingModes = existingEvent?.trainingModes ? JSON.parse(JSON.stringify(existingEvent.trainingModes)) : {};
                 
