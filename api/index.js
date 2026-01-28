@@ -2354,7 +2354,7 @@ async function crudHandler(context, request, containerName) {
             
             case 'POST':
                 const body = await request.json();
-                let extraTravelDayCrcs = [];
+                let extraTravelEvents = [];
                 
                 // For events, validate that we're not creating N/A entries and prevent overriding training
                 if (containerName === 'events') {
@@ -2455,15 +2455,56 @@ async function crudHandler(context, request, containerName) {
                             }
                         }
 
-                        // If a Travel Day includes multiple CRCs, split into individual events
-                        if (body.crcIds && Array.isArray(body.crcIds) && body.crcIds.length > 1) {
-                            const validCrcIds = body.crcIds.filter(id => id && typeof id === 'string' && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
-                            if (validCrcIds.length > 1) {
-                                const firstCrcId = validCrcIds[0];
-                                extraTravelDayCrcs = validCrcIds.slice(1);
-                                body.crcIds = [firstCrcId];
-                                body.crcId = firstCrcId;
-                                context.log.info(`Splitting group Travel Day into ${validCrcIds.length} individual events. Main event for ${firstCrcId}.`);
+                        // FIX: "DOUBLE EXPLOSION" - Split Multiple CRCs AND Date Ranges into individual daily events
+                        const validCrcIds = (body.crcIds || []).filter(id => id && typeof id === 'string' && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                        
+                        // 1. Calculate all dates in the range
+                        const dates = [];
+                        if (body.startDate && body.endDate && body.startDate !== body.endDate) {
+                            let curr = new Date(body.startDate);
+                            const last = new Date(body.endDate);
+                            // Safety: Cap at 60 days to prevent infinite loops on bad data
+                            let safety = 0; 
+                            while (curr <= last && safety < 60) {
+                                dates.push(curr.toISOString().split('T')[0]);
+                                curr.setDate(curr.getDate() + 1);
+                                safety++;
+                            }
+                        } else {
+                            // Single day (use date or startDate)
+                            dates.push(body.date || body.startDate);
+                        }
+
+                        // 2. If we have >1 person OR >1 day, we need to split
+                        if ((validCrcIds.length > 0 && dates.length > 0) && (validCrcIds.length > 1 || dates.length > 1)) {
+                            
+                            // Generate ALL combinations [Person + Day]
+                            const allCombinations = [];
+                            for (const dateStr of dates) {
+                                for (const crcId of validCrcIds) {
+                                    allCombinations.push({ date: dateStr, crcId });
+                                }
+                            }
+
+                            if (allCombinations.length > 0) {
+                                // 3. Take the FIRST combination for the Main Event (so the initial API call succeeds)
+                                const mainParams = allCombinations[0];
+                                
+                                // Update the main 'body' to match this single day/person
+                                body.date = mainParams.date;
+                                body.crcId = mainParams.crcId;
+                                body.crcIds = [mainParams.crcId];
+                                body.startDate = mainParams.date; // Flatten range to single day
+                                body.endDate = mainParams.date;   // Flatten range to single day
+                                
+                                // 4. Save the REST for the "extras" loop
+                                const remaining = allCombinations.slice(1);
+                                extraTravelEvents = remaining.map(params => ({
+                                    date: params.date,
+                                    crcId: params.crcId
+                                }));
+                                
+                                context.log.info(`Exploding Travel Day into ${allCombinations.length} events (${dates.length} days x ${validCrcIds.length} people).`);
                             }
                         }
                     }
@@ -2595,21 +2636,26 @@ async function crudHandler(context, request, containerName) {
                 try {
                     const { resource: createdItem } = await container.items.create(newItem);
 
-                    // Create additional Travel Day events for split CRCs
-                    if (containerName === 'events' && createdItem && createdItem.type === 'Travel Day' && extraTravelDayCrcs.length > 0) {
-                        for (const extraCrcId of extraTravelDayCrcs) {
+                    // FIX: Create the extra individual events (Dates x People)
+                    if (containerName === 'events' && createdItem && createdItem.type === 'Travel Day' && extraTravelEvents.length > 0) {
+                        for (const params of extraTravelEvents) {
                             const extraEvent = {
-                                ...createdItem,
+                                ...createdItem, // Copy base props from main event
                                 id: generateId(),
-                                crcId: extraCrcId,
-                                crcIds: [extraCrcId]
+                                date: params.date,
+                                startDate: params.date, // Ensure it's a single day
+                                endDate: params.date,   // Ensure it's a single day
+                                crcId: params.crcId,
+                                crcIds: [params.crcId]
                             };
+                            // Clean up system fields
                             ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => delete extraEvent[k]);
+
                             try {
                                 await container.items.create(extraEvent);
-                                context.log.info(`Created split Travel Day ${extraEvent.id} for CRC ${extraCrcId}`);
+                                context.log.info(`Created extra Travel Day: ${params.date} for ${params.crcId}`);
                             } catch (extraError) {
-                                context.log.error(`Failed to create split Travel Day for ${extraCrcId}:`, extraError.message || extraError);
+                                context.log.error(`Failed to create extra Travel Day:`, extraError);
                             }
                         }
                     }
@@ -2629,6 +2675,20 @@ async function crudHandler(context, request, containerName) {
                         try {
                             const eventsContainer = getContainer('events');
                             const shiftDate = toDateOnlyString(createdItem.date);
+                            const baseStartDate = createdItem.startDate || createdItem.date;
+                            const baseEndDate = createdItem.endDate || createdItem.date;
+                            const computeDefaultTravelDates = () => {
+                                const startObj = new Date(`${baseStartDate}T00:00:00`);
+                                const endObj = new Date(`${baseEndDate}T00:00:00`);
+                                if (Number.isNaN(startObj.getTime()) || Number.isNaN(endObj.getTime())) {
+                                    return { start: shiftDate, end: shiftDate };
+                                }
+                                const startTravel = new Date(startObj);
+                                startTravel.setDate(startTravel.getDate() - 1);
+                                const endTravel = new Date(endObj);
+                                endTravel.setDate(endTravel.getDate() + 1);
+                                return { start: toDateOnlyString(startTravel), end: toDateOnlyString(endTravel) };
+                            };
                             
                             // Collect all CRCs assigned to this shift
                             const shiftCrcIds = new Set();
@@ -2663,8 +2723,9 @@ async function crudHandler(context, request, containerName) {
                                     
                                     const includeStart = prefs === true || (prefs && typeof prefs === 'object' && prefs.includeStartTravel === true);
                                     const includeEnd = prefs === true || (prefs && typeof prefs === 'object' && prefs.includeEndTravel === true);
-                                    const startDate = (prefs && typeof prefs === 'object' && prefs.startTravelDate) ? prefs.startTravelDate : shiftDate;
-                                    const endDate = (prefs && typeof prefs === 'object' && prefs.endTravelDate) ? prefs.endTravelDate : shiftDate;
+                                    const defaults = computeDefaultTravelDates();
+                                    const startDate = (prefs && typeof prefs === 'object' && prefs.startTravelDate) ? prefs.startTravelDate : defaults.start;
+                                    const endDate = (prefs && typeof prefs === 'object' && prefs.endTravelDate) ? prefs.endTravelDate : defaults.end;
                                     const datesToCreate = [];
                                     if (includeStart && startDate) datesToCreate.push(startDate);
                                     if (includeEnd && endDate && endDate !== startDate) datesToCreate.push(endDate);
@@ -3716,6 +3777,20 @@ async function crudHandler(context, request, containerName) {
                         try {
                             const eventsContainer = getContainer('events');
                             const shiftDate = toDateOnlyString(result.date);
+                            const baseStartDate = result.startDate || result.date;
+                            const baseEndDate = result.endDate || result.date;
+                            const computeDefaultTravelDates = () => {
+                                const startObj = new Date(`${baseStartDate}T00:00:00`);
+                                const endObj = new Date(`${baseEndDate}T00:00:00`);
+                                if (Number.isNaN(startObj.getTime()) || Number.isNaN(endObj.getTime())) {
+                                    return { start: shiftDate, end: shiftDate };
+                                }
+                                const startTravel = new Date(startObj);
+                                startTravel.setDate(startTravel.getDate() - 1);
+                                const endTravel = new Date(endObj);
+                                endTravel.setDate(endTravel.getDate() + 1);
+                                return { start: toDateOnlyString(startTravel), end: toDateOnlyString(endTravel) };
+                            };
                             
                             // Skip if date is invalid
                             if (!shiftDate) {
@@ -3815,8 +3890,9 @@ async function crudHandler(context, request, containerName) {
                                         if (shouldHaveTravel && shiftCrcIds.has(crcId)) {
                                             const includeStart = travelPrefs === true || (typeof travelPrefs === 'object' && travelPrefs.includeStartTravel === true);
                                             const includeEnd = travelPrefs === true || (typeof travelPrefs === 'object' && travelPrefs.includeEndTravel === true);
-                                            const startDate = (typeof travelPrefs === 'object' && travelPrefs.startTravelDate) ? travelPrefs.startTravelDate : shiftDate;
-                                            const endDate = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : shiftDate;
+                                            const defaults = computeDefaultTravelDates();
+                                            const startDate = (typeof travelPrefs === 'object' && travelPrefs.startTravelDate) ? travelPrefs.startTravelDate : defaults.start;
+                                            const endDate = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : defaults.end;
                                             const datesToCreate = [];
                                             if (includeStart && startDate) datesToCreate.push(startDate);
                                             if (includeEnd && endDate && endDate !== startDate) datesToCreate.push(endDate);
@@ -3863,8 +3939,9 @@ async function crudHandler(context, request, containerName) {
                                                     travelPrefs.travelNotNeeded === true &&
                                                     !travelPrefs.includeStartTravel && !travelPrefs.includeEndTravel)) {
                                             // If travel is unchecked or removed, delete travel day for this CRC
-                                            const startDate = (typeof travelPrefs === 'object' && travelPrefs.startTravelDate) ? travelPrefs.startTravelDate : shiftDate;
-                                            const endDate = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : shiftDate;
+                                            const defaults = computeDefaultTravelDates();
+                                            const startDate = (typeof travelPrefs === 'object' && travelPrefs.startTravelDate) ? travelPrefs.startTravelDate : defaults.start;
+                                            const endDate = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : defaults.end;
                                             const datesToCheck = Array.from(new Set([startDate, endDate].filter(Boolean)));
                                             for (const travelDate of datesToCheck) {
                                                 const travelDaysOnDate = await getTravelDaysForDate(travelDate);
