@@ -2358,11 +2358,8 @@ async function crudHandler(context, request, containerName) {
                 
                 // For events, validate that we're not creating N/A entries and prevent overriding training
                 if (containerName === 'events') {
-                    // CRITICAL: Normalize Travel Day events FIRST (before any other processing)
-                    // Check for isTravelDay flag - this is the most reliable indicator from frontend
-                    if (body.isTravelDay === true || body.isTravelDay === 'true' || body.travelDay === true) {
-                        body.type = 'Travel Day';
-                    }
+                    // Variable to hold extra events if we need to split Group/Range Travel Days
+                    extraTravelEvents = [];
                     
                     // Prevent creating overridden training events
                     // Check if this is a training event and prevent isOverridden from being set
@@ -2409,8 +2406,8 @@ async function crudHandler(context, request, containerName) {
                             delete body.isOverridden;
                         }
                     }
-                    // Normalize Travel Day events: ensure type is set correctly
-                    // Check for isTravelDay flag FIRST (before checking type) - this is the most reliable indicator
+                    // 1. FIRST: Normalize type based on isTravelDay flag
+                    // Check for isTravelDay flag - this is the most reliable indicator
                     const isTravelDayFlag = body.isTravelDay === true || body.isTravelDay === 'true' || body.travelDay === true;
                     const isTravelDayType = body.type === 'Travel Day' || body.type === 'travel day' || body.type === 'travel';
                     
@@ -2454,11 +2451,14 @@ async function crudHandler(context, request, containerName) {
                                 body.crcIds = [];
                             }
                         }
+                    }
 
-                        // FIX: "DOUBLE EXPLOSION" - Split Multiple CRCs AND Date Ranges into individual daily events
+                    // 2. SECOND: Now that type is normalized, run the "Double Explosion" logic
+                    // This handles splitting Multiple CRCs AND Date Ranges into individual daily events
+                    if (body.type === 'Travel Day') {
                         const validCrcIds = (body.crcIds || []).filter(id => id && typeof id === 'string' && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
                         
-                        // 1. Calculate all dates in the range
+                        // Calculate all dates in the range
                         const dates = [];
                         if (body.startDate && body.endDate && body.startDate !== body.endDate) {
                             let curr = new Date(body.startDate);
@@ -2471,11 +2471,10 @@ async function crudHandler(context, request, containerName) {
                                 safety++;
                             }
                         } else {
-                            // Single day (use date or startDate)
                             dates.push(body.date || body.startDate);
                         }
 
-                        // 2. If we have >1 person OR >1 day, we need to split
+                        // If we have >1 person OR >1 day, we need to split
                         if ((validCrcIds.length > 0 && dates.length > 0) && (validCrcIds.length > 1 || dates.length > 1)) {
                             
                             // Generate ALL combinations [Person + Day]
@@ -2487,17 +2486,17 @@ async function crudHandler(context, request, containerName) {
                             }
 
                             if (allCombinations.length > 0) {
-                                // 3. Take the FIRST combination for the Main Event (so the initial API call succeeds)
+                                // Take the FIRST combination for the Main Event
                                 const mainParams = allCombinations[0];
                                 
                                 // Update the main 'body' to match this single day/person
                                 body.date = mainParams.date;
                                 body.crcId = mainParams.crcId;
                                 body.crcIds = [mainParams.crcId];
-                                body.startDate = mainParams.date; // Flatten range to single day
-                                body.endDate = mainParams.date;   // Flatten range to single day
+                                body.startDate = mainParams.date; 
+                                body.endDate = mainParams.date;   
                                 
-                                // 4. Save the REST for the "extras" loop
+                                // Save the REST for the "extras" loop
                                 const remaining = allCombinations.slice(1);
                                 extraTravelEvents = remaining.map(params => ({
                                     date: params.date,

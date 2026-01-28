@@ -32788,13 +32788,20 @@
                                             Object.values(finalRoleAssignments).forEach(assignments => {
                                                 if (Array.isArray(assignments)) {
                                                     assignments.forEach(crcId => {
-                                                        if (crcId && crcId !== 'SITE_STAFF') {
+                                                        if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                                             assignedCrcsForTravelPrefs.add(crcId);
                                                         }
                                                     });
                                                 }
                                             });
                                         }
+                                        // Also collect from current role selects to catch unsaved changes
+                                        const roleSelectsForPrefs = form.querySelectorAll('select[name^="role-"]');
+                                        roleSelectsForPrefs.forEach(select => {
+                                            if (select.value && select.value !== 'SITE_STAFF' && select.value !== 'UNASSIGNED') {
+                                                assignedCrcsForTravelPrefs.add(select.value);
+                                            }
+                                        });
                                         
                                         // Get travel day preferences from checkboxes
                                         // Check both in form and in travel-selection-container (in case checkboxes are nested)
@@ -32894,7 +32901,38 @@
                                         // CRITICAL: This UPDATE preserves the existing shift - it does NOT delete it
                                         // The shift will remain on the schedule with all its data intact
                                         console.log('UPDATING existing shift (preserving it):', eventId, updatePayload.type);
-                                        const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
+                                        let updatedEvent = null;
+                                        if (isGroupEvent && existingGroupId) {
+                                            const groupEventsToUpdate = state.crc_events.filter(e => 
+                                                e.groupId === existingGroupId && e.type !== 'Travel Day'
+                                            );
+                                            for (const groupEvent of groupEventsToUpdate) {
+                                                const payloadForDay = {
+                                                    ...updatePayload,
+                                                    id: groupEvent.id,
+                                                    date: groupEvent.date,
+                                                    startDate: groupEvent.date,
+                                                    endDate: updatePayload.endDate || groupEvent.endDate || groupEvent.date,
+                                                    groupId: existingGroupId
+                                                };
+                                                try {
+                                                    const updated = await apiService.updateEvent(groupEvent.id, payloadForDay);
+                                                    if (updated && updated.id) {
+                                                        const idx = state.crc_events.findIndex(e => e.id === groupEvent.id);
+                                                        if (idx !== -1) {
+                                                            state.crc_events[idx] = updated;
+                                                        }
+                                                        if (!updatedEvent) {
+                                                            updatedEvent = updated;
+                                                        }
+                                                    }
+                                                } catch (groupUpdateError) {
+                                                    console.error(`Error updating group event ${groupEvent.id}:`, groupUpdateError);
+                                                }
+                                            }
+                                        } else {
+                                            updatedEvent = await apiService.updateEvent(eventId, updatePayload);
+                                        }
                                         if (updatedEvent && updatePayload.travelDayPreferences && !updatedEvent.travelDayPreferences) {
                                             updatedEvent.travelDayPreferences = updatePayload.travelDayPreferences;
                                         }
@@ -32902,26 +32940,36 @@
                                         // CRITICAL: Update the shift in state - this PRESERVES the shift on the schedule
                                         // The shift is NOT deleted - it's updated with new data (including travel preferences)
                                         if (updatedEvent && updatedEvent.id) {
-                                            const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
-                                            if (eventIndex >= 0) {
-                                                // CRITICAL: Replace the event in place - this preserves it, doesn't delete it
-                                                console.log('PRESERVING shift in state at index:', eventIndex, 'Event ID:', updatedEvent.id);
-                                                state.crc_events[eventIndex] = updatedEvent;
+                                            if (isGroupEvent && existingGroupId) {
+                                                // Group update: state was already updated in the loop above
+                                                setState({ crc_events: [...state.crc_events] }, { skipRender: false });
+                                                const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
+                                                renderContent();
+                                                requestAnimationFrame(() => {
+                                                    window.scrollTo(0, scrollPosition);
+                                                });
                                             } else {
-                                                // If not found, add it (shouldn't happen, but safe fallback)
-                                                console.warn('Shift not found in state, adding it:', updatedEvent.id);
-                                                state.crc_events.push(updatedEvent);
+                                                const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
+                                                if (eventIndex >= 0) {
+                                                    // CRITICAL: Replace the event in place - this preserves it, doesn't delete it
+                                                    console.log('PRESERVING shift in state at index:', eventIndex, 'Event ID:', updatedEvent.id);
+                                                    state.crc_events[eventIndex] = updatedEvent;
+                                                } else {
+                                                    // If not found, add it (shouldn't happen, but safe fallback)
+                                                    console.warn('Shift not found in state, adding it:', updatedEvent.id);
+                                                    state.crc_events.push(updatedEvent);
+                                                }
+                                                // Force a refresh of the UI to show the updated data
+                                                setState({ crc_events: [...state.crc_events] }, { skipRender: false });
+                                                // Preserve scroll position before refreshing
+                                                const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
+                                                // Refresh the view to show updated data immediately
+                                                renderContent();
+                                                // Restore scroll position after render
+                                                requestAnimationFrame(() => {
+                                                    window.scrollTo(0, scrollPosition);
+                                                });
                                             }
-                                            // Force a refresh of the UI to show the updated data
-                                            setState({ crc_events: [...state.crc_events] }, { skipRender: false });
-                                            // Preserve scroll position before refreshing
-                                            const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
-                                            // Refresh the view to show updated data immediately
-                                            renderContent();
-                                            // Restore scroll position after render
-                                            requestAnimationFrame(() => {
-                                                window.scrollTo(0, scrollPosition);
-                                            });
                                         } else {
                                             console.error('CRITICAL ERROR: Shift update failed - updatedEvent is missing or has no ID!', updatedEvent);
                                             console.error('Update payload that was sent:', updatePayload);
