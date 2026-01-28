@@ -2411,58 +2411,82 @@ async function crudHandler(context, request, containerName) {
                     const isTravelDayFlag = body.isTravelDay === true || body.isTravelDay === 'true' || body.travelDay === true;
                     const isTravelDayType = body.type === 'Travel Day' || body.type === 'travel day' || body.type === 'travel';
                     
+                    context.log.info(`[TRAVEL DEBUG] Initial body check: type=${body.type}, isTravelDay=${body.isTravelDay}, travelDay=${body.travelDay}, crcId=${body.crcId}, crcIds=${JSON.stringify(body.crcIds)}, roleAssignments=${JSON.stringify(body.roleAssignments)}`);
+                    
                     if (isTravelDayFlag || isTravelDayType || 
                         (body.type === 'Site Assignment' && body.isTravelDay === true)) {
                         body.type = 'Travel Day';
+                        context.log.info(`[TRAVEL DEBUG] Normalized type to Travel Day`);
                         
-                        // Travel Days should use crcId/crcIds, not roleAssignments
-                        // If roleAssignments are provided, extract CRC IDs from them
-                        if (body.roleAssignments && typeof body.roleAssignments === 'object') {
-                            const crcIdsFromRoles = [];
-                            Object.values(body.roleAssignments).forEach(assignments => {
-                                if (Array.isArray(assignments)) {
-                                    assignments.forEach(crcId => {
-                                        if (crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED' && crcId !== 'SITE_STAFF') {
-                                            if (!crcIdsFromRoles.includes(crcId)) {
-                                                crcIdsFromRoles.push(crcId);
-                                            }
-                                        }
-                                    });
+                        // Collect CRCs from multiple sources: crcIds, crcId, and roleAssignments
+                        const allCrcIds = new Set();
+                        
+                        // Source 1: Existing crcIds array from frontend
+                        if (body.crcIds && Array.isArray(body.crcIds)) {
+                            body.crcIds.forEach(id => {
+                                if (id && typeof id === 'string' && id.trim() !== '' && id !== 'UNASSIGNED' && id !== 'SITE_STAFF') {
+                                    allCrcIds.add(id.trim());
                                 }
                             });
-                            
-                            // If we found CRCs in roleAssignments, use them for crcIds
-                            if (crcIdsFromRoles.length > 0) {
-                                body.crcIds = crcIdsFromRoles;
-                                if (!body.crcId || body.crcId.trim() === '') {
-                                    body.crcId = crcIdsFromRoles[0];
+                            context.log.info(`[TRAVEL DEBUG] Found ${allCrcIds.size} CRCs from crcIds array`);
+                        }
+                        
+                        // Source 2: Single crcId 
+                        if (body.crcId && typeof body.crcId === 'string' && body.crcId.trim() !== '' && body.crcId !== 'UNASSIGNED' && body.crcId !== 'SITE_STAFF') {
+                            allCrcIds.add(body.crcId.trim());
+                            context.log.info(`[TRAVEL DEBUG] Added crcId: ${body.crcId}`);
+                        }
+                        
+                        // Source 3: Extract from roleAssignments (recursive to handle any structure)
+                        if (body.roleAssignments) {
+                            const extractIds = (val) => {
+                                if (!val) return;
+                                if (Array.isArray(val)) {
+                                    val.forEach(item => extractIds(item));
+                                } else if (typeof val === 'object') {
+                                    Object.values(val).forEach(item => extractIds(item));
+                                } else if (typeof val === 'string') {
+                                    const cleanId = val.trim();
+                                    if (cleanId !== '' && cleanId !== 'UNASSIGNED' && cleanId !== 'SITE_STAFF') {
+                                        allCrcIds.add(cleanId);
+                                    }
                                 }
-                            }
+                            };
+                            extractIds(body.roleAssignments);
+                            context.log.info(`[TRAVEL DEBUG] Extracted CRCs from roleAssignments, total now: ${allCrcIds.size}`);
                             
                             // Remove roleAssignments from Travel Days - they don't need them
                             delete body.roleAssignments;
                         }
                         
-                        // Ensure Travel Day events have proper structure
-                        if (!body.crcIds || !Array.isArray(body.crcIds)) {
-                            if (body.crcId) {
-                                body.crcIds = [body.crcId];
-                            } else {
-                                body.crcIds = [];
-                            }
+                        // Set the consolidated crcIds
+                        body.crcIds = Array.from(allCrcIds);
+                        if (body.crcIds.length > 0 && (!body.crcId || body.crcId.trim() === '')) {
+                            body.crcId = body.crcIds[0];
                         }
+                        
+                        context.log.info(`[TRAVEL DEBUG] Final CRC collection: ${JSON.stringify(body.crcIds)} (${body.crcIds.length} CRCs)`);
                     }
 
                     // 2. SECOND: Now that type is normalized, run the "Double Explosion" logic
                     // This handles splitting Multiple CRCs AND Date Ranges into individual daily events
                     if (body.type === 'Travel Day') {
+                        // DEBUG: Log incoming Travel Day data
+                        context.log.info(`[TRAVEL DEBUG] Incoming body: crcId=${body.crcId}, crcIds=${JSON.stringify(body.crcIds)}, date=${body.date}, startDate=${body.startDate}, endDate=${body.endDate}`);
+                        
                         const validCrcIds = (body.crcIds || []).filter(id => id && typeof id === 'string' && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
                         
+                        context.log.info(`[TRAVEL DEBUG] Valid CRC IDs after filter: ${JSON.stringify(validCrcIds)} (count: ${validCrcIds.length})`);
+                        
                         // Calculate all dates in the range
+                        // IMPORTANT: Always prefer startDate/endDate over date for range calculation
                         const dates = [];
-                        if (body.startDate && body.endDate && body.startDate !== body.endDate) {
-                            let curr = new Date(body.startDate);
-                            const last = new Date(body.endDate);
+                        const hasDateRange = body.startDate && body.endDate && body.startDate !== body.endDate;
+                        
+                        if (hasDateRange) {
+                            context.log.info(`[TRAVEL DEBUG] Processing date RANGE: ${body.startDate} to ${body.endDate}`);
+                            let curr = new Date(body.startDate + 'T00:00:00'); // Force local time
+                            const last = new Date(body.endDate + 'T00:00:00');
                             // Safety: Cap at 60 days to prevent infinite loops on bad data
                             let safety = 0; 
                             while (curr <= last && safety < 60) {
@@ -2471,12 +2495,21 @@ async function crudHandler(context, request, containerName) {
                                 safety++;
                             }
                         } else {
-                            dates.push(body.date || body.startDate);
+                            // Single day - use date field, falling back to startDate
+                            const singleDate = body.date || body.startDate;
+                            if (singleDate) {
+                                dates.push(singleDate);
+                            }
+                            context.log.info(`[TRAVEL DEBUG] Processing SINGLE date: ${singleDate}`);
                         }
+                        
+                        context.log.info(`[TRAVEL DEBUG] Final dates array: ${JSON.stringify(dates)} (count: ${dates.length})`);
 
                         // If we have >1 person OR >1 day, we need to split
-                        if ((validCrcIds.length > 0 && dates.length > 0) && (validCrcIds.length > 1 || dates.length > 1)) {
-                            
+                        const needsSplit = (validCrcIds.length > 0 && dates.length > 0) && (validCrcIds.length > 1 || dates.length > 1);
+                        context.log.info(`[TRAVEL DEBUG] Needs split? ${needsSplit} (${validCrcIds.length} people x ${dates.length} days)`);
+                        
+                        if (needsSplit) {
                             // Generate ALL combinations [Person + Day]
                             const allCombinations = [];
                             for (const dateStr of dates) {
@@ -2484,6 +2517,8 @@ async function crudHandler(context, request, containerName) {
                                     allCombinations.push({ date: dateStr, crcId });
                                 }
                             }
+
+                            context.log.info(`[TRAVEL DEBUG] Generated ${allCombinations.length} combinations`);
 
                             if (allCombinations.length > 0) {
                                 // Take the FIRST combination for the Main Event
@@ -2503,8 +2538,16 @@ async function crudHandler(context, request, containerName) {
                                     crcId: params.crcId
                                 }));
                                 
-                                context.log.info(`Exploding Travel Day into ${allCombinations.length} events (${dates.length} days x ${validCrcIds.length} people).`);
+                                context.log.info(`[TRAVEL DEBUG] EXPLODING Travel Day: Main event for ${mainParams.crcId} on ${mainParams.date}, plus ${extraTravelEvents.length} extra events`);
                             }
+                        } else if (validCrcIds.length === 1 && dates.length === 1) {
+                            // Single person, single day - no split needed but ensure fields are set
+                            context.log.info(`[TRAVEL DEBUG] Single person/day - no split needed`);
+                            body.date = dates[0];
+                            body.crcId = validCrcIds[0];
+                            body.crcIds = [validCrcIds[0]];
+                            body.startDate = dates[0];
+                            body.endDate = dates[0];
                         }
                     }
                     
@@ -2636,11 +2679,15 @@ async function crudHandler(context, request, containerName) {
                     const { resource: createdItem } = await container.items.create(newItem);
 
                     // FIX: Create the extra individual events (Dates x People)
-                    if (containerName === 'events' && createdItem && createdItem.type === 'Travel Day' && extraTravelEvents.length > 0) {
+                    context.log.info(`[TRAVEL DEBUG] After main create - extraTravelEvents.length = ${extraTravelEvents ? extraTravelEvents.length : 'undefined'}, createdItem.type = ${createdItem ? createdItem.type : 'none'}`);
+                    
+                    if (containerName === 'events' && extraTravelEvents && extraTravelEvents.length > 0) {
+                        context.log.info(`[TRAVEL DEBUG] Creating ${extraTravelEvents.length} extra Travel Day events...`);
                         for (const params of extraTravelEvents) {
                             const extraEvent = {
                                 ...createdItem, // Copy base props from main event
                                 id: generateId(),
+                                type: 'Travel Day', // Ensure type is Travel Day
                                 date: params.date,
                                 startDate: params.date, // Ensure it's a single day
                                 endDate: params.date,   // Ensure it's a single day
@@ -2652,11 +2699,12 @@ async function crudHandler(context, request, containerName) {
 
                             try {
                                 await container.items.create(extraEvent);
-                                context.log.info(`Created extra Travel Day: ${params.date} for ${params.crcId}`);
+                                context.log.info(`[TRAVEL DEBUG] Created extra Travel Day: ${params.date} for ${params.crcId}`);
                             } catch (extraError) {
-                                context.log.error(`Failed to create extra Travel Day:`, extraError);
+                                context.log.error(`[TRAVEL DEBUG] Failed to create extra Travel Day:`, extraError);
                             }
                         }
+                        context.log.info(`[TRAVEL DEBUG] Finished creating ${extraTravelEvents.length} extra events`);
                     }
                     
                     // Calculate enrollment for studies (non-fatal)
@@ -2671,11 +2719,15 @@ async function crudHandler(context, request, containerName) {
                     
                     // For Site Assignment shifts, create travel days from travelDayPreferences
                     if (containerName === 'events' && createdItem && createdItem.type === 'Site Assignment' && createdItem.date && createdItem.travelDayPreferences) {
+                        context.log.info(`[TRAVEL PREFS DEBUG] Processing travelDayPreferences for Site Assignment: ${JSON.stringify(createdItem.travelDayPreferences)}`);
                         try {
                             const eventsContainer = getContainer('events');
                             const shiftDate = toDateOnlyString(createdItem.date);
                             const baseStartDate = createdItem.startDate || createdItem.date;
                             const baseEndDate = createdItem.endDate || createdItem.date;
+                            
+                            context.log.info(`[TRAVEL PREFS DEBUG] Shift dates: date=${shiftDate}, startDate=${baseStartDate}, endDate=${baseEndDate}`);
+                            
                             const computeDefaultTravelDates = () => {
                                 const startObj = new Date(`${baseStartDate}T00:00:00`);
                                 const endObj = new Date(`${baseEndDate}T00:00:00`);
@@ -2713,21 +2765,41 @@ async function crudHandler(context, request, containerName) {
                                 });
                             }
                             
+                            context.log.info(`[TRAVEL PREFS DEBUG] CRCs assigned to shift: ${JSON.stringify([...shiftCrcIds])}`);
+                            
                             // Check travelDayPreferences and create travel days for CRCs that have travel checked
                             if (createdItem.travelDayPreferences && typeof createdItem.travelDayPreferences === 'object') {
+                                const defaults = computeDefaultTravelDates();
+                                context.log.info(`[TRAVEL PREFS DEBUG] Default travel dates: start=${defaults.start}, end=${defaults.end}`);
+                                
                                 for (const [crcId, prefs] of Object.entries(createdItem.travelDayPreferences)) {
-                                    if (!crcId || crcId.trim() === '' || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') continue;
-                                    if (!shiftCrcIds.has(crcId)) continue;
-                                    if (prefs && typeof prefs === 'object' && prefs.travelNotNeeded) continue;
+                                    context.log.info(`[TRAVEL PREFS DEBUG] Processing CRC ${crcId}: prefs=${JSON.stringify(prefs)}`);
+                                    
+                                    if (!crcId || crcId.trim() === '' || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') {
+                                        context.log.info(`[TRAVEL PREFS DEBUG] Skipping invalid CRC ID: ${crcId}`);
+                                        continue;
+                                    }
+                                    if (!shiftCrcIds.has(crcId)) {
+                                        context.log.info(`[TRAVEL PREFS DEBUG] Skipping CRC ${crcId} - not assigned to shift`);
+                                        continue;
+                                    }
+                                    if (prefs && typeof prefs === 'object' && prefs.travelNotNeeded) {
+                                        context.log.info(`[TRAVEL PREFS DEBUG] Skipping CRC ${crcId} - travelNotNeeded is true`);
+                                        continue;
+                                    }
                                     
                                     const includeStart = prefs === true || (prefs && typeof prefs === 'object' && prefs.includeStartTravel === true);
                                     const includeEnd = prefs === true || (prefs && typeof prefs === 'object' && prefs.includeEndTravel === true);
-                                    const defaults = computeDefaultTravelDates();
                                     const startDate = (prefs && typeof prefs === 'object' && prefs.startTravelDate) ? prefs.startTravelDate : defaults.start;
                                     const endDate = (prefs && typeof prefs === 'object' && prefs.endTravelDate) ? prefs.endTravelDate : defaults.end;
+                                    
+                                    context.log.info(`[TRAVEL PREFS DEBUG] CRC ${crcId}: includeStart=${includeStart}, includeEnd=${includeEnd}, startDate=${startDate}, endDate=${endDate}`);
+                                    
                                     const datesToCreate = [];
                                     if (includeStart && startDate) datesToCreate.push(startDate);
                                     if (includeEnd && endDate && endDate !== startDate) datesToCreate.push(endDate);
+                                    
+                                    context.log.info(`[TRAVEL PREFS DEBUG] CRC ${crcId}: Creating travel days for dates: ${JSON.stringify(datesToCreate)}`);
                                     
                                     for (const travelDate of datesToCreate) {
                                         const { resources: allTravelDaysOnDate } = await eventsContainer.items.query({
@@ -2749,6 +2821,8 @@ async function crudHandler(context, request, containerName) {
                                                 id: generateId(),
                                                 type: 'Travel Day',
                                                 date: travelDate,
+                                                startDate: travelDate,  // SINGLE DAY - not a range!
+                                                endDate: travelDate,    // SINGLE DAY - not a range!
                                                 crcId: crcId,
                                                 crcIds: [crcId],
                                                 name: 'Travel Day',
@@ -2764,17 +2838,19 @@ async function crudHandler(context, request, containerName) {
                                             
                                             try {
                                                 await eventsContainer.items.create(travelDayEvent);
-                                                context.log.info(`Created travel day ${travelDayEvent.id} for CRC ${crcId} on ${travelDate} from travelDayPreferences`);
+                                                context.log.info(`[TRAVEL PREFS DEBUG] CREATED travel day ${travelDayEvent.id} for CRC ${crcId} on ${travelDate}`);
                                             } catch (createTravelError) {
-                                                context.log.error(`Failed to create travel day for CRC ${crcId}:`, createTravelError);
+                                                context.log.error(`[TRAVEL PREFS DEBUG] Failed to create travel day for CRC ${crcId}:`, createTravelError);
                                             }
+                                        } else {
+                                            context.log.info(`[TRAVEL PREFS DEBUG] Travel day already exists for CRC ${crcId} on ${travelDate}`);
                                         }
                                     }
                                 }
                             }
                         } catch (travelDayError) {
                             // Log but don't fail the shift creation if travel day creation fails
-                            context.log.warn(`Error creating travel days from travelDayPreferences:`, travelDayError.message);
+                            context.log.warn(`[TRAVEL PREFS DEBUG] Error creating travel days from travelDayPreferences:`, travelDayError.message);
                         }
                     }
                     
