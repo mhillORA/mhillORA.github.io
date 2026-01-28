@@ -1996,11 +1996,12 @@ async function crudHandler(context, request, containerName) {
                                                     if (Array.isArray(assignments)) {
                                                         normalized[roleId] = assignments.map(entry => {
                                                             const id = extractCrcId(entry);
+                                                            if (id === 'SITE_STAFF') return 'SITE_STAFF';
                                                             return isValidCrcId(id) ? id : null;
                                                         });
                                                     } else {
                                                         const id = extractCrcId(assignments);
-                                                        normalized[roleId] = isValidCrcId(id) ? [id] : [null];
+                                                        normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (isValidCrcId(id) ? [id] : [null]);
                                                     }
                                                 } catch (e) {
                                                     normalized[roleId] = Array.isArray(assignments) ? assignments : [null];
@@ -2210,11 +2211,12 @@ async function crudHandler(context, request, containerName) {
                                                 if (Array.isArray(assignments)) {
                                                     normalized[roleId] = assignments.map(entry => {
                                                         const id = extractCrcId(entry);
+                                                        if (id === 'SITE_STAFF') return 'SITE_STAFF';
                                                         return isValidCrcId(id) ? id : null;
                                                     });
                                                 } else {
                                                     const id = extractCrcId(assignments);
-                                                    normalized[roleId] = isValidCrcId(id) ? [id] : [null];
+                                                    normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (isValidCrcId(id) ? [id] : [null]);
                                                 }
                                             } catch (e) {
                                                 normalized[roleId] = Array.isArray(assignments) ? assignments : [null];
@@ -2770,11 +2772,12 @@ async function crudHandler(context, request, containerName) {
                         if (Array.isArray(assignments)) {
                             normalized[roleId] = assignments.map(entry => {
                                 const id = extractCrcId(entry);
+                                if (id === 'SITE_STAFF') return 'SITE_STAFF';
                                 return isValidCrcId(id) ? id : null;
                             });
                         } else {
                             const id = extractCrcId(assignments);
-                            normalized[roleId] = isValidCrcId(id) ? [id] : [null];
+                            normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (isValidCrcId(id) ? [id] : [null]);
                         }
                     });
                     return normalized;
