@@ -3257,6 +3257,9 @@ async function crudHandler(context, request, containerName) {
                                             updatedItem.studyIds = [];
                                         }
                                     }
+                                    if (Array.isArray(updatedItem.studyIds) && updatedItem.studyIds.length > 1) {
+                                        updatedItem.studyIds = [updatedItem.studyIds[0]];
+                                    }
                                     if (updatedItem.studyId !== undefined) {
                                         delete updatedItem.studyId;
                                     }
