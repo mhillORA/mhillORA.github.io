@@ -2352,6 +2352,7 @@ async function crudHandler(context, request, containerName) {
             
             case 'POST':
                 const body = await request.json();
+                let extraTravelDayCrcs = [];
                 
                 // For events, validate that we're not creating N/A entries and prevent overriding training
                 if (containerName === 'events') {
@@ -2449,6 +2450,18 @@ async function crudHandler(context, request, containerName) {
                                 body.crcIds = [body.crcId];
                             } else {
                                 body.crcIds = [];
+                            }
+                        }
+
+                        // If a Travel Day includes multiple CRCs, split into individual events
+                        if (body.crcIds && Array.isArray(body.crcIds) && body.crcIds.length > 1) {
+                            const validCrcIds = body.crcIds.filter(id => id && typeof id === 'string' && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
+                            if (validCrcIds.length > 1) {
+                                const firstCrcId = validCrcIds[0];
+                                extraTravelDayCrcs = validCrcIds.slice(1);
+                                body.crcIds = [firstCrcId];
+                                body.crcId = firstCrcId;
+                                context.log.info(`Splitting group Travel Day into ${validCrcIds.length} individual events. Main event for ${firstCrcId}.`);
                             }
                         }
                     }
@@ -2579,6 +2592,25 @@ async function crudHandler(context, request, containerName) {
                 const newItem = { ...body, id: generateId() };
                 try {
                     const { resource: createdItem } = await container.items.create(newItem);
+
+                    // Create additional Travel Day events for split CRCs
+                    if (containerName === 'events' && createdItem && createdItem.type === 'Travel Day' && extraTravelDayCrcs.length > 0) {
+                        for (const extraCrcId of extraTravelDayCrcs) {
+                            const extraEvent = {
+                                ...createdItem,
+                                id: generateId(),
+                                crcId: extraCrcId,
+                                crcIds: [extraCrcId]
+                            };
+                            ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => delete extraEvent[k]);
+                            try {
+                                await container.items.create(extraEvent);
+                                context.log.info(`Created split Travel Day ${extraEvent.id} for CRC ${extraCrcId}`);
+                            } catch (extraError) {
+                                context.log.error(`Failed to create split Travel Day for ${extraCrcId}:`, extraError.message || extraError);
+                            }
+                        }
+                    }
                     
                     // Calculate enrollment for studies (non-fatal)
                     if (containerName === 'studies') {
