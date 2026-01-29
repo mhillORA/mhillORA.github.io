@@ -3757,7 +3757,55 @@
                 const startTime = startDate.getTime();
                 const endTime = endDate.getTime();
 
-                const requests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
+                // Start with DB-backed time off requests
+                const dbRequests = Array.isArray(state.timeOffRequests) ? state.timeOffRequests : [];
+                
+                // CRITICAL: Also include legacy time off events from crc_events to match the rollup sections
+                // Build keys for all dates already covered by DB requests to avoid duplicates
+                const requestKeys = new Set(
+                    dbRequests.flatMap(req => {
+                        if (!req || !req.crcId) return [];
+                        const start = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
+                        const end = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
+                        if (!start) return [];
+                        const out = [];
+                        const cursor = new Date(start + 'T00:00:00');
+                        const limit = new Date((end || start) + 'T00:00:00');
+                        while (cursor <= limit) {
+                            out.push(`${req.crcId}_${toDateOnlyString(cursor)}`);
+                            cursor.setDate(cursor.getDate() + 1);
+                        }
+                        return out;
+                    })
+                );
+                
+                // Legacy time off event types
+                const timeOffEventTypes = new Set([
+                    'Unavailable', 'Paid Time Off', 'Time Off', 'PTO', 'Sick Time',
+                    'Sick', 'Vacation', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem'
+                ]);
+                
+                const legacyRequests = [];
+                (state.crc_events || []).forEach(ev => {
+                    if (!ev || !ev.crcId) return;
+                    if (!timeOffEventTypes.has(ev.type)) return;
+                    const dateStr = toDateOnlyString(parseDateFlexible(ev.date));
+                    if (!dateStr) return;
+                    const key = `${ev.crcId}_${dateStr}`;
+                    if (requestKeys.has(key)) return; // Skip if already covered by a DB request
+                    
+                    legacyRequests.push({
+                        crcId: ev.crcId,
+                        date: dateStr,
+                        startDate: dateStr,
+                        endDate: dateStr,
+                        hours: ev.hours || (ev.period === 'Full Day' ? 8 : 4),
+                        period: ev.period || 'Full Day',
+                        status: 'approved' // Legacy events are treated as approved
+                    });
+                });
+                
+                const requests = [...dbRequests, ...legacyRequests];
                 const summaries = new Map();
                 const monthKeysSet = new Set();
 
