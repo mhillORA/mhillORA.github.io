@@ -3973,6 +3973,8 @@ async function crudHandler(context, request, containerName) {
                                                         id: generateId(),
                                                         type: 'Travel Day',
                                                         date: travelDate,
+                                                        startDate: travelDate,  // SINGLE DAY - not a range!
+                                                        endDate: travelDate,    // SINGLE DAY - not a range!
                                                         crcId: crcId,
                                                         crcIds: [crcId],
                                                         name: 'Travel Day',
