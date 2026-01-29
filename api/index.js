@@ -5432,8 +5432,8 @@ app.http('time-off-requests', {
                         }
                         
                         // Manager can delete the request
-                        const partitionKey = resource.partitionKey || resource.crcId || resource.id || id;
-                        await container.item(resource.id || id, partitionKey).delete();
+                        // CRITICAL: Partition key for time-off-requests is the id itself, not crcId
+                        await container.item(id, id).delete();
                         
                         // Also delete any related time off events that reference this PTO request
                         try {
