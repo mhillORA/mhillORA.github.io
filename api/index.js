@@ -761,34 +761,21 @@ const buildRecipientEmailContext = async ({ crcId, startDate, endDate, recipient
         `
         : `<p>No shifts in range.</p>`;
 
-    // "Full/Artemis" schedule: includes site address + emails/phones + study metadata when available.
+    // "Full" schedule: Date, Site, Study, Visit, Group, Role (no contact info)
     const scheduleFullText = shifts.length
         ? shifts.map(s => {
             const studies = (s.studies || []).join(', ');
             const roles = (s.roles || []).join(', ');
-            const site = s.site || {};
-            const siteName = s.siteName || site.name || s.siteId || '';
-            const addr = [site.address1, site.address2, site.city, site.state, site.zipCode || site.zip, site.country].filter(Boolean).join(', ');
-            const contacts = [
-                site.phoneNumber || site.phone ? `Phone: ${site.phoneNumber || site.phone}` : '',
-                site.pi || site.principalInvestigator ? `PI: ${site.pi || site.principalInvestigator}` : '',
-                site.piEmail ? `PI Email: ${site.piEmail}` : '',
-                site.siteCoordinator ? `Coordinator: ${site.siteCoordinator}` : '',
-                site.siteCoordinatorEmail ? `Coordinator Email: ${site.siteCoordinatorEmail}` : ''
-            ].filter(Boolean).join(' | ');
-            const visit = s.visitNumber ? `Visit ${s.visitNumber}` : '';
-            const group = s.groupNumber ? `Group ${s.groupNumber}` : '';
+            const siteName = s.siteName || (s.site && s.site.name) || s.siteId || '';
             const parts = [
-                `${s.date} (${s.period || 'Full Day'})`,
-                roles ? `Roles: ${roles}` : '',
-                studies ? `Study: ${studies}` : '',
-                visit,
-                group,
+                s.date,
                 siteName ? `Site: ${siteName}` : '',
-                addr ? `Address: ${addr}` : '',
-                contacts
+                studies ? `Study: ${studies}` : '',
+                s.visitNumber ? `Visit: ${s.visitNumber}` : '',
+                s.groupNumber ? `Group: ${s.groupNumber}` : '',
+                roles ? `Role: ${roles}` : ''
             ].filter(Boolean);
-            return `- ${parts.join(' • ')}`;
+            return `- ${parts.join(' | ')}`;
         }).join('\n')
         : 'No shifts in range.';
 
