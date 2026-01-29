@@ -3403,6 +3403,24 @@ async function crudHandler(context, request, containerName) {
                                         context.log.warn(`Failed to normalize existingEvent before merge:`, e.message);
                                     }
                                     
+                                    // SAFEGUARD: Detect if update would clear roleAssignments on a Site Assignment
+                                    const existingHasAssignments = normalizedExisting.roleAssignments && 
+                                        typeof normalizedExisting.roleAssignments === 'object' &&
+                                        Object.values(normalizedExisting.roleAssignments).some(arr => Array.isArray(arr) && arr.length > 0);
+                                    const requestHasAssignments = requestBody.roleAssignments && 
+                                        typeof requestBody.roleAssignments === 'object' &&
+                                        Object.values(requestBody.roleAssignments).some(arr => Array.isArray(arr) && arr.length > 0);
+                                    
+                                    // If existing has assignments but request doesn't, PRESERVE existing assignments
+                                    // This prevents accidental clearing of CRC assignments
+                                    if (existingHasAssignments && !requestHasAssignments && normalizedExisting.type === 'Site Assignment') {
+                                        context.log.warn(`[SAFEGUARD] Preserving roleAssignments for Site Assignment ${updateId} - request would have cleared them`);
+                                        // Don't let requestBody.roleAssignments overwrite - preserve existing
+                                        if (requestBody.roleAssignments !== undefined) {
+                                            delete requestBody.roleAssignments;
+                                        }
+                                    }
+                                    
                                     // Now merge normalized existing with requestBody (requestBody is already normalized)
                                     updatedItem = { ...normalizedExisting, ...requestBody, id: updateId };
                                     
@@ -3763,9 +3781,11 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
-                    // Log the update attempt for debugging
+                    // AUDIT LOG: Record event updates for debugging/recovery
                     if (containerName === 'events') {
-                        context.log.info(`Updating event ${updateId}: type=${updatedItem.type}, hasRoleAssignments=${!!updatedItem.roleAssignments}, hasTravelDayPreferences=${!!updatedItem.travelDayPreferences}`);
+                        const roleAssignmentCrcs = updatedItem.roleAssignments ? 
+                            Object.values(updatedItem.roleAssignments).flat().filter(id => id && id !== 'UNASSIGNED' && id !== 'SITE_STAFF') : [];
+                        context.log.info(`[AUDIT UPDATE] Event ${updateId} | Type: ${updatedItem.type} | Date: ${updatedItem.date} | Site: ${updatedItem.siteId} | CRCs: ${JSON.stringify(updatedItem.crcIds || [])} | RoleAssignment CRCs: ${JSON.stringify(roleAssignmentCrcs)}`);
                     }
                     
                     let result;
@@ -4078,6 +4098,11 @@ async function crudHandler(context, request, containerName) {
                         }
                         // For other read errors, log but continue to try delete
                         context.log.warn(`Error reading ${containerName} ${id} before delete:`, readError.message);
+                    }
+                    
+                    // AUDIT LOG: Record what's being deleted for debugging/recovery
+                    if (containerName === 'events' && resource) {
+                        context.log.info(`[AUDIT DELETE] Event ${id} | Type: ${resource.type} | Date: ${resource.date} | Site: ${resource.siteId} | CRCs: ${JSON.stringify(resource.crcIds || resource.crcId)} | RoleAssignments: ${JSON.stringify(Object.keys(resource.roleAssignments || {}))}`);
                     }
                     
                     // If deleting a Site Assignment shift, also delete associated travel days
