@@ -4961,46 +4961,63 @@
                     : state.crcs;
 
                 targetCrcs.forEach(crc => {
-                    // Get Site Assignment events for this CRC
+                    // Use Sets to track unique event IDs and prevent duplicate counting
+                    const seenEventIds = new Set();
+                    
+                    // Get Site Assignment events for this CRC (deduplicated by ID)
                     const siteAssignmentEvents = state.crc_events.filter(e => {
+                        if (e.id && seenEventIds.has(e.id)) return false;
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        return eventBelongsToCrc(e, crc.id) && 
+                        const matches = eventBelongsToCrc(e, crc.id) && 
                                eventDate.getFullYear() === year && 
                                eventDate.getMonth() === month &&
                                isSiteAssignmentWithCrc(e);
+                        if (matches && e.id) seenEventIds.add(e.id);
+                        return matches;
                     });
                     
-                    // Get Travel Day events for this CRC (if includeTravel is true)
+                    // Get Travel Day events for this CRC (if includeTravel is true, deduplicated)
+                    const travelSeenIds = new Set();
                     const travelEvents = includeTravel ? state.crc_events.filter(e => {
+                        if (e.id && travelSeenIds.has(e.id)) return false;
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        return eventBelongsToCrc(e, crc.id) && 
+                        const matches = eventBelongsToCrc(e, crc.id) && 
                                eventDate.getFullYear() === year && 
                                eventDate.getMonth() === month &&
                                e.type === 'Travel Day';
+                        if (matches && e.id) travelSeenIds.add(e.id);
+                        return matches;
                     }) : [];
                     
-                    const nonWorkEventTypes = ['Paid Time Off', 'Unavailable'];
+                    const nonWorkEventTypes = ['Paid Time Off', 'Unavailable', 'PTO', 'Time Off'];
 
                     const productiveDaysSet = new Set();
                     
-                    // Count Site Assignment days
+                    // Count Site Assignment days (using Set prevents duplicate dates)
                     siteAssignmentEvents.forEach(e => {
                         if (isSiteAssignmentWithCrc(e)) {
                             productiveDaysSet.add(e.date);
                         }
                     });
                     
-                    // Count Travel Day dates (if includeTravel is true)
+                    // Count Travel Day dates (if includeTravel is true) - using Set prevents duplicates
+                    const travelDaysSet = new Set();
                     travelEvents.forEach(e => {
                         productiveDaysSet.add(e.date);
+                        travelDaysSet.add(e.date);
                     });
 
+                    // Get non-work events (deduplicated by ID)
+                    const nonWorkSeenIds = new Set();
                     const nonWorkDaysSet = new Set();
                     state.crc_events.filter(e => {
+                        if (e.id && nonWorkSeenIds.has(e.id)) return false;
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        return eventBelongsToCrc(e, crc.id) && 
+                        const matches = eventBelongsToCrc(e, crc.id) && 
                                eventDate.getFullYear() === year && 
                                eventDate.getMonth() === month;
+                        if (matches && e.id) nonWorkSeenIds.add(e.id);
+                        return matches;
                     }).forEach(e => {
                         if (nonWorkEventTypes.includes(e.type)) {
                            nonWorkDaysSet.add(e.date);
@@ -5008,7 +5025,7 @@
                     });
                     const productiveDays = productiveDaysSet.size;
                     const nonWorkDays = nonWorkDaysSet.size;
-                    const travelDays = travelEvents.length;
+                    const travelDays = travelDaysSet.size; // Use Set size for unique travel DAYS, not event count
 
                     const crcAvailableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
                     const utilizationPercent = crcAvailableWorkDays > 0 ? Math.round((productiveDays / crcAvailableWorkDays) * 100) : 0;
@@ -5038,18 +5055,28 @@
 
                 const stats = {};
                 state.crcs.forEach(crc => {
-                    // Get all events for this week
+                    // Get all events for this week, deduplicated by ID
+                    const seenEventIds = new Set();
                     const eventsThisWeek = state.crc_events.filter(e => {
+                        if (e.id && seenEventIds.has(e.id)) return false;
                         const eventDate = new Date(e.date + 'T12:00:00');
-                        return eventDate >= startOfWeek && 
-                               eventDate <= endOfWeek;
+                        const matches = eventDate >= startOfWeek && eventDate <= endOfWeek;
+                        if (matches && e.id) seenEventIds.add(e.id);
+                        return matches;
                     });
                     // Calculate hours including travel based on setting
                     const totalHours = calculateCrcHours(eventsThisWeek, crc.id, { includeTravel });
                     
-                    // Also calculate travel hours separately for display
+                    // Also calculate travel hours separately for display (deduplicated by date)
+                    const travelDatesSeen = new Set();
                     const travelHours = includeTravel ? eventsThisWeek
-                        .filter(e => e.type === 'Travel Day' && eventBelongsToCrc(e, crc.id))
+                        .filter(e => {
+                            if (e.type !== 'Travel Day' || !eventBelongsToCrc(e, crc.id)) return false;
+                            // Only count each travel date once
+                            if (travelDatesSeen.has(e.date)) return false;
+                            travelDatesSeen.add(e.date);
+                            return true;
+                        })
                         .reduce((sum, e) => sum + (parseFloat(e.hours) || 5), 0) : 0;
                     
                     stats[crc.id] = {
@@ -5547,29 +5574,43 @@
             // Optionally includes Travel Day events
             // This ensures we only count work hours, not PTO/Unavailable/Open Shifts
             // Correctly divides hours when multiple CRCs are assigned to the same event
+            // Deduplicates events by ID to prevent double-counting
             const calculateCrcHours = (events, crcId = null, options = {}) => {
                 const { includeTravel = false } = options;
                 
+                // Track seen event IDs to prevent duplicates
+                const seenEventIds = new Set();
+                
                 // Filter to only Site Assignment events with CRCs assigned (or Travel if included)
+                // Also deduplicate by event ID
                 const workEvents = events.filter(e => {
+                    // Skip if we've already seen this event ID
+                    if (e.id && seenEventIds.has(e.id)) return false;
+                    
+                    let matches = false;
+                    
                     // Must be Site Assignment with CRC assigned
                     if (isSiteAssignmentWithCrc(e)) {
                         // If filtering for specific CRC, check if this CRC is assigned
                         if (crcId) {
-                            return eventBelongsToCrc(e, crcId);
+                            matches = eventBelongsToCrc(e, crcId);
+                        } else {
+                            matches = true; // Count all Site Assignments with CRCs
                         }
-                        return true; // Count all Site Assignments with CRCs
                     }
                     
                     // Optionally include Travel Day events
-                    if (includeTravel && e.type === 'Travel Day') {
+                    if (!matches && includeTravel && e.type === 'Travel Day') {
                         if (crcId) {
-                            return eventBelongsToCrc(e, crcId);
+                            matches = eventBelongsToCrc(e, crcId);
+                        } else {
+                            matches = true;
                         }
-                        return true;
                     }
                     
-                    return false;
+                    // Track this event if it matches
+                    if (matches && e.id) seenEventIds.add(e.id);
+                    return matches;
                 });
                 
                 // Sum hours using helper function that correctly divides hours
@@ -39818,17 +39859,21 @@
                     return dates;
                 };
                 
-                // Get all events in the period once
+                // Get all events in the period once, deduplicated by ID
+                const seenPeriodEventIds = new Set();
                 const periodEvents = (state.crc_events || []).filter(e => {
+                    if (e.id && seenPeriodEventIds.has(e.id)) return false;
                     const eventDate = new Date(e.date + 'T00:00:00');
-                    return eventDate >= startDate && eventDate <= endDate;
+                    const matches = eventDate >= startDate && eventDate <= endDate;
+                    if (matches && e.id) seenPeriodEventIds.add(e.id);
+                    return matches;
                 });
                 
                 // Calculate CRC utilization for selected period
                 const crcUtilization = (state.crcs || []).map(crc => {
                     const crcPeriodEvents = periodEvents.filter(e => eventBelongsToCrc(e, crc.id));
                     
-                    // Calculate hours worked (Site Assignment with optional Travel)
+                    // Calculate hours worked (Site Assignment with optional Travel) - calculateCrcHours handles deduplication
                     const hoursWorked = calculateCrcHours(crcPeriodEvents, crc.id, { includeTravel: state.managerViewIncludeTravel });
                     
                     // Studies vs Training split (Site Assignment only, no travel)
@@ -39845,23 +39890,33 @@
                     const allDates = getAllDatesInRange(startDate, endDate);
                     
                     // Calculate unavailable days (PTO, Unavailable, Sick, or scheduled shifts)
+                    // Using Set naturally prevents duplicates for the same date
                     const unavailableDates = new Set();
                     
+                    // Track seen event IDs to prevent duplicate processing
+                    const seenUnavailEventIds = new Set();
                     periodEvents.forEach(e => {
+                        if (e.id && seenUnavailEventIds.has(e.id)) return;
+                        if (e.id) seenUnavailEventIds.add(e.id);
+                        
                         if (e.crcId === crc.id || (e.roleAssignments && Object.values(e.roleAssignments).some(arr => Array.isArray(arr) && arr.includes(crc.id)))) {
                             const eventDate = new Date(e.date + 'T00:00:00');
                             const dateStr = eventDate.toISOString().split('T')[0];
                             
-                            // Count as unavailable if: PTO, Unavailable, Sick, or Site Assignment (scheduled)
+                            // Count as unavailable if: PTO, Unavailable, Sick, Time Off, or Site Assignment (scheduled)
                             if (e.type === 'Paid Time Off' || e.type === 'PTO' || e.type === 'Unavailable' || 
-                                e.type === 'Sick' || e.type === 'Site Assignment') {
+                                e.type === 'Sick' || e.type === 'Time Off' || e.type === 'Site Assignment') {
                                 unavailableDates.add(dateStr);
                             }
                         }
                     });
                     
-                    // Check time off requests for this CRC
+                    // Check time off requests for this CRC (deduplicated by request ID)
+                    const seenTimeOffRequestIds = new Set();
                     (state.timeOffRequests || []).forEach(req => {
+                        if (req.id && seenTimeOffRequestIds.has(req.id)) return;
+                        if (req.id) seenTimeOffRequestIds.add(req.id);
+                        
                         if (req.crcId === crc.id && normalizeTimeOffStatus(req.status) === 'approved') {
                             const start = new Date(req.startDate || req.date);
                             const end = req.endDate ? new Date(req.endDate) : start;
@@ -39869,7 +39924,7 @@
                             while (current <= end) {
                                 if (current >= startDate && current <= endDate) {
                                     const dateStr = current.toISOString().split('T')[0];
-                                    unavailableDates.add(dateStr);
+                                    unavailableDates.add(dateStr); // Set prevents duplicate dates
                                 }
                                 current.setDate(current.getDate() + 1);
                             }
