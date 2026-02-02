@@ -5130,6 +5130,22 @@
                 if (!state.changeLog) {
                     state.changeLog = [];
                 }
+                
+                // DEDUPLICATION: Always deduplicate crc_events by ID when state changes
+                if (Array.isArray(state.crc_events) && state.crc_events.length > 0) {
+                    const seenIds = new Set();
+                    const beforeCount = state.crc_events.length;
+                    state.crc_events = state.crc_events.filter(event => {
+                        if (!event.id) return true; // Keep events without ID
+                        if (seenIds.has(event.id)) return false; // Skip duplicates
+                        seenIds.add(event.id);
+                        return true;
+                    });
+                    const afterCount = state.crc_events.length;
+                    if (beforeCount !== afterCount) {
+                        console.warn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate events from crc_events`);
+                    }
+                }
                 if (options.skipRender) {
                     return;
                 }
@@ -5161,6 +5177,35 @@
                     }
                 } else {
                     console.log('CHAOS: Not ready to render yet');
+                }
+            };
+            
+            // Helper function to safely add an event to state without duplicates
+            const addEventToState = (newEvent) => {
+                if (!newEvent) return;
+                // Check if event with this ID already exists
+                if (newEvent.id && state.crc_events.some(e => e.id === newEvent.id)) {
+                    console.warn('CHAOS: Prevented adding duplicate event:', newEvent.id);
+                    return;
+                }
+                addEventToState(newEvent);
+            };
+            
+            // Helper function to safely add multiple events to state without duplicates
+            const addEventsToState = (newEvents) => {
+                if (!Array.isArray(newEvents) || newEvents.length === 0) return;
+                const existingIds = new Set(state.crc_events.map(e => e.id).filter(Boolean));
+                const eventsToAdd = newEvents.filter(event => {
+                    if (!event) return false;
+                    if (event.id && existingIds.has(event.id)) {
+                        console.warn('CHAOS: Prevented adding duplicate event:', event.id);
+                        return false;
+                    }
+                    if (event.id) existingIds.add(event.id); // Track newly added IDs
+                    return true;
+                });
+                if (eventsToAdd.length > 0) {
+                    state.crc_events = [...state.crc_events, ...eventsToAdd];
                 }
             };
 
@@ -7090,11 +7135,22 @@
                         return eventsList;
                     };
                     
-                    // Duplicate PTO cleanup disabled - existing logic should prevent duplicates
-                    // events = await cleanupDuplicatePTOEvents(events || []);
+                    // Re-enable PTO cleanup to handle any legacy duplicates
+                    events = await cleanupDuplicatePTOEvents(events || []);
                     
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
+                    
+                    // DEDUPLICATION: Track seen event IDs to prevent duplicate events in state
+                    const seenEventIds = new Set();
+                    
                     const sanitizedEvents = Array.isArray(events) ? events.reduce((acc, event) => {
+                        // Skip duplicate events by ID
+                        if (event.id && seenEventIds.has(event.id)) {
+                            console.warn('Skipping duplicate event ID:', event.id);
+                            return acc;
+                        }
+                        if (event.id) seenEventIds.add(event.id);
+                        
                         if (Array.isArray(event.studyIds) && event.studyIds.length > 0) {
                             const filteredIds = event.studyIds.filter(studyId => artemisStudyIdsSet.has(studyId));
                             if (filteredIds.length === 0) {
@@ -9135,10 +9191,19 @@
             };
 
             const performExportWithDateRange = (startDate, endDate, selectedEventTypes = [], exportFormat = 'csv') => {
-                // Filter events by date range
+                // DEDUPLICATION: Track seen event IDs to prevent duplicate events in export
+                const seenEventIds = new Set();
+                
+                // Filter events by date range with deduplication
                 let eventsToExport = state.crc_events.filter(e => {
+                    // Skip if we've already seen this event ID
+                    if (e.id && seenEventIds.has(e.id)) return false;
+                    
                     const eventDate = e.date;
-                    return eventDate >= startDate && eventDate <= endDate;
+                    const inDateRange = eventDate >= startDate && eventDate <= endDate;
+                    
+                    if (inDateRange && e.id) seenEventIds.add(e.id);
+                    return inDateRange;
                 });
                 
                 // Enforce Supervisor export restriction (Site Assignment + Travel Day only)
@@ -15333,7 +15398,10 @@
                             // If there are CRCs, create grouped container with header + staff blocks
                             if (allCrcs.length > 0 || event.type === 'Travel Day') {
                                 // Build header (matching weekly/monthly format with override and role icons)
-                                const header = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300 mb-0" style="border-left: 3px solid ${eventBgColor}; border-top: 1px solid ${eventBgColor}; border-right: 1px solid ${eventBgColor}">${headerText} ${event.isOverridden ? overrideIcon : roleIcon}</div>` : '';
+                                // Flash the header if there are unfilled shifts
+                                const planningHeaderHasUnfilled = !roleFulfillment.fulfilled;
+                                const planningHeaderFlashClass = planningHeaderHasUnfilled ? 'study-header-unfilled' : '';
+                                const header = headerText ? `<div class="text-xs font-semibold px-2 py-1 rounded-t ${planningHeaderFlashClass} mb-0" style="border-left: 3px solid ${eventBgColor}; border-top: 1px solid ${eventBgColor}; border-right: 1px solid ${eventBgColor}; ${planningHeaderHasUnfilled ? `background-color: ${eventBgColor}; color: white;` : ''}">${headerText}${planningHeaderHasUnfilled ? ' ⚠' : ''} ${event.isOverridden ? overrideIcon : roleIcon}</div>` : '';
                                 
                                 // Build all blocks - one per CRC, showing all their roles
                                 let blocksHtml = '';
@@ -15419,10 +15487,13 @@
                                 tableHtml += `<div class="mb-1">${header}${blocksWrapper}</div>`;
                             } else {
                                 // No CRCs assigned - show one block for the event (open shift)
+                                // Flash the header if there are unfilled shifts (open shifts are always unfilled)
+                                const openShiftHasUnfilled = !roleFulfillment.fulfilled;
+                                const openShiftFlashClass = openShiftHasUnfilled ? 'study-header-unfilled' : '';
                                 const displayText = 'Open Shift';
                                 
-                                tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
-                                    ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}</div>` : ''}
+                                tableHtml += `<div class="global-view-event cursor-pointer hover:ring-2 hover:ring-blue-500 ${openShiftFlashClass}" style="background-color: ${eventBgColor}; color: ${eventTextColor};" data-action="view-crc-event" data-event-id="${event.id}" ${tooltip ? `title="${tooltip}"` : ''}>
+                                    ${headerText ? `<div class="font-bold text-xs mb-1" style="color: ${spanTextColor};">${headerText}${openShiftHasUnfilled ? ' ⚠' : ''}</div>` : ''}
                                     <strong>${displayText}</strong> ${event.isOverridden ? overrideIcon : roleIcon}
                                 </div>`;
                             }
@@ -19918,12 +19989,21 @@
                 const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
                 const matchingCrcId = getLoggedInCrcId();
                 
-                // Get filtered events
+                // DEDUPLICATION: Track seen event IDs to prevent duplicate events in export
+                const seenEventIds = new Set();
+                
+                // Get filtered events with deduplication
                 let filteredEvents = state.crc_events.filter(event => {
+                    // Skip if we've already seen this event ID
+                    if (event.id && seenEventIds.has(event.id)) return false;
+                    
                     const eventDate = new Date(event.date + 'T00:00:00');
                     const startDate = new Date(state.allScheduleFilters.startDate + 'T00:00:00');
                     const endDate = new Date(state.allScheduleFilters.endDate + 'T23:59:59');
-                    return eventDate >= startDate && eventDate <= endDate;
+                    const inDateRange = eventDate >= startDate && eventDate <= endDate;
+                    
+                    if (inDateRange && event.id) seenEventIds.add(event.id);
+                    return inDateRange;
                 });
 
                 // For CRC users, filter to ONLY their events BEFORE other filters
@@ -19966,9 +20046,19 @@
                 // Sort by date
                 filteredEvents.sort((a, b) => a.date.localeCompare(b.date));
                 
+                // DEDUPLICATION: Track existing PTO events from crc_events to avoid adding duplicates from timeOffRequests
+                const existingPtoEvents = new Set();
+                filteredEvents.forEach(event => {
+                    if (event.type === 'Paid Time Off' || event.type === 'PTO' || event.type === 'Time Off' || event.isPTORequest) {
+                        const key = `${event.crcId}-${event.date}`;
+                        existingPtoEvents.add(key);
+                    }
+                });
+                
                 // Add time off requests to filtered events for export (same logic as display)
                 const timeOffRequests = state.timeOffRequests || [];
                 const ptoEventKeys = new Set();
+                const ptoEventIds = new Set();
                 timeOffRequests.forEach(request => {
                     if (!request.crcId) return;
                     // For CRC users, only include their own time off requests
@@ -19991,11 +20081,20 @@
                         const dateObj = new Date(dateStr + 'T00:00:00');
                         
                         if (dateObj >= filterStart && dateObj <= filterEnd) {
+                            const ptoEventId = `pto-${request.id}-${dateStr}`;
                             const ptoEventKey = `${request.crcId}-${dateStr}`;
-                            if (!ptoEventKeys.has(ptoEventKey)) {
+                            
+                            // Only add if:
+                            // 1. We haven't already added this specific PTO event ID
+                            // 2. We haven't already added a PTO event for this CRC on this date
+                            // 3. There isn't already an actual PTO event in crc_events for this CRC on this date
+                            if (!ptoEventIds.has(ptoEventId) && 
+                                !ptoEventKeys.has(ptoEventKey) && 
+                                !existingPtoEvents.has(ptoEventKey)) {
+                                ptoEventIds.add(ptoEventId);
                                 ptoEventKeys.add(ptoEventKey);
                                 const ptoEvent = {
-                                    id: `pto-${request.id}-${dateStr}`,
+                                    id: ptoEventId,
                                     crcId: request.crcId,
                                     date: dateStr,
                                     type: 'Paid Time Off',
@@ -29686,7 +29785,7 @@
                                 try {
                                     const createdEvent = await apiService.createEvent(eventData);
                                     const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
-                                    state.crc_events = [...state.crc_events, newEvent];
+                                    addEventToState(newEvent);
                                 } catch (eventError) {
                                     console.error('Error creating unavailability event:', eventError);
                                 }
@@ -30039,7 +30138,7 @@
                                                 try {
                                                     const createdEvent = await apiService.createEvent(eventData);
                                                     const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
-                                                    state.crc_events = [...state.crc_events, newEvent];
+                                                    addEventToState(newEvent);
                                                 } catch (eventError) {
                                                     console.error('Error creating associated event:', eventError);
                                                 }
@@ -30163,7 +30262,7 @@
                                                 try {
                                                     const createdEvent = await apiService.createEvent(eventData);
                                                     const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
-                                                    state.crc_events = [...state.crc_events, newEvent];
+                                                    addEventToState(newEvent);
                                                 } catch (eventError) {
                                                     console.error('Error creating unavailability event:', eventError);
                                                 }
@@ -32150,7 +32249,7 @@
                                 
                                 const created = await apiService.createEvent(payload);
                                 const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...payload };
-                                state.crc_events = [...state.crc_events, createdEvent];
+                                addEventToState(createdEvent);
                             };
                             
                             // Helper to get next business day (excluding weekends)
@@ -33651,7 +33750,7 @@
                                                     try {
                                                         const created = await apiService.createEvent(travelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
-                                                        state.crc_events = [...state.crc_events, createdEvent];
+                                                        addEventToState(createdEvent);
                                                     } catch (createError) {
                                                         console.error('Error creating travel day (edit mode):', createError);
                                                     }
@@ -34040,7 +34139,7 @@
                                                     console.log('Creating Travel Day event (new path) for:', dateStr, 'CRC:', travelCrcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
                                                     const created = await apiService.createEvent(travelEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
-                                                    state.crc_events = [...state.crc_events, createdEvent];
+                                                    addEventToState(createdEvent);
                                                 } else {
                                                     console.log('Travel day already exists for CRC:', travelCrcId, 'on date:', dateStr, '- skipping creation');
                                                 }
@@ -34152,7 +34251,7 @@
                                                     const created = await apiService.createEvent(travelEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
                                                     console.log(`[TRAVEL DEBUG] Travel day created for CRC ${crcId}:`, createdEvent.id);
-                                                    state.crc_events = [...state.crc_events, createdEvent];
+                                                    addEventToState(createdEvent);
                                                     return;
                                                 } else {
                                                     console.log(`[TRAVEL DEBUG] Travel day already exists for CRC ${crcId} - will update instead`);
@@ -34377,7 +34476,7 @@
                                                 // Reduced logging for performance
                                                 const created = await apiService.createEvent(currentEventData);
                                                 const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...currentEventData };
-                                                state.crc_events = [...state.crc_events, createdEvent];
+                                                addEventToState(createdEvent);
                                             }
                                             }
                                         } else {
@@ -34423,7 +34522,7 @@
                                                     
                                                     const created = await apiService.createEvent(shiftEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...shiftEventData };
-                                                    state.crc_events = [...state.crc_events, createdEvent];
+                                                    addEventToState(createdEvent);
                                                 }
                                                 
                                                 dayCursor.setDate(dayCursor.getDate() + 1);
@@ -34532,7 +34631,7 @@
                                                         console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
                                                         const created = await apiService.createEvent(startTravelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
-                                                        state.crc_events = [...state.crc_events, createdEvent];
+                                                        addEventToState(createdEvent);
                                                     } else {
                                                         console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation');
                                                     }
@@ -34596,7 +34695,7 @@
                                                 const created = await apiService.createEvent(currentEventData);
                                                 const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...currentEventData };
                                                 console.log('Created event roleAssignments:', createdEvent.roleAssignments);
-                                                state.crc_events = [...state.crc_events, createdEvent];
+                                                addEventToState(createdEvent);
                                             }
                                             
                                             // Create end travel day only if checkbox is checked for this CRC
@@ -34664,7 +34763,7 @@
                                                         console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
                                                         const created = await apiService.createEvent(endTravelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
-                                                        state.crc_events = [...state.crc_events, createdEvent];
+                                                        addEventToState(createdEvent);
                                                     } else {
                                                         console.log('Travel day already exists for CRC:', crcId, 'on date:', endTravelDateStr, '- skipping creation');
                                                     }
@@ -34725,7 +34824,7 @@
                                                         console.log('Creating Travel Day event for:', dateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
                                                         const created = await apiService.createEvent(travelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
-                                                        state.crc_events = [...state.crc_events, createdEvent];
+                                                        addEventToState(createdEvent);
                                                     } else {
                                                         console.log('Travel day already exists for CRC:', crcId, 'on date:', dateStr, '- skipping creation');
                                                     }
@@ -47703,7 +47802,7 @@
                             try {
                                 const createdEvent = await apiService.createEvent(eventData);
                                 const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
-                                state.crc_events = [...state.crc_events, newEvent];
+                                addEventToState(newEvent);
                                 console.log(`Created event for approved time off request: ${request.id}`);
                             } catch (eventError) {
                                 console.error('Error syncing time off request to event:', eventError);
@@ -47836,7 +47935,18 @@
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     trucks.sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
+                    
+                    // DEDUPLICATION: Track seen event IDs to prevent duplicate events in state
+                    const seenEventIds = new Set();
+                    
                     const sanitizedEvents = Array.isArray(events) ? events.reduce((acc, event) => {
+                        // Skip duplicate events by ID
+                        if (event.id && seenEventIds.has(event.id)) {
+                            console.warn('Initial load: Skipping duplicate event ID:', event.id);
+                            return acc;
+                        }
+                        if (event.id) seenEventIds.add(event.id);
+                        
                         // CRITICAL: Normalize Travel Day events to ensure proper display
                         // This fixes previously created travel days that may have incorrect startDate/endDate
                         if (event.type === 'Travel Day') {
