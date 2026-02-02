@@ -5426,7 +5426,15 @@
                     }
                     
                     html += `
-                        <div class="flex gap-3 mt-4">
+                        <div class="p-3 bg-blue-50 dark:bg-blue-900/30 rounded-lg text-sm text-blue-800 dark:text-blue-200 mt-4 mb-3">
+                            <strong>Safe Mode:</strong> Auto-clean will only delete:
+                            <ul class="list-disc ml-5 mt-1">
+                                <li>Events with identical IDs (true database duplicates)</li>
+                                <li>PTO entries with identical type, period, AND hours</li>
+                            </ul>
+                            <p class="mt-1">It will <strong>NOT</strong> delete AM/PM splits or different PTO types on the same day.</p>
+                        </div>
+                        <div class="flex gap-3">
                             <button data-action="auto-cleanup-duplicates" class="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700">
                                 <i data-lucide="trash-2" class="w-4 h-4 inline mr-1"></i>
                                 Auto-Clean Duplicates
@@ -5443,19 +5451,23 @@
             };
             
             // Auto-cleanup duplicates from the database
+            // SAFE MODE: Only deletes TRUE duplicates (same exact ID appearing multiple times)
+            // Does NOT delete PTO events that just happen to be on the same date (could be AM/PM split)
             const autoCleanupDuplicates = async () => {
                 const dupes = findDuplicates();
                 let deletedCount = 0;
                 let errorCount = 0;
+                let skippedPto = 0;
                 
                 showNotification('Cleaning up duplicates... Please wait.', 'info');
                 
-                // Delete duplicate events (keep first, delete rest)
+                // SAFE: Only delete events with IDENTICAL IDs (true database duplicates)
+                // These are definitely duplicates - same ID should only exist once
                 for (const dupe of dupes.events) {
+                    // Keep the first one, delete the rest (they have the same ID)
                     for (let i = 1; i < dupe.events.length; i++) {
                         try {
                             await apiService.deleteEvent(dupe.events[i].id);
-                            state.crc_events = state.crc_events.filter(e => e.id !== dupe.events[i].id);
                             deletedCount++;
                         } catch (err) {
                             console.error('Error deleting duplicate event:', err);
@@ -5464,28 +5476,62 @@
                     }
                 }
                 
-                // Delete duplicate PTO events (keep first, delete rest)
+                // SAFE: For PTO duplicates by date, only delete if they have IDENTICAL properties
+                // (same type, same period, same hours) - these are true duplicates
+                // Skip if they differ (could be AM/PM split or different PTO types)
                 for (const dupe of dupes.ptoByDateCrc) {
+                    const first = dupe.events[0];
                     for (let i = 1; i < dupe.events.length; i++) {
-                        try {
-                            await apiService.deleteEvent(dupe.events[i].id);
-                            state.crc_events = state.crc_events.filter(e => e.id !== dupe.events[i].id);
-                            deletedCount++;
-                        } catch (err) {
-                            console.error('Error deleting duplicate PTO event:', err);
-                            errorCount++;
+                        const current = dupe.events[i];
+                        // Only delete if it's truly identical (same type, period, hours)
+                        const isTrueDuplicate = 
+                            first.type === current.type &&
+                            first.period === current.period &&
+                            (first.hours || 8) === (current.hours || 8);
+                        
+                        if (isTrueDuplicate) {
+                            try {
+                                await apiService.deleteEvent(current.id);
+                                state.crc_events = state.crc_events.filter(e => e.id !== current.id);
+                                deletedCount++;
+                            } catch (err) {
+                                console.error('Error deleting duplicate PTO event:', err);
+                                errorCount++;
+                            }
+                        } else {
+                            // Different properties - might be legitimate (AM/PM split)
+                            skippedPto++;
+                            console.log('Skipped potential false-positive PTO duplicate:', {
+                                crc: dupe.crcName,
+                                date: dupe.date,
+                                first: { type: first.type, period: first.period, hours: first.hours },
+                                current: { type: current.type, period: current.period, hours: current.hours }
+                            });
                         }
                     }
                 }
                 
+                // Refresh state from server to ensure consistency
+                try {
+                    const updatedEvents = await apiService.getEvents();
+                    setState({ crc_events: updatedEvents });
+                } catch (err) {
+                    console.error('Error refreshing events after cleanup:', err);
+                }
+                
                 closeModal();
                 
+                let message = `Cleaned ${deletedCount} duplicate(s)`;
+                if (skippedPto > 0) {
+                    message += `, skipped ${skippedPto} potential AM/PM splits`;
+                }
                 if (errorCount > 0) {
-                    showNotification(`Cleaned ${deletedCount} duplicates with ${errorCount} errors.`, 'warning');
+                    message += ` with ${errorCount} error(s)`;
+                    showNotification(message, 'warning');
                 } else if (deletedCount > 0) {
-                    showNotification(`Successfully cleaned ${deletedCount} duplicate entries!`, 'success');
+                    showNotification(message + '!', 'success');
                 } else {
-                    showNotification('No duplicates to clean.', 'info');
+                    showNotification('No true duplicates to clean. Some entries may be legitimate AM/PM splits.', 'info');
                 }
                 
                 renderContent();
