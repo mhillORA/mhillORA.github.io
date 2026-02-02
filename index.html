@@ -5146,6 +5146,22 @@
                         console.warn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate events from crc_events`);
                     }
                 }
+                
+                // DEDUPLICATION: Always deduplicate timeOffRequests by ID when state changes
+                if (Array.isArray(state.timeOffRequests) && state.timeOffRequests.length > 0) {
+                    const seenIds = new Set();
+                    const beforeCount = state.timeOffRequests.length;
+                    state.timeOffRequests = state.timeOffRequests.filter(request => {
+                        if (!request.id) return true; // Keep requests without ID
+                        if (seenIds.has(request.id)) return false; // Skip duplicates
+                        seenIds.add(request.id);
+                        return true;
+                    });
+                    const afterCount = state.timeOffRequests.length;
+                    if (beforeCount !== afterCount) {
+                        console.warn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate time off requests`);
+                    }
+                }
                 if (options.skipRender) {
                     return;
                 }
@@ -5207,6 +5223,272 @@
                 if (eventsToAdd.length > 0) {
                     state.crc_events = [...state.crc_events, ...eventsToAdd];
                 }
+            };
+            
+            // Utility function to deduplicate arrays by a key function
+            const deduplicateArray = (arr, keyFn) => {
+                if (!Array.isArray(arr)) return arr;
+                const seen = new Set();
+                return arr.filter(item => {
+                    const key = keyFn(item);
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                });
+            };
+            
+            // Force deduplicate state data - can be called manually to clean up
+            const forceDeduplicateState = () => {
+                let deduped = 0;
+                
+                // Deduplicate crc_events
+                if (Array.isArray(state.crc_events)) {
+                    const before = state.crc_events.length;
+                    state.crc_events = deduplicateArray(state.crc_events, e => e.id || JSON.stringify(e));
+                    deduped += before - state.crc_events.length;
+                }
+                
+                // Deduplicate timeOffRequests
+                if (Array.isArray(state.timeOffRequests)) {
+                    const before = state.timeOffRequests.length;
+                    state.timeOffRequests = deduplicateArray(state.timeOffRequests, r => r.id || JSON.stringify(r));
+                    deduped += before - state.timeOffRequests.length;
+                }
+                
+                // Deduplicate travel
+                if (Array.isArray(state.travel)) {
+                    const before = state.travel.length;
+                    state.travel = deduplicateArray(state.travel, t => t.id || t.navanBookingId || t.navanBookingUuid || JSON.stringify(t));
+                    deduped += before - state.travel.length;
+                }
+                
+                if (deduped > 0) {
+                    console.warn(`CHAOS: Force deduplicated ${deduped} duplicate items from state`);
+                }
+                
+                return deduped;
+            };
+            
+            // Find and report duplicates in the data - returns detailed info for cleanup
+            const findDuplicates = () => {
+                const duplicates = {
+                    events: [],
+                    eventsByIdCount: new Map(),
+                    ptoByDateCrc: [],
+                    timeOffRequests: [],
+                    travel: []
+                };
+                
+                // Find duplicate event IDs
+                const eventIdCounts = new Map();
+                (state.crc_events || []).forEach(e => {
+                    if (e.id) {
+                        if (!eventIdCounts.has(e.id)) {
+                            eventIdCounts.set(e.id, []);
+                        }
+                        eventIdCounts.get(e.id).push(e);
+                    }
+                });
+                eventIdCounts.forEach((events, id) => {
+                    if (events.length > 1) {
+                        duplicates.events.push({ id, count: events.length, events });
+                    }
+                });
+                
+                // Find duplicate PTO events (same CRC + same date)
+                const ptoMap = new Map();
+                (state.crc_events || []).forEach(e => {
+                    if (['Paid Time Off', 'PTO', 'Unavailable', 'Time Off'].includes(e.type) && e.crcId && e.date) {
+                        const key = `${e.crcId}_${e.date}`;
+                        if (!ptoMap.has(key)) {
+                            ptoMap.set(key, []);
+                        }
+                        ptoMap.get(key).push(e);
+                    }
+                });
+                ptoMap.forEach((events, key) => {
+                    if (events.length > 1) {
+                        const [crcId, date] = key.split('_');
+                        const crc = state.crcs.find(c => c.id === crcId);
+                        duplicates.ptoByDateCrc.push({ 
+                            crcId, 
+                            crcName: crc?.name || crcId,
+                            date, 
+                            count: events.length, 
+                            events 
+                        });
+                    }
+                });
+                
+                // Find duplicate time off request IDs
+                const requestIdCounts = new Map();
+                (state.timeOffRequests || []).forEach(r => {
+                    if (r.id) {
+                        if (!requestIdCounts.has(r.id)) {
+                            requestIdCounts.set(r.id, []);
+                        }
+                        requestIdCounts.get(r.id).push(r);
+                    }
+                });
+                requestIdCounts.forEach((requests, id) => {
+                    if (requests.length > 1) {
+                        duplicates.timeOffRequests.push({ id, count: requests.length, requests });
+                    }
+                });
+                
+                return duplicates;
+            };
+            
+            // Show duplicate finder modal
+            const showDuplicateFinderModal = () => {
+                const dupes = findDuplicates();
+                const totalDupes = dupes.events.length + dupes.ptoByDateCrc.length + dupes.timeOffRequests.length;
+                
+                let html = `
+                    <h2 class="text-2xl font-bold dark:text-white mb-4">Duplicate Finder</h2>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
+                        Scans your data for duplicate entries that may cause issues in reports.
+                    </p>
+                `;
+                
+                if (totalDupes === 0) {
+                    html += `
+                        <div class="p-4 bg-green-100 dark:bg-green-900/30 rounded-lg text-green-800 dark:text-green-200">
+                            <i data-lucide="check-circle" class="w-5 h-5 inline mr-2"></i>
+                            No duplicates found! Your data is clean.
+                        </div>
+                    `;
+                } else {
+                    html += `
+                        <div class="p-4 bg-yellow-100 dark:bg-yellow-900/30 rounded-lg text-yellow-800 dark:text-yellow-200 mb-4">
+                            <i data-lucide="alert-triangle" class="w-5 h-5 inline mr-2"></i>
+                            Found ${totalDupes} duplicate issue(s) that may affect reports.
+                        </div>
+                    `;
+                    
+                    // Duplicate Event IDs
+                    if (dupes.events.length > 0) {
+                        html += `
+                            <div class="mb-4">
+                                <h3 class="font-semibold text-lg mb-2 text-red-600 dark:text-red-400">
+                                    Duplicate Event IDs (${dupes.events.length})
+                                </h3>
+                                <div class="max-h-40 overflow-y-auto bg-gray-50 dark:bg-gray-800 rounded p-2 text-sm">
+                                    ${dupes.events.map(d => `
+                                        <div class="py-1 border-b dark:border-gray-700">
+                                            <strong>ID:</strong> ${d.id.substring(0, 8)}... 
+                                            <span class="text-red-500">(${d.count}x)</span>
+                                            - Type: ${d.events[0]?.type || 'Unknown'}
+                                            - Date: ${d.events[0]?.date || 'N/A'}
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `;
+                    }
+                    
+                    // Duplicate PTO by CRC+Date
+                    if (dupes.ptoByDateCrc.length > 0) {
+                        html += `
+                            <div class="mb-4">
+                                <h3 class="font-semibold text-lg mb-2 text-orange-600 dark:text-orange-400">
+                                    Duplicate PTO/Time Off (Same CRC + Date) (${dupes.ptoByDateCrc.length})
+                                </h3>
+                                <div class="max-h-40 overflow-y-auto bg-gray-50 dark:bg-gray-800 rounded p-2 text-sm">
+                                    ${dupes.ptoByDateCrc.map(d => `
+                                        <div class="py-1 border-b dark:border-gray-700">
+                                            <strong>${d.crcName}</strong> on ${d.date}
+                                            <span class="text-orange-500">(${d.count} entries)</span>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `;
+                    }
+                    
+                    // Duplicate Time Off Requests
+                    if (dupes.timeOffRequests.length > 0) {
+                        html += `
+                            <div class="mb-4">
+                                <h3 class="font-semibold text-lg mb-2 text-purple-600 dark:text-purple-400">
+                                    Duplicate Time Off Request IDs (${dupes.timeOffRequests.length})
+                                </h3>
+                                <div class="max-h-40 overflow-y-auto bg-gray-50 dark:bg-gray-800 rounded p-2 text-sm">
+                                    ${dupes.timeOffRequests.map(d => `
+                                        <div class="py-1 border-b dark:border-gray-700">
+                                            <strong>ID:</strong> ${d.id.substring(0, 8)}...
+                                            <span class="text-purple-500">(${d.count}x)</span>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `;
+                    }
+                    
+                    html += `
+                        <div class="flex gap-3 mt-4">
+                            <button data-action="auto-cleanup-duplicates" class="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700">
+                                <i data-lucide="trash-2" class="w-4 h-4 inline mr-1"></i>
+                                Auto-Clean Duplicates
+                            </button>
+                            <button data-action="close-modal" class="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600">
+                                Close
+                            </button>
+                        </div>
+                    `;
+                }
+                
+                openModal(html, 'lg');
+                lucide.createIcons();
+            };
+            
+            // Auto-cleanup duplicates from the database
+            const autoCleanupDuplicates = async () => {
+                const dupes = findDuplicates();
+                let deletedCount = 0;
+                let errorCount = 0;
+                
+                showNotification('Cleaning up duplicates... Please wait.', 'info');
+                
+                // Delete duplicate events (keep first, delete rest)
+                for (const dupe of dupes.events) {
+                    for (let i = 1; i < dupe.events.length; i++) {
+                        try {
+                            await apiService.deleteEvent(dupe.events[i].id);
+                            state.crc_events = state.crc_events.filter(e => e.id !== dupe.events[i].id);
+                            deletedCount++;
+                        } catch (err) {
+                            console.error('Error deleting duplicate event:', err);
+                            errorCount++;
+                        }
+                    }
+                }
+                
+                // Delete duplicate PTO events (keep first, delete rest)
+                for (const dupe of dupes.ptoByDateCrc) {
+                    for (let i = 1; i < dupe.events.length; i++) {
+                        try {
+                            await apiService.deleteEvent(dupe.events[i].id);
+                            state.crc_events = state.crc_events.filter(e => e.id !== dupe.events[i].id);
+                            deletedCount++;
+                        } catch (err) {
+                            console.error('Error deleting duplicate PTO event:', err);
+                            errorCount++;
+                        }
+                    }
+                }
+                
+                closeModal();
+                
+                if (errorCount > 0) {
+                    showNotification(`Cleaned ${deletedCount} duplicates with ${errorCount} errors.`, 'warning');
+                } else if (deletedCount > 0) {
+                    showNotification(`Successfully cleaned ${deletedCount} duplicate entries!`, 'success');
+                } else {
+                    showNotification('No duplicates to clean.', 'info');
+                }
+                
+                renderContent();
             };
 
             const render = () => {
@@ -9191,6 +9473,9 @@
             };
 
             const performExportWithDateRange = (startDate, endDate, selectedEventTypes = [], exportFormat = 'csv') => {
+                // Force deduplication before export
+                forceDeduplicateState();
+                
                 // DEDUPLICATION: Track seen event IDs to prevent duplicate events in export
                 const seenEventIds = new Set();
                 
@@ -11857,6 +12142,9 @@
                 lucide.createIcons();
             };
             const exportUtilizationReport = () => {
+                // Force deduplication before export
+                forceDeduplicateState();
+                
                 const data = state.reportData;
                 if (!data || data.length === 0) {
                     showNotification('No report data to export.', 'info');
@@ -12198,6 +12486,9 @@
             };
 
             const exportTimeOffReport = () => {
+                // Force deduplication before export
+                forceDeduplicateState();
+                
                 const reportState = state.timeOffReportData;
                 if (!reportState || !Array.isArray(reportState.rows) || reportState.rows.length === 0) {
                     showNotification('No time off report data to export.', 'info');
@@ -19985,6 +20276,9 @@
             };
 
             const exportAllSchedule = () => {
+                // Force deduplication before export
+                forceDeduplicateState();
+                
                 // Check if current user is CRC and get their ID
                 const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
                 const matchingCrcId = getLoggedInCrcId();
@@ -27637,6 +27931,8 @@
                     case 'open-add-truck-modal': openModal(getAddTruckModalHTML(), '4xl'); break;
                     case 'open-truck-schedule-modal': openModal(getTruckScheduleModalHTML(), '4xl'); break;
                     case 'open-maintenance-modal': openModal(getMaintenanceModalHTML(), '4xl'); break;
+                    case 'find-duplicates': showDuplicateFinderModal(); break;
+                    case 'auto-cleanup-duplicates': autoCleanupDuplicates(); break;
                     case 'view-truck-details': {
                         const truck = state.trucks.find(t => t.id === id);
                         if (truck) openModal(getTruckDetailsModalHTML(truck), '4xl');
