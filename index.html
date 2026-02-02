@@ -7854,8 +7854,8 @@
                             const role = state.roles.find(r => r.id === roleId);
                             const roleName = role ? role.name : 'Role';
                             
-                            // Get all qualified CRCs for this role
-                            const qualifiedCrcs = state.crcs.filter(c => hasValidTraining(c, roleName))
+                            // Get all qualified CRCs for this role (exclude deactivated)
+                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             // Get existing assignments for this role
@@ -8095,7 +8095,7 @@
                             if (!role) return;
                             
                             const roleName = role.name;
-                            const qualifiedCrcs = state.crcs.filter(c => hasValidTraining(c, roleName))
+                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             const container = e.target.previousElementSibling;
@@ -8159,7 +8159,7 @@
                             if (!role) return;
                             
                             const roleName = role.name;
-                            const qualifiedCrcs = state.crcs.filter(c => hasValidTraining(c, roleName))
+                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             const container = e.target.closest('.border').querySelector(`#duplicate-role-${roleId}-assignments`);
@@ -10688,21 +10688,20 @@
                     // If event has a valid crcId, it's valid
                     if (event.crcId && event.crcId !== 'UNASSIGNED' && event.crcId !== 'SITE_STAFF') return true;
                     
-                    // If event has valid roleAssignments, it's valid
+                    // If event has roleAssignments with any meaningful values (including UNASSIGNED), it's valid
+                    // UNASSIGNED in roleAssignments marks a shift that needs to be filled
                     if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                        const hasValidAssignment = Object.values(event.roleAssignments).some(assignments => {
+                        const hasMeaningfulAssignment = Object.values(event.roleAssignments).some(assignments => {
                             if (Array.isArray(assignments)) {
                                 return assignments.some(crcId => 
                                     crcId && 
                                     typeof crcId === 'string' &&
-                                    crcId.trim() !== '' &&
-                                    crcId !== 'SITE_STAFF' && 
-                                    crcId !== 'UNASSIGNED'
+                                    crcId.trim() !== ''
                                 );
                             }
                             return false;
                         });
-                        if (hasValidAssignment) return true;
+                        if (hasMeaningfulAssignment) return true;
                     }
                     
                     // Otherwise, filter it out (it's an N/A entry)
@@ -30801,6 +30800,27 @@
                             const updatedUser = { ...user, active: !isCurrentlyActive };
                             
                             await apiService.updateUser(userId, updatedUser);
+                            
+                            // CRITICAL: Also update linked CRC's active status
+                            // When deactivating a user, also deactivate their linked CRC
+                            // When activating a user, also activate their linked CRC
+                            if (user.crcId) {
+                                const linkedCrc = state.crcs.find(c => c.id === user.crcId);
+                                if (linkedCrc) {
+                                    const updatedCrc = { ...linkedCrc, active: !isCurrentlyActive };
+                                    try {
+                                        await apiService.updateCrc(user.crcId, updatedCrc);
+                                        setState({
+                                            crcs: state.crcs.map(c => c.id === user.crcId ? updatedCrc : c)
+                                        });
+                                        console.log(`CRC ${linkedCrc.name} ${!isCurrentlyActive ? 'activated' : 'deactivated'} along with user`);
+                                    } catch (crcError) {
+                                        console.error('Error updating linked CRC status:', crcError);
+                                        // Continue even if CRC update fails - user is still updated
+                                    }
+                                }
+                            }
+                            
                             setState({
                                 users: state.users.map(u => u.id === userId ? updatedUser : u)
                             });
@@ -31643,14 +31663,14 @@
                                 const quantity = roleQuantities[roleId] || filteredIds.length;
                                 // Use existing assignments, but ensure we have the quantity specified
                                 roleAssignmentsForDuplicate[roleId] = filteredIds.slice(0, quantity);
-                                // If quantity is larger, pad with nulls (empty slots that can be filled later)
+                                // If quantity is larger, pad with UNASSIGNED (empty slots that can be filled later)
                                 while (roleAssignmentsForDuplicate[roleId].length < quantity) {
-                                    roleAssignmentsForDuplicate[roleId].push(null);
+                                    roleAssignmentsForDuplicate[roleId].push('UNASSIGNED');
                                 }
                             });
                             
-                            // Check if we have any actual assignments (not just nulls)
-                            const hasActualAssignments = Object.values(roleAssignmentsForDuplicate).some(ids => ids.some(id => id !== null));
+                            // Check if we have any actual assignments (not just UNASSIGNED)
+                            const hasActualAssignments = Object.values(roleAssignmentsForDuplicate).some(ids => ids.some(id => id && id !== 'UNASSIGNED'));
                             if (!hasActualAssignments && Object.keys(roleQuantities).length === 0) {
                                 showNotification('Duplicate schedule skipped: no assignments selected.', 'warning');
                                 return;
@@ -31811,6 +31831,8 @@
                                                 startDate: startTravelDateStr,  // CRITICAL: Single day
                                                 endDate: startTravelDateStr,    // CRITICAL: Single day
                                                 groupId: `travel-${crcId}-${startTravelDateStr}`,  // Unique groupId
+                                                parentShiftGroupId: groupIdDuplicate,  // Link to parent shift
+                                                isTravelBefore: true,  // Travel before shift starts
                                                 type: 'Travel Day',
                                                 hours: travelHours
                                             };
@@ -31854,10 +31876,11 @@
                                         const endTravelDateStr = toDateOnlyString(endTravelDate);
                                         
                                         // Check if travel day already exists for this CRC on this date
+                                        // CRITICAL: Check both crcId AND crcIds array
                                         const existingTravelDay = state.crc_events.find(e => 
-                                            e.crcId === crcId && 
+                                            e.type === 'Travel Day' && 
                                             e.date === endTravelDateStr && 
-                                            e.type === 'Travel Day'
+                                            (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
                                         );
                                         
                                         // Only create if it doesn't already exist
@@ -32018,8 +32041,8 @@
                                 Object.entries(adhocRoleConfigForInit).forEach(([roleId, qty]) => {
                                     const parsedQty = parseInt(qty) || 0;
                                     if (parsedQty > 0 && !roleAssignments[roleId]) {
-                                        // Initialize with empty array of correct length
-                                        roleAssignments[roleId] = new Array(parsedQty).fill(null);
+                                        // Initialize with UNASSIGNED array of correct length
+                                        roleAssignments[roleId] = new Array(parsedQty).fill('UNASSIGNED');
                                     }
                                 });
                                 
@@ -32041,10 +32064,10 @@
                                     }
                                     // Ensure array is large enough
                                     while (roleAssignments[roleId].length <= index) {
-                                        roleAssignments[roleId].push(null);
+                                        roleAssignments[roleId].push('UNASSIGNED');
                                     }
-                                    // Always set the value, even if empty (to allow clearing assignments)
-                                    const value = input.value && input.value.trim() !== '' ? input.value : null;
+                                    // Always set the value - convert empty/blank to UNASSIGNED so it shows on unfilled shifts
+                                    const value = input.value && input.value.trim() !== '' ? input.value : 'UNASSIGNED';
                                     roleAssignments[roleId][index] = value;
                                     // Reduced logging for performance
                                 });
@@ -32057,9 +32080,9 @@
                                         if (!roleAssignments[roleId]) {
                                             roleAssignments[roleId] = [];
                                         }
-                                        // Ensure array matches the ad hoc quantity
+                                        // Ensure array matches the ad hoc quantity - use UNASSIGNED for empty slots
                                         while (roleAssignments[roleId].length < parsedQty) {
-                                            roleAssignments[roleId].push(null);
+                                            roleAssignments[roleId].push('UNASSIGNED');
                                         }
                                         roleAssignments[roleId].length = parsedQty;
                                     }
@@ -32079,9 +32102,9 @@
                                         if (!roleAssignments[roleId]) {
                                             roleAssignments[roleId] = [];
                                         }
-                                        // Ensure array matches quantity, padding with nulls if needed
+                                        // Ensure array matches quantity, padding with UNASSIGNED if needed
                                         while (roleAssignments[roleId].length < quantity) {
-                                            roleAssignments[roleId].push(null);
+                                            roleAssignments[roleId].push('UNASSIGNED');
                                         }
                                         roleAssignments[roleId].length = quantity;
                                     }
@@ -32176,16 +32199,17 @@
                                 
                                 Object.keys(roleAssignments).forEach(roleId => {
                                     const assignmentsArray = roleAssignments[roleId] || [];
-                                    // Check if there's at least one valid assignment (not null, not empty string, not 'UNASSIGNED')
-                                    const hasValidAssignment = assignmentsArray.some(crcId => 
+                                    // Check if there's at least one meaningful assignment (CRC, SITE_STAFF, or UNASSIGNED)
+                                    // UNASSIGNED is a valid value that marks a role as "needs to be filled"
+                                    // Only filter out roles where ALL slots are null or empty string
+                                    const hasMeaningfulAssignment = assignmentsArray.some(crcId => 
                                         crcId && 
                                         typeof crcId === 'string' &&
-                                        crcId.trim() !== '' &&
-                                        crcId !== 'UNASSIGNED'
+                                        crcId.trim() !== ''
                                     );
                                     
-                                    // Always include if it has valid assignments OR if it's an ad hoc role
-                                    if (hasValidAssignment || adhocRoleIds.includes(roleId)) {
+                                    // Always include if it has meaningful assignments (including UNASSIGNED) OR if it's an ad hoc role
+                                    if (hasMeaningfulAssignment || adhocRoleIds.includes(roleId)) {
                                         filteredRoleAssignments[roleId] = assignmentsArray;
                                     }
                                 });
@@ -32194,9 +32218,9 @@
                                 // This ensures ad hoc roles are saved even if they don't have assignments yet
                                 adhocRoleIds.forEach(roleId => {
                                     if (!filteredRoleAssignments[roleId]) {
-                                        // Initialize with empty array of correct length
+                                        // Initialize with UNASSIGNED array of correct length
                                         const qty = parseInt(adhocRoleConfig[roleId]) || 0;
-                                        filteredRoleAssignments[roleId] = new Array(qty).fill(null);
+                                        filteredRoleAssignments[roleId] = new Array(qty).fill('UNASSIGNED');
                                     }
                                 });
                                 
@@ -33520,10 +33544,11 @@
                                                 const dateStr = toDateOnlyString(dayCursor);
                                                 
                                                 // Check if travel day already exists for this CRC on this date
+                                                // CRITICAL: Check both crcId AND crcIds array
                                                 const existingTravelDay = state.crc_events.find(e => 
-                                                    e.crcId === travelCrcId && 
+                                                    e.type === 'Travel Day' && 
                                                     e.date === dateStr && 
-                                                    e.type === 'Travel Day'
+                                                    (e.crcId === travelCrcId || (Array.isArray(e.crcIds) && e.crcIds.includes(travelCrcId)))
                                                 );
                                                 
                                                 // Only create if it doesn't already exist
@@ -33611,16 +33636,23 @@
                                             const matchesCrcId = (event, crcId) =>
                                                 event.crcId === crcId || (Array.isArray(event.crcIds) && event.crcIds.includes(crcId));
 
-                                            const upsertTravelDayForCrc = async ({ crcId, travelDateStr, isBefore }) => {
-                                                console.log(`[TRAVEL DEBUG] upsertTravelDayForCrc called: crcId=${crcId}, date=${travelDateStr}, isBefore=${isBefore}`);
+                                            const upsertTravelDayForCrc = async ({ crcId, travelDateStr, isBefore, parentShiftGroupId }) => {
+                                                console.log(`[TRAVEL DEBUG] upsertTravelDayForCrc called: crcId=${crcId}, date=${travelDateStr}, isBefore=${isBefore}, parentShiftGroupId=${parentShiftGroupId}`);
                                                 if (!travelDateStr) {
                                                     console.log(`[TRAVEL DEBUG] No travelDateStr, returning early`);
                                                     return;
                                                 }
-                                                // CRITICAL FIX: Check by date + CRC only, NOT groupId
-                                                // Travel days have their own unique groupId, so checking parent groupId won't find them
+                                                // CRITICAL FIX: Check by parentShiftGroupId + CRC + isBefore to find linked travel days
+                                                // This prevents duplicates when dates change
                                                 const existingTravelDay = state.crc_events.find(e =>
                                                     e.type === 'Travel Day' &&
+                                                    e.parentShiftGroupId === parentShiftGroupId &&
+                                                    matchesCrcId(e, crcId) &&
+                                                    e.isTravelBefore === isBefore
+                                                ) || state.crc_events.find(e =>
+                                                    // Fallback: check by date + CRC for legacy travel days without parentShiftGroupId
+                                                    e.type === 'Travel Day' &&
+                                                    !e.parentShiftGroupId &&
                                                     e.date === travelDateStr &&
                                                     matchesCrcId(e, crcId)
                                                 );
@@ -33643,6 +33675,9 @@
                                                         // NOTE: Travel days get their OWN groupId (not the shift's groupId)
                                                         // This prevents them from being grouped with the main shift in display
                                                         groupId: `travel-${crcId}-${travelDateStr}`,
+                                                        // CRITICAL: Link travel day to parent shift for proper updates
+                                                        parentShiftGroupId: parentShiftGroupId,
+                                                        isTravelBefore: isBefore,  // true = travel before shift, false = travel after shift
                                                         type: 'Travel Day',
                                                         hours: travelHours,
                                                         notes: '',
@@ -33757,6 +33792,8 @@
                                                 console.log(`[TRAVEL DEBUG] CRC ${crcId}: startCheckbox found=${!!startCheckbox}, checked=${startCheckbox?.checked}, endCheckbox found=${!!endCheckbox}, checked=${endCheckbox?.checked}`);
                                                 
                                                 // Get travel dates
+                                                // START travel = day BEFORE shift starts
+                                                // END travel = day AFTER shift ends
                                                 const startTravelDateInput = form.querySelector(`input[name="travel-start-date-${crcId}"]`);
                                                 const endTravelDateInput = form.querySelector(`input[name="travel-end-date-${crcId}"]`);
                                                 
@@ -33766,7 +33803,10 @@
                                                 } else if (includeStartTravelForCrc) {
                                                     const startDateObj = startDate instanceof Date ? startDate : parseDateOnly(startDate);
                                                     if (startDateObj) {
-                                                        startTravelDateStr = toDateOnlyString(startDateObj);
+                                                        // Travel day BEFORE shift starts
+                                                        const travelDate = new Date(startDateObj);
+                                                        travelDate.setDate(travelDate.getDate() - 1);
+                                                        startTravelDateStr = toDateOnlyString(travelDate);
                                                     }
                                                 }
                                                 
@@ -33776,7 +33816,10 @@
                                                 } else if (includeEndTravelForCrc) {
                                                     const endDateObj = endDate instanceof Date ? endDate : parseDateOnly(endDate);
                                                     if (endDateObj) {
-                                                        endTravelDateStr = toDateOnlyString(endDateObj);
+                                                        // Travel day AFTER shift ends
+                                                        const travelDate = new Date(endDateObj);
+                                                        travelDate.setDate(travelDate.getDate() + 1);
+                                                        endTravelDateStr = toDateOnlyString(travelDate);
                                                     }
                                                 }
                                                 
@@ -33993,10 +34036,11 @@
                                                 
                                                 if (startTravelDateStr) {
                                                     // Check if travel day already exists for this CRC on this date
+                                                    // CRITICAL: Check both crcId AND crcIds array
                                                     const existingTravelDay = state.crc_events.find(e => 
-                                                        e.crcId === crcId && 
+                                                        e.type === 'Travel Day' && 
                                                         e.date === startTravelDateStr && 
-                                                        e.type === 'Travel Day'
+                                                        (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
                                                     );
                                                     
                                                     // Only create if it doesn't already exist
@@ -34124,10 +34168,11 @@
                                                 
                                                 if (endTravelDateStr) {
                                                     // Check if travel day already exists for this CRC on this date
+                                                    // CRITICAL: Check both crcId AND crcIds array
                                                     const existingTravelDay = state.crc_events.find(e => 
-                                                        e.crcId === crcId && 
+                                                        e.type === 'Travel Day' && 
                                                         e.date === endTravelDateStr && 
-                                                        e.type === 'Travel Day'
+                                                        (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
                                                     );
                                                     
                                                     // Only create if it doesn't already exist
@@ -34181,10 +34226,11 @@
                                                     const dateStr = toDateOnlyString(dayCursor);
                                                     
                                                     // Check if travel day already exists for this CRC on this date
+                                                    // CRITICAL: Check both crcId AND crcIds array
                                                     const existingTravelDay = state.crc_events.find(e => 
-                                                        e.crcId === crcId && 
+                                                        e.type === 'Travel Day' && 
                                                         e.date === dateStr && 
-                                                        e.type === 'Travel Day'
+                                                        (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
                                                     );
                                                     
                                                     // Only create if it doesn't already exist
@@ -36069,9 +36115,10 @@
                             currentRoleAssignments[roleId] = [];
                         }
                         while (currentRoleAssignments[roleId].length <= index) {
-                            currentRoleAssignments[roleId].push(null);
+                            currentRoleAssignments[roleId].push('UNASSIGNED');
                         }
-                        currentRoleAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : null;
+                        // Convert empty to UNASSIGNED for consistency
+                        currentRoleAssignments[roleId][index] = input.value && input.value.trim() !== '' ? input.value : 'UNASSIGNED';
                     }
                 });
                 
@@ -36405,7 +36452,7 @@
                                                 const roleName = role ? role.name : '';
                                                 
                                                 const allowOverrideEdit = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                                const qualifiedCrcs = state.crcs.filter(c => allowOverrideEdit ? true : hasValidTraining(c, roleName))
+                                                const qualifiedCrcs = state.crcs.filter(c => c.active !== false && (allowOverrideEdit ? true : hasValidTraining(c, roleName)))
                                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                                 const trainingTypeValue = (mergedTrainingAssignments[roleId] && mergedTrainingAssignments[roleId][index]) || getExistingTrainingType(roleId, index);
                                                 const trainingModeKey = `${roleId}-${index}`;
@@ -36622,11 +36669,11 @@
                                 const eventRoles = existingEvent.roles || [];
                                 let qualifiedCrcs = state.crcs;
                                 
-                                // If there are specific roles, filter by training
+                                // If there are specific roles, filter by training (and active status)
                                 if (eventRoles.length > 0) {
                                     qualifiedCrcs = state.crcs.filter(c => {
-                                        // CRC must have training for at least one of the roles
-                                        return eventRoles.some(role => hasValidTraining(c, role));
+                                        // CRC must be active and have training for at least one of the roles
+                                        return c.active !== false && eventRoles.some(role => hasValidTraining(c, role));
                                     });
                                 }
                                 // Sort alphabetically
@@ -37235,8 +37282,8 @@
                         const existingCrcId = existingAssignments[0] || '';
                         
                         const allowOverrideRole = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                        // Only show CRCs who have valid training for this role (or all if override)
-                        let qualifiedCrcs = state.crcs.filter(crc => allowOverrideRole ? true : hasValidTraining(crc, roleName))
+                        // Only show CRCs who are active and have valid training for this role (or all if override)
+                        let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         
                         // IMPORTANT: If editing, include assigned CRCs even if they don't have training
@@ -37259,9 +37306,9 @@
                         const requiredTrainingNames = getTrainingNamesForRole(roleName);
                         const roleRequiresTraining = requiredTrainingNames.length > 0;
                         
-                        // If role doesn't require training, include all CRCs (for new CRCs without training records)
+                        // If role doesn't require training, include all active CRCs (for new CRCs without training records)
                         if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                            qualifiedCrcs = state.crcs.filter(crc => crc && crc.id)
+                            qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false)
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         }
                         
@@ -37571,7 +37618,7 @@
                                 if (!roleForSlot) return;
                                 
                                 const allowOverrideQty = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                const qualifiedCrcs = state.crcs.filter(crc => allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name))
+                                const qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
@@ -37773,8 +37820,8 @@
                     let existingAssignments = (mergedRoleAssignments[roleId] || []).filter(Boolean);
                     
                     const allowOverrideReq = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                    // Get CRCs who can fill this role (only show those with valid training, or all if override)
-                    let qualifiedCrcs = state.crcs.filter(crc => allowOverrideReq ? true : hasValidTraining(crc, role.name))
+                    // Get CRCs who are active and can fill this role (only show those with valid training, or all if override)
+                    let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
                         .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     
                     const untrainedAssignedCrcs = [];
@@ -37794,7 +37841,7 @@
                     const roleRequiresTraining = requiredTrainingNames.length > 0;
                     
                     if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                        qualifiedCrcs = state.crcs.filter(crc => crc && crc.id)
+                        qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false)
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     }
                     
@@ -38222,7 +38269,7 @@
                             
                             if (newQuantity > currentSlots) {
                                 const allowOverrideInc = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                const qualifiedCrcs = state.crcs.filter(crc => allowOverrideInc ? true : hasValidTraining(crc, role.name))
+                                const qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideInc ? true : hasValidTraining(crc, role.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
