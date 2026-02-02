@@ -2148,6 +2148,7 @@
                     return 'monthly';
                 })(), // 'monthly', 'weekly', or 'daily' for planning grid view
                 atAGlanceGroupBy: 'study', // 'study' or 'site'
+                atAGlanceViewMode: 'monthly', // 'daily', 'weekly', or 'monthly'
                 // --- FIX: Corrected syntax error from original file ---
                 activeTab: (() => {
                     // Check if there's a session with CRC user - if so, default to dashboard
@@ -2228,7 +2229,7 @@
                 undoHistoryMaxSize: 10, // Maximum number of undo states to keep
                 settings: {
                     'Site Assignment': 8,
-                    'Travel Day': 8,
+                    'Travel Day': 5,
                     'Paid Time Off': 8,
                     // New canonical category for PTO/unavailability going forward.
                     'Time Off': 8,
@@ -3812,11 +3813,20 @@
                 const requests = [...dbRequests, ...legacyRequests];
                 const summaries = new Map();
                 const monthKeysSet = new Set();
+                
+                // Track processed request IDs to prevent counting duplicate requests
+                const processedRequestIds = new Set();
+                // Track unique crcId + date + status combinations to prevent double-counting
+                const countedDateCrcStatus = new Set();
 
                 requests.forEach(request => {
                     if (!request) return;
                     const crcId = request.crcId;
                     if (!crcId) return;
+                    
+                    // Skip duplicate request IDs (from DB)
+                    if (request.id && processedRequestIds.has(request.id)) return;
+                    if (request.id) processedRequestIds.add(request.id);
 
                     const status = normalizeTimeOffStatus(request.status);
                     const start = parseDateFlexible(request.startDate || request.date);
@@ -3829,6 +3839,15 @@
                         const time = cursor.getTime();
                         if (time >= startTime && time <= endTime) {
                             const dateStr = toDateOnlyString(cursor);
+                            
+                            // Skip if we've already counted this crcId + date + status
+                            const countKey = `${crcId}_${dateStr}_${status}`;
+                            if (countedDateCrcStatus.has(countKey)) {
+                                cursor.setDate(cursor.getDate() + 1);
+                                continue;
+                            }
+                            countedDateCrcStatus.add(countKey);
+                            
                             const monthKey = getMonthKey(cursor);
                             monthKeysSet.add(monthKey);
 
@@ -4922,7 +4941,8 @@
             };
 
             // --- CALCULATION FUNCTIONS ---
-            const calculateMonthlyUtilization = (dateInMonth, crcIdsToCalculate = []) => {
+            const calculateMonthlyUtilization = (dateInMonth, crcIdsToCalculate = [], options = {}) => {
+                const { includeTravel = state.managerViewIncludeTravel !== false } = options;
                 const year = dateInMonth.getFullYear();
                 const month = dateInMonth.getMonth();
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
@@ -4941,34 +4961,54 @@
                     : state.crcs;
 
                 targetCrcs.forEach(crc => {
-                    const eventsThisMonth = state.crc_events.filter(e => {
+                    // Get Site Assignment events for this CRC
+                    const siteAssignmentEvents = state.crc_events.filter(e => {
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        // Check if CRC is assigned to this event (either as primary crcId or in roleAssignments)
-                        // AND it's a Site Assignment with CRC assigned (not empty/open shift)
                         return eventBelongsToCrc(e, crc.id) && 
                                eventDate.getFullYear() === year && 
                                eventDate.getMonth() === month &&
                                isSiteAssignmentWithCrc(e);
                     });
                     
+                    // Get Travel Day events for this CRC (if includeTravel is true)
+                    const travelEvents = includeTravel ? state.crc_events.filter(e => {
+                        const eventDate = new Date(e.date + 'T00:00:00');
+                        return eventBelongsToCrc(e, crc.id) && 
+                               eventDate.getFullYear() === year && 
+                               eventDate.getMonth() === month &&
+                               e.type === 'Travel Day';
+                    }) : [];
+                    
                     const nonWorkEventTypes = ['Paid Time Off', 'Unavailable'];
 
                     const productiveDaysSet = new Set();
-                    eventsThisMonth.forEach(e => {
-                        // Only count Site Assignments with CRCs assigned
+                    
+                    // Count Site Assignment days
+                    siteAssignmentEvents.forEach(e => {
                         if (isSiteAssignmentWithCrc(e)) {
                             productiveDaysSet.add(e.date);
                         }
                     });
+                    
+                    // Count Travel Day dates (if includeTravel is true)
+                    travelEvents.forEach(e => {
+                        productiveDaysSet.add(e.date);
+                    });
 
                     const nonWorkDaysSet = new Set();
-                    eventsThisMonth.forEach(e => {
+                    state.crc_events.filter(e => {
+                        const eventDate = new Date(e.date + 'T00:00:00');
+                        return eventBelongsToCrc(e, crc.id) && 
+                               eventDate.getFullYear() === year && 
+                               eventDate.getMonth() === month;
+                    }).forEach(e => {
                         if (nonWorkEventTypes.includes(e.type)) {
                            nonWorkDaysSet.add(e.date);
                         }
                     });
                     const productiveDays = productiveDaysSet.size;
                     const nonWorkDays = nonWorkDaysSet.size;
+                    const travelDays = travelEvents.length;
 
                     const crcAvailableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
                     const utilizationPercent = crcAvailableWorkDays > 0 ? Math.round((productiveDays / crcAvailableWorkDays) * 100) : 0;
@@ -4977,6 +5017,7 @@
                         utilizationPercent,
                         productiveDays,
                         nonWorkDays,
+                        travelDays,
                         availableWorkDays: crcAvailableWorkDays,
                         totalWorkDays: totalWorkingDaysInMonth
                     };
@@ -4984,7 +5025,8 @@
                 return stats;
             };
 
-            const calculateWeeklyUtilization = (dateInWeek) => {
+            const calculateWeeklyUtilization = (dateInWeek, options = {}) => {
+                const { includeTravel = state.managerViewIncludeTravel !== false } = options;
                 const dayOfWeek = getDaySaturdayStart(dateInWeek);
                 const startOfWeek = new Date(dateInWeek);
                 startOfWeek.setDate(dateInWeek.getDate() - dayOfWeek);
@@ -4996,16 +5038,23 @@
 
                 const stats = {};
                 state.crcs.forEach(crc => {
-                    // Only count Site Assignment events with CRCs assigned (not empty/open shifts)
+                    // Get all events for this week
                     const eventsThisWeek = state.crc_events.filter(e => {
                         const eventDate = new Date(e.date + 'T12:00:00');
                         return eventDate >= startOfWeek && 
                                eventDate <= endOfWeek;
                     });
-                    // Calculate hours using helper - Site Assignment only
-                    const totalHours = calculateCrcHours(eventsThisWeek, crc.id, { includeTravel: false });
+                    // Calculate hours including travel based on setting
+                    const totalHours = calculateCrcHours(eventsThisWeek, crc.id, { includeTravel });
+                    
+                    // Also calculate travel hours separately for display
+                    const travelHours = includeTravel ? eventsThisWeek
+                        .filter(e => e.type === 'Travel Day' && eventBelongsToCrc(e, crc.id))
+                        .reduce((sum, e) => sum + (parseFloat(e.hours) || 5), 0) : 0;
+                    
                     stats[crc.id] = {
                         totalHours,
+                        travelHours,
                         utilizationPercent: Math.round((totalHours / 40) * 100)
                     };
                 });
@@ -10942,7 +10991,7 @@
                                 ? `${event.hours}h`
                                 : ((isPTO || isTimeOffEvent) && event.period
                                     ? (event.period === 'Full Day' ? '8h' : '4h')
-                                    : (normalizedEventType === 'Travel Day' ? '8h' : 'Not set'));
+                                    : (normalizedEventType === 'Travel Day' ? '5h' : 'Not set'));
                             
                             // Determine event type display
                             const eventTypeDisplay = isPTO
@@ -11436,30 +11485,48 @@
                             }
                         }
 
-                        let eventsForMonth = state.crc_events.filter(e => {
+                        // Get ALL events for this CRC in this month (including Travel, PTO, etc.)
+                        // Use a Set to track unique event IDs to prevent duplicate counting
+                        const seenEventIds = new Set();
+                        let allEventsForMonth = state.crc_events.filter(e => {
+                            // Skip if we've already seen this event
+                            if (e.id && seenEventIds.has(e.id)) return false;
+                            
                             const eventDate = new Date(e.date + 'T00:00:00');
-                            return eventBelongsToCrc(e, crcId) && 
-                                   eventDate.getFullYear() == year && 
-                                   eventDate.getMonth() == month &&
-                                   isSiteAssignmentWithCrc(e);
+                            const matchesCrc = eventBelongsToCrc(e, crcId);
+                            const matchesMonth = eventDate.getFullYear() == year && eventDate.getMonth() == month;
+                            
+                            if (matchesCrc && matchesMonth) {
+                                if (e.id) seenEventIds.add(e.id);
+                                return true;
+                            }
+                            return false;
                         });
 
-                        // Apply site filter
+                        // Apply site filter only to Site Assignments (not to Travel/PTO)
+                        let siteAssignmentEvents = allEventsForMonth.filter(e => isSiteAssignmentWithCrc(e));
                         if (selectedSites.length > 0) {
-                            eventsForMonth = eventsForMonth.filter(e => !e.siteId || selectedSites.includes(e.siteId));
+                            siteAssignmentEvents = siteAssignmentEvents.filter(e => !e.siteId || selectedSites.includes(e.siteId));
                         }
 
-                        // Apply study filter
+                        // Apply study filter only to Site Assignments
                         if (selectedStudies.length > 0) {
-                            eventsForMonth = eventsForMonth.filter(e => {
+                            siteAssignmentEvents = siteAssignmentEvents.filter(e => {
                                 if (!e.studyIds || e.studyIds.length === 0) return false;
                                 return e.studyIds.some(studyId => selectedStudies.includes(studyId));
                             });
                         }
 
+                        // Get time off from timeOffRequests (approved only)
+                        // Use Set to track unique dates to prevent duplicates
                         const timeOffDaysSet = new Set();
+                        const processedTimeOffIds = new Set();
                         (state.timeOffRequests || []).forEach(req => {
                             if (!req || req.crcId !== crcId) return;
+                            // Skip if we've already processed this request
+                            if (req.id && processedTimeOffIds.has(req.id)) return;
+                            if (req.id) processedTimeOffIds.add(req.id);
+                            
                             const statusKey = normalizeTimeOffStatus(req.status);
                             if (statusKey !== 'approved') return;
                             const start = parseDateFlexible(req.startDate || req.date);
@@ -11475,8 +11542,8 @@
                             }
                         });
 
-                        // Only count Site Assignments with CRCs assigned (not empty/open shifts)
-                        const productiveEvents = eventsForMonth.filter(e => isSiteAssignmentWithCrc(e));
+                        // Productive events = Site Assignments (after filters)
+                        const productiveEvents = siteAssignmentEvents;
                         const productiveDaysSet = new Set(productiveEvents.map(e => e.date));
                         const productiveStudiesDaysSet = new Set();
                         const productiveTrainingDaysSet = new Set();
@@ -11484,7 +11551,9 @@
                             if (eventIsTraining(e)) productiveTrainingDaysSet.add(e.date);
                             else productiveStudiesDaysSet.add(e.date);
                         });
-                        const travelEvents = eventsForMonth.filter(e => e.type === 'Travel Day');
+                        
+                        // Travel events - get from ALL events, not just filtered ones
+                        const travelEvents = allEventsForMonth.filter(e => e.type === 'Travel Day');
                         const travelDaysSet = new Set(travelEvents.map(e => e.date));
                         const travelStudiesDaysSet = new Set();
                         const travelTrainingDaysSet = new Set();
@@ -11492,7 +11561,12 @@
                             if (eventIsTraining(e)) travelTrainingDaysSet.add(e.date);
                             else travelStudiesDaysSet.add(e.date);
                         });
-                        const nonWorkDaysSet = new Set(eventsForMonth.filter(e => ['Paid Time Off', 'Unavailable'].includes(e.type)).map(e => e.date));
+                        
+                        // Non-work days from events (PTO, Unavailable from crc_events)
+                        const nonWorkDaysSet = new Set(allEventsForMonth.filter(e => 
+                            ['Paid Time Off', 'Unavailable', 'PTO', 'Time Off'].includes(e.type)
+                        ).map(e => e.date));
+                        // Also add from timeOffRequests
                         timeOffDaysSet.forEach(date => nonWorkDaysSet.add(date));
 
                         const crcRecord = state.crcs.find(c => c.id === crcId);
@@ -11539,7 +11613,15 @@
                         const travelTrainingDays = travelTrainingDaysSet.size;
                         const timeOffDays = timeOffDaysSet.size;
                         const availableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
-                        const utilizationPercent = availableWorkDays > 0 ? Math.round((productiveDays / availableWorkDays) * 100) : 0;
+                        
+                        // Calculate travel hours (default 5 per travel day if not specified)
+                        const travelHours = travelEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 5), 0);
+                        
+                        // Include travel in utilization (travel days count toward productive time)
+                        // Combine productive days and travel days (avoiding duplicates)
+                        const allProductiveDaysSet = new Set([...productiveDaysSet, ...travelDaysSet]);
+                        const totalProductiveDays = allProductiveDaysSet.size;
+                        const utilizationPercent = availableWorkDays > 0 ? Math.round((totalProductiveDays / availableWorkDays) * 100) : 0;
                         
                         reportData.push({
                             crcName,
@@ -11551,6 +11633,7 @@
                             nonWorkDays,
                             timeOffDays,
                             travelDays,
+                            travelHours,
                             travelStudiesDays,
                             travelTrainingDays,
                             travelRecords,
@@ -11585,6 +11668,7 @@
                                         <th class="px-6 py-3 text-left text-xs font-medium text-blue-600 dark:text-blue-400 uppercase tracking-wider">Studies</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-amber-600 dark:text-amber-400 uppercase tracking-wider">Training</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Travel Days</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-orange-600 dark:text-orange-400 uppercase tracking-wider">Travel Hours</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-blue-600 dark:text-blue-400 uppercase tracking-wider">Travel (S)</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-amber-600 dark:text-amber-400 uppercase tracking-wider">Travel (T)</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Travel Records</th>
@@ -11607,6 +11691,7 @@
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-blue-600 dark:text-blue-400">${row.productiveStudiesDays || 0}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-amber-600 dark:text-amber-400">${row.productiveTrainingDays || 0}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.travelDays}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-orange-600 dark:text-orange-400">${row.travelHours || 0}h</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-blue-600 dark:text-blue-400">${row.travelStudiesDays || 0}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-amber-600 dark:text-amber-400">${row.travelTrainingDays || 0}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.travelRecords}</td>
@@ -11643,7 +11728,7 @@
                     return;
                 }
 
-                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Studies', 'Training', 'Travel Days', 'Travel (Studies)', 'Travel (Training)', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Utilization %'];
+                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Studies', 'Training', 'Travel Days', 'Travel Hours', 'Travel (Studies)', 'Travel (Training)', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Utilization %'];
                 const rows = data.map(row => [
                     row.crcName,
                     row.month,
@@ -11652,6 +11737,7 @@
                     row.productiveStudiesDays || 0,
                     row.productiveTrainingDays || 0,
                     row.travelDays,
+                    row.travelHours || 0,
                     row.travelStudiesDays || 0,
                     row.travelTrainingDays || 0,
                     row.travelRecords,
@@ -11823,10 +11909,22 @@
                 const dailyEntriesMap = new Map();
                 selectedCrcMeta.forEach(({ id }) => dailyEntriesMap.set(id, []));
 
+                // Track processed request IDs to prevent duplicates
+                const processedRequestIds = new Set();
+                // Track unique date+crc+status combinations to prevent duplicate entries
+                const seenDateCrcStatus = new Set();
+                
                 (Array.isArray(state.timeOffRequests) ? state.timeOffRequests : []).forEach(request => {
                     if (!request || !request.crcId || !selectedCrcs.includes(request.crcId)) {
                         return;
                     }
+                    
+                    // Skip if we've already processed this request ID
+                    if (request.id && processedRequestIds.has(request.id)) {
+                        return;
+                    }
+                    if (request.id) processedRequestIds.add(request.id);
+                    
                     const statusKey = normalizeTimeOffStatus(request.status);
                     if (!normalizedSelectedStatuses.includes(statusKey)) {
                         return;
@@ -11834,7 +11932,14 @@
                     const entries = getDailyEntriesForTimeOffRequest(request, rangeStartDate, rangeEndDate);
                     if (!entries.length) return;
                     const bucket = dailyEntriesMap.get(request.crcId) || [];
-                    entries.forEach(entry => bucket.push(entry));
+                    entries.forEach(entry => {
+                        // Prevent duplicate date+crc+status entries
+                        const key = `${entry.crcId}_${entry.dateStr}_${entry.status}`;
+                        if (!seenDateCrcStatus.has(key)) {
+                            seenDateCrcStatus.add(key);
+                            bucket.push(entry);
+                        }
+                    });
                     dailyEntriesMap.set(request.crcId, bucket);
                 });
 
@@ -12440,6 +12545,15 @@
                     }
                 } else if (state.calendarView === 'roles') title = `Roles View - ${weekName}`;
                 else if (state.calendarView === 'total-view') title = `Total View - ${monthName}`;
+                else if (state.calendarDisplayMode === 'at-a-glance') {
+                    if (state.atAGlanceViewMode === 'daily') {
+                        title = `At-a-Glance - ${dayName}`;
+                    } else if (state.atAGlanceViewMode === 'weekly') {
+                        title = `At-a-Glance - ${weekName}`;
+                    } else {
+                        title = `At-a-Glance - ${monthName}`;
+                    }
+                }
                 else title = monthName;
                 
                 // Determine navigation actions based on view
@@ -12453,6 +12567,12 @@
                 } else if (state.calendarView === 'week' || state.calendarView === 'roles') {
                     prevAction = 'prev-crc-week';
                     nextAction = 'next-crc-week';
+                } else if (state.calendarDisplayMode === 'at-a-glance' && state.atAGlanceViewMode === 'daily') {
+                    prevAction = 'prev-crc-day';
+                    nextAction = 'next-crc-day';
+                } else if (state.calendarDisplayMode === 'at-a-glance' && state.atAGlanceViewMode === 'weekly') {
+                    prevAction = 'prev-crc-week';
+                    nextAction = 'next-crc-week';
                 } else {
                     prevAction = 'prev-crc-month';
                     nextAction = 'next-crc-month';
@@ -12463,7 +12583,9 @@
                 
                 // Generate date options for daily view - all dates in current month
                 let dateOptions = '';
-                if (state.calendarView === 'planning-grid' && state.planningGridMode === 'daily') {
+                const isDailyView = (state.calendarView === 'planning-grid' && state.planningGridMode === 'daily') ||
+                                   (state.calendarDisplayMode === 'at-a-glance' && state.atAGlanceViewMode === 'daily');
+                if (isDailyView) {
                     const currentMonth = now.getMonth();
                     const currentYear = now.getFullYear();
                     const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
@@ -12494,6 +12616,13 @@
                                 <button data-action="set-display-mode" data-mode="travel" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'travel' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Travel</button>
                                 <button data-action="set-display-mode" data-mode="at-a-glance" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'at-a-glance' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} ${state.calendarView === 'planning-grid' ? '' : 'rounded-r-md'}">At-a-Glance</button>
                             </div>
+                            ${state.calendarDisplayMode === 'at-a-glance' ? `
+                            <div class="flex items-center rounded-md border dark:border-gray-600 overflow-x-auto">
+                                <button data-action="set-at-a-glance-view-mode" data-mode="daily" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'daily' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Daily</button>
+                                <button data-action="set-at-a-glance-view-mode" data-mode="weekly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'weekly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Weekly</button>
+                                <button data-action="set-at-a-glance-view-mode" data-mode="monthly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'monthly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Monthly</button>
+                            </div>
+                            ` : ''}
                         </div>
                         <!-- Calendar View and Navigation on second row -->
                         <div class="flex flex-wrap items-center justify-between gap-2">
@@ -12515,7 +12644,7 @@
                             </div>
                             <div class="flex items-center space-x-2">
                                 <button data-action="${prevAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left" class="w-4 h-4 md:w-5 md:h-5"></i></button>
-                                ${state.calendarView === 'planning-grid' && state.planningGridMode === 'daily' ? `
+                                ${isDailyView ? `
                                     <select id="date-selector" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
                                         ${dateOptions}
                                     </select>
@@ -15917,11 +16046,33 @@
                 const now = state.crcCalendarDate;
                 const year = now.getFullYear();
                 const month = now.getMonth();
-                const daysInMonth = new Date(year, month + 1, 0).getDate();
+                const viewMode = state.atAGlanceViewMode || 'monthly';
+                
+                // Calculate date range based on view mode
+                let dateRange = [];
+                if (viewMode === 'daily') {
+                    // Just today's date
+                    dateRange = [toDateOnlyString(now)];
+                } else if (viewMode === 'weekly') {
+                    // Get the week containing the current date (Sun-Sat)
+                    const startOfWeek = new Date(now);
+                    startOfWeek.setDate(now.getDate() - now.getDay()); // Sunday
+                    for (let i = 0; i < 7; i++) {
+                        const d = new Date(startOfWeek);
+                        d.setDate(startOfWeek.getDate() + i);
+                        dateRange.push(toDateOnlyString(d));
+                    }
+                } else {
+                    // Monthly - all days in month
+                    const daysInMonth = new Date(year, month + 1, 0).getDate();
+                    for (let day = 1; day <= daysInMonth; day++) {
+                        dateRange.push(`${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
+                    }
+                }
 
+                // Filter events to the date range
                 let filteredEvents = state.crc_events.filter(e => {
-                    const eventDate = new Date(e.date + 'T00:00:00');
-                    return eventDate.getFullYear() === year && eventDate.getMonth() === month;
+                    return dateRange.includes(e.date);
                 });
                 if (state.selectedCrcFilter !== 'all') {
                     filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.selectedCrcFilter));
@@ -15948,13 +16099,15 @@
                 }
 
                 // Build staff counts by study and site (nested structure)
+                // For daily/weekly, also track CRC names for detailed display
                 const staffCountByStudySiteAndDate = {};
+                const staffDetailsByStudySiteAndDate = {};
                 
                 // Helper to get all CRC IDs from an event (checking both crcId and roleAssignments)
                 const getEventCrcIds = (event) => {
                     const crcIds = new Set();
                     // Check legacy crcId
-                    if (event.crcId && event.crcId !== 'SITE_STAFF') {
+                    if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
                         crcIds.add(event.crcId);
                     }
                     // Check roleAssignments
@@ -15962,7 +16115,7 @@
                         Object.values(event.roleAssignments).forEach(assignments => {
                             if (Array.isArray(assignments)) {
                                 assignments.forEach(crcId => {
-                                    if (crcId && crcId !== 'SITE_STAFF') {
+                                    if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                         crcIds.add(crcId);
                                     }
                                 });
@@ -15982,21 +16135,43 @@
                     studyIds.forEach(studyId => {
                         if (!staffCountByStudySiteAndDate[studyId]) staffCountByStudySiteAndDate[studyId] = {};
                         if (!staffCountByStudySiteAndDate[studyId][siteId]) staffCountByStudySiteAndDate[studyId][siteId] = {};
+                        if (!staffDetailsByStudySiteAndDate[studyId]) staffDetailsByStudySiteAndDate[studyId] = {};
+                        if (!staffDetailsByStudySiteAndDate[studyId][siteId]) staffDetailsByStudySiteAndDate[studyId][siteId] = {};
+                        
                         if (!staffCountByStudySiteAndDate[studyId][siteId][event.date]) {
                             staffCountByStudySiteAndDate[studyId][siteId][event.date] = new Set();
+                            staffDetailsByStudySiteAndDate[studyId][siteId][event.date] = [];
                         }
                         // Add all CRC IDs from this event
                         eventCrcIds.forEach(crcId => {
                             staffCountByStudySiteAndDate[studyId][siteId][event.date].add(crcId);
+                            // Store CRC name for detailed views
+                            const crc = state.crcs.find(c => c.id === crcId);
+                            if (crc && !staffDetailsByStudySiteAndDate[studyId][siteId][event.date].includes(crc.name)) {
+                                staffDetailsByStudySiteAndDate[studyId][siteId][event.date].push(crc.name);
+                            }
                         });
                     });
                 });
 
+                // Build table header
                 let tableHtml = `<div class="overflow-auto custom-scrollbar border dark:border-gray-700 rounded-lg" style="max-height: 75vh;"><table class="min-w-full text-sm border-collapse">`;
-                tableHtml += `<thead class="sticky top-0 z-10"><tr class="bg-gray-100 dark:bg-gray-800"><th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold">Study / Site</th>`;
-                for (let day = 1; day <= daysInMonth; day++) {
-                    tableHtml += `<th class="p-2 font-normal w-10">${day}</th>`;
-                }
+                tableHtml += `<thead class="sticky top-0 z-10"><tr class="bg-gray-100 dark:bg-gray-800"><th class="p-2 text-left sticky left-0 bg-gray-100 dark:bg-gray-800 font-semibold z-20">Study / Site</th>`;
+                
+                // Column headers based on view mode
+                dateRange.forEach(dateStr => {
+                    const d = parseDateOnly(dateStr);
+                    if (viewMode === 'daily') {
+                        const dayName = d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+                        tableHtml += `<th class="p-2 font-semibold min-w-[200px]">${dayName}</th>`;
+                    } else if (viewMode === 'weekly') {
+                        const dayName = d.toLocaleDateString('en-US', { weekday: 'short', month: 'numeric', day: 'numeric' });
+                        tableHtml += `<th class="p-2 font-normal min-w-[100px]">${dayName}</th>`;
+                    } else {
+                        const day = d.getDate();
+                        tableHtml += `<th class="p-2 font-normal w-10">${day}</th>`;
+                    }
+                });
                 tableHtml += `</tr></thead>`;
                 
                 let tbodyHtml = '<tbody>';
@@ -16012,7 +16187,7 @@
                     // Study header row
                     const studyColor = study.color || (document.documentElement.classList.contains('dark') ? '#374151' : '#e5e7eb');
                     const studyTextColor = getContrastColor(studyColor);
-                    tbodyHtml += `<tr class="border-t-2 dark:border-gray-600 bg-gray-50 dark:bg-gray-900/50"><td class="p-2 text-left sticky left-0 bg-gray-50 dark:bg-gray-900/50 font-bold" colspan="${daysInMonth + 1}" style="background-color: ${studyColor}; color: ${studyTextColor};">${study.title || study.name}</td></tr>`;
+                    tbodyHtml += `<tr class="border-t-2 dark:border-gray-600 bg-gray-50 dark:bg-gray-900/50"><td class="p-2 text-left sticky left-0 bg-gray-50 dark:bg-gray-900/50 font-bold z-10" colspan="${dateRange.length + 1}" style="background-color: ${studyColor}; color: ${studyTextColor};">${study.title || study.name}</td></tr>`;
                     
                     // Get sites for this study
                     const sitesForStudy = Object.keys(staffCountByStudySiteAndDate[study.id] || {});
@@ -16024,13 +16199,14 @@
 
                     sortedSiteIds.forEach(siteId => {
                         const site = state.crc_sites.find(s => s.id === siteId) || { name: 'Unassigned Site' };
-                        tbodyHtml += `<tr class="border-t dark:border-gray-700"><td class="p-2 pl-8 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap">${site.name}</td>`;
-                        for (let day = 1; day <= daysInMonth; day++) {
-                            const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                        tbodyHtml += `<tr class="border-t dark:border-gray-700"><td class="p-2 pl-8 text-left sticky left-0 bg-white dark:bg-gray-900 font-medium whitespace-nowrap z-10">${site.name}</td>`;
+                        
+                        dateRange.forEach(dateStr => {
                             const staffSet = staffCountByStudySiteAndDate[study.id]?.[siteId]?.[dateStr];
+                            const staffNames = staffDetailsByStudySiteAndDate[study.id]?.[siteId]?.[dateStr] || [];
                             const staffCount = staffSet ? staffSet.size : 0;
                             
-                            let cellClass = 'text-center border-l dark:border-gray-700';
+                            let cellClass = 'border-l dark:border-gray-700 p-2';
                             // Color coding based on scheduled count only
                             if (staffCount === 0) {
                                 cellClass += ' bg-gray-50 dark:bg-gray-800/30';
@@ -16042,9 +16218,34 @@
                                 cellClass += ' bg-yellow-100 dark:bg-yellow-900/50 font-bold';
                             }
                             
-                            const displayText = staffCount > 0 ? staffCount : '-';
-                            tbodyHtml += `<td class="${cellClass}">${displayText}</td>`;
-                        }
+                            // Display content based on view mode
+                            let displayContent = '';
+                            if (viewMode === 'daily') {
+                                // Show full names in daily view
+                                cellClass += ' text-left align-top';
+                                if (staffCount === 0) {
+                                    displayContent = '<span class="text-gray-400">-</span>';
+                                } else {
+                                    displayContent = `<div class="text-xs font-semibold mb-1">${staffCount} staff</div>` +
+                                        staffNames.map(name => `<div class="text-sm">${name}</div>`).join('');
+                                }
+                            } else if (viewMode === 'weekly') {
+                                // Show count with tooltip for names
+                                cellClass += ' text-center';
+                                if (staffCount === 0) {
+                                    displayContent = '-';
+                                } else {
+                                    const tooltipNames = staffNames.join(', ');
+                                    displayContent = `<span title="${tooltipNames}" class="cursor-help">${staffCount}</span>`;
+                                }
+                            } else {
+                                // Monthly - just show count
+                                cellClass += ' text-center';
+                                displayContent = staffCount > 0 ? staffCount : '-';
+                            }
+                            
+                            tbodyHtml += `<td class="${cellClass}">${displayContent}</td>`;
+                        });
                         tbodyHtml += `</tr>`;
                     });
                 });
@@ -16844,20 +17045,22 @@
                     titleEl.textContent = `CRC Utilization (Current Week) - ${monthName}`;
                     const weeklyStats = calculateWeeklyUtilization(state.crcCalendarDate);
                     utilizationHTML = state.crcs.map(crc => {
-                        const stats = weeklyStats[crc.id] || { totalHours: 0, utilizationPercent: 0 };
+                        const stats = weeklyStats[crc.id] || { totalHours: 0, travelHours: 0, utilizationPercent: 0 };
                         const totalHours = stats.totalHours;
+                        const travelHours = stats.travelHours || 0;
                         const utilizationPercent = stats.utilizationPercent;
                         let barColor = 'bg-green-500';
                         if (totalHours > 35) barColor = 'bg-yellow-500';
                         if (totalHours > 40) barColor = 'bg-red-500';
                         const isOverCapacity = utilizationPercent > 100;
                         const barWidth = isOverCapacity ? 100 : utilizationPercent;
+                        const travelInfo = travelHours > 0 ? ` <span class="text-orange-500 dark:text-orange-400 text-xs">(+${travelHours.toFixed(1)}h travel)</span>` : '';
                         return `
                             <div>
                                 <div class="flex justify-between mb-1 font-medium">
                                     <span>${crc.name}</span>
                                     <span class="dark:text-gray-300">
-                                        ${totalHours.toFixed(1)} hrs 
+                                        ${totalHours.toFixed(1)} hrs${travelInfo}
                                         ${isOverCapacity ? `<span class="text-red-600 dark:text-red-400 font-bold">(${utilizationPercent.toFixed(0)}%)</span>` : `(${utilizationPercent.toFixed(0)}%)`}
                                     </span>
                                 </div>
@@ -16872,19 +17075,21 @@
                     titleEl.textContent = `CRC Utilization - ${monthName}`;
                     const monthlyStats = calculateMonthlyUtilization(state.crcCalendarDate);
                     utilizationHTML = state.crcs.map(crc => {
-                        const stats = monthlyStats[crc.id] || { utilizationPercent: 0 };
+                        const stats = monthlyStats[crc.id] || { utilizationPercent: 0, travelDays: 0 };
                         const utilizationPercent = stats.utilizationPercent;
+                        const travelDays = stats.travelDays || 0;
                         const isOverCapacity = utilizationPercent > 100;
                         const barWidth = isOverCapacity ? 100 : utilizationPercent;
                         let barColor = 'bg-green-500';
                         if (utilizationPercent > 85) barColor = 'bg-yellow-500';
                         if (utilizationPercent >= 100) barColor = 'bg-red-500';
+                        const travelInfo = travelDays > 0 ? ` <span class="text-orange-500 dark:text-orange-400 text-xs">(+${travelDays}d travel)</span>` : '';
                         return `
                             <div>
                                 <div class="flex justify-between mb-1 font-medium">
                                     <span>${crc.name}</span>
                                     <span class="dark:text-gray-300">
-                                        ${isOverCapacity ? `<span class="text-red-600 dark:text-red-400 font-bold">${utilizationPercent.toFixed(0)}%</span>` : `${utilizationPercent.toFixed(0)}%`}
+                                        ${isOverCapacity ? `<span class="text-red-600 dark:text-red-400 font-bold">${utilizationPercent.toFixed(0)}%</span>` : `${utilizationPercent.toFixed(0)}%`}${travelInfo}
                                     </span>
                                 </div>
                                 <div class="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2.5 relative overflow-hidden">
@@ -19773,7 +19978,7 @@
                     const timeOffPTO = isPTO ? (timeOffType || event.type || 'Time Off') : '';
                     
                     // Handle hours display - show actual hours, only use fallback when hours don't exist
-                    const hoursDisplay = event.hours ? `${event.hours}` : (isPTO && event.period ? (event.period === 'Full Day' ? '8' : (event.period === 'Half Day AM' || event.period === 'Half Day PM' ? '4' : '')) : (event.type === 'Travel Day' ? '8' : ''));
+                    const hoursDisplay = event.hours ? `${event.hours}` : (isPTO && event.period ? (event.period === 'Full Day' ? '8' : (event.period === 'Half Day AM' || event.period === 'Half Day PM' ? '4' : '')) : (event.type === 'Travel Day' ? '5' : ''));
                     
                     return [
                         event.date,
@@ -26918,6 +27123,12 @@
                         }
                         break;
                     case 'set-at-a-glance-group': setState({ atAGlanceGroupBy: group }); break;
+                    case 'set-at-a-glance-view-mode':
+                        setState({ atAGlanceViewMode: mode });
+                        if (state.activeTab === 'scheduler' && state.calendarDisplayMode === 'at-a-glance') {
+                            renderCRCCalendar();
+                        }
+                        break;
                     case 'set-sidebar-tab': {
                         // Prevent CRC and Supervisor users from accessing sidebar
                         const isCRC = state.currentUser && state.currentUser.permissionLevel === 'CRC';
@@ -31819,7 +32030,7 @@
                                         if (!existingTravelDay) {
                                             // Find matching flight
                                             const matchingFlight = findFlightWithinBusinessDay(crcId, startDateDuplicate, true);
-                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
                                             
                                             const travelPayload = {
                                                 ...duplicateBase,
@@ -31887,7 +32098,7 @@
                                         if (!existingTravelDay) {
                                             // Find matching flight
                                             const matchingFlight = findFlightWithinBusinessDay(crcId, endDateDuplicate, false);
-                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                            const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
                                             
                                             const travelPayload = {
                                                 ...duplicateBase,
@@ -33194,7 +33405,7 @@
                                                 );
 
                                                 const matchingFlight = findFlightWithinBusinessDay(crcId, isBefore ? eventStartDate : eventEndDate, isBefore);
-                                                const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                                const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
 
                                                 if (!existingTravelDay) {
                                                     const travelEventData = {
@@ -33561,7 +33772,7 @@
                                                 if (!existingTravelDay) {
                                                     // Find matching flight
                                                     const matchingFlight = findFlightWithinBusinessDay(travelCrcId, dayCursor, false);
-                                                    const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                                    const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
                                                     
                                                     const travelEventData = { 
                                                         // Travel days inherit study/site from parent shift for grid display
@@ -33666,7 +33877,7 @@
                                                 console.log(`[TRAVEL DEBUG] existingTravelDay found: ${!!existingTravelDay}`);
 
                                                 const matchingFlight = findFlightWithinBusinessDay(crcId, isBefore ? startDate : endDate, isBefore);
-                                                const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                                const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
 
                                                 if (!existingTravelDay) {
                                                     console.log(`[TRAVEL DEBUG] Creating NEW travel day for CRC ${crcId}`);
@@ -34053,7 +34264,7 @@
                                                     if (!existingTravelDay) {
                                                         // Find matching flight
                                                         const matchingFlight = findFlightWithinBusinessDay(crcId, startDate, true);
-                                                        const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                                        const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
                                                         
                                                         const startTravelEventData = { 
                                                             // Travel days inherit study/site from parent shift for grid display
@@ -34185,7 +34396,7 @@
                                                     if (!existingTravelDay) {
                                                         // Find matching flight
                                                         const matchingFlight = findFlightWithinBusinessDay(crcId, endDate, false);
-                                                        const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                                        const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
                                                         
                                                         const endTravelEventData = { 
                                                             // Travel days inherit study/site from parent shift for grid display
@@ -34246,7 +34457,7 @@
                                                     if (!existingTravelDay) {
                                                         // Find matching flight
                                                         const matchingFlight = findFlightWithinBusinessDay(crcId, dayCursor, false);
-                                                        const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 8) : 8;
+                                                        const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
                                                         
                                                         const travelEventData = { 
                                                             // Travel days inherit study/site from parent shift for grid display
