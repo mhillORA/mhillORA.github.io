@@ -281,6 +281,20 @@
             margin-top: 4px;
         }
         
+        /* Flashing study header when there are unfilled shifts */
+        @keyframes studyHeaderPulse {
+            0%, 100% { 
+                opacity: 1;
+            }
+            50% { 
+                opacity: 0.5;
+            }
+        }
+        
+        .study-header-unfilled {
+            animation: studyHeaderPulse 2s ease-in-out infinite;
+        }
+        
         .flight-calendar-day {
             min-height: 100px;
             position: relative;
@@ -4806,7 +4820,45 @@
             };
 
             const checkRoleFulfillment = (event) => {
-                if (!event.studyIds || event.studyIds.length === 0 || !event.siteId) return { fulfilled: true, missingRoles: [], unfilledSlots: [], totalUnfilled: 0 };
+                // IMPORTANT: First check for UNASSIGNED roles regardless of study/site config
+                // This ensures shifts with UNASSIGNED always show as unfilled
+                const missingRoles = [];
+                const unfilledSlots = [];
+                let totalUnfilled = 0;
+                
+                // Check roleAssignments for empty/null/UNASSIGNED slots FIRST (before study check)
+                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        if (Array.isArray(assignments)) {
+                            const role = state.roles.find(r => r.id === roleId);
+                            if (role) {
+                                assignments.forEach((crcId, index) => {
+                                    // Treat empty, null, or UNASSIGNED as unfilled slots
+                                    if (!crcId || crcId === '' || crcId === 'UNASSIGNED') {
+                                        unfilledSlots.push({ roleId, roleName: role.name, slotIndex: index });
+                                        totalUnfilled++;
+                                    }
+                                });
+                                // Add to missingRoles summary
+                                const filled = assignments.filter(a => a && a !== '' && a !== 'UNASSIGNED').length;
+                                const unfilled = assignments.length - filled;
+                                if (unfilled > 0 && !missingRoles.find(m => m.startsWith(role.name))) {
+                                    missingRoles.push(`${role.name} (${filled}/${assignments.length})`);
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                // If no study/site, return what we've found from roleAssignments
+                if (!event.studyIds || event.studyIds.length === 0 || !event.siteId) {
+                    return { 
+                        fulfilled: totalUnfilled === 0, 
+                        missingRoles, 
+                        unfilledSlots, 
+                        totalUnfilled 
+                    };
+                }
                 
                 // Get role requirements for this specific Study-Site combination
                 const studySiteRoleRequirements = {};
@@ -4833,7 +4885,7 @@
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                         // Filter out empty/null assignments AND 'UNASSIGNED' (which is an explicit unfilled marker)
-                        const validAssignments = assignments.filter(a => a && a !== 'UNASSIGNED');
+                        const validAssignments = assignments.filter(a => a && a !== '' && a !== 'UNASSIGNED');
                         assignedRoles[roleId] = validAssignments.length;
                     });
                 }
@@ -4847,54 +4899,31 @@
                     });
                 }
                 
-                // Check fulfillment and gather unfilled slot info
-                const missingRoles = [];
-                const unfilledSlots = []; // Detailed list of unfilled slots with role names
-                let totalUnfilled = 0;
-                
+                // Check study-site role requirements and add any ADDITIONAL unfilled slots
+                // (we already found UNASSIGNED slots above, now check against requirements)
                 Object.keys(studySiteRoleRequirements).forEach(roleId => {
                     const required = studySiteRoleRequirements[roleId];
                     const assigned = assignedRoles[roleId] || 0;
                     if (assigned < required) {
                         const role = state.roles.find(r => r.id === roleId);
                         if (role) {
-                            const unfilled = required - assigned;
-                            missingRoles.push(`${role.name} (${assigned}/${required})`);
-                            // Add each unfilled slot to the list
-                            for (let i = 0; i < unfilled; i++) {
-                                unfilledSlots.push({ roleId, roleName: role.name, slotIndex: assigned + i });
+                            // Check how many slots we already have for this role from UNASSIGNED check
+                            const existingSlotsForRole = unfilledSlots.filter(s => s.roleId === roleId).length;
+                            const additionalUnfilled = (required - assigned) - existingSlotsForRole;
+                            
+                            // Add additional slots if requirements exceed what we found
+                            for (let i = 0; i < additionalUnfilled; i++) {
+                                unfilledSlots.push({ roleId, roleName: role.name, slotIndex: assigned + existingSlotsForRole + i });
+                                totalUnfilled++;
                             }
-                            totalUnfilled += unfilled;
+                            
+                            // Update missingRoles summary if not already there
+                            if (!missingRoles.find(m => m.startsWith(role.name))) {
+                                missingRoles.push(`${role.name} (${assigned}/${required})`);
+                            }
                         }
                     }
                 });
-                
-                // Also check roleAssignments for null slots or UNASSIGNED (open positions)
-                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                        if (Array.isArray(assignments)) {
-                            const role = state.roles.find(r => r.id === roleId);
-                            if (role) {
-                                assignments.forEach((crcId, index) => {
-                                    // Treat empty, null, or UNASSIGNED as unfilled slots
-                                    if (!crcId || crcId === '' || crcId === 'UNASSIGNED') {
-                                        // This is an unfilled slot
-                                        const alreadyAdded = unfilledSlots.find(s => s.roleId === roleId && s.slotIndex === index);
-                                        if (!alreadyAdded) {
-                                            unfilledSlots.push({ roleId, roleName: role.name, slotIndex: index });
-                                            totalUnfilled++;
-                                            if (!missingRoles.find(m => m.startsWith(role.name))) {
-                                                // Count filled excluding UNASSIGNED
-                                                const filled = assignments.filter(a => a && a !== 'UNASSIGNED').length;
-                                                missingRoles.push(`${role.name} (${filled}/${assignments.length})`);
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    });
-                }
                 
                 return {
                     fulfilled: missingRoles.length === 0 && totalUnfilled === 0,
@@ -13018,8 +13047,14 @@
                                 return `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}"><div class="flex items-center justify-between">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>${unfilledRolesDisplay}</div>`;
                             }).join('');
                             
+                            // Check if event has unfilled shifts for header styling
+                            const eventFulfillmentForHeader = checkRoleFulfillment(event);
+                            const headerHasUnfilled = !eventFulfillmentForHeader.fulfilled;
+                            const headerFlashClass = headerHasUnfilled ? 'study-header-unfilled' : '';
+                            
                             // Wrap header and blocks in a grouped container - ALWAYS show header
-                            const header = `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}">${headerText}</div>`;
+                            // Flash the study header in the study's color if there are unfilled shifts
+                            const header = `<div class="text-xs font-semibold px-2 py-1 rounded-t ${headerFlashClass}" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}; ${headerHasUnfilled ? `background-color: ${bgColor}; color: white;` : ''}">${headerText}${headerHasUnfilled ? ' ⚠' : ''}</div>`;
                             const blocksWrapper = `<div class="rounded-b border-l border-r border-b mb-1" style="border-color: ${bgColor}">${blocks}</div>`;
                             
                             return `<div class="mb-1">${header}${blocksWrapper}</div>`;
@@ -13089,7 +13124,9 @@
                                 : '';
                             
                             // Wrap header and block in a grouped container - ALWAYS show header
-                            const headerNoCrcs = `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}">${headerTextEmpty}</div>`;
+                            // Flash the header if there are unfilled shifts
+                            const noCrcHeaderFlash = !roleFulfillment.fulfilled ? 'study-header-unfilled' : '';
+                            const headerNoCrcs = `<div class="text-xs font-semibold px-2 py-1 rounded-t ${noCrcHeaderFlash}" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}; ${!roleFulfillment.fulfilled ? `background-color: ${bgColor}; color: white;` : ''}">${headerTextEmpty}${!roleFulfillment.fulfilled ? ' ⚠' : ''}</div>`;
                             const block = `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag rounded-b border-l border-r border-b" style="background-color:${bgColor}; color: ${textColor}; border-color: ${bgColor};" title="${tooltip}"><div class="flex items-center justify-between">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>${unfilledRolesDisplay}</div>`;
                             
                             return `<div class="mb-1">${headerNoCrcs}${block}</div>`;
@@ -13349,8 +13386,14 @@
                                 return `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag" style="background-color:${bgColor}; color: ${textColor};" title="${tooltip}"><div class="flex items-center justify-between">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>${unfilledRolesDisplay}</div>`;
                             }).join('');
                             
+                            // Check if event has unfilled shifts for header styling
+                            const eventFulfillmentForHeader = checkRoleFulfillment(event);
+                            const headerHasUnfilled = !eventFulfillmentForHeader.fulfilled;
+                            const headerFlashClass = headerHasUnfilled ? 'study-header-unfilled' : '';
+                            
                             // Wrap header and blocks in a grouped container - ALWAYS show header
-                            const header = `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}">${headerText}</div>`;
+                            // Flash the study header in the study's color if there are unfilled shifts
+                            const header = `<div class="text-xs font-semibold px-2 py-1 rounded-t ${headerFlashClass}" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}; ${headerHasUnfilled ? `background-color: ${bgColor}; color: white;` : ''}">${headerText}${headerHasUnfilled ? ' ⚠' : ''}</div>`;
                             const blocksWrapper = `<div class="rounded-b border-l border-r border-b mb-1" style="border-color: ${bgColor}">${blocks}</div>`;
                             
                             return `<div class="mb-1">${header}${blocksWrapper}</div>`;
@@ -13420,7 +13463,9 @@
                                 : '';
                             
                             // Wrap header and block in a grouped container - ALWAYS show header
-                            const headerNoCrcsWeekly = `<div class="text-xs font-semibold px-2 py-1 rounded-t bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}">${headerTextEmpty}</div>`;
+                            // Flash the header if there are unfilled shifts
+                            const noCrcHeaderFlashWeekly = !roleFulfillment.fulfilled ? 'study-header-unfilled' : '';
+                            const headerNoCrcsWeekly = `<div class="text-xs font-semibold px-2 py-1 rounded-t ${noCrcHeaderFlashWeekly}" style="border-left: 3px solid ${bgColor}; border-top: 1px solid ${bgColor}; border-right: 1px solid ${bgColor}; ${!roleFulfillment.fulfilled ? `background-color: ${bgColor}; color: white;` : ''}">${headerTextEmpty}${!roleFulfillment.fulfilled ? ' ⚠' : ''}</div>`;
                             const blockWeekly = `<div data-action="view-crc-event" data-event-id="${event.id}" class="crc-event-tag rounded-b border-l border-r border-b" style="background-color:${bgColor}; color: ${textColor}; border-color: ${bgColor};" title="${tooltip}"><div class="flex items-center justify-between">${title}${event.isOverridden ? overrideIcon : roleIcon}</div>${unfilledRolesDisplay}</div>`;
                             
                             return [`<div class="mb-1">${headerNoCrcsWeekly}${blockWeekly}</div>`];
@@ -31804,15 +31849,21 @@
                             assignmentsMap.forEach((arr, roleId) => {
                                 // Check if there's a role quantity override for this role
                                 const quantityInput = form.querySelector(`input[name="role-quantity-${roleId}"], input[data-role-id="${roleId}"]`);
-                                const hasQuantityOverride = quantityInput && parseInt(quantityInput.value) > 0;
+                                // FIXED: Allow 0 as a valid quantity override (ad-hoc removal of a role)
+                                const hasQuantityOverride = quantityInput && quantityInput.value !== '' && quantityInput.value !== null;
                                 
                                 if (hasQuantityOverride) {
-                                    // Preserve all slots up to the quantity, including nulls
-                                    const quantity = parseInt(quantityInput.value) || arr.length;
-                                    while (arr.length < quantity) {
-                                        arr.push(null);
+                                    const quantity = parseInt(quantityInput.value);
+                                    if (quantity === 0) {
+                                        // Quantity 0 means remove this role entirely for this shift
+                                        arr.length = 0;
+                                    } else if (quantity > 0) {
+                                        // Preserve all slots up to the quantity, including nulls
+                                        while (arr.length < quantity) {
+                                            arr.push(null);
+                                        }
+                                        arr.length = quantity; // Trim to exact quantity
                                     }
-                                    arr.length = quantity; // Trim to exact quantity
                                 } else {
                                     // No quantity override - remove trailing nulls but keep internal nulls
                                     while (arr.length > 0 && arr[arr.length - 1] === null) {
@@ -32463,7 +32514,11 @@
                                 // Apply role quantity overrides to ensure correct array length
                                 Object.keys(roleQuantityOverrides).forEach(roleId => {
                                     const quantity = roleQuantityOverrides[roleId];
-                                    if (quantity > 0) {
+                                    if (quantity === 0) {
+                                        // Quantity 0 means remove this role entirely for this shift (ad-hoc)
+                                        // Set to empty array so it's clear this role was intentionally removed
+                                        roleAssignments[roleId] = [];
+                                    } else if (quantity > 0) {
                                         if (!roleAssignments[roleId]) {
                                             roleAssignments[roleId] = [];
                                         }
@@ -37425,6 +37480,29 @@
                         manualRoleConfig[visitKeyForManual] = {};
                     }
 
+                    // CRITICAL: Load roleQuantityOverrides from existing event when editing
+                    // This ensures saved quantity changes (including 0) are restored when reopening
+                    if (existingEvent && existingEvent.roleQuantityOverrides && !form._roleQuantityOverridesLoaded) {
+                        Object.entries(existingEvent.roleQuantityOverrides).forEach(([roleId, qty]) => {
+                            // Only set if not already in manualRoleConfig (preserve user changes during session)
+                            if (manualRoleConfig[visitKeyForManual][roleId] === undefined) {
+                                manualRoleConfig[visitKeyForManual][roleId] = qty;
+                            }
+                        });
+                        // Also ensure roles from roleAssignments are in manualRoleConfig
+                        if (existingEvent.roleAssignments) {
+                            Object.entries(existingEvent.roleAssignments).forEach(([roleId, assignments]) => {
+                                if (manualRoleConfig[visitKeyForManual][roleId] === undefined) {
+                                    // Use length of assignments array as quantity, or check roleQuantityOverrides
+                                    const overrideQty = existingEvent.roleQuantityOverrides?.[roleId];
+                                    const assignmentQty = Array.isArray(assignments) ? assignments.length : 0;
+                                    manualRoleConfig[visitKeyForManual][roleId] = overrideQty !== undefined ? overrideQty : assignmentQty;
+                                }
+                            });
+                        }
+                        form._roleQuantityOverridesLoaded = true;
+                    }
+
                     // If visit has roles with 0 quantity, pre-populate them in manual config (so they show up)
                     if (allQuantitiesZero && requiredRoles.size > 0) {
                         requiredRoles.forEach((qty, roleId) => {
@@ -38213,8 +38291,21 @@
                         continue;
                     }
                     
-                    // Ensure quantity is always defined (default to 1 if undefined)
-                    const roleQuantity = (quantity !== undefined && quantity !== null && quantity > 0) ? quantity : 1;
+                    // Check for roleQuantityOverrides from existing event (ad-hoc quantity changes)
+                    // This allows users to override the default quantity for a specific shift
+                    const overrideQuantity = existingEvent?.roleQuantityOverrides?.[roleId];
+                    // Use override if it exists (even if 0), otherwise use the required quantity
+                    let roleQuantity;
+                    if (overrideQuantity !== undefined && overrideQuantity !== null) {
+                        roleQuantity = overrideQuantity;
+                        // If override is 0, skip this role entirely (user intentionally removed it)
+                        if (roleQuantity === 0) {
+                            continue;
+                        }
+                    } else {
+                        // Default behavior: use required quantity (default to 1 if undefined)
+                        roleQuantity = (quantity !== undefined && quantity !== null && quantity > 0) ? quantity : 1;
+                    }
                     
                     // Get existing assignments for this role if editing - use mergedRoleAssignments which has converted legacy data
                     let existingAssignments = (mergedRoleAssignments[roleId] || []).filter(Boolean);
@@ -38395,13 +38486,10 @@
                         return optionsHtml;
                     };
 
-                    // Get override quantity if editing
-                    // Use roleQuantity from the loop scope (ensured to be defined)
-                    const overrideQuantity = existingEvent && existingEvent.roleQuantityOverrides && existingEvent.roleQuantityOverrides[roleId]
-                        ? existingEvent.roleQuantityOverrides[roleId]
-                        : roleQuantity;
+                    // Get display quantity for this role
+                    // Use the already-calculated roleQuantity (which accounts for overrides)
                     // Ensure we show at least as many slots as there are existing assignments
-                    const displayQuantity = Math.max(overrideQuantity || roleQuantity, existingAssignments.length || 0);
+                    const displayQuantity = Math.max(roleQuantity, existingAssignments.length || 0);
 
                     roleAssignmentHTML += `
                         <div class="border dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
@@ -45499,15 +45587,18 @@
                         const study = state.studies?.find(s => event.studyIds?.includes(s.id));
                         const site = state.crc_sites?.find(s => s.id === event.siteId);
                         
+                        // Get visit number from various possible field names
+                        const visitDisplay = event.visitNumber || event.visit || event.visitName || 'N/A';
+                        
                         fulfillment.unfilledSlots.forEach(slot => {
                             unfilledShifts.push({
                                 eventId: event.id,
                                 date: event.date,
                                 studyId: event.studyIds?.[0],
-                                studyName: study?.name || study?.title || 'Unknown Study',
+                                studyName: study?.name || study?.title || (event.studyIds?.length > 0 ? 'Unknown Study' : 'No Study'),
                                 siteId: event.siteId,
-                                siteName: site?.name || 'Unknown Site',
-                                visit: event.visit || event.visitName || 'N/A',
+                                siteName: site?.name || (event.siteId ? 'Unknown Site' : 'No Site'),
+                                visit: visitDisplay,
                                 roleId: slot.roleId,
                                 roleName: slot.roleName,
                                 period: event.period || 'Full Day',
