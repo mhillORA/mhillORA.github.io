@@ -5049,6 +5049,29 @@
             };
 
             // --- CALCULATION FUNCTIONS ---
+            /** True if CRC has at least one shift (Site Assignment or Travel Day) in the date range. Used to show deactivated CRCs in utilization only when they have work in that period. */
+            const crcHasShiftInPeriod = (crcId, startDate, endDate) => {
+                if (!crcId || !state.crc_events || state.crc_events.length === 0) return false;
+                const start = startDate instanceof Date ? startDate : new Date(startDate);
+                const end = endDate instanceof Date ? endDate : new Date(endDate);
+                return state.crc_events.some(e => {
+                    const eventDate = new Date(e.date + 'T00:00:00');
+                    if (eventDate < start || eventDate > end) return false;
+                    if (!eventBelongsToCrc(e, crcId)) return false;
+                    return isSiteAssignmentWithCrc(e) || e.type === 'Travel Day';
+                });
+            };
+            /** True if CRC has at least one shift in the given calendar month (year, month 0-11). */
+            const crcHasShiftInMonth = (crcId, year, month) => {
+                if (!crcId || !state.crc_events || state.crc_events.length === 0) return false;
+                return state.crc_events.some(e => {
+                    const eventDate = new Date(e.date + 'T00:00:00');
+                    if (eventDate.getFullYear() !== year || eventDate.getMonth() !== month) return false;
+                    if (!eventBelongsToCrc(e, crcId)) return false;
+                    return isSiteAssignmentWithCrc(e) || e.type === 'Travel Day';
+                });
+            };
+
             const calculateMonthlyUtilization = (dateInMonth, crcIdsToCalculate = [], options = {}) => {
                 const { includeTravel = state.managerViewIncludeTravel !== false } = options;
                 const year = dateInMonth.getFullYear();
@@ -17904,7 +17927,12 @@
                 if (state.calendarView === 'week') {
                     titleEl.textContent = `CRC Utilization (Current Week) - ${monthName}`;
                     const weeklyStats = calculateWeeklyUtilization(state.crcCalendarDate);
-                    utilizationHTML = state.crcs.map(crc => {
+                    const weekStart = new Date(now);
+                    weekStart.setDate(now.getDate() - getDaySaturdayStart(now));
+                    const weekEnd = new Date(weekStart);
+                    weekEnd.setDate(weekStart.getDate() + 6);
+                    const crcsToShow = state.crcs.filter(crc => crc.active !== false || crcHasShiftInPeriod(crc.id, weekStart, weekEnd));
+                    utilizationHTML = crcsToShow.map(crc => {
                         const stats = weeklyStats[crc.id] || { totalHours: 0, travelHours: 0, utilizationPercent: 0 };
                         const totalHours = stats.totalHours;
                         const travelHours = stats.travelHours || 0;
@@ -17934,7 +17962,10 @@
                 } else {
                     titleEl.textContent = `CRC Utilization - ${monthName}`;
                     const monthlyStats = calculateMonthlyUtilization(state.crcCalendarDate);
-                    utilizationHTML = state.crcs.map(crc => {
+                    const year = now.getFullYear();
+                    const month = now.getMonth();
+                    const crcsToShow = state.crcs.filter(crc => crc.active !== false || crcHasShiftInMonth(crc.id, year, month));
+                    utilizationHTML = crcsToShow.map(crc => {
                         const stats = monthlyStats[crc.id] || { utilizationPercent: 0, travelDays: 0 };
                         const utilizationPercent = stats.utilizationPercent;
                         const travelDays = stats.travelDays || 0;
@@ -21596,10 +21627,11 @@
                 workEvents.forEach(event => {
                     const hours = parseFloat(event.hours) || 0;
                     if (hours === 0) return;
-                    if (event.roles && event.roles.length > 0) {
-                        const hoursPerRole = hours / event.roles.length;
-                        event.roles.forEach(role => {
-                            hoursByRole[role] = (hoursByRole[role] || 0) + hoursPerRole;
+                    const roleNames = getEventRoles(event);
+                    if (roleNames && roleNames.length > 0) {
+                        const hoursPerRole = hours / roleNames.length;
+                        roleNames.forEach(roleName => {
+                            hoursByRole[roleName] = (hoursByRole[roleName] || 0) + hoursPerRole;
                         });
                     }
                     const studyIds = getValidStudyIdsForEvent(event);
@@ -40942,8 +40974,11 @@
                     return matches;
                 });
                 
+                // Deactivated CRCs: show only if they have a shift in this period (for past/current/next month)
+                const crcsToShow = (state.crcs || []).filter(crc => crc.active !== false || crcHasShiftInPeriod(crc.id, startDate, endDate));
+                
                 // Calculate CRC utilization for selected period
-                const crcUtilization = (state.crcs || []).map(crc => {
+                const crcUtilization = crcsToShow.map(crc => {
                     const crcPeriodEvents = periodEvents.filter(e => eventBelongsToCrc(e, crc.id));
                     
                     // Calculate hours worked (Site Assignment with optional Travel) - calculateCrcHours handles deduplication
