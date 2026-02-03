@@ -5145,6 +5145,40 @@
                     if (beforeCount !== afterCount) {
                         console.warn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate events from crc_events`);
                     }
+                    // TRAVEL DAY DISPLAY DEDUPE: Keep only one travel day per (crcId, date) so UI never shows hundreds per day
+                    const travelKey = (e) => {
+                        const cid = e.crcId || (Array.isArray(e.crcIds) && e.crcIds[0]) || null;
+                        return cid && e.date ? `travel:${cid}::${e.date}` : null;
+                    };
+                    const seenTravelKeys = new Set();
+                    const beforeTravel = state.crc_events.length;
+                    state.crc_events = state.crc_events.filter(event => {
+                        if (event.type !== 'Travel Day') return true;
+                        const key = travelKey(event);
+                        if (!key) return true;
+                        if (seenTravelKeys.has(key)) return false;
+                        seenTravelKeys.add(key);
+                        return true;
+                    });
+                    if (state.crc_events.length < beforeTravel) {
+                        console.warn(`CHAOS: Collapsed ${beforeTravel - state.crc_events.length} duplicate travel days for display (one per person per date)`);
+                    }
+                    // PTO/TIME OFF DISPLAY DEDUPE: Keep only one per (crcId, date) across all legacy formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.)
+                    const ptoTypes = new Set(['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty']);
+                    const ptoKey = (e) => e.crcId && e.date ? `pto:${e.crcId}::${e.date}` : null;
+                    const seenPtoKeys = new Set();
+                    const beforePto = state.crc_events.length;
+                    state.crc_events = state.crc_events.filter(event => {
+                        if (!ptoTypes.has(event.type)) return true;
+                        const key = ptoKey(event);
+                        if (!key) return true;
+                        if (seenPtoKeys.has(key)) return false;
+                        seenPtoKeys.add(key);
+                        return true;
+                    });
+                    if (state.crc_events.length < beforePto) {
+                        console.warn(`CHAOS: Collapsed ${beforePto - state.crc_events.length} duplicate PTO/time off for display (one per person per date)`);
+                    }
                 }
                 
                 // DEDUPLICATION: Always deduplicate timeOffRequests by ID when state changes
@@ -5160,6 +5194,22 @@
                     const afterCount = state.timeOffRequests.length;
                     if (beforeCount !== afterCount) {
                         console.warn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate time off requests`);
+                    }
+                    // PTO REQUESTS DISPLAY DEDUPE: Keep one per (crcId, startDate) so multiple formats don't flood the UI
+                    const reqStart = (r) => toDateOnlyString(parseDateFlexible(r.startDate || r.date));
+                    const seenReqKeys = new Set();
+                    const beforeReq = state.timeOffRequests.length;
+                    state.timeOffRequests = state.timeOffRequests.filter(request => {
+                        const crcId = request.crcId;
+                        const start = reqStart(request);
+                        if (!crcId || !start) return true;
+                        const key = `req:${crcId}::${start}`;
+                        if (seenReqKeys.has(key)) return false;
+                        seenReqKeys.add(key);
+                        return true;
+                    });
+                    if (state.timeOffRequests.length < beforeReq) {
+                        console.warn(`CHAOS: Collapsed ${beforeReq - state.timeOffRequests.length} duplicate time off requests for display (one per person per start date)`);
                     }
                 }
                 if (options.skipRender) {
@@ -5203,8 +5253,23 @@
         console.warn('CHAOS: Prevented adding duplicate event:', newEvent.id);
         return;
     }
-    // Actually push the data into the array like a professional
-    state.crc_events.push(newEvent); 
+    // CRITICAL: Never add duplicate travel days (one per CRC per date)
+    if (newEvent.type === 'Travel Day' && (newEvent.crcId || (newEvent.crcIds && newEvent.crcIds.length > 0)) && newEvent.date) {
+        const cid = newEvent.crcId || (newEvent.crcIds && newEvent.crcIds[0]);
+        if (cid && state.crc_events.some(e => e.type === 'Travel Day' && e.date === newEvent.date && (e.crcId === cid || (Array.isArray(e.crcIds) && e.crcIds.includes(cid))))) {
+            console.warn('CHAOS: Prevented duplicate travel day:', cid, newEvent.date);
+            return;
+        }
+    }
+    // CRITICAL: Never add duplicate PTO/time off (one per CRC per date; all formats treated same)
+    const ptoTypes = ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty'];
+    if (ptoTypes.includes(newEvent.type) && newEvent.crcId && newEvent.date) {
+        if (state.crc_events.some(e => ptoTypes.includes(e.type) && e.crcId === newEvent.crcId && e.date === newEvent.date)) {
+            console.warn('CHAOS: Prevented duplicate PTO/time off:', newEvent.crcId, newEvent.date);
+            return;
+        }
+    }
+    state.crc_events.push(newEvent);
 };
             
             // Helper function to safely add multiple events to state without duplicates
@@ -5267,6 +5332,115 @@
                 }
                 
                 return deduped;
+            };
+            
+            // Remove duplicate travel days from the API. Keeps exactly one per (person, date); deletes only the extras.
+            // CONFIRMED: For each (crcId, date) we KEEP the first event (by id) and DELETE the rest. No valid travel days are removed.
+            const cleanDuplicateTravelDaysInApi = async () => {
+                const events = await apiService.getEvents();
+                const travelEvents = (events || []).filter(e => e.type === 'Travel Day');
+                const getCrcId = (e) => e.crcId || (Array.isArray(e.crcIds) && e.crcIds[0]) || null;
+                const groups = new Map();
+                travelEvents.forEach(e => {
+                    const cid = getCrcId(e);
+                    if (!cid || !e.date) return;
+                    const key = `${cid}::${e.date}`;
+                    if (!groups.has(key)) groups.set(key, []);
+                    groups.get(key).push(e);
+                });
+                const toDelete = [];
+                groups.forEach((list) => {
+                    if (list.length <= 1) return; // Keep the only one; nothing to delete
+                    list.sort((a, b) => (a.id || '').localeCompare(b.id || '')); // Deterministic: keep first by id
+                    for (let i = 1; i < list.length; i++) toDelete.push(list[i].id); // Delete extras only; list[0] is kept
+                });
+                if (toDelete.length === 0) {
+                    showNotification('No duplicate travel days found.', 'success');
+                    return;
+                }
+                for (const id of toDelete) {
+                    try {
+                        await apiService.deleteEvent(id);
+                    } catch (err) {
+                        console.error('Error deleting duplicate travel day:', id, err);
+                        showNotification(`Failed to delete some duplicates. See console.`, 'error');
+                    }
+                }
+                const updated = await apiService.getEvents();
+                setState({ crc_events: updated });
+                showNotification(`Removed ${toDelete.length} duplicate travel day(s). One per person per date kept.`, 'success');
+            };
+            
+            // Remove duplicate PTO/time off EVENTS from crc_events (one per person per date). Keeps one, deletes extras. All legacy formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.) treated as same for dedupe.
+            const PTO_EVENT_TYPES = new Set(['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty']);
+            const cleanDuplicatePTOInApi = async () => {
+                const events = await apiService.getEvents();
+                const ptoEvents = (events || []).filter(e => PTO_EVENT_TYPES.has(e.type));
+                const groups = new Map();
+                ptoEvents.forEach(e => {
+                    if (!e.crcId || !e.date) return;
+                    const key = `${e.crcId}::${e.date}`;
+                    if (!groups.has(key)) groups.set(key, []);
+                    groups.get(key).push(e);
+                });
+                const toDelete = [];
+                groups.forEach((list) => {
+                    if (list.length <= 1) return;
+                    list.sort((a, b) => (a.id || '').localeCompare(b.id || ''));
+                    for (let i = 1; i < list.length; i++) toDelete.push(list[i].id);
+                });
+                if (toDelete.length === 0) {
+                    showNotification('No duplicate PTO/time off events found.', 'success');
+                    return;
+                }
+                for (const id of toDelete) {
+                    try {
+                        await apiService.deleteEvent(id);
+                    } catch (err) {
+                        console.error('Error deleting duplicate PTO event:', id, err);
+                        showNotification(`Failed to delete some PTO duplicates. See console.`, 'error');
+                    }
+                }
+                const updated = await apiService.getEvents();
+                setState({ crc_events: updated });
+                showNotification(`Removed ${toDelete.length} duplicate PTO/time off event(s). One per person per date kept.`, 'success');
+            };
+            
+            // Remove duplicate time off REQUESTS (one per person per start date). Keeps one, deletes extras.
+            const cleanDuplicateTimeOffRequestsInApi = async () => {
+                const requests = await apiService.getTimeOffRequests();
+                const list = Array.isArray(requests) ? requests : [];
+                const reqStart = (r) => toDateOnlyString(parseDateFlexible(r.startDate || r.date));
+                const groups = new Map();
+                list.forEach(r => {
+                    const crcId = r.crcId;
+                    const start = reqStart(r);
+                    if (!crcId || !start) return;
+                    const key = `${crcId}::${start}`;
+                    if (!groups.has(key)) groups.set(key, []);
+                    groups.get(key).push(r);
+                });
+                const toDelete = [];
+                groups.forEach((list) => {
+                    if (list.length <= 1) return;
+                    list.sort((a, b) => (a.id || '').localeCompare(b.id || ''));
+                    for (let i = 1; i < list.length; i++) toDelete.push(list[i].id);
+                });
+                if (toDelete.length === 0) {
+                    showNotification('No duplicate time off requests found.', 'success');
+                    return;
+                }
+                for (const id of toDelete) {
+                    try {
+                        await apiService.deleteTimeOffRequest(id);
+                    } catch (err) {
+                        console.error('Error deleting duplicate time off request:', id, err);
+                        showNotification(`Failed to delete some request duplicates. See console.`, 'error');
+                    }
+                }
+                const updated = await apiService.getTimeOffRequests();
+                setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
+                showNotification(`Removed ${toDelete.length} duplicate time off request(s). One per person per start date kept.`, 'success');
             };
             
             // Find and report duplicates in the data - returns detailed info for cleanup
@@ -11296,10 +11470,19 @@
                         
                         <div class="mb-4 flex justify-between items-center">
                             <p class="text-sm text-gray-600 dark:text-gray-400">Showing <strong>${filteredEvents.length}</strong> events</p>
-                            <div class="flex gap-2">
+                            <div class="flex gap-2 flex-wrap">
                                 ${canDeleteEvents ? `
                                 <button id="bulk-delete-events-btn" data-action="bulk-delete-all-schedule-events" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 flex items-center text-sm disabled:opacity-50 disabled:cursor-not-allowed" disabled>
                                     <i data-lucide="trash-2" class="w-4 h-4 mr-2"></i>Delete Selected (<span id="selected-count">0</span>)
+                                </button>
+                                <button data-action="clean-duplicate-travel-days" class="bg-amber-600 text-white px-4 py-2 rounded-md hover:bg-amber-700 flex items-center text-sm" title="Keep one travel day per person per date; remove extras only">
+                                    <i data-lucide="trash-2" class="w-4 h-4 mr-2"></i>Clean duplicate travel days
+                                </button>
+                                <button data-action="clean-duplicate-pto" class="bg-amber-600 text-white px-4 py-2 rounded-md hover:bg-amber-700 flex items-center text-sm" title="Keep one PTO/time off event per person per date (all formats); remove extras">
+                                    <i data-lucide="calendar-off" class="w-4 h-4 mr-2"></i>Clean duplicate PTO events
+                                </button>
+                                <button data-action="clean-duplicate-time-off-requests" class="bg-amber-600 text-white px-4 py-2 rounded-md hover:bg-amber-700 flex items-center text-sm" title="Keep one time off request per person per start date; remove extras">
+                                    <i data-lucide="calendar-off" class="w-4 h-4 mr-2"></i>Clean duplicate time off requests
                                 </button>
                                 ` : ''}
                                 <button data-action="export-all-schedule" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 flex items-center text-sm">
@@ -13119,7 +13302,7 @@
                                     <button data-action="set-view" data-view="week" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'week' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Week</button>
                                 </div>
                             </div>
-                            <div class="flex items-center space-x-2">
+                            <div class="flex items-center space-x-2 flex-wrap gap-1">
                                 <button data-action="${prevAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left" class="w-4 h-4 md:w-5 md:h-5"></i></button>
                                 ${isDailyView ? `
                                     <select id="date-selector" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
@@ -22647,7 +22830,7 @@
             };
 
 
-            const getCRCEventModalHTML = (date, event = null, seriesStartDate = null, seriesEndDate = null) => {
+            const getCRCEventModalHTML = (date, event = null, seriesStartDate = null, seriesEndDate = null, editMode = null) => {
                 const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
                 const isEditing = event !== null && event.id;
                 const eventType = event ? event.type : 'Site Assignment';
@@ -29436,6 +29619,57 @@
                         }
                         break;
                     }
+                    case 'clean-duplicate-travel-days': {
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors cannot run data cleanup.', 'error');
+                            return;
+                        }
+                        const confirmed = confirm('This will find all duplicate travel days (same person, same date) and remove the extras, keeping one per person per date. Run this once to clean existing data. Continue?');
+                        if (confirmed) {
+                            try {
+                                await cleanDuplicateTravelDaysInApi();
+                            } catch (err) {
+                                console.error('Clean duplicate travel days failed:', err);
+                                showNotification('Cleanup failed. See console.', 'error');
+                            }
+                        }
+                        break;
+                    }
+                    case 'clean-duplicate-pto': {
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors cannot run data cleanup.', 'error');
+                            return;
+                        }
+                        const confirmed = confirm('This will find duplicate PTO/time off EVENTS (same person, same date) across all formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.) and remove the extras, keeping one per person per date. Continue?');
+                        if (confirmed) {
+                            try {
+                                await cleanDuplicatePTOInApi();
+                            } catch (err) {
+                                console.error('Clean duplicate PTO failed:', err);
+                                showNotification('Cleanup failed. See console.', 'error');
+                            }
+                        }
+                        break;
+                    }
+                    case 'clean-duplicate-time-off-requests': {
+                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisor) {
+                            showNotification('Supervisors cannot run data cleanup.', 'error');
+                            return;
+                        }
+                        const confirmed = confirm('This will find duplicate time off REQUESTS (same person, same start date) and remove the extras, keeping one per person per start date. Continue?');
+                        if (confirmed) {
+                            try {
+                                await cleanDuplicateTimeOffRequestsInApi();
+                            } catch (err) {
+                                console.error('Clean duplicate time off requests failed:', err);
+                                showNotification('Cleanup failed. See console.', 'error');
+                            }
+                        }
+                        break;
+                    }
                     case 'bulk-delete-all-schedule-events': {
                         // Block supervisors from deleting events
                         const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
@@ -32250,6 +32484,17 @@
                         const isEditing = !!eventId;
                         const existingEvent = isEditing ? state.crc_events.find(e => e.id === eventId) : null;
                         const existingGroupId = existingEvent && existingEvent.groupId ? existingEvent.groupId : null;
+                        // CRITICAL: Prevent duplicate travel events - one travel day per (crcId, date) per submit
+                        const travelDaysCreatedThisSubmit = new Set();
+                        const travelDayKey = (crcId, dateStr) => `${crcId}::${dateStr}`;
+                        const findExistingTravelDay = (crcId, dateStr) => {
+                            if (travelDaysCreatedThisSubmit.has(travelDayKey(crcId, dateStr))) return true; // already created this submit - treat as "exists"
+                            return state.crc_events.find(e =>
+                                e.type === 'Travel Day' && e.date === dateStr &&
+                                (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
+                            ) || null;
+                        };
+                        const registerTravelDayCreated = (crcId, dateStr) => { travelDaysCreatedThisSubmit.add(travelDayKey(crcId, dateStr)); };
                         const errorMessageDiv = document.getElementById('form-error-message');
                         if (errorMessageDiv) errorMessageDiv.textContent = '';
 
@@ -32740,21 +32985,10 @@
                                         const startTravelDate = new Date(startDateDuplicate);
                                         startTravelDate.setDate(startTravelDate.getDate() - 1);
                                         const startTravelDateStr = toDateOnlyString(startTravelDate);
-                                        
-                                        // Check if travel day already exists for this CRC on this date
-                                        // CRITICAL: Check both crcId AND crcIds array
-                                        const existingTravelDay = state.crc_events.find(e => 
-                                            e.type === 'Travel Day' && 
-                                            e.date === startTravelDateStr && 
-                                            (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
-                                        );
-                                        
-                                        // Only create if it doesn't already exist
-                                        if (!existingTravelDay) {
-                                            // Find matching flight
+                                        const existingTravelDay = findExistingTravelDay(crcId, startTravelDateStr);
+                                        if (existingTravelDay !== true && !existingTravelDay) {
                                             const matchingFlight = findFlightWithinBusinessDay(crcId, startDateDuplicate, true);
                                             const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
-                                            
                                             const travelPayload = {
                                                 ...duplicateBase,
                                                 name: 'Travel Day',
@@ -32762,16 +32996,14 @@
                                                 crcIds: [crcId],
                                                 roles: [],
                                                 date: startTravelDateStr,
-                                                startDate: startTravelDateStr,  // CRITICAL: Single day
-                                                endDate: startTravelDateStr,    // CRITICAL: Single day
-                                                groupId: `travel-${crcId}-${startTravelDateStr}`,  // Unique groupId
-                                                parentShiftGroupId: groupIdDuplicate,  // Link to parent shift
-                                                isTravelBefore: true,  // Travel before shift starts
+                                                startDate: startTravelDateStr,
+                                                endDate: startTravelDateStr,
+                                                groupId: `travel-${crcId}-${startTravelDateStr}`,
+                                                parentShiftGroupId: groupIdDuplicate,
+                                                isTravelBefore: true,
                                                 type: 'Travel Day',
                                                 hours: travelHours
                                             };
-                                            
-                                            // Add flight information if found
                                             if (matchingFlight) {
                                                 if (matchingFlight.flightNumber) travelPayload.flightNumber = matchingFlight.flightNumber;
                                                 if (matchingFlight.airline) travelPayload.airline = matchingFlight.airline;
@@ -32782,10 +33014,8 @@
                                                 if (matchingFlight.confirmationNumber) travelPayload.confirmationNumber = matchingFlight.confirmationNumber;
                                                 if (matchingFlight.bookingId) travelPayload.travelBookingId = matchingFlight.bookingId;
                                             }
-                                            
+                                            registerTravelDayCreated(crcId, startTravelDateStr);
                                             await createAndStoreEvent(travelPayload);
-                                        } else {
-                                            console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation in duplicate schedule');
                                         }
                                     }
                                     const dayCursor = new Date(startDateDuplicate);
@@ -32808,21 +33038,10 @@
                                         const endTravelDate = new Date(endDateDuplicate);
                                         endTravelDate.setDate(endTravelDate.getDate() + 1);
                                         const endTravelDateStr = toDateOnlyString(endTravelDate);
-                                        
-                                        // Check if travel day already exists for this CRC on this date
-                                        // CRITICAL: Check both crcId AND crcIds array
-                                        const existingTravelDay = state.crc_events.find(e => 
-                                            e.type === 'Travel Day' && 
-                                            e.date === endTravelDateStr && 
-                                            (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
-                                        );
-                                        
-                                        // Only create if it doesn't already exist
-                                        if (!existingTravelDay) {
-                                            // Find matching flight
+                                        const existingTravelDay = findExistingTravelDay(crcId, endTravelDateStr);
+                                        if (existingTravelDay !== true && !existingTravelDay) {
                                             const matchingFlight = findFlightWithinBusinessDay(crcId, endDateDuplicate, false);
                                             const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
-                                            
                                             const travelPayload = {
                                                 ...duplicateBase,
                                                 name: 'Travel Day',
@@ -32830,14 +33049,12 @@
                                                 crcIds: [crcId],
                                                 roles: [],
                                                 date: endTravelDateStr,
-                                                startDate: endTravelDateStr,  // CRITICAL: Single day
-                                                endDate: endTravelDateStr,    // CRITICAL: Single day
-                                                groupId: `travel-${crcId}-${endTravelDateStr}`,  // Unique groupId
+                                                startDate: endTravelDateStr,
+                                                endDate: endTravelDateStr,
+                                                groupId: `travel-${crcId}-${endTravelDateStr}`,
                                                 type: 'Travel Day',
                                                 hours: travelHours
                                             };
-                                            
-                                            // Add flight information if found
                                             if (matchingFlight) {
                                                 if (matchingFlight.flightNumber) travelPayload.flightNumber = matchingFlight.flightNumber;
                                                 if (matchingFlight.airline) travelPayload.airline = matchingFlight.airline;
@@ -32848,10 +33065,8 @@
                                                 if (matchingFlight.confirmationNumber) travelPayload.confirmationNumber = matchingFlight.confirmationNumber;
                                                 if (matchingFlight.bookingId) travelPayload.travelBookingId = matchingFlight.bookingId;
                                             }
-                                            
+                                            registerTravelDayCreated(crcId, endTravelDateStr);
                                             await createAndStoreEvent(travelPayload);
-                                        } else {
-                                            console.log('Travel day already exists for CRC:', crcId, 'on date:', endTravelDateStr, '- skipping creation in duplicate schedule');
                                         }
                                     }
                                 }
@@ -33368,6 +33583,8 @@
                                         }
                                         
                                         // For group events, we need to handle role assignments properly
+                                        // Preserve shift type when editing so we never recreate a shift as travel
+                                        const typeForDateRange = isEditing && existingEvent ? existingEvent.type : data.eventType;
                                         // Get roles from role assignments if available, otherwise from legacy roles
                                         const rolesForGroup = [];
                                         if (Object.keys(finalRoleAssignments).length > 0) {
@@ -33383,7 +33600,7 @@
                                         }
                                         
                                         // Travel Day events can have training roles assigned (e.g., "Training, ICF")
-                                        const isTravelDayEdit = data.eventType === 'Travel Day';
+                                        const isTravelDayEdit = typeForDateRange === 'Travel Day';
                                         // For travel days, filter to only include training roles
                                         let finalRolesForGroup = [];
                                         if (isTravelDayEdit) {
@@ -33403,8 +33620,8 @@
                                             const dateStr = toDateOnlyString(dayCursor);
                                             const eventPayload = {
                                                 ...baseEventData,
-                                                type: data.eventType,
-                                                crcId: isTravelDay ? travelDayCrcId : null, // For Travel Day, preserve crcId; for others use roleAssignments
+                                                type: typeForDateRange,
+                                                crcId: isTravelDayEdit ? travelDayCrcId : null, // Match type: only set for Travel Day
                                                 roles: [], // Legacy field - use roleAssignments instead
                                                 // CRITICAL: Always include roleAssignments, even if empty (for Open Shifts)
                                     // The API will allow Site Assignment events with empty roleAssignments as Open Shifts
@@ -33474,12 +33691,13 @@
                                         closeModal();
                                     } else if (changedToMultiDay) {
                                         // Changing from single-day to multi-day - create additional events
-                                        // For editing, handle both cases: with CRC or without CRC
+                                        // Preserve shift type when editing so we never turn a shift into travel
+                                        const typeForMultiDay = isEditing && existingEvent ? existingEvent.type : data.eventType;
                                         const roles = crcIds.length > 0 ? formData.getAll(`roles-${crcIds[0]}`) : [];
                                         
                                         // Travel Day events should not have roles assigned
                                         // Travel Day events can have training roles assigned (e.g., "Training, ICF")
-                                        const isTravelDayEdit = data.eventType === 'Travel Day';
+                                        const isTravelDayEdit = typeForMultiDay === 'Travel Day';
                                         // For travel days, filter to only include training roles
                                         let finalRoles = [];
                                         if (isTravelDayEdit) {
@@ -33574,7 +33792,7 @@
                                         
                                         const updatePayload = {
                                             ...baseEventData,
-                                            type: data.eventType,
+                                            type: typeForMultiDay,
                                             crcId: isTravelDayEdit ? (existingEvent?.crcId || travelDayCrcId) : null, // For Travel Day, preserve crcId; for others use roleAssignments
                                             roles: [], // Legacy field - use roleAssignments instead
                                             // CRITICAL: Always include roleAssignments, even if empty (for Open Shifts)
@@ -33615,8 +33833,8 @@
                                             const dateStr = toDateOnlyString(dayCursor);
                                             const eventPayload = {
                                                 ...baseEventData,
-                                                type: data.eventType,
-                                                crcId: isTravelDay ? travelDayCrcId : null, // For Travel Day, preserve crcId; for others use roleAssignments
+                                                type: typeForMultiDay,
+                                                crcId: isTravelDayEdit ? travelDayCrcId : null, // Match type: only set for Travel Day
                                                 roles: [], // Legacy field - use roleAssignments instead
                                                 // CRITICAL: Always include roleAssignments, even if empty (for Open Shifts)
                                     // The API will allow Site Assignment events with empty roleAssignments as Open Shifts
@@ -33673,9 +33891,11 @@
                                         }
                                         
                                         // Update the remaining event to remove groupId and set endDate to same as date
+                                        // Preserve shift type when editing so we never turn a shift into travel
+                                        const typeForSingleDay = isEditing && existingEvent ? existingEvent.type : data.eventType;
                                         const roles = crcIds.length > 0 ? formData.getAll(`roles-${crcIds[0]}`) : [];
                                         // Travel Day events can have training roles assigned (e.g., "Training, ICF")
-                                        const isTravelDayEdit = data.eventType === 'Travel Day';
+                                        const isTravelDayEdit = typeForSingleDay === 'Travel Day';
                                         // For travel days, filter to only include training roles
                                         let finalRoles = [];
                                         if (isTravelDayEdit) {
@@ -33701,7 +33921,7 @@
                                         
                                         const updatePayload = {
                                             ...baseEventData,
-                                            type: data.eventType,
+                                            type: typeForSingleDay,
                                             crcId: isTravelDayEdit ? (existingEvent?.crcId || travelDayCrcId) : null, // For Travel Day, preserve crcId; for others use roleAssignments
                                             roles: [], // Legacy field - use roleAssignments instead
                                             // CRITICAL: Always include roleAssignments, even if empty (for Open Shifts)
@@ -33874,9 +34094,11 @@
                                         console.log('[TRAVEL DEBUG] travelDayPreferences:', JSON.stringify(travelDayPreferences, null, 2));
                                         console.log('[TRAVEL DEBUG] hasSelectedTravel:', hasSelectedTravel);
                                         
-                                        // When editing, preserve the existing event type so we never convert a shift to Travel Day
-                                        // (e.g. if the form incorrectly showed Travel Day from a merged view)
-                                        const payloadType = isEditing && existingEvent ? existingEvent.type : data.eventType;
+                                        // When updating SHIFT days (group or single), never use Travel Day: we're editing the shift, not travel.
+                                        // If user opened from a travel-day block, existingEvent is Travel Day—we must still send Site Assignment for the shift.
+                                        const payloadType = (isGroupEvent && existingGroupId)
+                                            ? 'Site Assignment'
+                                            : (isEditing && existingEvent ? existingEvent.type : data.eventType);
                                         const updatePayload = {
                                             ...baseEventData,
                                             // CRITICAL: Preserve the event ID and type to ensure it's an UPDATE, not a delete
@@ -34125,14 +34347,9 @@
 
                                             const upsertTravelDay = async ({ crcId, travelDateStr, isBefore }) => {
                                                 if (!travelDateStr) return;
-                                                // CRITICAL: Check for existing travel days across ALL dates and groupIds, not just the current groupId
-                                                // This prevents duplicates when the same CRC has travel days from different shifts
-                                                const existingTravelDay = state.crc_events.find(e =>
-                                                    e.type === 'Travel Day' &&
-                                                    e.date === travelDateStr &&
-                                                    matchesCrcId(e, crcId)
-                                                );
-
+                                                // CRITICAL: Single source of truth - never create duplicate travel (crcId + date)
+                                                const existingTravelDay = findExistingTravelDay(crcId, travelDateStr);
+                                                if (existingTravelDay === true) return; // already created this submit
                                                 const matchingFlight = findFlightWithinBusinessDay(crcId, isBefore ? eventStartDate : eventEndDate, isBefore);
                                                 const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
 
@@ -34171,6 +34388,7 @@
                                                     try {
                                                         const created = await apiService.createEvent(travelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
+                                                        registerTravelDayCreated(crcId, travelDateStr);
                                                         addEventToState(createdEvent);
                                                     } catch (createError) {
                                                         console.error('Error creating travel day (edit mode):', createError);
@@ -34511,31 +34729,20 @@
                                             const dayCursor = new Date(startDate);
                                             while (dayCursor <= endDate) {
                                                 const dateStr = toDateOnlyString(dayCursor);
-                                                
-                                                // Check if travel day already exists for this CRC on this date
-                                                // CRITICAL: Check both crcId AND crcIds array
-                                                const existingTravelDay = state.crc_events.find(e => 
-                                                    e.type === 'Travel Day' && 
-                                                    e.date === dateStr && 
-                                                    (e.crcId === travelCrcId || (Array.isArray(e.crcIds) && e.crcIds.includes(travelCrcId)))
-                                                );
-                                                
-                                                // Only create if it doesn't already exist
+                                                const existingTravelDay = findExistingTravelDay(travelCrcId, dateStr);
+                                                if (existingTravelDay === true) { dayCursor.setDate(dayCursor.getDate() + 1); continue; }
                                                 if (!existingTravelDay) {
-                                                    // Find matching flight
                                                     const matchingFlight = findFlightWithinBusinessDay(travelCrcId, dayCursor, false);
                                                     const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
-                                                    
                                                     const travelEventData = { 
-                                                        // Travel days inherit study/site from parent shift for grid display
                                                         name: 'Travel Day', 
                                                         crcId: travelCrcId,
                                                         crcIds: [travelCrcId],
                                                         roles: [], 
                                                         date: dateStr,
-                                                        startDate: dateStr,  // CRITICAL: Single day
-                                                        endDate: dateStr,    // CRITICAL: Single day
-                                                        groupId: `travel-${travelCrcId}-${dateStr}`,  // Unique groupId
+                                                        startDate: dateStr,
+                                                        endDate: dateStr,
+                                                        groupId: `travel-${travelCrcId}-${dateStr}`,
                                                         type: 'Travel Day',
                                                         hours: travelHours,
                                                         notes: '',
@@ -34544,8 +34751,6 @@
                                                         siteId: selectedSiteId || null,
                                                         roleAssignments: {}
                                                     };
-                                                    
-                                                    // Add flight information if found
                                                     if (matchingFlight) {
                                                         if (matchingFlight.flightNumber) travelEventData.flightNumber = matchingFlight.flightNumber;
                                                         if (matchingFlight.airline) travelEventData.airline = matchingFlight.airline;
@@ -34556,15 +34761,12 @@
                                                         if (matchingFlight.confirmationNumber) travelEventData.confirmationNumber = matchingFlight.confirmationNumber;
                                                         if (matchingFlight.bookingId) travelEventData.travelBookingId = matchingFlight.bookingId;
                                                     }
-                                                    
-                                                    console.log('Creating Travel Day event (new path) for:', dateStr, 'CRC:', travelCrcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
+                                                    console.log('Creating Travel Day event (new path) for:', dateStr, 'CRC:', travelCrcId);
                                                     const created = await apiService.createEvent(travelEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
+                                                    registerTravelDayCreated(travelCrcId, dateStr);
                                                     addEventToState(createdEvent);
-                                                } else {
-                                                    console.log('Travel day already exists for CRC:', travelCrcId, 'on date:', dateStr, '- skipping creation');
                                                 }
-                                                
                                                 dayCursor.setDate(dayCursor.getDate() + 1);
                                             }
                                         } else {
@@ -34611,15 +34813,15 @@
                                                     console.log(`[TRAVEL DEBUG] No travelDateStr, returning early`);
                                                     return;
                                                 }
-                                                // CRITICAL FIX: Check by parentShiftGroupId + CRC + isBefore to find linked travel days
-                                                // This prevents duplicates when dates change
-                                                const existingTravelDay = state.crc_events.find(e =>
+                                                // CRITICAL: One travel day per (crcId, date) - never create duplicates
+                                                const existingByKey = findExistingTravelDay(crcId, travelDateStr);
+                                                if (existingByKey === true) return; // already created this submit
+                                                const existingTravelDay = existingByKey || state.crc_events.find(e =>
                                                     e.type === 'Travel Day' &&
                                                     e.parentShiftGroupId === parentShiftGroupId &&
                                                     matchesCrcId(e, crcId) &&
                                                     e.isTravelBefore === isBefore
                                                 ) || state.crc_events.find(e =>
-                                                    // Fallback: check by date + CRC for legacy travel days without parentShiftGroupId
                                                     e.type === 'Travel Day' &&
                                                     !e.parentShiftGroupId &&
                                                     e.date === travelDateStr &&
@@ -34669,6 +34871,7 @@
                                                         if (matchingFlight.bookingId) travelEventData.travelBookingId = matchingFlight.bookingId;
                                                     }
 
+                                                    registerTravelDayCreated(crcId, travelDateStr);
                                                     const created = await apiService.createEvent(travelEventData);
                                                     const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
                                                     console.log(`[TRAVEL DEBUG] Travel day created for CRC ${crcId}:`, createdEvent.id);
@@ -35004,30 +35207,19 @@
                                                 }
                                                 
                                                 if (startTravelDateStr) {
-                                                    // Check if travel day already exists for this CRC on this date
-                                                    // CRITICAL: Check both crcId AND crcIds array
-                                                    const existingTravelDay = state.crc_events.find(e => 
-                                                        e.type === 'Travel Day' && 
-                                                        e.date === startTravelDateStr && 
-                                                        (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
-                                                    );
-                                                    
-                                                    // Only create if it doesn't already exist
-                                                    if (!existingTravelDay) {
-                                                        // Find matching flight
+                                                    const existingTravelDay = findExistingTravelDay(crcId, startTravelDateStr);
+                                                    if (existingTravelDay !== true && !existingTravelDay) {
                                                         const matchingFlight = findFlightWithinBusinessDay(crcId, startDate, true);
                                                         const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
-                                                        
                                                         const startTravelEventData = { 
-                                                            // Travel days inherit study/site from parent shift for grid display
                                                             name: 'Travel Day', 
                                                             crcId, 
-                                                            crcIds: [crcId],  // CRITICAL: Single CRC
+                                                            crcIds: [crcId],
                                                             roles: [], 
                                                             date: startTravelDateStr,
-                                                            startDate: startTravelDateStr,  // CRITICAL: Single day
-                                                            endDate: startTravelDateStr,    // CRITICAL: Single day
-                                                            groupId: `travel-${crcId}-${startTravelDateStr}`,  // Travel days get their OWN groupId
+                                                            startDate: startTravelDateStr,
+                                                            endDate: startTravelDateStr,
+                                                            groupId: `travel-${crcId}-${startTravelDateStr}`,
                                                             type: 'Travel Day',
                                                             hours: travelHours,
                                                             notes: '',
@@ -35036,8 +35228,6 @@
                                                             siteId: selectedSiteId || null,
                                                             roleAssignments: {}
                                                         };
-                                                        
-                                                        // Add flight information if found
                                                         if (matchingFlight) {
                                                             if (matchingFlight.flightNumber) startTravelEventData.flightNumber = matchingFlight.flightNumber;
                                                             if (matchingFlight.airline) startTravelEventData.airline = matchingFlight.airline;
@@ -35048,13 +35238,11 @@
                                                             if (matchingFlight.confirmationNumber) startTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
                                                             if (matchingFlight.bookingId) startTravelEventData.travelBookingId = matchingFlight.bookingId;
                                                         }
-                                                        
-                                                        console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
+                                                        console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'CRC:', crcId);
                                                         const created = await apiService.createEvent(startTravelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
+                                                        registerTravelDayCreated(crcId, startTravelDateStr);
                                                         addEventToState(createdEvent);
-                                                    } else {
-                                                        console.log('Travel day already exists for CRC:', crcId, 'on date:', startTravelDateStr, '- skipping creation');
                                                     }
                                                 }
                                             }
@@ -35136,30 +35324,19 @@
                                                 }
                                                 
                                                 if (endTravelDateStr) {
-                                                    // Check if travel day already exists for this CRC on this date
-                                                    // CRITICAL: Check both crcId AND crcIds array
-                                                    const existingTravelDay = state.crc_events.find(e => 
-                                                        e.type === 'Travel Day' && 
-                                                        e.date === endTravelDateStr && 
-                                                        (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
-                                                    );
-                                                    
-                                                    // Only create if it doesn't already exist
-                                                    if (!existingTravelDay) {
-                                                        // Find matching flight
+                                                    const existingTravelDay = findExistingTravelDay(crcId, endTravelDateStr);
+                                                    if (existingTravelDay !== true && !existingTravelDay) {
                                                         const matchingFlight = findFlightWithinBusinessDay(crcId, endDate, false);
                                                         const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
-                                                        
                                                         const endTravelEventData = { 
-                                                            // Travel days inherit study/site from parent shift for grid display
                                                             name: 'Travel Day', 
                                                             crcId, 
-                                                            crcIds: [crcId],  // CRITICAL: Single CRC
+                                                            crcIds: [crcId],
                                                             roles: [], 
                                                             date: endTravelDateStr, 
-                                                            startDate: endTravelDateStr,  // CRITICAL: Single day
-                                                            endDate: endTravelDateStr,    // CRITICAL: Single day
-                                                            groupId: `travel-${crcId}-${endTravelDateStr}`,  // CRITICAL: Travel days get their OWN groupId
+                                                            startDate: endTravelDateStr,
+                                                            endDate: endTravelDateStr,
+                                                            groupId: `travel-${crcId}-${endTravelDateStr}`,
                                                             type: 'Travel Day',
                                                             hours: travelHours,
                                                             notes: '',
@@ -35168,8 +35345,6 @@
                                                             siteId: selectedSiteId || null,
                                                             roleAssignments: {}
                                                         };
-                                                        
-                                                        // Add flight information if found
                                                         if (matchingFlight) {
                                                             if (matchingFlight.flightNumber) endTravelEventData.flightNumber = matchingFlight.flightNumber;
                                                             if (matchingFlight.airline) endTravelEventData.airline = matchingFlight.airline;
@@ -35180,13 +35355,11 @@
                                                             if (matchingFlight.confirmationNumber) endTravelEventData.confirmationNumber = matchingFlight.confirmationNumber;
                                                             if (matchingFlight.bookingId) endTravelEventData.travelBookingId = matchingFlight.bookingId;
                                                         }
-                                                        
-                                                        console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
+                                                        console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'CRC:', crcId);
                                                         const created = await apiService.createEvent(endTravelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
+                                                        registerTravelDayCreated(crcId, endTravelDateStr);
                                                         addEventToState(createdEvent);
-                                                    } else {
-                                                        console.log('Travel day already exists for CRC:', crcId, 'on date:', endTravelDateStr, '- skipping creation');
                                                     }
                                                 }
                                             }
@@ -35196,31 +35369,19 @@
                                                 const dayCursor = new Date(startDate);
                                                 while (dayCursor <= endDate) {
                                                     const dateStr = toDateOnlyString(dayCursor);
-                                                    
-                                                    // Check if travel day already exists for this CRC on this date
-                                                    // CRITICAL: Check both crcId AND crcIds array
-                                                    const existingTravelDay = state.crc_events.find(e => 
-                                                        e.type === 'Travel Day' && 
-                                                        e.date === dateStr && 
-                                                        (e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId)))
-                                                    );
-                                                    
-                                                    // Only create if it doesn't already exist
-                                                    if (!existingTravelDay) {
-                                                        // Find matching flight
+                                                    const existingTravelDay = findExistingTravelDay(crcId, dateStr);
+                                                    if (existingTravelDay !== true && !existingTravelDay) {
                                                         const matchingFlight = findFlightWithinBusinessDay(crcId, dayCursor, false);
                                                         const travelHours = matchingFlight ? (matchingFlight.flightDuration || matchingFlight.hours || 5) : 5;
-                                                        
                                                         const travelEventData = { 
-                                                            // Travel days inherit study/site from parent shift for grid display
                                                             name: 'Travel Day', 
                                                             crcId, 
-                                                            crcIds: [crcId],  // CRITICAL: Single CRC
+                                                            crcIds: [crcId],
                                                             roles: [], 
                                                             date: dateStr, 
-                                                            startDate: dateStr,  // CRITICAL: Single day
-                                                            endDate: dateStr,    // CRITICAL: Single day
-                                                            groupId: `travel-${crcId}-${dateStr}`,  // CRITICAL: Travel days get their OWN groupId
+                                                            startDate: dateStr,
+                                                            endDate: dateStr,
+                                                            groupId: `travel-${crcId}-${dateStr}`,
                                                             type: 'Travel Day',
                                                             hours: travelHours,
                                                             notes: '',
@@ -35229,8 +35390,6 @@
                                                             siteId: selectedSiteId || null,
                                                             roleAssignments: {}
                                                         };
-                                                        
-                                                        // Add flight information if found
                                                         if (matchingFlight) {
                                                             if (matchingFlight.flightNumber) travelEventData.flightNumber = matchingFlight.flightNumber;
                                                             if (matchingFlight.airline) travelEventData.airline = matchingFlight.airline;
@@ -35241,15 +35400,12 @@
                                                             if (matchingFlight.confirmationNumber) travelEventData.confirmationNumber = matchingFlight.confirmationNumber;
                                                             if (matchingFlight.bookingId) travelEventData.travelBookingId = matchingFlight.bookingId;
                                                         }
-                                                        
-                                                        console.log('Creating Travel Day event for:', dateStr, 'CRC:', crcId, 'Hours:', travelHours, 'Flight:', matchingFlight?.flightNumber || 'None');
+                                                        console.log('Creating Travel Day event for:', dateStr, 'CRC:', crcId);
                                                         const created = await apiService.createEvent(travelEventData);
                                                         const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
+                                                        registerTravelDayCreated(crcId, dateStr);
                                                         addEventToState(createdEvent);
-                                                    } else {
-                                                        console.log('Travel day already exists for CRC:', crcId, 'on date:', dateStr, '- skipping creation');
                                                     }
-                                                    
                                                     dayCursor.setDate(dayCursor.getDate() + 1);
                                                 }
                                             }
@@ -44007,6 +44163,7 @@
                     'Per Diem'
                 ]);
 
+                // CRITICAL: One legacy "request" per (crcId, date) so reports/exports don't show 8 rows and 8x hours for duplicate PTO
                 (state.crc_events || []).forEach(ev => {
                     if (!ev || !ev.crcId) return;
                     if (!timeOffEventTypes.has(ev.type)) return;
@@ -44014,6 +44171,7 @@
                     if (!dateStr) return;
                     const key = `${ev.crcId}_${dateStr}`;
                     if (requestKeys.has(key)) return;
+                    requestKeys.add(key); // so we only add one legacy entry per person per date
 
                     legacyRequests.push({
                         id: `legacy-timeoff-event-${ev.id || crypto.randomUUID()}`,
