@@ -13,13 +13,8 @@
         }
     </script>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Chart.js and Azure Maps loaded on first use (Dashboard / map views) for faster initial load -->
     <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
-    <!-- Azure Maps CSS and JS -->
-    <link rel="stylesheet" href="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.css" type="text/css" />
-    <script src="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.js"></script>
-    <!-- Azure Maps Animation Library -->
-    <script src="https://cdn.jsdelivr.net/gh/Azure-Samples/azure-maps-animations@main/dist/azure-maps-animations.min.js"></script>
     <script>
         // Azure Maps key will be loaded from backend
         let AZURE_MAPS_KEY = null;
@@ -41,6 +36,37 @@
                 AZURE_MAPS_KEY = null;
             }
         })();
+        window.loadChartJs = function () {
+            if (typeof Chart !== 'undefined') return Promise.resolve();
+            return new Promise(function (resolve, reject) {
+                var s = document.createElement('script');
+                s.src = 'https://cdn.jsdelivr.net/npm/chart.js';
+                s.onload = function () { resolve(); };
+                s.onerror = function () { reject(new Error('Chart.js failed to load')); };
+                document.head.appendChild(s);
+            });
+        };
+        window.loadAzureMaps = function () {
+            // Azure Maps JS SDK exposes global "atlas"
+            if (typeof atlas !== 'undefined') return Promise.resolve();
+            return new Promise(function (resolve, reject) {
+                var link = document.createElement('link');
+                link.rel = 'stylesheet';
+                link.href = 'https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.css';
+                document.head.appendChild(link);
+                var s1 = document.createElement('script');
+                s1.src = 'https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.js';
+                s1.onload = function () {
+                    var s2 = document.createElement('script');
+                    s2.src = 'https://cdn.jsdelivr.net/gh/Azure-Samples/azure-maps-animations@main/dist/azure-maps-animations.min.js';
+                    s2.onload = function () { resolve(); };
+                    s2.onerror = function () { resolve(); };
+                    document.head.appendChild(s2);
+                };
+                s1.onerror = function () { reject(new Error('Azure Maps failed to load')); };
+                document.head.appendChild(s1);
+            });
+        };
     </script>
     <!-- Removed Handsontable and Gantt chart libraries to improve load performance -->
     <style>
@@ -879,7 +905,7 @@
                 </button>
                 <div class="flex items-center gap-2">
                     <span class="text-xs sm:text-sm font-semibold text-gray-500 dark:text-gray-400">V5.0.1</span>
-                    <button data-action="open-settings" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
+                    <button data-action="open-settings" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300" aria-label="Open settings">
                         <i data-lucide="settings" class="w-5 h-5"></i>
                     </button>
                 </div>
@@ -1030,7 +1056,7 @@
             
             // --- API Service ---
             class ApiService {
-                async request(endpoint, options = {}) {
+                async request(endpoint, options = {}, isRetry = false) {
                     const url = `${API_BASE_URL}${endpoint}`;
                     const config = {
                         headers: {
@@ -1039,11 +1065,18 @@
                         },
                         ...options
                     };
+                    const isGet = !config.method || config.method === 'GET';
 
                     try {
                         const response = await fetch(url, config);
                         
                         if (!response.ok) {
+                            // Transient status: retry GET once after short delay
+                            const transient = response.status >= 500 || response.status === 408 || response.status === 429;
+                            if (isGet && !isRetry && transient) {
+                                await new Promise(r => setTimeout(r, 800));
+                                return this.request(endpoint, options, true);
+                            }
                             // Try to get error details from response
                             let errorDetails = '';
                             let errorJson = null;
@@ -1104,6 +1137,12 @@
                         
                         return await response.text();
                     } catch (error) {
+                        // Network/fetch failure: retry GET once
+                        const isNetworkError = error.name === 'TypeError' || !error.status;
+                        if (isGet && !isRetry && isNetworkError) {
+                            await new Promise(r => setTimeout(r, 800));
+                            return this.request(endpoint, options, true);
+                        }
                         console.error('API request error:', error);
                         throw error;
                     }
@@ -1132,7 +1171,7 @@
                     if (useCache && state.siteCache.data && state.siteCache.timestamp) {
                         const cacheAge = Date.now() - state.siteCache.timestamp;
                         if (cacheAge < state.siteCache.ttl) {
-                            console.log('CHAOS: Using cached sites data');
+                            debugLog('CHAOS: Using cached sites data');
                             return state.siteCache.data;
                         }
                     }
@@ -2271,9 +2310,52 @@
                     ttl: 5 * 60 * 1000 // 5 minutes cache
                 }
             };
+
+            // --- CONFIG: magic values for PTO, time off, and filters (single source of truth) ---
+            const CONFIG = {
+                ptoEventTypes: ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty'],
+                ptoEventTypesShort: ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off'],
+                timeOffRequestStatuses: ['pending', 'approved', 'rejected'],
+            };
+            const DEBUG = false;
+            const debugLog = (...args) => { if (DEBUG) console.log(...args); };
+            const debugWarn = (...args) => { if (DEBUG) console.warn(...args); };
+            const getPtoEventTypesSet = () => new Set(CONFIG.ptoEventTypes);
+            const getPtoEventTypesShortSet = () => new Set(CONFIG.ptoEventTypesShort);
+
             let currentDuplicatePanelController = null;
 
             // --- Helpers ---
+            const debounce = (fn, ms) => {
+                let t = null;
+                return (...args) => {
+                    if (t) clearTimeout(t);
+                    t = setTimeout(() => { t = null; fn(...args); }, ms);
+                };
+            };
+            const applyCalendarFilterFromDOM = () => {
+                try {
+                    const crcFilterEl = document.getElementById('crc-filter');
+                    const siteFilterEl = document.getElementById('site-filter');
+                    const studyFilterEl = document.getElementById('study-filter');
+                    const regionFilterEl = document.getElementById('region-filter');
+                    const employmentTypeFilterEl = document.getElementById('employment-type-filter');
+                    const eventTypeFilterEl = document.getElementById('event-type-filter');
+                    const openShiftsFilterEl = document.getElementById('open-shifts-filter');
+                    const filterUpdates = {};
+                    if (crcFilterEl) filterUpdates.selectedCrcFilter = crcFilterEl.value || 'all';
+                    if (siteFilterEl) filterUpdates.selectedSiteFilter = siteFilterEl.value || 'all';
+                    if (studyFilterEl) filterUpdates.selectedStudyFilter = studyFilterEl.value || 'all';
+                    if (regionFilterEl) filterUpdates.selectedRegionFilter = regionFilterEl.value || 'all';
+                    if (employmentTypeFilterEl) filterUpdates.selectedEmploymentTypeFilter = employmentTypeFilterEl.value || 'all';
+                    if (eventTypeFilterEl) filterUpdates.selectedEventTypeFilter = eventTypeFilterEl.value || 'all';
+                    if (openShiftsFilterEl) filterUpdates.selectedOpenShiftsFilter = openShiftsFilterEl.value || 'all';
+                    setState(filterUpdates);
+                } catch (e) { console.error('Error applying calendar filter:', e); }
+            };
+            const DEBOUNCE_CALENDAR_FILTER_MS = 120;
+            const debouncedApplyCalendarFilter = debounce(applyCalendarFilterFromDOM, DEBOUNCE_CALENDAR_FILTER_MS);
+
             // Calculate distance between two coordinates (Haversine formula - straight line distance)
             const calculateHaversineDistance = (lat1, lon1, lat2, lon2) => {
                 const R = 3959; // Earth's radius in miles
@@ -2304,7 +2386,7 @@
                     console.warn('Failed to save undo history to localStorage:', e);
                 }
                 
-                console.log('State saved to undo history. History size:', state.undoHistory.length);
+                debugLog('State saved to undo history. History size:', state.undoHistory.length);
                 updateUndoButtonState();
             };
             
@@ -2689,7 +2771,7 @@
             let currentSiteCoords = null;
             
             // Update map with current pins (hotel and/or site)
-            // This function updates the map whenever hotel or site coordinates change
+            // Uses Azure Maps; the Azure Maps JavaScript SDK exposes the global "atlas" (see https://docs.microsoft.com/azure/azure-maps/)
             const updateMapWithPins = async () => {
                 const mapContainer = document.getElementById('hotel-site-map');
                 const mapContainerWrapper = document.getElementById('hotel-site-map-container');
@@ -2713,13 +2795,10 @@
                     setTimeout(() => updateMapWithPins(), 500);
                     return;
                 }
-                
-                // Check if atlas is loaded
+                // Azure Maps SDK global is "atlas"
                 if (typeof atlas === 'undefined') {
-                    console.error('Azure Maps SDK not loaded');
-                    return;
+                    try { await window.loadAzureMaps(); } catch (e) { console.error('Azure Maps load failed:', e); return; }
                 }
-                
                 // Dispose existing map if it exists
                 if (hotelSiteMap) {
                     hotelSiteMap.dispose();
@@ -3269,7 +3348,7 @@
                 }
             };
             
-            const showHotelSiteMap = (path, hotelCoords, siteCoords, siteName) => {
+            const showHotelSiteMap = async (path, hotelCoords, siteCoords, siteName) => {
                 console.log('showHotelSiteMap called', { path, hotelCoords, siteCoords, siteName });
                 
                 const mapContainer = document.getElementById('hotel-site-map');
@@ -3298,18 +3377,13 @@
                 mapContainerWrapper.style.display = 'block';
                 
                 // Map is already visible, just update it with route
-                // Wait for Azure Maps key
                 if (!AZURE_MAPS_KEY) {
                     setTimeout(() => showHotelSiteMap(path, hotelCoords, siteCoords, siteName), 500);
                     return;
                 }
-                
-                // Check if atlas is loaded
                 if (typeof atlas === 'undefined') {
-                    console.error('Azure Maps SDK not loaded');
-                    return;
+                    try { await window.loadAzureMaps(); } catch (e) { console.error('Azure Maps load failed:', e); return; }
                 }
-                
                 // Dispose existing map if it exists
                 if (hotelSiteMap) {
                     hotelSiteMap.dispose();
@@ -3798,11 +3872,8 @@
                     })
                 );
                 
-                // Legacy time off event types
-                const timeOffEventTypes = new Set([
-                    'Unavailable', 'Paid Time Off', 'Time Off', 'PTO', 'Sick Time',
-                    'Sick', 'Vacation', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem'
-                ]);
+                // Legacy time off event types (see CONFIG.ptoEventTypes)
+                const timeOffEventTypes = getPtoEventTypesSet();
                 
                 const legacyRequests = [];
                 (state.crc_events || []).forEach(ev => {
@@ -5018,7 +5089,7 @@
                         return matches;
                     }) : [];
                     
-                    const nonWorkEventTypes = ['Paid Time Off', 'Unavailable', 'PTO', 'Time Off'];
+                    const nonWorkEventTypes = CONFIG.ptoEventTypesShort;
 
                     const productiveDaysSet = new Set();
                     
@@ -5130,7 +5201,10 @@
                 if (!state.changeLog) {
                     state.changeLog = [];
                 }
-                
+                // Bulletproof: ensure critical arrays are never null/undefined so app never crashes on bad API or partial state
+                const ensureArray = (key) => { state[key] = Array.isArray(state[key]) ? state[key] : []; };
+                ['crc_events', 'timeOffRequests', 'crcs', 'studies', 'crc_sites', 'roles', 'users', 'travel', 'trucks', 'truck_events', 'training_types'].forEach(ensureArray);
+
                 // DEDUPLICATION: Always deduplicate crc_events by ID when state changes
                 if (Array.isArray(state.crc_events) && state.crc_events.length > 0) {
                     const seenIds = new Set();
@@ -5143,7 +5217,7 @@
                     });
                     const afterCount = state.crc_events.length;
                     if (beforeCount !== afterCount) {
-                        console.warn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate events from crc_events`);
+                        debugWarn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate events from crc_events`);
                     }
                     // TRAVEL DAY DISPLAY DEDUPE: Keep only one travel day per (crcId, date) so UI never shows hundreds per day
                     const travelKey = (e) => {
@@ -5161,10 +5235,10 @@
                         return true;
                     });
                     if (state.crc_events.length < beforeTravel) {
-                        console.warn(`CHAOS: Collapsed ${beforeTravel - state.crc_events.length} duplicate travel days for display (one per person per date)`);
+                        debugWarn(`CHAOS: Collapsed ${beforeTravel - state.crc_events.length} duplicate travel days for display (one per person per date)`);
                     }
-                    // PTO/TIME OFF DISPLAY DEDUPE: Keep only one per (crcId, date) across all legacy formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.)
-                    const ptoTypes = new Set(['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty']);
+                    // PTO/TIME OFF DISPLAY DEDUPE: Keep only one per (crcId, date) across all legacy formats (see CONFIG.ptoEventTypes)
+                    const ptoTypes = getPtoEventTypesSet();
                     const ptoKey = (e) => e.crcId && e.date ? `pto:${e.crcId}::${e.date}` : null;
                     const seenPtoKeys = new Set();
                     const beforePto = state.crc_events.length;
@@ -5177,7 +5251,7 @@
                         return true;
                     });
                     if (state.crc_events.length < beforePto) {
-                        console.warn(`CHAOS: Collapsed ${beforePto - state.crc_events.length} duplicate PTO/time off for display (one per person per date)`);
+                        debugWarn(`CHAOS: Collapsed ${beforePto - state.crc_events.length} duplicate PTO/time off for display (one per person per date)`);
                     }
                 }
                 
@@ -5193,7 +5267,7 @@
                     });
                     const afterCount = state.timeOffRequests.length;
                     if (beforeCount !== afterCount) {
-                        console.warn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate time off requests`);
+                        debugWarn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate time off requests`);
                     }
                     // PTO REQUESTS DISPLAY DEDUPE: Keep one per (crcId, startDate) so multiple formats don't flood the UI
                     const reqStart = (r) => toDateOnlyString(parseDateFlexible(r.startDate || r.date));
@@ -5209,13 +5283,13 @@
                         return true;
                     });
                     if (state.timeOffRequests.length < beforeReq) {
-                        console.warn(`CHAOS: Collapsed ${beforeReq - state.timeOffRequests.length} duplicate time off requests for display (one per person per start date)`);
+                        debugWarn(`CHAOS: Collapsed ${beforeReq - state.timeOffRequests.length} duplicate time off requests for display (one per person per start date)`);
                     }
                 }
                 if (options.skipRender) {
                     return;
                 }
-                console.log('CHAOS: setState called. authReady=', state.authReady, 'initialLoadComplete=', state.initialLoadComplete);
+                debugLog('CHAOS: setState called. authReady=', state.authReady, 'initialLoadComplete=', state.initialLoadComplete);
                 if (state.authReady && state.initialLoadComplete) {
                     // Always force-hide the loading overlay once we're ready.
                     // This must be idempotent because other code paths can accidentally re-show the overlay,
@@ -5229,11 +5303,11 @@
                     // Only stop the phrase “rotation” once.
                     if (!overlayHidden) {
                         overlayHidden = true;
-                        console.log('CHAOS: Both flags true, hiding loading overlay and rendering...');
+                        debugLog('CHAOS: Both flags true, hiding loading overlay and rendering...');
                         window.requestAnimationFrame(() => {
                             render();
                             stopLoadingPhraseRotation();
-                            console.log('CHAOS: Loading overlay hidden, app should be visible now');
+                            debugLog('CHAOS: Loading overlay hidden, app should be visible now');
                         });
                     } else {
                         window.requestAnimationFrame(() => {
@@ -5242,7 +5316,7 @@
                         });
                     }
                 } else {
-                    console.log('CHAOS: Not ready to render yet');
+                    debugLog('CHAOS: Not ready to render yet');
                 }
             };
             
@@ -5250,14 +5324,14 @@
             const addEventToState = (newEvent) => {
     if (!newEvent) return;
     if (newEvent.id && state.crc_events.some(e => e.id === newEvent.id)) {
-        console.warn('CHAOS: Prevented adding duplicate event:', newEvent.id);
+        debugWarn('CHAOS: Prevented adding duplicate event:', newEvent.id);
         return;
     }
     // CRITICAL: Never add duplicate travel days (one per CRC per date)
     if (newEvent.type === 'Travel Day' && (newEvent.crcId || (newEvent.crcIds && newEvent.crcIds.length > 0)) && newEvent.date) {
         const cid = newEvent.crcId || (newEvent.crcIds && newEvent.crcIds[0]);
         if (cid && state.crc_events.some(e => e.type === 'Travel Day' && e.date === newEvent.date && (e.crcId === cid || (Array.isArray(e.crcIds) && e.crcIds.includes(cid))))) {
-            console.warn('CHAOS: Prevented duplicate travel day:', cid, newEvent.date);
+            debugWarn('CHAOS: Prevented duplicate travel day:', cid, newEvent.date);
             return;
         }
     }
@@ -5265,7 +5339,7 @@
     const ptoTypes = ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty'];
     if (ptoTypes.includes(newEvent.type) && newEvent.crcId && newEvent.date) {
         if (state.crc_events.some(e => ptoTypes.includes(e.type) && e.crcId === newEvent.crcId && e.date === newEvent.date)) {
-            console.warn('CHAOS: Prevented duplicate PTO/time off:', newEvent.crcId, newEvent.date);
+            debugWarn('CHAOS: Prevented duplicate PTO/time off:', newEvent.crcId, newEvent.date);
             return;
         }
     }
@@ -5279,7 +5353,7 @@
                 const eventsToAdd = newEvents.filter(event => {
                     if (!event) return false;
                     if (event.id && existingIds.has(event.id)) {
-                        console.warn('CHAOS: Prevented adding duplicate event:', event.id);
+                        debugWarn('CHAOS: Prevented adding duplicate event:', event.id);
                         return false;
                     }
                     if (event.id) existingIds.add(event.id); // Track newly added IDs
@@ -5328,7 +5402,7 @@
                 }
                 
                 if (deduped > 0) {
-                    console.warn(`CHAOS: Force deduplicated ${deduped} duplicate items from state`);
+                    debugWarn(`CHAOS: Force deduplicated ${deduped} duplicate items from state`);
                 }
                 
                 return deduped;
@@ -5372,7 +5446,7 @@
             };
             
             // Remove duplicate PTO/time off EVENTS from crc_events (one per person per date). Keeps one, deletes extras. All legacy formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.) treated as same for dedupe.
-            const PTO_EVENT_TYPES = new Set(['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty']);
+            const PTO_EVENT_TYPES = getPtoEventTypesSet();
             const cleanDuplicatePTOInApi = async () => {
                 const events = await apiService.getEvents();
                 const ptoEvents = (events || []).filter(e => PTO_EVENT_TYPES.has(e.type));
@@ -5472,7 +5546,7 @@
                 // Find duplicate PTO events (same CRC + same date)
                 const ptoMap = new Map();
                 (state.crc_events || []).forEach(e => {
-                    if (['Paid Time Off', 'PTO', 'Unavailable', 'Time Off'].includes(e.type) && e.crcId && e.date) {
+                    if (CONFIG.ptoEventTypesShort.includes(e.type) && e.crcId && e.date) {
                         const key = `${e.crcId}_${e.date}`;
                         if (!ptoMap.has(key)) {
                             ptoMap.set(key, []);
@@ -6634,6 +6708,17 @@
                 });
             };
             
+            // After saving a shift or travel: render then restore scroll so the page doesn't jump to top
+            const renderContentPreservingScroll = () => {
+                const y = window.pageYOffset || document.documentElement.scrollTop;
+                renderContent();
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        window.scrollTo(0, y);
+                    });
+                });
+            };
+            
             const renderContent = () => {
                 // Show login page if not authenticated
                 if (!state.isAuthenticated) {
@@ -6993,6 +7078,7 @@
                     }
                 }
                 
+                try {
                 if (state.activeTab === 'scheduler') {
                     mainAppContent.innerHTML = getSchedulerHTML();
                     mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
@@ -7138,6 +7224,11 @@
                     mainAppContent.innerHTML = getUnfilledShiftsHTML();
                     mainAppContent.className = 'w-full';
                     renderUnfilledShiftsContent();
+                }
+                } catch (err) {
+                    console.error('Error rendering tab content:', err);
+                    mainAppContent.innerHTML = '<div class="p-6 text-center"><p class="text-red-600 dark:text-red-400 font-medium">Something went wrong loading this view.</p><p class="text-sm text-gray-500 dark:text-gray-400 mt-2">Check the console for details.</p><button type="button" data-action="retry-tab-content" class="mt-4 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm">Try again</button></div>';
+                    mainAppContent.className = 'w-full';
                 }
             };
 
@@ -7450,22 +7541,22 @@
                     try {
                         timeOffRequests = await apiService.getTimeOffRequests();
                     } catch (error) {
-                        console.warn('CHAOS: Failed to refresh time off requests:', error);
+                        debugWarn('CHAOS: Failed to refresh time off requests:', error);
                     }
 
                     let travel = [];
                     try {
                         travel = await apiService.getTravel();
                     } catch (error) {
-                        console.warn('CHAOS: Failed to refresh travel data:', error);
+                        debugWarn('CHAOS: Failed to refresh travel data:', error);
                     }
 
                     let announcements = [];
                     try {
                         announcements = await apiService.getAnnouncements();
-                        console.log('CHAOS: Loaded', announcements.length, 'announcements');
+                        debugLog('CHAOS: Loaded', announcements.length, 'announcements');
                     } catch (error) {
-                        console.warn('CHAOS: Failed to refresh announcements:', error);
+                        debugWarn('CHAOS: Failed to refresh announcements:', error);
                     }
 
                     let usersUpdate = undefined;
@@ -7473,7 +7564,7 @@
                         try {
                             usersUpdate = await apiService.getUsers();
                         } catch (error) {
-                            console.warn('CHAOS: Failed to refresh users list:', error);
+                            debugWarn('CHAOS: Failed to refresh users list:', error);
                         }
                     }
 
@@ -8324,6 +8415,19 @@
                 }, duration);
             };
 
+            // Bulletproof: global error handlers so one uncaught error doesn't take down the app (DB assumed up)
+            window.addEventListener('error', (event) => {
+                console.error('Uncaught error:', event.error || event.message, event.filename, event.lineno);
+                showNotification('Something went wrong. You can keep using the app or reload the page.', 'error', 8000);
+                event.preventDefault();
+                return true;
+            });
+            window.addEventListener('unhandledrejection', (event) => {
+                console.error('Unhandled promise rejection:', event.reason);
+                showNotification('Something went wrong. You can keep using the app or reload the page.', 'error', 8000);
+                event.preventDefault();
+            });
+
             const openModal = (content, size = 'lg') => {
                 if (!modalContainer) {
                     console.error('Modal container not found');
@@ -8336,8 +8440,8 @@
                         <div class="modal-content overflow-y-auto max-h-[90vh] custom-scrollbar pr-4">
                             ${content}
                         </div>
-                        <button data-action="close-modal" class="absolute top-3 right-3 text-gray-500 dark:text-gray-300 hover:text-gray-800 dark:hover:text-white rounded-full p-1 hover:bg-gray-200 dark:hover:bg-gray-700">
-                            <i data-lucide="x" class="w-5 h-5"></i>
+                        <button data-action="close-modal" class="absolute top-3 right-3 text-gray-500 dark:text-gray-300 hover:text-gray-800 dark:hover:text-white rounded-full p-1 hover:bg-gray-200 dark:hover:bg-gray-700" aria-label="Close">
+                            <i data-lucide="x" class="w-5 h-5" aria-hidden="true"></i>
                         </button>
                     </div>
                     <style>
@@ -8947,6 +9051,13 @@
                 modalContainer.innerHTML = '';
             };
 
+            // Close modal on Escape
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape' && modalContainer && !modalContainer.classList.contains('hidden')) {
+                    closeModal();
+                }
+            });
+
             // --- CSV HANDLING ---
             const parseCSV = (text) => {
                 const lines = text.replace(/\r/g, '').split('\n').filter(Boolean);
@@ -8971,10 +9082,10 @@
             const handleCsvUpload = async (file, uploadType = 'shifts') => {
                 if (!file) return;
                 openModal(`
-                    <div class="text-center p-4">
-                        <h3 class="text-xl font-semibold mb-4 dark:text-white">Processing CSV...</h3>
+                    <div class="text-center p-4" role="status" aria-live="polite">
+                        <h3 class="text-xl font-semibold mb-4 dark:text-white">Importing…</h3>
                         <div class="flex items-center justify-center space-x-2">
-                            <svg class="animate-spin h-8 w-8 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <svg class="animate-spin h-8 w-8 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" aria-hidden="true">
                                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                                 <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                             </svg>
@@ -9656,6 +9767,7 @@
                         
                         newForm.addEventListener('submit', (e) => {
                             e.preventDefault();
+                            const submitBtn = newForm.querySelector('button[type="submit"]');
                             const formData = new FormData(newForm);
                             const startDate = formData.get('startDate');
                             const endDate = formData.get('endDate');
@@ -9663,30 +9775,31 @@
                             const exportFormat = formData.get('exportFormat') || 'csv';
                             const isSupervisor = state.currentUser && getEffectivePermissionLevel() === 'Supervisor';
                             if (isSupervisor) {
-                                // Enforce supervisor export restriction even if someone manipulates the DOM
                                 const allowed = new Set(['Site Assignment', 'Travel Day']);
                                 selectedEventTypes = selectedEventTypes.filter(t => allowed.has(t));
                             }
-                            
                             if (!startDate || !endDate) {
                                 showNotification('Please select both start and end dates.', 'error');
                                 return;
                             }
-                            
                             if (new Date(startDate) > new Date(endDate)) {
                                 showNotification('Start date must be before or equal to end date.', 'error');
                                 return;
                             }
-                            
                             if (selectedEventTypes.length === 0) {
                                 showNotification(isSupervisor
                                     ? 'Supervisors can only export Site Assignments and/or Travel Days.'
                                     : 'Please select at least one event type to export.', 'error');
                                 return;
                             }
-                            
-                            performExportWithDateRange(startDate, endDate, selectedEventTypes, exportFormat);
-                            closeModal();
+                            const origSubmitHtml = submitBtn ? submitBtn.innerHTML : '';
+                            if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span role="status" aria-live="polite">Exporting…</span>'; }
+                            try {
+                                performExportWithDateRange(startDate, endDate, selectedEventTypes, exportFormat);
+                                closeModal();
+                            } finally {
+                                if (submitBtn && submitBtn.parentNode) { submitBtn.disabled = false; submitBtn.innerHTML = origSubmitHtml; }
+                            }
                         });
                     }
                 }, 100);
@@ -11090,7 +11203,7 @@
                 const timeOffEndValue = state.timeOffReportEndMonth || currentMonthValue;
                 const defaultTimeOffCrcs = state.crcs.map(crc => crc.id);
                 const selectedTimeOffCrcs = (state.timeOffReportSelectedCrcs && state.timeOffReportSelectedCrcs.length > 0) ? state.timeOffReportSelectedCrcs : defaultTimeOffCrcs;
-                const selectedTimeOffStatuses = (state.timeOffReportStatuses && state.timeOffReportStatuses.length > 0) ? state.timeOffReportStatuses : ['pending', 'approved', 'rejected'];
+                const selectedTimeOffStatuses = (state.timeOffReportStatuses && state.timeOffReportStatuses.length > 0) ? state.timeOffReportStatuses : [...CONFIG.timeOffRequestStatuses];
                 const timeOffStatusOptions = [
                     { value: 'pending', label: 'Pending Review' },
                     { value: 'approved', label: 'Approved' },
@@ -12804,7 +12917,7 @@
 
                 state.timeOffReportStartMonth = currentValue;
                 state.timeOffReportEndMonth = currentValue;
-                state.timeOffReportStatuses = ['pending', 'approved', 'rejected'];
+                state.timeOffReportStatuses = [...CONFIG.timeOffRequestStatuses];
                 state.timeOffReportSelectedCrcs = state.crcs.map(crc => crc.id);
                 renderTimeOffReportTable();
                 showNotification('Time off report filters reset to current month.', 'info');
@@ -12831,7 +12944,7 @@
 
                 const selectedStatuses = state.timeOffReportStatuses && state.timeOffReportStatuses.length > 0
                     ? state.timeOffReportStatuses
-                    : ['pending', 'approved', 'rejected'];
+                    : [...CONFIG.timeOffRequestStatuses];
                 statusCheckboxes.forEach(cb => {
                     cb.checked = selectedStatuses.includes(cb.value);
                     cb.addEventListener('change', () => renderTimeOffReportTable());
@@ -13092,47 +13205,54 @@
                 if (openShiftsFilter) {
                     openShiftsFilter.value = state.selectedOpenShiftsFilter || 'all';
                 }
+                [document.getElementById('crc-filter'), document.getElementById('site-filter'), document.getElementById('study-filter'), document.getElementById('region-filter'), document.getElementById('employment-type-filter'), document.getElementById('event-type-filter'), document.getElementById('open-shifts-filter')].filter(Boolean).forEach(el => {
+                    el.removeEventListener('change', debouncedApplyCalendarFilter);
+                    el.addEventListener('change', debouncedApplyCalendarFilter);
+                });
             };
 
             const renderCRCCalendar = () => {
                 const container = document.getElementById('crc-calendar-container');
                 if (!container) return;
-
-                if (state.calendarView === 'month') {
-                    if (state.calendarDisplayMode === 'study') {
-                        container.innerHTML = getStudyCalendarHTML();
-                    } else if (state.calendarDisplayMode === 'site') {
-                        container.innerHTML = getSiteCalendarHTML();
-                    } else if (state.calendarDisplayMode === 'shift') {
-                        container.innerHTML = getShiftViewCalendarHTML();
-                    } else {
-                        container.innerHTML = getMonthlyCalendarHTML();
-                    }
-                } else if (state.calendarView === 'week') {
-                    if (state.calendarDisplayMode === 'shift') {
-                        container.innerHTML = getShiftViewWeeklyHTML();
-                    } else {
-                        container.innerHTML = getWeeklyCalendarHTML();
-                    }
-                } else if (state.calendarView === 'planning-grid') {
-                    if (state.calendarDisplayMode === 'at-a-glance') {
-                        container.innerHTML = getAtAGlanceViewHTML();
-                    } else if (state.calendarDisplayMode === 'travel') {
-                        container.innerHTML = getTravelViewHTML();
-                    } else {
-                        // Use planning grid mode to determine monthly vs weekly vs daily view
-                        if (state.planningGridMode === 'daily') {
-                            container.innerHTML = getDailyPlanningGridHTML();
-                        } else if (state.planningGridMode === 'weekly') {
-                            container.innerHTML = getWeeklyPlanningGridHTML();
+                try {
+                    if (state.calendarView === 'month') {
+                        if (state.calendarDisplayMode === 'study') {
+                            container.innerHTML = getStudyCalendarHTML();
+                        } else if (state.calendarDisplayMode === 'site') {
+                            container.innerHTML = getSiteCalendarHTML();
+                        } else if (state.calendarDisplayMode === 'shift') {
+                            container.innerHTML = getShiftViewCalendarHTML();
                         } else {
-                            container.innerHTML = getGlobalViewDetailedHTML();
+                            container.innerHTML = getMonthlyCalendarHTML();
                         }
+                    } else if (state.calendarView === 'week') {
+                        if (state.calendarDisplayMode === 'shift') {
+                            container.innerHTML = getShiftViewWeeklyHTML();
+                        } else {
+                            container.innerHTML = getWeeklyCalendarHTML();
+                        }
+                    } else if (state.calendarView === 'planning-grid') {
+                        if (state.calendarDisplayMode === 'at-a-glance') {
+                            container.innerHTML = getAtAGlanceViewHTML();
+                        } else if (state.calendarDisplayMode === 'travel') {
+                            container.innerHTML = getTravelViewHTML();
+                        } else {
+                            if (state.planningGridMode === 'daily') {
+                                container.innerHTML = getDailyPlanningGridHTML();
+                            } else if (state.planningGridMode === 'weekly') {
+                                container.innerHTML = getWeeklyPlanningGridHTML();
+                            } else {
+                                container.innerHTML = getGlobalViewDetailedHTML();
+                            }
+                        }
+                    } else if (state.calendarView === 'roles') {
+                        container.innerHTML = getRolesViewHTML();
+                    } else if (state.calendarView === 'total-view') {
+                        container.innerHTML = getTotalViewHTML();
                     }
-                } else if (state.calendarView === 'roles') {
-                    container.innerHTML = getRolesViewHTML();
-                } else if (state.calendarView === 'total-view') {
-                    container.innerHTML = getTotalViewHTML();
+                } catch (err) {
+                    console.error('Error rendering calendar:', err);
+                    container.innerHTML = '<div class="p-4 text-center text-red-600 dark:text-red-400"><p class="font-medium">Something went wrong loading the calendar.</p><p class="text-sm mt-1 text-gray-500 dark:text-gray-400">Check the console for details.</p><button type="button" data-action="retry-calendar" class="mt-3 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm">Try again</button></div>';
                 }
             };
 
@@ -13270,17 +13390,17 @@
                         <div class="flex flex-wrap items-center gap-2 md:gap-4">
                             <h3 class="text-xl font-semibold text-gray-800 dark:text-gray-200">${title}</h3>
                             <div class="flex items-center rounded-md border dark:border-gray-600 overflow-x-auto">
-                                <button data-action="set-display-mode" data-mode="employee" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'employee' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Employee</button>
-                                <button data-action="set-display-mode" data-mode="study" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'study' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Study</button>
-                                <button data-action="set-display-mode" data-mode="site" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'site' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Site</button>
-                                <button data-action="set-display-mode" data-mode="travel" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'travel' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Travel</button>
-                                <button data-action="set-display-mode" data-mode="at-a-glance" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'at-a-glance' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} ${state.calendarView === 'planning-grid' ? '' : 'rounded-r-md'}">At-a-Glance</button>
+                                <button type="button" data-action="set-display-mode" data-mode="employee" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'employee' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Employee</button>
+                                <button type="button" data-action="set-display-mode" data-mode="study" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'study' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Study</button>
+                                <button type="button" data-action="set-display-mode" data-mode="site" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'site' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Site</button>
+                                <button type="button" data-action="set-display-mode" data-mode="travel" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'travel' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Travel</button>
+                                <button type="button" data-action="set-display-mode" data-mode="at-a-glance" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarDisplayMode === 'at-a-glance' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} ${state.calendarView === 'planning-grid' ? '' : 'rounded-r-md'}">At-a-Glance</button>
                             </div>
                             ${state.calendarDisplayMode === 'at-a-glance' ? `
                             <div class="flex items-center rounded-md border dark:border-gray-600 overflow-x-auto">
-                                <button data-action="set-at-a-glance-view-mode" data-mode="daily" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'daily' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Daily</button>
-                                <button data-action="set-at-a-glance-view-mode" data-mode="weekly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'weekly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Weekly</button>
-                                <button data-action="set-at-a-glance-view-mode" data-mode="monthly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'monthly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Monthly</button>
+                                <button type="button" data-action="set-at-a-glance-view-mode" data-mode="daily" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'daily' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Daily</button>
+                                <button type="button" data-action="set-at-a-glance-view-mode" data-mode="weekly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'weekly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Weekly</button>
+                                <button type="button" data-action="set-at-a-glance-view-mode" data-mode="monthly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.atAGlanceViewMode === 'monthly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Monthly</button>
                             </div>
                             ` : ''}
                         </div>
@@ -13288,29 +13408,29 @@
                         <div class="flex flex-wrap items-center justify-between gap-2">
                             <div class="flex items-center gap-2">
                                 <div class="flex items-center rounded-md border dark:border-gray-600 overflow-x-auto">
-                                    <button data-action="set-view" data-view="planning-grid" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'planning-grid' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Planning Grid</button>
+                                    <button type="button" data-action="set-view" data-view="planning-grid" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'planning-grid' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Planning Grid</button>
                                     ${state.calendarView === 'planning-grid' ? `
-                                        <button data-action="set-planning-grid-mode" data-mode="monthly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'monthly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Monthly</button>
-                                        <button data-action="set-planning-grid-mode" data-mode="weekly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'weekly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Weekly</button>
-                                        <button data-action="set-planning-grid-mode" data-mode="daily" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'daily' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Daily</button>
+                                        <button type="button" data-action="set-planning-grid-mode" data-mode="monthly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'monthly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Monthly</button>
+                                        <button type="button" data-action="set-planning-grid-mode" data-mode="weekly" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'weekly' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'}">Weekly</button>
+                                        <button type="button" data-action="set-planning-grid-mode" data-mode="daily" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.planningGridMode === 'daily' ? 'bg-green-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Daily</button>
                                     ` : ''}
                                 </div>
                                 <div class="flex items-center rounded-md border dark:border-gray-600 overflow-x-auto">
-                                    <button data-action="set-view" data-view="roles" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'roles' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Roles</button>
-                                    <button data-action="set-view" data-view="total-view" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'total-view' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Total View</button>
-                                    <button data-action="set-view" data-view="month" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'month' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Month</button>
-                                    <button data-action="set-view" data-view="week" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'week' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Week</button>
+                                    <button type="button" data-action="set-view" data-view="roles" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'roles' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-l-md">Roles</button>
+                                    <button type="button" data-action="set-view" data-view="total-view" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'total-view' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Total View</button>
+                                    <button type="button" data-action="set-view" data-view="month" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'month' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'}">Month</button>
+                                    <button type="button" data-action="set-view" data-view="week" class="px-2 md:px-3 py-1 text-xs md:text-sm whitespace-nowrap ${state.calendarView === 'week' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700'} rounded-r-md">Week</button>
                                 </div>
                             </div>
                             <div class="flex items-center space-x-2 flex-wrap gap-1">
-                                <button data-action="${prevAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left" class="w-4 h-4 md:w-5 md:h-5"></i></button>
+                                <button type="button" data-action="${prevAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left" class="w-4 h-4 md:w-5 md:h-5"></i></button>
                                 ${isDailyView ? `
                                     <select id="date-selector" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
                                         ${dateOptions}
                                     </select>
                                 ` : ''}
                                 <input type="month" id="month-selector" value="${currentMonthValue}" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
-                                <button data-action="${nextAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right" class="w-4 h-4 md:w-5 md:h-5"></i></button>
+                                <button type="button" data-action="${nextAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right" class="w-4 h-4 md:w-5 md:h-5"></i></button>
                             </div>
                         </div>
                     </div>
@@ -17937,25 +18057,19 @@
             
             // Initialize scheduler map with site locations
             let schedulerMap = null;
-            const initializeSchedulerMap = () => {
+            const initializeSchedulerMap = async () => {
                 const mapContainer = document.getElementById('chaos-scheduler-map');
                 if (!mapContainer) {
                     console.log('Scheduler map container not found');
                     return;
                 }
-                
-                // Wait for Azure Maps key
                 if (!AZURE_MAPS_KEY) {
                     setTimeout(() => initializeSchedulerMap(), 500);
                     return;
                 }
-                
-                // Check if atlas is loaded
                 if (typeof atlas === 'undefined') {
-                    console.error('Azure Maps SDK not loaded');
-                    return;
+                    try { await window.loadAzureMaps(); } catch (e) { console.error('Azure Maps load failed:', e); return; }
                 }
-                
                 // Dispose existing map if it exists
                 if (schedulerMap) {
                     schedulerMap.dispose();
@@ -18183,17 +18297,16 @@
             // ============ CRC DEPLOYMENT MAP ============
             let deploymentMap = null;
             
-            const initializeDeploymentMap = () => {
+            const initializeDeploymentMap = async () => {
                 const mapContainer = document.getElementById('crc-deployment-map');
                 if (!mapContainer) return;
-                
                 if (!AZURE_MAPS_KEY) {
                     setTimeout(() => initializeDeploymentMap(), 500);
                     return;
                 }
-                
-                if (typeof atlas === 'undefined') return;
-                
+                if (typeof atlas === 'undefined') {
+                    try { await window.loadAzureMaps(); } catch (e) { console.error('Azure Maps load failed:', e); return; }
+                }
                 if (deploymentMap) {
                     deploymentMap.dispose();
                     deploymentMap = null;
@@ -20618,15 +20731,9 @@
                     filteredEvents = filteredEvents.filter(e => e.type === state.allScheduleFilters.eventType);
                 }
                 
-                console.log('EXPORT DEBUG: Total events in state:', state.crc_events.length);
-                console.log('EXPORT DEBUG: Events after date range filter:', filteredEvents.length);
-                console.log('EXPORT DEBUG: Filters applied:', {
-                    crc: state.allScheduleFilters.crc,
-                    site: state.allScheduleFilters.site,
-                    study: state.allScheduleFilters.study,
-                    eventType: state.allScheduleFilters.eventType,
-                    dateRange: `${state.allScheduleFilters.startDate} to ${state.allScheduleFilters.endDate}`
-                });
+                debugLog('EXPORT DEBUG: Total events in state:', state.crc_events.length);
+                debugLog('EXPORT DEBUG: Events after date range filter:', filteredEvents.length);
+                debugLog('EXPORT DEBUG: Filters applied:', { crc: state.allScheduleFilters.crc, site: state.allScheduleFilters.site, study: state.allScheduleFilters.study, eventType: state.allScheduleFilters.eventType, dateRange: `${state.allScheduleFilters.startDate} to ${state.allScheduleFilters.endDate}` });
                 
                 if (filteredEvents.length === 0) {
                     showNotification('No events to export.', 'info');
@@ -21371,7 +21478,10 @@
                 }
             };
 
-            const renderDashboardCharts = () => {
+            const renderDashboardCharts = async () => {
+                if (typeof Chart === 'undefined') {
+                    try { await window.loadChartJs(); } catch (e) { console.error('Chart.js load failed:', e); return; }
+                }
                 // Initialize view state if not set
                 if (!state.dashboardViewState) {
                     state.dashboardViewState = {
@@ -22894,9 +23004,9 @@
                     return `<option value="${crc.id}" ${isSelected ? 'selected' : ''}>${crc.name}${pendingText}${unavailableText}${trainingNote}</option>`;
                 }).join('');
                 // Debug site loading for shift creation
-                console.log('CHAOS: Sites available for shift creation:', state.crc_sites.length);
+                debugLog('CHAOS: Sites available for shift creation:', state.crc_sites.length);
                 if (state.crc_sites.length === 0) {
-                    console.warn('CHAOS: No sites available for shift creation - check if sites are loaded from ARTEMIS');
+                    debugWarn('CHAOS: No sites available for shift creation - check if sites are loaded from ARTEMIS');
                 }
                 
                 const siteOptions = getFilteredSites().map(site => {
@@ -27655,7 +27765,14 @@
                         break;
                     }
                     case 'export-timeoff-report': {
-                        exportTimeOffReport();
+                        const btn = document.getElementById('export-timeoff-report-btn');
+                        const origHtml = btn ? btn.innerHTML : '';
+                        if (btn) { btn.disabled = true; btn.innerHTML = '<span class="inline-flex items-center gap-1" role="status" aria-live="polite">Exporting…</span>'; }
+                        try {
+                            exportTimeOffReport();
+                        } finally {
+                            if (btn) { btn.disabled = false; btn.innerHTML = origHtml; lucide.createIcons(); }
+                        }
                         break;
                     }
                     case 'reset-timeoff-report-filters': {
@@ -27924,10 +28041,14 @@
                         setState({ unavailabilityDate: new Date(state.unavailabilityDate.setMonth(state.unavailabilityDate.getMonth() + 1)) });
                         renderUnavailabilityCalendar();
                         break;
-                    case 'set-view': 
-                        setState({ calendarView: view }); 
-                        if (state.activeTab === 'scheduler') {
-                            renderCRCCalendar();
+                    case 'set-view':
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (view) {
+                            setState({ calendarView: view });
+                            if (state.activeTab === 'scheduler') {
+                                renderCRCCalendar();
+                            }
                         }
                         break;
                     case 'set-planning-grid-mode':
@@ -28078,7 +28199,14 @@
                         break;
                     }
                     case 'export-all-schedule': {
-                        exportAllSchedule();
+                        const btn = document.querySelector('[data-action="export-all-schedule"]');
+                        const origHtml = btn ? btn.innerHTML : '';
+                        if (btn) { btn.disabled = true; btn.innerHTML = '<span class="inline-flex items-center gap-2" role="status" aria-live="polite">Exporting…</span>'; }
+                        try {
+                            exportAllSchedule();
+                        } finally {
+                            if (btn) { btn.disabled = false; btn.innerHTML = origHtml; lucide.createIcons(); }
+                        }
                         break;
                     }
                     case 'set-training-tab': setState({ trainingTab: tabId }); renderTrainingContent(); break;
@@ -29662,11 +29790,16 @@
                         }
                         const confirmed = confirm('This will find all duplicate travel days (same person, same date) and remove the extras, keeping one per person per date. Run this once to clean existing data. Continue?');
                         if (confirmed) {
+                            const btn = document.querySelector('[data-action="clean-duplicate-travel-days"]');
+                            const origHtml = btn ? btn.innerHTML : '';
+                            if (btn) { btn.disabled = true; btn.innerHTML = '<span class="inline-flex items-center gap-2" role="status" aria-live="polite">Cleaning…</span>'; }
                             try {
                                 await cleanDuplicateTravelDaysInApi();
                             } catch (err) {
                                 console.error('Clean duplicate travel days failed:', err);
                                 showNotification('Cleanup failed. See console.', 'error');
+                            } finally {
+                                if (btn) { btn.disabled = false; btn.innerHTML = origHtml; lucide.createIcons(); }
                             }
                         }
                         break;
@@ -29679,11 +29812,16 @@
                         }
                         const confirmed = confirm('This will find duplicate PTO/time off EVENTS (same person, same date) across all formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.) and remove the extras, keeping one per person per date. Continue?');
                         if (confirmed) {
+                            const btn = document.querySelector('[data-action="clean-duplicate-pto"]');
+                            const origHtml = btn ? btn.innerHTML : '';
+                            if (btn) { btn.disabled = true; btn.innerHTML = '<span class="inline-flex items-center gap-2" role="status" aria-live="polite">Cleaning…</span>'; }
                             try {
                                 await cleanDuplicatePTOInApi();
                             } catch (err) {
                                 console.error('Clean duplicate PTO failed:', err);
                                 showNotification('Cleanup failed. See console.', 'error');
+                            } finally {
+                                if (btn) { btn.disabled = false; btn.innerHTML = origHtml; lucide.createIcons(); }
                             }
                         }
                         break;
@@ -29696,11 +29834,16 @@
                         }
                         const confirmed = confirm('This will find duplicate time off REQUESTS (same person, same start date) and remove the extras, keeping one per person per start date. Continue?');
                         if (confirmed) {
+                            const btn = document.querySelector('[data-action="clean-duplicate-time-off-requests"]');
+                            const origHtml = btn ? btn.innerHTML : '';
+                            if (btn) { btn.disabled = true; btn.innerHTML = '<span class="inline-flex items-center gap-2" role="status" aria-live="polite">Cleaning…</span>'; }
                             try {
                                 await cleanDuplicateTimeOffRequestsInApi();
                             } catch (err) {
                                 console.error('Clean duplicate time off requests failed:', err);
                                 showNotification('Cleanup failed. See console.', 'error');
+                            } finally {
+                                if (btn) { btn.disabled = false; btn.innerHTML = origHtml; lucide.createIcons(); }
                             }
                         }
                         break;
@@ -32247,32 +32390,15 @@
                         break;
                     }
                     case 'apply-calendar-filter': {
-                        // Safely apply all calendar filters at once to prevent crashes
-                        try {
-                            const crcFilterEl = document.getElementById('crc-filter');
-                            const siteFilterEl = document.getElementById('site-filter');
-                            const studyFilterEl = document.getElementById('study-filter');
-                            const regionFilterEl = document.getElementById('region-filter');
-                            const employmentTypeFilterEl = document.getElementById('employment-type-filter');
-                            const eventTypeFilterEl = document.getElementById('event-type-filter');
-                            const openShiftsFilterEl = document.getElementById('open-shifts-filter');
-                            
-                            const filterUpdates = {};
-                            
-                            if (crcFilterEl) filterUpdates.selectedCrcFilter = crcFilterEl.value || 'all';
-                            if (siteFilterEl) filterUpdates.selectedSiteFilter = siteFilterEl.value || 'all';
-                            if (studyFilterEl) filterUpdates.selectedStudyFilter = studyFilterEl.value || 'all';
-                            if (regionFilterEl) filterUpdates.selectedRegionFilter = regionFilterEl.value || 'all';
-                            if (employmentTypeFilterEl) filterUpdates.selectedEmploymentTypeFilter = employmentTypeFilterEl.value || 'all';
-                            if (eventTypeFilterEl) filterUpdates.selectedEventTypeFilter = eventTypeFilterEl.value || 'all';
-                            if (openShiftsFilterEl) filterUpdates.selectedOpenShiftsFilter = openShiftsFilterEl.value || 'all';
-                            
-                            // Update state with all filters at once, then refresh calendar
-                            setState(filterUpdates);
-                        } catch (error) {
-                            console.error('Error applying calendar filters:', error);
-                            // Don't crash - just log the error
-                        }
+                        applyCalendarFilterFromDOM();
+                        break;
+                    }
+                    case 'retry-calendar': {
+                        if (typeof renderCRCCalendar === 'function') renderCRCCalendar();
+                        break;
+                    }
+                    case 'retry-tab-content': {
+                        if (typeof renderContent === 'function') renderContent();
                         break;
                     }
                     case 'generate-utilization-report': {
@@ -33715,13 +33841,7 @@
                                         }
                                         
                                         setState({ crc_events: [...state.crc_events] });
-                                        // Preserve scroll position before refreshing
-                                        const scrollPosition1 = window.pageYOffset || document.documentElement.scrollTop;
-                                        renderContent();
-                                        // Restore scroll position after render
-                                        requestAnimationFrame(() => {
-                                            window.scrollTo(0, scrollPosition1);
-                                        });
+                                        renderContentPreservingScroll();
                                         showNotification(`Shift updated successfully! ${createdEvents.length} day(s) scheduled.`, 'success');
                                         closeModal();
                                     } else if (changedToMultiDay) {
@@ -33899,12 +34019,7 @@
                                         
                                         setState({ crc_events: [...state.crc_events] });
                                         // Preserve scroll position before refreshing
-                                        const scrollPosition2 = window.pageYOffset || document.documentElement.scrollTop;
-                                        renderContent();
-                                        // Restore scroll position after render
-                                        requestAnimationFrame(() => {
-                                            window.scrollTo(0, scrollPosition2);
-                                        });
+                                        renderContentPreservingScroll();
                                         showNotification(`Shift updated successfully! Now scheduled for ${createdEvents.length + 1} day(s).`, 'success');
                                         closeModal();
                                     } else if (changedFromMultiDay && isGroupEvent) {
@@ -33987,13 +34102,7 @@
                                         }
                                         
                                         setState({ crc_events: [...state.crc_events] }, { skipRender: false });
-                                        // Preserve scroll position before refreshing
-                                        const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
-                                        renderContent();
-                                        // Restore scroll position after render
-                                        requestAnimationFrame(() => {
-                                            window.scrollTo(0, scrollPosition);
-                                        });
+                                        renderContentPreservingScroll();
                                         showNotification('Shift updated successfully!', 'success');
                                         closeModal();
                                     } else {
@@ -34204,11 +34313,7 @@
                                             if (isGroupEvent && existingGroupId) {
                                                 // Group update: state was already updated in the loop above
                                                 setState({ crc_events: [...state.crc_events] }, { skipRender: false });
-                                                const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
-                                                renderContent();
-                                                requestAnimationFrame(() => {
-                                                    window.scrollTo(0, scrollPosition);
-                                                });
+                                                renderContentPreservingScroll();
                                             } else {
                                                 const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
                                                 if (eventIndex >= 0) {
@@ -34222,14 +34327,7 @@
                                                 }
                                                 // Force a refresh of the UI to show the updated data
                                                 setState({ crc_events: [...state.crc_events] }, { skipRender: false });
-                                                // Preserve scroll position before refreshing
-                                                const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
-                                                // Refresh the view to show updated data immediately
-                                                renderContent();
-                                                // Restore scroll position after render
-                                                requestAnimationFrame(() => {
-                                                    window.scrollTo(0, scrollPosition);
-                                                });
+                                                renderContentPreservingScroll();
                                             }
                                         } else {
                                             console.error('CRITICAL ERROR: Shift update failed - updatedEvent is missing or has no ID!', updatedEvent);
@@ -34369,8 +34467,9 @@
                                             };
                                             
                                             // Check for travel day checkboxes and create travel days
-                                            const eventStartDate = updatedEvent.startDate || updatedEvent.date;
-                                            const eventEndDate = updatedEvent.endDate || updatedEvent.date;
+                                            // Use form date range so multi-day edits get correct start/end (updatedEvent may be last day only)
+                                            const eventStartDate = startDateStr;
+                                            const eventEndDate = toDateOnlyString(endDateObj);
                                             
                                             // Store travel day preferences on the event
                                             if (!updatedEvent.travelDayPreferences) {
@@ -34398,6 +34497,7 @@
                                                         startDate: travelDateStr,  // CRITICAL: Single day - not a range!
                                                         endDate: travelDateStr,    // CRITICAL: Single day - not a range!
                                                         groupId: `travel-${crcId}-${travelDateStr}`,  // Travel days get their OWN groupId
+                                                        parentShiftGroupId: eventGroupId || undefined,  // Link to shift for edit/delete logic
                                                         type: 'Travel Day',
                                                         hours: travelHours,
                                                         notes: '',
@@ -34664,7 +34764,7 @@
                                             // Refresh state after travel days are updated
                                             if (assignedCrcsForTravel.size > 0 || removedCrcs.length > 0) {
                                                 setState({ crc_events: [...state.crc_events] }, { skipRender: false });
-                                                renderContent();
+                                                renderContentPreservingScroll();
                                             }
                                         }
                                         
@@ -35457,9 +35557,10 @@
                                 if (duplicateConfig) {
                                     await handleDuplicateSchedule(duplicateConfig, baseEventData);
                                 }
-                                // Force UI refreshes so schedule and calendar reflect new events immediately
+                                // Force UI refreshes so schedule and calendar reflect new events immediately (preserve scroll)
                                 try {
-                                    setState({ crc_events: state.crc_events.slice() });
+                                    setState({ crc_events: state.crc_events.slice() }, { skipRender: true });
+                                    renderContentPreservingScroll();
                                 } catch (e) {
                                     // Ignore errors in UI refresh
                                 }
@@ -35809,7 +35910,7 @@
                                 }
                             }
                         }
-                        console.log('CHAOS: Collected visit names from form:', visitNames);
+                        debugLog('CHAOS: Collected visit names from form:', visitNames);
                         
                         // Collect visit-specific role quantities (for both modals now)
                         let visitRoleRequirements = {};
@@ -35873,7 +35974,7 @@
                         }
                         
                         try {
-                            console.log('CHAOS: Updating study:', {
+                            debugLog('CHAOS: Updating study:', {
                                 studyId,
                                 studyName,
                                 color,
@@ -35940,11 +36041,11 @@
                                 delete updateData.status;
                             }
                             
-                            console.log('CHAOS: Study update data:', JSON.stringify(updateData, null, 2));
+                            debugLog('CHAOS: Study update data:', JSON.stringify(updateData, null, 2));
                             
                             const oldStudy = state.studies.find(s => s.id === studyId);
                             const saved = await apiService.updateStudy(studyId, updateData);
-                            console.log('CHAOS: Study updated successfully');
+                            debugLog('CHAOS: Study updated successfully');
                             // Update local state so shift creation sees latest requirements immediately
                             const updatedStudy = saved && saved.id ? saved : updateData;
                             
@@ -38395,6 +38496,17 @@
                                     delete manualRoleConfig[visitKeyForManual][roleId];
                                 }
                                 handleShiftStudySiteSelection();
+                                // Re-enable the removed role in the "Add role" dropdown so it can be added again
+                                const addRoleSelect = document.getElementById('manual-visit-role-select');
+                                if (addRoleSelect) {
+                                    const option = addRoleSelect.querySelector(`option[value="${roleId}"]`);
+                                    if (option) {
+                                        option.disabled = false;
+                                        option.removeAttribute('disabled');
+                                        const role = state.roles.find(r => r.id === roleId);
+                                        option.textContent = (role && role.name) ? role.name : roleId;
+                                    }
+                                }
                             });
                         });
                         roleAssignmentContainer.querySelectorAll('input[name^="role-quantity-"]').forEach(input => {
@@ -39758,22 +39870,15 @@
                     }
                     
                     // Fallback: Check if there's a travel day event for this CRC on this date
-                    // Check with groupId if available, otherwise just check date and crcId
+                    // Travel days have their own groupId (travel-${crcId}-${date}); link to shift via parentShiftGroupId
                     const matchesCrc = (e) => e.crcId === crcId || (Array.isArray(e.crcIds) && e.crcIds.includes(crcId));
-                    if (groupId) {
-                        return state.crc_events.some(e => 
-                            e.type === 'Travel Day' && 
-                            matchesCrc(e) && 
-                            e.date === travelDateStr &&
-                            e.groupId === groupId
-                        );
-                    } else {
-                        return state.crc_events.some(e => 
-                            e.type === 'Travel Day' && 
-                            matchesCrc(e) && 
-                            e.date === travelDateStr
-                        );
-                    }
+                    return state.crc_events.some(e => {
+                        if (e.type !== 'Travel Day' || !matchesCrc(e) || e.date !== travelDateStr) return false;
+                        if (groupId) {
+                            return e.parentShiftGroupId === groupId || e.groupId === groupId;
+                        }
+                        return true;
+                    });
                 };
                 
                 let html = '<div class="space-y-3">';
@@ -39825,12 +39930,22 @@
                     
                     // CRITICAL: Only check existing travel days if preferences don't explicitly say travel is included
                     // This prevents checkboxes from being checked when user explicitly unchecked them
-                    // But if preferences say travel is included, trust that over existing events
-                    if (startTravelDateStr && !hasStartTravel) {
-                        hasStartTravel = checkExistingTravelDays(crcId, startTravelDateStr);
+                    // Also support same-day travel: check for existing travel on startDate and endDate (same day as appt)
+                    if (!hasStartTravel) {
+                        if (startDate && checkExistingTravelDays(crcId, startDate)) {
+                            hasStartTravel = true;
+                            startTravelDateStr = startDate;
+                        } else if (startTravelDateStr && checkExistingTravelDays(crcId, startTravelDateStr)) {
+                            hasStartTravel = true;
+                        }
                     }
-                    if (endTravelDateStr && !hasEndTravel) {
-                        hasEndTravel = checkExistingTravelDays(crcId, endTravelDateStr);
+                    if (!hasEndTravel) {
+                        if (endDate && checkExistingTravelDays(crcId, endDate)) {
+                            hasEndTravel = true;
+                            endTravelDateStr = endDate;
+                        } else if (endTravelDateStr && checkExistingTravelDays(crcId, endTravelDateStr)) {
+                            hasEndTravel = true;
+                        }
                     }
                     
                     const startTravelHours = startTravelDateStr ? getTravelHoursForCrc(crcId, startTravelDateStr) : null;
@@ -39852,16 +39967,16 @@
                                 <div class="space-y-2">
                                     <label class="flex items-center">
                                         <input type="checkbox" name="travel-start-${crcId}" ${hasStartTravel ? 'checked' : ''} ${isSupervisor ? 'disabled' : ''} class="mr-2 rounded border-gray-300 text-blue-600 focus:ring-blue-500 ${isSupervisor ? 'opacity-50 cursor-not-allowed' : ''}">
-                                        <span class="text-xs text-gray-700 dark:text-gray-300">Travel Day Before</span>
+                                        <span class="text-xs text-gray-700 dark:text-gray-300">Travel day (before or same day)</span>
                                     </label>
-                                    <input type="date" name="travel-start-date-${crcId}" value="${startTravelDateStr || ''}" ${isSupervisor ? 'disabled readonly class="ml-6 w-full p-1 text-xs border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="ml-6 w-full p-1 text-xs border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
+                                    <input type="date" name="travel-start-date-${crcId}" value="${startTravelDateStr || ''}" ${isSupervisor ? 'disabled readonly class="ml-6 w-full p-1 text-xs border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="ml-6 w-full p-1 text-xs border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} title="Set to day before or same day as start">
                                 </div>
                                 <div class="space-y-2">
                                     <label class="flex items-center">
                                         <input type="checkbox" name="travel-end-${crcId}" ${hasEndTravel ? 'checked' : ''} ${isSupervisor ? 'disabled' : ''} class="mr-2 rounded border-gray-300 text-blue-600 focus:ring-blue-500 ${isSupervisor ? 'opacity-50 cursor-not-allowed' : ''}">
-                                        <span class="text-xs text-gray-700 dark:text-gray-300">Travel Day After</span>
+                                        <span class="text-xs text-gray-700 dark:text-gray-300">Travel day (after or same day)</span>
                                     </label>
-                                    <input type="date" name="travel-end-date-${crcId}" value="${endTravelDateStr || ''}" ${isSupervisor ? 'disabled readonly class="ml-6 w-full p-1 text-xs border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="ml-6 w-full p-1 text-xs border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
+                                    <input type="date" name="travel-end-date-${crcId}" value="${endTravelDateStr || ''}" ${isSupervisor ? 'disabled readonly class="ml-6 w-full p-1 text-xs border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="ml-6 w-full p-1 text-xs border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} title="Set to day after or same day as end">
                                 </div>
                             </div>
                         </div>
@@ -44159,6 +44274,7 @@
                 document.getElementById('email-preview-text').textContent = text || '(no text)';
             };
 
+            // --- Pure helpers (reporting / dedupe): no DOM, same inputs → same outputs ---
             // Merge DB-backed time off requests with legacy time off events so ALL time off types
             // (Per Diem, Bereavement, Sick, etc.) are visible in the Time Off Requests tab.
             // Legacy events are display-only and marked as "Approved (Legacy Event)".
@@ -48312,7 +48428,7 @@
             const setupRealtimeListeners = () => {
                 // Azure API doesn't support realtime listeners like Firebase
                 // Use background polling to keep data fresh without disrupting the user
-                console.log('CHAOS: Starting background data refresh loop');
+                debugLog('CHAOS: Starting background data refresh loop');
                 scheduleDataRefresh();
                 
                 // Schedule hourly Navan imports (7AM-9PM, every hour on the hour)
@@ -48342,10 +48458,10 @@
                                         }, {
                                             silent: true // Silent mode for scheduled imports
                                         }).catch(error => {
-                                            console.warn('CHAOS: Scheduled Navan import failed:', error);
+                                            debugWarn('CHAOS: Scheduled Navan import failed:', error);
                                         });
                                     } else {
-                                        console.log('CHAOS: Skipping hourly Navan import - connection not available');
+                                        debugLog('CHAOS: Skipping hourly Navan import - connection not available');
                                     }
                                 }
                             }
@@ -48445,10 +48561,10 @@
             
             const performInitialLoad = async () => {
                 // Don't override the rotating phrases - let them show
-                console.log('CHAOS: performInitialLoad started');
+                debugLog('CHAOS: performInitialLoad started');
                 
                 try {
-                    console.log('CHAOS: Fetching data from Azure API...');
+                    debugLog('CHAOS: Fetching data from Azure API...');
                     
                     // Load data from Azure API
                     const [crcs, sites, studies, events, roles, training_types] = await Promise.all([
@@ -48465,7 +48581,7 @@
                     if (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager')) {
                         try {
                             users = await apiService.getUsers();
-                            console.log('CHAOS: Loaded', users.length, 'users');
+                            debugLog('CHAOS: Loaded', users.length, 'users');
                         } catch (error) {
                             console.error('CHAOS: Error loading users:', error);
                         }
@@ -48474,9 +48590,9 @@
                     let timeOffRequests = [];
                         try {
                             timeOffRequests = await apiService.getTimeOffRequests();
-                            console.log('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
+                            debugLog('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
                         } catch (error) {
-                            console.warn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
+                            debugWarn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
                             timeOffRequests = [];
                     }
                     
@@ -48489,7 +48605,7 @@
                     let travel = [];
                     try {
                         travel = await apiService.getTravel();
-                        console.log('CHAOS: Loaded', travel.length, 'travel records');
+                        debugLog('CHAOS: Loaded', travel.length, 'travel records');
                     } catch (error) {
                         console.error('CHAOS: Error loading travel:', error);
                         // If endpoint doesn't exist yet, that's okay - just continue
@@ -48499,35 +48615,35 @@
                     let announcements = [];
                     try {
                         announcements = await apiService.getAnnouncements();
-                        console.log('CHAOS: Loaded', announcements.length, 'announcements');
+                        debugLog('CHAOS: Loaded', announcements.length, 'announcements');
                     } catch (error) {
-                        console.warn('CHAOS: Failed to load announcements:', error);
+                        debugWarn('CHAOS: Failed to load announcements:', error);
                         announcements = [];
                     }
                     
-                    console.log('CHAOS: Data fetched successfully from Azure API');
-                    console.log('CHAOS: Loaded', crcs.length, 'CRCs');
-                    console.log('CHAOS: Loaded', sites.length, 'sites');
-                    console.log('CHAOS: Loaded', studies.length, 'studies');
-                    console.log('CHAOS: Loaded', events.length, 'events');
-                    console.log('CHAOS: Loaded', roles.length, 'roles');
-                    console.log('CHAOS: Loaded', training_types.length, 'training types');
+                    debugLog('CHAOS: Data fetched successfully from Azure API');
+                    debugLog('CHAOS: Loaded', crcs.length, 'CRCs');
+                    debugLog('CHAOS: Loaded', sites.length, 'sites');
+                    debugLog('CHAOS: Loaded', studies.length, 'studies');
+                    debugLog('CHAOS: Loaded', events.length, 'events');
+                    debugLog('CHAOS: Loaded', roles.length, 'roles');
+                    debugLog('CHAOS: Loaded', training_types.length, 'training types');
                     
                     // Debug site loading
                     if (sites.length > 0) {
-                        console.log('CHAOS: First site loaded from ARTEMIS:', sites[0].name || sites[0].id);
+                        debugLog('CHAOS: First site loaded from ARTEMIS:', sites[0].name || sites[0].id);
                     } else {
-                        console.warn('CHAOS: No sites loaded from ARTEMIS API');
+                        debugWarn('CHAOS: No sites loaded from ARTEMIS API');
                     }
                     
                     // Debug study loading
                     if (studies.length > 0) {
-                        console.log('CHAOS: First study loaded from ARTEMIS:', studies[0].title || studies[0].name || studies[0].id);
+                        debugLog('CHAOS: First study loaded from ARTEMIS:', studies[0].title || studies[0].name || studies[0].id);
                         if (studies[0].siteIds) {
-                            console.log('CHAOS: Study siteIds:', studies[0].siteIds);
+                            debugLog('CHAOS: Study siteIds:', studies[0].siteIds);
                         }
                     } else {
-                        console.warn('CHAOS: No studies loaded from ARTEMIS API');
+                        debugWarn('CHAOS: No studies loaded from ARTEMIS API');
                     }
                     
                     // Initialize empty arrays for CHAOS-specific data
@@ -48535,7 +48651,7 @@
                     let truck_events = [];
                     
                     // Sort the data
-                    console.log('CHAOS: Sorting data...');
+                    debugLog('CHAOS: Sorting data...');
                     crcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     sites.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     
@@ -48611,8 +48727,8 @@
                         return acc;
                     }, []) : events;
 
-                    console.log('CHAOS: Setting state with initialLoadComplete=true');
-                    console.log('CHAOS: authReady=', state.authReady, 'initialLoadComplete will be=', true);
+                    debugLog('CHAOS: Setting state with initialLoadComplete=true');
+                    debugLog('CHAOS: authReady=', state.authReady, 'initialLoadComplete will be=', true);
                     setState({ 
                         crcs, 
                         crc_sites: sites, 
@@ -48652,7 +48768,7 @@
                         }, 200);
                     }
                     
-                    console.log('CHAOS: performInitialLoad completed successfully');
+                    debugLog('CHAOS: performInitialLoad completed successfully');
                     
                     // Check and show announcement popup after initial load and render
                     setTimeout(() => {
@@ -48704,7 +48820,7 @@
 
             const init = async () => {
 				try {
-					console.log('CHAOS: Initializing application...');
+					debugLog('CHAOS: Initializing application...');
 					lucide.createIcons();
 					setupThemeToggle();
 					
@@ -48734,7 +48850,7 @@
 					// Check for existing session
 					const session = checkSession();
 					if (session && session.user) {
-						console.log('CHAOS: Restoring session for user:', session.user.username);
+						debugLog('CHAOS: Restoring session for user:', session.user.username);
 						setState({
 							currentUser: session.user,
 							isAuthenticated: true
@@ -48761,7 +48877,7 @@
 						performInitialLoad();
 					} else {
 						// Nos valid session - show login page
-						console.log('CHAOS: No valid session found');
+						debugLog('CHAOS: No valid session found');
 						state.authReady = true;
 						// Hide loading overlay to show login page
 						if (loadingOverlay) {
