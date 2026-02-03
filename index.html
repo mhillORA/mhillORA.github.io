@@ -20335,14 +20335,28 @@
                 const seenEventIds = new Set();
                 
                 // Get filtered events with deduplication
+                // Handle events that use date, startDate, or both
                 let filteredEvents = state.crc_events.filter(event => {
                     // Skip if we've already seen this event ID
                     if (event.id && seenEventIds.has(event.id)) return false;
                     
-                    const eventDate = new Date(event.date + 'T00:00:00');
-                    const startDate = new Date(state.allScheduleFilters.startDate + 'T00:00:00');
-                    const endDate = new Date(state.allScheduleFilters.endDate + 'T23:59:59');
-                    const inDateRange = eventDate >= startDate && eventDate <= endDate;
+                    // Handle different date formats: some events use 'date', others use 'startDate'
+                    const eventDateStr = event.date || event.startDate;
+                    if (!eventDateStr) {
+                        console.warn('EXPORT: Skipping event with no date:', event.id, event.type);
+                        return false;
+                    }
+                    
+                    const eventDate = new Date(eventDateStr + 'T00:00:00');
+                    const filterStart = new Date(state.allScheduleFilters.startDate + 'T00:00:00');
+                    const filterEnd = new Date(state.allScheduleFilters.endDate + 'T23:59:59');
+                    
+                    // For multi-day events, check if any part of the event falls within range
+                    const eventEndDateStr = event.endDate || eventDateStr;
+                    const eventEndDate = new Date(eventEndDateStr + 'T23:59:59');
+                    
+                    // Event is in range if: event starts before filter ends AND event ends after filter starts
+                    const inDateRange = eventDate <= filterEnd && eventEndDate >= filterStart;
                     
                     if (inDateRange && event.id) seenEventIds.add(event.id);
                     return inDateRange;
@@ -20370,28 +20384,40 @@
                         filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
                     }
                 }
-                // Site filter - include events that match site OR have no site (PTO/Travel don't have sites)
+                // Apply site filter when selected
                 if (state.allScheduleFilters.site !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site || !e.siteId);
+                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site);
                 }
-                // Study filter - include events that match study OR have no study (PTO/Travel don't have studies)
+                // Apply study filter when selected
                 if (state.allScheduleFilters.study !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => {
-                        if (!e.studyIds || e.studyIds.length === 0) return true; // Keep events without studies
-                        return e.studyIds.includes(state.allScheduleFilters.study);
-                    });
+                    filteredEvents = filteredEvents.filter(e => (e.studyIds || []).includes(state.allScheduleFilters.study));
                 }
+                // Apply event type filter when selected
                 if (state.allScheduleFilters.eventType !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.type === state.allScheduleFilters.eventType);
                 }
+                
+                console.log('EXPORT DEBUG: Total events in state:', state.crc_events.length);
+                console.log('EXPORT DEBUG: Events after date range filter:', filteredEvents.length);
+                console.log('EXPORT DEBUG: Filters applied:', {
+                    crc: state.allScheduleFilters.crc,
+                    site: state.allScheduleFilters.site,
+                    study: state.allScheduleFilters.study,
+                    eventType: state.allScheduleFilters.eventType,
+                    dateRange: `${state.allScheduleFilters.startDate} to ${state.allScheduleFilters.endDate}`
+                });
                 
                 if (filteredEvents.length === 0) {
                     showNotification('No events to export.', 'info');
                     return;
                 }
                 
-                // Sort by date
-                filteredEvents.sort((a, b) => a.date.localeCompare(b.date));
+                // Sort by date (handle events with date or startDate)
+                filteredEvents.sort((a, b) => {
+                    const dateA = a.date || a.startDate || '';
+                    const dateB = b.date || b.startDate || '';
+                    return dateA.localeCompare(dateB);
+                });
                 
                 // DEDUPLICATION: Track existing PTO/Unavailable events from crc_events to avoid adding duplicates from timeOffRequests
                 // Include ALL time-off related event types
@@ -20464,27 +20490,32 @@
                 if (!isCRCUser && state.allScheduleFilters.crc !== 'all') {
                     filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
                 }
-                // Site filter - include events that match site OR have no site (PTO events don't have sites)
-                if (state.allScheduleFilters.site !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site || !e.siteId);
+                // Re-apply filters to include PTO events (for CRC users, filter is already applied above)
+                if (!isCRCUser && state.allScheduleFilters.crc !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
                 }
-                // Study filter - include events that match study OR have no study (PTO events don't have studies)
+                if (state.allScheduleFilters.site !== 'all') {
+                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site);
+                }
                 if (state.allScheduleFilters.study !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => {
-                        if (!e.studyIds || e.studyIds.length === 0) return true; // Keep PTO events
-                        return e.studyIds.includes(state.allScheduleFilters.study);
-                    });
+                    filteredEvents = filteredEvents.filter(e => (e.studyIds || []).includes(state.allScheduleFilters.study));
                 }
                 if (state.allScheduleFilters.eventType !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.type === state.allScheduleFilters.eventType);
                 }
                 
                 // Sort by date again after adding PTO events
-                filteredEvents.sort((a, b) => a.date.localeCompare(b.date));
+                filteredEvents.sort((a, b) => {
+                    const dateA = a.date || a.startDate || '';
+                    const dateB = b.date || b.startDate || '';
+                    return dateA.localeCompare(dateB);
+                });
                 
                 const headers = ['Date', 'CRC Name', 'Position/Role', 'Site', 'Study', 'Time Off/PTO', 'Hours', 'Period', 'Notes'];
-                const rows = filteredEvents.map(event => {
-                    const crc = state.crcs.find(c => c.id === event.crcId);
+                
+                // For Site Assignments with roleAssignments, we need to expand into multiple rows (one per CRC)
+                const expandedRows = [];
+                filteredEvents.forEach(event => {
                     const site = state.crc_sites.find(s => s.id === event.siteId);
                     const studies = event.studyIds ? event.studyIds.map(studyId => {
                         const study = state.studies.find(s => s.id === studyId);
@@ -20494,15 +20525,41 @@
                     const isPTO = event.isPTORequest || event.type === 'Paid Time Off' || event.type === 'PTO';
                     const timeOffType = event.ptoType || event.type || (isPTO ? 'Time Off' : null);
                     
-                    // Handle CRC name display
-                    let crcDisplayName = 'Open Shift';
-                    if (event.crcId === 'SITE_STAFF') {
-                        crcDisplayName = 'Site Staff';
-                    } else if (event.crcId === 'UNASSIGNED') {
-                        crcDisplayName = '⚠ Unassigned';
-                    } else if (crc) {
-                        crcDisplayName = crc.name;
+                    // Get ALL CRCs assigned to this event (from both crcId and roleAssignments)
+                    const assignedCrcIds = new Set();
+                    if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
+                        assignedCrcIds.add(event.crcId);
                     }
+                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                        Object.values(event.roleAssignments).forEach(assignments => {
+                            if (Array.isArray(assignments)) {
+                                assignments.forEach(crcId => {
+                                    if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                        assignedCrcIds.add(crcId);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    
+                    // If no CRCs assigned, still create one row with appropriate label
+                    if (assignedCrcIds.size === 0) {
+                        let crcDisplayName = 'Open Shift';
+                        if (event.crcId === 'SITE_STAFF') crcDisplayName = 'Site Staff';
+                        else if (event.crcId === 'UNASSIGNED') crcDisplayName = '⚠ Unassigned';
+                        
+                        expandedRows.push({ event, crcDisplayName, site, studies, roles, isPTO, timeOffType });
+                    } else {
+                        // Create a row for EACH assigned CRC
+                        assignedCrcIds.forEach(crcId => {
+                            const crc = state.crcs.find(c => c.id === crcId);
+                            const crcDisplayName = crc ? crc.name : 'Unknown CRC';
+                            expandedRows.push({ event, crcDisplayName, site, studies, roles, isPTO, timeOffType });
+                        });
+                    }
+                });
+                
+                const rows = expandedRows.map(({ event, crcDisplayName, site, studies, roles, isPTO, timeOffType }) => {
                     
                     // Handle roles display - show actual roles, only use fallback when roles don't exist
                     const rolesDisplay = roles.length > 0 ? roles.join('; ') : (isPTO ? (event.type || 'Time Off') : (event.type === 'Travel Day' ? 'Travel' : (event.type === 'Site Assignment' && (!event.crcId || event.crcId === null) ? 'Open Shift' : '')));
@@ -20520,7 +20577,7 @@
                     const hoursDisplay = event.hours ? `${event.hours}` : (isPTO && event.period ? (event.period === 'Full Day' ? '8' : (event.period === 'Half Day AM' || event.period === 'Half Day PM' ? '4' : '')) : (event.type === 'Travel Day' ? '5' : ''));
                     
                     return [
-                        event.date,
+                        event.date || event.startDate || '',
                         crcDisplayName,
                         rolesDisplay,
                         siteDisplay,
