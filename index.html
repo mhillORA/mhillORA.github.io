@@ -11930,8 +11930,13 @@
 
                 const selectedMonths = Array.from(monthSelect.selectedOptions).map(opt => parseInt(opt.value));
                 const selectedCrcs = Array.from(crcSelect.selectedOptions).map(opt => opt.value);
-                const selectedSites = Array.from(siteSelect.selectedOptions).map(opt => opt.value);
-                const selectedStudies = Array.from(studySelect.selectedOptions).map(opt => opt.value);
+                let selectedSites = Array.from(siteSelect.selectedOptions).map(opt => opt.value);
+                let selectedStudies = Array.from(studySelect.selectedOptions).map(opt => opt.value);
+                // When user has selected every site/study, treat as "all" so we don't exclude any events
+                const totalSites = siteSelect.options.length;
+                const totalStudies = studySelect.options.length;
+                if (totalSites > 0 && selectedSites.length >= totalSites) selectedSites = [];
+                if (totalStudies > 0 && selectedStudies.length >= totalStudies) selectedStudies = [];
 
                 if (selectedMonths.length === 0 || selectedCrcs.length === 0) {
                     container.innerHTML = `<p class="p-4 text-center text-gray-500 dark:text-gray-400">Please select at least one month and one CRC to generate a report.</p>`;
@@ -11974,10 +11979,12 @@
                         // Apply site filter only to Site Assignments (not to Travel/PTO)
                         let siteAssignmentEvents = allEventsForMonth.filter(e => isSiteAssignmentWithCrc(e));
                         if (selectedSites.length > 0) {
-                            siteAssignmentEvents = siteAssignmentEvents.filter(e => !e.siteId || selectedSites.includes(e.siteId));
+                            siteAssignmentEvents = siteAssignmentEvents.filter(e =>
+                                !e.siteId || selectedSites.includes(e.siteId)
+                            );
                         }
 
-                        // Apply study filter only to Site Assignments
+                        // Apply study filter only to Site Assignments (empty selectedStudies = show all)
                         if (selectedStudies.length > 0) {
                             siteAssignmentEvents = siteAssignmentEvents.filter(e => {
                                 if (!e.studyIds || e.studyIds.length === 0) return false;
@@ -11985,16 +11992,18 @@
                             });
                         }
 
-                        // Get time off from timeOffRequests (approved only)
-                        // Use Set to track unique dates to prevent duplicates
-                        const timeOffDaysSet = new Set();
+                        // Single deduplicated set of time-off dates (events + approved requests) so we never double-count PTO
+                        const timeOffDatesSet = new Set();
+                        // From crc_events (PTO, Unavailable, etc.) for this CRC
+                        allEventsForMonth.filter(e => 
+                            ['Paid Time Off', 'Unavailable', 'PTO', 'Time Off'].includes(e.type)
+                        ).forEach(e => { timeOffDatesSet.add(e.date); });
+                        // From approved timeOffRequests
                         const processedTimeOffIds = new Set();
                         (state.timeOffRequests || []).forEach(req => {
                             if (!req || req.crcId !== crcId) return;
-                            // Skip if we've already processed this request
                             if (req.id && processedTimeOffIds.has(req.id)) return;
                             if (req.id) processedTimeOffIds.add(req.id);
-                            
                             const statusKey = normalizeTimeOffStatus(req.status);
                             if (statusKey !== 'approved') return;
                             const start = parseDateFlexible(req.startDate || req.date);
@@ -12004,11 +12013,13 @@
                             const limit = end ? new Date(end.getFullYear(), end.getMonth(), end.getDate()) : new Date(cursor);
                             while (cursor <= limit) {
                                 if (cursor.getFullYear() == year && cursor.getMonth() == month) {
-                                    timeOffDaysSet.add(toDateOnlyString(cursor));
+                                    timeOffDatesSet.add(toDateOnlyString(cursor));
                                 }
                                 cursor.setDate(cursor.getDate() + 1);
                             }
                         });
+                        const timeOffDays = timeOffDatesSet.size;
+                        const nonWorkDaysSet = new Set(timeOffDatesSet);
 
                         // Productive events = Site Assignments (after filters)
                         const productiveEvents = siteAssignmentEvents;
@@ -12029,13 +12040,6 @@
                             if (eventIsTraining(e)) travelTrainingDaysSet.add(e.date);
                             else travelStudiesDaysSet.add(e.date);
                         });
-                        
-                        // Non-work days from events (PTO, Unavailable from crc_events)
-                        const nonWorkDaysSet = new Set(allEventsForMonth.filter(e => 
-                            ['Paid Time Off', 'Unavailable', 'PTO', 'Time Off'].includes(e.type)
-                        ).map(e => e.date));
-                        // Also add from timeOffRequests
-                        timeOffDaysSet.forEach(date => nonWorkDaysSet.add(date));
 
                         const crcRecord = state.crcs.find(c => c.id === crcId);
                         const crcName = crcRecord?.name || 'Unknown';
@@ -12079,7 +12083,6 @@
                         const travelDays = travelDaysSet.size;
                         const travelStudiesDays = travelStudiesDaysSet.size;
                         const travelTrainingDays = travelTrainingDaysSet.size;
-                        const timeOffDays = timeOffDaysSet.size;
                         const availableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
                         
                         // Calculate travel hours (default 5 per travel day if not specified)
