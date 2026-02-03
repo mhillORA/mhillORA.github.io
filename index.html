@@ -5071,6 +5071,18 @@
                     return isSiteAssignmentWithCrc(e) || e.type === 'Travel Day';
                 });
             };
+            /** True if study has at least one shift (Site Assignment or Travel Day) in the date range. Used to show only studies with activity in the dashboard budget month. */
+            const studyHasShiftInPeriod = (studyId, startDate, endDate) => {
+                if (!studyId || !state.crc_events || state.crc_events.length === 0) return false;
+                const start = startDate instanceof Date ? startDate : new Date(startDate + 'T00:00:00');
+                const end = endDate instanceof Date ? endDate : new Date(endDate + 'T23:59:59');
+                return state.crc_events.some(e => {
+                    if (!e.studyIds || !e.studyIds.includes(studyId)) return false;
+                    const eventDate = new Date(e.date + 'T12:00:00');
+                    if (eventDate < start || eventDate > end) return false;
+                    return isSiteAssignmentWithCrc(e) || e.type === 'Travel Day';
+                });
+            };
 
             const calculateMonthlyUtilization = (dateInMonth, crcIdsToCalculate = [], options = {}) => {
                 const { includeTravel = state.managerViewIncludeTravel !== false } = options;
@@ -22254,12 +22266,16 @@
                     return a.visitNumber.localeCompare(b.visitNumber);
                 });
 
-                // Render budget comparison section
+                // Render budget comparison section (only studies that have a shift in the displayed month)
                 const budgetComparisonContainer = document.getElementById('dashboard-budget-comparison');
                 if (budgetComparisonContainer) {
+                    const budgetStart = state.dashboardStartDate ? new Date(state.dashboardStartDate + 'T00:00:00') : null;
+                    const budgetEnd = state.dashboardEndDate ? new Date(state.dashboardEndDate + 'T23:59:59') : null;
                     const activeStudies = (state.studies || []).filter(study => {
                         const statusString = String(study.status || study.state || study.phase || '').toLowerCase();
-                        return !statusString.includes('closed') && (Array.isArray(study.siteIds) && study.siteIds.length > 0);
+                        if (statusString.includes('closed') || !Array.isArray(study.siteIds) || study.siteIds.length === 0) return false;
+                        if (budgetStart && budgetEnd && !studyHasShiftInPeriod(study.id, budgetStart, budgetEnd)) return false;
+                        return true;
                     });
                     
                     if (activeStudies.length === 0) {
@@ -27850,6 +27866,43 @@
                     }
                     case 'export-utilization-report': {
                         exportUtilizationReport();
+                        break;
+                    }
+                    case 'export-budget-summary': {
+                        const startStr = state.dashboardStartDate || (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`; })();
+                        const endStr = state.dashboardEndDate || (() => { const d = new Date(); const last = new Date(d.getFullYear(), d.getMonth() + 1, 0); return `${last.getFullYear()}-${String(last.getMonth() + 1).padStart(2, '0')}-${String(last.getDate()).padStart(2, '0')}`; })();
+                        const budgetStart = new Date(startStr + 'T00:00:00');
+                        const budgetEnd = new Date(endStr + 'T23:59:59');
+                        const studiesToExport = (state.studies || []).filter(study => {
+                            const statusString = String(study.status || study.state || study.phase || '').toLowerCase();
+                            if (statusString.includes('closed') || !Array.isArray(study.siteIds) || study.siteIds.length === 0) return false;
+                            if (!studyHasShiftInPeriod(study.id, budgetStart, budgetEnd)) return false;
+                            return true;
+                        });
+                        const rows = [['Study', 'Flight Budget', 'Flight Actual', 'Hotel Budget', 'Hotel Actual', 'Car Budget', 'Car Actual', 'CRC Hours Est. Cost', 'Total Budget', 'Total Actual (Travel)', 'Remaining']];
+                        studiesToExport.forEach(study => {
+                            const c = calculateStudyBudgetComparison(study);
+                            if (!c) return;
+                            const flightBudget = c.flightBudget || 0;
+                            const hotelBudget = c.hotelBudget || 0;
+                            const carBudget = c.carBudget || 0;
+                            const totalBudget = c.totalBudget || (flightBudget + hotelBudget + carBudget) || 0;
+                            const totalActual = c.totalActualCost || 0;
+                            const remaining = totalBudget ? totalBudget - totalActual : '';
+                            const name = (study.title || study.name || 'Unknown').replace(/"/g, '""');
+                            rows.push([name, flightBudget, c.totalActualFlight || 0, hotelBudget, c.totalActualHotel || 0, carBudget, c.totalActualCar || 0, c.crcHoursEstimatedCost || 0, totalBudget, totalActual, remaining]);
+                        });
+                        const csv = rows.map(row => row.map(cell => typeof cell === 'number' ? String(cell) : `"${String(cell)}"`).join(',')).join('\n');
+                        const blob = new Blob([csv], { type: 'text/csv' });
+                        const url = window.URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = url;
+                        link.setAttribute('download', `budget_summary_${startStr}_to_${endStr}.csv`);
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        window.URL.revokeObjectURL(url);
+                        showNotification('Budget summary exported', 'success');
                         break;
                     }
                     case 'reset-report-filters': {
