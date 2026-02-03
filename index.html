@@ -11087,10 +11087,12 @@
                 const ptoEventKeys = new Set(); // Track by crcId-date combination
                 const timeOffRequests = state.timeOffRequests || [];
                 
-                // First, check if there are any actual PTO events in baseEvents to avoid duplicates
+                // First, check if there are any actual PTO/Unavailable events in baseEvents to avoid duplicates
+                // Include ALL time-off related event types
+                const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem']);
                 const existingPtoEvents = new Set();
                 baseEvents.forEach(event => {
-                    if (event.type === 'Paid Time Off' || event.type === 'PTO' || event.isPTORequest) {
+                    if (timeOffTypes.has(event.type) || event.isPTORequest) {
                         const key = `${event.crcId}-${event.date}`;
                         existingPtoEvents.add(key);
                     }
@@ -20368,11 +20370,16 @@
                         filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
                     }
                 }
+                // Site filter - include events that match site OR have no site (PTO/Travel don't have sites)
                 if (state.allScheduleFilters.site !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site);
+                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site || !e.siteId);
                 }
+                // Study filter - include events that match study OR have no study (PTO/Travel don't have studies)
                 if (state.allScheduleFilters.study !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => (e.studyIds || []).includes(state.allScheduleFilters.study));
+                    filteredEvents = filteredEvents.filter(e => {
+                        if (!e.studyIds || e.studyIds.length === 0) return true; // Keep events without studies
+                        return e.studyIds.includes(state.allScheduleFilters.study);
+                    });
                 }
                 if (state.allScheduleFilters.eventType !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.type === state.allScheduleFilters.eventType);
@@ -20386,10 +20393,12 @@
                 // Sort by date
                 filteredEvents.sort((a, b) => a.date.localeCompare(b.date));
                 
-                // DEDUPLICATION: Track existing PTO events from crc_events to avoid adding duplicates from timeOffRequests
+                // DEDUPLICATION: Track existing PTO/Unavailable events from crc_events to avoid adding duplicates from timeOffRequests
+                // Include ALL time-off related event types
+                const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem']);
                 const existingPtoEvents = new Set();
                 filteredEvents.forEach(event => {
-                    if (event.type === 'Paid Time Off' || event.type === 'PTO' || event.type === 'Time Off' || event.isPTORequest) {
+                    if (timeOffTypes.has(event.type) || event.isPTORequest) {
                         const key = `${event.crcId}-${event.date}`;
                         existingPtoEvents.add(key);
                     }
@@ -20455,11 +20464,16 @@
                 if (!isCRCUser && state.allScheduleFilters.crc !== 'all') {
                     filteredEvents = filteredEvents.filter(e => eventBelongsToCrc(e, state.allScheduleFilters.crc));
                 }
+                // Site filter - include events that match site OR have no site (PTO events don't have sites)
                 if (state.allScheduleFilters.site !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site);
+                    filteredEvents = filteredEvents.filter(e => e.siteId === state.allScheduleFilters.site || !e.siteId);
                 }
+                // Study filter - include events that match study OR have no study (PTO events don't have studies)
                 if (state.allScheduleFilters.study !== 'all') {
-                    filteredEvents = filteredEvents.filter(e => (e.studyIds || []).includes(state.allScheduleFilters.study));
+                    filteredEvents = filteredEvents.filter(e => {
+                        if (!e.studyIds || e.studyIds.length === 0) return true; // Keep PTO events
+                        return e.studyIds.includes(state.allScheduleFilters.study);
+                    });
                 }
                 if (state.allScheduleFilters.eventType !== 'all') {
                     filteredEvents = filteredEvents.filter(e => e.type === state.allScheduleFilters.eventType);
@@ -48098,11 +48112,14 @@
                     const approvedRequests = timeOffRequests.filter(req => req.status === 'approved');
                     const approvedRequestIds = new Set(approvedRequests.map(req => req.id));
                     
+                    // All time-off related event types
+                    const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem']);
+                    
                     // First, remove events for requests that are no longer approved (rejected, deleted, or pending)
                     const eventsToRemove = state.crc_events.filter(e => 
                         e.timeOffRequestId && 
                         !approvedRequestIds.has(e.timeOffRequestId) &&
-                        (e.type === 'Unavailable' || e.type === 'Paid Time Off')
+                        timeOffTypes.has(e.type)
                     );
                     
                     for (const eventToRemove of eventsToRemove) {
@@ -48120,35 +48137,47 @@
                         const date = request.date || request.startDate;
                         if (!date || !request.crcId) continue;
                         
-                        // Check if unavailability event already exists
+                        // DUPLICATE PREVENTION: Check if ANY time-off event already exists for this CRC+date
+                        // This catches both events with matching timeOffRequestId AND legacy events without it
                         const existingEvent = state.crc_events.find(e => 
                             e.crcId === request.crcId && 
                             e.date === date && 
-                            (e.type === 'Unavailable' || e.type === 'Paid Time Off') &&
-                            e.timeOffRequestId === request.id
+                            timeOffTypes.has(e.type)
                         );
                         
-                        if (!existingEvent) {
-                            // Create unavailability event for approved request
-                            const eventData = {
-                                crcId: request.crcId,
-                                date: date,
-                                type: request.type === 'Paid Time Off' ? 'Paid Time Off' : 'Unavailable',
-                                name: request.type || 'Vacation',
-                                period: request.period || 'Full Day',
-                                hours: request.hours || (request.period === 'Full Day' ? 8 : 4),
-                                notes: request.notes || `Approved time off: ${request.type}`,
-                                timeOffRequestId: request.id
-                            };
-                            
-                            try {
-                                const createdEvent = await apiService.createEvent(eventData);
-                                const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
-                                addEventToState(newEvent);
-                                console.log(`Created event for approved time off request: ${request.id}`);
-                            } catch (eventError) {
-                                console.error('Error syncing time off request to event:', eventError);
+                        if (existingEvent) {
+                            // Event already exists - just update it with the timeOffRequestId if missing
+                            if (!existingEvent.timeOffRequestId) {
+                                try {
+                                    await apiService.updateEvent(existingEvent.id, { timeOffRequestId: request.id });
+                                    existingEvent.timeOffRequestId = request.id;
+                                    console.log(`Linked existing event to time off request: ${request.id}`);
+                                } catch (updateError) {
+                                    console.warn('Could not link existing event to request:', updateError);
+                                }
                             }
+                            continue; // Skip creating - already exists
+                        }
+                        
+                        // No existing event found - create new one
+                        const eventData = {
+                            crcId: request.crcId,
+                            date: date,
+                            type: request.type === 'Paid Time Off' ? 'Paid Time Off' : 'Unavailable',
+                            name: request.type || 'Vacation',
+                            period: request.period || 'Full Day',
+                            hours: request.hours || (request.period === 'Full Day' ? 8 : 4),
+                            notes: request.notes || `Approved time off: ${request.type}`,
+                            timeOffRequestId: request.id
+                        };
+                        
+                        try {
+                            const createdEvent = await apiService.createEvent(eventData);
+                            const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                            addEventToState(newEvent);
+                            console.log(`Created event for approved time off request: ${request.id}`);
+                        } catch (eventError) {
+                            console.error('Error syncing time off request to event:', eventError);
                         }
                     }
                 } catch (error) {
