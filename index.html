@@ -2259,6 +2259,8 @@
                 travelFilterType: 'thisYear', // 'thisYear', 'lastYear', 'month', 'quarter', 'custom'
                 travelFilterMonth: null,
                 finalizedMonths: {},
+                /** For CRCs viewing a finalized month: merged list (live events outside month + snapshot inside month). Undefined for managers or when not viewing finalized month. */
+                crc_events_display: undefined,
                 travelFilterQuarter: null,
                 travelFilterYear: null,
                 travelFilterStartDate: null,
@@ -2321,9 +2323,11 @@
 
             // --- CONFIG: magic values for PTO, time off, and filters (single source of truth) ---
             const CONFIG = {
-                ptoEventTypes: ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty'],
+                ptoEventTypes: ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only'],
                 ptoEventTypesShort: ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off'],
                 timeOffRequestStatuses: ['pending', 'approved', 'rejected'],
+                // Capped - FTE only: same approval flow as PTO but counted separately in reports/exports
+                cappedFteOnlyType: 'Capped - FTE only',
             };
             const DEBUG = false;
             const debugLog = (...args) => { if (DEBUG) console.log(...args); };
@@ -5379,7 +5383,7 @@
         }
     }
     // CRITICAL: Never add duplicate PTO/time off (one per CRC per date; all formats treated same)
-    const ptoTypes = ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty'];
+    const ptoTypes = ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only'];
     if (ptoTypes.includes(newEvent.type) && newEvent.crcId && newEvent.date) {
         if (state.crc_events.some(e => ptoTypes.includes(e.type) && e.crcId === newEvent.crcId && e.date === newEvent.date)) {
             debugWarn('CHAOS: Prevented duplicate PTO/time off:', newEvent.crcId, newEvent.date);
@@ -7684,7 +7688,7 @@
                         // First pass: Find all PTO/Unavailable events and group by CRC+date
                         // Early exit if no duplicates found
                         eventsList.forEach(event => {
-                            if ((event.type === 'Unavailable' || event.type === 'Paid Time Off' || event.type === 'PTO') && event.crcId && event.date) {
+                            if ((event.type === 'Unavailable' || event.type === 'Paid Time Off' || event.type === 'PTO' || event.type === 'Capped - FTE only') && event.crcId && event.date) {
                                 const key = `${event.crcId}-${event.date}`;
                                 if (!ptoMap.has(key)) {
                                     ptoMap.set(key, []);
@@ -7824,7 +7828,14 @@
                     }
 
                     setState(updates, { skipRender: true });
-                    refreshActiveTabContent();
+                    if (state.currentUser && getEffectivePermissionLevel(state.currentUser) === 'CRC') {
+                        (async () => {
+                            await ensureFinalizedSnapshotForCurrentMonth();
+                            refreshActiveTabContent();
+                        })();
+                    } else {
+                        refreshActiveTabContent();
+                    }
                 } catch (error) {
                     console.error('CHAOS: Background data refresh failed:', error);
                 } finally {
@@ -9291,7 +9302,7 @@
 
                     const normalizedEventType = (EventType || '').toString().trim().toLowerCase();
                     const normalizedEventTypeSimple = normalizedEventType.replace(/[\s-]/g, '');
-                    const isTimeOffImportRow = ['timeoffrequest', 'timeoff', 'pto', 'ptorequest', 'vacation', 'sick', 'holiday', 'bereavement', 'juryduty', 'jury'].includes(normalizedEventTypeSimple);
+                    const isTimeOffImportRow = ['timeoffrequest', 'timeoff', 'pto', 'ptorequest', 'vacation', 'sick', 'holiday', 'bereavement', 'juryduty', 'jury', 'capped', 'capped - fte only', 'cappedfte'].includes(normalizedEventTypeSimple);
 
                     if (isTimeOffImportRow) {
                         if (!CRCName) {
@@ -10122,7 +10133,7 @@
                     return false;
                 };
 
-                const monthEvents = (state.crc_events || []).filter(e => {
+                const monthEvents = (getDisplayEvents() || []).filter(e => {
                     if (!e.date) return false;
                     return e.date >= startDateStr && e.date <= endDateStr && isCrcEvent(e);
                 });
@@ -10361,7 +10372,7 @@
                 today.setHours(0, 0, 0, 0);
                 const todayStr = toDateOnlyString(today);
                 
-                const allCrcEvents = (state.crc_events || []).filter(e => {
+                const allCrcEvents = (getDisplayEvents() || []).filter(e => {
                     // Check legacy crcId
                     if (e.crcId === matchingCrcId) return true;
                     // Check roleAssignments
@@ -10651,7 +10662,7 @@
                 let filteredEvents = [];
                 if (dashboardView === 'mySchedule') {
                     // Only show this CRC's events
-                    filteredEvents = (state.crc_events || []).filter(e => {
+                    filteredEvents = (getDisplayEvents() || []).filter(e => {
                         if (e.crcId === matchingCrcId) return true;
                         if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
                             return Object.values(e.roleAssignments).some(assignments => {
@@ -10665,7 +10676,7 @@
                     });
                 } else {
                     // Show all shifts only (entire schedule)
-                    filteredEvents = (state.crc_events || []).filter(e => e.type === 'Site Assignment');
+                    filteredEvents = (getDisplayEvents() || []).filter(e => e.type === 'Site Assignment');
                 }
                 
                 // Filter to current month
@@ -10751,7 +10762,7 @@
                                         }
                                     }
                                     const crcNameDisplay = crcNames.length > 0 ? crcNames.join(', ') : '';
-                                    const timeOffTypes = new Set(['Unavailable', 'Paid Time Off', 'Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty']);
+                                    const timeOffTypes = new Set(['Unavailable', 'Paid Time Off', 'Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only']);
                                     const isTimeOff = timeOffTypes.has(event.type) || timeOffTypes.has(event.name);
                                     
                                     const bgColor = isTimeOff ? '#10b981' : (event.type === 'Travel Day' ? '#3b82f6' : '#8b5cf6');
@@ -10894,7 +10905,7 @@
                 });
                 
                 // Separate time off events from shift events
-                const timeOffTypes = ['Unavailable', 'Paid Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty'];
+                const timeOffTypes = ['Unavailable', 'Paid Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only'];
                 const timeOffEvents = allCrcEvents.filter(e => timeOffTypes.includes(e.type) || timeOffTypes.includes(e.name));
                 
                 // Shift events - must have studyIds OR be Travel Day
@@ -11420,7 +11431,7 @@
                 
                 // First, check if there are any actual PTO/Unavailable events in baseEvents to avoid duplicates
                 // Include ALL time-off related event types
-                const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem']);
+                const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem', 'Capped - FTE only']);
                 const existingPtoEvents = new Set();
                 baseEvents.forEach(event => {
                     if (timeOffTypes.has(event.type) || event.isPTORequest) {
@@ -12923,7 +12934,7 @@
                                 day.statusLabel || formatTimeOffStatus(day.status),
                                 day.period || 'Full Day',
                                 formatHours(day.hours || 0),
-                                'Time Off',
+                                day.type || 'Time Off',
                                 day.requestId || ''
                             ].map(val => `"${(val || '').toString().replace(/"/g, '""')}"`).join(','));
                         });
@@ -13336,6 +13347,144 @@
                 }
             };
 
+            /** Events to show in calendar: for CRCs viewing a finalized month, use snapshot merge; otherwise live events. */
+            const getDisplayEvents = () => (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
+
+            /** Returns true if the current user should see the finalized snapshot (CRC viewing a finalized month). */
+            const isViewingFinalizedSchedule = () => {
+                const level = getEffectivePermissionLevel(state.currentUser);
+                if (level === 'Manager' || level === 'Supervisor' || isAdminUser()) return false;
+                const monthKey = getScheduleMonthKey(state.crcCalendarDate);
+                return !!state.finalizedMonths[monthKey];
+            };
+
+            /** For CRC: load finalized snapshot for current calendar month and set crc_events_display. For managers or non-finalized month, clear crc_events_display. */
+            const ensureFinalizedSnapshotForCurrentMonth = async () => {
+                const level = getEffectivePermissionLevel(state.currentUser);
+                const monthKey = getScheduleMonthKey(state.crcCalendarDate);
+                if (level === 'Manager' || level === 'Supervisor' || isAdminUser()) {
+                    setState({ crc_events_display: undefined });
+                    return;
+                }
+                const finalized = await loadMonthFinalization(monthKey);
+                if (!finalized) {
+                    setState({ crc_events_display: undefined });
+                    return;
+                }
+                try {
+                    const recordId = getFinalizationRecordId(monthKey);
+                    const record = await apiService.getSchedule(recordId);
+                    // Race guard: user may have navigated to another month while we were fetching
+                    if (getScheduleMonthKey(state.crcCalendarDate) !== monthKey) return;
+                    const snapshotEvents = Array.isArray(record?.events) ? record.events : [];
+                    const [y, m] = monthKey.split('-').map(Number);
+                    const monthStart = `${y}-${String(m).padStart(2, '0')}-01`;
+                    const monthEnd = toDateOnlyString(new Date(y, m, 0));
+                    const liveEvents = (state.crc_events || []).filter(e => {
+                        const d = e.date || e.startDate;
+                        if (!d) return true;
+                        return d < monthStart || d > monthEnd;
+                    });
+                    const merged = [...liveEvents, ...snapshotEvents];
+                    if (getScheduleMonthKey(state.crcCalendarDate) !== monthKey) return;
+                    setState({ crc_events_display: merged });
+                } catch (err) {
+                    console.warn('Failed to load finalized snapshot for', monthKey, err);
+                    if (getScheduleMonthKey(state.crcCalendarDate) === monthKey) setState({ crc_events_display: undefined });
+                }
+            };
+
+            /** Build list of changes between previous snapshot and current events for a month. Each item: { date, siteName, studyNames, originalNames, newNames }. */
+            const buildFinalizeChanges = (previousEvents, currentEvents, monthKey) => {
+                const [y, m] = monthKey.split('-').map(Number);
+                const monthStart = `${y}-${String(m).padStart(2, '0')}-01`;
+                const monthEnd = toDateOnlyString(new Date(y, m, 0));
+                const inMonth = (e) => {
+                    const d = e.date || e.startDate;
+                    return d && d >= monthStart && d <= monthEnd;
+                };
+                const prev = (previousEvents || []).filter(inMonth);
+                const curr = (currentEvents || []).filter(inMonth);
+                const crcName = (id) => (state.crcs || []).find(c => c.id === id)?.name || id || '(unassigned)';
+                const eventKey = (e) => `${e.date || e.startDate}_${e.siteId}_${(e.studyIds || []).sort().join(',')}_${e.id || ''}`;
+                const namesForEvent = (e) => {
+                    const names = new Set();
+                    if (e.crcId) names.add(crcName(e.crcId));
+                    if (e.roleAssignments && typeof e.roleAssignments === 'object') {
+                        Object.values(e.roleAssignments).flat().filter(Boolean).forEach(crcId => names.add(crcName(crcId)));
+                    }
+                    return Array.from(names).sort().join(', ') || '(unassigned)';
+                };
+                const prevByKey = new Map(prev.map(e => [eventKey(e), e]));
+                const currByKey = new Map(curr.map(e => [eventKey(e), e]));
+                const siteName = (id) => (state.crc_sites || []).find(s => s.id === id)?.name || id || '';
+                const studyNames = (ids) => (ids || []).map(sid => (state.studies || []).find(s => s.id === sid)?.name || sid).filter(Boolean).join(', ') || '—';
+                const changes = [];
+                const seen = new Set();
+                curr.forEach(e => {
+                    const k = eventKey(e);
+                    seen.add(k);
+                    const p = prevByKey.get(k);
+                    const oldNames = p ? namesForEvent(p) : '(none)';
+                    const newNames = namesForEvent(e);
+                    if (oldNames !== newNames) {
+                        changes.push({
+                            date: e.date || e.startDate,
+                            siteName: siteName(e.siteId),
+                            studyNames: studyNames(e.studyIds),
+                            originalNames: oldNames,
+                            newNames
+                        });
+                    }
+                });
+                prev.forEach(e => {
+                    const k = eventKey(e);
+                    if (seen.has(k)) return;
+                    changes.push({
+                        date: e.date || e.startDate,
+                        siteName: siteName(e.siteId),
+                        studyNames: studyNames(e.studyIds),
+                        originalNames: namesForEvent(e),
+                        newNames: '(removed)'
+                    });
+                });
+                return changes.sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.siteName || '').localeCompare(b.siteName || ''));
+            };
+
+            const getFinalizeChangesModalHTML = (changes, monthLabel) => {
+                if (!changes || changes.length === 0) {
+                    return `
+                        <h2 class="text-xl font-bold dark:text-white mb-4">Refinalize schedule</h2>
+                        <p class="text-gray-600 dark:text-gray-400">No assignment changes detected. The schedule is unchanged from the last finalized version.</p>
+                        <div class="mt-6 flex justify-end gap-2">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="button" data-action="confirm-refinalize" class="py-2 px-4 rounded-md bg-green-600 text-white hover:bg-green-700">Finalize anyway</button>
+                        </div>`;
+                }
+                return `
+                    <h2 class="text-xl font-bold dark:text-white mb-4">Refinalize schedule – ${monthLabel}</h2>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">The following assignment changes will be shown to CRCs when you finalize:</p>
+                    <div class="max-h-80 overflow-y-auto border dark:border-gray-600 rounded-md p-3 bg-gray-50 dark:bg-gray-800/50 mb-4">
+                        <table class="w-full text-sm">
+                            <thead><tr class="text-left border-b dark:border-gray-600"><th class="py-1 pr-2">Date</th><th class="py-1 pr-2">Site</th><th class="py-1 pr-2">Study</th><th class="py-1">Original → New</th></tr></thead>
+                            <tbody>
+                                ${changes.map(c => `
+                                    <tr class="border-b border-gray-200 dark:border-gray-700 last:border-0">
+                                        <td class="py-1.5 pr-2 whitespace-nowrap">${formatDisplayDate(c.date)}</td>
+                                        <td class="py-1.5 pr-2">${(c.siteName || '—').toString().replace(/</g, '&lt;')}</td>
+                                        <td class="py-1.5 pr-2">${(c.studyNames || '—').toString().replace(/</g, '&lt;')}</td>
+                                        <td class="py-1.5"><span class="text-gray-600 dark:text-gray-400">${(c.originalNames || '—').toString().replace(/</g, '&lt;')}</span> → <span class="text-green-700 dark:text-green-300 font-medium">${(c.newNames || '—').toString().replace(/</g, '&lt;')}</span></td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="flex justify-end gap-2">
+                        <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                        <button type="button" data-action="confirm-refinalize" class="py-2 px-4 rounded-md bg-green-600 text-white hover:bg-green-700">Finalize</button>
+                    </div>`;
+            };
+
             const removeCrcFromRoleAssignments = (crcId) => {
                 const form = document.getElementById('crc-event-form');
                 if (!form || !crcId) return;
@@ -13475,6 +13624,11 @@
                                 ` : ''}
                                 <input type="month" id="month-selector" value="${currentMonthValue}" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
                                 <button type="button" data-action="${nextAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right" class="w-4 h-4 md:w-5 md:h-5"></i></button>
+                                ${(isAdminUser() || getEffectivePermissionLevel() === 'Manager') ? `
+                                <button type="button" data-action="finalize-schedule-month" id="finalize-schedule-month-btn" class="p-1.5 md:p-2 rounded-md bg-green-600 hover:bg-green-700 text-white text-xs md:text-sm flex items-center gap-1" title="Finalize this month so CRCs see this version">
+                                    <i data-lucide="lock" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Finalize</span>
+                                </button>
+                                ` : ''}
                             </div>
                         </div>
                     </div>
@@ -13503,7 +13657,7 @@
                     const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                     const isToday = new Date().toDateString() === new Date(year, month, day).toDateString();
                     const dayClass = isToday ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-white dark:bg-gray-800';
-                    const todaysEvents = state.crc_events.filter(e => e.date === dateStr);
+                    const todaysEvents = getDisplayEvents().filter(e => e.date === dateStr);
                     
                     const uniqueIds = idField === 'studyIds'
                         ? [...new Set(todaysEvents.flatMap(e => e.studyIds || []))]
@@ -13564,9 +13718,9 @@
                 
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
-                let filteredEvents = state.crc_events;
-                console.log('All events:', state.crc_events.length);
-                console.log('Travel Day events in state:', state.crc_events.filter(e => e.type === 'Travel Day'));
+                let filteredEvents = getDisplayEvents();
+                console.log('All events:', getDisplayEvents().length);
+                console.log('Travel Day events in state:', getDisplayEvents().filter(e => e.type === 'Travel Day'));
                 
                 // Filter out PTO/Unavailable/Sick Time events - they should only appear in the time off calendar, not the main scheduler
                 filteredEvents = filteredEvents.filter(e => 
@@ -13933,7 +14087,7 @@
                     
                     crcsToDisplay = crcsToDisplay.filter(crc => {
                         // Check if this CRC has any time off events in the current week
-                        const hasTimeOff = state.crc_events.some(event => 
+                        const hasTimeOff = getDisplayEvents().some(event => 
                             event.crcId === crc.id && 
                             (event.type === 'Paid Time Off' || event.type === 'Unavailable') &&
                             event.date >= weekStartStr && 
@@ -13945,7 +14099,7 @@
                 
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
-                let filteredEvents = state.crc_events;
+                let filteredEvents = getDisplayEvents();
                 
                 // Filter out PTO/Unavailable/Sick Time events
                 // NOTE: We no longer strictly require studyIds to ensure all Site Assignments show
@@ -14252,7 +14406,7 @@
                 }
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
-                let filteredEvents = state.crc_events.filter(e => {
+                let filteredEvents = getDisplayEvents().filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
@@ -14604,7 +14758,7 @@
                 }
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
-                let filteredEvents = state.crc_events;
+                let filteredEvents = getDisplayEvents();
                 
                 // Filter out PTO/Unavailable events - they should only appear in the time off calendar, not the main scheduler
                 // Filter out PTO/Unavailable/Sick Time events and events without studyIds
@@ -14945,7 +15099,7 @@
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
                 const isDarkMode = document.documentElement.classList.contains('dark');
 
-                let filteredEvents = state.crc_events.filter(e => {
+                let filteredEvents = getDisplayEvents().filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
@@ -15345,7 +15499,7 @@
                 }
                 
                 // Filter events for the week
-                let filteredEvents = state.crc_events.filter(e => {
+                let filteredEvents = getDisplayEvents().filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
                     return eventDate >= startOfWeek && eventDate < new Date(startOfWeek.getTime() + 7 * 24 * 60 * 60 * 1000);
                 });
@@ -15799,7 +15953,7 @@
                 const dateStr = toDateOnlyString(day);
                 
                 // Filter events for the single day
-                let filteredEvents = state.crc_events.filter(e => e.date === dateStr);
+                let filteredEvents = getDisplayEvents().filter(e => e.date === dateStr);
 
                 // For CRC users, ONLY show their events (check both crcId and roleAssignments)
                 if (isCRCUser && matchingCrcId) {
@@ -16213,7 +16367,7 @@
                 const allSites = state.crc_sites;
                 
                 // Filter events for the current week - only Site Assignments
-                let filteredEvents = state.crc_events.filter(e => {
+                let filteredEvents = getDisplayEvents().filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
                     const endOfWeek = new Date(startOfWeek);
                     endOfWeek.setDate(endOfWeek.getDate() + 6);
@@ -16464,7 +16618,7 @@
                 }
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
                 
-                let filteredEvents = state.crc_events.filter(e => {
+                let filteredEvents = getDisplayEvents().filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
@@ -16965,7 +17119,7 @@
                 }
 
                 // Filter events to the date range
-                let filteredEvents = state.crc_events.filter(e => {
+                let filteredEvents = getDisplayEvents().filter(e => {
                     return dateRange.includes(e.date);
                 });
                 if (state.selectedCrcFilter !== 'all') {
@@ -17155,7 +17309,7 @@
                 const month = now.getMonth();
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
 
-                let filteredEvents = state.crc_events.filter(e => {
+                let filteredEvents = getDisplayEvents().filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
@@ -17309,7 +17463,7 @@
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
                 // Filter shifts (Site Assignment events) for the current month
-                let filteredEvents = state.crc_events.filter(e => {
+                let filteredEvents = getDisplayEvents().filter(e => {
                     const eventDate = new Date(e.date + 'T00:00:00');
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month &&
                            (e.type === 'Site Assignment' || e.type === 'Travel Day');
@@ -20814,7 +20968,7 @@
                 
                 // DEDUPLICATION: Track existing PTO/Unavailable events from crc_events to avoid adding duplicates from timeOffRequests
                 // Include ALL time-off related event types
-                const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem']);
+                const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem', 'Capped - FTE only']);
                 const existingPtoEvents = new Set();
                 filteredEvents.forEach(event => {
                     if (timeOffTypes.has(event.type) || event.isPTORequest) {
@@ -21614,7 +21768,7 @@
                 document.getElementById('dashboard-crc-filter').value = state.dashboardCrcFilter;
                 document.getElementById('dashboard-study-filter').value = state.dashboardStudyFilter;
 
-                let filteredEvents = state.crc_events;
+                let filteredEvents = getDisplayEvents();
                 if (state.dashboardStartDate && state.dashboardEndDate) {
                     const start = new Date(state.dashboardStartDate + 'T00:00:00');
                     const end = new Date(state.dashboardEndDate + 'T23:59:59');
@@ -24841,6 +24995,15 @@
                                 </div>
                             </div>
                         </button>
+                        <button data-action="pto-type-selected" data-pto-type="Capped - FTE only" class="p-4 bg-slate-50 dark:bg-slate-900/20 border-2 border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-900/30 transition-colors text-left">
+                            <div class="flex items-center gap-2">
+                                <span class="text-lg">📋</span>
+                                <div>
+                                    <div class="text-base font-semibold text-slate-900 dark:text-slate-200">Capped - FTE only</div>
+                                    <div class="text-xs text-slate-700 dark:text-slate-300">Counted separately; manager approval</div>
+                                </div>
+                            </div>
+                        </button>
                     </div>
                     <div class="mt-6 flex justify-end">
                         <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
@@ -24856,7 +25019,8 @@
                     'Holiday': '🎉 Holiday',
                     'Bereavement': '💜 Bereavement',
                     'Jury Duty': '⚖ Jury Duty',
-                    'Per Diem': '💰 Per Diem'
+                    'Per Diem': '💰 Per Diem',
+                    'Capped - FTE only': '📋 Capped - FTE only'
                 };
                 
                 const now = new Date();
@@ -25602,6 +25766,7 @@
                                 <option value="Holiday">Holiday (PTO)</option>
                                 <option value="Bereavement">Bereavement (PTO)</option>
                                 <option value="Jury Duty">Jury Duty (PTO)</option>
+                                <option value="Capped - FTE only">Capped - FTE only</option>
                             </select>
                         </div>
                         <div>
@@ -28156,8 +28321,71 @@
                         openModal(getCRCEventModalHTML(toDateOnlyString(new Date())), '4xl'); 
                         break;
                     case 'close-modal': closeModal(); break;
-                    case 'prev-crc-month': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() - 1)) }); break;
-                    case 'next-crc-month': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() + 1)) }); break;
+                    case 'prev-crc-month': 
+                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.getFullYear(), state.crcCalendarDate.getMonth() - 1, 1) }); 
+                        (async () => { await ensureFinalizedSnapshotForCurrentMonth(); if (state.activeTab === 'scheduler') renderCRCCalendar(); })();
+                        break;
+                    case 'next-crc-month': 
+                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.getFullYear(), state.crcCalendarDate.getMonth() + 1, 1) }); 
+                        (async () => { await ensureFinalizedSnapshotForCurrentMonth(); if (state.activeTab === 'scheduler') renderCRCCalendar(); })();
+                        break;
+                    case 'finalize-schedule-month': {
+                        const btn = document.getElementById('finalize-schedule-month-btn');
+                        if (btn) { btn.disabled = true; btn.dataset.originalContent = btn.innerHTML; btn.innerHTML = '<span class="flex items-center gap-1"><i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i>Finalizing…</span>'; lucide.createIcons(); }
+                        const monthKey = getScheduleMonthKey(state.crcCalendarDate);
+                        const recordId = getFinalizationRecordId(monthKey);
+                        const [y, m] = monthKey.split('-').map(Number);
+                        const monthStart = `${y}-${String(m).padStart(2, '0')}-01`;
+                        const monthEnd = toDateOnlyString(new Date(y, m, 0));
+                        const eventsInMonth = (state.crc_events || []).filter(e => { const d = e.date || e.startDate; return d && d >= monthStart && d <= monthEnd; });
+                        const snapshot = eventsInMonth.map(e => ({ ...e })); // copy for snapshot
+                        let existing = null;
+                        try {
+                            existing = await apiService.getSchedule(recordId);
+                        } catch (err) {
+                            existing = null;
+                        }
+                        const alreadyFinalized = !!existing?.finalized;
+                        if (!alreadyFinalized) {
+                            try {
+                                await apiService.upsertSchedule(recordId, { id: recordId, finalized: true, monthKey, snapshotAt: new Date().toISOString(), events: snapshot });
+                                state.finalizedMonths[monthKey] = true;
+                                showNotification('Schedule finalized. CRCs will now see this version.', 'success');
+                                if (state.activeTab === 'scheduler') renderCRCCalendar();
+                            } catch (err) {
+                                console.error('Finalize failed:', err);
+                                showNotification(err?.message || 'Failed to finalize schedule.', 'error');
+                            }
+                        } else {
+                            const changes = buildFinalizeChanges(existing?.events || [], state.crc_events || [], monthKey);
+                            window._pendingRefinalize = { monthKey, recordId };
+                            openModal(getFinalizeChangesModalHTML(changes, formatScheduleMonthLabel(monthKey)), 'xl');
+                        }
+                        if (btn) { btn.disabled = false; btn.innerHTML = btn.dataset.originalContent || ''; delete btn.dataset.originalContent; lucide.createIcons(); }
+                        break;
+                    }
+                    case 'confirm-refinalize': {
+                        const pending = window._pendingRefinalize;
+                        if (!pending) { closeModal(); break; }
+                        const { monthKey, recordId } = pending;
+                        const [y, m] = monthKey.split('-').map(Number);
+                        const monthStart = `${y}-${String(m).padStart(2, '0')}-01`;
+                        const monthEnd = toDateOnlyString(new Date(y, m, 0));
+                        const eventsInMonth = (state.crc_events || []).filter(e => { const d = e.date || e.startDate; return d && d >= monthStart && d <= monthEnd; });
+                        const snapshot = eventsInMonth.map(e => ({ ...e }));
+                        try {
+                            await apiService.upsertSchedule(recordId, { id: recordId, finalized: true, monthKey, snapshotAt: new Date().toISOString(), events: snapshot });
+                            state.finalizedMonths[monthKey] = true;
+                            window._pendingRefinalize = null;
+                            closeModal();
+                            showNotification('Schedule refinalized. CRCs will now see the updated version.', 'success');
+                            if (state.activeTab === 'scheduler') renderCRCCalendar();
+                        } catch (err) {
+                            console.error('Refinalize failed:', err);
+                            showNotification(err?.message || 'Failed to refinalize.', 'error');
+                        }
+                        break;
+                    }
                     case 'prev-crc-schedule-month': 
                         setState({ crcCalendarDate: new Date(state.crcCalendarDate.setMonth(state.crcCalendarDate.getMonth() - 1)) }); 
                         if (state.activeTab === 'crc-schedule') {
@@ -37197,6 +37425,10 @@
                     } else {
                         setState({ crcCalendarDate: new Date(year, month, 1) });
                     }
+                    (async () => {
+                        await ensureFinalizedSnapshotForCurrentMonth();
+                        if (state.activeTab === 'scheduler') renderCRCCalendar();
+                    })();
                 }
                 if (target.id === 'date-selector') {
                     const dateStr = target.value;
@@ -43270,7 +43502,7 @@
                     
                     (state.crc_events || []).forEach(ev => {
                         if (!ev || ev.crcId !== loggedInCrcId) return;
-                        if (!['Unavailable', 'Paid Time Off', 'Time Off', 'PTO', 'Sick Time'].includes(ev.type)) return;
+                        if (!['Unavailable', 'Paid Time Off', 'Time Off', 'PTO', 'Sick Time', 'Capped - FTE only'].includes(ev.type)) return;
                         const dateStr = toDateOnlyString(parseDateFlexible(ev.date));
                         if (!dateStr) return;
                         const key = `${loggedInCrcId}_${dateStr}`;
@@ -44393,7 +44625,7 @@
 
                 // Populate time off and travel data if we have a CRC
                 if (crcId && myEvents.length > 0) {
-                    const timeOff = myEvents.filter(ev => ['time off','unavailable','paid time off','pto','sick time','vacation','holiday','bereavement','jury duty','per diem'].includes(String(ev.type||'').toLowerCase()));
+                    const timeOff = myEvents.filter(ev => ['time off','unavailable','paid time off','pto','sick time','vacation','holiday','bereavement','jury duty','per diem','capped - fte only'].includes(String(ev.type||'').toLowerCase()));
                     if (timeOff.length) {
                         ctx.timeOffText = timeOff.map(ev => `- ${toDateOnlyString(parseDateFlexible(ev.date))} ${ev.type} (${ev.period || 'Full Day'})`).join('\n');
                         ctx.timeOffHtml = `<ul>${timeOff.map(ev => `<li>${toDateOnlyString(parseDateFlexible(ev.date))} • ${ev.type} • ${ev.period || 'Full Day'}</li>`).join('')}</ul>`;
@@ -48652,7 +48884,7 @@
                     const approvedRequestIds = new Set(approvedRequests.map(req => req.id));
                     
                     // All time-off related event types
-                    const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem']);
+                    const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem', 'Capped - FTE only']);
                     
                     // First, remove events for requests that are no longer approved (rejected, deleted, or pending)
                     const eventsToRemove = state.crc_events.filter(e => 

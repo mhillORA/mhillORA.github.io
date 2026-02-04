@@ -200,7 +200,8 @@ const isTimeOffLikeType = (type) => {
         'holiday',
         'bereavement',
         'jury duty',
-        'per diem'
+        'per diem',
+        'capped - fte only'
     ].includes(t);
 };
 
@@ -3284,9 +3285,11 @@ async function crudHandler(context, request, containerName) {
                             }
                             break;
                         case 'schedules':
-                            validateSchedulesSchema(requestBody);
-                            // Validate site-study relationship
-                            await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
+                            // Finalization records (schedule-finalized-{monthKey}) store snapshot + finalized flag; skip strict schema
+                            if (!updateId || !String(updateId).startsWith('schedule-finalized-')) {
+                                validateSchedulesSchema(requestBody);
+                                await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
+                            }
                             break;
                         case 'surveys':
                             validateSurveysSchema(requestBody);
