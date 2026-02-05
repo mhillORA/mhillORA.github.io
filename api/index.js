@@ -3180,6 +3180,13 @@ async function crudHandler(context, request, containerName) {
                             if (existingEvent.type === 'Travel Day' && !requestBody.type) {
                                 requestBody.type = 'Travel Day';
                             }
+                            // Preserve volunteer-for-shift fields if not in request (partial updates)
+                            if (requestBody.openForVolunteers === undefined && existingEvent.openForVolunteers !== undefined) {
+                                requestBody.openForVolunteers = existingEvent.openForVolunteers;
+                            }
+                            if (requestBody.volunteerApplications === undefined && Array.isArray(existingEvent.volunteerApplications)) {
+                                requestBody.volunteerApplications = existingEvent.volunteerApplications;
+                            }
                         }
                     } catch (readError) {
                         // If we can't read the existing event, continue with normal update
