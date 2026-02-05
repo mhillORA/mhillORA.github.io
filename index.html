@@ -10730,8 +10730,9 @@
                                     const crcNameDisplay = crcNames.length > 0 ? crcNames.join(', ') : '';
                                     const timeOffTypes = new Set(['Unavailable', 'Paid Time Off', 'Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only']);
                                     const isTimeOff = timeOffTypes.has(event.type) || timeOffTypes.has(event.name);
-                                    
-                                    const bgColor = isTimeOff ? '#10b981' : (event.type === 'Travel Day' ? '#3b82f6' : '#8b5cf6');
+                                    const firstStudy = studies.length > 0 ? studies[0] : null;
+                                    const bgColor = isTimeOff ? '#10b981' : (event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : '#8b5cf6'));
+                                    const textColorForEvent = (typeof getContrastColor === 'function') ? getContrastColor(bgColor) : 'white';
                                     
                                     // For Travel Day events, calculate and display distance from site
                                     let travelDistanceInfo = '';
@@ -10764,7 +10765,7 @@
                                     
                                     return `
                                         <div class="text-xs p-1 rounded cursor-pointer hover:opacity-80 transition-opacity" 
-                                             style="background-color: ${bgColor}; color: white;"
+                                             style="background-color: ${bgColor}; color: ${textColorForEvent};"
                                              data-action="view-crc-event" 
                                              data-event-id="${event.id}"
                                              title="${isTimeOff ? 'Time Off' : `${event.type} - ${site ? site.name : 'Unknown Site'}${pi ? ' - PI: ' + pi : ''} - ${studyNames}`}${crcNameDisplay ? ' - ' + crcNameDisplay : ''}">
@@ -10957,59 +10958,86 @@
                 const viewMode = state.crcScheduleViewMode || 'calendar';
                 const isDarkMode = document.documentElement.classList.contains('dark');
 
-                // List view: table of shifts for the month (scheduled view style)
+                // List view: all CRCs' shifts for the month in one table (scheduled list style)
                 if (viewMode === 'list') {
+                    const allShiftAndTravel = (state.crc_events || []).filter(e => {
+                        const eventDate = new Date(e.date + 'T00:00:00');
+                        if (eventDate.getFullYear() !== year || eventDate.getMonth() !== month) return false;
+                        return e.type === 'Site Assignment' || e.type === 'Travel Day';
+                    });
+                    const getStaffNames = (event) => {
+                        const names = [];
+                        if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
+                            const c = state.crcs.find(cr => cr.id === event.crcId);
+                            if (c) names.push(c.name);
+                        }
+                        if (event.crcIds && Array.isArray(event.crcIds)) {
+                            event.crcIds.forEach(crcId => {
+                                const c = state.crcs.find(cr => cr.id === crcId);
+                                if (c && !names.includes(c.name)) names.push(c.name);
+                            });
+                        }
+                        if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                            Object.values(event.roleAssignments).forEach(assignments => {
+                                if (Array.isArray(assignments)) {
+                                    assignments.forEach(crcId => {
+                                        if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                            const c = state.crcs.find(cr => cr.id === crcId);
+                                            if (c && !names.includes(c.name)) names.push(c.name);
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        if (event.crcId === 'SITE_STAFF') return 'Site Staff';
+                        if (event.crcId === 'UNASSIGNED' || (!names.length && (event.type === 'Site Assignment'))) return 'Open';
+                        return names.length ? names.join(', ') : '—';
+                    };
                     const rows = [];
-                    for (let day = 1; day <= daysInMonth; day++) {
-                        const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                        const dayData = eventsByDate[dateStr] || { shifts: [], timeOff: [] };
-                        const dateLabel = new Date(year, month, day - 1).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-                        dayData.timeOff.forEach(event => {
-                            const statusLabel = event.isRequest ? (event.status === 'pending' ? 'Pending' : event.status === 'approved' ? 'Approved' : event.status || '') : '';
-                            rows.push({ date: dateStr, dateLabel, type: 'Time Off', event, studyColor: null, siteName: '—', studyNames: event.type || event.name || 'Time Off', visit: '—', time: event.period || 'Full Day', statusLabel });
-                        });
-                        dayData.shifts.forEach(event => {
-                            const site = state.crc_sites.find(s => s.id === event.siteId);
-                            const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
-                            const firstStudy = studies.length > 0 ? studies[0] : null;
-                            const studyColor = event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : (isDarkMode ? '#6d28d9' : '#8b5cf6'));
-                            const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
-                            const visitDisplay = event.visitNumber ? getVisitDisplayName(event.visitNumber, event.studyIds) : '—';
-                            rows.push({ date: dateStr, dateLabel, type: event.type === 'Travel Day' ? 'Travel' : 'Shift', event, studyColor, siteName: site ? site.name : '—', studyNames, visit: visitDisplay, time: event.period || 'Full Day', statusLabel: null });
-                        });
-                    }
+                    allShiftAndTravel.forEach(event => {
+                        const dateStr = event.date;
+                        const dateLabel = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+                        const site = state.crc_sites.find(s => s.id === event.siteId);
+                        const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
+                        const firstStudy = studies.length > 0 ? studies[0] : null;
+                        const studyColor = event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : (isDarkMode ? '#6d28d9' : '#8b5cf6'));
+                        const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
+                        const visitDisplay = event.visitNumber ? getVisitDisplayName(event.visitNumber, event.studyIds) : '—';
+                        const staffDisplay = getStaffNames(event);
+                        rows.push({ dateLabel, type: event.type === 'Travel Day' ? 'Travel' : 'Shift', event, studyColor, siteName: site ? site.name : '—', studyNames, visit: visitDisplay, time: event.period || 'Full Day', staffDisplay });
+                    });
+                    rows.sort((a, b) => a.event.date.localeCompare(b.event.date) || (a.event.siteId || '').localeCompare(b.event.siteId || ''));
                     let listHTML = `
                         <div class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
                             <table class="min-w-full text-sm border-collapse">
                                 <thead class="bg-gray-100 dark:bg-gray-800">
                                     <tr>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Date</th>
+                                        <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Staff</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Type</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Site</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Study</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Visit</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Time</th>
-                                        <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Status</th>
                                     </tr>
                                 </thead>
                                 <tbody class="bg-white dark:bg-gray-900">
                     `;
                     if (rows.length === 0) {
-                        listHTML += `<tr><td colspan="7" class="border border-gray-300 dark:border-gray-600 px-3 py-4 text-center text-gray-500 dark:text-gray-400">No events this month.</td></tr>`;
+                        listHTML += `<tr><td colspan="7" class="border border-gray-300 dark:border-gray-600 px-3 py-4 text-center text-gray-500 dark:text-gray-400">No shifts this month.</td></tr>`;
                     } else {
-                        rows.forEach(({ dateLabel, type, event, studyColor, siteName, studyNames, visit, time, statusLabel }) => {
-                            const rowBg = studyColor || '';
+                        rows.forEach(({ dateLabel, type, event, studyColor, siteName, studyNames, visit, time, staffDisplay }) => {
                             const textColor = studyColor && typeof getContrastColor === 'function' ? getContrastColor(studyColor) : '';
                             const style = studyColor ? `background-color: ${studyColor}; color: ${textColor};` : '';
                             listHTML += `
-                                <tr class="border-b border-gray-200 dark:border-gray-700 hover:opacity-90 ${type === 'Shift' || type === 'Travel' ? 'cursor-pointer' : ''}" ${(type === 'Shift' || type === 'Travel') && event.id ? `data-action="view-crc-schedule-event" data-event-id="${event.id}"` : ''} style="${style}">
+                                <tr class="border-b border-gray-200 dark:border-gray-700 hover:opacity-90 cursor-pointer" data-action="view-crc-schedule-event" data-event-id="${event.id}" style="${style}">
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${dateLabel}</td>
+                                    <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${staffDisplay}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${type === 'Travel' ? '✈ Travel' : type}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${siteName}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${studyNames}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${visit}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${time}</td>
-                                    <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${statusLabel || '—'}</td>
                                 </tr>
                             `;
                         });
@@ -15833,9 +15861,9 @@
                                 const eventSite = state.crc_sites.find(s => s.id === event.siteId);
                                 const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
                                 const pi = event.principalInvestigator || eventSite?.principalInvestigator;
-                                let eventBgColor = eventSite?.color || study?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
+                                let eventBgColor = study?.color || eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
                                 if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
-                                else if (event.type === 'Travel Day') eventBgColor = isDarkMode ? '#431407' : '#fed7aa';
+                                else if (event.type === 'Travel Day') eventBgColor = study?.color || (isDarkMode ? '#1e3a5f' : '#3b82f6');
                                 const eventTextColor = getContrastColor(eventBgColor);
                                 const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                 const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
@@ -16323,9 +16351,9 @@
                             const eventSite = state.crc_sites.find(s => s.id === event.siteId);
                             const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
                             const pi = event.principalInvestigator || eventSite?.principalInvestigator;
-                            let eventBgColor = eventSite?.color || study?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
+                            let eventBgColor = study?.color || eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
                             if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
-                            else if (event.type === 'Travel Day') eventBgColor = isDarkMode ? '#431407' : '#fed7aa';
+                            else if (event.type === 'Travel Day') eventBgColor = study?.color || (isDarkMode ? '#1e3a5f' : '#3b82f6');
                             const eventTextColor = getContrastColor(eventBgColor);
                             const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                             const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
@@ -17035,9 +17063,9 @@
                                 const eventSite = state.crc_sites.find(s => s.id === event.siteId);
                                 const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
                                 const pi = event.principalInvestigator || eventSite?.principalInvestigator;
-                                let eventBgColor = eventSite?.color || study?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
+                                let eventBgColor = study?.color || eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
                                 if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
-                                else if (event.type === 'Travel Day') eventBgColor = isDarkMode ? '#431407' : '#fed7aa';
+                                else if (event.type === 'Travel Day') eventBgColor = study?.color || (isDarkMode ? '#1e3a5f' : '#3b82f6');
                                 const eventTextColor = getContrastColor(eventBgColor);
                                 const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                 const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
@@ -17817,9 +17845,10 @@
                                     const eventCrcs = getEventCRCs(event);
                                     const primaryCrc = eventCrcs.length > 0 ? eventCrcs[0] : null;
                                     const eventSite = state.crc_sites.find(s => s.id === event.siteId);
-                                    let eventBgColor = eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
+                                    const studyForEvent = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
+                                    let eventBgColor = studyForEvent?.color || eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
                                     if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
-                                    else if (event.type === 'Travel Day') eventBgColor = isDarkMode ? '#431407' : '#fed7aa';
+                                    else if (event.type === 'Travel Day') eventBgColor = studyForEvent?.color || (isDarkMode ? '#1e3a5f' : '#3b82f6');
                                     const eventTextColor = getContrastColor(eventBgColor);
                                     const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                     const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
