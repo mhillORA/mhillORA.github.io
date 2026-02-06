@@ -3187,6 +3187,10 @@ async function crudHandler(context, request, containerName) {
                             if (requestBody.volunteerApplications === undefined && Array.isArray(existingEvent.volunteerApplications)) {
                                 requestBody.volunteerApplications = existingEvent.volunteerApplications;
                             }
+                            // Preserve roleQuantityOverrides so "0" for a role is remembered (shift won't show as unassigned)
+                            if (requestBody.roleQuantityOverrides === undefined && existingEvent.roleQuantityOverrides && typeof existingEvent.roleQuantityOverrides === 'object') {
+                                requestBody.roleQuantityOverrides = existingEvent.roleQuantityOverrides;
+                            }
                         }
                     } catch (readError) {
                         // If we can't read the existing event, continue with normal update
