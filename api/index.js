@@ -4736,6 +4736,58 @@ async function processEmailTriggers(context, payload) {
                 .filter(r => r.email);
         };
 
+        const getCrcDisplayName = (crcId) => {
+            const user = usersByCrcId.get(crcId);
+            const crc = crcsById.get(crcId);
+            return (user && (user.name || user.username)) || (crc && crc.name) || crcId || '';
+        };
+
+        const buildTriggerContext = () => {
+            const base = { triggerType };
+            if (triggerType === 'pto_request' && timeOffRequest) {
+                const start = timeOffRequest.startDate || timeOffRequest.date;
+                const end = timeOffRequest.endDate || timeOffRequest.date || timeOffRequest.startDate;
+                let ptoDates = '';
+                if (start && end && String(start).trim() !== String(end).trim()) {
+                    ptoDates = `${String(start).split('T')[0]} – ${String(end).split('T')[0]}`;
+                } else {
+                    ptoDates = start ? String(start).split('T')[0] : (timeOffRequest.date ? String(timeOffRequest.date).split('T')[0] : '');
+                }
+                return {
+                    ...base,
+                    ptoType: timeOffRequest.type || 'Time Off',
+                    ptoDates,
+                    startDate: start ? String(start).split('T')[0] : '',
+                    endDate: end ? String(end).split('T')[0] : '',
+                    date: timeOffRequest.date ? String(timeOffRequest.date).split('T')[0] : '',
+                    crcId: timeOffRequest.crcId || '',
+                    crcName: getCrcDisplayName(timeOffRequest.crcId),
+                    requestId: timeOffRequest.id || '',
+                    status: timeOffRequest.status || 'pending',
+                    requestedBy: timeOffRequest.requestedBy || ''
+                };
+            }
+            if ((triggerType === 'new_shift' || triggerType === 'shift_edit') && event) {
+                const crcIds = Array.from(getCrcIdsFromEvent(event));
+                const crcNames = crcIds.map(getCrcDisplayName).filter(Boolean).join(', ') || '—';
+                const eventDate = event.date || event.startDate || '';
+                return {
+                    ...base,
+                    eventId: event.id || '',
+                    eventDate: eventDate ? String(eventDate).split('T')[0] : '',
+                    eventType: event.type || event.name || 'Shift',
+                    crcNames,
+                    siteId: event.siteId || '',
+                    studyIds: Array.isArray(event.studyIds) ? event.studyIds.join(', ') : (event.studyId || '')
+                };
+            }
+            if (triggerType === 'finalized_schedule') {
+                const count = Array.isArray(eventsSnapshot) ? eventsSnapshot.length : 0;
+                return { ...base, scheduleMonthKey: scheduleMonthKey || '', eventCount: String(count) };
+            }
+            return base;
+        };
+
         const emailClient = getEmailClient();
         const defaults = TRIGGER_DEFAULTS[triggerType] || { subject: 'Notification', body: 'You have a notification.' };
 
@@ -4772,6 +4824,10 @@ async function processEmailTriggers(context, payload) {
                     log.warn(`processEmailTriggers: template ${rule.templateId} not found, using defaults`);
                 }
             }
+
+            const triggerContext = buildTriggerContext();
+            subject = renderTemplateString(subject, triggerContext);
+            plainText = renderTemplateString(plainText, triggerContext);
 
             for (const r of recipients) {
                 if (!r.email) continue;
