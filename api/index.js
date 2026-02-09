@@ -4640,7 +4640,8 @@ const TRIGGER_DEFAULTS = {
     new_shift: { subject: 'New shift assigned', body: 'A new shift has been added to the schedule.' },
     shift_edit: { subject: 'Shift updated', body: 'A shift has been updated on the schedule.' },
     finalized_schedule: { subject: 'Schedule finalized', body: 'The schedule has been finalized for the month.' },
-    pto_request: { subject: 'Time off request submitted', body: 'A time off request has been submitted for approval.' }
+    pto_request: { subject: 'Time off request submitted', body: 'A time off request has been submitted for approval.' },
+    pto_approved: { subject: 'Time off approved', body: 'Your time off request has been approved.' }
 };
 
 async function processEmailTriggers(context, payload) {
@@ -4656,9 +4657,9 @@ async function processEmailTriggers(context, payload) {
         }).fetchAll();
         if (!rules || rules.length === 0) return;
 
-        // For pto_request, filter rules by ptoTypes if specified (rule applies only to selected types)
+        // For pto_request and pto_approved, filter rules by ptoTypes if specified (rule applies only to selected types)
         let filteredRules = rules;
-        if (triggerType === 'pto_request' && timeOffRequest) {
+        if ((triggerType === 'pto_request' || triggerType === 'pto_approved') && timeOffRequest) {
             const requestType = (timeOffRequest.type || 'Time Off').trim();
             filteredRules = rules.filter(rule => {
                 const ptoTypes = rule.ptoTypes;
@@ -4744,7 +4745,7 @@ async function processEmailTriggers(context, payload) {
 
         const buildTriggerContext = () => {
             const base = { triggerType };
-            if (triggerType === 'pto_request' && timeOffRequest) {
+            if ((triggerType === 'pto_request' || triggerType === 'pto_approved') && timeOffRequest) {
                 const start = timeOffRequest.startDate || timeOffRequest.date;
                 const end = timeOffRequest.endDate || timeOffRequest.date || timeOffRequest.startDate;
                 let ptoDates = '';
@@ -4794,7 +4795,7 @@ async function processEmailTriggers(context, payload) {
         for (const rule of filteredRules) {
             let recipients = [];
             if (rule.sendTo === 'on_shift') {
-                if (triggerType === 'pto_request' && timeOffRequest && timeOffRequest.crcId) {
+                if ((triggerType === 'pto_request' || triggerType === 'pto_approved') && timeOffRequest && timeOffRequest.crcId) {
                     recipients = resolveToEmails([timeOffRequest.crcId], []);
                 } else if (event) {
                     recipients = resolveToEmails(Array.from(getCrcIdsFromEvent(event)), []);
@@ -5727,6 +5728,11 @@ app.http('time-off-requests', {
                     
                     const updatedRequest = { ...requestBody, id: updateId };
                     const { resource: result } = await container.items.upsert(updatedRequest);
+                    if (requestBody.status === 'approved' && result) {
+                        try { await processEmailTriggers(context, { triggerType: 'pto_approved', timeOffRequest: result }); } catch (triggerErr) {
+                            context.log.warn('processEmailTriggers (pto_approved) failed:', triggerErr.message);
+                        }
+                    }
                     return { jsonBody: result };
 
                 case 'DELETE':
