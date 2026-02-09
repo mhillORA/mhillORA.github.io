@@ -23058,12 +23058,13 @@
                         const rowClass = isPast ? 'bg-gray-50/50 dark:bg-gray-900/30' : '';
                         const dateClass = isToday ? 'text-blue-600 dark:text-blue-400 font-semibold' : (isPast ? 'text-gray-400 dark:text-gray-500' : 'text-gray-700 dark:text-gray-300');
                         const todayBadge = isToday ? '<span class="ml-1 px-1.5 py-0.5 text-xs bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded animate-pulse">Today</span>' : '';
+                        const pastDatesBadge = isPast ? '<span class="ml-1 px-1.5 py-0.5 text-xs bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 rounded">(Past Dates)</span>' : '';
                         
                         html += `
                             <tr class="${rowClass} hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors">
                                 <td class="px-4 py-2.5">${statusBadge}</td>
                                 <td class="px-4 py-2.5 text-sm font-medium text-gray-900 dark:text-white">${sanitizeText(crcName)}</td>
-                                <td class="px-4 py-2.5 text-sm ${dateClass}">${dateLabel}${todayBadge}</td>
+                                <td class="px-4 py-2.5 text-sm ${dateClass}">${dateLabel}${todayBadge}${pastDatesBadge}</td>
                                 <td class="px-4 py-2.5 text-sm text-gray-600 dark:text-gray-400">${sanitizeText(type)} <span class="text-gray-400 dark:text-gray-500">(${period})</span></td>
                                 <td class="px-4 py-2.5 text-sm text-right font-medium text-gray-700 dark:text-gray-300">${hours}h</td>
                             </tr>
@@ -25374,8 +25375,11 @@
                 const today = toDateOnlyString(new Date());
                 const selectedDates = window._ptoSelectedDates || new Set();
                 
-                // Managers can select past dates for retroactive time off tracking
+                // Managers/Admins can select any past date; CRCs can select up to 30 days in the past
                 const canSelectPastDates = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
+                const thirtyDaysAgo = new Date();
+                thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+                const thirtyDaysAgoStr = toDateOnlyString(thirtyDaysAgo);
                 
                 // Get CRC ID for checking existing time off
                 const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
@@ -25415,10 +25419,10 @@
                     const isSelected = selectedDates.has(dateStr);
                     const isApproved = approvedDates.has(dateStr);
                     const isPending = pendingDates.has(dateStr);
-                    
-                    // For managers, past dates are selectable (shown with different style)
-                    // For regular users, past dates are disabled
-                    const isPastAndBlocked = isPast && !canSelectPastDates;
+                    // CRCs can select past dates up to 30 days ago
+                    const isPastWithin30ForCrc = isPast && isCrcUser && dateStr >= thirtyDaysAgoStr;
+                    const isPastAndSelectable = isPast && (canSelectPastDates || isPastWithin30ForCrc);
+                    const isPastAndBlocked = isPast && !isPastAndSelectable;
                     
                     let buttonClass = '';
                     let statusLabel = '';
@@ -25434,13 +25438,14 @@
                         statusLabel = '<div class="text-[10px] text-yellow-700 dark:text-yellow-300">Pending</div>';
                     } else if (isToday) {
                         buttonClass = 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/30';
-                    } else if (isPast && canSelectPastDates) {
-                        // Past dates for managers - slightly muted but still selectable
+                    } else if (isPastAndSelectable) {
+                        // Past dates for managers (any) or CRCs (up to 30 days)
                         buttonClass = 'cursor-pointer border-amber-300 dark:border-amber-600 bg-amber-50 dark:bg-amber-900/20 hover:border-amber-400 dark:hover:border-amber-500 hover:bg-amber-100 dark:hover:bg-amber-900/30 text-gray-700 dark:text-gray-300';
                     } else {
                         buttonClass = 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-700 hover:border-blue-300 dark:hover:border-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 text-gray-900 dark:text-gray-100';
                     }
                     
+                    const pastTitle = isPastAndSelectable ? (isCrcUser ? dateStr + ' (Past date - within 30 days)' : dateStr + ' (Past date - Manager access)') : dateStr;
                     calendarHTML += `
                         <button 
                             data-action="pto-date-selected" 
@@ -25448,8 +25453,8 @@
                             data-pto-type="${ptoType}"
                             class="min-h-[60px] p-2 rounded-md border-2 transition-all ${buttonClass} font-medium flex flex-col items-center justify-center"
                             ${isPastAndBlocked || isApproved || isPending ? 'disabled' : ''}
-                            ${isPast && canSelectPastDates && !isApproved && !isPending ? 'style="pointer-events: auto;"' : ''}
-                            title="${isApproved ? dateStr + ' (Already approved)' : isPending ? dateStr + ' (Pending approval)' : isPast && canSelectPastDates ? dateStr + ' (Past date - Manager access)' : dateStr}"
+                            ${isPastAndSelectable && !isApproved && !isPending ? 'style="pointer-events: auto;"' : ''}
+                            title="${isApproved ? dateStr + ' (Already approved)' : isPending ? dateStr + ' (Pending approval)' : pastTitle}"
                         >
                             <span>${day}</span>
                             ${statusLabel}
@@ -31512,33 +31517,24 @@
                             return;
                         }
                         
-                        // Permission check: CRC users can only edit their own pending requests, supervisors can edit any
+                        // Permission: CRC can edit their own (any status); Manager/Supervisor/Admin can edit any
                         const statusKey = normalizeTimeOffStatus(request.status);
                         const loggedInCrcId = getLoggedInCrcId();
-                        const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
-                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
-                        const isAdmin = state.currentUser && state.currentUser.permissionLevel === 'Admin';
+                        const isCrcUser = state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser();
+                        const isManagerLike = isAdminUser() || getEffectivePermissionLevel() === 'Manager' || getEffectivePermissionLevel() === 'Supervisor';
                         
                         if (isCrcUser) {
-                            if (statusKey !== 'pending') {
-                                showNotification('You can only edit pending time off requests.', 'error');
-                                return;
-                            }
-                            
-                            // Check if request belongs to the logged-in CRC user
-                            const canEdit = loggedInCrcId && (
-                                request.crcId === loggedInCrcId || 
+                            const canEditOwn = loggedInCrcId && (
+                                request.crcId === loggedInCrcId ||
                                 request.requestedBy === loggedInCrcId ||
-                                request.requestedBy === state.currentUser.id ||
-                                request.crcId === state.currentUser.id
+                                request.requestedBy === state.currentUser?.id ||
+                                request.crcId === state.currentUser?.id
                             );
-                            
-                            if (!canEdit) {
+                            if (!canEditOwn) {
                                 showNotification('You can only edit your own time off requests.', 'error');
                                 return;
                             }
-                        } else if (!isSupervisor && !isAdmin) {
-                            // Only CRC users, supervisors, and admins can edit
+                        } else if (!isManagerLike) {
                             showNotification('You do not have permission to edit time off requests.', 'error');
                             return;
                         }
@@ -31551,15 +31547,11 @@
                         const typeValue = request.type || 'Vacation';
                         const notesValue = request.notes || '';
                         const hoursValue = request.hours || (periodValue === 'Full Day' ? 8 : 4);
+                        const statusValue = statusKey || 'pending';
                         
-                        // For CRC users, make employee field read-only (it already is disabled)
-                        // For supervisors/admins, allow changing employee
-                        const isEditingOwnRequest = isCrcUser && loggedInCrcId && (
-                            request.crcId === loggedInCrcId || 
-                            request.requestedBy === loggedInCrcId ||
-                            request.requestedBy === state.currentUser.id
-                        );
-                        const canChangeEmployee = isSupervisor || isAdmin;
+                        // Managers/Supervisors/Admins can change employee and status (e.g. unapprove)
+                        const canChangeEmployee = isManagerLike;
+                        const canChangeStatus = isManagerLike;
                         
                         openModal(`
                             <h3 class="text-xl font-bold dark:text-white mb-4">Edit Time Off Request</h3>
@@ -31574,6 +31566,17 @@
                                         <input type="text" value="${crcName}" disabled class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-700 dark:text-white">
                                     `}
                                 </div>
+                                ${canChangeStatus ? `
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Status</label>
+                                    <select name="status" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="pending" ${statusValue === 'pending' ? 'selected' : ''}>Pending</option>
+                                        <option value="approved" ${statusValue === 'approved' ? 'selected' : ''}>Approved</option>
+                                        <option value="rejected" ${statusValue === 'rejected' ? 'selected' : ''}>Rejected</option>
+                                    </select>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Managers can set back to Pending to unapprove.</p>
+                                </div>
+                                ` : ''}
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-2">Type</label>
                                     <select name="type" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
@@ -31635,10 +31638,11 @@
                                         hours: parseFloat(formData.get('hours')) || 8,
                                         notes: formData.get('notes') || undefined
                                     };
-                                    
-                                    // If supervisor/admin changed the employee, update crcId
                                     if (canChangeEmployee && formData.get('crcId')) {
                                         updateData.crcId = formData.get('crcId');
+                                    }
+                                    if (canChangeStatus && formData.get('status')) {
+                                        updateData.status = formData.get('status');
                                     }
                                     
                                     try {
@@ -45744,11 +45748,17 @@
                                             const statusColor = statusKey === 'approved' ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200' : 
                                                                statusKey === 'rejected' ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200' : 
                                                                      'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200';
+                                            const reqDateStr = request.date || request.startDate;
+                                            const reqDateObj = reqDateStr ? new Date(reqDateStr + 'T00:00:00') : null;
+                                            const todayForPast = new Date();
+                                            todayForPast.setHours(0, 0, 0, 0);
+                                            const isPastRequest = reqDateObj && reqDateObj < todayForPast;
+                                            const pastDatesLabel = isPastRequest ? ' <span class="text-amber-600 dark:text-amber-400 text-xs font-medium">(Past Dates)</span>' : '';
                                                     return `
                                             <tr>
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${displayName}</td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
-                                                        ${formatDisplayDate(request.date || request.startDate)}
+                                                        ${formatDisplayDate(request.date || request.startDate)}${pastDatesLabel}
                                                             </td>
                                                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                                                 ${request.type || 'Time Off'}
@@ -45765,16 +45775,26 @@
                                                         ${request.createdAt ? formatDisplayDate(request.createdAt) : 'N/A'}
                                                 </td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                        ${statusKey === 'pending'
-                                                            ? `
-                                                    <button data-action="approve-time-off-request" data-id="${request.id}" class="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 mr-2">Approve</button>
-                                                    <button data-action="reject-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700">Reject</button>
-                                                            `
-                                                            : `
-                                                                <button data-action="edit-time-off-request" data-id="${request.id}" class="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 mr-2" title="Edit ${formatTimeOffStatus(request.status)} request">Edit</button>
-                                                                <button data-action="change-time-off-status" data-id="${request.id}" data-current-status="${statusKey}" class="bg-yellow-600 text-white px-3 py-1 rounded hover:bg-yellow-700 mr-2" title="Change status of ${formatTimeOffStatus(request.status)} request">Change Status</button>
-                                                                <button data-action="delete-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700" title="Delete ${formatTimeOffStatus(request.status)} request">Delete</button>
-                                                                `}
+                                                        ${(function() {
+                                                            const isCrcUser = state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser();
+                                                            const loggedInCrcId = getLoggedInCrcId();
+                                                            const isOwnRequest = loggedInCrcId && request.crcId === loggedInCrcId;
+                                                            const isManagerLike = isAdminUser() || getEffectivePermissionLevel() === 'Manager' || getEffectivePermissionLevel() === 'Supervisor';
+                                                            if (isCrcUser && isOwnRequest) {
+                                                                return `<button data-action="edit-time-off-request" data-id="${request.id}" class="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 mr-2" title="Edit">Edit</button>
+                                                                    <button data-action="delete-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700" title="Delete">Delete</button>`;
+                                                            }
+                                                            if (isManagerLike) {
+                                                                if (statusKey === 'pending') {
+                                                                    return `<button data-action="approve-time-off-request" data-id="${request.id}" class="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 mr-2">Approve</button>
+                                                                        <button data-action="reject-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700">Reject</button>`;
+                                                                }
+                                                                return `<button data-action="edit-time-off-request" data-id="${request.id}" class="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 mr-2" title="Edit">Edit</button>
+                                                                    <button data-action="change-time-off-status" data-id="${request.id}" data-current-status="${statusKey}" class="bg-yellow-600 text-white px-3 py-1 rounded hover:bg-yellow-700 mr-2" title="Change status">Change Status</button>
+                                                                    <button data-action="delete-time-off-request" data-id="${request.id}" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700" title="Delete">Delete</button>`;
+                                                            }
+                                                            return '';
+                                                        })()}
                                                 </td>
                                             </tr>
                                                     `;

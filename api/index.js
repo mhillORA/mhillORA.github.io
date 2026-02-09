@@ -5256,6 +5256,22 @@ app.http('time-off-requests', {
                     body.startDate = toDateOnlyString(body.startDate || body.date);
                     body.endDate = toDateOnlyString(body.endDate || body.startDate || body.date);
                     
+                    // Allow requests up to 30 days in the past (for retroactive PTO)
+                    const todayStr = toDateOnlyString(new Date());
+                    const thirtyDaysAgo = new Date();
+                    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+                    const thirtyDaysAgoStr = toDateOnlyString(thirtyDaysAgo);
+                    if (body.startDate < thirtyDaysAgoStr) {
+                        return {
+                            status: 400,
+                            jsonBody: {
+                                error: 'Time off date too far in the past',
+                                message: 'Time off requests can only be submitted for dates within the last 30 days. Please select a date on or after ' + thirtyDaysAgoStr + '.'
+                            },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                    
                     validateTimeOffRequestsSchema(body);
                     
                     // Simple duplicate check: ONE request per CRC per day (rejected don't count)
@@ -5442,22 +5458,25 @@ app.http('time-off-requests', {
                             return { status: 204 };
                         }
                         
-                        // If CRC is canceling their own request, mark as cancelled instead of deleting
+                        // CRC can delete their own request (actual delete, not just cancel)
                         if (!isManager && isOwnRequest) {
-                            // Update status to cancelled so managers can track total time requested
-                            const cancelledRequest = {
-                                ...resource,
-                                status: 'cancelled',
-                                cancelledAt: new Date().toISOString()
-                            };
-                            const { resource: updatedRequest } = await container.items.upsert(cancelledRequest);
-                            return { 
-                                status: 200,
-                                jsonBody: { 
-                                    ...updatedRequest,
-                                    message: 'Time off request cancelled (not deleted)'
+                            await container.item(id, id).delete();
+                            // Clean up related time off events if any
+                            try {
+                                const eventsContainer = getContainer('events');
+                                const { resources: relatedEvents } = await eventsContainer.items.query({
+                                    query: "SELECT * FROM c WHERE c.timeOffRequestId = @ptoId",
+                                    parameters: [{ name: "@ptoId", value: id }]
+                                }).fetchAll();
+                                for (const event of (relatedEvents || [])) {
+                                    if (event && event.id) {
+                                        try {
+                                            await eventsContainer.item(event.id, event.id).delete();
+                                        } catch (e) { /* ignore */ }
+                                    }
                                 }
-                            };
+                            } catch (e) { /* ignore */ }
+                            return { status: 204 };
                         }
                         
                         // If not authorized, return forbidden
