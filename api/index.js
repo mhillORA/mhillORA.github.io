@@ -113,6 +113,15 @@ const getContainer = (containerName) => {
     return database.container(containerName);
 };
 
+// Ensure email-triggers container exists (create if not). Call before using getContainer('email-triggers').
+const ensureEmailTriggersContainer = async () => {
+    const { database } = getCosmosClient();
+    await database.containers.createIfNotExists({
+        id: 'email-triggers',
+        partitionKey: { paths: ['/id'] }
+    });
+};
+
 // ---------------------------------------------------------------------------------
 // EMAIL TEMPLATE RENDERING + SEND
 // ---------------------------------------------------------------------------------
@@ -4639,6 +4648,7 @@ async function processEmailTriggers(context, payload) {
     if (!triggerType || !context) return;
     const log = context.log || console;
     try {
+        await ensureEmailTriggersContainer();
         const triggersContainer = getContainer('email-triggers');
         const { resources: rules } = await triggersContainer.items.query({
             query: 'SELECT * FROM c WHERE c.enabled = true AND c.triggerType = @triggerType',
@@ -4793,6 +4803,7 @@ app.http('email-triggers', {
         }
         let container;
         try {
+            await ensureEmailTriggersContainer();
             container = getContainer('email-triggers');
         } catch (e) {
             context.log.error('Error getting email-triggers container:', e);
