@@ -2842,6 +2842,13 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
+                    // Triggered emails: new shift
+                    if (containerName === 'events' && createdItem && createdItem.type === 'Site Assignment') {
+                        try { await processEmailTriggers(context, { triggerType: 'new_shift', event: createdItem }); } catch (triggerErr) {
+                            context.log.warn('processEmailTriggers (new_shift) failed:', triggerErr.message);
+                        }
+                    }
+                    
                     return { status: 201, jsonBody: createdItem };
                 } catch (createError) {
                     // Handle case where container doesn't exist
@@ -4079,6 +4086,19 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
+                    // Triggered emails: shift edit
+                    if (containerName === 'events' && result && result.type === 'Site Assignment') {
+                        try { await processEmailTriggers(context, { triggerType: 'shift_edit', event: result }); } catch (triggerErr) {
+                            context.log.warn('processEmailTriggers (shift_edit) failed:', triggerErr.message);
+                        }
+                    }
+                    // Triggered emails: schedule finalized
+                    if (containerName === 'schedules' && updateId && String(updateId).startsWith('schedule-finalized-') && result && result.finalized) {
+                        try { await processEmailTriggers(context, { triggerType: 'finalized_schedule', scheduleMonthKey: result.monthKey, eventsSnapshot: result.events || [] }); } catch (triggerErr) {
+                            context.log.warn('processEmailTriggers (finalized_schedule) failed:', triggerErr.message);
+                        }
+                    }
+                    
                     return { jsonBody: result };
                 } catch (upsertError) {
                     context.log.error(`Error upserting ${containerName} item:`, upsertError.message || upsertError);
@@ -4602,6 +4622,249 @@ app.http('templates', {
     authLevel: 'anonymous',
     route: 'templates/{id?}',
     handler: (request, context) => crudHandler(context, request, 'templates'),
+});
+
+// ---------------------------------------------------------------------------------
+// TRIGGERED EMAILS: process rules when events occur (new shift, shift edit, finalized schedule, PTO request)
+// ---------------------------------------------------------------------------------
+const TRIGGER_DEFAULTS = {
+    new_shift: { subject: 'New shift assigned', body: 'A new shift has been added to the schedule.' },
+    shift_edit: { subject: 'Shift updated', body: 'A shift has been updated on the schedule.' },
+    finalized_schedule: { subject: 'Schedule finalized', body: 'The schedule has been finalized for the month.' },
+    pto_request: { subject: 'Time off request submitted', body: 'A time off request has been submitted for approval.' }
+};
+
+async function processEmailTriggers(context, payload) {
+    const { triggerType, event, timeOffRequest, scheduleMonthKey, eventsSnapshot } = payload || {};
+    if (!triggerType || !context) return;
+    const log = context.log || console;
+    try {
+        const triggersContainer = getContainer('email-triggers');
+        const { resources: rules } = await triggersContainer.items.query({
+            query: 'SELECT * FROM c WHERE c.enabled = true AND c.triggerType = @triggerType',
+            parameters: [{ name: '@triggerType', value: triggerType }]
+        }).fetchAll();
+        if (!rules || rules.length === 0) return;
+
+        // For pto_request, filter rules by ptoTypes if specified (rule applies only to selected types)
+        let filteredRules = rules;
+        if (triggerType === 'pto_request' && timeOffRequest) {
+            const requestType = (timeOffRequest.type || 'Time Off').trim();
+            filteredRules = rules.filter(rule => {
+                const ptoTypes = rule.ptoTypes;
+                if (!ptoTypes || !Array.isArray(ptoTypes) || ptoTypes.length === 0) return true;
+                return ptoTypes.some(t => String(t).trim().toLowerCase() === requestType.toLowerCase());
+            });
+        }
+
+        const senderAddress = process.env.EMAIL_SENDER_ADDRESS;
+        if (!senderAddress) {
+            log.warn('processEmailTriggers: EMAIL_SENDER_ADDRESS not set, skipping');
+            return;
+        }
+
+        const usersContainer = getContainer('users');
+        const crcsContainer = getContainer('crcs');
+        const { resources: userList } = await usersContainer.items.readAll().fetchAll();
+        const { resources: crcList } = await crcsContainer.items.readAll().fetchAll();
+        const usersById = new Map((userList || []).filter(u => u && u.id).map(u => [u.id, u]));
+        const usersByCrcId = new Map((userList || []).filter(u => u && u.crcId).map(u => [u.crcId, u]));
+        const crcsById = new Map((crcList || []).filter(c => c && c.id).map(c => [c.id, c]));
+
+        const resolveToEmails = (crcIds, userIdsOrEmails) => {
+            const out = [];
+            const seen = new Set();
+            if (Array.isArray(crcIds)) {
+                crcIds.forEach(crcId => {
+                    if (!crcId || seen.has(crcId)) return;
+                    seen.add(crcId);
+                    const user = usersByCrcId.get(crcId);
+                    const crc = crcsById.get(crcId);
+                    const email = user?.email || crc?.email;
+                    if (email) out.push({ email: email.trim(), displayName: user?.name || user?.username || crc?.name || email });
+                });
+            }
+            if (Array.isArray(userIdsOrEmails)) {
+                userIdsOrEmails.forEach(id => {
+                    if (!id || seen.has(id)) return;
+                    seen.add(id);
+                    if (String(id).includes('@')) {
+                        out.push({ email: id.trim(), displayName: id });
+                        return;
+                    }
+                    const user = usersById.get(id);
+                    if (user && user.email) {
+                        out.push({ email: user.email.trim(), displayName: user.name || user.username || user.email });
+                        return;
+                    }
+                    const crc = crcsById.get(id);
+                    const u2 = usersByCrcId.get(id);
+                    const email = (u2 && u2.email) || (crc && crc.email);
+                    if (email) out.push({ email: email.trim(), displayName: (u2 && (u2.name || u2.username)) || crc?.name || email });
+                });
+            }
+            return out;
+        };
+
+        const getCrcIdsFromEvent = (ev) => {
+            const set = new Set();
+            if (!ev) return set;
+            if (ev.crcId && ev.crcId !== 'SITE_STAFF' && ev.crcId !== 'UNASSIGNED') set.add(ev.crcId);
+            if (Array.isArray(ev.crcIds)) ev.crcIds.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') set.add(id); });
+            if (ev.roleAssignments && typeof ev.roleAssignments === 'object') {
+                Object.values(ev.roleAssignments).forEach(assignments => {
+                    if (Array.isArray(assignments)) assignments.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') set.add(id); });
+                });
+            }
+            return set;
+        };
+
+        const getManagerEmails = () => {
+            return (userList || [])
+                .filter(u => u && (u.permissionLevel || '').toLowerCase() === 'manager')
+                .map(u => ({ email: (u.email || '').trim(), displayName: u.name || u.username || u.email }))
+                .filter(r => r.email);
+        };
+
+        const emailClient = getEmailClient();
+        const defaults = TRIGGER_DEFAULTS[triggerType] || { subject: 'Notification', body: 'You have a notification.' };
+
+        for (const rule of filteredRules) {
+            let recipients = [];
+            if (rule.sendTo === 'on_shift') {
+                if (triggerType === 'pto_request' && timeOffRequest && timeOffRequest.crcId) {
+                    recipients = resolveToEmails([timeOffRequest.crcId], []);
+                } else if (event) {
+                    recipients = resolveToEmails(Array.from(getCrcIdsFromEvent(event)), []);
+                } else if (triggerType === 'finalized_schedule' && Array.isArray(eventsSnapshot)) {
+                    const allCrcIds = new Set();
+                    eventsSnapshot.forEach(ev => getCrcIdsFromEvent(ev).forEach(id => allCrcIds.add(id)));
+                    recipients = resolveToEmails(Array.from(allCrcIds), []);
+                }
+            } else if (rule.sendTo === 'managers') {
+                recipients = getManagerEmails();
+            } else if (rule.sendTo === 'specific' && Array.isArray(rule.specificRecipientIds) && rule.specificRecipientIds.length > 0) {
+                recipients = resolveToEmails([], rule.specificRecipientIds);
+            }
+            if (recipients.length === 0) continue;
+
+            let subject = rule.subject || defaults.subject;
+            let plainText = rule.body || rule.plainText || defaults.body;
+            if (rule.templateId) {
+                try {
+                    const templatesContainer = getContainer('templates');
+                    const { resource: template } = await templatesContainer.item(rule.templateId, rule.templateId).read();
+                    if (template) {
+                        subject = template.subject || template.title || subject;
+                        plainText = template.plainText || template.text || template.html || template.bodyHtml || template.body || plainText;
+                    }
+                } catch (e) {
+                    log.warn(`processEmailTriggers: template ${rule.templateId} not found, using defaults`);
+                }
+            }
+
+            for (const r of recipients) {
+                if (!r.email) continue;
+                try {
+                    const message = {
+                        senderAddress,
+                        content: { subject, plainText },
+                        recipients: { to: [{ address: r.email, displayName: r.displayName || undefined }] }
+                    };
+                    await emailClient.beginSend(message).then(p => p.pollUntilDone());
+                    log.info(`Triggered email sent to ${r.email} for rule ${rule.id} (${triggerType})`);
+                } catch (sendErr) {
+                    log.warn(`Triggered email failed to ${r.email}: ${sendErr.message}`);
+                }
+            }
+        }
+    } catch (err) {
+        log.warn(`processEmailTriggers failed: ${err.message}`);
+    }
+}
+
+app.http('email-triggers', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'email-triggers/{id?}',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return { status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } };
+        }
+        let container;
+        try {
+            container = getContainer('email-triggers');
+        } catch (e) {
+            context.log.error('Error getting email-triggers container:', e);
+            return { status: 500, jsonBody: { error: 'Database container error. Ensure the email-triggers container exists.' }, headers: { 'Content-Type': 'application/json' } };
+        }
+        const id = (request.params && request.params.id) || (request.query && request.query.id);
+        const { method } = request;
+        try {
+            if (method === 'GET') {
+                if (id) {
+                    try {
+                        const { resource } = await container.item(id, id).read();
+                        if (!resource) return { status: 404, jsonBody: { error: 'Not found' } };
+                        return { jsonBody: resource };
+                    } catch (e) {
+                        return { status: 404, jsonBody: { error: 'Not found' } };
+                    }
+                }
+                const { resources } = await container.items.readAll().fetchAll();
+                return { jsonBody: resources || [] };
+            }
+            if (method === 'POST') {
+                const body = await request.json();
+                const newItem = {
+                    id: generateId(),
+                    name: body.name || '',
+                    triggerType: body.triggerType || 'new_shift',
+                    ptoTypes: Array.isArray(body.ptoTypes) ? body.ptoTypes : [],
+                    sendTo: body.sendTo || 'managers',
+                    specificRecipientIds: Array.isArray(body.specificRecipientIds) ? body.specificRecipientIds : [],
+                    templateId: body.templateId || null,
+                    subject: body.subject || null,
+                    body: body.body || null,
+                    enabled: body.enabled !== false,
+                    createdAt: new Date().toISOString()
+                };
+                const { resource } = await container.items.create(newItem);
+                return { status: 201, jsonBody: resource };
+            }
+            if (method === 'PUT') {
+                const body = await request.json();
+                const updateId = id || body.id;
+                if (!updateId) return { status: 400, jsonBody: { error: 'id required' } };
+                const updated = {
+                    ...body,
+                    id: updateId,
+                    name: body.name !== undefined ? body.name : undefined,
+                    triggerType: body.triggerType !== undefined ? body.triggerType : undefined,
+                    ptoTypes: Array.isArray(body.ptoTypes) ? body.ptoTypes : undefined,
+                    sendTo: body.sendTo !== undefined ? body.sendTo : undefined,
+                    specificRecipientIds: Array.isArray(body.specificRecipientIds) ? body.specificRecipientIds : undefined,
+                    templateId: body.templateId !== undefined ? body.templateId : undefined,
+                    subject: body.subject !== undefined ? body.subject : undefined,
+                    body: body.body !== undefined ? body.body : undefined,
+                    enabled: body.enabled !== undefined ? body.enabled : undefined
+                };
+                Object.keys(updated).forEach(k => { if (updated[k] === undefined) delete updated[k]; });
+                const { resource } = await container.items.upsert(updated);
+                return { jsonBody: resource };
+            }
+            if (method === 'DELETE') {
+                if (!id) return { status: 400, jsonBody: { error: 'id required' } };
+                try {
+                    await container.item(id, id).delete();
+                } catch (e) { /* ignore */ }
+                return { status: 204 };
+            }
+            return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+        } catch (err) {
+            return handleError(context, err, 'email-triggers operation failed');
+        }
+    }
 });
 
 app.http('send-email', {
@@ -5323,6 +5586,10 @@ app.http('time-off-requests', {
                     };
                     
                     const { resource: createdRequest } = await container.items.create(newRequest);
+                    // Triggered emails: PTO request
+                    try { await processEmailTriggers(context, { triggerType: 'pto_request', timeOffRequest: createdRequest }); } catch (triggerErr) {
+                        context.log.warn('processEmailTriggers (pto_request) failed:', triggerErr.message);
+                    }
                     return { status: 201, jsonBody: createdRequest };
                 
                 case 'PUT':

@@ -1553,6 +1553,20 @@
                     });
                 }
 
+                // Email trigger rules (triggered emails)
+                async getEmailTriggers() {
+                    return this.request('/email-triggers');
+                }
+                async createEmailTrigger(data) {
+                    return this.request('/email-triggers', { method: 'POST', body: JSON.stringify(data) });
+                }
+                async updateEmailTrigger(id, data) {
+                    return this.request(`/email-triggers/${id}`, { method: 'PUT', body: JSON.stringify({ ...data, id }) });
+                }
+                async deleteEmailTrigger(id) {
+                    return this.request(`/email-triggers/${id}`, { method: 'DELETE' });
+                }
+
                 // Announcement methods
                 async getAnnouncements() {
                     return this.request('/announcements');
@@ -2253,6 +2267,7 @@
                 users: [], // Users for authentication
                 permissionSets: [], // Permission sets/roles for access control
                 timeOffRequests: [], // Time off requests awaiting approval
+                emailTriggers: [], // Triggered email rules (when X happens, send to Y)
                 timeOffRequestsMonth: null,
                 timeOffRequestsStatusFilter: 'all', // Default to showing all statuses
                 timeOffRequestsEmployeeFilter: 'all', // Default to showing all employees
@@ -27884,6 +27899,204 @@
                         }
                         break;
                     }
+                    case 'add-triggered-email': {
+                        state.editingEmailTriggerId = null;
+                        const ptoOptionsHtml = PTO_TYPE_OPTIONS.map(t => `<label class="flex items-center gap-2"><input type="checkbox" name="ptoType" value="${t}" class="rounded border-gray-300 dark:border-gray-600">${t}</label>`).join('');
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-4">Add Triggered Email</h3>
+                            <form id="triggered-email-form" class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Name (optional)</label>
+                                    <input type="text" name="name" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g. Notify managers on new shift">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">When</label>
+                                    <select name="triggerType" id="trigger-type-select" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="new_shift">New shift</option>
+                                        <option value="shift_edit">Shift edit</option>
+                                        <option value="finalized_schedule">Finalized schedule</option>
+                                        <option value="pto_request">PTO / Time off request</option>
+                                    </select>
+                                </div>
+                                <div id="triggered-email-pto-types" class="hidden">
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Time off types (leave empty for all)</label>
+                                    <div class="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto p-2 border dark:border-gray-600 rounded-md bg-gray-50 dark:bg-gray-900/40">${ptoOptionsHtml}</div>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Send email to</label>
+                                    <select name="sendTo" id="trigger-send-to-select" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="on_shift">Who's on shift</option>
+                                        <option value="managers">Managers</option>
+                                        <option value="specific">Specific people</option>
+                                    </select>
+                                </div>
+                                <div id="triggered-email-specific" class="hidden">
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Specific people</label>
+                                    <select name="specificRecipientIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" size="6">
+                                        ${(state.users || []).filter(u => u && (u.email || u.name)).map(u => `<option value="${u.id}">${(u.name || u.username || u.email) || u.id}</option>`).join('')}
+                                        ${(state.crcs || []).filter(c => c && c.id).map(c => `<option value="${c.id}">${c.name || c.id} (CRC)</option>`).join('')}
+                                    </select>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hold Ctrl/Cmd to select multiple.</p>
+                                </div>
+                                <div>
+                                    <label class="flex items-center gap-2">
+                                        <input type="checkbox" name="enabled" checked class="rounded border-gray-300 dark:border-gray-600">
+                                        <span class="text-sm dark:text-gray-300">Enabled</span>
+                                    </label>
+                                </div>
+                                <div class="flex justify-end gap-2">
+                                    <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Cancel</button>
+                                    <button type="submit" class="py-2 px-4 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Save</button>
+                                </div>
+                            </form>
+                        `);
+                        document.getElementById('trigger-type-select')?.addEventListener('change', function() {
+                            document.getElementById('triggered-email-pto-types').classList.toggle('hidden', this.value !== 'pto_request');
+                        });
+                        document.getElementById('trigger-send-to-select')?.addEventListener('change', function() {
+                            document.getElementById('triggered-email-specific').classList.toggle('hidden', this.value !== 'specific');
+                        });
+                        document.getElementById('triggered-email-form')?.addEventListener('submit', async (ev) => {
+                            ev.preventDefault();
+                            const form = ev.target;
+                            const triggerType = form.triggerType?.value || 'new_shift';
+                            const ptoTypes = Array.from(form.querySelectorAll('input[name="ptoType"]:checked')).map(cb => cb.value);
+                            const specificRecipientIds = Array.from(form.querySelectorAll('select[name="specificRecipientIds"] option:checked')).map(o => o.value);
+                            try {
+                                const payload = {
+                                    name: form.name?.value?.trim() || '',
+                                    triggerType,
+                                    ptoTypes: triggerType === 'pto_request' ? ptoTypes : [],
+                                    sendTo: form.sendTo?.value || 'managers',
+                                    specificRecipientIds: form.sendTo?.value === 'specific' ? specificRecipientIds : [],
+                                    enabled: form.enabled?.checked !== false
+                                };
+                                if (state.editingEmailTriggerId) {
+                                    await apiService.updateEmailTrigger(state.editingEmailTriggerId, payload);
+                                    showNotification('Trigger updated', 'success');
+                                } else {
+                                    await apiService.createEmailTrigger(payload);
+                                    showNotification('Trigger created', 'success');
+                                }
+                                const triggers = await apiService.getEmailTriggers();
+                                setState({ emailTriggers: Array.isArray(triggers) ? triggers : [] });
+                                renderTriggeredEmailsContent();
+                                document.querySelector('[data-action="close-modal"]')?.click();
+                            } catch (err) {
+                                showNotification(`Failed to save trigger: ${err.message}`, 'error');
+                            }
+                        });
+                        lucide.createIcons();
+                        break;
+                    }
+                    case 'edit-triggered-email': {
+                        const ruleId = actionButton?.dataset?.id;
+                        const rule = (state.emailTriggers || []).find(r => r.id === ruleId);
+                        if (!rule) { showNotification('Trigger not found', 'error'); break; }
+                        state.editingEmailTriggerId = rule.id;
+                        const ptoOptionsHtml = PTO_TYPE_OPTIONS.map(t => {
+                            const checked = (rule.ptoTypes || []).includes(t) ? 'checked' : '';
+                            return `<label class="flex items-center gap-2"><input type="checkbox" name="ptoType" value="${t}" ${checked} class="rounded border-gray-300 dark:border-gray-600">${t}</label>`;
+                        }).join('');
+                        const selectedIds = new Set(rule.specificRecipientIds || []);
+                        const specificOptions = [
+                            ...(state.users || []).filter(u => u && (u.email || u.name)).map(u => ({ id: u.id, label: (u.name || u.username || u.email) || u.id })),
+                            ...(state.crcs || []).filter(c => c && c.id).map(c => ({ id: c.id, label: `${c.name || c.id} (CRC)` }))
+                        ].map(o => `<option value="${o.id}" ${selectedIds.has(o.id) ? 'selected' : ''}>${o.label}</option>`).join('');
+                        openModal(`
+                            <h3 class="text-xl font-bold dark:text-white mb-4">Edit Triggered Email</h3>
+                            <form id="triggered-email-form" class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Name (optional)</label>
+                                    <input type="text" name="name" value="${(rule.name || '').replace(/"/g, '&quot;')}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">When</label>
+                                    <select name="triggerType" id="trigger-type-select" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="new_shift" ${rule.triggerType === 'new_shift' ? 'selected' : ''}>New shift</option>
+                                        <option value="shift_edit" ${rule.triggerType === 'shift_edit' ? 'selected' : ''}>Shift edit</option>
+                                        <option value="finalized_schedule" ${rule.triggerType === 'finalized_schedule' ? 'selected' : ''}>Finalized schedule</option>
+                                        <option value="pto_request" ${rule.triggerType === 'pto_request' ? 'selected' : ''}>PTO / Time off request</option>
+                                    </select>
+                                </div>
+                                <div id="triggered-email-pto-types" class="${rule.triggerType === 'pto_request' ? '' : 'hidden'}">
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Time off types (leave empty for all)</label>
+                                    <div class="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto p-2 border dark:border-gray-600 rounded-md bg-gray-50 dark:bg-gray-900/40">${ptoOptionsHtml}</div>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Send email to</label>
+                                    <select name="sendTo" id="trigger-send-to-select" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                        <option value="on_shift" ${rule.sendTo === 'on_shift' ? 'selected' : ''}>Who's on shift</option>
+                                        <option value="managers" ${rule.sendTo === 'managers' ? 'selected' : ''}>Managers</option>
+                                        <option value="specific" ${rule.sendTo === 'specific' ? 'selected' : ''}>Specific people</option>
+                                    </select>
+                                </div>
+                                <div id="triggered-email-specific" class="${rule.sendTo === 'specific' ? '' : 'hidden'}">
+                                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Specific people</label>
+                                    <select name="specificRecipientIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" size="6">${specificOptions}</select>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hold Ctrl/Cmd to select multiple.</p>
+                                </div>
+                                <div>
+                                    <label class="flex items-center gap-2">
+                                        <input type="checkbox" name="enabled" ${rule.enabled !== false ? 'checked' : ''} class="rounded border-gray-300 dark:border-gray-600">
+                                        <span class="text-sm dark:text-gray-300">Enabled</span>
+                                    </label>
+                                </div>
+                                <div class="flex justify-end gap-2">
+                                    <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Cancel</button>
+                                    <button type="submit" class="py-2 px-4 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Save</button>
+                                </div>
+                            </form>
+                        `);
+                        document.getElementById('trigger-type-select')?.addEventListener('change', function() {
+                            document.getElementById('triggered-email-pto-types').classList.toggle('hidden', this.value !== 'pto_request');
+                        });
+                        document.getElementById('trigger-send-to-select')?.addEventListener('change', function() {
+                            document.getElementById('triggered-email-specific').classList.toggle('hidden', this.value !== 'specific');
+                        });
+                        document.getElementById('triggered-email-form')?.addEventListener('submit', async (ev) => {
+                            ev.preventDefault();
+                            const form = ev.target;
+                            const triggerType = form.triggerType?.value || 'new_shift';
+                            const ptoTypes = Array.from(form.querySelectorAll('input[name="ptoType"]:checked')).map(cb => cb.value);
+                            const specificRecipientIds = Array.from(form.querySelectorAll('select[name="specificRecipientIds"] option:checked')).map(o => o.value);
+                            try {
+                                const payload = {
+                                    name: form.name?.value?.trim() || '',
+                                    triggerType,
+                                    ptoTypes: triggerType === 'pto_request' ? ptoTypes : [],
+                                    sendTo: form.sendTo?.value || 'managers',
+                                    specificRecipientIds: form.sendTo?.value === 'specific' ? specificRecipientIds : [],
+                                    enabled: form.enabled?.checked !== false
+                                };
+                                await apiService.updateEmailTrigger(state.editingEmailTriggerId, payload);
+                                showNotification('Trigger updated', 'success');
+                                const triggers = await apiService.getEmailTriggers();
+                                setState({ emailTriggers: Array.isArray(triggers) ? triggers : [] });
+                                renderTriggeredEmailsContent();
+                                document.querySelector('[data-action="close-modal"]')?.click();
+                            } catch (err) {
+                                showNotification(`Failed to save trigger: ${err.message}`, 'error');
+                            }
+                        });
+                        lucide.createIcons();
+                        break;
+                    }
+                    case 'delete-triggered-email': {
+                        const triggerId = actionButton?.dataset?.id;
+                        if (!triggerId) break;
+                        if (!confirm('Delete this triggered email rule?')) break;
+                        try {
+                            await apiService.deleteEmailTrigger(triggerId);
+                            const triggers = await apiService.getEmailTriggers();
+                            setState({ emailTriggers: Array.isArray(triggers) ? triggers : [] });
+                            renderTriggeredEmailsContent();
+                            showNotification('Trigger deleted', 'success');
+                        } catch (err) {
+                            showNotification(`Failed to delete trigger: ${err.message}`, 'error');
+                        }
+                        break;
+                    }
                     case 'insert-email-var': {
                         e.preventDefault(); // Prevent any default button behavior
                         // Get the button that was clicked - could be actionButton or e.target
@@ -44256,6 +44469,20 @@
                             </div>
                         </div>
 
+                        <!-- Triggered Emails: When X happens, send email to Y -->
+                        <div class="bg-white dark:bg-gray-800 p-4 md:p-6 rounded-lg shadow-md">
+                            <h4 class="text-lg font-semibold dark:text-gray-200 mb-4 flex items-center gap-2">
+                                <i data-lucide="zap" class="w-5 h-5"></i>
+                                Triggered Emails
+                            </h4>
+                            <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Send automatic emails when something happens (e.g. new shift, PTO request). Choose the trigger and who receives the email.</p>
+                            <div id="triggered-emails-list" class="space-y-3"></div>
+                            <button type="button" data-action="add-triggered-email" class="mt-3 px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 text-sm font-medium flex items-center gap-2">
+                                <i data-lucide="plus" class="w-4 h-4"></i>
+                                Add trigger
+                            </button>
+                        </div>
+
                         ${getEmailTemplatesHTML()}
                     </div>
                 `;
@@ -44265,8 +44492,59 @@
                 // Announcements
                 renderAnnouncementsList();
                 setupAnnouncementHandlers();
+                // Triggered emails
+                try {
+                    const triggers = await apiService.getEmailTriggers();
+                    setState({ emailTriggers: Array.isArray(triggers) ? triggers : [] });
+                } catch (e) {
+                    console.warn('Failed to load email triggers:', e);
+                    setState({ emailTriggers: [] });
+                }
+                renderTriggeredEmailsContent();
                 // Email templates
                 await renderEmailTemplatesContent();
+                lucide.createIcons();
+            };
+
+            const TRIGGER_TYPE_LABELS = {
+                new_shift: 'New shift',
+                shift_edit: 'Shift edit',
+                finalized_schedule: 'Finalized schedule',
+                pto_request: 'PTO / Time off request'
+            };
+            const SEND_TO_LABELS = {
+                on_shift: "Who's on shift",
+                managers: 'Managers',
+                specific: 'Specific people'
+            };
+            const PTO_TYPE_OPTIONS = ['Vacation', 'Sick', 'Sick Time', 'Holiday', 'Bereavement', 'Jury Duty', 'Time Off', 'Unavailable', 'PTO', 'Paid Time Off', 'Capped - FTE only'];
+
+            const renderTriggeredEmailsContent = () => {
+                const container = document.getElementById('triggered-emails-list');
+                if (!container) return;
+                const triggers = state.emailTriggers || [];
+                if (triggers.length === 0) {
+                    container.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400">No triggers yet. Click "Add trigger" to create one.</p>';
+                } else {
+                    container.innerHTML = triggers.map(rule => {
+                        const whenLabel = TRIGGER_TYPE_LABELS[rule.triggerType] || rule.triggerType;
+                        const sendToLabel = SEND_TO_LABELS[rule.sendTo] || rule.sendTo;
+                        const ptoTypesText = (rule.ptoTypes && rule.ptoTypes.length) ? ` (${rule.ptoTypes.join(', ')})` : '';
+                        const name = rule.name ? `: ${rule.name}` : '';
+                        const enabledBadge = rule.enabled !== false ? '<span class="text-xs text-green-600 dark:text-green-400">Enabled</span>' : '<span class="text-xs text-gray-500">Disabled</span>';
+                        return `
+                            <div class="flex items-center justify-between p-3 border border-gray-200 dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-900/40">
+                                <div>
+                                    <div class="font-medium text-gray-900 dark:text-white">When <strong>${whenLabel}</strong>${ptoTypesText} → Send to <strong>${sendToLabel}</strong> ${name}</div>
+                                    <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">${enabledBadge}</div>
+                                </div>
+                                <div class="flex gap-2">
+                                    <button type="button" data-action="edit-triggered-email" data-id="${rule.id}" class="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">Edit</button>
+                                    <button type="button" data-action="delete-triggered-email" data-id="${rule.id}" class="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 text-sm">Delete</button>
+                                </div>
+                            </div>`;
+                    }).join('');
+                }
                 lucide.createIcons();
             };
 
