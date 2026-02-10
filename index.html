@@ -10713,13 +10713,15 @@
                     return eventDate.getFullYear() === year && eventDate.getMonth() === month;
                 });
                 
-                // Group events by date
+                // Group events by date, deduplicating by event id per date
                 const eventsByDate = {};
                 filteredEvents.forEach(event => {
                     if (!eventsByDate[event.date]) {
                         eventsByDate[event.date] = [];
                     }
-                    eventsByDate[event.date].push(event);
+                    const dayList = eventsByDate[event.date];
+                    if (event.id && dayList.some(e => e.id === event.id)) return;
+                    dayList.push(event);
                 });
                 
                 // Build calendar HTML
@@ -10754,7 +10756,9 @@
                 // Days of the month
                 for (let day = 1; day <= daysInMonth; day++) {
                     const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                    const dayEvents = eventsByDate[dateStr] || [];
+                    const rawDay = eventsByDate[dateStr] || [];
+                    const seenDayIds = new Set();
+                    const dayEvents = rawDay.filter(e => { if (e.id && seenDayIds.has(e.id)) return false; if (e.id) seenDayIds.add(e.id); return true; });
                     const isToday = dateStr === toDateOnlyString(new Date());
                     
                     calendarHTML += `
@@ -10766,13 +10770,14 @@
                                     const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                                     const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
                                     const pi = event.principalInvestigator || (site && site.principalInvestigator) || '';
+                                    const locationStr = site ? [site.city, site.state].filter(Boolean).join(', ') : '';
                                     
-                                    // Get CRC names for entire schedule view
+                                    // Get CRC names with location for entire schedule view (location beside name for travel)
                                     let crcNames = [];
                                     if (dashboardView === 'entireSchedule') {
                                         if (event.crcId) {
                                             const crc = state.crcs.find(c => c.id === event.crcId);
-                                            if (crc) crcNames.push(crc.name.split(' ')[0]);
+                                            if (crc) crcNames.push(locationStr ? crc.name.split(' ')[0] + ' · ' + locationStr : crc.name.split(' ')[0]);
                                         }
                                         if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                                             Object.values(event.roleAssignments).forEach(assignments => {
@@ -10780,8 +10785,9 @@
                                                     assignments.forEach(crcId => {
                                                         if (crcId) {
                                                             const crc = state.crcs.find(c => c.id === crcId);
-                                                            if (crc && !crcNames.includes(crc.name.split(' ')[0])) {
-                                                                crcNames.push(crc.name.split(' ')[0]);
+                                                            if (crc) {
+                                                                const label = locationStr ? crc.name.split(' ')[0] + ' · ' + locationStr : crc.name.split(' ')[0];
+                                                                if (!crcNames.includes(label)) crcNames.push(label);
                                                             }
                                                         }
                                                     });
@@ -10803,7 +10809,6 @@
                                         if (travelCrcId) {
                                             const travelCrc = state.crcs.find(c => c.id === travelCrcId);
                                             if (travelCrc) {
-                                                // Calculate city-to-city distance asynchronously and update display
                                                 const crcCity = travelCrc.homeLocation || travelCrc.city || '';
                                                 const siteCity = site.city || '';
                                                 const crcCityState = travelCrc.homeLocation || [crcCity, travelCrc.state].filter(Boolean).join(', ');
@@ -10830,13 +10835,14 @@
                                              style="background-color: ${bgColor}; color: ${textColorForEvent};"
                                              data-action="view-crc-event" 
                                              data-event-id="${event.id}"
-                                             title="${isTimeOff ? 'Time Off' : `${event.type} - ${site ? site.name : 'Unknown Site'}${pi ? ' - PI: ' + pi : ''} - ${studyNames}`}${crcNameDisplay ? ' - ' + crcNameDisplay : ''}">
+                                             title="${isTimeOff ? 'Time Off' : `${event.type} - ${site ? site.name : 'Unknown Site'}${locationStr ? ' - ' + locationStr : ''}${pi ? ' - PI: ' + pi : ''} - ${studyNames}`}${crcNameDisplay ? ' - ' + crcNameDisplay : ''}">
                                             <div class="font-medium truncate">${isTimeOff ? '🏖 Time Off' : (event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown'))}</div>
                                             ${pi ? `<div class="text-[10px] opacity-90 truncate">PI: ${pi}</div>` : ''}
+                                            ${locationStr ? `<div class="text-[10px] opacity-90 truncate">${locationStr}</div>` : ''}
                                             ${event.type === 'Travel Day' && event.crcIds && Array.isArray(event.crcIds) && event.crcIds.length > 1 
                                                 ? `<div class="text-[10px] opacity-90" style="line-height: 1.2;">${event.crcIds.map(crcId => {
                                                     const crc = state.crcs.find(c => c.id === crcId);
-                                                    return crc ? crc.name.split(' ')[0] : crcId;
+                                                    return crc ? (locationStr ? crc.name.split(' ')[0] + ' · ' + locationStr : crc.name.split(' ')[0]) : crcId;
                                                 }).filter(Boolean).join(', ')}</div>`
                                                 : (crcNameDisplay ? `<div class="text-[10px] opacity-90 truncate">${crcNameDisplay}</div>` : '')}
                                             ${travelDistanceInfo}
@@ -10996,22 +11002,29 @@
                     req.status !== 'rejected'
                 );
                 
-                // Group events by date, deduplicating travel days (only show one per date)
+                // Group events by date, deduplicating travel days and duplicate event ids per date
                 const eventsByDate = {};
                 const travelDaysSeen = new Set(); // Track travel days by date to prevent duplicates
+                const shiftIdsSeenByDate = {}; // Per-date set of event ids to avoid duplicate shifts
                 
                 crcEvents.forEach(event => {
                     if (!eventsByDate[event.date]) {
                         eventsByDate[event.date] = { shifts: [], timeOff: [] };
+                        shiftIdsSeenByDate[event.date] = new Set();
                     }
+                    const seen = shiftIdsSeenByDate[event.date];
                     
                     // For Travel Day events, only add if we haven't seen a travel day for this date yet
                     if (event.type === 'Travel Day') {
                         if (!travelDaysSeen.has(event.date)) {
                             eventsByDate[event.date].shifts.push(event);
                             travelDaysSeen.add(event.date);
+                            if (event.id) seen.add(event.id);
                         }
                     } else {
+                        // Site Assignment: only add once per event id per date (no duplicates)
+                        if (event.id && seen.has(event.id)) return;
+                        if (event.id) seen.add(event.id);
                         eventsByDate[event.date].shifts.push(event);
                     }
                 });
@@ -11086,6 +11099,11 @@
                     return names.length ? names.join(', ') : '—';
                 };
 
+                const getLocationDisplay = (site) => {
+                    if (!site) return '—';
+                    const parts = [site.city, site.state].filter(Boolean);
+                    return parts.length ? parts.join(', ') : (site.name || '—');
+                };
                 const buildListRows = (events) => {
                     const rows = [];
                     const seenIds = new Set();
@@ -11102,8 +11120,11 @@
                         const studyColor = event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : (isDarkMode ? '#6d28d9' : '#8b5cf6'));
                         const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
                         const visitDisplay = event.visitNumber ? getVisitDisplayName(event.visitNumber, event.studyIds) : '—';
-                        const staffDisplay = getStaffNames(event);
-                        rows.push({ dateLabel, type: event.type === 'Travel Day' ? 'Travel' : 'Shift', event, studyColor, siteName: site ? site.name : '—', studyNames, visit: visitDisplay, time: event.period || 'Full Day', staffDisplay });
+                        const staffNames = getStaffNames(event);
+                        const locationDisplay = getLocationDisplay(site);
+                        const piDisplay = event.principalInvestigator || (site && site.principalInvestigator) || '—';
+                        const staffDisplay = locationDisplay && locationDisplay !== '—' ? `${staffNames} · ${locationDisplay}` : staffNames;
+                        rows.push({ dateLabel, type: event.type === 'Travel Day' ? 'Travel' : 'Shift', event, studyColor, siteName: site ? site.name : '—', studyNames, visit: visitDisplay, time: event.period || 'Full Day', staffDisplay, locationDisplay, piDisplay });
                     });
                     rows.sort((a, b) => a.event.date.localeCompare(b.event.date) || (a.event.siteId || '').localeCompare(b.event.siteId || ''));
                     return rows;
@@ -11138,6 +11159,8 @@
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Staff</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Type</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Site</th>
+                                        <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Location</th>
+                                        <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">PI</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Study</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Visit</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Time</th>
@@ -11146,9 +11169,9 @@
                                 <tbody class="bg-white dark:bg-gray-900">
                     `;
                     if (rows.length === 0) {
-                        listHTML += `<tr><td colspan="7" class="border border-gray-300 dark:border-gray-600 px-3 py-4 text-center text-gray-500 dark:text-gray-400">No shifts this month.</td></tr>`;
+                        listHTML += `<tr><td colspan="9" class="border border-gray-300 dark:border-gray-600 px-3 py-4 text-center text-gray-500 dark:text-gray-400">No shifts this month.</td></tr>`;
                     } else {
-                        rows.forEach(({ dateLabel, type, event, studyColor, siteName, studyNames, visit, time, staffDisplay }) => {
+                        rows.forEach(({ dateLabel, type, event, studyColor, siteName, studyNames, visit, time, staffDisplay, locationDisplay, piDisplay }) => {
                             const textColor = studyColor && typeof getContrastColor === 'function' ? getContrastColor(studyColor) : '';
                             const style = studyColor ? `background-color: ${studyColor}; color: ${textColor};` : '';
                             listHTML += `
@@ -11157,6 +11180,8 @@
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${staffDisplay}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${type === 'Travel' ? '✈ Travel' : type}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${siteName}</td>
+                                    <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${locationDisplay}</td>
+                                    <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${piDisplay}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${studyNames}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${visit}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${time}</td>
@@ -11227,11 +11252,15 @@
                                         </div>
                                     `;
                                 }).join('')}
-                                ${dayData.shifts.map(event => {
+                                ${(function() {
+                                    const seen = new Set();
+                                    const shifts = (dayData.shifts || []).filter(e => { if (e.id && seen.has(e.id)) return false; if (e.id) seen.add(e.id); return true; });
+                                    return shifts.map(event => {
                                     const site = state.crc_sites.find(s => s.id === event.siteId);
                                     const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                                     const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
                                     const pi = event.principalInvestigator || (site && site.principalInvestigator) || '';
+                                    const locationStr = site ? [site.city, site.state].filter(Boolean).join(', ') : '';
                                     const firstStudy = studies.length > 0 ? studies[0] : null;
                                     const isDarkMode = document.documentElement.classList.contains('dark');
                                     // Travel Day: blue; Site Assignment: use study color when available
@@ -11272,15 +11301,16 @@
                                              style="background-color: ${bgColor}; color: ${textColor};"
                                              data-action="view-crc-schedule-event" 
                                              data-event-id="${event.id}"
-                                             title="${event.type} - ${site ? site.name : 'Unknown Site'}${pi ? ' - PI: ' + pi : ''} - ${studyNames}">
+                                             title="${event.type} - ${site ? site.name : 'Unknown Site'}${locationStr ? ' - ' + locationStr : ''}${pi ? ' - PI: ' + pi : ''} - ${studyNames}">
                                             <div class="font-medium truncate">${event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown')}</div>
                                             ${pi ? `<div class="text-[10px] opacity-90 truncate">PI: ${pi}</div>` : ''}
+                                            ${locationStr ? `<div class="text-[10px] opacity-90 truncate">${locationStr}</div>` : ''}
                                             ${travelDistanceInfoSchedule}
                                             <div class="text-[10px] opacity-90 truncate">${studyNames}</div>
                                             ${event.period ? `<div class="text-[10px] opacity-75">${event.period}</div>` : ''}
                                         </div>
                                     `;
-                                }).join('')}
+                                }).join(''); })()}
                             </div>
                         </div>
                     `;
@@ -23711,8 +23741,8 @@
                     }
                 })();
                 
-                // For supervisors, show all fields so they can see everything (even if disabled)
-                const show = isSupervisor ? {
+                // For read-only (Supervisor or CRC), show all fields so they can see everything (even if disabled)
+                const show = readOnly ? {
                     crc: true,
                     site: true,
                     study: true,
@@ -23732,6 +23762,59 @@
                     travel: eventType === 'Site Assignment'
                 };
 
+                // CRC only: show a read-only view (no form, no inputs) so they can never edit
+                if (isCRC) {
+                    if (!event || !event.id) {
+                        return `
+                            <h2 class="text-2xl font-bold dark:text-white mb-4">View Shift</h2>
+                            <p class="text-gray-600 dark:text-gray-400 mb-6">CRCs cannot create or edit shifts. Use this view to see shift details only.</p>
+                            <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
+                        `;
+                    }
+                    const site = state.crc_sites.find(s => s.id === event.siteId);
+                    const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
+                    const studyNames = studies.length ? studies.map(s => (s && (s.title || s.name)) || '').join(', ') : '—';
+                    const assignedCrcs = typeof getEventCRCs === 'function' ? getEventCRCs(event) : [];
+                    const startDateValue = seriesStartDate || event.date || date;
+                    const endDateValue = seriesEndDate || (event.endDate || event.date || startDateValue);
+                    const visitDisplay = event.visitNumber && typeof getVisitDisplayName === 'function' ? getVisitDisplayName(event.visitNumber, event.studyIds) : (event.visitNumber || '—');
+                    const locationStr = site ? [site.city, site.state].filter(Boolean).join(', ') : '—';
+                    return `
+                        <h2 class="text-2xl font-bold dark:text-white mb-4">View Shift</h2>
+                        <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">Read-only. CRCs cannot edit schedules.</p>
+                        <div class="max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar space-y-4">
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Start Date</div><div class="text-gray-900 dark:text-white">${startDateValue}</div></div>
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">End Date</div><div class="text-gray-900 dark:text-white">${endDateValue}</div></div>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Event Type</div><div class="text-gray-900 dark:text-white">${event.type || 'Site Assignment'}</div></div>
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Hours</div><div class="text-gray-900 dark:text-white">${event.hours ?? '—'}</div></div>
+                            </div>
+                            <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Time Period</div><div class="text-gray-900 dark:text-white">${event.period || 'Full Day'}</div></div>
+                            ${(event.type === 'Site Assignment' || event.type === 'Travel Day') ? `
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 border-t dark:border-gray-700 pt-4">
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Site</div><div class="text-gray-900 dark:text-white">${site ? site.name : '—'}</div></div>
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Location</div><div class="text-gray-900 dark:text-white">${locationStr}</div></div>
+                            </div>
+                            <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Study/Studies</div><div class="text-gray-900 dark:text-white">${studyNames}</div></div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Group</div><div class="text-gray-900 dark:text-white">${event.groupNumber || '—'}</div></div>
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Visit</div><div class="text-gray-900 dark:text-white">${visitDisplay}</div></div>
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Number of Patients</div><div class="text-gray-900 dark:text-white">${event.numberOfPatients ?? '—'}</div></div>
+                                <div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Principal Investigator</div><div class="text-gray-900 dark:text-white">${event.principalInvestigator || (site && site.principalInvestigator) || '—'}</div></div>
+                            </div>
+                            ` : ''}
+                            ${assignedCrcs.length > 0 ? `<div><div class="text-sm font-medium text-gray-500 dark:text-gray-400 mb-2">Assigned Staff</div><div class="text-gray-900 dark:text-white">${assignedCrcs.map(c => c.name).join(', ')}</div></div>` : ''}
+                            ${event.type === 'Travel Day' && event.mileage != null ? `<div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Mileage</div><div class="text-gray-900 dark:text-white">${event.mileage}</div></div>` : ''}
+                            ${event.notes ? `<div><div class="text-sm font-medium text-gray-500 dark:text-gray-400">Notes</div><div class="text-gray-900 dark:text-white whitespace-pre-wrap">${event.notes}</div></div>` : ''}
+                        </div>
+                        <div class="mt-6 pt-4 border-t dark:border-gray-700">
+                            <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-500">Close</button>
+                        </div>
+                    `;
+                }
+
                 return `
                     <h2 class="text-2xl font-bold dark:text-white mb-6">${readOnly ? 'View' : (isEditing ? 'Edit' : 'Add')} Shift</h2>
                     ${readOnly ? `
@@ -23746,14 +23829,14 @@
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Start Date</label>
-                                <input type="date" name="startDate" required ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} value="${startDateValue}">
+                                <input type="date" name="startDate" required ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} value="${startDateValue}">
                             </div>
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">End Date</label>
-                                <input type="date" name="endDate" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} value="${endDateValue}">
+                                <input type="date" name="endDate" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} value="${endDateValue}">
                             </div>
                         </div>
-                        ${isEditing && event?.groupId ? `
+                        ${isEditing && event?.groupId && !readOnly ? `
                         <div class="p-3 rounded-md border border-amber-200 dark:border-amber-700 bg-amber-50/60 dark:bg-amber-900/20">
                             <label class="flex items-center gap-2 cursor-pointer">
                                 <input type="checkbox" name="applyToAllDaysInShift" class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
@@ -23765,7 +23848,7 @@
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Event Type</label>
-                                <select id="crc-event-type" name="eventType" required ${isSupervisor ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'}>
+                                <select id="crc-event-type" name="eventType" required ${readOnly ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'}>
                                     <option ${eventType === 'Site Assignment' ? 'selected' : ''}>Site Assignment</option>
                                     <option ${eventType === 'Travel Day' ? 'selected' : ''}>Travel Day</option>
                                     <option ${eventType === 'Paid Time Off' ? 'selected' : ''}>Paid Time Off</option>
@@ -23774,12 +23857,12 @@
                             </div>
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Hours</label>
-                                <input type="number" name="hours" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} value="${hours}" step="0.5">
+                                <input type="number" name="hours" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} value="${hours}" step="0.5">
                             </div>
                         </div>
                         <div id="period-group" class="${show.period ? '' : 'hidden'}">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Time Period</label>
-                            <select name="period" id="period-select" ${isSupervisor ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'}>
+                            <select name="period" id="period-select" ${readOnly ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'}>
                                 <option value="Full Day" ${period === 'Full Day' || !period || (period !== 'AM' && period !== 'PM' && !period.includes(':')) ? 'selected' : ''}>Full Day</option>
                                 <option value="Custom" ${period && period !== 'Full Day' && period !== 'AM' && period !== 'PM' && period.includes(':') ? 'selected' : ''}>Custom Time</option>
                                 <option value="AM" ${period === 'AM' ? 'selected' : ''}>AM (Before Noon)</option>
@@ -23790,10 +23873,10 @@
                                     <div>
                                         <label class="block text-xs font-medium dark:text-gray-300 mb-1">Start Time</label>
                                         <div class="flex gap-2">
-                                            <input type="number" name="startHour" id="start-hour-input" min="1" max="12" value="${period && period.includes(':') ? (parseInt(period.split('-')[0].split(':')[0]) % 12 || 12) : '9'}" ${isSupervisor ? 'disabled readonly class="w-16 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-16 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="Hour">
+                                            <input type="number" name="startHour" id="start-hour-input" min="1" max="12" value="${period && period.includes(':') ? (parseInt(period.split('-')[0].split(':')[0]) % 12 || 12) : '9'}" ${readOnly ? 'disabled readonly class="w-16 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-16 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="Hour">
                                             <span class="self-center text-gray-500 dark:text-gray-400">:</span>
-                                            <input type="number" name="startMinute" id="start-minute-input" min="0" max="59" value="${period && period.includes(':') ? period.split('-')[0].split(':')[1]?.replace(/\D/g, '') || '00' : '00'}" step="15" ${isSupervisor ? 'disabled readonly class="w-16 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-16 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="Min">
-                                            <select name="startAmPm" id="start-ampm-input" ${isSupervisor ? 'disabled class="w-20 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-20 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
+                                            <input type="number" name="startMinute" id="start-minute-input" min="0" max="59" value="${period && period.includes(':') ? period.split('-')[0].split(':')[1]?.replace(/\D/g, '') || '00' : '00'}" step="15" ${readOnly ? 'disabled readonly class="w-16 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-16 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="Min">
+                                            <select name="startAmPm" id="start-ampm-input" ${readOnly ? 'disabled class="w-20 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-20 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
                                                 <option value="AM" ${period && period.includes(':') && period.split('-')[0].toUpperCase().includes('PM') ? '' : 'selected'}>AM</option>
                                                 <option value="PM" ${period && period.includes(':') && period.split('-')[0].toUpperCase().includes('PM') ? 'selected' : ''}>PM</option>
                                             </select>
@@ -23802,10 +23885,10 @@
                                     <div>
                                         <label class="block text-xs font-medium dark:text-gray-300 mb-1">End Time</label>
                                         <div class="flex gap-2">
-                                            <input type="number" name="endHour" id="end-hour-input" min="1" max="12" value="${period && period.includes(':') ? (parseInt(period.split('-')[1]?.split(':')[0]) % 12 || 12) : '5'}" ${isSupervisor ? 'disabled readonly class="w-16 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-16 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="Hour">
+                                            <input type="number" name="endHour" id="end-hour-input" min="1" max="12" value="${period && period.includes(':') ? (parseInt(period.split('-')[1]?.split(':')[0]) % 12 || 12) : '5'}" ${readOnly ? 'disabled readonly class="w-16 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-16 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="Hour">
                                             <span class="self-center text-gray-500 dark:text-gray-400">:</span>
-                                            <input type="number" name="endMinute" id="end-minute-input" min="0" max="59" value="${period && period.includes(':') ? period.split('-')[1]?.split(':')[1]?.replace(/\D/g, '') || '00' : '00'}" step="15" ${isSupervisor ? 'disabled readonly class="w-16 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-16 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="Min">
-                                            <select name="endAmPm" id="end-ampm-input" ${isSupervisor ? 'disabled class="w-20 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-20 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
+                                            <input type="number" name="endMinute" id="end-minute-input" min="0" max="59" value="${period && period.includes(':') ? period.split('-')[1]?.split(':')[1]?.replace(/\D/g, '') || '00' : '00'}" step="15" ${readOnly ? 'disabled readonly class="w-16 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-16 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="Min">
+                                            <select name="endAmPm" id="end-ampm-input" ${readOnly ? 'disabled class="w-20 p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-20 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
                                                 <option value="AM" ${period && period.includes(':') && period.split('-')[1]?.toUpperCase().includes('PM') ? '' : 'selected'}>AM</option>
                                                 <option value="PM" ${period && period.includes(':') && period.split('-')[1]?.toUpperCase().includes('PM') ? 'selected' : ''}>PM</option>
                                             </select>
@@ -23819,11 +23902,11 @@
                             <h3 class="text-lg font-semibold dark:text-white">Step 1: Select Study and Site</h3>
                             <div id="study-group">
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Study/Studies <span class="text-xs font-light">(Hold Ctrl/Cmd to select multiple)</span></label>
-                                <select name="studyIds" ${isSupervisor ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'}><option value="">Select Study</option>${studyOptions}</select>
+                                <select name="studyIds" ${readOnly ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'}><option value="">Select Study</option>${studyOptions}</select>
                             </div>
                             <div id="site-group">
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">Site</label>
-                                <select name="siteId" ${isSupervisor ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'}><option value="">Select Site</option>${siteOptions}</select>
+                                <select name="siteId" ${readOnly ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'}><option value="">Select Site</option>${siteOptions}</select>
                             </div>
                         </div>
                         
@@ -23833,11 +23916,11 @@
                             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Group Number</label>
-                                    <input type="text" name="groupNumber" value="${event ? event.groupNumber || '' : ''}" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 1, 1-2, 1/2"'} pattern="[0-9/\-\\\\]+" title="Only numbers and symbols (-, /, \) allowed">
+                                    <input type="text" name="groupNumber" value="${event ? event.groupNumber || '' : ''}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 1, 1-2, 1/2"'} pattern="[0-9/\-\\\\]+" title="Only numbers and symbols (-, /, \) allowed">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit Number</label>
-                                    <select name="visitNumber" id="visitNumberSelect" ${isSupervisor ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} disabled>
+                                    <select name="visitNumber" id="visitNumberSelect" ${readOnly ? 'disabled class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} disabled>
                                         <option value="">Select Visit</option>
                                         <!-- Visit options will be populated dynamically based on study -->
                                     </select>
@@ -23845,11 +23928,11 @@
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Number of Patients</label>
-                                    <input type="number" name="numberOfPatients" value="${event ? event.numberOfPatients || '' : ''}" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 20"'} min="0" step="1">
+                                    <input type="number" name="numberOfPatients" value="${event ? event.numberOfPatients || '' : ''}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 20"'} min="0" step="1">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Principal Investigator</label>
-                                    <input type="text" name="principalInvestigator" value="${event ? event.principalInvestigator || '' : ''}" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Defaults to site PI"'} >
+                                    <input type="text" name="principalInvestigator" value="${event ? event.principalInvestigator || '' : ''}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Defaults to site PI"'} >
                                 </div>
                             </div>
                         </div>
@@ -23857,7 +23940,7 @@
                         <!-- Role Assignment (Step 2) -->
                         <div id="role-assignment-section" class="${show.role ? '' : 'hidden'} space-y-4 border-t dark:border-gray-700 pt-4">
                             <h3 class="text-lg font-semibold dark:text-white">Step 2: Assign Staff to Roles</h3>
-                            <label class="flex items-center gap-2 ${isSupervisor ? 'hidden' : ''}">
+                            <label class="flex items-center gap-2 ${readOnly ? 'hidden' : ''}">
                                 <input type="checkbox" name="overrideCrcRestrictions" class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
                                 <span class="text-sm text-gray-600 dark:text-gray-400">Override: allow selecting anyone (ignore availability &amp; training)</span>
                             </label>
@@ -23896,7 +23979,7 @@
                         <!-- Travel Selection (Step 3) - After role assignments -->
                         <div id="ask-volunteers-section" class="${show.role ? '' : 'hidden'} space-y-2 border-t dark:border-gray-700 pt-4">
                             <label class="flex items-center gap-2 cursor-pointer">
-                                <input type="checkbox" name="askForVolunteers" ${event && event.openForVolunteers ? 'checked' : ''} class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                                <input type="checkbox" name="askForVolunteers" ${event && event.openForVolunteers ? 'checked' : ''} ${readOnly ? 'disabled' : ''} class="rounded border-gray-300 text-blue-600 focus:ring-blue-500 ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}">
                                 <span class="text-sm font-medium dark:text-gray-300">Ask for volunteers?</span>
                             </label>
                             <p class="text-xs text-gray-500 dark:text-gray-400">When saved with unassigned slots, CRCs will see this shift in "Volunteer for shift" and can volunteer. You can then accept one per position.</p>
@@ -23912,24 +23995,24 @@
                         <!-- Legacy CRC Selection (for non-Site Assignment events) -->
                         <div id="crc-group" class="${show.crc && !show.role ? '' : 'hidden'}">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">CRC(s) <span class="text-xs font-light">(Hold Ctrl/Cmd to select multiple)</span></label>
-                            <select name="crcId" ${!isEditing ? 'multiple' : ''} class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white h-32">
+                            <select name="crcId" ${!isEditing ? 'multiple' : ''} ${readOnly ? 'disabled' : ''} class="w-full p-2 border dark:border-gray-600 rounded ${readOnly ? 'bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed' : 'bg-white dark:bg-gray-700 dark:text-white'} h-32">
                                 ${!isEditing ? crcOptions : `<option value="">Select CRC</option>${crcOptions}`}
                             </select>
                             <div id="crc-hours-info" class="text-sm mt-2 h-5 text-gray-600 dark:text-gray-400"></div>
                         </div>
                         <div id="mileage-group" class="${show.mileage ? '' : 'hidden'}">
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Mileage</label>
-                            <input type="number" name="mileage" value="${event ? event.mileage || '' : ''}" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} step="0.1">
+                            <input type="number" name="mileage" value="${event ? event.mileage || '' : ''}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} step="0.1">
                         </div>
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-1">Notes</label>
-                            <textarea name="notes" rows="3" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only for supervisors"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >${event ? event.notes || '' : ''}</textarea>
+                            <textarea name="notes" rows="3" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >${event ? event.notes || '' : ''}</textarea>
                         </div>
                         <div id="form-error-message" class="text-red-500 text-sm h-4"></div>
                         <div class="border-t dark:border-gray-700 pt-4">
                             <div class="flex items-center justify-between">
                                 <p class="text-sm font-semibold text-gray-700 dark:text-gray-200">Schedule for next Group or Visit?</p>
-                                <button type="button" id="toggle-duplicate-panel" ${isSupervisor ? 'disabled' : ''} class="text-sm text-blue-600 dark:text-blue-400 hover:underline ${isSupervisor ? 'opacity-50 cursor-not-allowed' : ''}">Configure</button>
+                                <button type="button" id="toggle-duplicate-panel" ${readOnly ? 'disabled' : ''} class="text-sm text-blue-600 dark:text-blue-400 hover:underline ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}">Configure</button>
                             </div>
                             <input type="hidden" name="duplicateEnabled" value="false">
                             <div id="duplicate-summary" class="mt-2 text-xs text-gray-600 dark:text-gray-400"></div>
@@ -23940,21 +24023,21 @@
                                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                     <div>
                                         <label class="block text-xs font-medium dark:text-gray-300 mb-1">Next Group Number</label>
-                                        <input type="text" name="duplicateGroupNumber" value="${defaultDuplicateGroup}" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="e.g., G2">
+                                        <input type="text" name="duplicateGroupNumber" value="${defaultDuplicateGroup}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="e.g., G2">
                                     </div>
                                     <div>
                                         <label class="block text-xs font-medium dark:text-gray-300 mb-1">Next Visit Number</label>
-                                        <input type="text" name="duplicateVisitNumber" value="${defaultDuplicateVisit}" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="e.g., V2">
+                                        <input type="text" name="duplicateVisitNumber" value="${defaultDuplicateVisit}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} placeholder="e.g., V2">
                                     </div>
                                 </div>
                                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                     <div>
                                         <label class="block text-xs font-medium dark:text-gray-300 mb-1">Next Start Date</label>
-                                        <input type="date" name="duplicateStartDate" value="${defaultDuplicateStartDate}" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
+                                        <input type="date" name="duplicateStartDate" value="${defaultDuplicateStartDate}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
                                     </div>
                                     <div>
                                         <label class="block text-xs font-medium dark:text-gray-300 mb-1">Next End Date</label>
-                                        <input type="date" name="duplicateEndDate" value="${defaultDuplicateEndDate}" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
+                                        <input type="date" name="duplicateEndDate" value="${defaultDuplicateEndDate}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} >
                                     </div>
                                 </div>
                                 <div>
@@ -23972,19 +24055,19 @@
                                     </div>
                                 </div>
                                 <div class="flex justify-end gap-3">
-                                    <button type="button" id="clear-duplicate-selection" ${isSupervisor ? 'disabled' : ''} class="text-xs text-gray-600 dark:text-gray-300 hover:underline ${isSupervisor ? 'opacity-50 cursor-not-allowed' : ''}">Clear</button>
-                                    <button type="button" id="apply-duplicate-selection" ${isSupervisor ? 'disabled' : ''} class="text-xs bg-blue-600 text-white px-3 py-2 rounded hover:bg-blue-700 ${isSupervisor ? 'opacity-50 cursor-not-allowed' : ''}">Apply Selection</button>
+                                    <button type="button" id="clear-duplicate-selection" ${readOnly ? 'disabled' : ''} class="text-xs text-gray-600 dark:text-gray-300 hover:underline ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}">Clear</button>
+                                    <button type="button" id="apply-duplicate-selection" ${readOnly ? 'disabled' : ''} class="text-xs bg-blue-600 text-white px-3 py-2 rounded hover:bg-blue-700 ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}">Apply Selection</button>
                                 </div>
                             </div>
                         </div>
                         <div class="flex justify-between items-center pt-4">
                             <div class="flex items-center gap-4">
-                                ${isSupervisor ? '' : (isEditing ? `<button type="button" data-action="delete-crc-event" data-event-id="${event.id}" data-group-id="${event.groupId || ''}" class="text-red-600 hover:underline">Delete Event</button>` : '<div></div>')}
-                                ${isSupervisor ? '' : (isFullDayEvent ? `<button type="button" data-action="split-shift" data-event-id="${event.id}" class="text-blue-600 hover:underline">Split AM/PM</button>` : '')}
-                                ${isSupervisor ? '' : (isMultiDayEvent ? `<button type="button" data-action="split-by-day" data-event-id="${event.id}" data-start-date="${startDateValue}" data-end-date="${endDateValue}" class="text-purple-600 hover:underline">Split by Day</button>` : '')}
-                                ${isSupervisor ? '' : (isEditing ? `<button type="button" data-action="copy-shift" data-event-id="${event.id}" class="text-green-600 hover:underline">Copy Shift</button>` : '')}
+                                ${readOnly ? '' : (isEditing ? `<button type="button" data-action="delete-crc-event" data-event-id="${event.id}" data-group-id="${event.groupId || ''}" class="text-red-600 hover:underline">Delete Event</button>` : '<div></div>')}
+                                ${readOnly ? '' : (isFullDayEvent ? `<button type="button" data-action="split-shift" data-event-id="${event.id}" class="text-blue-600 hover:underline">Split AM/PM</button>` : '')}
+                                ${readOnly ? '' : (isMultiDayEvent ? `<button type="button" data-action="split-by-day" data-event-id="${event.id}" data-start-date="${startDateValue}" data-end-date="${endDateValue}" class="text-purple-600 hover:underline">Split by Day</button>` : '')}
+                                ${readOnly ? '' : (isEditing ? `<button type="button" data-action="copy-shift" data-event-id="${event.id}" class="text-green-600 hover:underline">Copy Shift</button>` : '')}
                             </div>
-                            ${isSupervisor ? '' : `<button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">${isEditing ? 'Save Changes' : 'Add Event(s)'}</button>`}
+                            ${readOnly ? '' : `<button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">${isEditing ? 'Save Changes' : 'Add Event(s)'}</button>`}
                         </div>
                     </form>
                     </div>
