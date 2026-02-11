@@ -2292,6 +2292,8 @@
                 travelFilterStartDate: null,
                 travelFilterEndDate: null,
                 travelFilterCrcId: null,
+                travelOnlyCalendarDate: new Date(), // For Travel Only view (month/week calendar)
+                travelOnlyViewMode: 'month', // 'month' | 'week'
                 navanConnectionStatus: null,
                 navanConnectionLastCheck: 0,
                 navanImportSummary: null,
@@ -6038,6 +6040,9 @@
             };
             
             const canAccessTab = (tabId) => {
+                // Travel Only uses same access as Travel (calendar of travel days from planning grid)
+                if (tabId === 'travelOnly') return canAccessTab('travel');
+                
                 const permissions = getUserPermissions();
                 if (!permissions) return false;
                 
@@ -6613,6 +6618,7 @@
                     { id: 'managerView', label: "Manager View" },
                     { id: 'unfilledShifts', label: 'Unfilled Shifts' },
                     { id: 'travel', label: 'Travel' },
+                    { id: 'travelOnly', label: 'Travel Only' },
                     { id: 'timeOff', label: 'Time Off' },
                     { id: 'timeOffRequests', label: 'Time Off Requests' },
                     { id: 'communications', label: 'Communications' }
@@ -6644,7 +6650,7 @@
                     // For Supervisor users, remove restricted tabs
                     if (state.currentUser && getEffectivePermissionLevel() === 'Supervisor') {
                         // Remove: CRC, Dashboard, Reporting, Training, Manager view, Travel, Users, Backend, Time Off Requests, Time Off
-                        tabs = tabs.filter(tab => !['crcs', 'dashboard', 'reporting', 'training', 'managerView', 'travel', 'users', 'allSchedule', 'communications', 'timeOffRequests', 'timeOff'].includes(tab.id));
+                        tabs = tabs.filter(tab => !['crcs', 'dashboard', 'reporting', 'training', 'managerView', 'travel', 'travelOnly', 'users', 'allSchedule', 'communications', 'timeOffRequests', 'timeOff'].includes(tab.id));
                     }
                     
                     if (state.currentUser && getEffectivePermissionLevel() === 'Manager') {
@@ -7365,6 +7371,11 @@
                     mainAppContent.innerHTML = getTravelHTML();
                     mainAppContent.className = 'w-full';
                     renderTravelContent();
+                } else if (state.activeTab === 'travelOnly') {
+                    _lastRenderedTab = state.activeTab;
+                    mainAppContent.innerHTML = getTravelOnlyHTML();
+                    mainAppContent.className = 'w-full';
+                    renderTravelOnlyContent();
                 } else if (state.activeTab === 'unfilledShifts') {
                     _lastRenderedTab = state.activeTab;
                     mainAppContent.innerHTML = getUnfilledShiftsHTML();
@@ -34555,10 +34566,13 @@
                                 // Collect role quantity overrides FIRST (before role assignments)
                                 // This ensures we know how many slots to create for each role
                                 const roleQuantityOverrides = {};
+                                // When editing, start from existing overrides so we preserve "removed" (0) roles even if DOM is missing an input
+                                if (isEditing && existingEvent?.roleQuantityOverrides && typeof existingEvent.roleQuantityOverrides === 'object') {
+                                    Object.assign(roleQuantityOverrides, existingEvent.roleQuantityOverrides);
+                                }
                                 const quantityInputs = form.querySelectorAll('input[name^="role-quantity-"]');
                                 quantityInputs.forEach(input => {
                                     const roleId = input.dataset.roleId || input.name.replace('role-quantity-', '');
-                                    const defaultQuantity = parseInt(input.dataset.defaultQuantity) || 0;
                                     const overrideQuantity = parseInt(input.value, 10);
                                     const overrideQuantityValid = Number.isFinite(overrideQuantity) && overrideQuantity >= 0 ? overrideQuantity : 0;
                                     
@@ -40383,6 +40397,14 @@
                         }
                     });
                 }
+                // Include roles that were explicitly set to 0 (removed) so we render them and persist the removal on save
+                if (isEditing && existingEvent?.roleQuantityOverrides && typeof existingEvent.roleQuantityOverrides === 'object') {
+                    Object.entries(existingEvent.roleQuantityOverrides).forEach(([roleId, qty]) => {
+                        if (qty === 0 && state.roles.find(r => r.id === roleId)) {
+                            requiredRoles.set(roleId, 0);
+                        }
+                    });
+                }
 
                 // Ad-hoc roles: allow adding roles beyond study/visit requirements
                 form._adhocRoleConfig = form._adhocRoleConfig || {};
@@ -40443,10 +40465,7 @@
                     let roleQuantity;
                     if (overrideQuantity !== undefined && overrideQuantity !== null) {
                         roleQuantity = overrideQuantity;
-                        // If override is 0, skip this role entirely (user intentionally removed it)
-                        if (roleQuantity === 0) {
-                            continue;
-                        }
+                        // When override is 0, still render the role so we have an input to persist 0 on save (role stays removed)
                     } else {
                         // Default behavior: use required quantity (default to 1 if undefined)
                         roleQuantity = (quantity !== undefined && quantity !== null && quantity > 0) ? quantity : 1;
@@ -46824,6 +46843,42 @@
                 `;
             };
 
+            // Travel Only: calendar of Travel Day events from planning grid (month + week)
+            const getTravelOnlyHTML = () => {
+                const now = state.travelOnlyCalendarDate || new Date();
+                const monthLabel = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+                const weekStart = new Date(now);
+                weekStart.setDate(now.getDate() - getDaySaturdayStart(now));
+                const weekEnd = new Date(weekStart);
+                weekEnd.setDate(weekStart.getDate() + 6);
+                const weekLabel = `${weekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${weekEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+                const viewMode = state.travelOnlyViewMode || 'month';
+                return `
+                    <div id="travel-only-content" class="space-y-4">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                            <div>
+                                <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Travel Only</h2>
+                                <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Travel days from the planning grid (CRCs)</p>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <div class="flex rounded-md border dark:border-gray-600 overflow-hidden">
+                                    <button type="button" data-action="travel-only-view" data-mode="month" class="px-3 py-2 text-sm font-medium ${viewMode === 'month' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300'} hover:bg-blue-100 dark:hover:bg-gray-600">Month</button>
+                                    <button type="button" data-action="travel-only-view" data-mode="week" class="px-3 py-2 text-sm font-medium ${viewMode === 'week' ? 'bg-blue-600 text-white' : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300'} hover:bg-blue-100 dark:hover:bg-gray-600">Week</button>
+                                </div>
+                                <div class="flex items-center rounded-md border dark:border-gray-600 overflow-hidden">
+                                    <button type="button" data-action="travel-only-prev" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-600"><i data-lucide="chevron-left" class="w-5 h-5 text-gray-600 dark:text-gray-400"></i></button>
+                                    <span class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 min-w-[180px] text-center" id="travel-only-title">${viewMode === 'month' ? monthLabel : weekLabel}</span>
+                                    <button type="button" data-action="travel-only-next" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-600"><i data-lucide="chevron-right" class="w-5 h-5 text-gray-600 dark:text-gray-400"></i></button>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="travel-only-calendar" class="crc-calendar-grid bg-gray-200 dark:bg-gray-700 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+                            <!-- Calendar grid filled by renderTravelOnlyContent -->
+                        </div>
+                    </div>
+                `;
+            };
+
             // Helper function to resolve valid CRC ID from travel record
             // Returns the actual CRC ID if the travel record matches a valid CRC, or null if invalid
             // This prevents duplicate grouping when the same person has multiple travel records with different IDs
@@ -46891,6 +46946,120 @@
                     start: toDateOnlyString(start),
                     end: toDateOnlyString(end)
                 };
+            };
+
+            const renderTravelOnlyContent = () => {
+                const calendarEl = document.getElementById('travel-only-calendar');
+                const titleEl = document.getElementById('travel-only-title');
+                if (!calendarEl) return;
+                
+                const events = (getDisplayEvents ? getDisplayEvents() : state.crc_events || []).filter(e => e.type === 'Travel Day');
+                const now = state.travelOnlyCalendarDate || new Date();
+                const viewMode = state.travelOnlyViewMode || 'month';
+                
+                const getCrcName = (event) => {
+                    const id = event.crcId || (Array.isArray(event.crcIds) && event.crcIds[0]) || null;
+                    if (!id) return 'Travel';
+                    const c = state.crcs.find(c => c.id === id);
+                    return c ? c.name : id;
+                };
+                
+                const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+                let grid = '';
+                grid += weekdays.map(day => `<div class="text-center font-medium text-sm py-2 bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-400">${day}</div>`).join('');
+                
+                if (viewMode === 'month') {
+                    const year = now.getFullYear();
+                    const month = now.getMonth();
+                    const firstDayOfMonth = getDaySaturdayStart(new Date(year, month, 1));
+                    const daysInMonth = new Date(year, month + 1, 0).getDate();
+                    
+                    for (let i = 0; i < firstDayOfMonth; i++) {
+                        grid += '<div class="bg-gray-50 dark:bg-gray-800/50 min-h-[100px]"></div>';
+                    }
+                    for (let day = 1; day <= daysInMonth; day++) {
+                        const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                        const dayEvents = events.filter(e => (e.date || e.startDate) === dateStr);
+                        const isToday = toDateOnlyString(new Date()) === dateStr;
+                        const dayClass = isToday ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-white dark:bg-gray-800';
+                        const tags = dayEvents.slice(0, 5).map(ev => {
+                            const name = getCrcName(ev);
+                            return `<div class="crc-event-tag bg-blue-500 text-white">${name.replace(/</g, '&lt;')}</div>`;
+                        }).join('');
+                        const more = dayEvents.length > 5 ? `<div class="text-xs text-blue-600 dark:text-blue-400 mt-1">+${dayEvents.length - 5} more</div>` : '';
+                        grid += `
+                            <div class="crc-calendar-day ${dayClass} min-h-[100px]">
+                                <span class="day-number text-gray-500 dark:text-gray-400 ${isToday ? 'font-bold text-blue-600 dark:text-blue-400' : ''}">${day}</span>
+                                <div class="mt-1 space-y-1">${tags}${more}</div>
+                            </div>
+                        `;
+                    }
+                } else {
+                    const startOfWeek = new Date(now);
+                    startOfWeek.setDate(now.getDate() - getDaySaturdayStart(now));
+                    for (let d = 0; d < 7; d++) {
+                        const dayDate = new Date(startOfWeek);
+                        dayDate.setDate(startOfWeek.getDate() + d);
+                        const dateStr = toDateOnlyString(dayDate);
+                        const dayEvents = events.filter(e => (e.date || e.startDate) === dateStr);
+                        const isToday = toDateOnlyString(new Date()) === dateStr;
+                        const dayClass = isToday ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-white dark:bg-gray-800';
+                        const dayLabel = dayDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+                        const tags = dayEvents.map(ev => {
+                            const name = getCrcName(ev);
+                            return `<div class="crc-event-tag bg-blue-500 text-white">${name.replace(/</g, '&lt;')}</div>`;
+                        }).join('');
+                        grid += `
+                            <div class="crc-calendar-day ${dayClass} min-h-[120px]">
+                                <span class="day-number text-gray-500 dark:text-gray-400 ${isToday ? 'font-bold text-blue-600 dark:text-blue-400' : ''}">${dayLabel}</span>
+                                <div class="mt-1 space-y-1">${tags || '<span class="text-xs text-gray-400">—</span>'}</div>
+                            </div>
+                        `;
+                    }
+                }
+                
+                calendarEl.innerHTML = grid;
+                if (titleEl) {
+                    if (viewMode === 'month') {
+                        titleEl.textContent = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+                    } else {
+                        const ws = new Date(now);
+                        ws.setDate(now.getDate() - getDaySaturdayStart(now));
+                        const we = new Date(ws);
+                        we.setDate(ws.getDate() + 6);
+                        titleEl.textContent = `${ws.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${we.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+                    }
+                }
+                
+                lucide.createIcons();
+                
+                document.querySelectorAll('[data-action="travel-only-prev"]').forEach(btn => {
+                    btn.onclick = () => {
+                        const d = state.travelOnlyCalendarDate || new Date();
+                        const next = new Date(d);
+                        if (state.travelOnlyViewMode === 'week') next.setDate(next.getDate() - 7);
+                        else next.setMonth(next.getMonth() - 1);
+                        setState({ travelOnlyCalendarDate: next });
+                        renderTravelOnlyContent();
+                    };
+                });
+                document.querySelectorAll('[data-action="travel-only-next"]').forEach(btn => {
+                    btn.onclick = () => {
+                        const d = state.travelOnlyCalendarDate || new Date();
+                        const next = new Date(d);
+                        if (state.travelOnlyViewMode === 'week') next.setDate(next.getDate() + 7);
+                        else next.setMonth(next.getMonth() + 1);
+                        setState({ travelOnlyCalendarDate: next });
+                        renderTravelOnlyContent();
+                    };
+                });
+                document.querySelectorAll('[data-action="travel-only-view"]').forEach(btn => {
+                    btn.onclick = () => {
+                        const mode = btn.getAttribute('data-mode');
+                        if (mode) setState({ travelOnlyViewMode: mode });
+                        renderTravelOnlyContent();
+                    };
+                });
             };
 
             const renderTravelContent = async () => {
