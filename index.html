@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ora SMO Scheduler</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👁</text></svg>">
-    <!-- For production, replace with a built CSS (PostCSS or Tailwind CLI) per https://tailwindcss.com/docs/installation -->
+    <!-- Tailwind: CDN is convenient but not for production (warning in console; slower load). For production: build with PostCSS or Tailwind CLI and replace with a single built CSS. See https://tailwindcss.com/docs/installation -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -10490,12 +10490,22 @@
                     return '<div class="p-4 text-center text-gray-600 dark:text-gray-400">CRC profile not found. Please contact support.</div>';
                 }
                 
-                // Get all events for this CRC (crcId, crcIds, and roleAssignments)
+                // Get all events for this CRC (crcId, crcIds, and roleAssignments); deduplicate by event id so one shift doesn't show multiple times
                 const today = new Date();
                 today.setHours(0, 0, 0, 0);
                 const todayStr = toDateOnlyString(today);
                 
-                const allCrcEvents = (getDisplayEvents() || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                const rawCrcEvents = (getDisplayEvents() || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                const seenIds = new Set();
+                const seenDateGroup = new Set(); // (date, groupId) to avoid same shift multiple times
+                const allCrcEvents = rawCrcEvents.filter(e => {
+                    if (e.id && seenIds.has(e.id)) return false;
+                    const key = e.type === 'Site Assignment' && e.groupId ? `${e.date}\t${e.groupId}` : (e.id || `${e.date}\t${e.type}\t${e.crcId || ''}`);
+                    if (seenDateGroup.has(key)) return false;
+                    if (e.id) seenIds.add(e.id);
+                    seenDateGroup.add(key);
+                    return true;
+                });
                 
                 // Filter out PTO/Unavailable/Sick Time and events without studyIds (except Travel Days)
                 const crcEvents = allCrcEvents.filter(e => 
@@ -10715,14 +10725,32 @@
                 const firstDayOfMonth = new Date(year, month, 1).getDay();
                 const monthName = new Date(year, month, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
                 
-                // Get events based on view selection
+                // Get events based on view selection; deduplicate by event id so the same shift doesn't show multiple times
                 let filteredEvents = [];
                 if (dashboardView === 'mySchedule') {
-                    // Only show this CRC's events (crcId, crcIds, and roleAssignments)
-                    filteredEvents = (getDisplayEvents() || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                    const raw = (getDisplayEvents() || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                    const seenIds = new Set();
+                    const seenDateGroup = new Set();
+                    filteredEvents = raw.filter(e => {
+                        if (e.id && seenIds.has(e.id)) return false;
+                        const key = e.type === 'Site Assignment' && e.groupId ? `${e.date}\t${e.groupId}` : (e.id || `${e.date}\t${e.type}\t${e.crcId || ''}`);
+                        if (seenDateGroup.has(key)) return false;
+                        if (e.id) seenIds.add(e.id);
+                        seenDateGroup.add(key);
+                        return true;
+                    });
                 } else {
-                    // Show all shifts only (entire schedule)
-                    filteredEvents = (getDisplayEvents() || []).filter(e => e.type === 'Site Assignment');
+                    const raw = (getDisplayEvents() || []).filter(e => e.type === 'Site Assignment');
+                    const seenIds = new Set();
+                    const seenDateGroup = new Set();
+                    filteredEvents = raw.filter(e => {
+                        if (e.id && seenIds.has(e.id)) return false;
+                        const key = e.groupId ? `${e.date}\t${e.groupId}` : (e.id || e.date);
+                        if (seenDateGroup.has(key)) return false;
+                        if (e.id) seenIds.add(e.id);
+                        seenDateGroup.add(key);
+                        return true;
+                    });
                 }
                 
                 // Filter to current month
@@ -10972,8 +11000,18 @@
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
                 const firstDayOfMonth = new Date(year, month, 1).getDay();
 
-                // Get all events for this CRC (crcId, crcIds, and roleAssignments)
-                const allCrcEvents = (state.crc_events || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                // Get all events for this CRC (crcId, crcIds, and roleAssignments); deduplicate by id and by (date, groupId)
+                const rawCrcEvents = (state.crc_events || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                const seenIds = new Set();
+                const seenDateGroup = new Set();
+                const allCrcEvents = rawCrcEvents.filter(e => {
+                    if (e.id && seenIds.has(e.id)) return false;
+                    const key = e.type === 'Site Assignment' && e.groupId ? `${e.date}\t${e.groupId}` : (e.id || `${e.date}\t${e.type}\t${e.crcId || ''}`);
+                    if (seenDateGroup.has(key)) return false;
+                    if (e.id) seenIds.add(e.id);
+                    seenDateGroup.add(key);
+                    return true;
+                });
                 
                 // Separate time off events from shift events
                 const timeOffTypes = ['Unavailable', 'Paid Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only'];
@@ -18722,7 +18760,7 @@
             const initializeSchedulerMap = async () => {
                 const mapContainer = document.getElementById('chaos-scheduler-map');
                 if (!mapContainer) {
-                    console.log('Scheduler map container not found');
+                    debugLog('Scheduler map container not found (expected when not on scheduler tab)');
                     return;
                 }
                 if (!AZURE_MAPS_KEY) {
@@ -50374,7 +50412,7 @@
                             const createdEvent = await apiService.createEvent(eventData);
                             const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
                             addEventToState(newEvent);
-                            console.log(`Created event for approved time off request: ${request.id}`);
+                            debugLog(`Created event for approved time off request: ${request.id}`);
                         } catch (eventError) {
                             console.error('Error syncing time off request to event:', eventError);
                         }
