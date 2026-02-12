@@ -320,6 +320,24 @@
         .study-header-unfilled {
             animation: studyHeaderPulse 2s ease-in-out infinite;
         }
+
+        /* Finalize button: flash when schedule has changes since last finalize */
+        @keyframes finalizeBtnFlash {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5); }
+            50% { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.2); }
+        }
+        .finalize-btn-needs-finalize {
+            animation: finalizeBtnFlash 1.8s ease-in-out infinite;
+        }
+
+        /* Old-timey clock style flash for "Last finalized at ..." */
+        @keyframes clockFlash {
+            0%, 100% { opacity: 1; text-shadow: 0 0 4px rgba(0, 0, 0, 0.1); }
+            50% { opacity: 0.85; text-shadow: 0 0 8px rgba(0, 0, 0, 0.15); }
+        }
+        .finalize-timestamp-clock {
+            animation: clockFlash 2s ease-in-out infinite;
+        }
         
         .flight-calendar-day {
             min-height: 100px;
@@ -2289,6 +2307,10 @@
                 travelFilterType: 'thisYear', // 'thisYear', 'lastYear', 'month', 'quarter', 'custom'
                 travelFilterMonth: null,
                 finalizedMonths: {},
+                /** Last finalized timestamp per month (ISO string) for "Last finalized at ..." display. */
+                finalizedAtByMonth: {},
+                /** Months that have schedule changes since last finalize; used to flash Finalize button. */
+                scheduleModifiedSinceFinalize: {},
                 /** For CRCs viewing a finalized month: merged list (live events outside month + snapshot inside month). Undefined for managers or when not viewing finalized month. */
                 crc_events_display: undefined,
                 travelFilterQuarter: null,
@@ -5452,6 +5474,10 @@
         }
     }
     state.crc_events.push(newEvent);
+    if (typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
+        const mk = getScheduleMonthKeyFromEvent(newEvent);
+        if (mk) markScheduleModifiedForMonth(mk);
+    }
 };
 
             /** Merge assignment fields from the payload we sent into the server response.
@@ -13684,11 +13710,29 @@
                     const record = await apiService.getSchedule(recordId);
                     const finalized = !!record?.finalized;
                     state.finalizedMonths[monthKey] = finalized;
+                    if (finalized && record?.snapshotAt) {
+                        state.finalizedAtByMonth[monthKey] = record.snapshotAt;
+                    }
                     return finalized;
                 } catch (error) {
                     state.finalizedMonths[monthKey] = false;
                     return false;
                 }
+            };
+
+            /** Mark a schedule month as having changes since last finalize (so Finalize button flashes). */
+            const markScheduleModifiedForMonth = (monthKey) => {
+                if (!monthKey) return;
+                const next = { ...state.scheduleModifiedSinceFinalize, [monthKey]: true };
+                setState({ scheduleModifiedSinceFinalize: next });
+            };
+
+            /** Get month key "YYYY-MM" from event date string (YYYY-MM-DD) or Date. */
+            const getScheduleMonthKeyFromEvent = (eventOrDateStr) => {
+                const d = typeof eventOrDateStr === 'string' ? eventOrDateStr : (eventOrDateStr?.date || eventOrDateStr?.startDate);
+                if (!d) return getScheduleMonthKey(state.crcCalendarDate);
+                const parts = String(d).substring(0, 10).split('-');
+                return parts.length >= 2 ? `${parts[0]}-${parts[1]}` : null;
             };
 
             /** Events to show in calendar: for CRCs viewing a finalized month, use snapshot merge; otherwise live events. */
@@ -13869,7 +13913,9 @@
                 const roleSelects = form.querySelectorAll('select[name^="role-"]');
                 roleSelects.forEach(select => {
                     if (select.value === crcId) {
-                        select.value = '';
+                        // Use 'UNASSIGNED' so the removal persists on save (empty string can be unreliable in some browsers)
+                        const unassignedOption = Array.from(select.options).find(opt => opt.value === 'UNASSIGNED');
+                        select.value = unassignedOption ? 'UNASSIGNED' : '';
                         select.dispatchEvent(new Event('change', { bubbles: true }));
                     }
                 });
@@ -14003,11 +14049,25 @@
                                 ` : ''}
                                 <input type="month" id="month-selector" value="${currentMonthValue}" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
                                 <button type="button" data-action="${nextAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right" class="w-4 h-4 md:w-5 md:h-5"></i></button>
-                                ${(isAdminUser() || getEffectivePermissionLevel() === 'Manager') ? `
-                                <button type="button" data-action="finalize-schedule-month" id="finalize-schedule-month-btn" class="p-1.5 md:p-2 rounded-md bg-green-600 hover:bg-green-700 text-white text-xs md:text-sm flex items-center gap-1" title="Finalize this month so CRCs see this version">
-                                    <i data-lucide="lock" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Finalize</span>
-                                </button>
-                                ` : ''}
+                                ${(isAdminUser() || getEffectivePermissionLevel() === 'Manager') ? (() => {
+                                    const finalizeMonthKey = getScheduleMonthKey(state.crcCalendarDate);
+                                    const finalizeIsFinalized = !!state.finalizedMonths[finalizeMonthKey];
+                                    const finalizeHasChanges = !!state.scheduleModifiedSinceFinalize[finalizeMonthKey];
+                                    const finalizeNeedsFinalize = !finalizeIsFinalized || finalizeHasChanges;
+                                    const finalizeLastAt = state.finalizedAtByMonth[finalizeMonthKey];
+                                    const finalizeLastAtFormatted = finalizeLastAt ? new Date(finalizeLastAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }) : '';
+                                    const btnClass = finalizeNeedsFinalize
+                                        ? 'p-1.5 md:p-2 rounded-md bg-green-600 hover:bg-green-700 text-white text-xs md:text-sm flex items-center gap-1 finalize-btn-needs-finalize'
+                                        : 'p-1.5 md:p-2 rounded-md bg-gray-500 hover:bg-gray-600 text-white text-xs md:text-sm flex items-center gap-1';
+                                    return `
+                                <div class="flex items-center gap-2 flex-wrap">
+                                    <button type="button" data-action="finalize-schedule-month" id="finalize-schedule-month-btn" class="${btnClass}" title="${finalizeNeedsFinalize ? 'Finalize this month so CRCs see this version' : 'Schedule is finalized'}">
+                                        <i data-lucide="lock" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Finalize</span>
+                                    </button>
+                                    ${finalizeLastAtFormatted ? `<span class="finalize-timestamp-clock text-xs text-gray-600 dark:text-gray-400 whitespace-nowrap" title="Last finalized">The schedule was last finalized at ${finalizeLastAtFormatted}.</span>` : ''}
+                                </div>
+                                    `;
+                                })() : ''}
                             </div>
                         </div>
                     </div>
@@ -29218,8 +29278,12 @@
                         const alreadyFinalized = !!existing?.finalized;
                         if (!alreadyFinalized) {
                             try {
-                                await apiService.upsertSchedule(recordId, { id: recordId, finalized: true, monthKey, snapshotAt: new Date().toISOString(), events: snapshot });
+                                const snapshotAt = new Date().toISOString();
+                                await apiService.upsertSchedule(recordId, { id: recordId, finalized: true, monthKey, snapshotAt, events: snapshot });
                                 state.finalizedMonths[monthKey] = true;
+                                state.finalizedAtByMonth[monthKey] = snapshotAt;
+                                const modNext = { ...state.scheduleModifiedSinceFinalize }; delete modNext[monthKey]; state.scheduleModifiedSinceFinalize = modNext;
+                                setState({ finalizedAtByMonth: { ...state.finalizedAtByMonth, [monthKey]: snapshotAt }, scheduleModifiedSinceFinalize: modNext });
                                 showNotification('Schedule finalized. CRCs will now see this version.', 'success');
                                 if (state.activeTab === 'scheduler') renderCRCCalendar();
                             } catch (err) {
@@ -29244,8 +29308,12 @@
                         const eventsInMonth = (state.crc_events || []).filter(e => { const d = e.date || e.startDate; return d && d >= monthStart && d <= monthEnd; });
                         const snapshot = eventsInMonth.map(e => ({ ...e }));
                         try {
-                            await apiService.upsertSchedule(recordId, { id: recordId, finalized: true, monthKey, snapshotAt: new Date().toISOString(), events: snapshot });
+                            const snapshotAt = new Date().toISOString();
+                            await apiService.upsertSchedule(recordId, { id: recordId, finalized: true, monthKey, snapshotAt, events: snapshot });
                             state.finalizedMonths[monthKey] = true;
+                            state.finalizedAtByMonth[monthKey] = snapshotAt;
+                            const modNext = { ...state.scheduleModifiedSinceFinalize }; delete modNext[monthKey]; state.scheduleModifiedSinceFinalize = modNext;
+                            setState({ finalizedAtByMonth: { ...state.finalizedAtByMonth, [monthKey]: snapshotAt }, scheduleModifiedSinceFinalize: modNext });
                             window._pendingRefinalize = null;
                             closeModal();
                             showNotification('Schedule refinalized. CRCs will now see the updated version.', 'success');
@@ -31069,11 +31137,15 @@
                         }
                         
                         try {
+                            const eventBeforeDelete = state.crc_events.find(e => e.id === eventId);
                             saveStateToUndoHistory();
                             await apiService.deleteEvent(eventId);
                             // Re-fetch events from DB
                             const updatedEvents = await apiService.getEvents();
                             setState({ crc_events: updatedEvents }, { skipRender: true });
+                            if (eventBeforeDelete && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
+                                markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(eventBeforeDelete));
+                            }
                             updateUndoButtonState();
                             showNotification('Event deleted successfully!', 'success');
                             closeModal();
@@ -35646,6 +35718,7 @@
                                                 // Group update: state was already updated in the loop above
                                                 setState({ crc_events: [...state.crc_events] }, { skipRender: false });
                                                 renderContentPreservingScroll();
+                                                markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(updatePayload));
                                             } else {
                                                 const eventIndex = state.crc_events.findIndex(e => e.id === eventId);
                                                 if (eventIndex >= 0) {
@@ -35660,6 +35733,7 @@
                                                 // Force a refresh of the UI to show the updated data
                                                 setState({ crc_events: [...state.crc_events] }, { skipRender: false });
                                                 renderContentPreservingScroll();
+                                                markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(updatePayload));
                                             }
                                         } else {
                                             console.error('CRITICAL ERROR: Shift update failed - updatedEvent is missing or has no ID!', updatedEvent);
