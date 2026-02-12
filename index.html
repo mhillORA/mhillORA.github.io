@@ -1028,7 +1028,8 @@
                 "Good things come to those who wait, but better things come to those who don't micromanage.",
                 "Today is tomorrow's yesterday.",
                 "I'm not stuck, i'm just thinking",
-                "Wake up every day and run faster than a jaguar."
+                "Wake up every day and run faster than a jaguar.",
+                "\"Shoot for the moon and even if you miss you'll land among the stars.\" — Caitlin Black"
             ];
             
             let loadingPhraseInterval = null;
@@ -1222,7 +1223,8 @@
                     return this.request(`/crcs/${id}`);
                 }
 
-                // Events
+                // Events - Backend MUST persist and return roleAssignments, crcId, crcIds for each event
+                // so planning grid and Backend (All Schedule) tab stay in sync after save and on refresh.
                 async getEvents() {
                     return this.request('/events');
                 }
@@ -2051,6 +2053,7 @@
                     });
                 }
 
+                // PUT must persist full event including roleAssignments, crcId, crcIds and return them in the response.
                 async updateEvent(eventId, data) {
                     return this.request(`/events/${eventId}`, {
                         method: 'PUT',
@@ -5450,6 +5453,20 @@
     }
     state.crc_events.push(newEvent);
 };
+
+            /** Merge assignment fields from the payload we sent into the server response.
+             *  Backend MUST persist and return roleAssignments, crcId, crcIds for shifts so planning grid and Backend tab stay in sync.
+             *  If the server response omits them, we preserve what we sent so the same-session UI and re-fetches stay correct. */
+            const mergeEventAssignmentFields = (serverEvent, payload) => {
+                if (!serverEvent || !payload) return serverEvent;
+                const merged = { ...serverEvent };
+                if (payload.roleAssignments != null && typeof payload.roleAssignments === 'object') {
+                    merged.roleAssignments = (merged.roleAssignments && Object.keys(merged.roleAssignments).length > 0) ? merged.roleAssignments : payload.roleAssignments;
+                }
+                if (payload.crcId !== undefined && payload.crcId !== null) merged.crcId = merged.crcId ?? payload.crcId;
+                if (payload.crcIds != null && Array.isArray(payload.crcIds)) merged.crcIds = (merged.crcIds && merged.crcIds.length > 0) ? merged.crcIds : payload.crcIds;
+                return merged;
+            };
             
             // Helper function to safely add multiple events to state without duplicates
             const addEventsToState = (newEvents) => {
@@ -10473,25 +10490,12 @@
                     return '<div class="p-4 text-center text-gray-600 dark:text-gray-400">CRC profile not found. Please contact support.</div>';
                 }
                 
-                // Get all events for this CRC (check both crcId and roleAssignments)
+                // Get all events for this CRC (crcId, crcIds, and roleAssignments)
                 const today = new Date();
                 today.setHours(0, 0, 0, 0);
                 const todayStr = toDateOnlyString(today);
                 
-                const allCrcEvents = (getDisplayEvents() || []).filter(e => {
-                    // Check legacy crcId
-                    if (e.crcId === matchingCrcId) return true;
-                    // Check roleAssignments
-                    if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
-                        return Object.values(e.roleAssignments).some(assignments => {
-                            if (Array.isArray(assignments)) {
-                                return assignments.includes(matchingCrcId);
-                            }
-                            return false;
-                        });
-                    }
-                    return false;
-                });
+                const allCrcEvents = (getDisplayEvents() || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
                 
                 // Filter out PTO/Unavailable/Sick Time and events without studyIds (except Travel Days)
                 const crcEvents = allCrcEvents.filter(e => 
@@ -10714,19 +10718,8 @@
                 // Get events based on view selection
                 let filteredEvents = [];
                 if (dashboardView === 'mySchedule') {
-                    // Only show this CRC's events
-                    filteredEvents = (getDisplayEvents() || []).filter(e => {
-                        if (e.crcId === matchingCrcId) return true;
-                        if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
-                            return Object.values(e.roleAssignments).some(assignments => {
-                                if (Array.isArray(assignments)) {
-                                    return assignments.includes(matchingCrcId);
-                                }
-                                return false;
-                            });
-                        }
-                        return false;
-                    });
+                    // Only show this CRC's events (crcId, crcIds, and roleAssignments)
+                    filteredEvents = (getDisplayEvents() || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
                 } else {
                     // Show all shifts only (entire schedule)
                     filteredEvents = (getDisplayEvents() || []).filter(e => e.type === 'Site Assignment');
@@ -10979,21 +10972,8 @@
                 const daysInMonth = new Date(year, month + 1, 0).getDate();
                 const firstDayOfMonth = new Date(year, month, 1).getDay();
 
-                // Get all events for this CRC
-                const allCrcEvents = (state.crc_events || []).filter(e => {
-                    // Check legacy crcId
-                    if (e.crcId === matchingCrcId) return true;
-                    // Check roleAssignments
-                    if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
-                        return Object.values(e.roleAssignments).some(assignments => {
-                            if (Array.isArray(assignments)) {
-                                return assignments.includes(matchingCrcId);
-                            }
-                            return false;
-                        });
-                    }
-                    return false;
-                });
+                // Get all events for this CRC (crcId, crcIds, and roleAssignments)
+                const allCrcEvents = (state.crc_events || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
                 
                 // Separate time off events from shift events
                 const timeOffTypes = ['Unavailable', 'Paid Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only'];
@@ -35044,8 +35024,9 @@
                                             try {
                                                 const created = await apiService.createEvent(eventPayload);
                                                 if (created && created.id) {
-                                                    createdEvents.push(created);
-                                                    state.crc_events.push(created);
+                                                    const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(created, eventPayload) : created;
+                                                    createdEvents.push(merged);
+                                                    state.crc_events.push(merged);
                                                 }
                                             } catch (error) {
                                                 console.error(`Error creating event for date ${dateStr}:`, error);
@@ -35251,8 +35232,9 @@
                                             try {
                                                 const created = await apiService.createEvent(eventPayload);
                                                 if (created && created.id) {
-                                                    createdEvents.push(created);
-                                                    state.crc_events.push(created);
+                                                    const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(created, eventPayload) : created;
+                                                    createdEvents.push(merged);
+                                                    state.crc_events.push(merged);
                                                 }
                                             } catch (error) {
                                                 console.error(`Error creating event for date ${dateStr}:`, error);
@@ -35560,12 +35542,13 @@
                                                 try {
                                                     const updated = await apiService.updateEvent(groupEvent.id, payloadForDay);
                                                     if (updated && updated.id) {
+                                                        const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(updated, payloadForDay) : updated;
                                                         const idx = state.crc_events.findIndex(e => e.id === groupEvent.id);
                                                         if (idx !== -1) {
-                                                            state.crc_events[idx] = updated;
+                                                            state.crc_events[idx] = merged;
                                                         }
                                                         if (!updatedEvent) {
-                                                            updatedEvent = updated;
+                                                            updatedEvent = merged;
                                                         }
                                                     }
                                                 } catch (groupUpdateError) {
@@ -35577,6 +35560,10 @@
                                         }
                                         if (updatedEvent && updatePayload.travelDayPreferences && !updatedEvent.travelDayPreferences) {
                                             updatedEvent.travelDayPreferences = updatePayload.travelDayPreferences;
+                                        }
+                                        // Ensure assignment fields (roleAssignments, crcId, crcIds) are preserved from payload if server omits them
+                                        if (updatedEvent && typeof mergeEventAssignmentFields === 'function') {
+                                            updatedEvent = mergeEventAssignmentFields(updatedEvent, updatePayload);
                                         }
                                         
                                         // CRITICAL: Update the shift in state - this PRESERVES the shift on the schedule
