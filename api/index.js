@@ -1994,14 +1994,15 @@ async function crudHandler(context, request, containerName) {
                                                         normalized[roleId] = assignments.map(entry => {
                                                             const id = extractCrcId(entry);
                                                             if (id === 'SITE_STAFF') return 'SITE_STAFF';
-                                                            return isValidCrcId(id) ? id : null;
+                                                            if (id === 'UNASSIGNED' || (typeof id === 'string' && id.trim() === '')) return 'UNASSIGNED';
+                                                            return isValidCrcId(id) ? id : 'UNASSIGNED';
                                                         });
                                                     } else {
                                                         const id = extractCrcId(assignments);
-                                                        normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (isValidCrcId(id) ? [id] : [null]);
+                                                        normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (id === 'UNASSIGNED' || !isValidCrcId(id) ? ['UNASSIGNED'] : [id]);
                                                     }
                                                 } catch (e) {
-                                                    normalized[roleId] = Array.isArray(assignments) ? assignments : [null];
+                                                    normalized[roleId] = Array.isArray(assignments) ? assignments : ['UNASSIGNED'];
                                                 }
                                             });
                                             return normalized;
@@ -2209,14 +2210,15 @@ async function crudHandler(context, request, containerName) {
                                                     normalized[roleId] = assignments.map(entry => {
                                                         const id = extractCrcId(entry);
                                                         if (id === 'SITE_STAFF') return 'SITE_STAFF';
-                                                        return isValidCrcId(id) ? id : null;
+                                                        if (id === 'UNASSIGNED' || (typeof id === 'string' && id.trim() === '')) return 'UNASSIGNED';
+                                                        return isValidCrcId(id) ? id : 'UNASSIGNED';
                                                     });
                                                 } else {
                                                     const id = extractCrcId(assignments);
-                                                    normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (isValidCrcId(id) ? [id] : [null]);
+                                                    normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (id === 'UNASSIGNED' || !isValidCrcId(id) ? ['UNASSIGNED'] : [id]);
                                                 }
                                             } catch (e) {
-                                                normalized[roleId] = Array.isArray(assignments) ? assignments : [null];
+                                                normalized[roleId] = Array.isArray(assignments) ? assignments : ['UNASSIGNED'];
                                             }
                                         });
                                         return normalized;
@@ -2913,11 +2915,12 @@ async function crudHandler(context, request, containerName) {
                             normalized[roleId] = assignments.map(entry => {
                                 const id = extractCrcId(entry);
                                 if (id === 'SITE_STAFF') return 'SITE_STAFF';
-                                return isValidCrcId(id) ? id : null;
+                                if (id === 'UNASSIGNED' || (typeof id === 'string' && id.trim() === '')) return 'UNASSIGNED';
+                                return isValidCrcId(id) ? id : 'UNASSIGNED';
                             });
                         } else {
                             const id = extractCrcId(assignments);
-                            normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (isValidCrcId(id) ? [id] : [null]);
+                            normalized[roleId] = id === 'SITE_STAFF' ? ['SITE_STAFF'] : (id === 'UNASSIGNED' || !isValidCrcId(id) ? ['UNASSIGNED'] : [id]);
                         }
                     });
                     return normalized;
@@ -4538,10 +4541,10 @@ app.http('scheduleExport', {
                 startDate = new Date(today.getFullYear(), today.getMonth(), 1);
                 endDate = new Date(today.getFullYear(), today.getMonth() + 1, 0);
             } else {
-                // Weekly: Monday to Sunday of current week
+                // Weekly: Monday to Sunday of current week (do not mutate today)
                 const dayOfWeek = today.getDay();
-                const diff = today.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1); // Adjust when day is Sunday
-                startDate = new Date(today.setDate(diff));
+                const diff = today.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1); // Monday = 1
+                startDate = new Date(today.getFullYear(), today.getMonth(), diff);
                 startDate.setHours(0, 0, 0, 0);
                 endDate = new Date(startDate);
                 endDate.setDate(endDate.getDate() + 6);
