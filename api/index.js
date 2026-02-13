@@ -3533,7 +3533,7 @@ async function crudHandler(context, request, containerName) {
                                     }
                                     
                                     // CRITICAL: Normalize crcIds - requestBody takes precedence, but derive from roleAssignments if needed
-                                    // If requestBody has roleAssignments, extract crcIds from it
+                                    // When requestBody has roleAssignments, always derive crcIds from it (including empty when all UNASSIGNED)
                                     if (requestBody.roleAssignments && typeof requestBody.roleAssignments === 'object') {
                                         const crcIdsFromRoles = new Set();
                                         Object.values(requestBody.roleAssignments).forEach(assignments => {
@@ -3545,9 +3545,7 @@ async function crudHandler(context, request, containerName) {
                                                 });
                                             }
                                         });
-                                        if (crcIdsFromRoles.size > 0) {
-                                            updatedItem.crcIds = Array.from(crcIdsFromRoles);
-                                        }
+                                        updatedItem.crcIds = Array.from(crcIdsFromRoles);
                                     } else if (requestBody.crcIds !== undefined && Array.isArray(requestBody.crcIds)) {
                                         // User provided crcIds directly - use it
                                         updatedItem.crcIds = requestBody.crcIds;
