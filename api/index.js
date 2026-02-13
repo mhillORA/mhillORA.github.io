@@ -3436,23 +3436,8 @@ async function crudHandler(context, request, containerName) {
                                         context.log.warn(`Failed to normalize existingEvent before merge:`, e.message);
                                     }
                                     
-                                    // SAFEGUARD: Detect if update would clear roleAssignments on a Site Assignment
-                                    const existingHasAssignments = normalizedExisting.roleAssignments && 
-                                        typeof normalizedExisting.roleAssignments === 'object' &&
-                                        Object.values(normalizedExisting.roleAssignments).some(arr => Array.isArray(arr) && arr.length > 0);
-                                    const requestHasAssignments = requestBody.roleAssignments && 
-                                        typeof requestBody.roleAssignments === 'object' &&
-                                        Object.values(requestBody.roleAssignments).some(arr => Array.isArray(arr) && arr.length > 0);
-                                    
-                                    // If existing has assignments but request doesn't, PRESERVE existing assignments
-                                    // This prevents accidental clearing of CRC assignments
-                                    if (existingHasAssignments && !requestHasAssignments && normalizedExisting.type === 'Site Assignment') {
-                                        context.log.warn(`[SAFEGUARD] Preserving roleAssignments for Site Assignment ${updateId} - request would have cleared them`);
-                                        // Don't let requestBody.roleAssignments overwrite - preserve existing
-                                        if (requestBody.roleAssignments !== undefined) {
-                                            delete requestBody.roleAssignments;
-                                        }
-                                    }
+                                    // When client sends roleAssignments (including all UNASSIGNED), always use it.
+                                    // Do NOT preserve existing assignments - that prevented removals from saving.
                                     
                                     // Now merge normalized existing with requestBody (requestBody is already normalized)
                                     updatedItem = { ...normalizedExisting, ...requestBody, id: updateId };
