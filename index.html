@@ -2364,7 +2364,9 @@
                 timeOffCollapsedEmployees: {},
                 managerViewIncludeTravel: true, // Default to including travel time in Manager's view
                 managerViewNotificationsEnabled: true, // Default to enabled for unfilled shift notifications
-                managerViewUtilizationPeriod: 'month', // 'month', 'week', or 'nextMonth' for utilization display
+                managerViewUtilizationPeriod: 'month', // legacy; used only when custom range not set
+                managerViewUtilizationStartDate: null, // custom range start (YYYY-MM-DD)
+                managerViewUtilizationEndDate: null,   // custom range end (YYYY-MM-DD)
                 changeLog: [], // Track changes for Catch-Up feature
                 undoHistory: [], // Stack of previous event states for undo functionality
                 undoHistoryMaxSize: 10, // Maximum number of undo states to keep
@@ -6722,11 +6724,11 @@
                     if (state.currentUser && getEffectivePermissionLevel() === 'CRC') {
                         // Remove tabs that CRCs should not access:
                         // - scheduler (they use My Schedule and read-only Planning Grid instead)
-                        // - timeOffRequests (they can only see their own time off, not manage others)
                         // - dashboard (replaced with CRC Dashboard)
                         // - managerView (manager only)
                         // - reporting (manager/supervisor only)
-                        tabs = tabs.filter(tab => !['dashboard', 'scheduler', 'timeOffRequests', 'managerView', 'reporting', 'communications'].includes(tab.id));
+                        // CRCs keep access to timeOff and timeOffRequests
+                        tabs = tabs.filter(tab => !['dashboard', 'scheduler', 'managerView', 'reporting', 'communications'].includes(tab.id));
                         // Add CRC Dashboard, My Schedule, and Planning Grid (read-only) at the beginning
                         tabs.unshift({ id: 'dashboard', label: 'CRC Dashboard' });
                         tabs.splice(1, 0, { id: 'crc-schedule', label: 'My Schedule' });
@@ -12420,13 +12422,19 @@
                         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                             <!-- Resource Utilization -->
                             <div id="manager-resource-utilization" class="bg-white dark:bg-gray-800 p-4 md:p-6 rounded-lg shadow-md">
-                                <div class="flex justify-between items-center mb-4">
+                                <div class="flex flex-wrap justify-between items-center gap-3 mb-4">
                                     <h4 class="text-lg font-semibold dark:text-gray-200">Resource Utilization</h4>
-                                    <select id="manager-utilization-period" class="text-sm border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white px-2 py-1">
-                                        <option value="month" ${state.managerViewUtilizationPeriod === 'month' ? 'selected' : ''}>This Month</option>
-                                        <option value="week" ${state.managerViewUtilizationPeriod === 'week' ? 'selected' : ''}>This Week</option>
-                                        <option value="nextMonth" ${state.managerViewUtilizationPeriod === 'nextMonth' ? 'selected' : ''}>Next Month</option>
-                                    </select>
+                                    <div class="flex flex-wrap items-center gap-2">
+                                        <label class="text-xs text-gray-600 dark:text-gray-400">From</label>
+                                        <input type="date" id="manager-utilization-start" class="text-sm border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white px-2 py-1" value="${state.managerViewUtilizationStartDate || (() => { const d = new Date(); d.setDate(1); return d.toISOString().slice(0,10); })()}">
+                                        <label class="text-xs text-gray-600 dark:text-gray-400">To</label>
+                                        <input type="date" id="manager-utilization-end" class="text-sm border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white px-2 py-1" value="${state.managerViewUtilizationEndDate || (() => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth() + 1, 0).toISOString().slice(0,10); })()}">
+                                        <div class="flex gap-1 flex-wrap">
+                                            <button type="button" data-action="manager-utilization-preset" data-preset="week" class="text-xs px-2 py-1 rounded border dark:border-gray-600 bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300">This Week</button>
+                                            <button type="button" data-action="manager-utilization-preset" data-preset="month" class="text-xs px-2 py-1 rounded border dark:border-gray-600 bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300">This Month</button>
+                                            <button type="button" data-action="manager-utilization-preset" data-preset="nextMonth" class="text-xs px-2 py-1 rounded border dark:border-gray-600 bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300">Next Month</button>
+                                        </div>
+                                    </div>
                                 </div>
                                 <div id="resource-utilization-content"></div>
                             </div>
@@ -15987,42 +15995,6 @@
                     gridHtml += `</tr>`;
                 }
                 
-                // Time off row ON the grid: one cell per day (grid shows first 8 days of month with 2 cols each = 4 days)
-                const timeOffTypesShift = ['Time Off', 'Paid Time Off', 'PTO', 'Unavailable', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Sick', 'Jury Duty'];
-                const timeOffByDateShift = {};
-                const monthStartShift = new Date(year, month, 1);
-                const monthEndShift = new Date(year, month, 4);
-                for (let day = 1; day <= 4; day++) {
-                    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                    const names = [];
-                    (state.crc_events || []).filter(e => e.date === dateStr && timeOffTypesShift.includes(e.type)).forEach(e => {
-                        const id = e.crcId || (e.crcIds && e.crcIds[0]);
-                        if (id) {
-                            const c = state.crcs.find(c => c.id === id);
-                            if (c && !names.includes(c.name)) names.push(c.name);
-                        }
-                    });
-                    (state.timeOffRequests || []).filter(req => normalizeTimeOffStatus(req.status) === 'approved').forEach(req => {
-                        const entries = getDailyEntriesForTimeOffRequest(req, monthStartShift, monthEndShift);
-                        if (entries.some(ent => ent.dateStr === dateStr) && req.crcId) {
-                            const c = state.crcs.find(c => c.id === req.crcId);
-                            if (c && !names.includes(c.name)) names.push(c.name);
-                        }
-                    });
-                    timeOffByDateShift[dateStr] = names;
-                }
-                const timeOffRowBgShift = isDarkMode ? '#374151' : '#e5e7eb';
-                const timeOffRowTextShift = getContrastColor(timeOffRowBgShift);
-                gridHtml += `<tr class="border-t-2 dark:border-gray-700">`;
-                gridHtml += `<td class="p-1 text-center sticky left-0 font-semibold border-r dark:border-gray-700" style="background-color: ${timeOffRowBgShift}; color: ${timeOffRowTextShift};">Time Off</td>`;
-                for (let day = 1; day <= 4; day++) {
-                    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                    const names = timeOffByDateShift[dateStr] || [];
-                    const cellContent = names.length > 0 ? names.map(n => (n || '').replace(/</g, '&lt;')).join(', ') : '—';
-                    gridHtml += `<td colspan="2" class="p-1 text-xs border-l dark:border-gray-700 align-top" style="background-color: ${timeOffRowBgShift}; color: ${timeOffRowTextShift};" title="${names.length > 0 ? names.join(', ') : 'No time off'}">${cellContent}</td>`;
-                }
-                gridHtml += `</tr>`;
-
                 gridHtml += `</tbody>`;
                 gridHtml += `</table>`;
                 gridHtml += `</div>`;
@@ -16543,43 +16515,6 @@
                     });
                 });
 
-                // Time off row ON the grid: one cell per day of the week
-                const timeOffTypesWeek = ['Time Off', 'Paid Time Off', 'PTO', 'Unavailable', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Sick', 'Jury Duty'];
-                const timeOffByDateWeek = {};
-                const weekStart = new Date(startOfWeek);
-                const weekEnd = new Date(startOfWeek.getTime() + 6 * 24 * 60 * 60 * 1000);
-                weekDays.forEach((d, idx) => {
-                    const dateStr = toDateOnlyString(d);
-                    const names = [];
-                    (state.crc_events || []).filter(e => e.date === dateStr && timeOffTypesWeek.includes(e.type)).forEach(e => {
-                        const id = e.crcId || (e.crcIds && e.crcIds[0]);
-                        if (id) {
-                            const c = state.crcs.find(c => c.id === id);
-                            if (c && !names.includes(c.name)) names.push(c.name);
-                        }
-                    });
-                    (state.timeOffRequests || []).filter(req => normalizeTimeOffStatus(req.status) === 'approved').forEach(req => {
-                        const entries = getDailyEntriesForTimeOffRequest(req, weekStart, weekEnd);
-                        const hit = entries.find(ent => ent.dateStr === dateStr);
-                        if (hit && req.crcId) {
-                            const c = state.crcs.find(c => c.id === req.crcId);
-                            if (c && !names.includes(c.name)) names.push(c.name);
-                        }
-                    });
-                    timeOffByDateWeek[dateStr] = names;
-                });
-                const timeOffRowBgWeek = isDarkMode ? '#374151' : '#e5e7eb';
-                const timeOffRowTextWeek = getContrastColor(timeOffRowBgWeek);
-                tableHtml += `<tr class="border-t-2 dark:border-gray-600" style="position: sticky; top: 6.7rem; z-index: 19;"><td class="global-view-study-header p-2 sticky left-0 z-20 font-semibold pl-8" style="background-color: ${timeOffRowBgWeek}; color: ${timeOffRowTextWeek}; width: 200px; min-width: 200px; max-width: 200px; box-sizing: border-box;"><i data-lucide="calendar-off" class="w-4 h-4 inline-block mr-1 align-middle"></i>Time Off</td>`;
-                weekDays.forEach((day, dayIndex) => {
-                    const dateStr = toDateOnlyString(day);
-                    const names = timeOffByDateWeek[dateStr] || [];
-                    const firstDayBorder = dayIndex === 0 ? ' border-l-2 border-gray-400 dark:border-gray-500' : ' border-l dark:border-gray-700';
-                    const cellContent = names.length > 0 ? names.map(n => (n || '').replace(/</g, '&lt;')).join(', ') : '—';
-                    tableHtml += `<td class="global-view-cell p-1 text-xs align-top${firstDayBorder}" style="background-color: ${timeOffRowBgWeek}; color: ${timeOffRowTextWeek};" title="${names.length > 0 ? names.join(', ') : 'No time off'}">${cellContent}</td>`;
-                });
-                tableHtml += `</tr>`;
-
                 tableHtml += `</tbody></table></div></div>`;
                 
                 // Initialize dual scroll after render
@@ -17019,30 +16954,6 @@
                         tableHtml += `</tr>`;
                     });
                 });
-
-                // Time off row ON the grid for this day
-                const timeOffTypesDaily = ['Time Off', 'Paid Time Off', 'PTO', 'Unavailable', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Sick', 'Jury Duty'];
-                const timeOffNamesDaily = [];
-                (state.crc_events || []).filter(e => e.date === dateStr && timeOffTypesDaily.includes(e.type)).forEach(e => {
-                    const id = e.crcId || (e.crcIds && e.crcIds[0]);
-                    if (id) {
-                        const c = state.crcs.find(c => c.id === id);
-                        if (c && !timeOffNamesDaily.includes(c.name)) timeOffNamesDaily.push(c.name);
-                    }
-                });
-                (state.timeOffRequests || []).filter(req => normalizeTimeOffStatus(req.status) === 'approved').forEach(req => {
-                    const entries = getDailyEntriesForTimeOffRequest(req, day, day);
-                    if (entries.some(ent => ent.dateStr === dateStr) && req.crcId) {
-                        const c = state.crcs.find(c => c.id === req.crcId);
-                        if (c && !timeOffNamesDaily.includes(c.name)) timeOffNamesDaily.push(c.name);
-                    }
-                });
-                const timeOffRowBgDaily = isDarkMode ? '#374151' : '#e5e7eb';
-                const timeOffRowTextDaily = getContrastColor(timeOffRowBgDaily);
-                const timeOffCellContent = timeOffNamesDaily.length > 0 ? timeOffNamesDaily.map(n => (n || '').replace(/</g, '&lt;')).join(', ') : '—';
-                tableHtml += `<tr class="border-t-2 dark:border-gray-600" style="position: sticky; top: ${isMobile ? '5.5rem' : '6.7rem'}; z-index: 19;"><td class="global-view-study-header ${tablePadding} sticky left-0 z-20 font-semibold ${isMobile ? 'pl-2' : 'pl-8'}" style="background-color: ${timeOffRowBgDaily}; color: ${timeOffRowTextDaily};"><i data-lucide="calendar-off" class="w-4 h-4 inline-block mr-1 align-middle"></i>Time Off</td>`;
-                tableHtml += `<td class="global-view-cell p-1 text-xs align-top border-l dark:border-gray-700" style="background-color: ${timeOffRowBgDaily}; color: ${timeOffRowTextDaily};" title="${timeOffNamesDaily.length > 0 ? timeOffNamesDaily.join(', ') : 'No time off'}">${timeOffCellContent}</td>`;
-                tableHtml += `</tr>`;
 
                 tableHtml += `</tbody></table></div></div>`;
                 
@@ -17786,43 +17697,6 @@
                         tableHtml += `</tr>`;
                     });
                 });
-
-                // Time off row ON the grid: one cell per day
-                const timeOffTypes = ['Time Off', 'Paid Time Off', 'PTO', 'Unavailable', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Sick', 'Jury Duty'];
-                const timeOffByDate = {};
-                const monthStart = new Date(year, month, 1);
-                const monthEnd = new Date(year, month + 1, 0);
-                for (let day = 1; day <= daysInMonth; day++) {
-                    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                    const names = [];
-                    (state.crc_events || []).filter(e => e.date === dateStr && timeOffTypes.includes(e.type)).forEach(e => {
-                        const id = e.crcId || (e.crcIds && e.crcIds[0]);
-                        if (id) {
-                            const c = state.crcs.find(c => c.id === id);
-                            if (c && !names.includes(c.name)) names.push(c.name);
-                        }
-                    });
-                    (state.timeOffRequests || []).filter(req => normalizeTimeOffStatus(req.status) === 'approved').forEach(req => {
-                        const entries = getDailyEntriesForTimeOffRequest(req, monthStart, monthEnd);
-                        const hit = entries.find(ent => ent.dateStr === dateStr);
-                        if (hit && req.crcId) {
-                            const c = state.crcs.find(c => c.id === req.crcId);
-                            if (c && !names.includes(c.name)) names.push(c.name);
-                        }
-                    });
-                    timeOffByDate[dateStr] = names;
-                }
-                const timeOffRowBg = isDarkMode ? '#374151' : '#e5e7eb';
-                const timeOffRowText = getContrastColor(timeOffRowBg);
-                tableHtml += `<tr class="border-t-2 dark:border-gray-600" style="position: sticky; top: 6.7rem; z-index: 19;"><td class="global-view-study-header p-2 sticky left-0 z-20 font-semibold" style="background-color: ${timeOffRowBg}; color: ${timeOffRowText}; width: 200px; min-width: 200px; max-width: 200px; box-sizing: border-box;"><i data-lucide="calendar-off" class="w-4 h-4 inline-block mr-1 align-middle"></i>Time Off</td>`;
-                for (let day = 1; day <= daysInMonth; day++) {
-                    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                    const names = timeOffByDate[dateStr] || [];
-                    const firstDayBorder = day === 1 ? ' border-l-2 border-gray-400 dark:border-gray-500' : ' border-l dark:border-gray-700';
-                    const cellContent = names.length > 0 ? names.map(n => (n || '').replace(/</g, '&lt;')).join(', ') : '—';
-                    tableHtml += `<td class="global-view-cell p-1 text-xs align-top${firstDayBorder}" style="background-color: ${timeOffRowBg}; color: ${timeOffRowText};" title="${names.length > 0 ? names.join(', ') : 'No time off'}">${cellContent}</td>`;
-                }
-                tableHtml += `</tr>`;
 
                 tableHtml += `</tbody></table></div></div>`;
                 
@@ -29629,6 +29503,37 @@
                         } else {
                             setState({ activeTab: desiredTab });
                         }
+                        break;
+                    }
+                    case 'manager-utilization-preset': {
+                        const preset = actionButton.dataset.preset || actionButton.getAttribute('data-preset');
+                        const now = new Date();
+                        let startStr, endStr;
+                        if (preset === 'week') {
+                            const weekStart = new Date(now);
+                            weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+                            const weekEnd = new Date(weekStart);
+                            weekEnd.setDate(weekEnd.getDate() + 6);
+                            startStr = weekStart.toISOString().slice(0, 10);
+                            endStr = weekEnd.toISOString().slice(0, 10);
+                        } else if (preset === 'nextMonth') {
+                            const y = now.getFullYear();
+                            const m = now.getMonth() + 1;
+                            const nextY = m > 11 ? y + 1 : y;
+                            const nextM = m > 11 ? 0 : m;
+                            startStr = `${nextY}-${String(nextM + 1).padStart(2, '0')}-01`;
+                            endStr = new Date(nextY, nextM + 1, 0).toISOString().slice(0, 10);
+                        } else {
+                            // month (this month)
+                            startStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+                            endStr = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
+                        }
+                        setState({ managerViewUtilizationStartDate: startStr, managerViewUtilizationEndDate: endStr });
+                        const startEl = document.getElementById('manager-utilization-start');
+                        const endEl = document.getElementById('manager-utilization-end');
+                        if (startEl) startEl.value = startStr;
+                        if (endEl) endEl.value = endStr;
+                        if (typeof renderResourceUtilization === 'function') renderResourceUtilization();
                         break;
                     }
                     case 'catch-up': {
@@ -41990,10 +41895,19 @@
                         });
                     }
                     
-                    const utilizationPeriodSelect = document.getElementById('manager-utilization-period');
-                    if (utilizationPeriodSelect) {
-                        utilizationPeriodSelect.addEventListener('change', (e) => {
-                            setState({ managerViewUtilizationPeriod: e.target.value });
+                    const utilizationStart = document.getElementById('manager-utilization-start');
+                    const utilizationEnd = document.getElementById('manager-utilization-end');
+                    if (utilizationStart) {
+                        utilizationStart.addEventListener('change', (e) => {
+                            const start = e.target.value;
+                            setState({ managerViewUtilizationStartDate: start || null });
+                            renderResourceUtilization();
+                        });
+                    }
+                    if (utilizationEnd) {
+                        utilizationEnd.addEventListener('change', (e) => {
+                            const end = e.target.value;
+                            setState({ managerViewUtilizationEndDate: end || null });
                             renderResourceUtilization();
                         });
                     }
@@ -42541,35 +42455,45 @@
                 if (!container) return;
 
                 const now = new Date();
-                const period = state.managerViewUtilizationPeriod || 'month';
                 let startDate, endDate, periodLabel;
-                
-                if (period === 'week') {
-                    // This week (Sunday to Saturday)
-                    const weekStart = new Date(now);
-                    weekStart.setDate(weekStart.getDate() - weekStart.getDay()); // Sunday
-                    const weekEnd = new Date(weekStart);
-                    weekEnd.setDate(weekEnd.getDate() + 6); // Saturday
-                    startDate = weekStart;
-                    endDate = weekEnd;
-                    periodLabel = `This Week (${weekStart.toLocaleDateString()} - ${weekEnd.toLocaleDateString()})`;
-                } else if (period === 'nextMonth') {
-                    // Next month
-                    const nextMonth = now.getMonth() + 1;
-                    const nextMonthYear = now.getFullYear();
-                    // Handle year rollover
-                    const actualNextMonth = nextMonth > 11 ? 0 : nextMonth;
-                    const actualNextMonthYear = nextMonth > 11 ? nextMonthYear + 1 : nextMonthYear;
-                    startDate = new Date(actualNextMonthYear, actualNextMonth, 1);
-                    endDate = new Date(actualNextMonthYear, actualNextMonth + 1, 0);
-                    periodLabel = `Next Month (${startDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })})`;
+                const customStart = state.managerViewUtilizationStartDate;
+                const customEnd = state.managerViewUtilizationEndDate;
+
+                if (customStart && customEnd) {
+                    startDate = new Date(customStart + 'T00:00:00');
+                    endDate = new Date(customEnd + 'T00:00:00');
+                    if (startDate > endDate) {
+                        const swap = endDate;
+                        endDate = startDate;
+                        startDate = swap;
+                    }
+                    const days = Math.round((endDate - startDate) / (24 * 60 * 60 * 1000)) + 1;
+                    periodLabel = `${startDate.toLocaleDateString()} – ${endDate.toLocaleDateString()} (${days} day${days !== 1 ? 's' : ''})`;
                 } else {
-                    // This month
-                    const currentMonth = now.getMonth();
-                    const currentYear = now.getFullYear();
-                    startDate = new Date(currentYear, currentMonth, 1);
-                    endDate = new Date(currentYear, currentMonth + 1, 0);
-                    periodLabel = `This Month (${startDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })})`;
+                    const period = state.managerViewUtilizationPeriod || 'month';
+                    if (period === 'week') {
+                        const weekStart = new Date(now);
+                        weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+                        const weekEnd = new Date(weekStart);
+                        weekEnd.setDate(weekEnd.getDate() + 6);
+                        startDate = weekStart;
+                        endDate = weekEnd;
+                        periodLabel = `This Week (${weekStart.toLocaleDateString()} - ${weekEnd.toLocaleDateString()})`;
+                    } else if (period === 'nextMonth') {
+                        const nextMonth = now.getMonth() + 1;
+                        const nextMonthYear = now.getFullYear();
+                        const actualNextMonth = nextMonth > 11 ? 0 : nextMonth;
+                        const actualNextMonthYear = nextMonth > 11 ? nextMonthYear + 1 : nextMonthYear;
+                        startDate = new Date(actualNextMonthYear, actualNextMonth, 1);
+                        endDate = new Date(actualNextMonthYear, actualNextMonth + 1, 0);
+                        periodLabel = `Next Month (${startDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })})`;
+                    } else {
+                        const currentMonth = now.getMonth();
+                        const currentYear = now.getFullYear();
+                        startDate = new Date(currentYear, currentMonth, 1);
+                        endDate = new Date(currentYear, currentMonth + 1, 0);
+                        periodLabel = `This Month (${startDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })})`;
+                    }
                 }
                 
                 // Helper function to get all dates in range
@@ -42659,26 +42583,26 @@
                     });
                     
                     const availableDays = allDates.length - unavailableDates.size;
-                    
+                    const numDays = allDates.length;
+                    const isWeekLike = numDays <= 7;
+
                     let hoursAvailable, maxHoursForPercent;
-                    
+
                     if (isFTE) {
-                        if (period === 'week') {
+                        if (isWeekLike) {
                             hoursAvailable = 40; // FTE: 40 hours/week
                             maxHoursForPercent = 40;
                         } else {
-                            // FTE: 40 hours/week * weeks in month
-                            const weeksInMonth = allDates.length / 7;
-                            hoursAvailable = weeksInMonth * 40;
-                            maxHoursForPercent = 160; // 160 hours/month is 100% for both
+                            const weeksInRange = numDays / 7;
+                            hoursAvailable = weeksInRange * 40;
+                            maxHoursForPercent = Math.max(160, weeksInRange * 40); // 160h/month baseline
                         }
                     } else {
-                        // PTE/Contractor: available days * 10 hours/day
                         hoursAvailable = availableDays * 10;
-                        if (period === 'week') {
-                            maxHoursForPercent = 40; // Use 40 hours/week as max for percentage
+                        if (isWeekLike) {
+                            maxHoursForPercent = 40;
                         } else {
-                            maxHoursForPercent = 160; // 160 hours/month is 100%
+                            maxHoursForPercent = Math.max(160, (numDays / 30) * 160);
                         }
                     }
                     
@@ -42704,10 +42628,12 @@
                     return;
                 }
 
+                const rangeDays = Math.round((endDate - startDate) / (24 * 60 * 60 * 1000)) + 1;
+                const rangeHint = rangeDays <= 7 ? 'FTE: 40h/week max | Contractor: Available days × 10h/day' : 'FTE/Contractor: scaled to range (160h/month = 100% baseline)';
                 container.innerHTML = `
                     <div class="mb-3 p-2 bg-blue-50 dark:bg-blue-900/20 rounded-md border border-blue-200 dark:border-blue-800">
                         <p class="text-xs text-blue-700 dark:text-blue-300 font-semibold">${periodLabel}</p>
-                        <p class="text-xs text-blue-600 dark:text-blue-400 mt-1">${period === 'week' ? 'FTE: 40h/week max | Contractor: Available days × 10h/day' : 'Both: 160h/month max (100%)'}</p>
+                        <p class="text-xs text-blue-600 dark:text-blue-400 mt-1">${rangeHint}</p>
                         <p class="text-xs text-blue-600 dark:text-blue-400 mt-1">Studies = ARTEMIS · Training = CHAOS</p>
                     </div>
                     <div class="space-y-3">
