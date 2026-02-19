@@ -2337,6 +2337,8 @@
                 scheduleModifiedSinceFinalize: {},
                 /** For CRCs viewing a finalized month: merged list (live events outside month + snapshot inside month). Undefined for managers or when not viewing finalized month. */
                 crc_events_display: undefined,
+                /** When set by Manager/Admin: preview the app as this CRC (view-as mode). Null = normal view. */
+                viewAsCrcId: null,
                 travelFilterQuarter: null,
                 travelFilterYear: null,
                 travelFilterStartDate: null,
@@ -6250,8 +6252,12 @@
                 return level === 'full';
             };
             
-            // Helper function to get logged-in CRC's ID
+            const isViewingAsCrc = () => !!(state.viewAsCrcId && state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'));
+            const effectiveIsCrcView = () => (state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) || isViewingAsCrc();
+
+            // Helper function to get logged-in CRC's ID (when viewing as CRC, returns that CRC's id for display)
             const getLoggedInCrcId = () => {
+                if (isViewingAsCrc()) return state.viewAsCrcId;
                 if (!state.currentUser || (getEffectivePermissionLevel() !== 'CRC' || isAdminUser())) {
                     return null;
                 }
@@ -6713,23 +6719,21 @@
                 
                 // Filter tabs based on permissions
                 let tabs = allTabs.filter(tab => canAccessTab(tab.id));
-                
-                // Admin users get all tabs (full access) - skip filtering
-                if (isAdminUser()) {
-                    // Admin gets all tabs including Users and Backend
+
+                if (isViewingAsCrc()) {
+                    tabs = tabs.filter(tab => !['dashboard', 'scheduler', 'managerView', 'reporting', 'communications'].includes(tab.id));
+                    tabs.unshift({ id: 'dashboard', label: 'CRC Dashboard' });
+                    tabs.splice(1, 0, { id: 'crc-schedule', label: 'My Schedule' });
+                    tabs.splice(2, 0, { id: 'planning-grid', label: 'Planning Grid' });
+                } else if (isAdminUser()) {
+                    // Admin gets all tabs (full access) - skip filtering
                     tabs.push({ id: 'users', label: 'Users' });
                     tabs.push({ id: 'allSchedule', label: 'Backend - Admin Only' });
                 } else {
                     // For CRC users, customize their tab access
                     if (state.currentUser && getEffectivePermissionLevel() === 'CRC') {
-                        // Remove tabs that CRCs should not access:
-                        // - scheduler (they use My Schedule and read-only Planning Grid instead)
-                        // - dashboard (replaced with CRC Dashboard)
-                        // - managerView (manager only)
-                        // - reporting (manager/supervisor only)
-                        // CRCs keep access to timeOff and timeOffRequests
+                        // Remove tabs that CRCs should not access
                         tabs = tabs.filter(tab => !['dashboard', 'scheduler', 'managerView', 'reporting', 'communications'].includes(tab.id));
-                        // Add CRC Dashboard, My Schedule, and Planning Grid (read-only) at the beginning
                         tabs.unshift({ id: 'dashboard', label: 'CRC Dashboard' });
                         tabs.splice(1, 0, { id: 'crc-schedule', label: 'My Schedule' });
                         tabs.splice(2, 0, { id: 'planning-grid', label: 'Planning Grid' });
@@ -6761,7 +6765,12 @@
                                 }).join('')}
                             </nav>
                             <div class="flex items-center gap-4">
-                                ${state.currentUser ? `
+                                ${isViewingAsCrc() ? `
+                                    <div class="flex items-center gap-2 text-sm flex-wrap">
+                                        <span class="px-3 py-1.5 rounded-md bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200 font-medium">Viewing as: ${(state.crcs.find(c => c.id === state.viewAsCrcId) || {}).name || 'CRC'}</span>
+                                        <button data-action="exit-view-as-crc" class="px-3 py-1.5 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 text-gray-800 dark:text-gray-200 text-sm font-medium">Exit view</button>
+                                    </div>
+                                ` : state.currentUser ? `
                                     <div class="flex items-center gap-2 text-sm">
                                         <span class="text-gray-600 dark:text-gray-400 hidden lg:inline">Logged in as:</span>
                                         <span class="font-medium text-gray-900 dark:text-white">${state.currentUser.username}</span>
@@ -7314,8 +7323,8 @@
                     if (typeof initializeSchedulerMap === 'function') setTimeout(() => initializeSchedulerMap(), 200);
                     if (typeof initializeDeploymentMap === 'function') setTimeout(() => initializeDeploymentMap(), 300);
                     setTimeout(() => lucide.createIcons(), 100);
-                } else if (state.activeTab === 'planning-grid' && state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
-                    // CRC read-only Planning Grid: same calendar UI as managers but no sidebar; view-only
+                } else if (state.activeTab === 'planning-grid' && effectiveIsCrcView()) {
+                    // CRC read-only Planning Grid (or view-as-CRC): same calendar UI, no sidebar; view-only
                     const sk = getScheduleMonthKey(state.crcCalendarDate);
                     _lastRenderedTab = state.activeTab;
                     mainAppContent.innerHTML = getSchedulerHTML();
@@ -7363,8 +7372,8 @@
                         state.dashboardEndDate = toDateOnlyString(currentMonthEnd);
                     }
                     
-                    // Show CRC Dashboard for non-managers, regular dashboard for managers
-                    if (state.currentUser && !isAdminUser() && getEffectivePermissionLevel() !== 'Manager') {
+                    // Show CRC Dashboard for CRCs or when viewing as CRC; regular dashboard for managers
+                    if (state.currentUser && (effectiveIsCrcView() || (!isAdminUser() && getEffectivePermissionLevel() !== 'Manager'))) {
                         mainAppContent.innerHTML = getCRCDashboardHTML();
                         setTimeout(() => {
                             renderCRCDashboardCalendar();
@@ -10357,7 +10366,7 @@
                 const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
                 const isCRC = state.currentUser && state.currentUser.permissionLevel === 'CRC';
                 const isCollapsed = state.sidebarCollapsed || false;
-                const sidebarHidden = isSupervisor || isCRC; // Hide sidebar for supervisors and CRCs
+                const sidebarHidden = isSupervisor || isCRC || isViewingAsCrc(); // Hide sidebar for supervisors, CRCs, and when viewing as CRC
                 return `
                 ${!sidebarHidden ? `
                 <aside id="schedule-sidebar" class="bg-white dark:bg-gray-800 rounded-lg shadow-md flex flex-col transition-all duration-300 ${isCollapsed ? 'w-12 lg:w-12 p-2' : 'w-full lg:w-1/3 xl:w-1/4 p-3 md:p-6'} ${isCollapsed ? '' : 'space-y-4 md:space-y-6'}">
@@ -12604,9 +12613,16 @@
                                             </div>
                                         </div>
                                         
-                                        <button data-action="view-crc-profile" data-id="${crc.id}" class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors text-sm">
-                                            View & Edit Profile
-                                        </button>
+                                        <div class="flex gap-2">
+                                            <button data-action="view-crc-profile" data-id="${crc.id}" class="flex-1 bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors text-sm">
+                                                View & Edit Profile
+                                            </button>
+                                            ${(isAdminUser() || getEffectivePermissionLevel() === 'Manager') ? `
+                                            <button data-action="set-view-as-crc" data-crc-id="${crc.id}" class="px-3 py-2 rounded-md bg-amber-500 text-white hover:bg-amber-600 transition-colors text-sm" title="See dashboard and schedule as this CRC">
+                                                <i data-lucide="eye" class="w-4 h-4"></i>
+                                            </button>
+                                            ` : ''}
+                                        </div>
                                     </div>
                                 `;
                             }).join('')}
@@ -13850,12 +13866,16 @@
                     const record = await apiService.getSchedule(recordId);
                     // Race guard: user may have navigated to another month while we were fetching
                     if (getScheduleMonthKey(state.crcCalendarDate) !== monthKey) return;
-                    const snapshotEvents = Array.isArray(record?.events) ? record.events : [];
+                    const rawSnapshot = Array.isArray(record?.events) ? record.events : [];
                     const [y, m] = monthKey.split('-').map(Number);
                     const monthStart = `${y}-${String(m).padStart(2, '0')}-01`;
                     const monthEnd = toDateOnlyString(new Date(y, m, 0));
+                    const snapshotEvents = rawSnapshot.filter(e => {
+                        const d = (e.date || e.startDate || '').toString().substring(0, 10);
+                        return d && d >= monthStart && d <= monthEnd;
+                    });
                     const liveEvents = (state.crc_events || []).filter(e => {
-                        const d = e.date || e.startDate;
+                        const d = (e.date || e.startDate || '').toString().substring(0, 10);
                         if (!d) return true;
                         return d < monthStart || d > monthEnd;
                     });
@@ -14135,7 +14155,7 @@
                                 ` : ''}
                                 <input type="month" id="month-selector" value="${currentMonthValue}" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-xs md:text-sm">
                                 <button type="button" data-action="${nextAction}" class="p-1.5 md:p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right" class="w-4 h-4 md:w-5 md:h-5"></i></button>
-                                ${(isAdminUser() || getEffectivePermissionLevel() === 'Manager') ? (() => {
+                                ${(isAdminUser() || getEffectivePermissionLevel() === 'Manager') && !isViewingAsCrc() ? (() => {
                                     const finalizeMonthKey = getScheduleMonthKey(state.crcCalendarDate);
                                     const finalizeIsFinalized = !!state.finalizedMonths[finalizeMonthKey];
                                     const finalizeHasChanges = !!state.scheduleModifiedSinceFinalize[finalizeMonthKey];
@@ -14165,6 +14185,11 @@
                                     <button type="button" data-action="finalize-schedule-month" id="finalize-schedule-month-btn" class="${btnClass}" title="${finalizeNeedsFinalize ? 'Finalize this month so CRCs see this version' : 'Schedule is finalized'}">
                                         <i data-lucide="lock" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Finalize</span>
                                     </button>
+                                    ${finalizeIsFinalized ? `
+                                    <button type="button" data-action="unfinalize-schedule-month" id="unfinalize-schedule-month-btn" class="p-1.5 md:p-2 rounded-md bg-amber-600 hover:bg-amber-700 text-white text-xs md:text-sm flex items-center gap-1" title="Unfinalize this month so CRCs see live schedule again; you can refinalize after making changes">
+                                        <i data-lucide="lock-open" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Unfinalize</span>
+                                    </button>
+                                    ` : ''}
                                     ${finalizeLastAtFormatted ? `<span class="finalize-timestamp-clock whitespace-nowrap" title="Last finalized">Last finalized <span class="finalize-time">${finalizeLastAtFormatted}</span></span>` : ''}
                                 </div>
                                     `;
@@ -25101,15 +25126,17 @@
                 ` : '<p class="text-sm text-gray-500 dark:text-gray-400 mt-4">No training records found.</p>';
                 
                 const canEditCRCs = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC');
+                const canViewAs = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager');
                 return `
                     <div class="flex justify-between items-start mb-4">
                         <h2 class="text-2xl font-bold dark:text-white">CRC Profile: ${crc.name}</h2>
-                        ${canEditCRCs ? `
-                        <div class="flex gap-2">
+                        <div class="flex gap-2 flex-wrap">
+                            ${canViewAs ? `<button data-action="set-view-as-crc" data-crc-id="${crc.id}" class="px-4 py-2 rounded-md bg-amber-500 text-white hover:bg-amber-600 text-sm flex items-center gap-1"><i data-lucide="eye" class="w-4 h-4"></i>View as this CRC</button>` : ''}
+                            ${canEditCRCs ? `
                             <button data-action="archive-crc" data-id="${crc.id}" class="px-4 py-2 rounded-md bg-yellow-600 text-white hover:bg-yellow-700 text-sm">Archive</button>
                             <button data-action="delete-crc" data-id="${crc.id}" class="px-4 py-2 rounded-md bg-red-600 text-white hover:bg-red-700 text-sm">Delete</button>
+                            ` : ''}
                         </div>
-                        ` : ''}
                     </div>
                     <!-- Tab Navigation -->
                     <div class="border-b dark:border-gray-700 mb-4">
@@ -29319,9 +29346,13 @@
                         const recordId = getFinalizationRecordId(monthKey);
                         const [y, m] = monthKey.split('-').map(Number);
                         const monthStart = `${y}-${String(m).padStart(2, '0')}-01`;
-                        const monthEnd = toDateOnlyString(new Date(y, m, 0));
-                        const eventsInMonth = (state.crc_events || []).filter(e => { const d = e.date || e.startDate; return d && d >= monthStart && d <= monthEnd; });
-                        const snapshot = eventsInMonth.map(e => ({ ...e })); // copy for snapshot
+                        const lastDayOfMonth = new Date(y, m, 0);
+                        const monthEnd = toDateOnlyString(lastDayOfMonth);
+                        const eventsInMonth = (state.crc_events || []).filter(e => {
+                            const d = (e.date || e.startDate || '').toString().substring(0, 10);
+                            return d && d >= monthStart && d <= monthEnd;
+                        });
+                        const snapshot = eventsInMonth.map(e => ({ ...e })); // snapshot: this month only
                         let existing = null;
                         try {
                             existing = await apiService.getSchedule(recordId);
@@ -29363,7 +29394,10 @@
                         const [y, m] = monthKey.split('-').map(Number);
                         const monthStart = `${y}-${String(m).padStart(2, '0')}-01`;
                         const monthEnd = toDateOnlyString(new Date(y, m, 0));
-                        const eventsInMonth = (state.crc_events || []).filter(e => { const d = e.date || e.startDate; return d && d >= monthStart && d <= monthEnd; });
+                        const eventsInMonth = (state.crc_events || []).filter(e => {
+                            const d = (e.date || e.startDate || '').toString().substring(0, 10);
+                            return d && d >= monthStart && d <= monthEnd;
+                        });
                         const snapshot = eventsInMonth.map(e => ({ ...e }));
                         try {
                             const snapshotAt = new Date().toISOString();
@@ -29384,6 +29418,34 @@
                         } catch (err) {
                             console.error('Refinalize failed:', err);
                             showNotification(err?.message || 'Failed to refinalize.', 'error');
+                        }
+                        break;
+                    }
+                    case 'unfinalize-schedule-month': {
+                        const monthKey = getScheduleMonthKey(state.crcCalendarDate);
+                        const recordId = getFinalizationRecordId(monthKey);
+                        let existing = null;
+                        try {
+                            existing = await apiService.getSchedule(recordId);
+                        } catch (err) {
+                            existing = null;
+                        }
+                        if (!existing || !existing.finalized) {
+                            setState({ finalizedMonths: { ...state.finalizedMonths, [monthKey]: false }, finalizedAtByMonth: { ...state.finalizedAtByMonth, [monthKey]: undefined }, finalizedByByMonth: { ...state.finalizedByByMonth, [monthKey]: undefined } });
+                            showNotification('This month is not finalized.', 'info');
+                            break;
+                        }
+                        try {
+                            await apiService.upsertSchedule(recordId, { id: recordId, ...existing, finalized: false });
+                            const finNext = { ...state.finalizedMonths, [monthKey]: false };
+                            const atNext = { ...state.finalizedAtByMonth }; delete atNext[monthKey];
+                            const byNext = { ...state.finalizedByByMonth }; delete byNext[monthKey];
+                            setState({ finalizedMonths: finNext, finalizedAtByMonth: atNext, finalizedByByMonth: byNext, crc_events_display: undefined });
+                            showNotification('Schedule unfinalized. CRCs will see live schedule for this month. You can refinalize after making changes.', 'success');
+                            if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar();
+                        } catch (err) {
+                            console.error('Unfinalize failed:', err);
+                            showNotification(err?.message || 'Failed to unfinalize schedule.', 'error');
                         }
                         break;
                     }
@@ -29509,8 +29571,8 @@
                             console.warn('set-main-tab clicked but no tabId found', actionButton);
                             break;
                         }
-                        // CRC Planning Grid tab: show planning grid in monthly view (read-only)
-                        if (desiredTab === 'planning-grid' && state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
+                        // CRC Planning Grid tab (or view-as-CRC): show planning grid in monthly view (read-only)
+                        if (desiredTab === 'planning-grid' && effectiveIsCrcView()) {
                             setState({ activeTab: 'planning-grid', calendarView: 'planning-grid', planningGridMode: 'monthly' });
                         } else {
                             setState({ activeTab: desiredTab });
@@ -29910,8 +29972,8 @@
                         break;
                     case 'export-csv-btn': exportCurrentMonthToCSV(); break;
                     case 'open-crc-event-modal': 
-                        // CRC on Planning Grid tab: read-only, do not open create-shift modal
-                        if (state.activeTab === 'planning-grid' && state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
+                        // CRC on Planning Grid tab (or view-as-CRC): read-only, do not open create-shift modal
+                        if (state.activeTab === 'planning-grid' && effectiveIsCrcView()) {
                             break;
                         }
                         // Ensure date is set - if not provided, use today
@@ -30059,8 +30121,8 @@
                             // Store the merged event object on window so handleShiftStudySiteSelection can access it
                             window._currentEditingEvent = mergedEvent;
                             
-                            // CRC on Planning Grid tab: open read-only quick view instead of edit modal
-                            if (state.activeTab === 'planning-grid' && state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
+                            // CRC on Planning Grid tab (or view-as-CRC): open read-only quick view instead of edit modal
+                            if (state.activeTab === 'planning-grid' && effectiveIsCrcView()) {
                                 openModal(getPlanningGridQuickViewModalHTML(mergedEvent), '2xl');
                                 break;
                             }
@@ -31614,11 +31676,23 @@
                         const crc = state.crcs.find(c => c.id === id);
                         if (crc) {
                             openModal(getCRCProfileModalHTML(crc), '4xl');
-                            // Setup CRC profile modal interactions
-                            setTimeout(() => {
-                                setupCRCProfileModal();
-                            }, 100);
+                            setTimeout(() => setupCRCProfileModal(), 100);
                         }
+                        break;
+                    }
+                    case 'set-view-as-crc': {
+                        const crcId = actionButton.dataset.crcId || actionButton.getAttribute('data-crc-id');
+                        const crc = state.crcs.find(c => c.id === crcId);
+                        if (crcId && crc && (isAdminUser() || getEffectivePermissionLevel() === 'Manager')) {
+                            closeModal();
+                            setState({ viewAsCrcId: crcId, activeTab: 'dashboard' });
+                            showNotification(`Viewing as ${crc.name}. Use "Exit view" in the header to return.`, 'success');
+                        }
+                        break;
+                    }
+                    case 'exit-view-as-crc': {
+                        setState({ viewAsCrcId: null, activeTab: 'scheduler' });
+                        showNotification('Exited view-as mode.', 'success');
                         break;
                     }
                     case 'toggle-travel-view': {
