@@ -2275,12 +2275,15 @@
                 atAGlanceViewMode: 'monthly', // 'daily', 'weekly', or 'monthly'
                 // --- FIX: Corrected syntax error from original file ---
                 activeTab: (() => {
-                    // Check if there's a session with CRC user - if so, default to dashboard
+                    // Default tab: CRC users get dashboard; managers/admins (and admin-by-email) always get scheduler so they never load in CRC view
                     try {
                         const sessionData = localStorage.getItem('ora_smo_session');
                         if (sessionData) {
                             const session = JSON.parse(sessionData);
-                            if (session.user && session.user.permissionLevel === 'CRC') {
+                            const u = session.user;
+                            if (u && u.permissionLevel === 'CRC') {
+                                const email = (u.email || u.username || '').toLowerCase().trim();
+                                if (email.includes('jkirby@oraclinical')) return 'scheduler'; // Admin-by-email: never default to CRC dashboard
                                 return 'dashboard';
                             }
                         }
@@ -6202,27 +6205,33 @@
                 return Array.isArray(permissions.sites) && permissions.sites.includes(siteId);
             };
             
-            // Helper function to check if current user is admin
+            // Admin-by-email: treat as admin (Manager-level, never stuck in CRC view)
+            const isAdminByEmail = (user) => {
+                if (!user) return false;
+                const email = (user.email || user.username || '').toLowerCase().trim();
+                return email.includes('jkirby@oraclinical');
+            };
+            
+            // Helper function to check if current user is admin (username or email)
             const isAdminUser = () => {
-                return state.currentUser && state.currentUser.username && 
-                       state.currentUser.username.toLowerCase().trim() === 'admin';
+                if (!state.currentUser) return false;
+                if (state.currentUser.username && state.currentUser.username.toLowerCase().trim() === 'admin') return true;
+                return isAdminByEmail(state.currentUser);
             };
             
             // Helper function to get display permission level (shows "Admin" for admin users)
             const getDisplayPermissionLevel = (user = state.currentUser) => {
                 if (!user) return 'CRC';
-                if (user.username && user.username.toLowerCase().trim() === 'admin') {
-                    return 'Admin';
-                }
+                if (user.username && user.username.toLowerCase().trim() === 'admin') return 'Admin';
+                if (isAdminByEmail(user)) return 'Admin';
                 return user.permissionLevel || 'CRC';
             };
             
-            // Helper function to get effective permission level for access checks (admin = Manager)
+            // Helper function to get effective permission level for access checks (admin = Manager; never CRC for admin-by-email)
             const getEffectivePermissionLevel = (user = state.currentUser) => {
                 if (!user) return 'CRC';
-                if (user.username && user.username.toLowerCase().trim() === 'admin') {
-                    return 'Manager'; // Admin always has Manager-level access
-                }
+                if (user.username && user.username.toLowerCase().trim() === 'admin') return 'Manager';
+                if (isAdminByEmail(user)) return 'Manager'; // Admin-by-email always Manager-level, never stuck in CRC view
                 return user.permissionLevel || 'CRC';
             };
             
@@ -51081,7 +51090,11 @@
 					const session = checkSession();
 					if (session && session.user) {
 						debugLog('CHAOS: Restoring session for user:', session.user.username);
-						const isManagerOrAdmin = session.user.permissionLevel === 'Manager' || (session.user.username && session.user.username.toLowerCase().trim() === 'admin');
+						const email = (session.user.email || session.user.username || '').toLowerCase().trim();
+						const isAdminByEmailSession = email.includes('jkirby@oraclinical');
+						const isManagerOrAdmin = session.user.permissionLevel === 'Manager' ||
+							(session.user.username && session.user.username.toLowerCase().trim() === 'admin') ||
+							isAdminByEmailSession;
 						setState({
 							currentUser: session.user,
 							isAuthenticated: true,
@@ -51090,8 +51103,8 @@
 						state.authReady = true;
 						state.userId = 'chaos-user';
 						
-						// Load users if Manager
-						if (session.user.permissionLevel === 'Manager') {
+						// Load users if Manager (or admin-by-email)
+						if (session.user.permissionLevel === 'Manager' || isAdminByEmailSession) {
 							try {
 								const users = await apiService.getUsers();
 								setState({ users });
@@ -51100,9 +51113,12 @@
 							}
 						}
 						
-						// Redirect CRC users to dashboard on refresh (instead of scheduler)
-						if (session.user.permissionLevel === 'CRC') {
+						// Redirect CRC users to dashboard on refresh — but never for managers/admins or admin-by-email (they must not get stuck in CRC view)
+						if (session.user.permissionLevel === 'CRC' && !isManagerOrAdmin) {
 							setState({ activeTab: 'dashboard' });
+						}
+						if (isManagerOrAdmin && state.activeTab === 'dashboard') {
+							setState({ activeTab: 'scheduler' });
 						}
 						
 						renderNav();

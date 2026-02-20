@@ -1686,15 +1686,22 @@ const verifyPassword = (password, hash) => {
     return hashPassword(password) === hash;
 };
 
+// Helper: treat as admin (Manager-level, never stuck in CRC view) - username 'admin' or email jkirby@oraclinical
+const isAdminUser = (user) => {
+    if (!user) return false;
+    const username = (user.username || '').toLowerCase().trim();
+    const email = (user.email || user.username || '').toLowerCase().trim();
+    return username === 'admin' || email.includes('jkirby@oraclinical');
+};
+
 // Helper function to correct admin user permission level
 const correctAdminUser = async (user, container, context) => {
     if (!user || !user.username) return user;
     
-    const username = (user.username || '').toLowerCase().trim();
-    if (username === 'admin') {
-        // Admin must always be Manager
+    if (isAdminUser(user)) {
+        // Admin must always be Manager (never CRC so they don't get stuck in CRC view)
         if (user.permissionLevel !== 'Manager') {
-            context.log.warn(`Correcting admin user permission level from ${user.permissionLevel} to Manager`);
+            context.log.warn(`Correcting admin user permission level from ${user.permissionLevel} to Manager (user: ${user.username || user.email})`);
             user.permissionLevel = 'Manager';
             user.crcId = null; // Remove CRC link
             
