@@ -3995,24 +3995,66 @@ async function crudHandler(context, request, containerName) {
                                              !travelPrefs.travelNotNeeded)
                                         );
                                         
+                                        const defaults = computeDefaultTravelDates();
+                                        const startDatePref = (typeof travelPrefs === 'object' && travelPrefs.startTravelDate) ? travelPrefs.startTravelDate : defaults.start;
+                                        const endDatePref = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : defaults.end;
+                                        const includeStart = travelPrefs === true || (typeof travelPrefs === 'object' && travelPrefs.includeStartTravel === true);
+                                        const includeEnd = travelPrefs === true || (typeof travelPrefs === 'object' && travelPrefs.includeEndTravel === true);
+                                        const datesToCreate = [];
                                         if (shouldHaveTravel && shiftCrcIds.has(crcId)) {
-                                            const includeStart = travelPrefs === true || (typeof travelPrefs === 'object' && travelPrefs.includeStartTravel === true);
-                                            const includeEnd = travelPrefs === true || (typeof travelPrefs === 'object' && travelPrefs.includeEndTravel === true);
-                                            const defaults = computeDefaultTravelDates();
-                                            const startDate = (typeof travelPrefs === 'object' && travelPrefs.startTravelDate) ? travelPrefs.startTravelDate : defaults.start;
-                                            const endDate = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : defaults.end;
-                                            const datesToCreate = [];
-                                            if (includeStart && startDate) datesToCreate.push(startDate);
-                                            if (includeEnd && endDate && endDate !== startDate) datesToCreate.push(endDate);
-                                            
+                                            if (includeStart && startDatePref) datesToCreate.push(startDatePref);
+                                            if (includeEnd && endDatePref && endDatePref !== startDatePref) datesToCreate.push(endDatePref);
+                                        }
+                                        const datesToCreateSet = new Set(datesToCreate);
+                                        // Travel range = all dates we might have ever created for this shift (default range)
+                                        const rangeDates = [defaults.start, defaults.end, startDatePref, endDatePref].filter(Boolean);
+                                        const uniqueRangeDates = Array.from(new Set(rangeDates));
+                                        // Remove stale travel days: for this CRC, delete any travel day on range dates that is NOT in the new datesToCreate (edit changed travel dates)
+                                        for (const travelDate of uniqueRangeDates) {
+                                            if (datesToCreateSet.has(travelDate)) continue;
+                                            const travelDaysOnDate = await getTravelDaysForDate(travelDate);
+                                            const forThisCrc = (travelDaysOnDate || []).filter(td => {
+                                                if (!td || td.type !== 'Travel Day') return false;
+                                                if (td.crcId === crcId) return true;
+                                                if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
+                                                return false;
+                                            });
+                                            for (const td of forThisCrc) {
+                                                if (td.id) {
+                                                    try {
+                                                        await eventsContainer.item(td.id, td.id).delete();
+                                                        context.log.info(`Deleted stale travel day ${td.id} for CRC ${crcId} on ${travelDate} (no longer in preferred dates)`);
+                                                    } catch (e) {
+                                                        context.log.warn(`Failed to delete stale travel day ${td.id}: ${e.message}`);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        if (shouldHaveTravel && shiftCrcIds.has(crcId)) {
                                             for (const travelDate of datesToCreate) {
                                                 const travelDaysOnDate = await getTravelDaysForDate(travelDate);
-                                                const existingTravelDay = (travelDaysOnDate || []).find(td => {
+                                                const forThisCrc = (travelDaysOnDate || []).filter(td => {
                                                     if (!td || td.type !== 'Travel Day') return false;
                                                     if (td.crcId === crcId) return true;
                                                     if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
                                                     return false;
                                                 });
+                                                // Deduplicate: if multiple travel days for same CRC+date, delete extras and keep one
+                                                if (forThisCrc.length > 1) {
+                                                    for (let i = 1; i < forThisCrc.length; i++) {
+                                                        const dup = forThisCrc[i];
+                                                        if (dup.id) {
+                                                            try {
+                                                                await eventsContainer.item(dup.id, dup.id).delete();
+                                                                context.log.info(`Deleted duplicate travel day ${dup.id} for CRC ${crcId} on ${travelDate}`);
+                                                            } catch (e) {
+                                                                context.log.warn(`Failed to delete duplicate travel day ${dup.id}: ${e.message}`);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                const existingTravelDay = forThisCrc[0] || null;
                                                 
                                                 if (!existingTravelDay) {
                                                     const travelDayEvent = {
