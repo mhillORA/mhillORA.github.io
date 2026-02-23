@@ -2865,6 +2865,9 @@ async function crudHandler(context, request, containerName) {
                         try { await processEmailTriggers(context, { triggerType: 'new_shift', event: createdItem }); } catch (triggerErr) {
                             context.log.warn('processEmailTriggers (new_shift) failed:', triggerErr.message);
                         }
+                        try { await processEmailTriggers(context, { triggerType: 'shift_created_missing_role', event: createdItem }); } catch (triggerErr) {
+                            context.log.warn('processEmailTriggers (shift_created_missing_role) failed:', triggerErr.message);
+                        }
                     }
                     
                     return { status: 201, jsonBody: createdItem };
@@ -4632,10 +4635,20 @@ app.http('templates', {
 const TRIGGER_DEFAULTS = {
     new_shift: { subject: 'New shift assigned', body: 'A new shift has been added to the schedule.' },
     shift_edit: { subject: 'Shift updated', body: 'A shift has been updated on the schedule.' },
+    shift_created_missing_role: { subject: 'Shift created without required role', body: 'A shift was created that is missing the required role: {{missingRoleName}}. Date: {{eventDate}}, Site/Study: {{siteId}} / {{studyIds}}.' },
     finalized_schedule: { subject: 'Schedule finalized', body: 'The schedule has been finalized for the month.' },
     pto_request: { subject: 'Time off request submitted', body: 'A time off request has been submitted for approval.' },
     pto_approved: { subject: 'Time off approved', body: 'Your time off request has been approved.' }
 };
+
+// True if event has no assignment for roleId, or role exists but every slot is empty/unassigned
+function eventIsMissingRole(event, roleId) {
+    if (!event || !roleId) return false;
+    const ra = event.roleAssignments && typeof event.roleAssignments === 'object' ? event.roleAssignments[roleId] : undefined;
+    if (!ra || !Array.isArray(ra)) return true; // role not on shift
+    const hasAssigned = ra.some(id => id && String(id).trim() !== '' && id !== 'UNASSIGNED' && id !== 'SITE_STAFF');
+    return !hasAssigned; // role on shift but all unassigned
+}
 
 async function processEmailTriggers(context, payload) {
     const { triggerType, event, timeOffRequest, scheduleMonthKey, eventsSnapshot } = payload || {};
@@ -4660,6 +4673,10 @@ async function processEmailTriggers(context, payload) {
                 return ptoTypes.some(t => String(t).trim().toLowerCase() === requestType.toLowerCase());
             });
         }
+        // For shift_created_missing_role, only fire for rules whose missingRoleId is actually missing on this event
+        if (triggerType === 'shift_created_missing_role' && event) {
+            filteredRules = rules.filter(rule => rule.missingRoleId && eventIsMissingRole(event, rule.missingRoleId));
+        }
 
         const senderAddress = process.env.EMAIL_SENDER_ADDRESS;
         if (!senderAddress) {
@@ -4674,6 +4691,15 @@ async function processEmailTriggers(context, payload) {
         const usersById = new Map((userList || []).filter(u => u && u.id).map(u => [u.id, u]));
         const usersByCrcId = new Map((userList || []).filter(u => u && u.crcId).map(u => [u.crcId, u]));
         const crcsById = new Map((crcList || []).filter(c => c && c.id).map(c => [c.id, c]));
+
+        const roleNameById = new Map();
+        try {
+            const rolesContainer = getContainer('roles');
+            const { resources: rolesList } = await rolesContainer.items.readAll().fetchAll();
+            (rolesList || []).forEach(r => { if (r && r.id) roleNameById.set(r.id, r.name || r.id); });
+        } catch (e) {
+            log.warn('processEmailTriggers: failed to load roles for missing-role context:', e.message);
+        }
 
         const resolveToEmails = (crcIds, userIdsOrEmails) => {
             const out = [];
@@ -4736,7 +4762,7 @@ async function processEmailTriggers(context, payload) {
             return (user && (user.name || user.username)) || (crc && crc.name) || crcId || '';
         };
 
-        const buildTriggerContext = () => {
+        const buildTriggerContext = (rule) => {
             const base = { triggerType };
             if ((triggerType === 'pto_request' || triggerType === 'pto_approved') && timeOffRequest) {
                 const start = timeOffRequest.startDate || timeOffRequest.date;
@@ -4771,6 +4797,19 @@ async function processEmailTriggers(context, payload) {
                     eventDate: eventDate ? String(eventDate).split('T')[0] : '',
                     eventType: event.type || event.name || 'Shift',
                     crcNames,
+                    siteId: event.siteId || '',
+                    studyIds: Array.isArray(event.studyIds) ? event.studyIds.join(', ') : (event.studyId || '')
+                };
+            }
+            if (triggerType === 'shift_created_missing_role' && event && rule) {
+                const eventDate = event.date || event.startDate || '';
+                return {
+                    ...base,
+                    missingRoleId: rule.missingRoleId || '',
+                    missingRoleName: roleNameById.get(rule.missingRoleId) || rule.missingRoleId || 'Required role',
+                    eventId: event.id || '',
+                    eventDate: eventDate ? String(eventDate).split('T')[0] : '',
+                    eventType: event.type || event.name || 'Shift',
                     siteId: event.siteId || '',
                     studyIds: Array.isArray(event.studyIds) ? event.studyIds.join(', ') : (event.studyId || '')
                 };
@@ -4819,7 +4858,7 @@ async function processEmailTriggers(context, payload) {
                 }
             }
 
-            const triggerContext = buildTriggerContext();
+            const triggerContext = buildTriggerContext(rule);
             subject = renderTemplateString(subject, triggerContext);
             plainText = renderTemplateString(plainText, triggerContext);
 
@@ -4882,6 +4921,7 @@ app.http('email-triggers', {
                     name: body.name || '',
                     triggerType: body.triggerType || 'new_shift',
                     ptoTypes: Array.isArray(body.ptoTypes) ? body.ptoTypes : [],
+                    missingRoleId: body.missingRoleId || null,
                     sendTo: body.sendTo || 'managers',
                     specificRecipientIds: Array.isArray(body.specificRecipientIds) ? body.specificRecipientIds : [],
                     templateId: body.templateId || null,
@@ -4903,6 +4943,7 @@ app.http('email-triggers', {
                     name: body.name !== undefined ? body.name : undefined,
                     triggerType: body.triggerType !== undefined ? body.triggerType : undefined,
                     ptoTypes: Array.isArray(body.ptoTypes) ? body.ptoTypes : undefined,
+                    missingRoleId: body.missingRoleId !== undefined ? (body.missingRoleId || null) : undefined,
                     sendTo: body.sendTo !== undefined ? body.sendTo : undefined,
                     specificRecipientIds: Array.isArray(body.specificRecipientIds) ? body.specificRecipientIds : undefined,
                     templateId: body.templateId !== undefined ? body.templateId : undefined,
