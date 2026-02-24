@@ -2372,6 +2372,8 @@
                 timeOffReportData: null,
                 timeOffCollapsedEmployees: {},
                 managerViewIncludeTravel: true, // Default to including travel time in Manager's view
+                /** Event id to delete when user confirms; survives modal re-render so delete works first time (e.g. travel days). */
+                pendingDeleteEventId: null,
                 managerViewNotificationsEnabled: true, // Default to enabled for unfilled shift notifications
                 managerViewUtilizationPeriod: 'month', // legacy; used only when custom range not set
                 managerViewUtilizationStartDate: null, // custom range start (YYYY-MM-DD)
@@ -9363,6 +9365,8 @@
                 window._ptoSelectedDates = new Set();
                 // Clear the stored editing event when modal closes
                 window._currentEditingEvent = null;
+                // Clear pending delete so cancel doesn't leave a stale id
+                if (state.pendingDeleteEventId) setState({ pendingDeleteEventId: null });
                 if (!modalContainer) {
                     console.error('Modal container not found');
                     return;
@@ -31374,17 +31378,26 @@
                             showNotification('Supervisors have read-only access. You cannot delete events.', 'error');
                             return;
                         }
-                        
-                        const event = state.crc_events.find(e => e.id === eventId);
+                        const idToDelete = eventId || actionButton.dataset.eventId;
+                        if (!idToDelete) {
+                            console.error('[Delete event] No event id: button missing data-event-id', actionButton);
+                            showNotification('Cannot delete: event id missing. Try again.', 'error');
+                            return;
+                        }
+                        const event = state.crc_events.find(e => e.id === idToDelete);
                         if (event) {
+                            setState({ pendingDeleteEventId: idToDelete });
                             openModal(`
                                 <h3 class="text-xl font-bold dark:text-white mb-4">Delete Individual Event</h3>
                                 <p class="dark:text-gray-300 mb-6">Are you sure you want to delete this individual event? You can undo this change if needed.</p>
                                 <div class="flex justify-end gap-4">
                                     <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
-                                    <button data-action="confirm-delete-individual-event" data-event-id="${eventId}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Event</button>
+                                    <button data-action="confirm-delete-individual-event" data-event-id="${idToDelete}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Event</button>
                                 </div>
                             `);
+                        } else {
+                            console.warn('[Delete event] Event not found in state:', idToDelete);
+                            showNotification('Event not found. It may have been deleted already.', 'info');
                         }
                         break;
                     }
@@ -31400,11 +31413,20 @@
                             closeModal();
                             return;
                         }
-                        
+                        // Use pending id from state first (survives re-render); fallback to button data
+                        const idToDelete = state.pendingDeleteEventId || eventId || actionButton.dataset.eventId;
+                        if (!idToDelete) {
+                            console.error('[Delete event] Confirm: no event id (pendingDeleteEventId or data-event-id). Check that delete confirmation was not re-rendered.', { pendingDeleteEventId: state.pendingDeleteEventId, datasetEventId: actionButton.dataset.eventId });
+                            showNotification('Cannot delete: event id lost. Close and try deleting again.', 'error');
+                            closeModal();
+                            setState({ pendingDeleteEventId: null });
+                            return;
+                        }
                         try {
-                            const eventBeforeDelete = state.crc_events.find(e => e.id === eventId);
+                            const eventBeforeDelete = state.crc_events.find(e => e.id === idToDelete);
                             saveStateToUndoHistory();
-                            await apiService.deleteEvent(eventId);
+                            await apiService.deleteEvent(idToDelete);
+                            setState({ pendingDeleteEventId: null });
                             // Re-fetch events from DB
                             const updatedEvents = await apiService.getEvents();
                             setState({ crc_events: updatedEvents }, { skipRender: true });
@@ -31416,8 +31438,12 @@
                             closeModal();
                             renderContentPreservingScroll();
                         } catch (error) {
-                            console.error("Error deleting event:", error);
-                            showNotification('Failed to delete event. See console for details.', 'error');
+                            setState({ pendingDeleteEventId: null });
+                            console.error('[Delete event] Failed to delete event:', idToDelete, error);
+                            console.error('[Delete event] Error message:', error && error.message);
+                            if (error && error.stack) console.error('[Delete event] Stack:', error.stack);
+                            if (error && error.response) console.error('[Delete event] Response:', error.response.status, error.response.data);
+                            showNotification('Failed to delete event. See dev console (F12) for details.', 'error');
                         }
                         break;
                     }
