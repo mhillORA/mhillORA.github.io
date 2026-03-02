@@ -89,7 +89,7 @@ function validateRetinaAssignmentsSchema(data) {
     if (!data.date || typeof data.date !== 'string') errors.push('date required (YYYY-MM-DD)');
     if (!data.startTime || typeof data.startTime !== 'string') errors.push('startTime required');
     if (!data.endTime || typeof data.endTime !== 'string') errors.push('endTime required');
-    if (!data.location || typeof data.location !== 'string') errors.push('location required');
+    if (data.location !== undefined && data.location !== null && typeof data.location !== 'string') errors.push('location must be a string');
     if (errors.length) throw new Error(`VALIDATION_ERROR: Retina assignment: ${errors.join(', ')}`);
 }
 
