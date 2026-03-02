@@ -106,10 +106,18 @@ function validateRetinaTimeOffSchema(data) {
 }
 
 // --- CRUD handler (RMT containers only) ---
+function getIdFromRequest(request, containerName) {
+    const fromParams = request.params && request.params.id;
+    if (fromParams) return fromParams;
+    const url = request.url || '';
+    const match = url.match(/retina-(?:staff|assignments|timeoff)\/([^/?#]+)/i);
+    return match ? match[1] : undefined;
+}
+
 async function crudHandler(context, request, containerName) {
     const container = getContainer(containerName);
     const method = request.method;
-    const id = request.params && request.params.id;
+    const id = getIdFromRequest(request, containerName);
 
     try {
         if (method === 'GET') {
@@ -157,6 +165,9 @@ async function crudHandler(context, request, containerName) {
                 if (body.password) {
                     body.passwordHash = hashPassword(body.password);
                     delete body.password;
+                } else {
+                    const { resource: existing } = await container.item(updateId).read().catch(() => ({ resource: null }));
+                    if (existing && existing.passwordHash) body.passwordHash = existing.passwordHash;
                 }
             } else if (containerName === 'retina_assignments') validateRetinaAssignmentsSchema(body);
             else if (containerName === 'retina_timeoff') validateRetinaTimeOffSchema(body);
@@ -166,6 +177,9 @@ async function crudHandler(context, request, containerName) {
         }
 
         if (method === 'DELETE') {
+            if (!id) {
+                return { status: 400, jsonBody: { error: 'Resource id required for DELETE' }, headers: jsonHeaders };
+            }
             await container.item(id).delete();
             return { status: 204, headers: jsonHeaders };
         }
