@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Retina Mobility Testing</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = { darkMode: 'class' };
+    </script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script>
         // When deployed as a separate static web app, set window.RETINA_API_BASE to your API URL (e.g. 'https://your-api.azurestaticapps.net/api')
@@ -30,13 +33,16 @@
             --muted: #94a3b8;
             --border: #334155;
         }
+        html { font-size: 16px; }
         * { box-sizing: border-box; }
         body {
-            font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
             margin: 0;
             background: var(--bg);
             color: var(--text);
             min-height: 100vh;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
         }
         .app {
             max-width: 1100px;
@@ -119,6 +125,7 @@
             border-bottom: 1px solid var(--border);
         }
         th { font-size: 0.75rem; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+        td { color: var(--text); }
         input, select, textarea {
             padding: 0.5rem 0.75rem;
             border: 1px solid var(--border);
@@ -127,7 +134,9 @@
             color: var(--text);
             font-size: 0.875rem;
         }
+        input::placeholder, textarea::placeholder { color: var(--muted); opacity: 0.9; }
         label { display: block; margin-bottom: 0.25rem; font-size: 0.875rem; color: var(--muted); }
+        .card h2 { color: var(--text); }
         .form-row { margin-bottom: 0.75rem; }
         .form-actions { margin-top: 1rem; display: flex; gap: 0.5rem; }
         .badge {
@@ -157,6 +166,7 @@
         #toast.show { display: block; }
         #toast.success { background: var(--success); color: white; }
         #toast.error { background: var(--danger); color: white; }
+        #modal { color: var(--text); }
         .panel { display: none; }
         .panel.active { display: block; }
         #login-view { max-width: 360px; margin: 2rem auto; }
@@ -170,9 +180,13 @@
         .assignment-slot { border-radius: 0.375rem; border-left: 3px solid var(--primary); }
         .sched-view-btn.active { background: var(--primary); color: white; }
         .sched-view-btn:not(.active) { background: var(--border); color: var(--text); }
+        .theme-toggle { background: var(--border); color: var(--text); border: 1px solid var(--border); padding: 0.35rem 0.75rem; border-radius: 0.5rem; cursor: pointer; font-size: 0.875rem; display: inline-flex; align-items: center; gap: 0.35rem; }
+        .theme-toggle:hover { background: var(--muted); color: var(--text); }
+        .availability-list { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+        .availability-list strong { color: var(--text); font-weight: 600; }
     </style>
 </head>
-<body>
+<body id="app-body">
     <div id="login-view" class="app">
         <div class="card">
             <h1 style="margin-top:0;">Retina Mobility Testing</h1>
@@ -205,6 +219,11 @@
                     <button type="button" data-tab="timeoff">Time Off</button>
                 </nav>
                 <div class="user-bar">
+                    <button type="button" class="theme-toggle" id="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle theme">
+                        <i data-lucide="sun" id="theme-icon-light" style="width:1rem;height:1rem;"></i>
+                        <i data-lucide="moon" id="theme-icon-dark" class="hidden" style="width:1rem;height:1rem;"></i>
+                        <span id="theme-label">Dark</span>
+                    </button>
                     <span id="user-email"></span>
                     <button type="button" class="danger" id="logout-btn">Log out</button>
                 </div>
@@ -258,6 +277,12 @@
                         <button type="button" data-sched-view="month" class="sched-view-btn px-3 py-1.5 rounded text-sm font-medium">Month</button>
                         <button type="button" class="primary ml-2" id="add-assignment-btn">Add assignment</button>
                     </div>
+                </div>
+                <div class="mb-3 flex items-center gap-2">
+                    <label class="inline-flex items-center gap-2 cursor-pointer" style="margin:0;">
+                        <input type="checkbox" id="hide-when-pto" class="rounded border-gray-300 dark:border-gray-600">
+                        <span style="color: var(--text); font-size: 0.875rem;">Only show when staff is available (hide PTO days)</span>
+                    </label>
                 </div>
                 <div id="scheduling-list-view" class="sched-view">
                     <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
@@ -315,6 +340,7 @@
     <script>
         const API = window.RETINA_API_BASE || '/api';
         const USER_KEY = 'retina_user';
+        const THEME_KEY = 'retina_theme';
 
         const state = {
             tab: 'dashboard',
@@ -323,7 +349,8 @@
             timeoff: [],
             user: null,
             schedulingView: 'list',
-            calendarDate: new Date()
+            calendarDate: new Date(),
+            hideWhenOnPto: false
         };
 
         function getStoredUser() {
@@ -405,6 +432,24 @@
             return s ? s.name : id || '—';
         }
 
+        /** Staff IDs who have approved time off covering the given date (YYYY-MM-DD). */
+        function getStaffOnTimeOff(dateStr) {
+            const onPto = new Set();
+            state.timeoff.forEach(t => {
+                if (t.status !== 'approved' || !t.staffId) return;
+                const start = (t.startDate || '').slice(0, 10);
+                const end = (t.endDate || '').slice(0, 10);
+                if (dateStr >= start && dateStr <= end) onPto.add(t.staffId);
+            });
+            return onPto;
+        }
+
+        /** Staff who are available (not on approved PTO) on the given date. */
+        function getAvailableStaff(dateStr) {
+            const onPto = getStaffOnTimeOff(dateStr);
+            return state.staff.filter(s => !onPto.has(s.id)).map(s => ({ id: s.id, name: s.name }));
+        }
+
         function renderStaff() {
             const tbody = document.getElementById('staff-tbody');
             if (state.staff.length === 0) {
@@ -425,11 +470,18 @@
         function renderAssignments() {
             const tbody = document.getElementById('assignments-tbody');
             if (!tbody) return;
-            if (state.assignments.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="color: var(--muted);">No assignments yet.</td></tr>';
+            let list = state.assignments;
+            if (state.hideWhenOnPto) {
+                list = list.filter(a => {
+                    const onPto = getStaffOnTimeOff(a.date);
+                    return !onPto.has(a.staffId);
+                });
+            }
+            if (list.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="color: var(--muted);">' + (state.hideWhenOnPto ? 'No assignments when staff are available (or none yet).' : 'No assignments yet.') + '</td></tr>';
                 return;
             }
-            tbody.innerHTML = state.assignments.map(a => `
+            tbody.innerHTML = list.map(a => `
                 <tr>
                     <td>${escapeHtml(staffName(a.staffId))}</td>
                     <td>${escapeHtml(a.date)}</td>
@@ -515,18 +567,23 @@
                 const d = new Date(weekStart);
                 d.setDate(d.getDate() + i);
                 const dateStr = d.toISOString().split('T')[0];
+                const onPto = getStaffOnTimeOff(dateStr);
                 const dayAssignments = state.assignments.filter(a => a.date === dateStr);
-                html += `<div class="bg-gray-50 dark:bg-gray-700/50 p-2 min-h-[120px]">
-                    <p class="text-xs font-semibold text-gray-500 dark:text-gray-400">${dayNames[i]}</p>
+                const available = getAvailableStaff(dateStr);
+                html += `<div class="bg-gray-50 dark:bg-gray-700/50 p-2 min-h-[140px]">
+                    <p class="text-xs font-semibold" style="color: var(--muted);">${dayNames[i]}</p>
                     <p class="text-sm font-medium" style="color: var(--text);">${d.getDate()}</p>
                     <div class="mt-2 space-y-1">`;
                 dayAssignments.sort((a,b) => (a.startTime||'').localeCompare(b.startTime||'')).forEach(a => {
-                    html += `<div class="assignment-slot p-1.5 text-xs bg-teal-50 dark:bg-teal-900/30 rounded">
-                        <p class="font-medium truncate">${escapeHtml(staffName(a.staffId))}</p>
-                        <p class="text-gray-500 dark:text-gray-400">${a.startTime}–${a.endTime}</p>
+                    const isOnPto = onPto.has(a.staffId);
+                    html += `<div class="assignment-slot p-1.5 text-xs rounded ${isOnPto ? 'bg-amber-100 dark:bg-amber-900/40 opacity-75' : 'bg-teal-50 dark:bg-teal-900/30'}">
+                        <p class="font-medium truncate" style="color: var(--text);">${escapeHtml(staffName(a.staffId))}${isOnPto ? ' (PTO)' : ''}</p>
+                        <p style="color: var(--muted);">${a.startTime}–${a.endTime}</p>
                     </div>`;
                 });
-                html += `</div></div>`;
+                html += `</div>
+                    <div class="availability-list"><strong>Available:</strong> ${available.length ? available.map(x => escapeHtml(x.name)).join(', ') : '—'}</div>
+                </div>`;
             }
             html += `</div>`;
             container.innerHTML = html;
@@ -557,11 +614,15 @@
             for (let day = 1; day <= daysInMonth; day++) {
                 const currentDate = new Date(year, month, day);
                 const dateStr = currentDate.toISOString().split('T')[0];
+                const onPto = getStaffOnTimeOff(dateStr);
                 const dayAssignments = state.assignments.filter(a => a.date === dateStr);
-                let slotsHtml = dayAssignments.sort((a,b) => (a.startTime||'').localeCompare(b.startTime||'')).slice(0, 3).map(a =>
-                    `<div class="assignment-slot p-1 mb-1 text-xs bg-teal-100 dark:bg-teal-800/50 rounded truncate" title="${escapeHtml(staffName(a.staffId))} ${a.startTime}">${escapeHtml(staffName(a.staffId))} ${a.startTime}</div>`
-                ).join('');
-                if (dayAssignments.length > 3) slotsHtml += `<p class="text-xs text-gray-500">+${dayAssignments.length - 3} more</p>`;
+                const available = getAvailableStaff(dateStr);
+                let slotsHtml = dayAssignments.sort((a,b) => (a.startTime||'').localeCompare(b.startTime||'')).slice(0, 3).map(a => {
+                    const isOnPto = onPto.has(a.staffId);
+                    return `<div class="assignment-slot p-1 mb-1 text-xs rounded truncate ${isOnPto ? 'bg-amber-100 dark:bg-amber-900/40' : 'bg-teal-100 dark:bg-teal-800/50'}" title="${escapeHtml(staffName(a.staffId))} ${a.startTime}">${escapeHtml(staffName(a.staffId))} ${a.startTime}</div>`;
+                }).join('');
+                if (dayAssignments.length > 3) slotsHtml += `<p class="text-xs" style="color: var(--muted);">+${dayAssignments.length - 3} more</p>`;
+                slotsHtml += `<p class="availability-list mt-1"><strong>Avail:</strong> ${available.length}</p>`;
                 html += `<div class="calendar-day p-2 bg-white dark:bg-gray-800" data-date="${dateStr}">
                     <span class="font-medium" style="color: var(--text);">${day}</span>
                     <div class="mt-1 overflow-hidden max-h-20">${slotsHtml || ''}</div>
@@ -903,8 +964,44 @@
             showLogin();
         });
 
-        // Init: require login (email = username)
+        // Theme: apply saved or system preference
+        function getTheme() {
+            try {
+                const saved = localStorage.getItem(THEME_KEY);
+                if (saved === 'dark' || saved === 'light') return saved;
+            } catch (_) {}
+            if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark';
+            return 'light';
+        }
+        function applyTheme(theme) {
+            const root = document.documentElement;
+            const isDark = theme === 'dark';
+            root.classList.toggle('dark', isDark);
+            root.setAttribute('data-theme', theme);
+            try { localStorage.setItem(THEME_KEY, theme); } catch (_) {}
+            const label = document.getElementById('theme-label');
+            const iconLight = document.getElementById('theme-icon-light');
+            const iconDark = document.getElementById('theme-icon-dark');
+            if (label) label.textContent = isDark ? 'Light' : 'Dark';
+            if (iconLight) iconLight.classList.toggle('hidden', !isDark);
+            if (iconDark) iconDark.classList.toggle('hidden', isDark);
+            if (typeof lucide !== 'undefined') lucide.createIcons();
+        }
+        document.getElementById('theme-toggle').addEventListener('click', () => {
+            const theme = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
+            applyTheme(theme);
+        });
+
+        // PTO filter checkbox (may not exist until scheduling is shown)
+        const hidePtoEl = document.getElementById('hide-when-pto');
+        if (hidePtoEl) hidePtoEl.addEventListener('change', (e) => {
+            state.hideWhenOnPto = !!e.target.checked;
+            renderAssignments();
+        });
+
+        // Init: theme first (so login page is correct), then login
         (function init() {
+            applyTheme(getTheme());
             const user = getStoredUser();
             if (user && (user.email || user.id)) {
                 setStoredUser(user);
