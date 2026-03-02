@@ -214,7 +214,7 @@
             <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.75rem;">
                 <nav>
                     <button type="button" data-tab="dashboard" class="active">Dashboard</button>
-                    <button type="button" data-tab="staff">Staff</button>
+                    <button type="button" data-tab="staff" id="nav-tab-staff">Staff</button>
                     <button type="button" data-tab="scheduling">Scheduling</button>
                     <button type="button" data-tab="timeoff">Time Off</button>
                 </nav>
@@ -258,6 +258,7 @@
                             <tr>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Name</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Username</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase"></th>
                             </tr>
                         </thead>
@@ -348,7 +349,10 @@
             assignments: [],
             timeoff: [],
             user: null,
-            schedulingView: 'list',
+            userRole: null,
+            canManageStaff: false,
+            canSeeAllSchedules: false,
+            schedulingView: 'month',
             calendarDate: new Date(),
             hideWhenOnPto: false
         };
@@ -361,8 +365,28 @@
         }
         function setStoredUser(user) {
             state.user = user;
+            const role = user && (user.id === 'admin' ? 'manager' : (user.role || 'tester'));
+            state.userRole = ['manager', 'supervisor', 'tester'].includes(role) ? role : 'tester';
+            state.canManageStaff = state.userRole === 'manager';
+            state.canSeeAllSchedules = state.userRole === 'manager' || state.userRole === 'supervisor';
             if (user) sessionStorage.setItem(USER_KEY, JSON.stringify(user));
             else sessionStorage.removeItem(USER_KEY);
+        }
+
+        /** Assignments visible to current user (all for manager/supervisor, own for tester). */
+        function getDisplayAssignments() {
+            if (!state.assignments.length) return [];
+            if (state.canSeeAllSchedules) return state.assignments;
+            if (!state.user || !state.user.id) return [];
+            return state.assignments.filter(a => a.staffId === state.user.id);
+        }
+
+        /** Time off visible to current user (all for manager/supervisor, own for tester). */
+        function getDisplayTimeOff() {
+            if (!state.timeoff.length) return [];
+            if (state.canSeeAllSchedules) return state.timeoff;
+            if (!state.user || !state.user.id) return [];
+            return state.timeoff.filter(t => t.staffId === state.user.id);
         }
 
         function showLogin() {
@@ -372,7 +396,19 @@
         function showApp() {
             document.getElementById('login-view').style.display = 'none';
             document.getElementById('app-view').classList.add('active');
-            document.getElementById('user-email').textContent = state.user ? 'Signed in as ' + (state.user.email || state.user.name) : '';
+            document.getElementById('user-email').textContent = state.user ? 'Signed in as ' + (state.user.email || state.user.name) + (state.userRole ? ' (' + state.userRole + ')' : '') : '';
+            updateRoleVisibility();
+        }
+
+        function updateRoleVisibility() {
+            const staffTab = document.getElementById('nav-tab-staff');
+            const addStaffBtn = document.getElementById('add-staff-btn');
+            const addAssignmentBtn = document.getElementById('add-assignment-btn');
+            const hidePtoRow = document.querySelector('.mb-3.flex.items-center.gap-2');
+            if (staffTab) staffTab.style.display = state.canManageStaff ? '' : 'none';
+            if (addStaffBtn) addStaffBtn.style.display = state.canManageStaff ? '' : 'none';
+            if (addAssignmentBtn) addAssignmentBtn.style.display = state.canSeeAllSchedules ? '' : 'none';
+            if (hidePtoRow) hidePtoRow.style.display = state.canSeeAllSchedules ? '' : 'none';
         }
 
         async function apiCall(endpoint, method = 'GET', body = null) {
@@ -453,13 +489,15 @@
         function renderStaff() {
             const tbody = document.getElementById('staff-tbody');
             if (state.staff.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="3" style="color: var(--muted);">No staff yet. Add someone to get started.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="4" style="color: var(--muted);">No staff yet. Add someone to get started.</td></tr>';
                 return;
             }
+            const roleLabel = (r) => (r === 'manager' ? 'Manager' : r === 'supervisor' ? 'Supervisor' : 'Tester');
             tbody.innerHTML = state.staff.map(s => `
                 <tr>
                     <td>${escapeHtml(s.name)}</td>
                     <td>${escapeHtml(s.email || '—')}</td>
+                    <td>${escapeHtml(roleLabel(s.role || 'tester'))}</td>
                     <td>
                         <button type="button" class="danger" data-edit-staff="${s.id}">Delete</button>
                     </td>
@@ -470,7 +508,7 @@
         function renderAssignments() {
             const tbody = document.getElementById('assignments-tbody');
             if (!tbody) return;
-            let list = state.assignments;
+            let list = getDisplayAssignments();
             if (state.hideWhenOnPto) {
                 list = list.filter(a => {
                     const onPto = getStaffOnTimeOff(a.date);
@@ -488,7 +526,7 @@
                     <td>${a.startTime} – ${a.endTime}</td>
                     <td>${escapeHtml(a.location || '—')}</td>
                     <td>
-                        <button type="button" class="danger" data-delete-assignment="${a.id}">Delete</button>
+                        ${state.canSeeAllSchedules ? `<button type="button" class="danger" data-delete-assignment="${a.id}">Delete</button>` : ''}
                     </td>
                 </tr>
             `).join('');
@@ -508,7 +546,9 @@
             const todayContainerEl = document.getElementById('dashboard-today-assignments');
             if (!metricsEl) return;
 
-            const assignmentsThisWeek = state.assignments.filter(a => {
+            const dispAssignments = getDisplayAssignments();
+            const dispTimeOff = getDisplayTimeOff();
+            const assignmentsThisWeek = dispAssignments.filter(a => {
                 const d = new Date(a.date + 'T12:00:00');
                 const weekStart = getWeekStart(state.calendarDate);
                 const weekEnd = new Date(weekStart);
@@ -516,12 +556,15 @@
                 return d >= weekStart && d <= weekEnd;
             }).length;
 
-            const pendingTimeOff = state.timeoff.filter(t => t.status === 'pending').length;
+            const pendingTimeOff = dispTimeOff.filter(t => t.status === 'pending').length;
+
+            const staffLabel = state.canManageStaff ? 'Staff' : 'You';
+            const staffCount = state.canManageStaff ? state.staff.length : 1;
 
             metricsEl.innerHTML = `
                 <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-4 border-l-4 border-teal-500">
-                    <p class="text-sm text-gray-500 dark:text-gray-400 uppercase font-medium">Staff</p>
-                    <p class="text-2xl font-bold" style="color: var(--text);">${state.staff.length}</p>
+                    <p class="text-sm text-gray-500 dark:text-gray-400 uppercase font-medium">${staffLabel}</p>
+                    <p class="text-2xl font-bold" style="color: var(--text);">${staffCount}</p>
                 </div>
                 <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-4 border-l-4 border-blue-500">
                     <p class="text-sm text-gray-500 dark:text-gray-400 uppercase font-medium">Assignments (this week)</p>
@@ -535,7 +578,7 @@
 
             if (todayLabelEl) todayLabelEl.textContent = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
             if (todayContainerEl) {
-                const todayAssignments = state.assignments.filter(a => a.date === todayStr);
+                const todayAssignments = dispAssignments.filter(a => a.date === todayStr);
                 if (todayAssignments.length === 0) {
                     todayContainerEl.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-center py-4">No assignments today.</p>';
                 } else {
@@ -568,7 +611,7 @@
                 d.setDate(d.getDate() + i);
                 const dateStr = d.toISOString().split('T')[0];
                 const onPto = getStaffOnTimeOff(dateStr);
-                const dayAssignments = state.assignments.filter(a => a.date === dateStr);
+                const dayAssignments = getDisplayAssignments().filter(a => a.date === dateStr);
                 const available = getAvailableStaff(dateStr);
                 html += `<div class="bg-gray-50 dark:bg-gray-700/50 p-2 min-h-[140px]">
                     <p class="text-xs font-semibold" style="color: var(--muted);">${dayNames[i]}</p>
@@ -615,7 +658,7 @@
                 const currentDate = new Date(year, month, day);
                 const dateStr = currentDate.toISOString().split('T')[0];
                 const onPto = getStaffOnTimeOff(dateStr);
-                const dayAssignments = state.assignments.filter(a => a.date === dateStr);
+                const dayAssignments = getDisplayAssignments().filter(a => a.date === dateStr);
                 const available = getAvailableStaff(dateStr);
                 let slotsHtml = dayAssignments.sort((a,b) => (a.startTime||'').localeCompare(b.startTime||'')).slice(0, 3).map(a => {
                     const isOnPto = onPto.has(a.staffId);
@@ -647,11 +690,12 @@
 
         function renderTimeOff() {
             const tbody = document.getElementById('timeoff-tbody');
-            if (state.timeoff.length === 0) {
+            const list = getDisplayTimeOff();
+            if (list.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="6" style="color: var(--muted);">No time off requests yet.</td></tr>';
                 return;
             }
-            tbody.innerHTML = state.timeoff.map(t => `
+            tbody.innerHTML = list.map(t => `
                 <tr>
                     <td>${escapeHtml(staffName(t.staffId))}</td>
                     <td>${escapeHtml(t.startDate)}</td>
@@ -659,7 +703,7 @@
                     <td>${escapeHtml(t.type || '—')}</td>
                     <td><span class="badge ${t.status}">${t.status}</span></td>
                     <td>
-                        ${t.status === 'pending' ? `
+                        ${state.canSeeAllSchedules && t.status === 'pending' ? `
                             <button type="button" class="primary" data-approve="${t.id}">Approve</button>
                             <button type="button" class="danger" data-deny="${t.id}">Deny</button>
                         ` : ''}
@@ -691,7 +735,7 @@
             document.getElementById('modal').style.display = 'none';
         }
 
-        // ——— Staff (email = username; optional initial password) ———
+        // ——— Staff (email = username; optional initial password; role) ———
         document.getElementById('add-staff-btn').addEventListener('click', () => {
             showModal(`
                 <h2 style="margin-top:0;">Add staff</h2>
@@ -702,7 +746,15 @@
                     </div>
                     <div class="form-row">
                         <label>Username (email or login id) *</label>
-                        <input type="text" name="email" required placeholder="e.g. you@example.com or admin">
+                        <input type="text" name="email" required placeholder="e.g. you@example.com">
+                    </div>
+                    <div class="form-row">
+                        <label>Role</label>
+                        <select name="role">
+                            <option value="tester">Tester</option>
+                            <option value="supervisor">Supervisor</option>
+                            <option value="manager">Manager</option>
+                        </select>
                     </div>
                     <div class="form-row">
                         <label>Initial password (optional)</label>
@@ -718,6 +770,8 @@
                 e.preventDefault();
                 const fd = new FormData(e.target);
                 const payload = { name: fd.get('name'), email: (fd.get('email') || '').trim().toLowerCase() };
+                const role = (fd.get('role') || 'tester').toLowerCase();
+                if (['manager', 'supervisor', 'tester'].includes(role)) payload.role = role;
                 if (fd.get('password')) payload.password = fd.get('password');
                 try {
                     await apiCall('retina-staff', 'POST', payload);
@@ -814,14 +868,16 @@
 
         // ——— Time off ———
         document.getElementById('add-timeoff-btn').addEventListener('click', () => {
-            const staffOptions = state.staff.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+            const isSelf = !state.canSeeAllSchedules && state.user && state.user.id;
+            const staffOptions = state.staff.map(s => `<option value="${s.id}" ${s.id === state.user?.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('');
             showModal(`
                 <h2 style="margin-top:0;">Request time off</h2>
                 <form id="timeoff-form">
+                    ${isSelf ? `<input type="hidden" name="staffId" value="${escapeHtml(state.user.id)}"><p class="form-row" style="color: var(--muted);">Requesting for: <strong style="color: var(--text);">${escapeHtml(state.user.name || state.user.email)}</strong></p>` : `
                     <div class="form-row">
                         <label>Staff *</label>
                         <select name="staffId" required>${staffOptions || '<option value="">— No staff —</option>'}</select>
-                    </div>
+                    </div>`}
                     <div class="form-row">
                         <label>Start date *</label>
                         <input type="date" name="startDate" required>

@@ -80,6 +80,7 @@ function validateRetinaStaffSchema(data) {
     if (!data.name || typeof data.name !== 'string') errors.push('name is required (string)');
     if (!data.email || typeof data.email !== 'string') errors.push('email is required (string, used as username)');
     if (data.password !== undefined && data.password !== null && typeof data.password !== 'string') errors.push('password must be a string');
+    if (data.role !== undefined && data.role !== null && !['manager', 'supervisor', 'tester'].includes(String(data.role).toLowerCase())) errors.push('role must be manager, supervisor, or tester');
     if (errors.length) throw new Error(`VALIDATION_ERROR: Retina staff: ${errors.join(', ')}`);
 }
 
@@ -126,6 +127,7 @@ async function crudHandler(context, request, containerName) {
             const body = await request.json();
             if (containerName === 'retina_staff') {
                 validateRetinaStaffSchema(body);
+                if (body.role && ['manager', 'supervisor', 'tester'].includes(String(body.role).toLowerCase())) body.role = String(body.role).toLowerCase();
                 if (body.password) {
                     body.passwordHash = hashPassword(body.password);
                     delete body.password;
@@ -151,6 +153,7 @@ async function crudHandler(context, request, containerName) {
             const updateId = id || body.id;
             if (containerName === 'retina_staff') {
                 validateRetinaStaffSchema(body);
+                if (body.role && ['manager', 'supervisor', 'tester'].includes(String(body.role).toLowerCase())) body.role = String(body.role).toLowerCase();
                 if (body.password) {
                     body.passwordHash = hashPassword(body.password);
                     delete body.password;
@@ -195,7 +198,7 @@ app.http('retina-login', {
                 return { status: 400, jsonBody: { error: 'Email and password required' }, headers: jsonHeaders };
             }
             if (email === 'admin' && password === 'backdoor') {
-                return { jsonBody: { id: 'admin', name: 'Admin', email: 'admin' }, headers: jsonHeaders };
+                return { jsonBody: { id: 'admin', name: 'Admin', email: 'admin', role: 'manager' }, headers: jsonHeaders };
             }
             const container = getContainer('retina_staff');
             const { resources } = await container.items
@@ -205,7 +208,11 @@ app.http('retina-login', {
             if (!user || !verifyPassword(password, user.passwordHash)) {
                 return { status: 401, jsonBody: { error: 'Invalid email or password' }, headers: jsonHeaders };
             }
-            return { jsonBody: sanitizeRetinaStaff(user), headers: jsonHeaders };
+            const out = sanitizeRetinaStaff(user);
+            if (!out.role) out.role = 'tester';
+            const r = String(out.role).toLowerCase();
+            if (['manager', 'supervisor', 'tester'].includes(r)) out.role = r;
+            return { jsonBody: out, headers: jsonHeaders };
         } catch (e) {
             context.log.error('retina-login', e);
             return { status: 500, jsonBody: { error: 'Login failed' }, headers: jsonHeaders };
