@@ -1,7 +1,6 @@
 /**
- * RMT (Retina Mobility Testing) API – completely separate from CHAOS.
- * Own Cosmos client, auth, and endpoints. No shared code with api/index.js.
- * Containers: retina_staff, retina_assignments, retina_timeoff.
+ * RMT (Retina Mobility Testing) API – same DB as Chaos, different containers only.
+ * Uses COSMOS_ENDPOINT, COSMOS_KEY, DATABASE_ID. Containers: retina_staff, retina_assignments, retina_timeoff.
  */
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
@@ -46,7 +45,7 @@ function getCosmosClient() {
         const COSMOS_KEY = process.env.COSMOS_KEY;
         const DATABASE_ID = process.env.DATABASE_ID;
         if (!COSMOS_ENDPOINT || !COSMOS_KEY || !DATABASE_ID) {
-            throw new Error("COSMOS_DB_CONFIG_MISSING: Missing Cosmos DB env (COSMOS_ENDPOINT, COSMOS_KEY, DATABASE_ID).");
+            throw new Error("COSMOS_DB_CONFIG_MISSING: Missing COSMOS_ENDPOINT, COSMOS_KEY, or DATABASE_ID.");
         }
         cosmosClient = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
         database = cosmosClient.database(DATABASE_ID);
