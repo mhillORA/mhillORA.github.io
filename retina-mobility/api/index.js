@@ -106,10 +106,12 @@ function validateRetinaTimeOffSchema(data) {
 }
 
 // --- CRUD handler (RMT containers only) ---
-function getIdFromRequest(request, containerName) {
+function getIdFromRequest(request, context, containerName) {
     const fromParams = request.params && request.params.id;
     if (fromParams) return fromParams;
-    const url = request.url || '';
+    const fromBinding = context && context.bindingData && context.bindingData.id;
+    if (fromBinding) return fromBinding;
+    const url = (typeof request.url === 'string' ? request.url : '') || '';
     const match = url.match(/retina-(?:staff|assignments|timeoff)\/([^/?#]+)/i);
     return match ? match[1] : undefined;
 }
@@ -117,7 +119,7 @@ function getIdFromRequest(request, containerName) {
 async function crudHandler(context, request, containerName) {
     const container = getContainer(containerName);
     const method = request.method;
-    const id = getIdFromRequest(request, containerName);
+    const id = getIdFromRequest(request, context, containerName);
 
     try {
         if (method === 'GET') {
@@ -180,8 +182,17 @@ async function crudHandler(context, request, containerName) {
             if (!id) {
                 return { status: 400, jsonBody: { error: 'Resource id required for DELETE' }, headers: jsonHeaders };
             }
-            await container.item(id).delete();
-            return { status: 204, headers: jsonHeaders };
+            try {
+                await container.item(id).delete();
+                return { status: 204, headers: jsonHeaders };
+            } catch (deleteErr) {
+                const code = deleteErr.code || deleteErr.body?.code || (deleteErr.body && deleteErr.body.code);
+                const msg = (deleteErr.body && deleteErr.body.message) || deleteErr.message || '';
+                if (code === 404 || code === 40400 || String(msg).toLowerCase().includes('not found') || String(msg).toLowerCase().includes('resource with the specified id')) {
+                    return { status: 404, jsonBody: { error: 'Not found' }, headers: jsonHeaders };
+                }
+                throw deleteErr;
+            }
         }
 
         if (method === 'OPTIONS') {
