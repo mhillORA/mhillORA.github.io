@@ -182,38 +182,13 @@ async function crudHandler(context, request, containerName) {
             if (!id) {
                 return { status: 400, jsonBody: { error: 'Resource id required for DELETE' }, headers: jsonHeaders };
             }
-            const tryDelete = (partitionKeyValue) => {
-                if (partitionKeyValue !== undefined && partitionKeyValue !== null) {
-                    return container.item(id, partitionKeyValue).delete();
-                }
-                return container.item(id).delete();
-            };
             try {
-                await tryDelete();
+                await container.item(id).delete();
                 return { status: 204, headers: jsonHeaders };
             } catch (deleteErr) {
                 const code = deleteErr.code || deleteErr.body?.code || (deleteErr.body && deleteErr.body.code);
                 const msg = (deleteErr.body && deleteErr.body.message) || deleteErr.message || '';
-                const isNotFound = code === 404 || code === 40400 || String(msg).toLowerCase().includes('not found') || String(msg).toLowerCase().includes('resource with the specified id');
-                if (isNotFound && (containerName === 'retina_assignments' || containerName === 'retina_timeoff')) {
-                    try {
-                        const { resources } = await container.items.query({
-                            query: 'SELECT * FROM c WHERE c.id = @id',
-                            parameters: [{ name: '@id', value: id }]
-                        }).fetchAll();
-                        const item = resources && resources[0];
-                        if (item && item.staffId != null) {
-                            await container.item(id, item.staffId).delete();
-                            return { status: 204, headers: jsonHeaders };
-                        }
-                    } catch (retryErr) {
-                        if (retryErr.code === 404 || (retryErr.body && retryErr.body.code === 404)) {
-                            return { status: 404, jsonBody: { error: 'Not found' }, headers: jsonHeaders };
-                        }
-                        throw retryErr;
-                    }
-                }
-                if (isNotFound) {
+                if (code === 404 || code === 40400 || String(msg).toLowerCase().includes('not found') || String(msg).toLowerCase().includes('resource with the specified id')) {
                     return { status: 404, jsonBody: { error: 'Not found' }, headers: jsonHeaders };
                 }
                 throw deleteErr;
