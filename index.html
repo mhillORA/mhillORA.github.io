@@ -4956,40 +4956,36 @@
                 return visitNumber;
             };
             
-            // Helper function to get CRCs assigned to an event from roleAssignments, crcId, or crcIds
+            // Helper function to get CRCs assigned to an event from roleAssignments, crcId, or crcIds. For multi-day shifts (groupId), uses merged staff.
             const getEventCRCs = (event) => {
+                const source = (event && event.groupId && event.type === 'Site Assignment' && typeof getEventWithMergedGroupStaff === 'function')
+                    ? (getEventWithMergedGroupStaff(event) || event) : event;
+                if (!source) return [];
                 const crcs = [];
-                if (event.crcId) {
-                    // Legacy: check top-level crcId
-                    const crc = state.crcs.find(c => c.id === event.crcId);
+                if (source.crcId) {
+                    const crc = state.crcs.find(c => c.id === source.crcId);
                     if (crc) crcs.push(crc);
                 }
-                // Travel Day and shared travel: crcIds can include multiple CRCs
-                if (event.crcIds && Array.isArray(event.crcIds)) {
-                    event.crcIds.forEach(crcId => {
+                if (source.crcIds && Array.isArray(source.crcIds)) {
+                    source.crcIds.forEach(crcId => {
                         if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                             const c = state.crcs.find(c => c.id === crcId);
                             if (c && !crcs.find(x => x.id === c.id)) crcs.push(c);
                         }
                     });
                 }
-                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                    // New system: get CRCs from roleAssignments (includes regular roles and training roles)
-                    Object.values(event.roleAssignments).forEach(assignments => {
+                if (source.roleAssignments && Object.keys(source.roleAssignments).length > 0) {
+                    Object.values(source.roleAssignments).forEach(assignments => {
                         if (Array.isArray(assignments)) {
                             assignments.forEach(crcId => {
                                 if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                     const crc = state.crcs.find(c => c.id === crcId);
-                                    if (crc && !crcs.find(c => c.id === crc.id)) {
-                                        crcs.push(crc);
-                                    }
+                                    if (crc && !crcs.find(c => c.id === crc.id)) crcs.push(crc);
                                 }
                             });
                         }
                     });
                 }
-                // Training assignments are already included above since CRCs are in roleAssignments for Training role
-                // The trainingAssignments just specify what they're training for (e.g., "ICF")
                 return crcs;
             };
 
@@ -5021,6 +5017,42 @@
                 });
                 
                 return { roles, trainingInfo };
+            };
+
+            // For multi-day shifts (same groupId), merge roleAssignments/crcIds from all days so every day shows full staff and CRCs see their role
+            const getEventWithMergedGroupStaff = (event) => {
+                if (!event || !event.groupId || event.type !== 'Site Assignment') return event;
+                const events = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events || []).filter(e =>
+                    e && e.groupId === event.groupId && e.type === 'Site Assignment'
+                );
+                if (events.length <= 1) return event;
+                const mergedRoleAssignments = {};
+                const crcIdsSet = new Set();
+                let crcIdLegacy = null;
+                events.forEach(ev => {
+                    if (ev.crcId && ev.crcId !== 'SITE_STAFF' && ev.crcId !== 'UNASSIGNED') {
+                        crcIdsSet.add(ev.crcId);
+                        if (!crcIdLegacy) crcIdLegacy = ev.crcId;
+                    }
+                    if (ev.crcIds && Array.isArray(ev.crcIds)) ev.crcIds.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') crcIdsSet.add(id); });
+                    if (ev.roleAssignments && typeof ev.roleAssignments === 'object') {
+                        Object.entries(ev.roleAssignments).forEach(([roleId, assignments]) => {
+                            if (!Array.isArray(assignments)) return;
+                            if (!mergedRoleAssignments[roleId]) mergedRoleAssignments[roleId] = [];
+                            assignments.forEach(crcId => {
+                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED' && !mergedRoleAssignments[roleId].includes(crcId)) {
+                                    mergedRoleAssignments[roleId].push(crcId);
+                                }
+                            });
+                        });
+                    }
+                });
+                return {
+                    ...event,
+                    roleAssignments: Object.keys(mergedRoleAssignments).length ? mergedRoleAssignments : event.roleAssignments,
+                    crcIds: crcIdsSet.size ? Array.from(crcIdsSet) : event.crcIds,
+                    crcId: crcIdLegacy || event.crcId
+                };
             };
 
             const checkRoleFulfillment = (event) => {
@@ -6382,6 +6414,24 @@
                     if (foundInRoles) {
                         return true;
                     }
+                }
+                
+                // Multi-day shift: if this event has groupId but missing this CRC (e.g. day 2 payload incomplete), check other days in same group
+                if (event.groupId && event.type === 'Site Assignment') {
+                    const events = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events || []).filter(e =>
+                        e && e.groupId === event.groupId && e.type === 'Site Assignment'
+                    );
+                    const anyHasCrc = events.some(e => {
+                        if (e.crcId === crcId) return true;
+                        if (e.crcIds && Array.isArray(e.crcIds) && e.crcIds.includes(crcId)) return true;
+                        if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
+                            return Object.values(e.roleAssignments).some(assignments =>
+                                Array.isArray(assignments) && assignments.includes(crcId)
+                            );
+                        }
+                        return false;
+                    });
+                    if (anyHasCrc) return true;
                 }
                 
                 return false;
@@ -11321,7 +11371,8 @@
                         const studyColor = event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : (isDarkMode ? '#6d28d9' : '#8b5cf6'));
                         const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
                         const visitDisplay = event.visitNumber ? getVisitDisplayName(event.visitNumber, event.studyIds) : '—';
-                        const staffNames = getStaffNames(event);
+                        const eventForStaff = (typeof getEventWithMergedGroupStaff === 'function' ? getEventWithMergedGroupStaff(event) : null) || event;
+                        const staffNames = getStaffNames(eventForStaff);
                         const locationDisplay = getLocationDisplay(site);
                         const piDisplay = event.principalInvestigator || (site && site.principalInvestigator) || '—';
                         const staffDisplay = locationDisplay && locationDisplay !== '—' ? `${staffNames} · ${locationDisplay}` : staffNames;
@@ -11351,6 +11402,8 @@
                         if (studyFilter) listEvents = listEvents.filter(e => (e.studyIds || []).includes(studyFilter));
                     }
                     const rows = buildListRows(listEvents);
+                    const colCount = isListIndividual ? 10 : 9;
+                    const yourRoleHeader = isListIndividual ? '<th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Your role</th>' : '';
                     let listHTML = `
                         <div class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
                             <table class="min-w-full text-sm border-collapse">
@@ -11358,6 +11411,7 @@
                                     <tr>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Date</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Staff</th>
+                                        ${yourRoleHeader}
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Type</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Site</th>
                                         <th class="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold text-gray-900 dark:text-white">Location</th>
@@ -11370,15 +11424,19 @@
                                 <tbody class="bg-white dark:bg-gray-900">
                     `;
                     if (rows.length === 0) {
-                        listHTML += `<tr><td colspan="9" class="border border-gray-300 dark:border-gray-600 px-3 py-4 text-center text-gray-500 dark:text-gray-400">No shifts this month.</td></tr>`;
+                        listHTML += `<tr><td colspan="${colCount}" class="border border-gray-300 dark:border-gray-600 px-3 py-4 text-center text-gray-500 dark:text-gray-400">No shifts this month.</td></tr>`;
                     } else {
                         rows.forEach(({ dateLabel, type, event, studyColor, siteName, studyNames, visit, time, staffDisplay, locationDisplay, piDisplay }) => {
                             const textColor = studyColor && typeof getContrastColor === 'function' ? getContrastColor(studyColor) : '';
                             const style = studyColor ? `background-color: ${studyColor}; color: ${textColor};` : '';
+                            const eventForRole = (typeof getEventWithMergedGroupStaff === 'function' ? getEventWithMergedGroupStaff(event) : null) || event;
+                            const yourRoleInfo = isListIndividual && matchingCrcId && typeof getCRCRolesForEvent === 'function' ? getCRCRolesForEvent(matchingCrcId, eventForRole) : null;
+                            const yourRoleCell = isListIndividual ? `<td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${yourRoleInfo && yourRoleInfo.roles && yourRoleInfo.roles.length ? yourRoleInfo.roles.join(', ') + (yourRoleInfo.trainingInfo && yourRoleInfo.trainingInfo.length ? ` (${yourRoleInfo.trainingInfo.join(', ')})` : '') : '—'}</td>` : '';
                             listHTML += `
                                 <tr class="border-b border-gray-200 dark:border-gray-700 hover:opacity-90 cursor-pointer" data-action="view-crc-schedule-event" data-event-id="${event.id}" style="${style}">
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${dateLabel}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${staffDisplay}</td>
+                                    ${yourRoleCell}
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${type === 'Travel' ? '✈ Travel' : type}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${siteName}</td>
                                     <td class="border border-gray-300 dark:border-gray-600 px-3 py-2">${locationDisplay}</td>
@@ -11552,11 +11610,13 @@
             };
 
             const showCRCScheduleEventDetails = (event, currentCrcId) => {
+                const mergedEvent = (typeof getEventWithMergedGroupStaff === 'function' ? getEventWithMergedGroupStaff(event) : null) || event;
+                event = mergedEvent;
                 const site = state.crc_sites.find(s => s.id === event.siteId);
                 const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                 const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
-                
-                // Get all CRCs assigned to this event
+
+                // Get all CRCs assigned to this event (merged from same group so all days show everyone)
                 const assignedCrcs = [];
                 if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
                     const crc = state.crcs.find(c => c.id === event.crcId);
@@ -11598,9 +11658,17 @@
                 });
                 
                 
+                const yourRoleInfo = currentCrcId && typeof getCRCRolesForEvent === 'function' ? getCRCRolesForEvent(currentCrcId, event) : { roles: [], trainingInfo: [] };
+                const yourRoleDisplay = (yourRoleInfo.roles && yourRoleInfo.roles.length) ? yourRoleInfo.roles.join(', ') + (yourRoleInfo.trainingInfo && yourRoleInfo.trainingInfo.length ? ` (Training: ${yourRoleInfo.trainingInfo.join(', ')})` : '') : null;
                 openModal(`
                     <h3 class="text-xl font-bold dark:text-white mb-4">Shift Details</h3>
                     <div class="space-y-4">
+                        ${yourRoleDisplay ? `
+                        <div class="p-3 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700">
+                            <div class="text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">Your role on this shift</div>
+                            <div class="text-gray-900 dark:text-white font-medium">${yourRoleDisplay}</div>
+                        </div>
+                        ` : ''}
                         <div>
                             <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Date</div>
                             <div class="text-gray-900 dark:text-white">${formatDisplayDate(event.date)}</div>
