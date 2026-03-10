@@ -26,7 +26,7 @@ function verifyPassword(plain, stored) {
 // Strip login-sensitive fields from API responses (crcs = CRC logins for CHAOS only).
 function sanitizeLoginFields(containerName, item) {
     if (!item) return item;
-    if (containerName === 'crcs') {
+    if (containerName === 'crcs' || containerName === 'retina_staff') {
         const { passwordHash, password, ...rest } = item;
         return rest;
     }
@@ -640,8 +640,8 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
                 
-                // CRC login: hash password, never store plain (CHAOS only)
-                if (containerName === 'crcs' && body.password) {
+                // Hash password for crcs (CHAOS) and retina_staff (Entropy)
+                if ((containerName === 'crcs' || containerName === 'retina_staff') && body.password) {
                     body.passwordHash = hashPassword(body.password);
                     delete body.password;
                 }
@@ -698,7 +698,7 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
                 
-                if (containerName === 'crcs' && requestBody.password) {
+                if ((containerName === 'crcs' || containerName === 'retina_staff') && requestBody.password) {
                     requestBody.passwordHash = hashPassword(requestBody.password);
                     delete requestBody.password;
                 }
@@ -784,11 +784,11 @@ app.http('training-types', {
 });
 
 // RMT (Retina Mobility Testing) – same DB, RMT containers
-app.http('retina-staff', {
+app.http('retina_staff', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
-    route: 'retina-staff/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'retina-staff'),
+    route: 'retina_staff/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'retina_staff'),
 });
 app.http('retina_assignments', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -803,11 +803,41 @@ app.http('retina_timeoff', {
     handler: (request, context) => crudHandler(context, request, 'retina_timeoff'),
 });
 
-// =================================================================================
-// CHAOS CRC LOGIN (this API only – no shared code with RMT)
-// =================================================================================
-
 const jsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+
+// Entropy (RMT) staff login – same email/password convention as CHAOS
+app.http('retina-login', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'retina-login',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') return { status: 204, headers: jsonHeaders };
+        try {
+            const body = await request.json();
+            const email = body && body.email ? String(body.email).trim().toLowerCase() : '';
+            const password = body && body.password ? body.password : '';
+            if (!email || !password) {
+                return { status: 400, jsonBody: { error: 'Email and password are required' }, headers: jsonHeaders };
+            }
+            const container = getContainer('retina_staff');
+            const { resources } = await container.items
+                .query({ query: 'SELECT * FROM c WHERE LOWER(c.email) = @email', parameters: [{ name: '@email', value: email }] })
+                .fetchAll();
+            const user = resources && resources[0];
+            if (!user || !user.passwordHash || !verifyPassword(password, user.passwordHash)) {
+                return { status: 401, jsonBody: { error: 'Invalid email or password' }, headers: jsonHeaders };
+            }
+            return { jsonBody: sanitizeLoginFields('retina_staff', user), headers: jsonHeaders };
+        } catch (e) {
+            context.log.error('retina-login', e);
+            return { status: 500, jsonBody: { error: 'Login failed' }, headers: jsonHeaders };
+        }
+    }
+});
+
+// =================================================================================
+// CHAOS CRC LOGIN
+// =================================================================================
 
 app.http('crc-login', {
     methods: ['POST', 'OPTIONS'],
