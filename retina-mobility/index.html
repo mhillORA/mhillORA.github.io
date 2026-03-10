@@ -1971,7 +1971,19 @@ const getSchedulingHTML = () => {
            ${[1,2,3,4,5].map(v => `<option value="Visit ${v}" ${state.schedulingVisitFilter === `Visit ${v}` ? 'selected' : ''}>Visit ${v}</option>`).join('')}
        </select>` 
         : '';
+    const addShiftForm = `
+        <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-6">
+            <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Add shift</h3>
+            <form id="add-shift-form" class="flex flex-wrap items-end gap-4">
+                <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Staff</label><select name="staffId" required class="mt-1 p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select staff</option>${(state.staff || []).map(s => `<option value="${s.id}">${s.name || s.displayName || s.email || s.id}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Date</label><input type="date" name="date" required class="mt-1 p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/></div>
+                <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Start time</label><input type="time" name="startTime" value="09:00" required class="mt-1 p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/></div>
+                <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">End time</label><input type="time" name="endTime" value="17:00" class="mt-1 p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/></div>
+                <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">Add shift</button>
+            </form>
+        </div>`;
     return `
+    ${addShiftForm}
     <div class="flex justify-between items-center mb-6 flex-wrap gap-4">
         <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Scheduling</h2>
         <div class="flex items-center gap-2 flex-wrap ml-auto">
@@ -4283,7 +4295,34 @@ document.addEventListener('submit', async (e) => {
                 form.reset();
             } catch (err) {
                 const msg = err && err.message ? err.message : 'Request failed';
-                showNotification('Could not create staff: ' + msg + ' (API must expose POST /retina_staff and Cosmos container must be named retina_staff)', 'error');
+                const isNetwork = /fetch|network|cors/i.test(msg);
+                const displayMsg = isNetwork
+                    ? 'Cannot reach the API (network or CORS). Ensure the API is deployed and allows this origin. Container must be named retina_staff.'
+                    : 'Could not create staff: ' + msg + ' (API must expose POST /retina_staff and Cosmos container must be named retina_staff).';
+                showNotification(displayMsg, 'error');
+            }
+            break;
+        }
+        case 'add-shift-form': {
+            const staffId = (data.staffId || '').trim();
+            const dateStr = (data.date || '').trim();
+            const startTimeStr = (data.startTime || '09:00').trim();
+            const endTimeStr = (data.endTime || '17:00').trim();
+            if (!staffId || !dateStr) {
+                showNotification('Please select staff and date.', 'error');
+                break;
+            }
+            const startTime = new Date(dateStr + 'T' + startTimeStr + ':00').toISOString();
+            const endTime = endTimeStr ? new Date(dateStr + 'T' + endTimeStr + ':00').toISOString() : undefined;
+            try {
+                await createDocument('retina_assignments', { staffId, startTime, endTime });
+                await loadAllData();
+                render();
+                showNotification('Shift added.', 'success');
+                form.reset();
+            } catch (err) {
+                const msg = err && err.message ? err.message : 'Request failed';
+                showNotification('Could not add shift: ' + msg, 'error');
             }
             break;
         }
@@ -5463,20 +5502,35 @@ const renderCalendar = () => {
         const dateString = currentDate.toISOString().split('T')[0];
         let appointmentsHTML = '';
         filteredSchedules.forEach(schedule => {
-            schedule.slots.forEach(slot => {
+            (schedule.slots || []).forEach(slot => {
                 const slotDate = new Date(slot.startTime);
                 if (slotDate.toISOString().split('T')[0] === dateString) {
                     const study = state.studies.find(s => s.id === schedule.studyId);
-                    const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
-                    const isFull = bookedCount >= slot.capacity;
+                    const bookedCount = (state.patients || []).filter(p => p.appointment && p.appointment.slotId === slot.id).length;
+                    const isFull = bookedCount >= (slot.capacity || 1);
                     appointmentsHTML += `
                         <div data-schedule-id="${schedule.id}" data-slot-id="${slot.id}" class="appointment-slot p-1.5 mb-1 rounded-md text-xs cursor-pointer ${isFull ? 'bg-red-200 dark:bg-red-800 text-red-900 dark:text-red-100' : 'bg-blue-100 dark:bg-blue-800 hover:bg-blue-200 dark:hover:bg-blue-700 text-blue-900 dark:text-blue-100'}">
                             <p class="font-semibold truncate dark:text-white">${schedule.visit || 'General'}: ${study?.title || 'No Title'}</p>
-                            <p class="dark:text-gray-300">${slotDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} (${bookedCount}/${slot.capacity})</p>
+                            <p class="dark:text-gray-300">${slotDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} (${bookedCount}/${slot.capacity || 1})</p>
                         </div>
                     `;
                 }
             });
+        });
+        (state.assignments || []).filter(a => {
+            const d = new Date(a.startTime);
+            return d.toISOString().split('T')[0] === dateString;
+        }).forEach(a => {
+            const staff = (state.staff || []).find(s => s.id === a.staffId);
+            const start = new Date(a.startTime);
+            const end = a.endTime ? new Date(a.endTime) : null;
+            const timeStr = end ? start.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '–' + end.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : start.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+            appointmentsHTML += `
+                <div data-assignment-id="${a.id}" class="p-1.5 mb-1 rounded-md text-xs bg-emerald-100 dark:bg-emerald-800 text-emerald-900 dark:text-emerald-100">
+                    <p class="font-semibold truncate">${staff?.name || staff?.displayName || staff?.email || a.staffId || 'Staff'}</p>
+                    <p class="dark:text-emerald-200">${timeStr}</p>
+                </div>
+            `;
         });
         calendarHTML += `
             <div class="calendar-day p-2 bg-white dark:bg-gray-800 relative cursor-pointer" data-date="${dateString}">
