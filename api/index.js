@@ -783,6 +783,26 @@ app.http('training-types', {
     handler: (request, context) => crudHandler(context, request, 'training_types'),
 });
 
+// RMT (Retina Mobility Testing) – same DB, RMT containers
+app.http('retina-staff', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'retina-staff/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'retina-staff'),
+});
+app.http('retina_assignments', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'retina_assignments/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'retina_assignments'),
+});
+app.http('retina_timeoff', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'retina_timeoff/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'retina_timeoff'),
+});
+
 // =================================================================================
 // CHAOS CRC LOGIN (this API only – no shared code with RMT)
 // =================================================================================
