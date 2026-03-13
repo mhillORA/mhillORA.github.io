@@ -590,12 +590,12 @@ async function crudHandler(context, request, containerName) {
             case 'GET':
                 if (id) {
                     const { resource } = await container.item(id).read(); 
-                    if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
-                    return { jsonBody: sanitizeLoginFields(containerName, resource) };
+                    if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` }, headers: crudCorsHeaders };
+                    return { jsonBody: sanitizeLoginFields(containerName, resource), headers: crudCorsHeaders };
                 } else {
                     const { resources } = await container.items.readAll().fetchAll();
                     const sanitized = (resources || []).map(r => sanitizeLoginFields(containerName, r));
-                    return { jsonBody: sanitized };
+                    return { jsonBody: sanitized, headers: crudCorsHeaders };
                 }
             
             case 'POST':
@@ -636,7 +636,7 @@ async function crudHandler(context, request, containerName) {
                     return {
                         status: 400,
                         jsonBody: { error: validationError.message },
-                        headers: { 'Content-Type': 'application/json' }
+                        headers: crudCorsHeaders
                     };
                 }
                 
@@ -654,7 +654,7 @@ async function crudHandler(context, request, containerName) {
                     createdItem.enrolled = enrollment;
                 }
                 
-                return { status: 201, jsonBody: sanitizeLoginFields(containerName, createdItem) };
+                return { status: 201, jsonBody: sanitizeLoginFields(containerName, createdItem), headers: crudCorsHeaders };
             
             case 'PUT':
                 const requestBody = await request.json();
@@ -694,7 +694,7 @@ async function crudHandler(context, request, containerName) {
                     return {
                         status: 400,
                         jsonBody: { error: validationError.message },
-                        headers: { 'Content-Type': 'application/json' }
+                        headers: crudCorsHeaders
                     };
                 }
                 
@@ -711,17 +711,17 @@ async function crudHandler(context, request, containerName) {
                     result.enrolled = enrollment;
                 }
                 
-                return { jsonBody: sanitizeLoginFields(containerName, result) };
+                return { jsonBody: sanitizeLoginFields(containerName, result), headers: crudCorsHeaders };
 
             case 'DELETE':
                 await container.item(id).delete();
-                return { status: 204 };
+                return { status: 204, headers: crudCorsHeaders };
 
             case 'OPTIONS':
-                return { status: 200 };
+                return { status: 204, headers: crudCorsHeaders };
 
             default:
-                return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+                return { status: 405, jsonBody: { error: 'Method Not Allowed' }, headers: crudCorsHeaders };
         }
     } catch (error) {
         // Catch any error during the database operation
@@ -783,6 +783,13 @@ app.http('training-types', {
     handler: (request, context) => crudHandler(context, request, 'training_types'),
 });
 
+app.http('schedules', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'schedules/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'schedules'),
+});
+
 // RMT (Retina Mobility Testing) – same DB, RMT containers
 app.http('retina_staff', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -804,6 +811,7 @@ app.http('retina_timeoff', {
 });
 
 const jsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+const crudCorsHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
 
 // Entropy (RMT) staff login – same email/password convention as CHAOS
 app.http('retina-login', {
