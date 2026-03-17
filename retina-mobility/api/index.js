@@ -87,9 +87,8 @@ function validateRetinaStaffSchema(data) {
 function validateRetinaAssignmentsSchema(data) {
     const errors = [];
     if (!data.staffId || typeof data.staffId !== 'string') errors.push('staffId required');
-    if (!data.date || typeof data.date !== 'string') errors.push('date required (YYYY-MM-DD)');
-    if (!data.startTime || typeof data.startTime !== 'string') errors.push('startTime required');
-    if (!data.endTime || typeof data.endTime !== 'string') errors.push('endTime required');
+    if (!data.startTime || typeof data.startTime !== 'string') errors.push('startTime required (ISO or time string)');
+    if (data.endTime !== undefined && data.endTime !== null && typeof data.endTime !== 'string') errors.push('endTime must be a string if provided');
     if (data.location !== undefined && data.location !== null && typeof data.location !== 'string') errors.push('location must be a string');
     if (errors.length) throw new Error(`VALIDATION_ERROR: Retina assignment: ${errors.join(', ')}`);
 }
@@ -112,7 +111,7 @@ function getIdFromRequest(request, context, containerName) {
     const fromBinding = context && context.bindingData && context.bindingData.id;
     if (fromBinding) return fromBinding;
     const url = (typeof request.url === 'string' ? request.url : '') || '';
-    const match = url.match(/retina-(?:staff|assignments|timeoff)\/([^/?#]+)/i);
+    const match = url.match(/retina_(?:staff|assignments|timeoff)\/([^/?#]+)/i);
     return match ? match[1] : undefined;
 }
 
@@ -245,23 +244,48 @@ app.http('retina-login', {
     }
 });
 
-app.http('retina-staff', {
+// Routes must match frontend: retina_staff, retina_assignments, retina_timeoff, studies
+app.http('retina_staff', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
-    route: 'retina-staff/{id?}',
+    route: 'retina_staff/{id?}',
     handler: (request, context) => crudHandler(context, request, 'retina_staff'),
 });
 
-app.http('retina-assignments', {
+app.http('retina_assignments', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
-    route: 'retina-assignments/{id?}',
+    route: 'retina_assignments/{id?}',
     handler: (request, context) => crudHandler(context, request, 'retina_assignments'),
 });
 
-app.http('retina-timeoff', {
+app.http('retina_timeoff', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
-    route: 'retina-timeoff/{id?}',
+    route: 'retina_timeoff/{id?}',
     handler: (request, context) => crudHandler(context, request, 'retina_timeoff'),
+});
+
+// Studies: frontend expects GET /api/studies (list) and GET /api/studies/{id}
+app.http('studies', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'studies/{id?}',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') return { status: 204, headers: jsonHeaders };
+        try {
+            const container = getContainer('studies');
+            const id = request.params && request.params.id;
+            if (id) {
+                const { resource } = await container.item(id).read();
+                if (!resource) return { status: 404, jsonBody: { error: 'Not found' }, headers: jsonHeaders };
+                return { jsonBody: resource, headers: jsonHeaders };
+            }
+            const { resources } = await container.items.readAll().fetchAll();
+            return { jsonBody: resources || [], headers: jsonHeaders };
+        } catch (e) {
+            context.log.error('studies', e);
+            return handleError(context, e, 'studies');
+        }
+    }
 });
