@@ -702,6 +702,19 @@ async function crudHandler(context, request, containerName) {
                     requestBody.passwordHash = hashPassword(requestBody.password);
                     delete requestBody.password;
                 }
+
+                // IMPORTANT: retina_staff updates coming from the UI don't include passwordHash (it's sanitized out).
+                // Preserve the existing passwordHash unless a new password was provided.
+                if (containerName === 'retina_staff' && !requestBody.passwordHash) {
+                    try {
+                        const { resource: existing } = await container.item(updateId).read();
+                        if (existing && existing.passwordHash) {
+                            requestBody.passwordHash = existing.passwordHash;
+                        }
+                    } catch (_) {
+                        // If we can't read existing, proceed; upsert may still succeed for other fields.
+                    }
+                }
                 
                 const updatedItem = { ...requestBody, id: updateId };
                 const { resource: result } = await container.items.upsert(updatedItem);
