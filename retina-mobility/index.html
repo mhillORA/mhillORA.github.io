@@ -4565,6 +4565,26 @@ document.addEventListener('submit', async (e) => {
             const startTime = new Date(dateStr + 'T' + startTimeStr + ':00').toISOString();
             const endTime = endTimeStr ? new Date(dateStr + 'T' + endTimeStr + ':00').toISOString() : undefined;
             try {
+                // Prevent scheduling shifts during APPROVED PTO.
+                // PTO is stored as { startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD', status }.
+                const shiftStartYMD = new Date(startTime).toISOString().split('T')[0];
+                const shiftEndYMD = endTime ? new Date(endTime).toISOString().split('T')[0] : shiftStartYMD;
+                const conflictingPto = (state.timeOffRequests || []).filter(r => {
+                    if (!r || r.staffId !== staffId) return false;
+                    const status = String(r.status || '').toLowerCase();
+                    if (status !== 'approved') return false;
+                    if (!r.startDate || !r.endDate) return false;
+                    // Inclusive overlap check on day boundaries (YYYY-MM-DD lexicographically sortable).
+                    return shiftStartYMD <= String(r.endDate) && shiftEndYMD >= String(r.startDate);
+                });
+                if (conflictingPto.length > 0) {
+                    const r = conflictingPto[0];
+                    showNotification(
+                        `Cannot schedule shift: staff has approved PTO (${r.startDate} to ${r.endDate}).`,
+                        'error'
+                    );
+                    break;
+                }
                 await createDocument('retina_assignments', { staffId, startTime, endTime });
                 await loadAllData();
                 render();
@@ -5801,6 +5821,29 @@ const renderCalendar = () => {
         const currentDate = new Date(year, month, day);
         const dateString = currentDate.toISOString().split('T')[0];
         let appointmentsHTML = '';
+
+        // PTO blocks for the day (approved + pending)
+        (state.timeOffRequests || []).forEach(r => {
+            if (!r || !r.staffId || !r.startDate || !r.endDate) return;
+            const status = String(r.status || 'pending').toLowerCase();
+            if (status !== 'approved' && status !== 'pending') return; // skip denied
+            const startYMD = String(r.startDate);
+            const endYMD = String(r.endDate);
+            if (!(dateString >= startYMD && dateString <= endYMD)) return;
+            const staff = (state.staff || []).find(s => s.id === r.staffId);
+            const staffName = staff?.name || staff?.displayName || staff?.email || r.staffId || 'Staff';
+            const colorClass = status === 'approved'
+                ? 'bg-indigo-100 dark:bg-indigo-800/60 text-indigo-900 dark:text-indigo-100 border border-indigo-200 dark:border-indigo-700'
+                : 'bg-amber-100 dark:bg-amber-800/60 text-amber-900 dark:text-amber-100 border border-amber-200 dark:border-amber-700';
+            const timeLabel = `${r.type || 'PTO'} · ${status.charAt(0).toUpperCase() + status.slice(1)}`;
+            appointmentsHTML += `
+                <div class="p-1.5 rounded-md text-xs ${colorClass}">
+                    <p class="font-semibold truncate">${staffName}</p>
+                    <p class="dark:text-gray-900/70">${timeLabel}</p>
+                </div>
+            `;
+        });
+
         filteredSchedules.forEach(schedule => {
             (schedule.slots || []).forEach(slot => {
                 if (!slot || !slot.startTime) return;
@@ -5811,7 +5854,7 @@ const renderCalendar = () => {
                     const bookedCount = (state.patients || []).filter(p => p.appointment && p.appointment.slotId === slot.id).length;
                     const isFull = bookedCount >= (slot.capacity || 1);
                     appointmentsHTML += `
-                        <div data-schedule-id="${schedule.id}" data-slot-id="${slot.id}" class="appointment-slot p-1.5 mb-1 rounded-md text-xs cursor-pointer ${isFull ? 'bg-red-200 dark:bg-red-800 text-red-900 dark:text-red-100' : 'bg-blue-100 dark:bg-blue-800 hover:bg-blue-200 dark:hover:bg-blue-700 text-blue-900 dark:text-blue-100'}">
+                        <div data-schedule-id="${schedule.id}" data-slot-id="${slot.id}" class="appointment-slot p-1.5 rounded-md text-xs cursor-pointer ${isFull ? 'bg-red-200 dark:bg-red-800 text-red-900 dark:text-red-100' : 'bg-blue-100 dark:bg-blue-800 hover:bg-blue-200 dark:hover:bg-blue-700 text-blue-900 dark:text-blue-100'}">
                             <p class="font-semibold truncate dark:text-white">${schedule.visit || 'General'}: ${study?.title || 'No Title'}</p>
                             <p class="dark:text-gray-300">${slotDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} (${bookedCount}/${slot.capacity || 1})</p>
                         </div>
@@ -5830,7 +5873,7 @@ const renderCalendar = () => {
             const end = a.endTime ? new Date(a.endTime) : null;
             const timeStr = end ? start.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '–' + end.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : start.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
             appointmentsHTML += `
-                <div data-assignment-id="${a.id}" class="p-1.5 mb-1 rounded-md text-xs bg-emerald-100 dark:bg-emerald-800 text-emerald-900 dark:text-emerald-100">
+                <div data-assignment-id="${a.id}" class="p-1.5 rounded-md text-xs bg-emerald-50 dark:bg-emerald-900/40 text-emerald-900 dark:text-emerald-100 border border-emerald-200 dark:border-emerald-700">
                     <p class="font-semibold truncate">${staff?.name || staff?.displayName || staff?.email || a.staffId || 'Staff'}</p>
                     <p class="dark:text-emerald-200">${timeStr}</p>
                 </div>
@@ -5839,7 +5882,7 @@ const renderCalendar = () => {
         calendarHTML += `
             <div class="calendar-day p-2 bg-white dark:bg-gray-800 relative cursor-pointer" data-date="${dateString}">
                 <span class="font-medium text-gray-800 dark:text-gray-200">${day}</span>
-                <div class="mt-2 overflow-y-auto max-h-24">${appointmentsHTML}</div>
+                <div class="mt-2 overflow-y-auto max-h-24 space-y-1">${appointmentsHTML}</div>
             </div>
         `;
     }
