@@ -639,6 +639,10 @@ const renderContent = () => {
     };
     const fn = contentMap[state.activeTab] || getDashboardHTML;
     mainContent.innerHTML = fn();
+    if (state.activeTab === 'dashboard' && !isManager()) {
+        renderEmployeeCalendar();
+        renderEmployeeDayCalendar();
+    }
     if (state.activeTab === 'scheduling') {
         if (state.schedulingView === 'calendar') renderCalendar();
         if (state.schedulingView === 'day') renderDayView();
@@ -777,7 +781,10 @@ const getStaffHTML = () => {
                         <td class="px-6 py-4">${s.name || s.displayName || '—'}</td>
                         <td class="px-6 py-4">${s.email || '—'}</td>
                         <td class="px-6 py-4">
-                            <button data-action="edit-staff" data-id="${s.id}" class="text-blue-600 dark:text-blue-400 hover:underline text-sm">Edit</button>
+                            <div class="flex gap-3 items-center">
+                                <button data-action="view-staff-stats" data-id="${s.id}" class="text-indigo-600 dark:text-indigo-400 hover:underline text-sm">Stats</button>
+                                <button data-action="edit-staff" data-id="${s.id}" class="text-blue-600 dark:text-blue-400 hover:underline text-sm">Edit</button>
+                            </div>
                         </td>
                     </tr>`).join('')
                 }
@@ -809,6 +816,145 @@ const getEditStaffModalHTML = (staff) => {
                 <button type="submit" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">Save</button>
             </div>
         </form>
+    `;
+};
+
+const getStaffStatsModalHTML = (staff) => {
+    if (!staff) return `<h2 class="text-2xl font-bold dark:text-white mb-4">Staff not found</h2>`;
+    const staffId = staff.id;
+    const staffName = staff.name || staff.displayName || staff.email || staffId;
+
+    const parseYmdUtc = (ymd) => {
+        if (!ymd) return null;
+        const d = new Date(String(ymd) + 'T00:00:00Z');
+        return isNaN(d.getTime()) ? null : d;
+    };
+
+    const daysInclusive = (startYmd, endYmd) => {
+        const start = parseYmdUtc(startYmd);
+        const end = parseYmdUtc(endYmd);
+        if (!start || !end) return 0;
+        const diffMs = end.getTime() - start.getTime();
+        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        return diffDays >= 0 ? diffDays + 1 : 0;
+    };
+
+    const pto = (state.timeOffRequests || []).filter(r => r && r.staffId === staffId);
+    const pendingCount = pto.filter(r => String(r.status || '').toLowerCase() === 'pending').length;
+    const approvedCount = pto.filter(r => String(r.status || '').toLowerCase() === 'approved').length;
+    const deniedCount = pto.filter(r => String(r.status || '').toLowerCase() === 'denied').length;
+    const approvedDays = pto
+        .filter(r => String(r.status || '').toLowerCase() === 'approved')
+        .reduce((sum, r) => sum + daysInclusive(r.startDate, r.endDate), 0);
+
+    const now = new Date();
+    const shifts = (state.assignments || [])
+        .filter(a => a && a.staffId === staffId && a.startTime && !isNaN(new Date(a.startTime).getTime()))
+        .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+    const nextShifts = shifts
+        .filter(a => new Date(a.startTime) >= now)
+        .slice(0, 10);
+
+    const hoursCount = 12;
+    const hourStart = new Date(now);
+    hourStart.setMinutes(0, 0, 0);
+    const hourCells = Array.from({ length: hoursCount }).map((_, i) => {
+        const h = new Date(hourStart);
+        h.setHours(h.getHours() + i);
+
+        const hourEpoch = h.getTime();
+        const inShift = shifts.some(s => {
+            const sStart = new Date(s.startTime).getTime();
+            const sEnd = s.endTime ? new Date(s.endTime).getTime() : (sStart + 60 * 60 * 1000);
+            return hourEpoch >= sStart && hourEpoch < sEnd;
+        });
+
+        const inApprovedPto = pto.some(r => {
+            if (String(r.status || '').toLowerCase() !== 'approved') return false;
+            const start = parseYmdUtc(r.startDate);
+            const end = parseYmdUtc(r.endDate);
+            if (!start || !end) return false;
+            const day = new Date(h);
+            day.setHours(0, 0, 0, 0);
+            const dayUtc = new Date(day.toISOString().slice(0, 10) + 'T00:00:00Z').getTime();
+            return dayUtc >= start.getTime() && dayUtc <= end.getTime();
+        });
+
+        const label = h.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const cellClass = inShift
+            ? 'bg-emerald-100 dark:bg-emerald-800 text-emerald-900 dark:text-emerald-100 border border-emerald-200 dark:border-emerald-700'
+            : inApprovedPto
+                ? 'bg-rose-100 dark:bg-rose-800 text-rose-900 dark:text-rose-100 border border-rose-200 dark:border-rose-700'
+                : 'bg-gray-50 dark:bg-gray-700/40 text-gray-600 dark:text-gray-300 border border-gray-200 dark:border-gray-600';
+
+        const pillText = inShift ? 'Shift' : (inApprovedPto ? 'PTO' : '');
+        return `
+            <div class="px-2 py-1 rounded-md text-xs whitespace-nowrap ${cellClass}">
+                <div class="font-semibold">${label}</div>
+                ${pillText ? `<div class="text-[10px] opacity-90">${pillText}</div>` : ''}
+            </div>
+        `;
+    }).join('');
+
+    const nextShiftsRows = nextShifts.length === 0
+        ? `<tr><td colspan="2" class="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No upcoming shifts.</td></tr>`
+        : nextShifts.map(s => {
+            const start = new Date(s.startTime);
+            const end = s.endTime ? new Date(s.endTime) : null;
+            return `
+                <tr class="dark:text-gray-300">
+                    <td class="px-6 py-4">${start.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</td>
+                    <td class="px-6 py-4">${end ? end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                </tr>
+            `;
+        }).join('');
+
+    return `
+        <h2 class="text-2xl font-bold dark:text-white mb-2">Employee Stats</h2>
+        <p class="text-gray-600 dark:text-gray-400 mb-6">${staffName}</p>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            <div class="bg-white dark:bg-gray-800 p-5 rounded-lg shadow-md">
+                <h3 class="text-sm font-semibold text-gray-500 dark:text-gray-400">Pending PTO</h3>
+                <p class="text-2xl font-bold dark:text-white">${pendingCount}</p>
+            </div>
+            <div class="bg-white dark:bg-gray-800 p-5 rounded-lg shadow-md">
+                <h3 class="text-sm font-semibold text-gray-500 dark:text-gray-400">Approved PTO</h3>
+                <p class="text-2xl font-bold dark:text-white">${approvedCount}</p>
+                <p class="text-sm text-gray-500 dark:text-gray-400">(${approvedDays} days)</p>
+            </div>
+            <div class="bg-white dark:bg-gray-800 p-5 rounded-lg shadow-md">
+                <h3 class="text-sm font-semibold text-gray-500 dark:text-gray-400">Denied PTO</h3>
+                <p class="text-2xl font-bold dark:text-white">${deniedCount}</p>
+            </div>
+        </div>
+
+        <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-5 mb-6">
+            <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Upcoming Shifts</h3>
+            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                <thead class="bg-gray-50 dark:bg-gray-700">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Start</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">End</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+                    ${nextShiftsRows}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-5">
+            <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Next ${hoursCount} Hours (Shift/PTO)</h3>
+            <div class="flex flex-wrap gap-2">
+                ${hourCells}
+            </div>
+        </div>
+
+        <div class="flex justify-end mt-6">
+            <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600">Close</button>
+        </div>
     `;
 };
 
@@ -861,6 +1007,29 @@ const getStaffDashboardHTML = () => {
                     }).join('')}</ul>`
                 }
             </div>
+        </div>
+
+        <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">My Calendar</h3>
+                <div class="flex gap-2">
+                    <button type="button" data-action="prev-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700" aria-label="Previous month"><i data-lucide="chevron-left"></i></button>
+                    <button type="button" data-action="next-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700" aria-label="Next month"><i data-lucide="chevron-right"></i></button>
+                </div>
+            </div>
+            <div id="employee-calendar-container" class="mt-2"></div>
+        </div>
+
+        <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md mt-6">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">My Day</h3>
+                <div class="flex gap-2">
+                    <button type="button" data-action="prev-day" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700" aria-label="Previous day"><i data-lucide="chevron-left"></i></button>
+                    <button type="button" data-action="next-day" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700" aria-label="Next day"><i data-lucide="chevron-right"></i></button>
+                </div>
+            </div>
+            <div class="text-sm text-gray-600 dark:text-gray-400 mb-3" id="employee-day-header"></div>
+            <div id="employee-day-calendar-container"></div>
         </div>
     `;
 };
@@ -3975,6 +4144,7 @@ document.addEventListener('click', async (e) => {
             case 'edit-study': openModal(getEditStudyModalHTML(state.studies.find(s => s.id === id)), true); break;
             case 'edit-site': openModal(getEditSiteModalHTML(state.sites.find(s => s.id === id))); break;
             case 'edit-staff': openModal(getEditStaffModalHTML(state.staff.find(s => s.id === id))); break;
+            case 'view-staff-stats': openModal(getStaffStatsModalHTML(state.staff.find(s => s.id === id))); break;
             case 'schedule-patient': 
                 state.bookingCalendarDate = new Date();
                 openModal(getBookingModalHTML(state.patients.find(p => p.id === id))); 
@@ -4567,15 +4737,31 @@ document.addEventListener('submit', async (e) => {
             try {
                 // Prevent scheduling shifts during APPROVED PTO.
                 // PTO is stored as { startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD', status }.
-                const shiftStartYMD = new Date(startTime).toISOString().split('T')[0];
-                const shiftEndYMD = endTime ? new Date(endTime).toISOString().split('T')[0] : shiftStartYMD;
+                const toYMDLocal = (d) => {
+                    if (!d || isNaN(d.getTime())) return '';
+                    const y = d.getFullYear();
+                    const m = String(d.getMonth() + 1).padStart(2, '0');
+                    const day = String(d.getDate()).padStart(2, '0');
+                    return `${y}-${m}-${day}`;
+                };
+
+                const shiftStartLocal = new Date(dateStr + 'T' + startTimeStr + ':00');
+                let shiftEndLocal = endTimeStr ? new Date(dateStr + 'T' + endTimeStr + ':00') : shiftStartLocal;
+                // If an overnight shift was entered (end time earlier than start time), treat end date as next day.
+                if (endTimeStr && shiftEndLocal.getTime() < shiftStartLocal.getTime()) {
+                    shiftEndLocal.setDate(shiftEndLocal.getDate() + 1);
+                }
+                const shiftStartYMD = toYMDLocal(shiftStartLocal);
+                const shiftEndYMD = toYMDLocal(shiftEndLocal);
                 const conflictingPto = (state.timeOffRequests || []).filter(r => {
                     if (!r || r.staffId !== staffId) return false;
                     const status = String(r.status || '').toLowerCase();
                     if (status !== 'approved') return false;
                     if (!r.startDate || !r.endDate) return false;
+                    const ptoStartYMD = String(r.startDate).slice(0, 10);
+                    const ptoEndYMD = String(r.endDate).slice(0, 10);
                     // Inclusive overlap check on day boundaries (YYYY-MM-DD lexicographically sortable).
-                    return shiftStartYMD <= String(r.endDate) && shiftEndYMD >= String(r.startDate);
+                    return shiftStartYMD <= ptoEndYMD && shiftEndYMD >= ptoStartYMD;
                 });
                 if (conflictingPto.length > 0) {
                     const r = conflictingPto[0];
@@ -5827,8 +6013,8 @@ const renderCalendar = () => {
             if (!r || !r.staffId || !r.startDate || !r.endDate) return;
             const status = String(r.status || 'pending').toLowerCase();
             if (status !== 'approved' && status !== 'pending') return; // skip denied
-            const startYMD = String(r.startDate);
-            const endYMD = String(r.endDate);
+            const startYMD = String(r.startDate).slice(0, 10);
+            const endYMD = String(r.endDate).slice(0, 10);
             if (!(dateString >= startYMD && dateString <= endYMD)) return;
             const staff = (state.staff || []).find(s => s.id === r.staffId);
             const staffName = staff?.name || staff?.displayName || staff?.email || r.staffId || 'Staff';
@@ -5890,6 +6076,225 @@ const renderCalendar = () => {
     container.innerHTML = calendarHTML;
     lucide.createIcons();
 };
+
+// Employee-only month calendar (staff shifts + their PTO)
+const renderEmployeeCalendar = () => {
+    const container = document.getElementById('employee-calendar-container');
+    if (!container) return;
+    const staffId = state.loggedInUser?.id;
+    if (!staffId) {
+        container.innerHTML = '<p class="text-gray-500 dark:text-gray-400">No staff selected.</p>';
+        return;
+    }
+
+    const toYMDLocal = (d) => {
+        if (!d || isNaN(d.getTime())) return null;
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
+    };
+
+    const date = state.calendarDate || new Date();
+    const month = date.getMonth();
+    const year = date.getFullYear();
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const daysInMonth = lastDay.getDate();
+    const startDayOfWeek = firstDay.getDay();
+    const monthName = date.toLocaleString('default', { month: 'long' });
+
+    const assignmentsForStaff = (state.assignments || []).filter(a => {
+        if (!a || a.staffId !== staffId) return false;
+        if (!a.startTime) return false;
+        const sd = new Date(a.startTime);
+        return !isNaN(sd.getTime());
+    });
+
+    const ptoForStaff = (state.timeOffRequests || []).filter(r => r && r.staffId === staffId);
+
+    let calendarHTML = `
+        <div class="flex justify-between items-center mb-4 dark:text-white">
+            <button data-action="prev-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left"></i></button>
+            <h3 class="text-xl font-semibold">${monthName} ${year}</h3>
+            <button data-action="next-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-right"></i></button>
+        </div>
+        <div class="grid grid-cols-7 gap-px bg-gray-200 dark:bg-gray-700 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+            ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => `<div class="text-center font-semibold text-sm py-2 bg-gray-50 dark:bg-gray-700 dark:text-gray-300">${day}</div>`).join('')}
+        `;
+
+    for (let i = 0; i < startDayOfWeek; i++) {
+        calendarHTML += `<div class="bg-gray-50 dark:bg-gray-700/50"></div>`;
+    }
+
+    for (let day = 1; day <= daysInMonth; day++) {
+        const currentDate = new Date(year, month, day);
+        const dateYMD = toYMDLocal(currentDate);
+        let cellHTML = '';
+
+        // PTO blocks
+        ptoForStaff.forEach(r => {
+            if (!r || !r.startDate || !r.endDate) return;
+            const status = String(r.status || 'pending').toLowerCase();
+            if (status !== 'approved' && status !== 'pending') return;
+            const startYMD = String(r.startDate).slice(0, 10);
+            const endYMD = String(r.endDate).slice(0, 10);
+            if (!(dateYMD >= startYMD && dateYMD <= endYMD)) return;
+
+            const colorClass = status === 'approved'
+                ? 'bg-rose-100 dark:bg-rose-800/60 text-rose-900 dark:text-rose-100 border border-rose-200 dark:border-rose-700'
+                : 'bg-amber-100 dark:bg-amber-800/50 text-amber-900 dark:text-amber-100 border border-amber-200 dark:border-amber-700';
+
+            cellHTML += `
+                <div class="p-1 rounded-md text-xs ${colorClass} mt-1">
+                    <p class="font-semibold truncate">${r.type || 'PTO'}</p>
+                    <p class="text-[10px] opacity-90">${status.charAt(0).toUpperCase() + status.slice(1)}</p>
+                </div>
+            `;
+        });
+
+        // Shift blocks
+        assignmentsForStaff.forEach(a => {
+            const sd = new Date(a.startTime);
+            if (isNaN(sd.getTime())) return;
+            const startYMD = toYMDLocal(sd);
+            if (startYMD !== dateYMD) return;
+
+            const ed = a.endTime ? new Date(a.endTime) : null;
+            const timeStr = ed && !isNaN(ed.getTime())
+                ? sd.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '–' + ed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : sd.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+            cellHTML += `
+                <div class="p-1 rounded-md text-xs bg-emerald-50 dark:bg-emerald-900/30 text-emerald-900 dark:text-emerald-100 border border-emerald-200 dark:border-emerald-800 mt-1">
+                    <p class="font-semibold truncate">Shift</p>
+                    <p class="text-[10px] opacity-90">${timeStr}</p>
+                </div>
+            `;
+        });
+
+        calendarHTML += `
+            <div class="calendar-day p-2 bg-white dark:bg-gray-800 relative cursor-pointer" data-date="${dateYMD}">
+                <span class="font-medium text-gray-800 dark:text-gray-200">${day}</span>
+                <div class="mt-1 overflow-y-auto max-h-24">${cellHTML}</div>
+            </div>
+        `;
+    }
+
+    calendarHTML += `</div>`;
+    container.innerHTML = calendarHTML;
+    if (typeof lucide !== 'undefined') lucide.createIcons();
+};
+
+// Employee-only day view (PTO + shifts by hour)
+const renderEmployeeDayCalendar = () => {
+    const container = document.getElementById('employee-day-calendar-container');
+    if (!container) return;
+    const headerEl = document.getElementById('employee-day-header');
+    const staffId = state.loggedInUser?.id;
+
+    const toYMDLocal = (d) => {
+        if (!d || isNaN(d.getTime())) return null;
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
+    };
+
+    if (!staffId) {
+        container.innerHTML = '<p class="text-gray-500 dark:text-gray-400">No staff selected.</p>';
+        if (headerEl) headerEl.textContent = '';
+        return;
+    }
+
+    const date = state.calendarDate || new Date();
+    const dateYMD = toYMDLocal(date);
+    if (!dateYMD) {
+        container.innerHTML = '<p class="text-gray-500 dark:text-gray-400">Invalid date.</p>';
+        if (headerEl) headerEl.textContent = '';
+        return;
+    }
+
+    const dateLabel = date.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    if (headerEl) headerEl.textContent = `Calendar Day: ${dateLabel}`;
+
+    const ptoForStaff = (state.timeOffRequests || []).filter(r => {
+        if (!r || r.staffId !== staffId) return false;
+        if (!r.startDate || !r.endDate) return false;
+        const status = String(r.status || 'pending').toLowerCase();
+        if (status !== 'approved' && status !== 'pending') return false;
+        const startYMD = String(r.startDate).slice(0, 10);
+        const endYMD = String(r.endDate).slice(0, 10);
+        return dateYMD >= startYMD && dateYMD <= endYMD;
+    });
+
+    const assignmentsForStaff = (state.assignments || []).filter(a => {
+        if (!a || a.staffId !== staffId) return false;
+        if (!a.startTime) return false;
+        const sd = new Date(a.startTime);
+        if (isNaN(sd.getTime())) return false;
+        return toYMDLocal(sd) === dateYMD;
+    });
+
+    const shiftRanges = assignmentsForStaff.map(a => {
+        const start = new Date(a.startTime);
+        const end = a.endTime ? new Date(a.endTime) : new Date(start.getTime() + 60 * 60 * 1000);
+        return {
+            startMs: start.getTime(),
+            endMs: end.getTime(),
+        };
+    });
+
+    const startOfDay = new Date(date);
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const hourCells = Array.from({ length: 24 }).map((_, i) => {
+        const hStart = new Date(startOfDay);
+        hStart.setHours(i, 0, 0, 0);
+        const epoch = hStart.getTime();
+
+        const inShift = shiftRanges.some(r => epoch >= r.startMs && epoch < r.endMs);
+        const inApprovedPto = ptoForStaff.some(r => String(r.status || '').toLowerCase() === 'approved');
+        const inPendingPto = ptoForStaff.some(r => String(r.status || '').toLowerCase() === 'pending');
+
+        const cellClass = inShift
+            ? 'bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-100'
+            : inApprovedPto
+                ? 'bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-700 text-rose-900 dark:text-rose-100'
+                : inPendingPto
+                    ? 'bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 text-amber-900 dark:text-amber-100'
+                    : 'bg-gray-50 dark:bg-gray-700/30 border border-gray-200 dark:border-gray-600 text-gray-600 dark:text-gray-300';
+
+        const pill = inShift ? 'Shift' : (inApprovedPto ? 'PTO' : (inPendingPto ? 'PTO' : ''));
+        return `
+            <div class="px-2 py-2 rounded-md text-[11px] whitespace-nowrap ${cellClass}">
+                <div class="font-semibold">${String(i).padStart(2, '0')}:00</div>
+                ${pill ? `<div class="opacity-90 text-[10px]">${pill}</div>` : ''}
+            </div>
+        `;
+    }).join('');
+
+    const ptoSummary = ptoForStaff.length === 0
+        ? '<span class="text-gray-500 dark:text-gray-400">No PTO</span>'
+        : `<span class="text-rose-700 dark:text-rose-200 font-medium">${ptoForStaff.length} PTO request(s)</span>`;
+
+    const shiftSummary = assignmentsForStaff.length === 0
+        ? '<span class="text-gray-500 dark:text-gray-400">No shifts</span>'
+        : `<span class="text-emerald-700 dark:text-emerald-200 font-medium">${assignmentsForStaff.length} shift(s)</span>`;
+
+    container.innerHTML = `
+        <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+            <div>${shiftSummary}</div>
+            <div>${ptoSummary}</div>
+        </div>
+        <div class="grid grid-cols-4 gap-2">
+            ${hourCells}
+        </div>
+    `;
+
+    if (typeof lucide !== 'undefined') lucide.createIcons();
+};
+
 const renderDayView = () => {
     const container = document.getElementById('day-view-container');
     if (!container) return;
