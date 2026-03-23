@@ -3624,9 +3624,8 @@
             };
             
             const getDaySaturdayStart = (date) => {
-                // Return JavaScript day-of-week (Sunday=0, Monday=1, ..., Saturday=6)
-                // Calendar week now starts on Sunday
-                return date.getDay(); // Sunday=0, Monday=1, Tuesday=2, ..., Saturday=6
+                // Return day index where Saturday is start-of-week (Saturday=0 ... Friday=6)
+                return (date.getDay() + 1) % 7;
             };
             
             const toDateOnlyString = (dateObj) => {
@@ -3638,6 +3637,9 @@
                 const day = String(dateObj.getDate()).padStart(2, '0');
                 return `${year}-${month}-${day}`;
             };
+
+            // Date-only formatter for UI/input values without UTC timezone drift.
+            const toLocalInputDateString = (dateObj) => toDateOnlyString(dateObj);
 
             const parseDateOnly = (dateStr) => {
                 if (!dateStr || typeof dateStr !== 'string') return null;
@@ -6795,6 +6797,7 @@
                     { id: 'managerView', label: "Manager View" },
                     { id: 'unfilledShifts', label: 'Unfilled Shifts' },
                     { id: 'travel', label: 'Travel' },
+                    { id: 'trucks', label: 'CAE Trucks' },
                     { id: 'timeOff', label: 'Time Off' },
                     { id: 'timeOffRequests', label: 'Time Off Requests' },
                     { id: 'communications', label: 'Communications' }
@@ -6822,10 +6825,13 @@
                     // For Supervisor users, remove restricted tabs
                     if (state.currentUser && getEffectivePermissionLevel() === 'Supervisor') {
                         // Remove: CRC, Dashboard, Reporting, Training, Manager view, Travel, Users, Backend, Time Off Requests, Time Off
-                        tabs = tabs.filter(tab => !['crcs', 'dashboard', 'reporting', 'training', 'managerView', 'travel', 'users', 'allSchedule', 'communications', 'timeOffRequests', 'timeOff'].includes(tab.id));
+                        tabs = tabs.filter(tab => !['crcs', 'dashboard', 'reporting', 'training', 'managerView', 'travel', 'trucks', 'users', 'allSchedule', 'communications', 'timeOffRequests', 'timeOff'].includes(tab.id));
                     }
                     
                     if (state.currentUser && getEffectivePermissionLevel() === 'Manager') {
+                        if (!tabs.some(tab => tab.id === 'trucks')) {
+                            tabs.push({ id: 'trucks', label: 'CAE Trucks' });
+                        }
                         tabs.push({ id: 'users', label: 'Users' });
                         tabs.push({ id: 'allSchedule', label: 'Backend - Admin Only' });
                         tabs.push({ id: 'crcPreview', label: 'CRC View' });
@@ -7373,7 +7379,7 @@
                 }
                 
                 // Prevent CRC users from accessing restricted tabs - redirect to dashboard
-                const restrictedTabsForCRC = ['scheduler', 'crcs', 'sites', 'studies', 'users', 'reporting', 'training', 'managerView', 'travel', 'allSchedule', 'studyWorkload'];
+                const restrictedTabsForCRC = ['scheduler', 'crcs', 'sites', 'studies', 'users', 'reporting', 'training', 'managerView', 'travel', 'trucks', 'allSchedule', 'studyWorkload'];
                 if (state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
                     if (restrictedTabsForCRC.includes(state.activeTab)) {
                         setState({ activeTab: 'dashboard' });
@@ -7597,6 +7603,11 @@
                     mainAppContent.innerHTML = getTravelHTML();
                     mainAppContent.className = 'w-full';
                     renderTravelContent();
+                } else if (state.activeTab === 'trucks') {
+                    _lastRenderedTab = state.activeTab;
+                    mainAppContent.innerHTML = getTrucksHTML();
+                    mainAppContent.className = 'w-full';
+                    renderTrucksContent();
                 } else if (state.activeTab === 'unfilledShifts') {
                     _lastRenderedTab = state.activeTab;
                     mainAppContent.innerHTML = getUnfilledShiftsHTML();
@@ -17901,9 +17912,9 @@
                     // Just today's date
                     dateRange = [toDateOnlyString(now)];
                 } else if (viewMode === 'weekly') {
-                    // Get the week containing the current date (Sun-Sat)
+                    // Get the week containing the current date (Sat-Fri)
                     const startOfWeek = new Date(now);
-                    startOfWeek.setDate(now.getDate() - now.getDay()); // Sunday
+                    startOfWeek.setDate(now.getDate() - getDaySaturdayStart(now)); // Saturday
                     for (let i = 0; i < 7; i++) {
                         const d = new Date(startOfWeek);
                         d.setDate(startOfWeek.getDate() + i);
@@ -20765,6 +20776,76 @@
             };
 
             // --- TRUCKS FUNCTIONS ---
+            const getTruckDisplayName = (truck) => {
+                if (!truck) return 'Unknown Truck';
+                const type = truck.truckType ? ` [${truck.truckType}]` : '';
+                return `${truck.unitNumber || 'Truck'}${truck.nickname ? ` (${truck.nickname})` : ''}${type}`;
+            };
+
+            const normalizeTruckType = (value) => {
+                const validTypes = new Set(['tractor', 'generator', 'support']);
+                const type = (value || '').toString().trim().toLowerCase();
+                return validTypes.has(type) ? type : 'tractor';
+            };
+
+            const getPairedTruckIdsNormalized = (truck) => {
+                if (!truck || !Array.isArray(truck.pairedTruckIds)) return [];
+                return Array.from(new Set(truck.pairedTruckIds.filter(Boolean)));
+            };
+
+            const getConvoyTruckIds = (seedTruckId) => {
+                if (!seedTruckId) return [];
+                const allTrucks = Array.isArray(state.trucks) ? state.trucks : [];
+                const visited = new Set();
+                const queue = [seedTruckId];
+
+                while (queue.length > 0) {
+                    const currentId = queue.shift();
+                    if (!currentId || visited.has(currentId)) continue;
+                    visited.add(currentId);
+
+                    const currentTruck = allTrucks.find(t => t.id === currentId);
+                    const directPairs = currentTruck ? getPairedTruckIdsNormalized(currentTruck) : [];
+                    directPairs.forEach(pid => {
+                        if (!visited.has(pid)) queue.push(pid);
+                    });
+
+                    allTrucks.forEach(t => {
+                        if (t && t.id && t.id !== currentId && getPairedTruckIdsNormalized(t).includes(currentId) && !visited.has(t.id)) {
+                            queue.push(t.id);
+                        }
+                    });
+                }
+
+                return Array.from(visited);
+            };
+
+            const getTruckPairingOptionsHTML = (selectedIds = [], excludeTruckId = null) => {
+                const selectedSet = new Set((selectedIds || []).filter(Boolean));
+                return (state.trucks || [])
+                    .filter(t => t && t.id && t.id !== excludeTruckId)
+                    .map(t => `<option value="${t.id}" ${selectedSet.has(t.id) ? 'selected' : ''}>${getTruckDisplayName(t)}</option>`)
+                    .join('');
+            };
+
+            const getTruckConvoyGroups = () => {
+                const groups = [];
+                const seen = new Set();
+                const trucks = Array.isArray(state.trucks) ? state.trucks : [];
+                const sorted = [...trucks].sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
+                sorted.forEach(truck => {
+                    if (!truck?.id || seen.has(truck.id)) return;
+                    const convoyIds = getConvoyTruckIds(truck.id);
+                    convoyIds.forEach(id => seen.add(id));
+                    const convoyTrucks = convoyIds
+                        .map(id => trucks.find(t => t.id === id))
+                        .filter(Boolean)
+                        .sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
+                    groups.push(convoyTrucks);
+                });
+                return groups;
+            };
+
             const getTruckTotalMaintenanceCost = (truck) => {
                 if (!truck.serviceLog || truck.serviceLog.length === 0) return 0;
                 return truck.serviceLog.reduce((total, record) => {
@@ -20862,8 +20943,10 @@
                                     <thead class="bg-gray-50 dark:bg-gray-700">
                                         <tr>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Unit #</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Type</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Year/Make</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Current Location</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Paired With</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Status</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Mileage</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Last Inspection</th>
@@ -20872,18 +20955,30 @@
                                         </tr>
                                     </thead>
                                     <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                        ${state.trucks.map(truck => {
+                                        ${getTruckConvoyGroups().map((convoy, convoyIdx) => {
+                                            const convoyLabel = convoy.length > 1 ? `Convoy ${convoyIdx + 1}` : 'Single';
+                                            return convoy.map((truck, truckIdxInConvoy) => {
                                             const currentLocation = getTruckCurrentLocation(truck.id);
+                                            const pairedNames = getPairedTruckIdsNormalized(truck)
+                                                .map(pid => state.trucks.find(t => t.id === pid))
+                                                .filter(Boolean)
+                                                .map(p => p.unitNumber)
+                                                .join(', ') || 'None';
                                             const lastInspection = truck.inspections && truck.inspections.length > 0 
                                                 ? truck.inspections[truck.inspections.length - 1] 
                                                 : null;
                                             const totalMaintenanceCost = getTruckTotalMaintenanceCost(truck);
                                             
                                             return `
-                                                <tr>
+                                                <tr class="${truckIdxInConvoy > 0 ? 'bg-gray-50/40 dark:bg-gray-900/20' : ''}">
                                                     <td class="px-6 py-4 text-sm font-medium text-gray-900 dark:text-gray-100">${truck.unitNumber}${truck.nickname ? ` (${truck.nickname})` : ''}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400 capitalize">${truck.truckType || 'tractor'}</td>
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${truck.year} ${truck.make}</td>
                                                     <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">${currentLocation}</td>
+                                                    <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">
+                                                        <div>${pairedNames}</div>
+                                                        <div class="text-xs mt-1 ${convoy.length > 1 ? 'text-blue-600 dark:text-blue-300 font-medium' : 'text-gray-400 dark:text-gray-500'}">${convoyLabel}</div>
+                                                    </td>
                                                     <td class="px-6 py-4 whitespace-nowrap">
                                                         <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${getTruckStatusColor(truck.status)}">
                                                             ${truck.status}
@@ -20894,9 +20989,12 @@
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">$${totalMaintenanceCost.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                                         <button data-action="view-truck-details" data-id="${truck.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">View Details</button>
+                                                        <span class="mx-1 text-gray-300 dark:text-gray-600">|</span>
+                                                        <button data-action="pair-truck" data-id="${truck.id}" class="text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 dark:hover:text-indigo-300">Pair</button>
                                                     </td>
                                                 </tr>
                                             `;
+                                            }).join('');
                                         }).join('')}
                                     </tbody>
                                 </table>
@@ -21312,6 +21410,15 @@
                             <input type="text" name="nickname" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Big Blue, The Beast, etc.">
                         </div>
                         
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Truck Type</label>
+                            <select name="truckType" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="tractor">Tractor</option>
+                                <option value="generator">Generator</option>
+                                <option value="support">Support Truck</option>
+                            </select>
+                        </div>
+                        
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Year</label>
@@ -21359,6 +21466,14 @@
                             </select>
                         </div>
                         
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Paired Trucks (always travel together)</label>
+                            <select name="pairedTruckIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white h-32">
+                                ${getTruckPairingOptionsHTML()}
+                            </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hold Ctrl/Cmd to select multiple trucks to pair.</p>
+                        </div>
+                        
                         <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
                             <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Add Truck</button>
@@ -21369,7 +21484,7 @@
 
             const getEditTruckEventModalHTML = (event) => {
                 const truckOptions = state.trucks.map(truck => 
-                    `<option value="${truck.id}" ${truck.id === event.truckId ? 'selected' : ''}>${truck.unitNumber} - ${truck.year} ${truck.make}</option>`
+                    `<option value="${truck.id}" ${truck.id === event.truckId ? 'selected' : ''}>${getTruckDisplayName(truck)} - ${truck.year} ${truck.make}</option>`
                 ).join('');
                 
                 const siteOptions = getFilteredSites().map(site => 
@@ -21449,7 +21564,7 @@
 
             const getTruckScheduleModalHTML = () => {
                 const truckOptions = state.trucks.map(truck => 
-                    `<option value="${truck.id}">${truck.unitNumber} - ${truck.year} ${truck.make}</option>`
+                    `<option value="${truck.id}">${getTruckDisplayName(truck)} - ${truck.year} ${truck.make}</option>`
                 ).join('');
                 
                 const siteOptions = getFilteredSites().map(site => 
@@ -21475,6 +21590,7 @@
                                 <option value="">Choose a truck</option>
                                 ${truckOptions}
                             </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Any trucks paired with this truck are scheduled automatically on the same shift/site.</p>
                         </div>
                         
                         <div id="study-site-section" class="hidden">
@@ -21531,6 +21647,26 @@
                         <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
                             <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700">Schedule Truck</button>
+                        </div>
+                    </form>
+                `;
+            };
+
+            const getPairTruckModalHTML = (truck) => {
+                const selectedIds = getPairedTruckIdsNormalized(truck);
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-6">Pair Trucks - ${getTruckDisplayName(truck)}</h2>
+                    <form id="pair-truck-form" data-truck-id="${truck.id}" class="space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Select paired trucks</label>
+                            <select name="pairedTruckIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white h-56">
+                                ${getTruckPairingOptionsHTML(selectedIds, truck.id)}
+                            </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Paired trucks will appear grouped together and schedule together.</p>
+                        </div>
+                        <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Save Pairing</button>
                         </div>
                     </form>
                 `;
@@ -22075,6 +22211,7 @@
             };
 
             const getEditTruckModalHTML = (truck) => {
+                const pairedTruckIds = getPairedTruckIdsNormalized(truck);
                 return `
                     <h2 class="text-2xl font-bold dark:text-white mb-6">Edit Truck - ${truck.unitNumber}</h2>
                     <form id="edit-truck-form" data-id="${truck.id}" class="space-y-6">
@@ -22092,6 +22229,15 @@
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Nickname</label>
                             <input type="text" name="nickname" value="${truck.nickname || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Big Blue, The Beast, etc.">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Truck Type</label>
+                            <select name="truckType" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="tractor" ${normalizeTruckType(truck.truckType) === 'tractor' ? 'selected' : ''}>Tractor</option>
+                                <option value="generator" ${normalizeTruckType(truck.truckType) === 'generator' ? 'selected' : ''}>Generator</option>
+                                <option value="support" ${normalizeTruckType(truck.truckType) === 'support' ? 'selected' : ''}>Support Truck</option>
+                            </select>
                         </div>
                         
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -22141,6 +22287,14 @@
                             </select>
                         </div>
                         
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Paired Trucks (always travel together)</label>
+                            <select name="pairedTruckIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white h-32">
+                                ${getTruckPairingOptionsHTML(pairedTruckIds, truck.id)}
+                            </select>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hold Ctrl/Cmd to select multiple trucks to pair.</p>
+                        </div>
+                        
                         <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
                             <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Update Truck</button>
@@ -22153,6 +22307,10 @@
                 const currentLocation = getTruckCurrentLocation(truck.id);
                 const inspections = truck.inspections || [];
                 const serviceLog = truck.serviceLog || [];
+                const pairedTruckNames = getPairedTruckIdsNormalized(truck)
+                    .map(pid => state.trucks.find(t => t.id === pid))
+                    .filter(Boolean)
+                    .map(t => getTruckDisplayName(t));
                 
                 return `
                     <h2 class="text-2xl font-bold dark:text-white mb-6">Truck Details - ${truck.unitNumber}</h2>
@@ -22163,6 +22321,8 @@
                                 <div class="space-y-2">
                                     <p><span class="font-medium">Unit #:</span> ${truck.unitNumber}</p>
                                     ${truck.nickname ? `<p><span class="font-medium">Nickname:</span> ${truck.nickname}</p>` : ''}
+                                    <p><span class="font-medium">Type:</span> <span class="capitalize">${truck.truckType || 'tractor'}</span></p>
+                                    <p><span class="font-medium">Paired With:</span> ${pairedTruckNames.length ? pairedTruckNames.join(', ') : 'None'}</p>
                                     <p><span class="font-medium">VIN:</span> ${truck.vin}</p>
                                     <p><span class="font-medium">Year/Make:</span> ${truck.year} ${truck.make}</p>
                                     <p><span class="font-medium">Mileage:</span> ${truck.mileage?.toLocaleString() || 'N/A'}</p>
@@ -24523,8 +24683,8 @@
                             }
                         });
                     }
-                    // Also check legacy crcId (even if roleAssignments exist, to handle mixed data)
-                    if (evt.crcId && evt.crcId !== 'SITE_STAFF' && !assignedCrcIds.has(evt.crcId)) {
+                    // Fall back to legacy crcId only when no roleAssignments were present
+                    if (assignedCrcs.length === 0 && evt.crcId && evt.crcId !== 'SITE_STAFF' && !assignedCrcIds.has(evt.crcId)) {
                         const crc = state.crcs.find(c => c.id === evt.crcId);
                         if (crc) {
                             assignedCrcs.push(crc);
@@ -25403,16 +25563,16 @@
                             `;
                             
                             // Calculate next scheduled week (week containing the next shift)
-                            // Week runs Sunday (0) to Saturday (6)
+                            // Week runs Saturday (0) to Friday (6)
                             const shiftDateObj = new Date(shiftDate);
-                            const dayOfWeek = shiftDateObj.getDay(); // 0 = Sunday, 6 = Saturday
-                            // Get Sunday of that week (week starts on Sunday)
-                            const sundayOffset = dayOfWeek; // If Sunday (0), offset is 0; otherwise subtract days to get to Sunday
+                            const dayOfWeek = getDaySaturdayStart(shiftDateObj); // 0 = Saturday, 6 = Friday
+                            // Get Saturday of that week (week starts on Saturday)
+                            const saturdayOffset = dayOfWeek;
                             const weekStart = new Date(shiftDateObj);
-                            weekStart.setDate(shiftDateObj.getDate() - sundayOffset);
+                            weekStart.setDate(shiftDateObj.getDate() - saturdayOffset);
                             weekStart.setHours(0, 0, 0, 0);
                             const weekEnd = new Date(weekStart);
-                            weekEnd.setDate(weekStart.getDate() + 6); // Saturday (6 days after Sunday)
+                            weekEnd.setDate(weekStart.getDate() + 6); // Friday (6 days after Saturday)
                             weekEnd.setHours(23, 59, 59, 999);
                             
                             // Count shifts in that week
@@ -29669,10 +29829,30 @@
                             renderCRCScheduleView();
                         }
                         break;
-                    case 'prev-crc-week': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() - 7)) }); break;
-                    case 'next-crc-week': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() + 7)) }); break;
-                    case 'prev-crc-day': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() - 1)) }); break;
-                    case 'next-crc-day': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() + 1)) }); break;
+                    case 'prev-crc-week': {
+                        const nextDate = new Date(state.crcCalendarDate.getTime());
+                        nextDate.setDate(nextDate.getDate() - 7);
+                        setState({ crcCalendarDate: nextDate });
+                        break;
+                    }
+                    case 'next-crc-week': {
+                        const nextDate = new Date(state.crcCalendarDate.getTime());
+                        nextDate.setDate(nextDate.getDate() + 7);
+                        setState({ crcCalendarDate: nextDate });
+                        break;
+                    }
+                    case 'prev-crc-day': {
+                        const nextDate = new Date(state.crcCalendarDate.getTime());
+                        nextDate.setDate(nextDate.getDate() - 1);
+                        setState({ crcCalendarDate: nextDate });
+                        break;
+                    }
+                    case 'next-crc-day': {
+                        const nextDate = new Date(state.crcCalendarDate.getTime());
+                        nextDate.setDate(nextDate.getDate() + 1);
+                        setState({ crcCalendarDate: nextDate });
+                        break;
+                    }
                     case 'prev-unavailability-month':
                         setState({ unavailabilityDate: new Date(state.unavailabilityDate.setMonth(state.unavailabilityDate.getMonth() - 1)) });
                         renderUnavailabilityCalendar();
@@ -29774,19 +29954,19 @@
                             weekStart.setDate(weekStart.getDate() - weekStart.getDay());
                             const weekEnd = new Date(weekStart);
                             weekEnd.setDate(weekEnd.getDate() + 6);
-                            startStr = weekStart.toISOString().slice(0, 10);
-                            endStr = weekEnd.toISOString().slice(0, 10);
+                            startStr = toLocalInputDateString(weekStart);
+                            endStr = toLocalInputDateString(weekEnd);
                         } else if (preset === 'nextMonth') {
                             const y = now.getFullYear();
                             const m = now.getMonth() + 1;
                             const nextY = m > 11 ? y + 1 : y;
                             const nextM = m > 11 ? 0 : m;
                             startStr = `${nextY}-${String(nextM + 1).padStart(2, '0')}-01`;
-                            endStr = new Date(nextY, nextM + 1, 0).toISOString().slice(0, 10);
+                            endStr = toLocalInputDateString(new Date(nextY, nextM + 1, 0));
                         } else {
                             // month (this month)
                             startStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
-                            endStr = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
+                            endStr = toLocalInputDateString(new Date(now.getFullYear(), now.getMonth() + 1, 0));
                         }
                         setState({ managerViewUtilizationStartDate: startStr, managerViewUtilizationEndDate: endStr });
                         const startEl = document.getElementById('manager-utilization-start');
@@ -29800,8 +29980,8 @@
                         const today = new Date();
                         const lastWeek = new Date(today);
                         lastWeek.setDate(lastWeek.getDate() - 7);
-                        const startDateStr = lastWeek.toISOString().split('T')[0];
-                        const endDateStr = today.toISOString().split('T')[0];
+                        const startDateStr = toLocalInputDateString(lastWeek);
+                        const endDateStr = toLocalInputDateString(today);
                         
                         openModal(`
                             <h3 class="text-xl font-bold dark:text-white mb-4">Catch-Up: Change History</h3>
@@ -29850,7 +30030,7 @@
                         const today = new Date();
                         const yesterday = new Date(today);
                         yesterday.setDate(yesterday.getDate() - 1);
-                        renderCatchUpResults(changes, yesterday.toISOString().split('T')[0], today.toISOString().split('T')[0], false);
+                        renderCatchUpResults(changes, toLocalInputDateString(yesterday), toLocalInputDateString(today), false);
                         break;
                     }
                     case 'edit-all-schedule-event': {
@@ -30124,6 +30304,11 @@
                     case 'view-truck-details': {
                         const truck = state.trucks.find(t => t.id === id);
                         if (truck) openModal(getTruckDetailsModalHTML(truck), '4xl');
+                        break;
+                    }
+                    case 'pair-truck': {
+                        const truck = state.trucks.find(t => t.id === id);
+                        if (truck) openModal(getPairTruckModalHTML(truck), 'lg');
                         break;
                     }
                     case 'import-trucks-btn': openModal(getImportTrucksModalHTML(), '4xl'); break;
@@ -33994,6 +34179,14 @@
                             
                             // Delete the truck
                             await apiService.deleteTruck(id);
+                            state.truck_events = state.truck_events.filter(event => event.truckId !== id);
+                            state.trucks = state.trucks.filter(truck => truck.id !== id).map(truck => {
+                                const existingPairs = Array.isArray(truck.pairedTruckIds) ? truck.pairedTruckIds : [];
+                                return existingPairs.includes(id)
+                                    ? { ...truck, pairedTruckIds: existingPairs.filter(pid => pid !== id) }
+                                    : truck;
+                            });
+                            setState({ trucks: state.trucks, truck_events: state.truck_events }, { skipRender: true });
                             
                             // Batch operations replaced with individual API calls
                             showNotification('Truck deleted successfully!', 'success');
@@ -34040,6 +34233,8 @@
                     case 'confirm-delete-truck-event': {
                         try {
                             await apiService.deleteEvent(truckEventId);
+                            state.truck_events = state.truck_events.filter(e => e.id !== truckEventId);
+                            setState({ truck_events: state.truck_events }, { skipRender: true });
                             showNotification('Truck event deleted successfully!', 'success');
                             closeModal();
                         } catch (error) {
@@ -35356,8 +35551,9 @@
                                     // to allow the shift to be created (it will be an Open Shift)
                                 }
                                 
-                                // Legacy safety: if editing and no roleAssignments made it through, migrate from legacy roles/crcId
-                                if (!isTravelDay && isEditing && Object.keys(finalRoleAssignments).length === 0 && existingEvent) {
+                                // Legacy safety: only migrate old roles/crcId when this form has no role-assignment inputs.
+                                // If role inputs exist and user clears assignments intentionally, preserve that clear.
+                                if (!isTravelDay && isEditing && Object.keys(finalRoleAssignments).length === 0 && existingEvent && roleAssignmentInputs.length === 0) {
                                     const legacyCrcId = existingEvent.crcId && typeof existingEvent.crcId === 'string'
                                         ? existingEvent.crcId
                                         : (Array.isArray(existingEvent.crcIds) ? existingEvent.crcIds.find(id => id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') : null);
@@ -36044,6 +36240,24 @@
                                             }
                                             return false;
                                         });
+                                        const assignedCrcIdsForEvent = new Set();
+                                        if (finalRoleAssignments && typeof finalRoleAssignments === 'object') {
+                                            Object.values(finalRoleAssignments).forEach(assignments => {
+                                                if (!Array.isArray(assignments)) return;
+                                                assignments.forEach(cid => {
+                                                    if (cid && cid !== 'SITE_STAFF' && cid !== 'UNASSIGNED') assignedCrcIdsForEvent.add(cid);
+                                                });
+                                            });
+                                        }
+                                        const mergedTravelPrefs = Object.keys(travelDayPreferences).length > 0
+                                            ? { ...(existingEvent?.travelDayPreferences || {}), ...travelDayPreferences }
+                                            : (existingEvent?.travelDayPreferences || {});
+                                        const cleanedTravelPrefs = {};
+                                        if (mergedTravelPrefs && typeof mergedTravelPrefs === 'object') {
+                                            Object.entries(mergedTravelPrefs).forEach(([cid, pref]) => {
+                                                if (assignedCrcIdsForEvent.has(cid)) cleanedTravelPrefs[cid] = pref;
+                                            });
+                                        }
                                         
                                         // DEBUG: Log travel day preferences being sent to API
                                         debugLog('[TRAVEL DEBUG] assignedCrcsForTravelPrefs:', [...assignedCrcsForTravelPrefs]);
@@ -36061,6 +36275,9 @@
                                             id: eventId, // Explicitly preserve the ID
                                             type: payloadType, // Preserve the shift type when editing (Site Assignment stays Site Assignment)
                                             crcId: isTravelDayEdit ? (existingEvent?.crcId || travelDayCrcId) : null, // For Travel Day, preserve crcId; for others use roleAssignments
+                                            crcIds: isTravelDayEdit
+                                                ? (existingEvent?.crcId || travelDayCrcId ? [existingEvent?.crcId || travelDayCrcId] : [])
+                                                : Array.from(assignedCrcIdsForEvent),
                                             roles: [], // Legacy field - use roleAssignments instead
                                             // CRITICAL: Always include roleAssignments, even if empty (for Open Shifts)
                                     // The API will allow Site Assignment events with empty roleAssignments as Open Shifts
@@ -36073,9 +36290,7 @@
                                             endDate: toDateOnlyString(endDateObj),
                                             // CRITICAL: Always preserve travelDayPreferences, even if empty, to maintain checkbox state
                                             // Merge with existing preferences to preserve any CRCs not in current form
-                                            travelDayPreferences: Object.keys(travelDayPreferences).length > 0 
-                                                ? { ...(existingEvent?.travelDayPreferences || {}), ...travelDayPreferences }
-                                                : (existingEvent?.travelDayPreferences || undefined),
+                                            travelDayPreferences: Object.keys(cleanedTravelPrefs).length > 0 ? cleanedTravelPrefs : undefined,
                                             // Legacy safety: skip travel-day processing only if no travel is selected
                                             skipTravelDayProcessing: isLegacyShiftEdit && !hasSelectedTravel
                                         };
@@ -38157,10 +38372,13 @@
                     }
                     case 'add-truck-form': {
                         try {
-                            await apiService.createTruck({
+                            const pairedTruckIds = formData.getAll('pairedTruckIds').filter(id => id && id !== data.truckId);
+                            const createdTruck = await apiService.createTruck({
                                 unitNumber: data.unitNumber,
                                 vin: data.vin,
                                 nickname: data.nickname || '',
+                                truckType: normalizeTruckType(data.truckType),
+                                pairedTruckIds,
                                 year: parseInt(data.year),
                                 make: data.make,
                                 mileage: data.mileage ? parseInt(data.mileage) : 0,
@@ -38172,6 +38390,10 @@
                                 inspections: [],
                                 serviceLog: []
                             });
+                            if (createdTruck && createdTruck.id) {
+                                state.trucks = [...state.trucks.filter(t => t.id !== createdTruck.id), createdTruck];
+                                setState({ trucks: state.trucks }, { skipRender: true });
+                            }
                             showNotification('Truck added successfully!', 'success');
                             closeModal();
                         } catch (error) {
@@ -38183,12 +38405,31 @@
                     case 'edit-all-schedule-event-form': {
                         try {
                             const eventId = form.dataset.eventId;
+                            const existingEvent = state.crc_events.find(e => e.id === eventId);
+                            if (!existingEvent) {
+                                showNotification('Could not find this event to edit. Please refresh and try again.', 'error');
+                                break;
+                            }
+                            // updateEvent uses PUT, so send full event payload and only override editable fields
                             const updatedData = {
+                                ...existingEvent,
                                 hours: data.hours ? parseFloat(data.hours) : null,
                                 notes: data.notes || ''
                             };
                             
-                            await apiService.updateEvent(eventId, updatedData);
+                            const updatedEventRaw = await apiService.updateEvent(eventId, updatedData);
+                            const updatedEvent = (typeof mergeEventAssignmentFields === 'function')
+                                ? mergeEventAssignmentFields(updatedEventRaw, updatedData)
+                                : updatedEventRaw;
+                            if (updatedEvent && updatedEvent.id) {
+                                state.crc_events = state.crc_events.filter(e => e.id !== updatedEvent.id);
+                                state.crc_events.push(updatedEvent);
+                                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                            } else {
+                                // Fallback to canonical refresh if backend omitted updated record.
+                                const refreshedEvents = await apiService.getEvents();
+                                setState({ crc_events: refreshedEvents }, { skipRender: true });
+                            }
                             showNotification('Event updated successfully!', 'success');
                             closeModal();
                             // Refresh the All Schedule view
@@ -38204,69 +38445,75 @@
                     case 'truck-schedule-form': {
                         try {
                             const eventType = data.eventType;
-                            const startDate = new Date(data.startDate);
-                            const endDate = new Date(data.endDate);
+                            const startDate = parseDateOnly(data.startDate);
+                            const endDate = parseDateOnly(data.endDate);
+                            if (!startDate || !endDate) {
+                                showNotification('Please choose a valid start and end date.', 'error');
+                                break;
+                            }
+                            if (endDate < startDate) {
+                                showNotification('End date cannot be before start date.', 'error');
+                                break;
+                            }
                             const includeStartTravel = data.includeStartTravel === 'on';
                             const includeEndTravel = data.includeEndTravel === 'on';
+                            const convoyTruckIds = getConvoyTruckIds(data.truckId);
+                            const trucksToSchedule = convoyTruckIds.length > 0 ? convoyTruckIds : [data.truckId];
+                            const convoyGroupId = `truck-convoy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                            const siteName = state.crc_sites.find(s => s.id === data.siteId)?.name || 'site';
+                            const createdTruckEvents = [];
                             
-                            // Batch operations replaced with individual API calls
+                            const createTruckEvent = async (truckId, dateStr, type, notes) => {
+                                const payload = {
+                                    truckId,
+                                    studyId: data.studyId || null,
+                                    siteId: data.siteId || null,
+                                    startDate: dateStr,
+                                    endDate: dateStr,
+                                    type,
+                                    notes: notes || '',
+                                    status: 'active',
+                                    convoyGroupId,
+                                    pairedTruckIds: trucksToSchedule.filter(id => id !== truckId),
+                                    createdAt: new Date().toISOString()
+                                };
+                                const created = await apiService.createEvent(payload);
+                                const eventForState = created && created.id ? created : { id: crypto.randomUUID(), ...payload };
+                                createdTruckEvents.push(eventForState);
+                            };
                             
                             // Create start travel day if requested
                             if (includeStartTravel && eventType === 'assignment') {
                                 const startTravelDate = new Date(startDate);
                                 startTravelDate.setDate(startTravelDate.getDate() - 1);
-                                await apiService.createEvent({
-                                    truckId: data.truckId,
-                                    studyId: data.studyId || null,
-                                    siteId: data.siteId || null,
-                                    startDate: toDateOnlyString(startTravelDate),
-                                    endDate: toDateOnlyString(startTravelDate),
-                                    type: 'travel',
-                                    notes: `Travel to ${state.crc_sites.find(s => s.id === data.siteId)?.name || 'site'}`,
-                                    status: 'active',
-                                    createdAt: new Date().toISOString()
-                                });
+                                const dateStr = toDateOnlyString(startTravelDate);
+                                for (const truckId of trucksToSchedule) {
+                                    await createTruckEvent(truckId, dateStr, 'travel', `Travel to ${siteName}`);
+                                }
                             }
                             
                             // Create main assignment events for each day in the range
                             for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
                                 const dateStr = toDateOnlyString(d);
-                                // Create event directly
-                                
-                                const eventData = {
-                                    truckId: data.truckId,
-                                    studyId: data.studyId || null,
-                                    siteId: data.siteId || null,
-                                    startDate: dateStr,
-                                    endDate: dateStr,
-                                    type: eventType,
-                                    notes: data.notes || '',
-                                    status: 'active',
-                                    createdAt: new Date().toISOString()
-                                };
-                                
-                                await apiService.createEvent(eventData);
+                                for (const truckId of trucksToSchedule) {
+                                    await createTruckEvent(truckId, dateStr, eventType, data.notes || '');
+                                }
                             }
                             
                             // Create end travel day if requested
                             if (includeEndTravel && eventType === 'assignment') {
                                 const endTravelDate = new Date(endDate);
                                 endTravelDate.setDate(endTravelDate.getDate() + 1);
-                                await apiService.createEvent({
-                                    truckId: data.truckId,
-                                    studyId: data.studyId || null,
-                                    siteId: data.siteId || null,
-                                    startDate: toDateOnlyString(endTravelDate),
-                                    endDate: toDateOnlyString(endTravelDate),
-                                    type: 'travel',
-                                    notes: `Travel from ${state.crc_sites.find(s => s.id === data.siteId)?.name || 'site'}`,
-                                    status: 'active',
-                                    createdAt: new Date().toISOString()
-                                });
+                                const dateStr = toDateOnlyString(endTravelDate);
+                                for (const truckId of trucksToSchedule) {
+                                    await createTruckEvent(truckId, dateStr, 'travel', `Travel from ${siteName}`);
+                                }
                             }
-                            
-                            // Batch operations replaced with individual API calls
-                            showNotification('Truck scheduled successfully!', 'success');
+                            if (createdTruckEvents.length > 0) {
+                                state.truck_events = [...state.truck_events, ...createdTruckEvents];
+                                setState({ truck_events: state.truck_events }, { skipRender: true });
+                            }
+                            showNotification(`Truck schedule created for ${trucksToSchedule.length} truck(s).`, 'success');
                             closeModal();
                         } catch (error) {
                             console.error("Error scheduling truck:", error);
@@ -38277,7 +38524,7 @@
                     case 'edit-truck-event-form': {
                         try {
                             const eventId = form.dataset.eventId;
-                            await apiService.updateEvent(eventId, {
+                            const updatePayload = {
                                 truckId: data.truckId,
                                 studyId: data.studyId || null,
                                 siteId: data.siteId || null,
@@ -38286,7 +38533,12 @@
                                 type: data.eventType,
                                 notes: data.notes || '',
                                 status: 'active'
-                            });
+                            };
+                            const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
+                            const mergedEvent = updatedEvent && updatedEvent.id ? updatedEvent : { id: eventId, ...updatePayload };
+                            state.truck_events = state.truck_events.filter(e => e.id !== eventId);
+                            state.truck_events.push(mergedEvent);
+                            setState({ truck_events: state.truck_events }, { skipRender: true });
                             showNotification('Truck event updated successfully!', 'success');
                             closeModal();
                         } catch (error) {
@@ -38716,10 +38968,13 @@
                     case 'edit-truck-form': {
                         try {
                             const truckId = form.dataset.id;
-                            await apiService.updateTruck(truckId, {
+                            const pairedTruckIds = formData.getAll('pairedTruckIds').filter(id => id && id !== truckId);
+                            const updatedTruck = await apiService.updateTruck(truckId, {
                                 unitNumber: data.unitNumber,
                                 vin: data.vin,
                                 nickname: data.nickname || '',
+                                truckType: normalizeTruckType(data.truckType),
+                                pairedTruckIds,
                                 year: parseInt(data.year),
                                 make: data.make,
                                 mileage: data.mileage ? parseInt(data.mileage) : 0,
@@ -38729,11 +38984,74 @@
                                 eldSerialNumber: data.eldSerialNumber || '',
                                 status: data.status || 'active'
                             });
+                            if (updatedTruck && updatedTruck.id) {
+                                state.trucks = state.trucks.map(t => t.id === updatedTruck.id ? { ...t, ...updatedTruck } : t);
+                            } else {
+                                state.trucks = state.trucks.map(t => t.id === truckId ? {
+                                    ...t,
+                                    unitNumber: data.unitNumber,
+                                    vin: data.vin,
+                                    nickname: data.nickname || '',
+                                    truckType: normalizeTruckType(data.truckType),
+                                    pairedTruckIds,
+                                    year: parseInt(data.year),
+                                    make: data.make,
+                                    mileage: data.mileage ? parseInt(data.mileage) : 0,
+                                    regNumber: data.regNumber || '',
+                                    gvwt: data.gvwt ? parseInt(data.gvwt) : null,
+                                    ezPassNumber: data.ezPassNumber || '',
+                                    eldSerialNumber: data.eldSerialNumber || '',
+                                    status: data.status || 'active'
+                                } : t);
+                            }
+                            setState({ trucks: state.trucks }, { skipRender: true });
                             showNotification('Truck updated successfully!', 'success');
                             closeModal();
                         } catch (error) {
                             console.error("Error updating truck:", error);
                             showNotification('Failed to update truck. See console for details.', 'error');
+                        }
+                        break;
+                    }
+                    case 'pair-truck-form': {
+                        try {
+                            const truckId = form.dataset.truckId;
+                            const truck = state.trucks.find(t => t.id === truckId);
+                            if (!truck) {
+                                showNotification('Truck not found. Please refresh and try again.', 'error');
+                                break;
+                            }
+                            const selectedPairIds = formData.getAll('pairedTruckIds').filter(pid => pid && pid !== truckId);
+                            const selectedSet = new Set(selectedPairIds);
+
+                            // Update selected truck
+                            await apiService.updateTruck(truckId, { pairedTruckIds: selectedPairIds });
+                            state.trucks = state.trucks.map(t => t.id === truckId ? { ...t, pairedTruckIds: selectedPairIds } : t);
+
+                            // Keep pairing bidirectional for selected trucks and remove stale reverse links.
+                            for (const otherTruck of state.trucks.filter(t => t.id !== truckId)) {
+                                const existingPairs = new Set(Array.isArray(otherTruck.pairedTruckIds) ? otherTruck.pairedTruckIds : []);
+                                const shouldContain = selectedSet.has(otherTruck.id);
+                                const hasContain = existingPairs.has(truckId);
+                                if (shouldContain && !hasContain) {
+                                    existingPairs.add(truckId);
+                                    const updated = Array.from(existingPairs);
+                                    await apiService.updateTruck(otherTruck.id, { pairedTruckIds: updated });
+                                    state.trucks = state.trucks.map(t => t.id === otherTruck.id ? { ...t, pairedTruckIds: updated } : t);
+                                } else if (!shouldContain && hasContain) {
+                                    existingPairs.delete(truckId);
+                                    const updated = Array.from(existingPairs);
+                                    await apiService.updateTruck(otherTruck.id, { pairedTruckIds: updated });
+                                    state.trucks = state.trucks.map(t => t.id === otherTruck.id ? { ...t, pairedTruckIds: updated } : t);
+                                }
+                            }
+
+                            setState({ trucks: [...state.trucks] }, { skipRender: true });
+                            showNotification('Truck pairing updated.', 'success');
+                            closeModal();
+                        } catch (error) {
+                            console.error('Error updating truck pairing:', error);
+                            showNotification('Failed to update truck pairing. See console for details.', 'error');
                         }
                         break;
                     }
@@ -51152,7 +51470,7 @@
                         roles, 
                         training_types,
                         trucks, 
-                        truck_events,
+                        truck_events: (sanitizedEvents || []).filter(e => e && e.truckId),
                         users,
                         timeOffRequests,
                         travel,
