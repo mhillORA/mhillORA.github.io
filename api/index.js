@@ -4428,6 +4428,25 @@ app.http('travel', {
     handler: (request, context) => crudHandler(context, request, 'travel'),
 });
 
+app.http('trucks', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'trucks/{id?}',
+    handler: async (request, context) => {
+        try {
+            // Ensure trucks container exists so first-time setup doesn't fail.
+            const { database } = getCosmosClient();
+            await database.containers.createIfNotExists({
+                id: 'trucks',
+                partitionKey: { paths: ['/id'] }
+            });
+            return await crudHandler(context, request, 'trucks');
+        } catch (error) {
+            return handleError(context, error, 'Trucks endpoint failed');
+        }
+    },
+});
+
 app.http('announcements', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
