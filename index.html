@@ -5686,38 +5686,59 @@
             // Remove duplicate travel days from the API. Keeps exactly one per (person, date); deletes only the extras.
             // CONFIRMED: For each (crcId, date) we KEEP the first event (by id) and DELETE the rest. No valid travel days are removed.
             const cleanDuplicateTravelDaysInApi = async () => {
-                const events = await apiService.getEvents();
-                const travelEvents = (events || []).filter(e => e.type === 'Travel Day');
-                const getCrcId = (e) => e.crcId || (Array.isArray(e.crcIds) && e.crcIds[0]) || null;
-                const groups = new Map();
-                travelEvents.forEach(e => {
-                    const cid = getCrcId(e);
-                    if (!cid || !e.date) return;
-                    const key = `${cid}::${e.date}`;
-                    if (!groups.has(key)) groups.set(key, []);
-                    groups.get(key).push(e);
-                });
-                const toDelete = [];
-                groups.forEach((list) => {
-                    if (list.length <= 1) return; // Keep the only one; nothing to delete
-                    list.sort((a, b) => (a.id || '').localeCompare(b.id || '')); // Deterministic: keep first by id
-                    for (let i = 1; i < list.length; i++) toDelete.push(list[i].id); // Delete extras only; list[0] is kept
-                });
-                if (toDelete.length === 0) {
-                    showNotification('No duplicate travel days found.', 'success');
-                    return;
-                }
-                for (const id of toDelete) {
+                try {
+                    let events = [];
                     try {
-                        await apiService.deleteEvent(id);
-                    } catch (err) {
-                        console.error('Error deleting duplicate travel day:', id, err);
-                        showNotification(`Failed to delete some duplicates. See console.`, 'error');
+                        events = await apiService.getEvents();
+                    } catch (apiErr) {
+                        // Fallback to in-memory events when API refresh is temporarily unavailable.
+                        console.warn('Travel dedupe: getEvents failed, using current in-memory events:', apiErr);
+                        events = Array.isArray(state.crc_events) ? state.crc_events : [];
                     }
+                    const travelEvents = (events || []).filter(e => e && e.type === 'Travel Day');
+                    const getCrcId = (e) => e.crcId || (Array.isArray(e.crcIds) && e.crcIds[0]) || null;
+                    const groups = new Map();
+                    travelEvents.forEach(e => {
+                        const cid = getCrcId(e);
+                        if (!cid || !e.date) return;
+                        const key = `${cid}::${e.date}`;
+                        if (!groups.has(key)) groups.set(key, []);
+                        groups.get(key).push(e);
+                    });
+                    const toDelete = [];
+                    groups.forEach((list) => {
+                        if (list.length <= 1) return; // Keep the only one; nothing to delete
+                        list.sort((a, b) => (a.id || '').localeCompare(b.id || '')); // Deterministic: keep first by id
+                        for (let i = 1; i < list.length; i++) {
+                            if (list[i] && list[i].id) toDelete.push(list[i].id); // Delete extras only; list[0] is kept
+                        }
+                    });
+                    if (toDelete.length === 0) {
+                        showNotification('No duplicate travel days found.', 'success');
+                        return;
+                    }
+                    let deleted = 0;
+                    for (const id of toDelete) {
+                        try {
+                            await apiService.deleteEvent(id);
+                            deleted++;
+                        } catch (err) {
+                            console.error('Error deleting duplicate travel day:', id, err);
+                        }
+                    }
+                    // Always clean local state, even if some API deletes failed.
+                    const remainingIds = new Set(toDelete);
+                    const localUpdated = (state.crc_events || []).filter(e => !(e && e.id && remainingIds.has(e.id)));
+                    setState({ crc_events: localUpdated });
+                    if (deleted === toDelete.length) {
+                        showNotification(`Removed ${deleted} duplicate travel day(s). One per person per date kept.`, 'success');
+                    } else {
+                        showNotification(`Removed ${deleted}/${toDelete.length} duplicate travel day(s). Some could not be deleted from API.`, 'warning');
+                    }
+                } catch (err) {
+                    console.error('Travel dedupe failed:', err);
+                    showNotification('Duplicate travel cleanup failed. Check console and try again.', 'error');
                 }
-                const updated = await apiService.getEvents();
-                setState({ crc_events: updated });
-                showNotification(`Removed ${toDelete.length} duplicate travel day(s). One per person per date kept.`, 'success');
             };
             
             // Remove duplicate PTO/time off EVENTS from crc_events (one per person per date). Keeps one, deletes extras. All legacy formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.) treated as same for dedupe.
@@ -6034,13 +6055,8 @@
                     }
                 }
                 
-                // Refresh state from server to ensure consistency
-                try {
-                    const updatedEvents = await apiService.getEvents();
-                    setState({ crc_events: updatedEvents });
-                } catch (err) {
-                    console.error('Error refreshing events after cleanup:', err);
-                }
+                // Keep local state already updated by successful deletes to avoid a full reload.
+                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                 
                 closeModal();
                 
@@ -7164,7 +7180,7 @@
                                         state.userId = 'chaos-user';
                                         
                                         // Auto-launch dashboard for CRC users (admin gets manager view)
-                                        performInitialLoad();
+                                        await performInitialLoad();
                                         renderNav();
                                         renderContent();
                                         return; // Exit early, don't continue to API call
@@ -7217,7 +7233,7 @@
                                             setState({ activeTab: 'dashboard' });
                                         }
                                         
-                                        performInitialLoad();
+                                        await performInitialLoad();
                                         renderNav();
                                         renderContent();
                                     } else {
@@ -7950,36 +7966,35 @@
                     [crcs, sites, studies, events, roles, training_types] = results;
                     permissionSets = []; // Empty array - feature not in use
 
-                    let timeOffRequests = [];
-                    try {
-                        timeOffRequests = await apiService.getTimeOffRequests();
-                    } catch (error) {
-                        debugWarn('CHAOS: Failed to refresh time off requests:', error);
-                    }
-
-                    let travel = [];
-                    try {
-                        travel = await apiService.getTravel();
-                    } catch (error) {
-                        debugWarn('CHAOS: Failed to refresh travel data:', error);
-                    }
-
-                    let announcements = [];
-                    try {
-                        announcements = await apiService.getAnnouncements();
-                        debugLog('CHAOS: Loaded', announcements.length, 'announcements');
-                    } catch (error) {
-                        debugWarn('CHAOS: Failed to refresh announcements:', error);
-                    }
-
-                    let usersUpdate = undefined;
-                    if (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager')) {
-                        try {
-                            usersUpdate = await apiService.getUsers();
-                        } catch (error) {
-                            debugWarn('CHAOS: Failed to refresh users list:', error);
-                        }
-                    }
+                    const extraFetches = [
+                        apiService.getTimeOffRequests().catch(error => {
+                            debugWarn('CHAOS: Failed to refresh time off requests:', error);
+                            return [];
+                        }),
+                        apiService.getTravel().catch(error => {
+                            debugWarn('CHAOS: Failed to refresh travel data:', error);
+                            return [];
+                        }),
+                        apiService.getAnnouncements().catch(error => {
+                            debugWarn('CHAOS: Failed to refresh announcements:', error);
+                            return [];
+                        }),
+                        apiService.request('/trucks').catch(error => {
+                            debugWarn('CHAOS: Failed to refresh trucks:', error);
+                            return [];
+                        }),
+                        apiService.getTruckEvents().catch(error => {
+                            debugWarn('CHAOS: Failed to refresh truck events:', error);
+                            return [];
+                        }),
+                        (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'))
+                            ? apiService.getUsers().catch(error => {
+                                debugWarn('CHAOS: Failed to refresh users list:', error);
+                                return undefined;
+                            })
+                            : Promise.resolve(undefined)
+                    ];
+                    const [timeOffRequests, travel, announcements, trucks, truckEventsUpdate, usersUpdate] = await Promise.all(extraFetches);
 
                     // Normalize sites: map 'pi' from ARTEMIS to 'principalInvestigator' for consistency
                     sites = sites.map(site => {
@@ -8141,8 +8156,19 @@
                         return eventsList;
                     };
                     
-                    // Re-enable PTO cleanup to handle any legacy duplicates
-                    events = await cleanupDuplicatePTOEvents(events || []);
+                    // PTO duplicate cleanup can be expensive on large datasets. Run at most once every 24h in silent refresh.
+                    try {
+                        const cleanupKey = 'chaos_lastPtoCleanupAt';
+                        const lastCleanup = parseInt(localStorage.getItem(cleanupKey) || '0', 10);
+                        const nowMs = Date.now();
+                        const oneDayMs = 24 * 60 * 60 * 1000;
+                        if (!lastCleanup || (nowMs - lastCleanup) > oneDayMs) {
+                            events = await cleanupDuplicatePTOEvents(events || []);
+                            localStorage.setItem(cleanupKey, String(nowMs));
+                        }
+                    } catch (e) {
+                        debugWarn('CHAOS: PTO cleanup timing guard failed:', e);
+                    }
                     
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
                     
@@ -8182,6 +8208,8 @@
                         crc_events: sanitizedEvents,
                         roles,
                         training_types,
+                        trucks: Array.isArray(trucks) ? trucks : [],
+                        truck_events: Array.isArray(truckEventsUpdate) ? truckEventsUpdate : [],
                         timeOffRequests,
                         travel,
                         announcements
@@ -31430,9 +31458,8 @@
                         try {
                             if (operation === 'delete') {
                                 await apiService.deleteEvent(eventId);
-                                // Re-fetch events from DB
-                                const updatedEvents = await apiService.getEvents();
-                                setState({ crc_events: updatedEvents });
+                                state.crc_events = state.crc_events.filter(e => e.id !== eventId);
+                                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                                 showNotification('Unavailability removed. Day is now available.', 'success');
                             } else {
                                 const eventData = { 
@@ -31613,9 +31640,8 @@
                                         crcNames
                                     });
                                 }
-                                // Re-fetch events from DB
-                                const updatedEvents = await apiService.getEvents();
-                                setState({ crc_events: updatedEvents });
+                                state.crc_events = state.crc_events.filter(e => e.id !== eventId);
+                                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                                 showNotification('Event deleted successfully!', 'success');
                             closeModal();
                                 // Refresh calendar views
@@ -31651,9 +31677,8 @@
                                     crcNames
                                 });
                             }
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents();
-                            setState({ crc_events: updatedEvents });
+                            state.crc_events = state.crc_events.filter(e => e.id !== eventId);
+                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             showNotification('Event deleted successfully!', 'success');
                         closeModal();
                             // Refresh calendar views
@@ -31676,9 +31701,9 @@
                         for (const event of eventsToDelete) {
                             await apiService.deleteEvent(event.id);
                         }
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents();
-                            setState({ crc_events: updatedEvents });
+                            const idsToDelete = new Set(eventsToDelete.map(ev => ev.id));
+                            state.crc_events = state.crc_events.filter(e => !idsToDelete.has(e.id));
+                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             showNotification(`Successfully deleted ${eventsToDelete.length} events!`, 'success');
                         closeModal();
                             // Refresh calendar views
@@ -31749,9 +31774,8 @@
                             saveStateToUndoHistory();
                             await apiService.deleteEvent(idToDelete);
                             setState({ pendingDeleteEventId: null });
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents();
-                            setState({ crc_events: updatedEvents }, { skipRender: true });
+                            state.crc_events = state.crc_events.filter(e => e.id !== idToDelete);
+                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             if (eventBeforeDelete && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
                                 setTimeout(() => markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(eventBeforeDelete)), 0);
                             }
@@ -31994,9 +32018,9 @@
                                 await apiService.deleteEvent(event.id);
                             }
                             
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents();
-                            setState({ crc_events: updatedEvents }, { skipRender: true });
+                            const idsToDelete = new Set(eventsToDelete.map(ev => ev.id));
+                            state.crc_events = state.crc_events.filter(e => !idsToDelete.has(e.id));
+                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             updateUndoButtonState();
                             
                             showNotification(`Deleted ${eventsToDelete.length} events from the shift!`, 'success');
@@ -32090,9 +32114,9 @@
                                 }
                             }
                             
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents();
-                            setState({ crc_events: updatedEvents });
+                            const deletedIds = new Set(uniqueEventIds);
+                            state.crc_events = state.crc_events.filter(e => !deletedIds.has(e.id));
+                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             
                             closeModal();
                             
@@ -51345,50 +51369,39 @@
                         apiService.getTrainingTypes()
                     ]);
                     
-                    // Load users if current user is Manager
-                    let users = [];
-                    if (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager')) {
-                        try {
-                            users = await apiService.getUsers();
-                            debugLog('CHAOS: Loaded', users.length, 'users');
-                        } catch (error) {
-                            console.error('CHAOS: Error loading users:', error);
-                        }
-                    }
-                    
-                    let timeOffRequests = [];
-                    try {
-                        timeOffRequests = await apiService.getTimeOffRequests();
-                        debugLog('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
-                    } catch (error) {
-                        debugWarn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
-                        timeOffRequests = [];
-                    }
-                    
-                    // Sync approved time off requests with unavailability events after events are loaded
-                    if (timeOffRequests && timeOffRequests.length > 0) {
-                        syncApprovedTimeOffRequests(timeOffRequests);
-                    }
-                    
-                    // Load travel information
-                    let travel = [];
-                    try {
-                        travel = await apiService.getTravel();
-                        debugLog('CHAOS: Loaded', travel.length, 'travel records');
-                    } catch (error) {
-                        console.error('CHAOS: Error loading travel:', error);
-                        // If endpoint doesn't exist yet, that's okay - just continue
-                    }
-                    
-                    // Load announcements
-                    let announcements = [];
-                    try {
-                        announcements = await apiService.getAnnouncements();
-                        debugLog('CHAOS: Loaded', announcements.length, 'announcements');
-                    } catch (error) {
-                        debugWarn('CHAOS: Failed to load announcements:', error);
-                        announcements = [];
-                    }
+                    const initialExtras = [
+                        (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'))
+                            ? apiService.getUsers().catch(error => {
+                                console.error('CHAOS: Error loading users:', error);
+                                return [];
+                            })
+                            : Promise.resolve([]),
+                        apiService.getTimeOffRequests().catch(error => {
+                            debugWarn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
+                            return [];
+                        }),
+                        apiService.getTravel().catch(error => {
+                            console.error('CHAOS: Error loading travel:', error);
+                            return [];
+                        }),
+                        apiService.getAnnouncements().catch(error => {
+                            debugWarn('CHAOS: Failed to load announcements:', error);
+                            return [];
+                        }),
+                        apiService.request('/trucks').catch(error => {
+                            debugWarn('CHAOS: Failed to load trucks:', error);
+                            return [];
+                        }),
+                        apiService.getTruckEvents().catch(error => {
+                            debugWarn('CHAOS: Failed to load truck events:', error);
+                            return [];
+                        })
+                    ];
+                    const [users, timeOffRequests, travel, announcements, trucks, truck_events] = await Promise.all(initialExtras);
+                    debugLog('CHAOS: Loaded', users.length, 'users');
+                    debugLog('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
+                    debugLog('CHAOS: Loaded', travel.length, 'travel records');
+                    debugLog('CHAOS: Loaded', announcements.length, 'announcements');
                     
                     debugLog('CHAOS: Data fetched successfully from Azure API');
                     debugLog('CHAOS: Loaded', crcs.length, 'CRCs');
@@ -51413,22 +51426,6 @@
                         }
                     } else {
                         debugWarn('CHAOS: No studies loaded from ARTEMIS API');
-                    }
-                    
-                    // Initialize empty arrays for CHAOS-specific data
-                    let trucks = [];
-                    let truck_events = [];
-                    try {
-                        trucks = await apiService.request('/trucks');
-                    } catch (error) {
-                        debugWarn('CHAOS: Failed to load trucks:', error);
-                        trucks = [];
-                    }
-                    try {
-                        truck_events = await apiService.getTruckEvents();
-                    } catch (error) {
-                        debugWarn('CHAOS: Failed to load truck events:', error);
-                        truck_events = [];
                     }
                     
                     // Sort the data
