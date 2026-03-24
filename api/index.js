@@ -4447,6 +4447,24 @@ app.http('trucks', {
     },
 });
 
+app.http('truck-events', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'truck-events/{id?}',
+    handler: async (request, context) => {
+        try {
+            const { database } = getCosmosClient();
+            await database.containers.createIfNotExists({
+                id: 'truck-events',
+                partitionKey: { paths: ['/id'] }
+            });
+            return await crudHandler(context, request, 'truck-events');
+        } catch (error) {
+            return handleError(context, error, 'Truck events endpoint failed');
+        }
+    },
+});
+
 app.http('announcements', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
