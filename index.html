@@ -2702,7 +2702,11 @@
                 const src = { ...(crc || {}) };
                 ['_rid','_self','_etag','_attachments','_ts'].forEach(k => { if (k in src) delete src[k]; });
                 const merged = { ...src, ...overrides };
-                merged.name = (merged.name || '').toString();
+                let name = merged.name != null ? String(merged.name).trim() : '';
+                if (!name && crc?.name != null) name = String(crc.name).trim();
+                const idPart = merged.id || crc?.id;
+                if (!name && idPart) name = `CRC ${idPart}`.trim();
+                merged.name = name || 'Unnamed CRC';
                 merged.employmentType = normalizeEmploymentType(merged.employmentType || crc?.employmentType);
                 if (!merged.trainings) merged.trainings = crc?.trainings || [];
                 return merged;
@@ -3870,6 +3874,12 @@
                     }
                 }
                 return 8;
+            };
+
+            const getDisplayEventHours = (event) => {
+                const h = parseFloat(event?.hours);
+                if (Number.isFinite(h)) return h;
+                return event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8);
             };
 
             const getTimeOffRequestRange = (request) => {
@@ -5347,13 +5357,35 @@
                     const travelDays = travelDaysSet.size; // Use Set size for unique travel DAYS, not event count
 
                     const crcAvailableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
-                    const utilizationPercent = crcAvailableWorkDays > 0 ? Math.round((productiveDays / crcAvailableWorkDays) * 100) : 0;
+                    const monthEventsForCrc = state.crc_events.filter(e => {
+                        const eventDate = new Date(e.date + 'T00:00:00');
+                        return eventDate.getFullYear() === year &&
+                            eventDate.getMonth() === month &&
+                            eventBelongsToCrc(e, crc.id);
+                    });
+                    const productiveHours = calculateCrcHours(monthEventsForCrc, crc.id, { includeTravel });
+                    const MONTHLY_UTIL_HOURS_PER_WORKDAY = 8;
+                    const availableHours = crcAvailableWorkDays * MONTHLY_UTIL_HOURS_PER_WORKDAY;
+                    const utilizationPercent = availableHours > 0 ? Math.round((productiveHours / availableHours) * 100) : 0;
+
+                    const travelDatesForHours = new Set();
+                    let travelHours = 0;
+                    if (includeTravel) {
+                        travelEvents.forEach(e => {
+                            if (travelDatesForHours.has(e.date)) return;
+                            travelDatesForHours.add(e.date);
+                            travelHours += parseFloat(e.hours) || 5;
+                        });
+                    }
                     
                     stats[crc.id] = {
                         utilizationPercent,
+                        productiveHours,
+                        availableHours,
                         productiveDays,
                         nonWorkDays,
                         travelDays,
+                        travelHours,
                         availableWorkDays: crcAvailableWorkDays,
                         totalWorkDays: totalWorkingDaysInMonth
                     };
@@ -5424,8 +5456,12 @@
                 const ensureArray = (key) => { state[key] = Array.isArray(state[key]) ? state[key] : []; };
                 ['crc_events', 'timeOffRequests', 'crcs', 'studies', 'crc_sites', 'roles', 'users', 'travel', 'trucks', 'truck_events', 'training_types'].forEach(ensureArray);
 
-                // DEDUPLICATION: Always deduplicate crc_events by ID when state changes
-                if (Array.isArray(state.crc_events) && state.crc_events.length > 0) {
+                // DEDUPLICATION: Only when crc_events / timeOffRequests are part of this update (full passes are expensive on large schedules)
+                const dedupeEvents = Object.prototype.hasOwnProperty.call(newState, 'crc_events');
+                const dedupeTimeOffRequests = Object.prototype.hasOwnProperty.call(newState, 'timeOffRequests');
+
+                // DEDUPLICATION: crc_events by ID when state includes that slice
+                if (dedupeEvents && Array.isArray(state.crc_events) && state.crc_events.length > 0) {
                     const seenIds = new Set();
                     const beforeCount = state.crc_events.length;
                     state.crc_events = state.crc_events.filter(event => {
@@ -5474,8 +5510,8 @@
                     }
                 }
                 
-                // DEDUPLICATION: Always deduplicate timeOffRequests by ID when state changes
-                if (Array.isArray(state.timeOffRequests) && state.timeOffRequests.length > 0) {
+                // DEDUPLICATION: timeOffRequests when state includes that slice
+                if (dedupeTimeOffRequests && Array.isArray(state.timeOffRequests) && state.timeOffRequests.length > 0) {
                     const seenIds = new Set();
                     const beforeCount = state.timeOffRequests.length;
                     state.timeOffRequests = state.timeOffRequests.filter(request => {
@@ -5531,7 +5567,6 @@
                     } else {
                         window.requestAnimationFrame(() => {
                             render();
-                            lucide.createIcons();
                         });
                     }
                 } else {
@@ -6561,6 +6596,14 @@
                     return workEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
                 }
             };
+
+            /** Empty/missing uses fallback; 0 is valid; negative or non-numeric uses fallback. */
+            const parseNonNegativeHoursInput = (raw, fallback) => {
+                if (raw === undefined || raw === null || raw === '') return fallback;
+                const n = parseFloat(typeof raw === 'string' ? raw.trim() : String(raw).trim());
+                if (!Number.isFinite(n) || n < 0) return fallback;
+                return n;
+            };
             
             // Helper function to check if an event is an open shift
             const isOpenShift = (event) => {
@@ -7404,12 +7447,13 @@
                     renderSidebarTabs();
                     if (typeof renderCRCLists === 'function' && (document.getElementById('studyList') || document.getElementById('roleList') || document.getElementById('crcList') || document.getElementById('crcSiteList'))) {
                         renderCRCLists();
-                        setTimeout(() => lucide.createIcons(), 100);
                     }
                     renderUtilization();
                     if (typeof initializeSchedulerMap === 'function') setTimeout(() => initializeSchedulerMap(), 200);
                     if (typeof initializeDeploymentMap === 'function') setTimeout(() => initializeDeploymentMap(), 300);
-                    setTimeout(() => lucide.createIcons(), 100);
+                    setTimeout(() => {
+                        if (typeof lucide !== 'undefined') lucide.createIcons();
+                    }, 120);
                 } else if (state.activeTab === 'planning-grid' && effectiveIsCrcView()) {
                     // CRC read-only Planning Grid (or view-as-CRC): same calendar UI, no sidebar; view-only
                     const sk = getScheduleMonthKey(state.crcCalendarDate);
@@ -9709,12 +9753,16 @@
                         continue;
                     }
 
+                    const hoursKey = rowNormalized['hours'];
+                    const hasExplicitShiftHours = hoursKey !== undefined && hoursKey !== null && String(hoursKey).trim() !== '';
                     const eventData = {
                         date: date.trim(),
                         type: EventType.trim(),
                         notes: (Notes || '').trim(),
                         roles: Roles ? Roles.split(';').map(r => r.trim()) : [],
-                        hours: Hours ? parseFloat(Hours) : (state.settings[EventType.trim()] || 8),
+                        hours: hasExplicitShiftHours
+                            ? parseNonNegativeHoursInput(hoursKey, state.settings[EventType.trim()] || 8)
+                            : (state.settings[EventType.trim()] || 8),
                         period: (Period || 'Full Day'),
                         visitNumber: VisitNumber || null,
                         principalInvestigator: PrincipalInvestigator || null,
@@ -10791,7 +10839,7 @@
                         ? (roles.length > 0 ? roles.join(', ') : 'Travel') 
                         : (roles.length > 0 ? roles.join(', ') : 'No roles assigned');
                     const period = nextShift.period || 'Full Day';
-                    const hours = nextShift.hours || (nextShift.type === 'Travel Day' ? 5 : 8);
+                    const hours = getDisplayEventHours(nextShift);
                     
                     nextShiftHTML = `
                         <div class="p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg">
@@ -13036,15 +13084,18 @@
                         const travelStudiesDays = travelStudiesDaysSet.size;
                         const travelTrainingDays = travelTrainingDaysSet.size;
                         const availableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
-                        
-                        // Calculate travel hours (default 5 per travel day if not specified)
-                        const travelHours = travelEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 5), 0);
-                        
-                        // Include travel in utilization (travel days count toward productive time)
-                        // Combine productive days and travel days (avoiding duplicates)
-                        const allProductiveDaysSet = new Set([...productiveDaysSet, ...travelDaysSet]);
-                        const totalProductiveDays = allProductiveDaysSet.size;
-                        const utilizationPercent = availableWorkDays > 0 ? Math.round((totalProductiveDays / availableWorkDays) * 100) : 0;
+
+                        const travelDatesSeenReport = new Set();
+                        const travelHours = travelEvents.reduce((sum, e) => {
+                            if (travelDatesSeenReport.has(e.date)) return sum;
+                            travelDatesSeenReport.add(e.date);
+                            return sum + (parseFloat(e.hours) || 5);
+                        }, 0);
+
+                        const productiveHours = calculateCrcHours(allEventsForMonth, crcId, { includeTravel: true });
+                        const REPORT_UTIL_HOURS_PER_WORKDAY = 8;
+                        const availableHours = availableWorkDays * REPORT_UTIL_HOURS_PER_WORKDAY;
+                        const utilizationPercent = availableHours > 0 ? Math.round((productiveHours / availableHours) * 100) : 0;
                         
                         reportData.push({
                             crcName,
@@ -13053,6 +13104,7 @@
                             productiveDays,
                             productiveStudiesDays,
                             productiveTrainingDays,
+                            productiveHours,
                             nonWorkDays,
                             timeOffDays,
                             travelDays,
@@ -13065,6 +13117,7 @@
                             carsCount,
                             travelCost: Number.isFinite(travelCost) ? Math.round(travelCost * 100) / 100 : 0,
                             availableWorkDays,
+                            availableHours,
                             utilizationPercent
                         });
                     });
@@ -13102,6 +13155,8 @@
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Non-Working Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Time Off Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Total Working Days</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Productive Hours</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Available Hours</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Utilization %</th>
                                     </tr>
                                 </thead>
@@ -13125,6 +13180,8 @@
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.nonWorkDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.timeOffDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.availableWorkDays}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${(row.productiveHours ?? 0).toFixed(1)}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${(row.availableHours ?? 0).toFixed(1)}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.utilizationPercent}%</td>
                                     </tr>
                                     `).join('')}
@@ -13154,7 +13211,7 @@
                     return;
                 }
 
-                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Studies', 'Training', 'Travel Days', 'Travel Hours', 'Travel (Studies)', 'Travel (Training)', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Utilization %'];
+                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Studies', 'Training', 'Travel Days', 'Travel Hours', 'Travel (Studies)', 'Travel (Training)', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Productive Hours', 'Available Hours', 'Utilization %'];
                 const rows = data.map(row => [
                     row.crcName,
                     row.month,
@@ -13174,8 +13231,10 @@
                     row.nonWorkDays,
                     row.timeOffDays,
                     row.availableWorkDays,
+                    (row.productiveHours ?? 0).toFixed(1),
+                    (row.availableHours ?? 0).toFixed(1),
                     `${row.utilizationPercent}%`
-                ].map(val => `"${(val || '').toString().replace(/"/g, '""')}"`).join(','));
+                ].map(val => `"${(val ?? '').toString().replace(/"/g, '""')}"`).join(','));
                 
                 const csvContent = "data:text/csv;charset=utf-8," + [headers.join(','), ...rows].join('\n');
                 const encodedUri = encodeURI(csvContent);
@@ -15286,8 +15345,7 @@
                                     const textColor = getContrastColor(bgColor);
                                     const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                     
-                                    // Get hours for this event
-                                    const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8));
+                                    const eventHours = getDisplayEventHours(event);
                                     
                                     roleBlocks.push({
                                         visit: visitNumber,
@@ -15308,7 +15366,7 @@
                                 const bgColor = site?.color || '#3b82f6';
                                 const textColor = getContrastColor(bgColor);
                                 const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
-                                const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8));
+                                const eventHours = getDisplayEventHours(event);
                                 
                                 roleBlocks.push({
                                     visit: visitNumber,
@@ -15337,7 +15395,7 @@
                         if (block.role) displayParts.push(block.role);
                         displayParts.push(block.crcTitle);
                         // Add hours display
-                        if (block.hours) {
+                        if (Number.isFinite(block.hours)) {
                             displayParts.push(`${block.hours}h`);
                         }
                         
@@ -15633,8 +15691,7 @@
                                     const textColor = getContrastColor(bgColor);
                                     const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                     
-                                    // Get hours for this event
-                                    const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8));
+                                    const eventHours = getDisplayEventHours(event);
                                     
                                     roleBlocks.push({
                                         visit: visitNumber,
@@ -15655,7 +15712,7 @@
                                 const bgColor = site?.color || '#3b82f6';
                                 const textColor = getContrastColor(bgColor);
                                 const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
-                                const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8));
+                                const eventHours = getDisplayEventHours(event);
                                 
                                 roleBlocks.push({
                                     visit: visitNumber,
@@ -15684,7 +15741,7 @@
                         if (block.role) displayParts.push(block.role);
                         displayParts.push(block.crcTitle);
                         // Add hours display
-                        if (block.hours) {
+                        if (Number.isFinite(block.hours)) {
                             displayParts.push(`${block.hours}h`);
                         }
                         
@@ -18943,21 +19000,24 @@
                         if (me && !crcsToShow.length) crcsToShow = [me];
                     }
                     utilizationHTML = crcsToShow.map(crc => {
-                        const stats = monthlyStats[crc.id] || { utilizationPercent: 0, travelDays: 0 };
+                        const stats = monthlyStats[crc.id] || { utilizationPercent: 0, travelHours: 0, productiveHours: 0, availableHours: 0 };
                         const utilizationPercent = stats.utilizationPercent;
-                        const travelDays = stats.travelDays || 0;
+                        const productiveHours = stats.productiveHours ?? 0;
+                        const availableHours = stats.availableHours ?? 0;
+                        const travelHours = stats.travelHours || 0;
                         const isOverCapacity = utilizationPercent > 100;
                         const barWidth = isOverCapacity ? 100 : utilizationPercent;
                         let barColor = 'bg-green-500';
                         if (utilizationPercent > 85) barColor = 'bg-yellow-500';
                         if (utilizationPercent >= 100) barColor = 'bg-red-500';
-                        const travelInfo = travelDays > 0 ? ` <span class="text-orange-500 dark:text-orange-400 text-xs">(+${travelDays}d travel)</span>` : '';
+                        const travelInfo = travelHours > 0 ? ` <span class="text-orange-500 dark:text-orange-400 text-xs">(+${travelHours.toFixed(1)}h travel)</span>` : '';
                         return `
                             <div>
                                 <div class="flex justify-between mb-1 font-medium">
                                     <span>${crc.name}</span>
                                     <span class="dark:text-gray-300">
-                                        ${isOverCapacity ? `<span class="text-red-600 dark:text-red-400 font-bold">${utilizationPercent.toFixed(0)}%</span>` : `${utilizationPercent.toFixed(0)}%`}${travelInfo}
+                                        ${productiveHours.toFixed(1)} / ${availableHours.toFixed(1)} h${travelInfo}
+                                        ${isOverCapacity ? `<span class="text-red-600 dark:text-red-400 font-bold"> (${utilizationPercent.toFixed(0)}%)</span>` : ` <span class="text-gray-500 dark:text-gray-400">(${utilizationPercent.toFixed(0)}%)</span>`}
                                     </span>
                                 </div>
                                 <div class="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2.5 relative overflow-hidden">
@@ -21672,7 +21732,7 @@
                         
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hours</label>
-                            <input type="number" name="hours" value="${event.hours || ''}" step="0.5" min="0" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white"'} >
+                            <input type="number" name="hours" value="${(event.hours !== undefined && event.hours !== null) ? event.hours : ''}" step="0.5" min="0" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white"'} >
                         </div>
                         
                         <div>
@@ -24058,7 +24118,9 @@
                 const readOnly = isSupervisor || isCRC;
                 const isEditing = event !== null && event.id;
                 const eventType = event ? event.type : 'Site Assignment';
-                const hours = event ? event.hours : (state.settings[eventType] || 8);
+                const hours = (event && (event.hours !== undefined && event.hours !== null))
+                    ? Number(event.hours)
+                    : (state.settings[eventType] || 8);
                 const period = event ? (event.period || 'Full Day') : 'Full Day';
                 
                 // For Site Assignment events, filter CRCs by training when roles are known
@@ -25386,7 +25448,7 @@
                             const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study assigned';
                             const roles = (nextShift.roles || []).join(', ') || 'No roles';
                             const period = nextShift.period || 'Full Day';
-                            const hours = nextShift.hours || (nextShift.type === 'Travel Day' ? 5 : 8);
+                            const hours = getDisplayEventHours(nextShift);
                             
                             nextShiftHTML = `
                                 <div class="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-md">
@@ -30798,7 +30860,8 @@
                             showNotification('Error: Could not find the event to split.', 'error');
                             return;
                         }
-                        const originalHours = parseFloat(eventToSplit.hours) || 8;
+                        const oh = parseFloat(eventToSplit.hours);
+                        const originalHours = Number.isFinite(oh) && oh >= 0 ? oh : 8;
                         const splitHours = originalHours / 2;
                         try {
                             await apiService.updateEvent(eventId, { period: 'AM', hours: splitHours });
@@ -31250,10 +31313,19 @@
                     case 'confirm-archive-crc': {
                         try {
                             const crcId = actionButton.dataset.crcId || id;
+                            const crcRecord = state.crcs.find(c => c.id === crcId);
+                            if (!crcRecord) {
+                                showNotification('CRC not found. Please refresh and try again.', 'error');
+                                closeModal();
+                                break;
+                            }
                             // Archive by setting archived flag (if supported) or delete
                             // For now, we'll update with archived flag, but if backend doesn't support it, we can use delete
                             try {
-                                await apiService.updateCrc(crcId, { archived: true, archivedDate: new Date().toISOString() });
+                                await apiService.updateCrc(crcId, buildCrcUpdatePayload(crcRecord, {
+                                    archived: true,
+                                    archivedDate: new Date().toISOString()
+                                }));
                                 setState({
                                     crcs: state.crcs.filter(c => c.id !== crcId)
                                 });
@@ -32665,7 +32737,7 @@
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hours</label>
-                                    <input type="number" name="hours" value="${hoursValue}" min="1" max="8" step="0.5" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <input type="number" name="hours" value="${hoursValue}" min="0" max="8" step="0.5" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-2">Notes</label>
@@ -32692,7 +32764,7 @@
                                         startDate: formData.get('startDate'),
                                         endDate: formData.get('endDate'),
                                         period: formData.get('period'),
-                                        hours: parseFloat(formData.get('hours')) || 8,
+                                        hours: parseNonNegativeHoursInput(formData.get('hours'), 8),
                                         notes: formData.get('notes') || undefined
                                     };
                                     if (canChangeEmployee && formData.get('crcId')) {
@@ -32725,7 +32797,7 @@
                                                     ...existingEvent,
                                                     name: updateData.type || existingEvent.name,
                                                     period: updateData.period || existingEvent.period,
-                                                    hours: updateData.hours || existingEvent.hours,
+                                                    hours: updateData.hours ?? existingEvent.hours,
                                                     notes: updateData.notes || existingEvent.notes || `Approved time off: ${updateData.type}`,
                                                     timeOffRequestId: request.id,
                                                     date: date
@@ -32745,7 +32817,7 @@
                                                     type: 'Unavailable',
                                                     name: updateData.type || 'Vacation',
                                                     period: updateData.period || 'Full Day',
-                                                    hours: updateData.hours || (updateData.period === 'Full Day' ? 8 : 4),
+                                                    hours: updateData.hours ?? (updateData.period === 'Full Day' ? 8 : 4),
                                                     notes: updateData.notes || `Approved time off: ${updateData.type}`,
                                                     timeOffRequestId: request.id
                                                 };
@@ -33931,7 +34003,7 @@
                             if (user.crcId) {
                                 const linkedCrc = state.crcs.find(c => c.id === user.crcId);
                                 if (linkedCrc) {
-                                    const updatedCrc = { ...linkedCrc, active: !isCurrentlyActive };
+                                    const updatedCrc = buildCrcUpdatePayload(linkedCrc, { active: !isCurrentlyActive });
                                     try {
                                         await apiService.updateCrc(user.crcId, updatedCrc);
                                         setState({
@@ -35437,7 +35509,8 @@
                                     // Then override with form data
                                     siteId: data.siteId || existingEvent.siteId || null,
                                     studyIds: studyIds.length > 0 ? studyIds : (existingEvent.studyIds || []),
-                                    hours: parseFloat(data.hours) || existingEvent.hours || state.settings[data.eventType] || 8,
+                                    hours: parseNonNegativeHoursInput(data.hours,
+                                        Number.isFinite(Number(existingEvent.hours)) ? Number(existingEvent.hours) : (state.settings[data.eventType] || 8)),
                                     notes: data.notes !== undefined ? data.notes : (existingEvent.notes || ''),
                                     period: data.period || existingEvent.period || null,
                                     visitNumber: (data.visitNumber && data.visitNumber !== 'default') ? data.visitNumber : (data.visitNumberText || existingEvent.visitNumber || null),
@@ -35458,7 +35531,7 @@
                                     // For new events, create from scratch
                                     siteId: data.siteId || null,
                                     studyIds: studyIds,
-                                    hours: parseFloat(data.hours) || state.settings[data.eventType] || 8,
+                                    hours: parseNonNegativeHoursInput(data.hours, state.settings[data.eventType] || 8),
                                     notes: data.notes || '',
                                     period: data.period || null,
                                     visitNumber: (data.visitNumber && data.visitNumber !== 'default') ? data.visitNumber : (data.visitNumberText || null),
@@ -38183,8 +38256,14 @@
                     case 'edit-all-schedule-event-form': {
                         try {
                             const eventId = form.dataset.eventId;
+                            let hoursUpdate = null;
+                            const hRaw = data.hours;
+                            if (hRaw !== undefined && hRaw !== null && String(hRaw).trim() !== '') {
+                                const n = parseFloat(String(hRaw).trim());
+                                hoursUpdate = Number.isFinite(n) && n >= 0 ? n : null;
+                            }
                             const updatedData = {
-                                hours: data.hours ? parseFloat(data.hours) : null,
+                                hours: hoursUpdate,
                                 notes: data.notes || ''
                             };
                             
@@ -38806,7 +38885,7 @@
                                             }
                                             return t;
                                         });
-                                        await apiService.updateCrc(crc.id, { trainings: updatedTrainings });
+                                        await apiService.updateCrc(crc.id, buildCrcUpdatePayload(crc, { trainings: updatedTrainings }));
                                         updatedCount++;
                                     }
                                 }
@@ -49189,15 +49268,15 @@
                     // Calculate distance
                     const distanceInfo = await calculateCrcToSiteDistanceWithTime(crc, site);
                     
-                    // Calculate utilization (simplified - could be enhanced)
-                    const utilization = calculateMonthlyUtilization(parseDateOnly(date), [crc.id]);
+                    const utilByCrc = calculateMonthlyUtilization(parseDateOnly(date), [crc.id]);
+                    const utilizationPct = utilByCrc[crc.id]?.utilizationPercent ?? 0;
                     
                     suggestions.push({
                         crc,
                         distance: distanceInfo?.distanceMiles || null,
                         travelTime: distanceInfo?.travelTime || null,
                         travelTimeMinutes: distanceInfo?.travelTimeMinutes || null,
-                        utilization: utilization || 0,
+                        utilization: utilizationPct,
                         conflicts: availability.conflicts,
                         volunteered: volunteerCrcIds.includes(crc.id)
                     });
