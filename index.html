@@ -12,7 +12,7 @@
             darkMode: 'class',
         }
     </script>
-    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
     <!-- Chart.js and Azure Maps loaded on first use (Dashboard / map views) for faster initial load -->
     <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
     <script>
@@ -1108,6 +1108,27 @@
 
             // --- Azure API Configuration ---
             const API_BASE_URL = '/api';
+
+            /** Default Cosmos /events filter: ±2 years from the current month (inclusive); expand via ensureEventsCoverVisibleMonth when needed. */
+            const getDefaultEventsDateRange = () => {
+                const pad = (n) => String(n).padStart(2, '0');
+                const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+                const now = new Date();
+                const start = new Date(now.getFullYear() - 2, now.getMonth(), 1);
+                const end = new Date(now.getFullYear() + 2, now.getMonth() + 1, 0);
+                return { startDate: fmt(start), endDate: fmt(end) };
+            };
+
+            const mergeEventsById = (existing, incoming) => {
+                const map = new Map();
+                for (const e of (existing || [])) {
+                    if (e && e.id) map.set(e.id, e);
+                }
+                for (const e of (incoming || [])) {
+                    if (e && e.id) map.set(e.id, e);
+                }
+                return [...map.values()];
+            };
             
             // --- API Service ---
             class ApiService {
@@ -1269,8 +1290,23 @@
 
                 // Events - Backend MUST persist and return roleAssignments, crcId, crcIds for each event
                 // so planning grid and Backend (All Schedule) tab stay in sync after save and on refresh.
-                async getEvents() {
-                    return this.request('/events');
+                // rangeOverride: { startDate, endDate } or { full: true } for admin scans of entire container.
+                async getEvents(rangeOverride) {
+                    if (rangeOverride === 'full' || (rangeOverride && rangeOverride.full === true)) {
+                        return this.request('/events?full=true');
+                    }
+                    let startDate;
+                    let endDate;
+                    if (rangeOverride && rangeOverride.startDate && rangeOverride.endDate) {
+                        startDate = rangeOverride.startDate;
+                        endDate = rangeOverride.endDate;
+                    } else {
+                        const r = getDefaultEventsDateRange();
+                        startDate = r.startDate;
+                        endDate = r.endDate;
+                    }
+                    const qs = `?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`;
+                    return this.request(`/events${qs}`);
                 }
 
                 // Roles
@@ -2337,6 +2373,8 @@
                 crc_sites: [],
                 studies: [],
                 crc_events: [],
+                /** Server date range last loaded for crc_events; expanded when user navigates the grid outside this window. */
+                eventsQueryRange: null,
                 roles: [],
                 training_types: [],
                 trucks: [],
@@ -5689,7 +5727,7 @@
                 try {
                     let events = [];
                     try {
-                        events = await apiService.getEvents();
+                        events = await apiService.getEvents({ full: true });
                     } catch (apiErr) {
                         // Fallback to in-memory events when API refresh is temporarily unavailable.
                         console.warn('Travel dedupe: getEvents failed, using current in-memory events:', apiErr);
@@ -5744,7 +5782,7 @@
             // Remove duplicate PTO/time off EVENTS from crc_events (one per person per date). Keeps one, deletes extras. All legacy formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.) treated as same for dedupe.
             const PTO_EVENT_TYPES = getPtoEventTypesSet();
             const cleanDuplicatePTOInApi = async () => {
-                const events = await apiService.getEvents();
+                const events = await apiService.getEvents({ full: true });
                 const ptoEvents = (events || []).filter(e => PTO_EVENT_TYPES.has(e.type));
                 const groups = new Map();
                 ptoEvents.forEach(e => {
@@ -5771,8 +5809,8 @@
                         showNotification(`Failed to delete some PTO duplicates. See console.`, 'error');
                     }
                 }
-                const updated = await apiService.getEvents();
-                setState({ crc_events: updated });
+                const updated = await apiService.getEvents({ full: true });
+                setState({ crc_events: updated, eventsQueryRange: getDefaultEventsDateRange() });
                 showNotification(`Removed ${toDelete.length} duplicate PTO/time off event(s). One per person per date kept.`, 'success');
             };
             
@@ -7937,7 +7975,7 @@
                         apiService.getCrcs(),
                         apiService.getSites(),
                         apiService.getStudies(),
-                        apiService.getEvents(),
+                        apiService.getEvents(state.eventsQueryRange || undefined),
                         apiService.getRoles(),
                         apiService.getTrainingTypes()
                     ];
@@ -9869,7 +9907,7 @@
 
                     // Fetch the updated collections to refresh the UI immediately
                     const [updatedEvents, updatedSites, updatedStudies] = await Promise.all([
-                        apiService.getEvents(),
+                        apiService.getEvents(state.eventsQueryRange || undefined),
                         apiService.getSites(),
                         apiService.getStudies()
                     ]);
@@ -9910,7 +9948,7 @@
                     }
 
                     setState({
-                        crc_events: updatedEvents,
+                        crc_events: mergeEventsById(state.crc_events, updatedEvents),
                         crc_sites: updatedSites,
                         studies: sanitizedUpdatedStudies
                     });
@@ -30247,8 +30285,8 @@
                                 showNotification(`Cleanup complete! Deleted ${result.deletedCount} invalid event(s). Scanned ${result.totalScanned} total events.`, 'success');
                                 
                                 // Refresh events from backend
-                                const events = await apiService.getEvents();
-                                setState({ crc_events: events });
+                                const events = await apiService.getEvents({ full: true });
+                                setState({ crc_events: events, eventsQueryRange: getDefaultEventsDateRange() });
                                 renderContent();
                             } else {
                                 showNotification('Cleanup completed with errors. Check console for details.', 'warning');
@@ -31942,7 +31980,7 @@
                             
                             // Re-fetch events and time off requests from DB
                             const [updatedEvents, updatedTimeOffRequests] = await Promise.all([
-                                apiService.getEvents(),
+                                apiService.getEvents(state.eventsQueryRange || undefined),
                                 apiService.getTimeOffRequests()
                             ]);
                             setState({ 
@@ -38487,7 +38525,7 @@
                                 setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             } else {
                                 // Fallback to canonical refresh if backend omitted updated record.
-                                const refreshedEvents = await apiService.getEvents();
+                                const refreshedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
                                 setState({ crc_events: refreshedEvents }, { skipRender: true });
                             }
                             showNotification('Event updated successfully!', 'success');
@@ -39209,6 +39247,46 @@
                 }
             });
 
+            /** When the planning grid jumps outside the loaded /events window, fetch a wider range and merge (no lost shifts). */
+            const ensureEventsCoverVisibleMonth = async () => {
+                if (!state.initialLoadComplete) return;
+                const d = state.crcCalendarDate || new Date();
+                const y = d.getFullYear();
+                const m = d.getMonth();
+                const pad = (n) => String(n).padStart(2, '0');
+                const fmt = (dt) => `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+                const visStartStr = fmt(new Date(y, m, 1));
+                const visEndStr = fmt(new Date(y, m + 1, 0));
+                const rng = state.eventsQueryRange || getDefaultEventsDateRange();
+                const qStartStr = rng.startDate;
+                const qEndStr = rng.endDate;
+                if (visStartStr >= qStartStr && visEndStr <= qEndStr) return;
+
+                const parseIso = (s) => {
+                    const [a, b, c] = s.split('-').map(Number);
+                    return new Date(a, b - 1, c);
+                };
+                const qStart = parseIso(qStartStr);
+                const qEnd = parseIso(qEndStr);
+                const extendBefore = new Date(y, m - 18, 1);
+                const extendAfter = new Date(y, m + 19, 0);
+                const newStart = fmt(new Date(Math.min(qStart.getTime(), extendBefore.getTime())));
+                const newEnd = fmt(new Date(Math.max(qEnd.getTime(), extendAfter.getTime())));
+
+                try {
+                    const extra = await apiService.getEvents({ startDate: newStart, endDate: newEnd });
+                    const arr = Array.isArray(extra) ? extra : [];
+                    const merged = mergeEventsById(state.crc_events, arr);
+                    setState({
+                        crc_events: merged,
+                        eventsQueryRange: { startDate: newStart, endDate: newEnd }
+                    });
+                    debugLog('CHAOS: Expanded events range to', newStart, '—', newEnd, `(${arr.length} fetched, ${merged.length} merged)`);
+                } catch (err) {
+                    console.error('CHAOS: Failed to expand events range for visible month:', err);
+                }
+            };
+
             document.addEventListener('change', (e) => {
                 const target = e.target;
                 // Communications page handlers (Email templates portion)
@@ -39288,6 +39366,7 @@
                         setState({ crcCalendarDate: new Date(year, month, 1) });
                     }
                     (async () => {
+                        await ensureEventsCoverVisibleMonth();
                         await ensureFinalizedSnapshotForCurrentMonth();
                         if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar();
                     })();
@@ -39297,6 +39376,10 @@
                     if (dateStr) {
                         const [year, month, day] = dateStr.split('-').map(Number);
                         setState({ crcCalendarDate: new Date(year, month - 1, day) });
+                        (async () => {
+                            await ensureEventsCoverVisibleMonth();
+                            if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar();
+                        })();
                     }
                 }
                 if (target.name === 'studySites') {
@@ -51507,11 +51590,13 @@
 
                     debugLog('CHAOS: Setting state with initialLoadComplete=true');
                     debugLog('CHAOS: authReady=', state.authReady, 'initialLoadComplete will be=', true);
+                    const evRange = getDefaultEventsDateRange();
                     setState({ 
                         crcs, 
                         crc_sites: sites, 
                         studies: sanitizedStudies, 
                         crc_events: sanitizedEvents, 
+                        eventsQueryRange: evRange,
                         roles, 
                         training_types,
                         trucks, 

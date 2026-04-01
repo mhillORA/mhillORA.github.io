@@ -1906,6 +1906,29 @@ const validateSiteStudyRelationship = async (siteId, studyId) => {
 // ENHANCED CRUD HANDLERS
 // =================================================================================
 
+/** Parse ?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD for filtered events list (smaller payload than readAll). full=1 skips filter. */
+function parseEventsDateRangeQuery(request) {
+    try {
+        if (!request || !request.url) return null;
+        let urlString = request.url;
+        if (!urlString.includes('://')) {
+            urlString = 'https://placeholder.local' + (urlString.startsWith('/') ? urlString : '/' + urlString);
+        }
+        const u = new URL(urlString);
+        if (u.searchParams.get('full') === '1' || u.searchParams.get('full') === 'true') {
+            return null;
+        }
+        const startDate = u.searchParams.get('startDate');
+        const endDate = u.searchParams.get('endDate');
+        if (!startDate || !endDate) return null;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) return null;
+        if (startDate > endDate) return null;
+        return { startDate, endDate };
+    } catch (e) {
+        return null;
+    }
+}
+
 async function crudHandler(context, request, containerName) {
     // CRITICAL: Ensure logger is initialized before ANY logging calls
     ensureContextLogger(context);
@@ -2167,7 +2190,32 @@ async function crudHandler(context, request, containerName) {
                     }
                 } else {
                     try {
-                        const { resources } = await container.items.readAll().fetchAll();
+                        let resources;
+                        if (containerName === 'events') {
+                            const evRange = parseEventsDateRangeQuery(request);
+                            if (evRange) {
+                                const querySpec = {
+                                    query: `SELECT * FROM c WHERE
+                                        (IS_DEFINED(c.date) AND c.date >= @start AND c.date <= @end)
+                                        OR (IS_DEFINED(c.startDate) AND IS_DEFINED(c.endDate) AND c.startDate <= @end AND c.endDate >= @start)
+                                        OR (IS_DEFINED(c.startDate) AND c.startDate >= @start AND c.startDate <= @end)
+                                        OR (IS_DEFINED(c.endDate) AND c.endDate >= @start AND c.endDate <= @end)`,
+                                    parameters: [
+                                        { name: '@start', value: evRange.startDate },
+                                        { name: '@end', value: evRange.endDate }
+                                    ]
+                                };
+                                context.log.info(`events GET list: filtered ${evRange.startDate}..${evRange.endDate}`);
+                                const { resources: qres } = await container.items.query(querySpec).fetchAll();
+                                resources = Array.isArray(qres) ? qres : [];
+                            } else {
+                                const { resources: all } = await container.items.readAll().fetchAll();
+                                resources = all;
+                            }
+                        } else {
+                            const { resources: all } = await container.items.readAll().fetchAll();
+                            resources = all;
+                        }
                         
                         // Auto-migrate legacy events to modern format (safely, don't crash on errors)
                         // DISABLED for list GET - too many events, causes timeout. Migration happens on single GET and PUT instead.
