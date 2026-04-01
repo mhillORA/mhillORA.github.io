@@ -2192,30 +2192,6 @@
                     });
                 }
 
-                async getTruckEvents() {
-                    return this.request('/truck-events');
-                }
-
-                async createTruckEvent(data) {
-                    return this.request('/truck-events', {
-                        method: 'POST',
-                        body: JSON.stringify(data)
-                    });
-                }
-
-                async updateTruckEvent(id, data) {
-                    return this.request(`/truck-events/${id}`, {
-                        method: 'PUT',
-                        body: JSON.stringify(data)
-                    });
-                }
-
-                async deleteTruckEvent(id) {
-                    return this.request(`/truck-events/${id}`, {
-                        method: 'DELETE'
-                    });
-                }
-
                 // Training Type methods
                 async getTrainingTypes() {
                     return this.request('/training-types');
@@ -2764,7 +2740,11 @@
                 const src = { ...(crc || {}) };
                 ['_rid','_self','_etag','_attachments','_ts'].forEach(k => { if (k in src) delete src[k]; });
                 const merged = { ...src, ...overrides };
-                merged.name = (merged.name || '').toString();
+                let name = merged.name != null ? String(merged.name).trim() : '';
+                if (!name && crc?.name != null) name = String(crc.name).trim();
+                const idPart = merged.id || crc?.id;
+                if (!name && idPart) name = `CRC ${idPart}`.trim();
+                merged.name = name || 'Unnamed CRC';
                 merged.employmentType = normalizeEmploymentType(merged.employmentType || crc?.employmentType);
                 if (!merged.trainings) merged.trainings = crc?.trainings || [];
                 return merged;
@@ -3686,8 +3666,9 @@
             };
             
             const getDaySaturdayStart = (date) => {
-                // Return day index where Saturday is start-of-week (Saturday=0 ... Friday=6)
-                return (date.getDay() + 1) % 7;
+                // Return JavaScript day-of-week (Sunday=0, Monday=1, ..., Saturday=6)
+                // Calendar week now starts on Sunday
+                return date.getDay(); // Sunday=0, Monday=1, Tuesday=2, ..., Saturday=6
             };
             
             const toDateOnlyString = (dateObj) => {
@@ -3699,9 +3680,6 @@
                 const day = String(dateObj.getDate()).padStart(2, '0');
                 return `${year}-${month}-${day}`;
             };
-
-            // Date-only formatter for UI/input values without UTC timezone drift.
-            const toLocalInputDateString = (dateObj) => toDateOnlyString(dateObj);
 
             const parseDateOnly = (dateStr) => {
                 if (!dateStr || typeof dateStr !== 'string') return null;
@@ -3934,6 +3912,12 @@
                     }
                 }
                 return 8;
+            };
+
+            const getDisplayEventHours = (event) => {
+                const h = parseFloat(event?.hours);
+                if (Number.isFinite(h)) return h;
+                return event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8);
             };
 
             const getTimeOffRequestRange = (request) => {
@@ -5411,13 +5395,35 @@
                     const travelDays = travelDaysSet.size; // Use Set size for unique travel DAYS, not event count
 
                     const crcAvailableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
-                    const utilizationPercent = crcAvailableWorkDays > 0 ? Math.round((productiveDays / crcAvailableWorkDays) * 100) : 0;
+                    const monthEventsForCrc = state.crc_events.filter(e => {
+                        const eventDate = new Date(e.date + 'T00:00:00');
+                        return eventDate.getFullYear() === year &&
+                            eventDate.getMonth() === month &&
+                            eventBelongsToCrc(e, crc.id);
+                    });
+                    const productiveHours = calculateCrcHours(monthEventsForCrc, crc.id, { includeTravel });
+                    const MONTHLY_UTIL_HOURS_PER_WORKDAY = 8;
+                    const availableHours = crcAvailableWorkDays * MONTHLY_UTIL_HOURS_PER_WORKDAY;
+                    const utilizationPercent = availableHours > 0 ? Math.round((productiveHours / availableHours) * 100) : 0;
+
+                    const travelDatesForHours = new Set();
+                    let travelHours = 0;
+                    if (includeTravel) {
+                        travelEvents.forEach(e => {
+                            if (travelDatesForHours.has(e.date)) return;
+                            travelDatesForHours.add(e.date);
+                            travelHours += parseFloat(e.hours) || 5;
+                        });
+                    }
                     
                     stats[crc.id] = {
                         utilizationPercent,
+                        productiveHours,
+                        availableHours,
                         productiveDays,
                         nonWorkDays,
                         travelDays,
+                        travelHours,
                         availableWorkDays: crcAvailableWorkDays,
                         totalWorkDays: totalWorkingDaysInMonth
                     };
@@ -5488,8 +5494,12 @@
                 const ensureArray = (key) => { state[key] = Array.isArray(state[key]) ? state[key] : []; };
                 ['crc_events', 'timeOffRequests', 'crcs', 'studies', 'crc_sites', 'roles', 'users', 'travel', 'trucks', 'truck_events', 'training_types'].forEach(ensureArray);
 
-                // DEDUPLICATION: Always deduplicate crc_events by ID when state changes
-                if (Array.isArray(state.crc_events) && state.crc_events.length > 0) {
+                // DEDUPLICATION: Only when crc_events / timeOffRequests are part of this update (full passes are expensive on large schedules)
+                const dedupeEvents = Object.prototype.hasOwnProperty.call(newState, 'crc_events');
+                const dedupeTimeOffRequests = Object.prototype.hasOwnProperty.call(newState, 'timeOffRequests');
+
+                // DEDUPLICATION: crc_events by ID when state includes that slice
+                if (dedupeEvents && Array.isArray(state.crc_events) && state.crc_events.length > 0) {
                     const seenIds = new Set();
                     const beforeCount = state.crc_events.length;
                     state.crc_events = state.crc_events.filter(event => {
@@ -5538,8 +5548,8 @@
                     }
                 }
                 
-                // DEDUPLICATION: Always deduplicate timeOffRequests by ID when state changes
-                if (Array.isArray(state.timeOffRequests) && state.timeOffRequests.length > 0) {
+                // DEDUPLICATION: timeOffRequests when state includes that slice
+                if (dedupeTimeOffRequests && Array.isArray(state.timeOffRequests) && state.timeOffRequests.length > 0) {
                     const seenIds = new Set();
                     const beforeCount = state.timeOffRequests.length;
                     state.timeOffRequests = state.timeOffRequests.filter(request => {
@@ -5595,7 +5605,6 @@
                     } else {
                         window.requestAnimationFrame(() => {
                             render();
-                            lucide.createIcons();
                         });
                     }
                 } else {
@@ -5727,7 +5736,7 @@
                 try {
                     let events = [];
                     try {
-                        events = await apiService.getEvents({ full: true });
+                        events = await apiService.getEvents();
                     } catch (apiErr) {
                         // Fallback to in-memory events when API refresh is temporarily unavailable.
                         console.warn('Travel dedupe: getEvents failed, using current in-memory events:', apiErr);
@@ -6093,8 +6102,13 @@
                     }
                 }
                 
-                // Keep local state already updated by successful deletes to avoid a full reload.
-                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                // Refresh state from server to ensure consistency
+                try {
+                    const updatedEvents = await apiService.getEvents();
+                    setState({ crc_events: updatedEvents });
+                } catch (err) {
+                    console.error('Error refreshing events after cleanup:', err);
+                }
                 
                 closeModal();
                 
@@ -6641,6 +6655,14 @@
                     return workEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
                 }
             };
+
+            /** Empty/missing uses fallback; 0 is valid; negative or non-numeric uses fallback. */
+            const parseNonNegativeHoursInput = (raw, fallback) => {
+                if (raw === undefined || raw === null || raw === '') return fallback;
+                const n = parseFloat(typeof raw === 'string' ? raw.trim() : String(raw).trim());
+                if (!Number.isFinite(n) || n < 0) return fallback;
+                return n;
+            };
             
             // Helper function to check if an event is an open shift
             const isOpenShift = (event) => {
@@ -6875,7 +6897,6 @@
                     { id: 'managerView', label: "Manager View" },
                     { id: 'unfilledShifts', label: 'Unfilled Shifts' },
                     { id: 'travel', label: 'Travel' },
-                    { id: 'trucks', label: 'CAE Trucks' },
                     { id: 'timeOff', label: 'Time Off' },
                     { id: 'timeOffRequests', label: 'Time Off Requests' },
                     { id: 'communications', label: 'Communications' }
@@ -6903,13 +6924,10 @@
                     // For Supervisor users, remove restricted tabs
                     if (state.currentUser && getEffectivePermissionLevel() === 'Supervisor') {
                         // Remove: CRC, Dashboard, Reporting, Training, Manager view, Travel, Users, Backend, Time Off Requests, Time Off
-                        tabs = tabs.filter(tab => !['crcs', 'dashboard', 'reporting', 'training', 'managerView', 'travel', 'trucks', 'users', 'allSchedule', 'communications', 'timeOffRequests', 'timeOff'].includes(tab.id));
+                        tabs = tabs.filter(tab => !['crcs', 'dashboard', 'reporting', 'training', 'managerView', 'travel', 'users', 'allSchedule', 'communications', 'timeOffRequests', 'timeOff'].includes(tab.id));
                     }
                     
                     if (state.currentUser && getEffectivePermissionLevel() === 'Manager') {
-                        if (!tabs.some(tab => tab.id === 'trucks')) {
-                            tabs.push({ id: 'trucks', label: 'CAE Trucks' });
-                        }
                         tabs.push({ id: 'users', label: 'Users' });
                         tabs.push({ id: 'allSchedule', label: 'Backend - Admin Only' });
                         tabs.push({ id: 'crcPreview', label: 'CRC View' });
@@ -7218,7 +7236,7 @@
                                         state.userId = 'chaos-user';
                                         
                                         // Auto-launch dashboard for CRC users (admin gets manager view)
-                                        await performInitialLoad();
+                                        performInitialLoad();
                                         renderNav();
                                         renderContent();
                                         return; // Exit early, don't continue to API call
@@ -7271,7 +7289,7 @@
                                             setState({ activeTab: 'dashboard' });
                                         }
                                         
-                                        await performInitialLoad();
+                                        performInitialLoad();
                                         renderNav();
                                         renderContent();
                                     } else {
@@ -7457,7 +7475,7 @@
                 }
                 
                 // Prevent CRC users from accessing restricted tabs - redirect to dashboard
-                const restrictedTabsForCRC = ['scheduler', 'crcs', 'sites', 'studies', 'users', 'reporting', 'training', 'managerView', 'travel', 'trucks', 'allSchedule', 'studyWorkload'];
+                const restrictedTabsForCRC = ['scheduler', 'crcs', 'sites', 'studies', 'users', 'reporting', 'training', 'managerView', 'travel', 'allSchedule', 'studyWorkload'];
                 if (state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
                     if (restrictedTabsForCRC.includes(state.activeTab)) {
                         setState({ activeTab: 'dashboard' });
@@ -7488,12 +7506,13 @@
                     renderSidebarTabs();
                     if (typeof renderCRCLists === 'function' && (document.getElementById('studyList') || document.getElementById('roleList') || document.getElementById('crcList') || document.getElementById('crcSiteList'))) {
                         renderCRCLists();
-                        setTimeout(() => lucide.createIcons(), 100);
                     }
                     renderUtilization();
                     if (typeof initializeSchedulerMap === 'function') setTimeout(() => initializeSchedulerMap(), 200);
                     if (typeof initializeDeploymentMap === 'function') setTimeout(() => initializeDeploymentMap(), 300);
-                    setTimeout(() => lucide.createIcons(), 100);
+                    setTimeout(() => {
+                        if (typeof lucide !== 'undefined') lucide.createIcons();
+                    }, 120);
                 } else if (state.activeTab === 'planning-grid' && effectiveIsCrcView()) {
                     // CRC read-only Planning Grid (or view-as-CRC): same calendar UI, no sidebar; view-only
                     const sk = getScheduleMonthKey(state.crcCalendarDate);
@@ -7681,11 +7700,6 @@
                     mainAppContent.innerHTML = getTravelHTML();
                     mainAppContent.className = 'w-full';
                     renderTravelContent();
-                } else if (state.activeTab === 'trucks') {
-                    _lastRenderedTab = state.activeTab;
-                    mainAppContent.innerHTML = getTrucksHTML();
-                    mainAppContent.className = 'w-full';
-                    renderTrucksContent();
                 } else if (state.activeTab === 'unfilledShifts') {
                     _lastRenderedTab = state.activeTab;
                     mainAppContent.innerHTML = getUnfilledShiftsHTML();
@@ -8004,35 +8018,36 @@
                     [crcs, sites, studies, events, roles, training_types] = results;
                     permissionSets = []; // Empty array - feature not in use
 
-                    const extraFetches = [
-                        apiService.getTimeOffRequests().catch(error => {
-                            debugWarn('CHAOS: Failed to refresh time off requests:', error);
-                            return [];
-                        }),
-                        apiService.getTravel().catch(error => {
-                            debugWarn('CHAOS: Failed to refresh travel data:', error);
-                            return [];
-                        }),
-                        apiService.getAnnouncements().catch(error => {
-                            debugWarn('CHAOS: Failed to refresh announcements:', error);
-                            return [];
-                        }),
-                        apiService.request('/trucks').catch(error => {
-                            debugWarn('CHAOS: Failed to refresh trucks:', error);
-                            return [];
-                        }),
-                        apiService.getTruckEvents().catch(error => {
-                            debugWarn('CHAOS: Failed to refresh truck events:', error);
-                            return [];
-                        }),
-                        (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'))
-                            ? apiService.getUsers().catch(error => {
-                                debugWarn('CHAOS: Failed to refresh users list:', error);
-                                return undefined;
-                            })
-                            : Promise.resolve(undefined)
-                    ];
-                    const [timeOffRequests, travel, announcements, trucks, truckEventsUpdate, usersUpdate] = await Promise.all(extraFetches);
+                    let timeOffRequests = [];
+                    try {
+                        timeOffRequests = await apiService.getTimeOffRequests();
+                    } catch (error) {
+                        debugWarn('CHAOS: Failed to refresh time off requests:', error);
+                    }
+
+                    let travel = [];
+                    try {
+                        travel = await apiService.getTravel();
+                    } catch (error) {
+                        debugWarn('CHAOS: Failed to refresh travel data:', error);
+                    }
+
+                    let announcements = [];
+                    try {
+                        announcements = await apiService.getAnnouncements();
+                        debugLog('CHAOS: Loaded', announcements.length, 'announcements');
+                    } catch (error) {
+                        debugWarn('CHAOS: Failed to refresh announcements:', error);
+                    }
+
+                    let usersUpdate = undefined;
+                    if (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager')) {
+                        try {
+                            usersUpdate = await apiService.getUsers();
+                        } catch (error) {
+                            debugWarn('CHAOS: Failed to refresh users list:', error);
+                        }
+                    }
 
                     // Normalize sites: map 'pi' from ARTEMIS to 'principalInvestigator' for consistency
                     sites = sites.map(site => {
@@ -8194,19 +8209,8 @@
                         return eventsList;
                     };
                     
-                    // PTO duplicate cleanup can be expensive on large datasets. Run at most once every 24h in silent refresh.
-                    try {
-                        const cleanupKey = 'chaos_lastPtoCleanupAt';
-                        const lastCleanup = parseInt(localStorage.getItem(cleanupKey) || '0', 10);
-                        const nowMs = Date.now();
-                        const oneDayMs = 24 * 60 * 60 * 1000;
-                        if (!lastCleanup || (nowMs - lastCleanup) > oneDayMs) {
-                            events = await cleanupDuplicatePTOEvents(events || []);
-                            localStorage.setItem(cleanupKey, String(nowMs));
-                        }
-                    } catch (e) {
-                        debugWarn('CHAOS: PTO cleanup timing guard failed:', e);
-                    }
+                    // Re-enable PTO cleanup to handle any legacy duplicates
+                    events = await cleanupDuplicatePTOEvents(events || []);
                     
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
                     
@@ -8246,8 +8250,6 @@
                         crc_events: sanitizedEvents,
                         roles,
                         training_types,
-                        trucks: Array.isArray(trucks) ? trucks : [],
-                        truck_events: Array.isArray(truckEventsUpdate) ? truckEventsUpdate : [],
                         timeOffRequests,
                         travel,
                         announcements
@@ -8905,12 +8907,6 @@
 
             // Bulletproof: global error handlers so one uncaught error doesn't take down the app (DB assumed up)
             window.addEventListener('error', (event) => {
-                const msg = (event?.message || event?.error?.message || '').toString();
-                if (msg.includes('ResizeObserver loop completed with undelivered notifications')) {
-                    // Browser internal resize observer warning; suppress user-facing toast spam.
-                    event.preventDefault();
-                    return true;
-                }
                 console.error('Uncaught error:', event.error || event.message, event.filename, event.lineno);
                 showNotification('Something went wrong. You can keep using the app or reload the page.', 'error', 8000);
                 event.preventDefault();
@@ -9130,7 +9126,7 @@
                             const roleName = role ? role.name : 'Role';
                             
                             // Get all qualified CRCs for this role (exclude deactivated)
-                            const qualifiedCrcs = state.crcs.filter(c => isCrcSelectableForNewShift(c) && hasValidTraining(c, roleName))
+                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             // Get existing assignments for this role
@@ -9370,7 +9366,7 @@
                             if (!role) return;
                             
                             const roleName = role.name;
-                            const qualifiedCrcs = state.crcs.filter(c => isCrcSelectableForNewShift(c) && hasValidTraining(c, roleName))
+                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             const container = e.target.previousElementSibling;
@@ -9434,7 +9430,7 @@
                             if (!role) return;
                             
                             const roleName = role.name;
-                            const qualifiedCrcs = state.crcs.filter(c => isCrcSelectableForNewShift(c) && hasValidTraining(c, roleName))
+                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             const container = e.target.closest('.border').querySelector(`#duplicate-role-${roleId}-assignments`);
@@ -9816,12 +9812,16 @@
                         continue;
                     }
 
+                    const hoursKey = rowNormalized['hours'];
+                    const hasExplicitShiftHours = hoursKey !== undefined && hoursKey !== null && String(hoursKey).trim() !== '';
                     const eventData = {
                         date: date.trim(),
                         type: EventType.trim(),
                         notes: (Notes || '').trim(),
                         roles: Roles ? Roles.split(';').map(r => r.trim()) : [],
-                        hours: Hours ? parseFloat(Hours) : (state.settings[EventType.trim()] || 8),
+                        hours: hasExplicitShiftHours
+                            ? parseNonNegativeHoursInput(hoursKey, state.settings[EventType.trim()] || 8)
+                            : (state.settings[EventType.trim()] || 8),
                         period: (Period || 'Full Day'),
                         visitNumber: VisitNumber || null,
                         principalInvestigator: PrincipalInvestigator || null,
@@ -10898,7 +10898,7 @@
                         ? (roles.length > 0 ? roles.join(', ') : 'Travel') 
                         : (roles.length > 0 ? roles.join(', ') : 'No roles assigned');
                     const period = nextShift.period || 'Full Day';
-                    const hours = nextShift.hours || (nextShift.type === 'Travel Day' ? 5 : 8);
+                    const hours = getDisplayEventHours(nextShift);
                     
                     nextShiftHTML = `
                         <div class="p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg">
@@ -13143,15 +13143,18 @@
                         const travelStudiesDays = travelStudiesDaysSet.size;
                         const travelTrainingDays = travelTrainingDaysSet.size;
                         const availableWorkDays = totalWorkingDaysInMonth - nonWorkDays;
-                        
-                        // Calculate travel hours (default 5 per travel day if not specified)
-                        const travelHours = travelEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 5), 0);
-                        
-                        // Include travel in utilization (travel days count toward productive time)
-                        // Combine productive days and travel days (avoiding duplicates)
-                        const allProductiveDaysSet = new Set([...productiveDaysSet, ...travelDaysSet]);
-                        const totalProductiveDays = allProductiveDaysSet.size;
-                        const utilizationPercent = availableWorkDays > 0 ? Math.round((totalProductiveDays / availableWorkDays) * 100) : 0;
+
+                        const travelDatesSeenReport = new Set();
+                        const travelHours = travelEvents.reduce((sum, e) => {
+                            if (travelDatesSeenReport.has(e.date)) return sum;
+                            travelDatesSeenReport.add(e.date);
+                            return sum + (parseFloat(e.hours) || 5);
+                        }, 0);
+
+                        const productiveHours = calculateCrcHours(allEventsForMonth, crcId, { includeTravel: true });
+                        const REPORT_UTIL_HOURS_PER_WORKDAY = 8;
+                        const availableHours = availableWorkDays * REPORT_UTIL_HOURS_PER_WORKDAY;
+                        const utilizationPercent = availableHours > 0 ? Math.round((productiveHours / availableHours) * 100) : 0;
                         
                         reportData.push({
                             crcName,
@@ -13160,6 +13163,7 @@
                             productiveDays,
                             productiveStudiesDays,
                             productiveTrainingDays,
+                            productiveHours,
                             nonWorkDays,
                             timeOffDays,
                             travelDays,
@@ -13172,6 +13176,7 @@
                             carsCount,
                             travelCost: Number.isFinite(travelCost) ? Math.round(travelCost * 100) / 100 : 0,
                             availableWorkDays,
+                            availableHours,
                             utilizationPercent
                         });
                     });
@@ -13209,6 +13214,8 @@
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Non-Working Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Time Off Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Total Working Days</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Productive Hours</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Available Hours</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Utilization %</th>
                                     </tr>
                                 </thead>
@@ -13232,6 +13239,8 @@
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.nonWorkDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.timeOffDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.availableWorkDays}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${(row.productiveHours ?? 0).toFixed(1)}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${(row.availableHours ?? 0).toFixed(1)}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.utilizationPercent}%</td>
                                     </tr>
                                     `).join('')}
@@ -13261,7 +13270,7 @@
                     return;
                 }
 
-                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Studies', 'Training', 'Travel Days', 'Travel Hours', 'Travel (Studies)', 'Travel (Training)', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Utilization %'];
+                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Studies', 'Training', 'Travel Days', 'Travel Hours', 'Travel (Studies)', 'Travel (Training)', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Productive Hours', 'Available Hours', 'Utilization %'];
                 const rows = data.map(row => [
                     row.crcName,
                     row.month,
@@ -13281,8 +13290,10 @@
                     row.nonWorkDays,
                     row.timeOffDays,
                     row.availableWorkDays,
+                    (row.productiveHours ?? 0).toFixed(1),
+                    (row.availableHours ?? 0).toFixed(1),
                     `${row.utilizationPercent}%`
-                ].map(val => `"${(val || '').toString().replace(/"/g, '""')}"`).join(','));
+                ].map(val => `"${(val ?? '').toString().replace(/"/g, '""')}"`).join(','));
                 
                 const csvContent = "data:text/csv;charset=utf-8," + [headers.join(','), ...rows].join('\n');
                 const encodedUri = encodeURI(csvContent);
@@ -15393,8 +15404,7 @@
                                     const textColor = getContrastColor(bgColor);
                                     const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                     
-                                    // Get hours for this event
-                                    const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8));
+                                    const eventHours = getDisplayEventHours(event);
                                     
                                     roleBlocks.push({
                                         visit: visitNumber,
@@ -15415,7 +15425,7 @@
                                 const bgColor = site?.color || '#3b82f6';
                                 const textColor = getContrastColor(bgColor);
                                 const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
-                                const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8));
+                                const eventHours = getDisplayEventHours(event);
                                 
                                 roleBlocks.push({
                                     visit: visitNumber,
@@ -15444,7 +15454,7 @@
                         if (block.role) displayParts.push(block.role);
                         displayParts.push(block.crcTitle);
                         // Add hours display
-                        if (block.hours) {
+                        if (Number.isFinite(block.hours)) {
                             displayParts.push(`${block.hours}h`);
                         }
                         
@@ -15740,8 +15750,7 @@
                                     const textColor = getContrastColor(bgColor);
                                     const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                     
-                                    // Get hours for this event
-                                    const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8));
+                                    const eventHours = getDisplayEventHours(event);
                                     
                                     roleBlocks.push({
                                         visit: visitNumber,
@@ -15762,7 +15771,7 @@
                                 const bgColor = site?.color || '#3b82f6';
                                 const textColor = getContrastColor(bgColor);
                                 const spanTextColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
-                                const eventHours = event.hours || (event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8));
+                                const eventHours = getDisplayEventHours(event);
                                 
                                 roleBlocks.push({
                                     visit: visitNumber,
@@ -15791,7 +15800,7 @@
                         if (block.role) displayParts.push(block.role);
                         displayParts.push(block.crcTitle);
                         // Add hours display
-                        if (block.hours) {
+                        if (Number.isFinite(block.hours)) {
                             displayParts.push(`${block.hours}h`);
                         }
                         
@@ -18008,9 +18017,9 @@
                     // Just today's date
                     dateRange = [toDateOnlyString(now)];
                 } else if (viewMode === 'weekly') {
-                    // Get the week containing the current date (Sat-Fri)
+                    // Get the week containing the current date (Sun-Sat)
                     const startOfWeek = new Date(now);
-                    startOfWeek.setDate(now.getDate() - getDaySaturdayStart(now)); // Saturday
+                    startOfWeek.setDate(now.getDate() - now.getDay()); // Sunday
                     for (let i = 0; i < 7; i++) {
                         const d = new Date(startOfWeek);
                         d.setDate(startOfWeek.getDate() + i);
@@ -19050,21 +19059,24 @@
                         if (me && !crcsToShow.length) crcsToShow = [me];
                     }
                     utilizationHTML = crcsToShow.map(crc => {
-                        const stats = monthlyStats[crc.id] || { utilizationPercent: 0, travelDays: 0 };
+                        const stats = monthlyStats[crc.id] || { utilizationPercent: 0, travelHours: 0, productiveHours: 0, availableHours: 0 };
                         const utilizationPercent = stats.utilizationPercent;
-                        const travelDays = stats.travelDays || 0;
+                        const productiveHours = stats.productiveHours ?? 0;
+                        const availableHours = stats.availableHours ?? 0;
+                        const travelHours = stats.travelHours || 0;
                         const isOverCapacity = utilizationPercent > 100;
                         const barWidth = isOverCapacity ? 100 : utilizationPercent;
                         let barColor = 'bg-green-500';
                         if (utilizationPercent > 85) barColor = 'bg-yellow-500';
                         if (utilizationPercent >= 100) barColor = 'bg-red-500';
-                        const travelInfo = travelDays > 0 ? ` <span class="text-orange-500 dark:text-orange-400 text-xs">(+${travelDays}d travel)</span>` : '';
+                        const travelInfo = travelHours > 0 ? ` <span class="text-orange-500 dark:text-orange-400 text-xs">(+${travelHours.toFixed(1)}h travel)</span>` : '';
                         return `
                             <div>
                                 <div class="flex justify-between mb-1 font-medium">
                                     <span>${crc.name}</span>
                                     <span class="dark:text-gray-300">
-                                        ${isOverCapacity ? `<span class="text-red-600 dark:text-red-400 font-bold">${utilizationPercent.toFixed(0)}%</span>` : `${utilizationPercent.toFixed(0)}%`}${travelInfo}
+                                        ${productiveHours.toFixed(1)} / ${availableHours.toFixed(1)} h${travelInfo}
+                                        ${isOverCapacity ? `<span class="text-red-600 dark:text-red-400 font-bold"> (${utilizationPercent.toFixed(0)}%)</span>` : ` <span class="text-gray-500 dark:text-gray-400">(${utilizationPercent.toFixed(0)}%)</span>`}
                                     </span>
                                 </div>
                                 <div class="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2.5 relative overflow-hidden">
@@ -20872,78 +20884,6 @@
             };
 
             // --- TRUCKS FUNCTIONS ---
-            const getTruckDisplayName = (truck) => {
-                if (!truck) return 'Unknown Truck';
-                const type = truck.truckType ? ` [${truck.truckType}]` : '';
-                return `${truck.unitNumber || 'Truck'}${truck.nickname ? ` (${truck.nickname})` : ''}${type}`;
-            };
-
-            const normalizeTruckType = (value) => {
-                const validTypes = new Set(['tractor', 'generator', 'support']);
-                const type = (value || '').toString().trim().toLowerCase();
-                return validTypes.has(type) ? type : 'tractor';
-            };
-
-            const getPairedTruckIdsNormalized = (truck) => {
-                if (!truck || !Array.isArray(truck.pairedTruckIds)) return [];
-                return Array.from(new Set(truck.pairedTruckIds.filter(Boolean)));
-            };
-
-            const isCrcSelectableForNewShift = (crc) => !!(crc && crc.id && crc.active !== false && !crc.archived);
-
-            const getConvoyTruckIds = (seedTruckId) => {
-                if (!seedTruckId) return [];
-                const allTrucks = Array.isArray(state.trucks) ? state.trucks : [];
-                const visited = new Set();
-                const queue = [seedTruckId];
-
-                while (queue.length > 0) {
-                    const currentId = queue.shift();
-                    if (!currentId || visited.has(currentId)) continue;
-                    visited.add(currentId);
-
-                    const currentTruck = allTrucks.find(t => t.id === currentId);
-                    const directPairs = currentTruck ? getPairedTruckIdsNormalized(currentTruck) : [];
-                    directPairs.forEach(pid => {
-                        if (!visited.has(pid)) queue.push(pid);
-                    });
-
-                    allTrucks.forEach(t => {
-                        if (t && t.id && t.id !== currentId && getPairedTruckIdsNormalized(t).includes(currentId) && !visited.has(t.id)) {
-                            queue.push(t.id);
-                        }
-                    });
-                }
-
-                return Array.from(visited);
-            };
-
-            const getTruckPairingOptionsHTML = (selectedIds = [], excludeTruckId = null) => {
-                const selectedSet = new Set((selectedIds || []).filter(Boolean));
-                return (state.trucks || [])
-                    .filter(t => t && t.id && t.id !== excludeTruckId)
-                    .map(t => `<option value="${t.id}" ${selectedSet.has(t.id) ? 'selected' : ''}>${getTruckDisplayName(t)}</option>`)
-                    .join('');
-            };
-
-            const getTruckConvoyGroups = () => {
-                const groups = [];
-                const seen = new Set();
-                const trucks = Array.isArray(state.trucks) ? state.trucks : [];
-                const sorted = [...trucks].sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
-                sorted.forEach(truck => {
-                    if (!truck?.id || seen.has(truck.id)) return;
-                    const convoyIds = getConvoyTruckIds(truck.id);
-                    convoyIds.forEach(id => seen.add(id));
-                    const convoyTrucks = convoyIds
-                        .map(id => trucks.find(t => t.id === id))
-                        .filter(Boolean)
-                        .sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
-                    groups.push(convoyTrucks);
-                });
-                return groups;
-            };
-
             const getTruckTotalMaintenanceCost = (truck) => {
                 if (!truck.serviceLog || truck.serviceLog.length === 0) return 0;
                 return truck.serviceLog.reduce((total, record) => {
@@ -21041,10 +20981,8 @@
                                     <thead class="bg-gray-50 dark:bg-gray-700">
                                         <tr>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Unit #</th>
-                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Type</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Year/Make</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Current Location</th>
-                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Paired With</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Status</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Mileage</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Last Inspection</th>
@@ -21053,30 +20991,18 @@
                                         </tr>
                                     </thead>
                                     <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                        ${getTruckConvoyGroups().map((convoy, convoyIdx) => {
-                                            const convoyLabel = convoy.length > 1 ? `Convoy ${convoyIdx + 1}` : 'Single';
-                                            return convoy.map((truck, truckIdxInConvoy) => {
+                                        ${state.trucks.map(truck => {
                                             const currentLocation = getTruckCurrentLocation(truck.id);
-                                            const pairedNames = getPairedTruckIdsNormalized(truck)
-                                                .map(pid => state.trucks.find(t => t.id === pid))
-                                                .filter(Boolean)
-                                                .map(p => p.unitNumber)
-                                                .join(', ') || 'None';
                                             const lastInspection = truck.inspections && truck.inspections.length > 0 
                                                 ? truck.inspections[truck.inspections.length - 1] 
                                                 : null;
                                             const totalMaintenanceCost = getTruckTotalMaintenanceCost(truck);
                                             
                                             return `
-                                                <tr class="${truckIdxInConvoy > 0 ? 'bg-gray-50/40 dark:bg-gray-900/20' : ''}">
+                                                <tr>
                                                     <td class="px-6 py-4 text-sm font-medium text-gray-900 dark:text-gray-100">${truck.unitNumber}${truck.nickname ? ` (${truck.nickname})` : ''}</td>
-                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400 capitalize">${truck.truckType || 'tractor'}</td>
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${truck.year} ${truck.make}</td>
                                                     <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">${currentLocation}</td>
-                                                    <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">
-                                                        <div>${pairedNames}</div>
-                                                        <div class="text-xs mt-1 ${convoy.length > 1 ? 'text-blue-600 dark:text-blue-300 font-medium' : 'text-gray-400 dark:text-gray-500'}">${convoyLabel}</div>
-                                                    </td>
                                                     <td class="px-6 py-4 whitespace-nowrap">
                                                         <span class="inline-flex px-2 py-1 text-xs font-semibold rounded-full ${getTruckStatusColor(truck.status)}">
                                                             ${truck.status}
@@ -21087,12 +21013,9 @@
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">$${totalMaintenanceCost.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                                         <button data-action="view-truck-details" data-id="${truck.id}" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">View Details</button>
-                                                        <span class="mx-1 text-gray-300 dark:text-gray-600">|</span>
-                                                        <button data-action="pair-truck" data-id="${truck.id}" class="text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 dark:hover:text-indigo-300">Pair</button>
                                                     </td>
                                                 </tr>
                                             `;
-                                            }).join('');
                                         }).join('')}
                                     </tbody>
                                 </table>
@@ -21508,15 +21431,6 @@
                             <input type="text" name="nickname" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Big Blue, The Beast, etc.">
                         </div>
                         
-                        <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Truck Type</label>
-                            <select name="truckType" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                <option value="tractor">Tractor</option>
-                                <option value="generator">Generator</option>
-                                <option value="support">Support Truck</option>
-                            </select>
-                        </div>
-                        
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Year</label>
@@ -21564,14 +21478,6 @@
                             </select>
                         </div>
                         
-                        <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Paired Trucks (always travel together)</label>
-                            <select name="pairedTruckIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white h-32">
-                                ${getTruckPairingOptionsHTML()}
-                            </select>
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hold Ctrl/Cmd to select multiple trucks to pair.</p>
-                        </div>
-                        
                         <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
                             <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Add Truck</button>
@@ -21582,7 +21488,7 @@
 
             const getEditTruckEventModalHTML = (event) => {
                 const truckOptions = state.trucks.map(truck => 
-                    `<option value="${truck.id}" ${truck.id === event.truckId ? 'selected' : ''}>${getTruckDisplayName(truck)} - ${truck.year} ${truck.make}</option>`
+                    `<option value="${truck.id}" ${truck.id === event.truckId ? 'selected' : ''}>${truck.unitNumber} - ${truck.year} ${truck.make}</option>`
                 ).join('');
                 
                 const siteOptions = getFilteredSites().map(site => 
@@ -21662,7 +21568,7 @@
 
             const getTruckScheduleModalHTML = () => {
                 const truckOptions = state.trucks.map(truck => 
-                    `<option value="${truck.id}">${getTruckDisplayName(truck)} - ${truck.year} ${truck.make}</option>`
+                    `<option value="${truck.id}">${truck.unitNumber} - ${truck.year} ${truck.make}</option>`
                 ).join('');
                 
                 const siteOptions = getFilteredSites().map(site => 
@@ -21688,7 +21594,6 @@
                                 <option value="">Choose a truck</option>
                                 ${truckOptions}
                             </select>
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Any trucks paired with this truck are scheduled automatically on the same shift/site.</p>
                         </div>
                         
                         <div id="study-site-section" class="hidden">
@@ -21745,26 +21650,6 @@
                         <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
                             <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700">Schedule Truck</button>
-                        </div>
-                    </form>
-                `;
-            };
-
-            const getPairTruckModalHTML = (truck) => {
-                const selectedIds = getPairedTruckIdsNormalized(truck);
-                return `
-                    <h2 class="text-2xl font-bold dark:text-white mb-6">Pair Trucks - ${getTruckDisplayName(truck)}</h2>
-                    <form id="pair-truck-form" data-truck-id="${truck.id}" class="space-y-6">
-                        <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Select paired trucks</label>
-                            <select name="pairedTruckIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white h-56">
-                                ${getTruckPairingOptionsHTML(selectedIds, truck.id)}
-                            </select>
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Paired trucks will appear grouped together and schedule together.</p>
-                        </div>
-                        <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
-                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
-                            <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Save Pairing</button>
                         </div>
                     </form>
                 `;
@@ -21906,7 +21791,7 @@
                         
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hours</label>
-                            <input type="number" name="hours" value="${event.hours || ''}" step="0.5" min="0" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white"'} >
+                            <input type="number" name="hours" value="${(event.hours !== undefined && event.hours !== null) ? event.hours : ''}" step="0.5" min="0" ${isSupervisor ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white"'} >
                         </div>
                         
                         <div>
@@ -22309,7 +22194,6 @@
             };
 
             const getEditTruckModalHTML = (truck) => {
-                const pairedTruckIds = getPairedTruckIdsNormalized(truck);
                 return `
                     <h2 class="text-2xl font-bold dark:text-white mb-6">Edit Truck - ${truck.unitNumber}</h2>
                     <form id="edit-truck-form" data-id="${truck.id}" class="space-y-6">
@@ -22327,15 +22211,6 @@
                         <div>
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Nickname</label>
                             <input type="text" name="nickname" value="${truck.nickname || ''}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Big Blue, The Beast, etc.">
-                        </div>
-                        
-                        <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Truck Type</label>
-                            <select name="truckType" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                <option value="tractor" ${normalizeTruckType(truck.truckType) === 'tractor' ? 'selected' : ''}>Tractor</option>
-                                <option value="generator" ${normalizeTruckType(truck.truckType) === 'generator' ? 'selected' : ''}>Generator</option>
-                                <option value="support" ${normalizeTruckType(truck.truckType) === 'support' ? 'selected' : ''}>Support Truck</option>
-                            </select>
                         </div>
                         
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -22385,14 +22260,6 @@
                             </select>
                         </div>
                         
-                        <div>
-                            <label class="block text-sm font-medium dark:text-gray-300 mb-2">Paired Trucks (always travel together)</label>
-                            <select name="pairedTruckIds" multiple class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white h-32">
-                                ${getTruckPairingOptionsHTML(pairedTruckIds, truck.id)}
-                            </select>
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hold Ctrl/Cmd to select multiple trucks to pair.</p>
-                        </div>
-                        
                         <div class="flex justify-end gap-4 pt-4 border-t dark:border-gray-700">
                             <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                             <button type="submit" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Update Truck</button>
@@ -22405,10 +22272,6 @@
                 const currentLocation = getTruckCurrentLocation(truck.id);
                 const inspections = truck.inspections || [];
                 const serviceLog = truck.serviceLog || [];
-                const pairedTruckNames = getPairedTruckIdsNormalized(truck)
-                    .map(pid => state.trucks.find(t => t.id === pid))
-                    .filter(Boolean)
-                    .map(t => getTruckDisplayName(t));
                 
                 return `
                     <h2 class="text-2xl font-bold dark:text-white mb-6">Truck Details - ${truck.unitNumber}</h2>
@@ -22419,8 +22282,6 @@
                                 <div class="space-y-2">
                                     <p><span class="font-medium">Unit #:</span> ${truck.unitNumber}</p>
                                     ${truck.nickname ? `<p><span class="font-medium">Nickname:</span> ${truck.nickname}</p>` : ''}
-                                    <p><span class="font-medium">Type:</span> <span class="capitalize">${truck.truckType || 'tractor'}</span></p>
-                                    <p><span class="font-medium">Paired With:</span> ${pairedTruckNames.length ? pairedTruckNames.join(', ') : 'None'}</p>
                                     <p><span class="font-medium">VIN:</span> ${truck.vin}</p>
                                     <p><span class="font-medium">Year/Make:</span> ${truck.year} ${truck.make}</p>
                                     <p><span class="font-medium">Mileage:</span> ${truck.mileage?.toLocaleString() || 'N/A'}</p>
@@ -24037,8 +23898,14 @@
                 const visitGroup = form.querySelector('#visit-group');
                 const travelDayGroup = form.querySelector('#travel-day-group');
 
-                if(hoursInput) {
-                    hoursInput.value = state.settings[eventType] || 8;
+                if (hoursInput) {
+                    const prevType = selectElement.dataset.chaosPrevEventType;
+                    if (prevType === undefined) {
+                        selectElement.dataset.chaosPrevEventType = eventType;
+                    } else if (prevType !== eventType) {
+                        selectElement.dataset.chaosPrevEventType = eventType;
+                        hoursInput.value = state.settings[eventType] || 8;
+                    }
                 }
 
                 const allGroups = [crcGroup, siteGroup, studyGroup, roleAssignmentGroup, periodGroup, mileageGroup, visitGroup, travelDayGroup];
@@ -24316,7 +24183,9 @@
                 const readOnly = isSupervisor || isCRC;
                 const isEditing = event !== null && event.id;
                 const eventType = event ? event.type : 'Site Assignment';
-                const hours = event ? event.hours : (state.settings[eventType] || 8);
+                const hours = (event && (event.hours !== undefined && event.hours !== null))
+                    ? Number(event.hours)
+                    : (state.settings[eventType] || 8);
                 const period = event ? (event.period || 'Full Day') : 'Full Day';
                 
                 // For Site Assignment events, filter CRCs by training when roles are known
@@ -24359,6 +24228,10 @@
                 const endDateValue = seriesEndDate || (isEditing ? (event?.endDate || event?.date || date) : (seriesStartDate || event?.date || date));
                 // Check if this is a multi-day event (start and end dates are different)
                 const isMultiDayEvent = isEditing && startDateValue && endDateValue && startDateValue !== endDateValue;
+                const groupSeriesDates = (isEditing && event && event.groupId && Array.isArray(state.crc_events))
+                    ? new Set(state.crc_events.filter(e => e.groupId === event.groupId && e.type !== 'Travel Day').map(e => e.date))
+                    : new Set();
+                const isGroupSeriesMultiDay = groupSeriesDates.size > 1;
                 const baseGroupNumber = event?.groupNumber || '';
                 const baseVisitNumber = event?.visitNumber || '';
                 const defaultDuplicateGroup = baseGroupNumber ? suggestNextGroupNumber(baseGroupNumber) : '';
@@ -24475,7 +24348,7 @@
                                 <input type="date" name="endDate" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} value="${endDateValue}">
                             </div>
                         </div>
-                        ${isEditing && event?.groupId && !readOnly && isMultiDayEvent ? `
+                        ${isEditing && event?.groupId && !readOnly && (isMultiDayEvent || isGroupSeriesMultiDay) ? `
                         <div class="p-3 rounded-md border border-amber-200 dark:border-amber-700 bg-amber-50/60 dark:bg-amber-900/20">
                             <label class="flex items-center gap-2 cursor-pointer">
                                 <input type="checkbox" name="applyToAllDaysInShift" class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
@@ -24555,7 +24428,7 @@
                             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Group Number</label>
-                                    <input type="text" name="groupNumber" value="${event ? event.groupNumber || '' : ''}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 1, 1-2, 1/2"'} pattern="[0-9/-]+" title="Only numbers and symbols (-, /) allowed">
+                                    <input type="text" name="groupNumber" value="${event ? event.groupNumber || '' : ''}" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed" placeholder="Read-only"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 1, 1-2, 1/2"'} pattern="[-0-9/\\\\]+" title="Only numbers and symbols (-, /, \) allowed">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-1">Visit Number</label>
@@ -24781,8 +24654,8 @@
                             }
                         });
                     }
-                    // Fall back to legacy crcId only when no roleAssignments were present
-                    if (assignedCrcs.length === 0 && evt.crcId && evt.crcId !== 'SITE_STAFF' && !assignedCrcIds.has(evt.crcId)) {
+                    // Also check legacy crcId (even if roleAssignments exist, to handle mixed data)
+                    if (evt.crcId && evt.crcId !== 'SITE_STAFF' && !assignedCrcIds.has(evt.crcId)) {
                         const crc = state.crcs.find(c => c.id === evt.crcId);
                         if (crc) {
                             assignedCrcs.push(crc);
@@ -25543,19 +25416,13 @@
                 
                 const canEditCRCs = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC');
                 const canViewAs = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager');
-                const isCrcDeactivated = crc.archived || crc.active === false;
                 return `
                     <div class="flex justify-between items-start mb-4">
-                        <div>
-                            <h2 class="text-2xl font-bold dark:text-white">CRC Profile: ${crc.name}</h2>
-                            <div class="mt-1 text-sm ${isCrcDeactivated ? 'text-red-600 dark:text-red-400 font-semibold' : 'text-green-700 dark:text-green-400'}">
-                                Status: ${isCrcDeactivated ? 'Deactivated' : 'Active'}
-                            </div>
-                        </div>
+                        <h2 class="text-2xl font-bold dark:text-white">CRC Profile: ${crc.name}</h2>
                         <div class="flex gap-2 flex-wrap">
                             ${canViewAs ? `<button data-action="set-view-as-crc" data-crc-id="${crc.id}" class="px-4 py-2 rounded-md bg-amber-500 text-white hover:bg-amber-600 text-sm flex items-center gap-1"><i data-lucide="eye" class="w-4 h-4"></i>View as this CRC</button>` : ''}
                             ${canEditCRCs ? `
-                            <button data-action="archive-crc" data-id="${crc.id}" class="px-4 py-2 rounded-md bg-yellow-600 text-white hover:bg-yellow-700 text-sm">${isCrcDeactivated ? 'Deactivated' : 'Deactivate'}</button>
+                            <button data-action="archive-crc" data-id="${crc.id}" class="px-4 py-2 rounded-md bg-yellow-600 text-white hover:bg-yellow-700 text-sm">Archive</button>
                             <button data-action="delete-crc" data-id="${crc.id}" class="px-4 py-2 rounded-md bg-red-600 text-white hover:bg-red-700 text-sm">Delete</button>
                             ` : ''}
                         </div>
@@ -25650,7 +25517,7 @@
                             const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study assigned';
                             const roles = (nextShift.roles || []).join(', ') || 'No roles';
                             const period = nextShift.period || 'Full Day';
-                            const hours = nextShift.hours || (nextShift.type === 'Travel Day' ? 5 : 8);
+                            const hours = getDisplayEventHours(nextShift);
                             
                             nextShiftHTML = `
                                 <div class="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-md">
@@ -25667,16 +25534,16 @@
                             `;
                             
                             // Calculate next scheduled week (week containing the next shift)
-                            // Week runs Saturday (0) to Friday (6)
+                            // Week runs Sunday (0) to Saturday (6)
                             const shiftDateObj = new Date(shiftDate);
-                            const dayOfWeek = getDaySaturdayStart(shiftDateObj); // 0 = Saturday, 6 = Friday
-                            // Get Saturday of that week (week starts on Saturday)
-                            const saturdayOffset = dayOfWeek;
+                            const dayOfWeek = shiftDateObj.getDay(); // 0 = Sunday, 6 = Saturday
+                            // Get Sunday of that week (week starts on Sunday)
+                            const sundayOffset = dayOfWeek; // If Sunday (0), offset is 0; otherwise subtract days to get to Sunday
                             const weekStart = new Date(shiftDateObj);
-                            weekStart.setDate(shiftDateObj.getDate() - saturdayOffset);
+                            weekStart.setDate(shiftDateObj.getDate() - sundayOffset);
                             weekStart.setHours(0, 0, 0, 0);
                             const weekEnd = new Date(weekStart);
-                            weekEnd.setDate(weekStart.getDate() + 6); // Friday (6 days after Saturday)
+                            weekEnd.setDate(weekStart.getDate() + 6); // Saturday (6 days after Sunday)
                             weekEnd.setHours(23, 59, 59, 999);
                             
                             // Count shifts in that week
@@ -26272,9 +26139,10 @@
                     const isSelected = selectedDates.has(dateStr);
                     const isApproved = approvedDates.has(dateStr);
                     const isPending = pendingDates.has(dateStr);
-                    // CRCs can select past dates up to 30 days ago
+                    // CRCs can select past dates up to 30 days ago; fully backdate Capped - FTE only
+                    const isCappedFtePto = ptoType === 'Capped - FTE only';
                     const isPastWithin30ForCrc = isPast && isCrcUser && dateStr >= thirtyDaysAgoStr;
-                    const isPastAndSelectable = isPast && (canSelectPastDates || isPastWithin30ForCrc);
+                    const isPastAndSelectable = isPast && (canSelectPastDates || isPastWithin30ForCrc || (isCrcUser && isCappedFtePto));
                     const isPastAndBlocked = isPast && !isPastAndSelectable;
                     
                     let buttonClass = '';
@@ -26298,7 +26166,7 @@
                         buttonClass = 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-700 hover:border-blue-300 dark:hover:border-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 text-gray-900 dark:text-gray-100';
                     }
                     
-                    const pastTitle = isPastAndSelectable ? (isCrcUser ? dateStr + ' (Past date - within 30 days)' : dateStr + ' (Past date - Manager access)') : dateStr;
+                    const pastTitle = isPastAndSelectable ? (isCrcUser ? dateStr + (isCappedFtePto ? ' (Past date)' : ' (Past date - within 30 days)') : dateStr + ' (Past date - Manager access)') : dateStr;
                     calendarHTML += `
                         <button 
                             data-action="pto-date-selected" 
@@ -29933,30 +29801,10 @@
                             renderCRCScheduleView();
                         }
                         break;
-                    case 'prev-crc-week': {
-                        const nextDate = new Date(state.crcCalendarDate.getTime());
-                        nextDate.setDate(nextDate.getDate() - 7);
-                        setState({ crcCalendarDate: nextDate });
-                        break;
-                    }
-                    case 'next-crc-week': {
-                        const nextDate = new Date(state.crcCalendarDate.getTime());
-                        nextDate.setDate(nextDate.getDate() + 7);
-                        setState({ crcCalendarDate: nextDate });
-                        break;
-                    }
-                    case 'prev-crc-day': {
-                        const nextDate = new Date(state.crcCalendarDate.getTime());
-                        nextDate.setDate(nextDate.getDate() - 1);
-                        setState({ crcCalendarDate: nextDate });
-                        break;
-                    }
-                    case 'next-crc-day': {
-                        const nextDate = new Date(state.crcCalendarDate.getTime());
-                        nextDate.setDate(nextDate.getDate() + 1);
-                        setState({ crcCalendarDate: nextDate });
-                        break;
-                    }
+                    case 'prev-crc-week': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() - 7)) }); break;
+                    case 'next-crc-week': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() + 7)) }); break;
+                    case 'prev-crc-day': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() - 1)) }); break;
+                    case 'next-crc-day': setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() + 1)) }); break;
                     case 'prev-unavailability-month':
                         setState({ unavailabilityDate: new Date(state.unavailabilityDate.setMonth(state.unavailabilityDate.getMonth() - 1)) });
                         renderUnavailabilityCalendar();
@@ -30058,19 +29906,19 @@
                             weekStart.setDate(weekStart.getDate() - weekStart.getDay());
                             const weekEnd = new Date(weekStart);
                             weekEnd.setDate(weekEnd.getDate() + 6);
-                            startStr = toLocalInputDateString(weekStart);
-                            endStr = toLocalInputDateString(weekEnd);
+                            startStr = weekStart.toISOString().slice(0, 10);
+                            endStr = weekEnd.toISOString().slice(0, 10);
                         } else if (preset === 'nextMonth') {
                             const y = now.getFullYear();
                             const m = now.getMonth() + 1;
                             const nextY = m > 11 ? y + 1 : y;
                             const nextM = m > 11 ? 0 : m;
                             startStr = `${nextY}-${String(nextM + 1).padStart(2, '0')}-01`;
-                            endStr = toLocalInputDateString(new Date(nextY, nextM + 1, 0));
+                            endStr = new Date(nextY, nextM + 1, 0).toISOString().slice(0, 10);
                         } else {
                             // month (this month)
                             startStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
-                            endStr = toLocalInputDateString(new Date(now.getFullYear(), now.getMonth() + 1, 0));
+                            endStr = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
                         }
                         setState({ managerViewUtilizationStartDate: startStr, managerViewUtilizationEndDate: endStr });
                         const startEl = document.getElementById('manager-utilization-start');
@@ -30084,8 +29932,8 @@
                         const today = new Date();
                         const lastWeek = new Date(today);
                         lastWeek.setDate(lastWeek.getDate() - 7);
-                        const startDateStr = toLocalInputDateString(lastWeek);
-                        const endDateStr = toLocalInputDateString(today);
+                        const startDateStr = lastWeek.toISOString().split('T')[0];
+                        const endDateStr = today.toISOString().split('T')[0];
                         
                         openModal(`
                             <h3 class="text-xl font-bold dark:text-white mb-4">Catch-Up: Change History</h3>
@@ -30134,7 +29982,7 @@
                         const today = new Date();
                         const yesterday = new Date(today);
                         yesterday.setDate(yesterday.getDate() - 1);
-                        renderCatchUpResults(changes, toLocalInputDateString(yesterday), toLocalInputDateString(today), false);
+                        renderCatchUpResults(changes, yesterday.toISOString().split('T')[0], today.toISOString().split('T')[0], false);
                         break;
                     }
                     case 'edit-all-schedule-event': {
@@ -30408,11 +30256,6 @@
                     case 'view-truck-details': {
                         const truck = state.trucks.find(t => t.id === id);
                         if (truck) openModal(getTruckDetailsModalHTML(truck), '4xl');
-                        break;
-                    }
-                    case 'pair-truck': {
-                        const truck = state.trucks.find(t => t.id === id);
-                        if (truck) openModal(getPairTruckModalHTML(truck), 'lg');
                         break;
                     }
                     case 'import-trucks-btn': openModal(getImportTrucksModalHTML(), '4xl'); break;
@@ -31061,6 +30904,9 @@
                         const crcId = actionButton.dataset.crcId;
                         if (!crcId) break;
                         removeCrcFromRoleAssignments(crcId);
+                        if (typeof updateTravelSelectionContainer === 'function') {
+                            updateTravelSelectionContainer();
+                        }
                         // Mark pending on the chip
                         const chip = actionButton.closest('[data-current-crc-id]');
                         if (chip && !chip.querySelector('.pending-removal')) {
@@ -31087,7 +30933,8 @@
                             showNotification('Error: Could not find the event to split.', 'error');
                             return;
                         }
-                        const originalHours = parseFloat(eventToSplit.hours) || 8;
+                        const oh = parseFloat(eventToSplit.hours);
+                        const originalHours = Number.isFinite(oh) && oh >= 0 ? oh : 8;
                         const splitHours = originalHours / 2;
                         try {
                             await apiService.updateEvent(eventId, { period: 'AM', hours: splitHours });
@@ -31496,8 +31343,9 @@
                         try {
                             if (operation === 'delete') {
                                 await apiService.deleteEvent(eventId);
-                                state.crc_events = state.crc_events.filter(e => e.id !== eventId);
-                                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                                // Re-fetch events from DB
+                                const updatedEvents = await apiService.getEvents();
+                                setState({ crc_events: updatedEvents });
                                 showNotification('Unavailability removed. Day is now available.', 'success');
                             } else {
                                 const eventData = { 
@@ -31525,11 +31373,11 @@
                         const crc = state.crcs.find(c => c.id === id);
                         if (crc) {
                             openModal(`
-                                <h3 class="text-xl font-bold dark:text-white mb-4">Deactivate CRC</h3>
-                                <p class="dark:text-gray-300 mb-6">Are you sure you want to deactivate <strong>${crc.name}</strong>? They will no longer be selectable on new shifts, while historical data is preserved.</p>
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Archive CRC</h3>
+                                <p class="dark:text-gray-300 mb-6">Are you sure you want to archive <strong>${crc.name}</strong>? This will remove the CRC from active lists but preserve historical data.</p>
                                 <div class="flex justify-end gap-4">
                                     <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
-                                    <button data-action="confirm-archive-crc" data-crc-id="${crc.id}" class="py-2 px-4 rounded-md bg-yellow-600 text-white hover:bg-yellow-700">Deactivate CRC</button>
+                                    <button data-action="confirm-archive-crc" data-crc-id="${crc.id}" class="py-2 px-4 rounded-md bg-yellow-600 text-white hover:bg-yellow-700">Archive CRC</button>
                                 </div>
                             `);
                         }
@@ -31538,27 +31386,38 @@
                     case 'confirm-archive-crc': {
                         try {
                             const crcId = actionButton.dataset.crcId || id;
-                            const deactivatePayload = { archived: true, active: false, archivedDate: new Date().toISOString() };
+                            const crcRecord = state.crcs.find(c => c.id === crcId);
+                            if (!crcRecord) {
+                                showNotification('CRC not found. Please refresh and try again.', 'error');
+                                closeModal();
+                                break;
+                            }
+                            // Archive by setting archived flag (if supported) or delete
+                            // For now, we'll update with archived flag, but if backend doesn't support it, we can use delete
                             try {
-                                await apiService.updateCrc(crcId, deactivatePayload);
+                                await apiService.updateCrc(crcId, buildCrcUpdatePayload(crcRecord, {
+                                    archived: true,
+                                    archivedDate: new Date().toISOString()
+                                }));
                                 setState({
-                                    crcs: state.crcs.map(c => c.id === crcId ? { ...c, ...deactivatePayload } : c)
+                                    crcs: state.crcs.filter(c => c.id !== crcId)
                                 });
-                                showNotification('CRC deactivated successfully!', 'success');
+                                showNotification('CRC archived successfully!', 'success');
                             } catch (updateError) {
-                                // Fallback: preserve local state and mark as deactivated in UI.
-                                console.warn('Deactivate update failed; applying local deactivation state:', updateError);
+                                // If update with archived flag fails, fall back to delete
+                                console.warn('Archive flag not supported, using delete:', updateError);
+                                await apiService.deleteCrc(crcId);
                                 setState({
-                                    crcs: state.crcs.map(c => c.id === crcId ? { ...c, ...deactivatePayload } : c)
+                                    crcs: state.crcs.filter(c => c.id !== crcId)
                                 });
-                                showNotification('CRC marked deactivated locally. Backend sync failed; please retry later.', 'warning');
+                                showNotification('CRC archived successfully!', 'success');
                             }
                             closeModal();
                             // Re-render the view to reflect changes
                             renderContent();
                         } catch (error) {
-                            console.error('Error deactivating CRC:', error);
-                            showNotification('Failed to deactivate CRC. See console for details.', 'error');
+                            console.error('Error archiving CRC:', error);
+                            showNotification('Failed to archive CRC. See console for details.', 'error');
                         }
                         break;
                     }
@@ -31678,8 +31537,9 @@
                                         crcNames
                                     });
                                 }
-                                state.crc_events = state.crc_events.filter(e => e.id !== eventId);
-                                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                                // Re-fetch events from DB
+                                const updatedEvents = await apiService.getEvents();
+                                setState({ crc_events: updatedEvents });
                                 showNotification('Event deleted successfully!', 'success');
                             closeModal();
                                 // Refresh calendar views
@@ -31715,8 +31575,9 @@
                                     crcNames
                                 });
                             }
-                            state.crc_events = state.crc_events.filter(e => e.id !== eventId);
-                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents });
                             showNotification('Event deleted successfully!', 'success');
                         closeModal();
                             // Refresh calendar views
@@ -31739,9 +31600,9 @@
                         for (const event of eventsToDelete) {
                             await apiService.deleteEvent(event.id);
                         }
-                            const idsToDelete = new Set(eventsToDelete.map(ev => ev.id));
-                            state.crc_events = state.crc_events.filter(e => !idsToDelete.has(e.id));
-                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents });
                             showNotification(`Successfully deleted ${eventsToDelete.length} events!`, 'success');
                         closeModal();
                             // Refresh calendar views
@@ -31812,8 +31673,9 @@
                             saveStateToUndoHistory();
                             await apiService.deleteEvent(idToDelete);
                             setState({ pendingDeleteEventId: null });
-                            state.crc_events = state.crc_events.filter(e => e.id !== idToDelete);
-                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents }, { skipRender: true });
                             if (eventBeforeDelete && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
                                 setTimeout(() => markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(eventBeforeDelete)), 0);
                             }
@@ -32056,9 +31918,9 @@
                                 await apiService.deleteEvent(event.id);
                             }
                             
-                            const idsToDelete = new Set(eventsToDelete.map(ev => ev.id));
-                            state.crc_events = state.crc_events.filter(e => !idsToDelete.has(e.id));
-                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents }, { skipRender: true });
                             updateUndoButtonState();
                             
                             showNotification(`Deleted ${eventsToDelete.length} events from the shift!`, 'success');
@@ -32152,9 +32014,9 @@
                                 }
                             }
                             
-                            const deletedIds = new Set(uniqueEventIds);
-                            state.crc_events = state.crc_events.filter(e => !deletedIds.has(e.id));
-                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                            // Re-fetch events from DB
+                            const updatedEvents = await apiService.getEvents();
+                            setState({ crc_events: updatedEvents });
                             
                             closeModal();
                             
@@ -32948,7 +32810,7 @@
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-2">Hours</label>
-                                    <input type="number" name="hours" value="${hoursValue}" min="1" max="8" step="0.5" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <input type="number" name="hours" value="${hoursValue}" min="0" max="8" step="0.5" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300 mb-2">Notes</label>
@@ -32975,7 +32837,7 @@
                                         startDate: formData.get('startDate'),
                                         endDate: formData.get('endDate'),
                                         period: formData.get('period'),
-                                        hours: parseFloat(formData.get('hours')) || 8,
+                                        hours: parseNonNegativeHoursInput(formData.get('hours'), 8),
                                         notes: formData.get('notes') || undefined
                                     };
                                     if (canChangeEmployee && formData.get('crcId')) {
@@ -33008,7 +32870,7 @@
                                                     ...existingEvent,
                                                     name: updateData.type || existingEvent.name,
                                                     period: updateData.period || existingEvent.period,
-                                                    hours: updateData.hours || existingEvent.hours,
+                                                    hours: updateData.hours ?? existingEvent.hours,
                                                     notes: updateData.notes || existingEvent.notes || `Approved time off: ${updateData.type}`,
                                                     timeOffRequestId: request.id,
                                                     date: date
@@ -33028,7 +32890,7 @@
                                                     type: 'Unavailable',
                                                     name: updateData.type || 'Vacation',
                                                     period: updateData.period || 'Full Day',
-                                                    hours: updateData.hours || (updateData.period === 'Full Day' ? 8 : 4),
+                                                    hours: updateData.hours ?? (updateData.period === 'Full Day' ? 8 : 4),
                                                     notes: updateData.notes || `Approved time off: ${updateData.type}`,
                                                     timeOffRequestId: request.id
                                                 };
@@ -34214,7 +34076,7 @@
                             if (user.crcId) {
                                 const linkedCrc = state.crcs.find(c => c.id === user.crcId);
                                 if (linkedCrc) {
-                                    const updatedCrc = { ...linkedCrc, active: !isCurrentlyActive };
+                                    const updatedCrc = buildCrcUpdatePayload(linkedCrc, { active: !isCurrentlyActive });
                                     try {
                                         await apiService.updateCrc(user.crcId, updatedCrc);
                                         setState({
@@ -34270,21 +34132,13 @@
                             // Delete all truck events first
                             
                             // Delete all truck events
-                            const truckEvents = state.truck_events.filter(event => event.truckId === id);
+                            const truckEvents = state.crc_events.filter(event => event.truckId === id);
                             for (const event of truckEvents) {
-                                await apiService.deleteTruckEvent(event.id);
+                                await apiService.deleteEvent(event.id);
                             }
                             
                             // Delete the truck
                             await apiService.deleteTruck(id);
-                            state.truck_events = state.truck_events.filter(event => event.truckId !== id);
-                            state.trucks = state.trucks.filter(truck => truck.id !== id).map(truck => {
-                                const existingPairs = Array.isArray(truck.pairedTruckIds) ? truck.pairedTruckIds : [];
-                                return existingPairs.includes(id)
-                                    ? { ...truck, pairedTruckIds: existingPairs.filter(pid => pid !== id) }
-                                    : truck;
-                            });
-                            setState({ trucks: state.trucks, truck_events: state.truck_events }, { skipRender: true });
                             
                             // Batch operations replaced with individual API calls
                             showNotification('Truck deleted successfully!', 'success');
@@ -34330,9 +34184,7 @@
                     }
                     case 'confirm-delete-truck-event': {
                         try {
-                            await apiService.deleteTruckEvent(truckEventId);
-                            state.truck_events = state.truck_events.filter(e => e.id !== truckEventId);
-                            setState({ truck_events: state.truck_events }, { skipRender: true });
+                            await apiService.deleteEvent(truckEventId);
                             showNotification('Truck event deleted successfully!', 'success');
                             closeModal();
                         } catch (error) {
@@ -35149,7 +35001,7 @@
                                     return; // Skip creating duplicate
                                 }
                                 
-                                const created = await apiService.createTruckEvent(payload);
+                                const created = await apiService.createEvent(payload);
                                 const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...payload };
                                 addEventToState(createdEvent);
                             };
@@ -35649,9 +35501,8 @@
                                     // to allow the shift to be created (it will be an Open Shift)
                                 }
                                 
-                                // Legacy safety: only migrate old roles/crcId when this form has no role-assignment inputs.
-                                // If role inputs exist and user clears assignments intentionally, preserve that clear.
-                                if (!isTravelDay && isEditing && Object.keys(finalRoleAssignments).length === 0 && existingEvent && roleAssignmentInputs.length === 0) {
+                                // Legacy safety: if editing and no roleAssignments made it through, migrate from legacy roles/crcId
+                                if (!isTravelDay && isEditing && Object.keys(finalRoleAssignments).length === 0 && existingEvent) {
                                     const legacyCrcId = existingEvent.crcId && typeof existingEvent.crcId === 'string'
                                         ? existingEvent.crcId
                                         : (Array.isArray(existingEvent.crcIds) ? existingEvent.crcIds.find(id => id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') : null);
@@ -35731,7 +35582,8 @@
                                     // Then override with form data
                                     siteId: data.siteId || existingEvent.siteId || null,
                                     studyIds: studyIds.length > 0 ? studyIds : (existingEvent.studyIds || []),
-                                    hours: parseFloat(data.hours) || existingEvent.hours || state.settings[data.eventType] || 8,
+                                    hours: parseNonNegativeHoursInput(data.hours,
+                                        Number.isFinite(Number(existingEvent.hours)) ? Number(existingEvent.hours) : (state.settings[data.eventType] || 8)),
                                     notes: data.notes !== undefined ? data.notes : (existingEvent.notes || ''),
                                     period: data.period || existingEvent.period || null,
                                     visitNumber: (data.visitNumber && data.visitNumber !== 'default') ? data.visitNumber : (data.visitNumberText || existingEvent.visitNumber || null),
@@ -35752,7 +35604,7 @@
                                     // For new events, create from scratch
                                     siteId: data.siteId || null,
                                     studyIds: studyIds,
-                                    hours: parseFloat(data.hours) || state.settings[data.eventType] || 8,
+                                    hours: parseNonNegativeHoursInput(data.hours, state.settings[data.eventType] || 8),
                                     notes: data.notes || '',
                                     period: data.period || null,
                                     visitNumber: (data.visitNumber && data.visitNumber !== 'default') ? data.visitNumber : (data.visitNumberText || null),
@@ -36210,9 +36062,10 @@
                                         }
                                     } else {
                                         // Single event update or group event with no date range change
-                                        // When "Apply to all days" checkbox is present (multi-day shift), use its value; when absent (single-day), treat as apply so save works normally
+                                        // When "Apply to all days" checkbox is present, use its value; when absent, default true only for ungrouped forms (!formGroupId) so grouped per-day edits are not accidentally applied to every day
                                         const applyToAllDaysInput = form.querySelector('input[name="applyToAllDaysInShift"]');
-                                        const applyToAllDays = applyToAllDaysInput ? applyToAllDaysInput.checked === true : true;
+                                        const formGroupId = (form.dataset.groupId || '').trim();
+                                        const applyToAllDays = applyToAllDaysInput ? applyToAllDaysInput.checked === true : !formGroupId;
                                         // For editing, handle both cases: with CRC or without CRC
                                         const roles = crcIds.length > 0 ? formData.getAll(`roles-${crcIds[0]}`) : [];
                                         
@@ -36338,24 +36191,6 @@
                                             }
                                             return false;
                                         });
-                                        const assignedCrcIdsForEvent = new Set();
-                                        if (finalRoleAssignments && typeof finalRoleAssignments === 'object') {
-                                            Object.values(finalRoleAssignments).forEach(assignments => {
-                                                if (!Array.isArray(assignments)) return;
-                                                assignments.forEach(cid => {
-                                                    if (cid && cid !== 'SITE_STAFF' && cid !== 'UNASSIGNED') assignedCrcIdsForEvent.add(cid);
-                                                });
-                                            });
-                                        }
-                                        const mergedTravelPrefs = Object.keys(travelDayPreferences).length > 0
-                                            ? { ...(existingEvent?.travelDayPreferences || {}), ...travelDayPreferences }
-                                            : (existingEvent?.travelDayPreferences || {});
-                                        const cleanedTravelPrefs = {};
-                                        if (mergedTravelPrefs && typeof mergedTravelPrefs === 'object') {
-                                            Object.entries(mergedTravelPrefs).forEach(([cid, pref]) => {
-                                                if (assignedCrcIdsForEvent.has(cid)) cleanedTravelPrefs[cid] = pref;
-                                            });
-                                        }
                                         
                                         // DEBUG: Log travel day preferences being sent to API
                                         debugLog('[TRAVEL DEBUG] assignedCrcsForTravelPrefs:', [...assignedCrcsForTravelPrefs]);
@@ -36373,9 +36208,6 @@
                                             id: eventId, // Explicitly preserve the ID
                                             type: payloadType, // Preserve the shift type when editing (Site Assignment stays Site Assignment)
                                             crcId: isTravelDayEdit ? (existingEvent?.crcId || travelDayCrcId) : null, // For Travel Day, preserve crcId; for others use roleAssignments
-                                            crcIds: isTravelDayEdit
-                                                ? (existingEvent?.crcId || travelDayCrcId ? [existingEvent?.crcId || travelDayCrcId] : [])
-                                                : Array.from(assignedCrcIdsForEvent),
                                             roles: [], // Legacy field - use roleAssignments instead
                                             // CRITICAL: Always include roleAssignments, even if empty (for Open Shifts)
                                     // The API will allow Site Assignment events with empty roleAssignments as Open Shifts
@@ -36386,9 +36218,14 @@
                                             date: startDateStr,
                                             startDate: startDateStr,
                                             endDate: toDateOnlyString(endDateObj),
-                                            // CRITICAL: Always preserve travelDayPreferences, even if empty, to maintain checkbox state
-                                            // Merge with existing preferences to preserve any CRCs not in current form
-                                            travelDayPreferences: Object.keys(cleanedTravelPrefs).length > 0 ? cleanedTravelPrefs : undefined,
+                                            // Keep travel prefs only for CRCs still assigned (do not retain prefs for removed staff)
+                                            travelDayPreferences: (() => {
+                                                const merged = { ...(existingEvent?.travelDayPreferences || {}), ...travelDayPreferences };
+                                                const scoped = Object.fromEntries(
+                                                    Object.entries(merged).filter(([id]) => assignedCrcsForTravelPrefs.has(id))
+                                                );
+                                                return Object.keys(scoped).length > 0 ? scoped : undefined;
+                                            })(),
                                             // Legacy safety: skip travel-day processing only if no travel is selected
                                             skipTravelDayProcessing: isLegacyShiftEdit && !hasSelectedTravel
                                         };
@@ -38470,13 +38307,10 @@
                     }
                     case 'add-truck-form': {
                         try {
-                            const pairedTruckIds = formData.getAll('pairedTruckIds').filter(id => id && id !== data.truckId);
-                            const createdTruck = await apiService.createTruck({
+                            await apiService.createTruck({
                                 unitNumber: data.unitNumber,
                                 vin: data.vin,
                                 nickname: data.nickname || '',
-                                truckType: normalizeTruckType(data.truckType),
-                                pairedTruckIds,
                                 year: parseInt(data.year),
                                 make: data.make,
                                 mileage: data.mileage ? parseInt(data.mileage) : 0,
@@ -38488,10 +38322,6 @@
                                 inspections: [],
                                 serviceLog: []
                             });
-                            if (createdTruck && createdTruck.id) {
-                                state.trucks = [...state.trucks.filter(t => t.id !== createdTruck.id), createdTruck];
-                                setState({ trucks: state.trucks }, { skipRender: true });
-                            }
                             showNotification('Truck added successfully!', 'success');
                             closeModal();
                         } catch (error) {
@@ -38503,15 +38333,14 @@
                     case 'edit-all-schedule-event-form': {
                         try {
                             const eventId = form.dataset.eventId;
-                            const existingEvent = state.crc_events.find(e => e.id === eventId);
-                            if (!existingEvent) {
-                                showNotification('Could not find this event to edit. Please refresh and try again.', 'error');
-                                break;
+                            let hoursUpdate = null;
+                            const hRaw = data.hours;
+                            if (hRaw !== undefined && hRaw !== null && String(hRaw).trim() !== '') {
+                                const n = parseFloat(String(hRaw).trim());
+                                hoursUpdate = Number.isFinite(n) && n >= 0 ? n : null;
                             }
-                            // updateEvent uses PUT, so send full event payload and only override editable fields
                             const updatedData = {
-                                ...existingEvent,
-                                hours: data.hours ? parseFloat(data.hours) : null,
+                                hours: hoursUpdate,
                                 notes: data.notes || ''
                             };
                             
@@ -38525,7 +38354,7 @@
                                 setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             } else {
                                 // Fallback to canonical refresh if backend omitted updated record.
-                                const refreshedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
+                                const refreshedEvents = await apiService.getEvents();
                                 setState({ crc_events: refreshedEvents }, { skipRender: true });
                             }
                             showNotification('Event updated successfully!', 'success');
@@ -38543,75 +38372,69 @@
                     case 'truck-schedule-form': {
                         try {
                             const eventType = data.eventType;
-                            const startDate = parseDateOnly(data.startDate);
-                            const endDate = parseDateOnly(data.endDate);
-                            if (!startDate || !endDate) {
-                                showNotification('Please choose a valid start and end date.', 'error');
-                                break;
-                            }
-                            if (endDate < startDate) {
-                                showNotification('End date cannot be before start date.', 'error');
-                                break;
-                            }
+                            const startDate = new Date(data.startDate);
+                            const endDate = new Date(data.endDate);
                             const includeStartTravel = data.includeStartTravel === 'on';
                             const includeEndTravel = data.includeEndTravel === 'on';
-                            const convoyTruckIds = getConvoyTruckIds(data.truckId);
-                            const trucksToSchedule = convoyTruckIds.length > 0 ? convoyTruckIds : [data.truckId];
-                            const convoyGroupId = `truck-convoy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                            const siteName = state.crc_sites.find(s => s.id === data.siteId)?.name || 'site';
-                            const createdTruckEvents = [];
                             
-                            const createTruckEvent = async (truckId, dateStr, type, notes) => {
-                                const payload = {
-                                    truckId,
-                                    studyId: data.studyId || null,
-                                    siteId: data.siteId || null,
-                                    startDate: dateStr,
-                                    endDate: dateStr,
-                                    type,
-                                    notes: notes || '',
-                                    status: 'active',
-                                    convoyGroupId,
-                                    pairedTruckIds: trucksToSchedule.filter(id => id !== truckId),
-                                    createdAt: new Date().toISOString()
-                                };
-                                const created = await apiService.createEvent(payload);
-                                const eventForState = created && created.id ? created : { id: crypto.randomUUID(), ...payload };
-                                createdTruckEvents.push(eventForState);
-                            };
+                            // Batch operations replaced with individual API calls
                             
                             // Create start travel day if requested
                             if (includeStartTravel && eventType === 'assignment') {
                                 const startTravelDate = new Date(startDate);
                                 startTravelDate.setDate(startTravelDate.getDate() - 1);
-                                const dateStr = toDateOnlyString(startTravelDate);
-                                for (const truckId of trucksToSchedule) {
-                                    await createTruckEvent(truckId, dateStr, 'travel', `Travel to ${siteName}`);
-                                }
+                                await apiService.createEvent({
+                                    truckId: data.truckId,
+                                    studyId: data.studyId || null,
+                                    siteId: data.siteId || null,
+                                    startDate: toDateOnlyString(startTravelDate),
+                                    endDate: toDateOnlyString(startTravelDate),
+                                    type: 'travel',
+                                    notes: `Travel to ${state.crc_sites.find(s => s.id === data.siteId)?.name || 'site'}`,
+                                    status: 'active',
+                                    createdAt: new Date().toISOString()
+                                });
                             }
                             
                             // Create main assignment events for each day in the range
                             for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
                                 const dateStr = toDateOnlyString(d);
-                                for (const truckId of trucksToSchedule) {
-                                    await createTruckEvent(truckId, dateStr, eventType, data.notes || '');
-                                }
+                                // Create event directly
+                                
+                                const eventData = {
+                                    truckId: data.truckId,
+                                    studyId: data.studyId || null,
+                                    siteId: data.siteId || null,
+                                    startDate: dateStr,
+                                    endDate: dateStr,
+                                    type: eventType,
+                                    notes: data.notes || '',
+                                    status: 'active',
+                                    createdAt: new Date().toISOString()
+                                };
+                                
+                                await apiService.createEvent(eventData);
                             }
                             
                             // Create end travel day if requested
                             if (includeEndTravel && eventType === 'assignment') {
                                 const endTravelDate = new Date(endDate);
                                 endTravelDate.setDate(endTravelDate.getDate() + 1);
-                                const dateStr = toDateOnlyString(endTravelDate);
-                                for (const truckId of trucksToSchedule) {
-                                    await createTruckEvent(truckId, dateStr, 'travel', `Travel from ${siteName}`);
-                                }
+                                await apiService.createEvent({
+                                    truckId: data.truckId,
+                                    studyId: data.studyId || null,
+                                    siteId: data.siteId || null,
+                                    startDate: toDateOnlyString(endTravelDate),
+                                    endDate: toDateOnlyString(endTravelDate),
+                                    type: 'travel',
+                                    notes: `Travel from ${state.crc_sites.find(s => s.id === data.siteId)?.name || 'site'}`,
+                                    status: 'active',
+                                    createdAt: new Date().toISOString()
+                                });
                             }
-                            if (createdTruckEvents.length > 0) {
-                                state.truck_events = [...state.truck_events, ...createdTruckEvents];
-                                setState({ truck_events: state.truck_events }, { skipRender: true });
-                            }
-                            showNotification(`Truck schedule created for ${trucksToSchedule.length} truck(s).`, 'success');
+                            
+                            // Batch operations replaced with individual API calls
+                            showNotification('Truck scheduled successfully!', 'success');
                             closeModal();
                         } catch (error) {
                             console.error("Error scheduling truck:", error);
@@ -38622,7 +38445,7 @@
                     case 'edit-truck-event-form': {
                         try {
                             const eventId = form.dataset.eventId;
-                            const updatePayload = {
+                            await apiService.updateEvent(eventId, {
                                 truckId: data.truckId,
                                 studyId: data.studyId || null,
                                 siteId: data.siteId || null,
@@ -38631,12 +38454,7 @@
                                 type: data.eventType,
                                 notes: data.notes || '',
                                 status: 'active'
-                            };
-                            const updatedEvent = await apiService.updateTruckEvent(eventId, updatePayload);
-                            const mergedEvent = updatedEvent && updatedEvent.id ? updatedEvent : { id: eventId, ...updatePayload };
-                            state.truck_events = state.truck_events.filter(e => e.id !== eventId);
-                            state.truck_events.push(mergedEvent);
-                            setState({ truck_events: state.truck_events }, { skipRender: true });
+                            });
                             showNotification('Truck event updated successfully!', 'success');
                             closeModal();
                         } catch (error) {
@@ -39066,13 +38884,10 @@
                     case 'edit-truck-form': {
                         try {
                             const truckId = form.dataset.id;
-                            const pairedTruckIds = formData.getAll('pairedTruckIds').filter(id => id && id !== truckId);
-                            const updatedTruck = await apiService.updateTruck(truckId, {
+                            await apiService.updateTruck(truckId, {
                                 unitNumber: data.unitNumber,
                                 vin: data.vin,
                                 nickname: data.nickname || '',
-                                truckType: normalizeTruckType(data.truckType),
-                                pairedTruckIds,
                                 year: parseInt(data.year),
                                 make: data.make,
                                 mileage: data.mileage ? parseInt(data.mileage) : 0,
@@ -39082,74 +38897,11 @@
                                 eldSerialNumber: data.eldSerialNumber || '',
                                 status: data.status || 'active'
                             });
-                            if (updatedTruck && updatedTruck.id) {
-                                state.trucks = state.trucks.map(t => t.id === updatedTruck.id ? { ...t, ...updatedTruck } : t);
-                            } else {
-                                state.trucks = state.trucks.map(t => t.id === truckId ? {
-                                    ...t,
-                                    unitNumber: data.unitNumber,
-                                    vin: data.vin,
-                                    nickname: data.nickname || '',
-                                    truckType: normalizeTruckType(data.truckType),
-                                    pairedTruckIds,
-                                    year: parseInt(data.year),
-                                    make: data.make,
-                                    mileage: data.mileage ? parseInt(data.mileage) : 0,
-                                    regNumber: data.regNumber || '',
-                                    gvwt: data.gvwt ? parseInt(data.gvwt) : null,
-                                    ezPassNumber: data.ezPassNumber || '',
-                                    eldSerialNumber: data.eldSerialNumber || '',
-                                    status: data.status || 'active'
-                                } : t);
-                            }
-                            setState({ trucks: state.trucks }, { skipRender: true });
                             showNotification('Truck updated successfully!', 'success');
                             closeModal();
                         } catch (error) {
                             console.error("Error updating truck:", error);
                             showNotification('Failed to update truck. See console for details.', 'error');
-                        }
-                        break;
-                    }
-                    case 'pair-truck-form': {
-                        try {
-                            const truckId = form.dataset.truckId;
-                            const truck = state.trucks.find(t => t.id === truckId);
-                            if (!truck) {
-                                showNotification('Truck not found. Please refresh and try again.', 'error');
-                                break;
-                            }
-                            const selectedPairIds = formData.getAll('pairedTruckIds').filter(pid => pid && pid !== truckId);
-                            const selectedSet = new Set(selectedPairIds);
-
-                            // Update selected truck
-                            await apiService.updateTruck(truckId, { pairedTruckIds: selectedPairIds });
-                            state.trucks = state.trucks.map(t => t.id === truckId ? { ...t, pairedTruckIds: selectedPairIds } : t);
-
-                            // Keep pairing bidirectional for selected trucks and remove stale reverse links.
-                            for (const otherTruck of state.trucks.filter(t => t.id !== truckId)) {
-                                const existingPairs = new Set(Array.isArray(otherTruck.pairedTruckIds) ? otherTruck.pairedTruckIds : []);
-                                const shouldContain = selectedSet.has(otherTruck.id);
-                                const hasContain = existingPairs.has(truckId);
-                                if (shouldContain && !hasContain) {
-                                    existingPairs.add(truckId);
-                                    const updated = Array.from(existingPairs);
-                                    await apiService.updateTruck(otherTruck.id, { pairedTruckIds: updated });
-                                    state.trucks = state.trucks.map(t => t.id === otherTruck.id ? { ...t, pairedTruckIds: updated } : t);
-                                } else if (!shouldContain && hasContain) {
-                                    existingPairs.delete(truckId);
-                                    const updated = Array.from(existingPairs);
-                                    await apiService.updateTruck(otherTruck.id, { pairedTruckIds: updated });
-                                    state.trucks = state.trucks.map(t => t.id === otherTruck.id ? { ...t, pairedTruckIds: updated } : t);
-                                }
-                            }
-
-                            setState({ trucks: [...state.trucks] }, { skipRender: true });
-                            showNotification('Truck pairing updated.', 'success');
-                            closeModal();
-                        } catch (error) {
-                            console.error('Error updating truck pairing:', error);
-                            showNotification('Failed to update truck pairing. See console for details.', 'error');
                         }
                         break;
                     }
@@ -39222,7 +38974,7 @@
                                             }
                                             return t;
                                         });
-                                        await apiService.updateCrc(crc.id, { trainings: updatedTrainings });
+                                        await apiService.updateCrc(crc.id, buildCrcUpdatePayload(crc, { trainings: updatedTrainings }));
                                         updatedCount++;
                                     }
                                 }
@@ -40043,7 +39795,7 @@
                                                 const roleName = role ? role.name : '';
                                                 
                                                 const allowOverrideEdit = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                                const qualifiedCrcs = state.crcs.filter(c => isCrcSelectableForNewShift(c) && (allowOverrideEdit ? true : hasValidTraining(c, roleName)))
+                                                const qualifiedCrcs = state.crcs.filter(c => c.active !== false && (allowOverrideEdit ? true : hasValidTraining(c, roleName)))
                                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                                 const trainingTypeValue = (mergedTrainingAssignments[roleId] && mergedTrainingAssignments[roleId][index]) || getExistingTrainingType(roleId, index);
                                                 const trainingModeKey = `${roleId}-${index}`;
@@ -40268,7 +40020,7 @@
                                 if (eventRoles.length > 0) {
                                     qualifiedCrcs = state.crcs.filter(c => {
                                         // CRC must be active and have training for at least one of the roles
-                                        return isCrcSelectableForNewShift(c) && eventRoles.some(role => hasValidTraining(c, role));
+                                        return c.active !== false && eventRoles.some(role => hasValidTraining(c, role));
                                     });
                                 }
                                 // Sort alphabetically
@@ -40913,7 +40665,7 @@
                         
                         const allowOverrideRole = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                         // Only show CRCs who are active and have valid training for this role (or all if override)
-                        let qualifiedCrcs = state.crcs.filter(crc => isCrcSelectableForNewShift(crc) && (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
+                        let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         
                         // IMPORTANT: If editing, include assigned CRCs even if they don't have training
@@ -40938,7 +40690,7 @@
                         
                         // If role doesn't require training, include all active CRCs (for new CRCs without training records)
                         if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                            qualifiedCrcs = state.crcs.filter(crc => isCrcSelectableForNewShift(crc))
+                            qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false)
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         }
                         
@@ -41269,7 +41021,7 @@
                                 if (!roleForSlot) return;
                                 
                                 const allowOverrideQty = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                const qualifiedCrcs = state.crcs.filter(crc => isCrcSelectableForNewShift(crc) && (allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name)))
+                                const qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
@@ -41492,7 +41244,7 @@
                     
                     const allowOverrideReq = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                     // Get CRCs who are active and can fill this role (only show those with valid training, or all if override)
-                    let qualifiedCrcs = state.crcs.filter(crc => isCrcSelectableForNewShift(crc) && (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
+                    let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
                         .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     
                     const untrainedAssignedCrcs = [];
@@ -41512,7 +41264,7 @@
                     const roleRequiresTraining = requiredTrainingNames.length > 0;
                     
                     if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                        qualifiedCrcs = state.crcs.filter(crc => isCrcSelectableForNewShift(crc))
+                        qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false)
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     }
                     
@@ -41944,7 +41696,7 @@
                             
                             if (newQuantity > currentSlots) {
                                 const allowOverrideInc = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                const qualifiedCrcs = state.crcs.filter(crc => isCrcSelectableForNewShift(crc) && (allowOverrideInc ? true : hasValidTraining(crc, role.name)))
+                                const qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideInc ? true : hasValidTraining(crc, role.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
@@ -42101,7 +41853,7 @@
                     // Check both role- prefixed selects (legacy) and roles- prefixed selects (new role assignment system)
                     const roleSelects = form.querySelectorAll('select[name^="role-"]');
                     roleSelects.forEach(select => {
-                        if (select.value && select.value !== 'SITE_STAFF') {
+                        if (select.value && select.value !== 'SITE_STAFF' && select.value !== 'UNASSIGNED') {
                             assignedCrcs.add(select.value);
                         }
                     });
@@ -42111,7 +41863,7 @@
                     rolesSelects.forEach(select => {
                         const selectedOptions = Array.from(select.selectedOptions);
                         selectedOptions.forEach(option => {
-                            if (option.value && option.value !== 'SITE_STAFF') {
+                            if (option.value && option.value !== 'SITE_STAFF' && option.value !== 'UNASSIGNED') {
                                 // Extract CRC ID from the select name (roles-${crcId})
                                 const nameParts = select.name.split('-');
                                 if (nameParts.length >= 2) {
@@ -42129,7 +41881,7 @@
                         Object.values(event.roleAssignments).forEach(assignments => {
                             if (Array.isArray(assignments)) {
                                 assignments.forEach(crcId => {
-                                    if (crcId && crcId !== 'SITE_STAFF') {
+                                    if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                         assignedCrcs.add(crcId);
                                     }
                                 });
@@ -49650,15 +49402,15 @@
                     // Calculate distance
                     const distanceInfo = await calculateCrcToSiteDistanceWithTime(crc, site);
                     
-                    // Calculate utilization (simplified - could be enhanced)
-                    const utilization = calculateMonthlyUtilization(parseDateOnly(date), [crc.id]);
+                    const utilByCrc = calculateMonthlyUtilization(parseDateOnly(date), [crc.id]);
+                    const utilizationPct = utilByCrc[crc.id]?.utilizationPercent ?? 0;
                     
                     suggestions.push({
                         crc,
                         distance: distanceInfo?.distanceMiles || null,
                         travelTime: distanceInfo?.travelTime || null,
                         travelTimeMinutes: distanceInfo?.travelTimeMinutes || null,
-                        utilization: utilization || 0,
+                        utilization: utilizationPct,
                         conflicts: availability.conflicts,
                         volunteered: volunteerCrcIds.includes(crc.id)
                     });
@@ -51452,39 +51204,50 @@
                         apiService.getTrainingTypes()
                     ]);
                     
-                    const initialExtras = [
-                        (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'))
-                            ? apiService.getUsers().catch(error => {
-                                console.error('CHAOS: Error loading users:', error);
-                                return [];
-                            })
-                            : Promise.resolve([]),
-                        apiService.getTimeOffRequests().catch(error => {
-                            debugWarn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
-                            return [];
-                        }),
-                        apiService.getTravel().catch(error => {
-                            console.error('CHAOS: Error loading travel:', error);
-                            return [];
-                        }),
-                        apiService.getAnnouncements().catch(error => {
-                            debugWarn('CHAOS: Failed to load announcements:', error);
-                            return [];
-                        }),
-                        apiService.request('/trucks').catch(error => {
-                            debugWarn('CHAOS: Failed to load trucks:', error);
-                            return [];
-                        }),
-                        apiService.getTruckEvents().catch(error => {
-                            debugWarn('CHAOS: Failed to load truck events:', error);
-                            return [];
-                        })
-                    ];
-                    const [users, timeOffRequests, travel, announcements, trucks, truck_events] = await Promise.all(initialExtras);
-                    debugLog('CHAOS: Loaded', users.length, 'users');
-                    debugLog('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
-                    debugLog('CHAOS: Loaded', travel.length, 'travel records');
-                    debugLog('CHAOS: Loaded', announcements.length, 'announcements');
+                    // Load users if current user is Manager
+                    let users = [];
+                    if (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager')) {
+                        try {
+                            users = await apiService.getUsers();
+                            debugLog('CHAOS: Loaded', users.length, 'users');
+                        } catch (error) {
+                            console.error('CHAOS: Error loading users:', error);
+                        }
+                    }
+                    
+                    let timeOffRequests = [];
+                    try {
+                        timeOffRequests = await apiService.getTimeOffRequests();
+                        debugLog('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
+                    } catch (error) {
+                        debugWarn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
+                        timeOffRequests = [];
+                    }
+                    
+                    // Sync approved time off requests with unavailability events after events are loaded
+                    if (timeOffRequests && timeOffRequests.length > 0) {
+                        syncApprovedTimeOffRequests(timeOffRequests);
+                    }
+                    
+                    // Load travel information
+                    let travel = [];
+                    try {
+                        travel = await apiService.getTravel();
+                        debugLog('CHAOS: Loaded', travel.length, 'travel records');
+                    } catch (error) {
+                        console.error('CHAOS: Error loading travel:', error);
+                        // If endpoint doesn't exist yet, that's okay - just continue
+                    }
+                    
+                    // Load announcements
+                    let announcements = [];
+                    try {
+                        announcements = await apiService.getAnnouncements();
+                        debugLog('CHAOS: Loaded', announcements.length, 'announcements');
+                    } catch (error) {
+                        debugWarn('CHAOS: Failed to load announcements:', error);
+                        announcements = [];
+                    }
                     
                     debugLog('CHAOS: Data fetched successfully from Azure API');
                     debugLog('CHAOS: Loaded', crcs.length, 'CRCs');
@@ -51510,6 +51273,10 @@
                     } else {
                         debugWarn('CHAOS: No studies loaded from ARTEMIS API');
                     }
+                    
+                    // Initialize empty arrays for CHAOS-specific data
+                    let trucks = [];
+                    let truck_events = [];
                     
                     // Sort the data
                     debugLog('CHAOS: Sorting data...');
