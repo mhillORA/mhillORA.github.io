@@ -214,22 +214,32 @@ const validateSitesSchema = (data) => {
         errors.push('country must be a string');
     }
     
-    if (data.pi && typeof data.pi !== 'string') {
+    // PI fields are optional (legacy string fields)
+    if (data.pi !== undefined && data.pi !== null && typeof data.pi !== 'string') {
         errors.push('pi must be a string');
     }
     
-    if (data.piEmail && typeof data.piEmail !== 'string') {
+    if (data.piEmail !== undefined && data.piEmail !== null && typeof data.piEmail !== 'string') {
         errors.push('piEmail must be a string');
     }
     
-    if (data.siteCoordinator && typeof data.siteCoordinator !== 'string') {
+    // Coordinator fields are optional (legacy string fields)
+    if (data.siteCoordinator !== undefined && data.siteCoordinator !== null && typeof data.siteCoordinator !== 'string') {
         errors.push('siteCoordinator must be a string');
     }
     
-    if (data.siteCoordinatorEmail && typeof data.siteCoordinatorEmail !== 'string') {
+    if (data.siteCoordinatorEmail !== undefined && data.siteCoordinatorEmail !== null && typeof data.siteCoordinatorEmail !== 'string') {
         errors.push('siteCoordinatorEmail must be a string');
     }
     
+    // New relational staff references (optional)
+    if (data.piStaffId !== undefined && data.piStaffId !== null && typeof data.piStaffId !== 'string') {
+        errors.push('piStaffId must be a string');
+    }
+    if (data.coordinatorStaffId !== undefined && data.coordinatorStaffId !== null && typeof data.coordinatorStaffId !== 'string') {
+        errors.push('coordinatorStaffId must be a string');
+    }
+
     if (data.indication && !Array.isArray(data.indication)) {
         errors.push('indication must be an array');
     }
@@ -251,6 +261,20 @@ const validateSitesSchema = (data) => {
         throw new Error(`VALIDATION_ERROR: Sites validation failed: ${errors.join(', ')}`);
     }
     
+    return true;
+};
+
+const validateSiteStaffSchema = (data) => {
+    const errors = [];
+    if (!data.siteId || typeof data.siteId !== 'string') errors.push('siteId is required and must be a string');
+    if (!data.role || typeof data.role !== 'string') errors.push('role is required and must be a string');
+    const role = String(data.role || '').toLowerCase();
+    if (role && !['pi', 'coordinator'].includes(role)) errors.push('role must be one of: pi, coordinator');
+    if (data.name !== undefined && data.name !== null && typeof data.name !== 'string') errors.push('name must be a string');
+    if (data.email !== undefined && data.email !== null && typeof data.email !== 'string') errors.push('email must be a string');
+    if (data.entraId !== undefined && data.entraId !== null && typeof data.entraId !== 'string') errors.push('entraId must be a string');
+    if (data.studyIds !== undefined && !Array.isArray(data.studyIds)) errors.push('studyIds must be an array');
+    if (errors.length > 0) throw new Error(`VALIDATION_ERROR: SiteStaff validation failed: ${errors.join(', ')}`);
     return true;
 };
 
@@ -546,6 +570,43 @@ const validateSurveysSchema = (data) => {
     return true;
 };
 
+// ARTEMIS Site/Staff Surveys (PI/Coordinator) - Definitions, Assignments (unique links), Responses
+const validateSurveyDefinitionsSchema = (data) => {
+    const errors = [];
+    if (!data.title || typeof data.title !== 'string') errors.push('title is required and must be a string');
+    if (!data.audience || !Array.isArray(data.audience) || data.audience.length === 0) errors.push('audience is required and must be a non-empty array');
+    if (!data.questions || !Array.isArray(data.questions) || data.questions.length === 0) errors.push('questions is required and must be a non-empty array');
+    if (data.status && !['draft', 'active', 'archived'].includes(String(data.status).toLowerCase())) errors.push('status must be one of: draft, active, archived');
+    if (data.defaultValues && typeof data.defaultValues !== 'object') errors.push('defaultValues must be an object');
+    if (errors.length > 0) throw new Error(`VALIDATION_ERROR: SurveyDefinitions validation failed: ${errors.join(', ')}`);
+    return true;
+};
+
+const validateSurveyAssignmentsSchema = (data) => {
+    const errors = [];
+    if (!data.surveyId || typeof data.surveyId !== 'string') errors.push('surveyId is required and must be a string');
+    if (!data.siteId || typeof data.siteId !== 'string') errors.push('siteId is required and must be a string');
+    if (!data.targetRole || typeof data.targetRole !== 'string') errors.push('targetRole is required and must be a string');
+    if (data.targetEmail && typeof data.targetEmail !== 'string') errors.push('targetEmail must be a string');
+    if (data.status && !['sent', 'opened', 'submitted', 'closed'].includes(String(data.status).toLowerCase())) errors.push('status must be one of: sent, opened, submitted, closed');
+    if (errors.length > 0) throw new Error(`VALIDATION_ERROR: SurveyAssignments validation failed: ${errors.join(', ')}`);
+    return true;
+};
+
+const validateSurveyResponsesSchema = (data) => {
+    const errors = [];
+    if (!data.assignmentId || typeof data.assignmentId !== 'string') errors.push('assignmentId is required and must be a string');
+    if (!data.surveyId || typeof data.surveyId !== 'string') errors.push('surveyId is required and must be a string');
+    if (!data.siteId || typeof data.siteId !== 'string') errors.push('siteId is required and must be a string');
+    if (!data.targetRole || typeof data.targetRole !== 'string') errors.push('targetRole is required and must be a string');
+    if (!data.answers || !Array.isArray(data.answers)) errors.push('answers is required and must be an array');
+    if (data.entraId && typeof data.entraId !== 'string') errors.push('entraId must be a string');
+    if (data.email && typeof data.email !== 'string') errors.push('email must be a string');
+    if (data.displayName && typeof data.displayName !== 'string') errors.push('displayName must be a string');
+    if (errors.length > 0) throw new Error(`VALIDATION_ERROR: SurveyResponses validation failed: ${errors.join(', ')}`);
+    return true;
+};
+
 const validateTimeOffRequestsSchema = (data) => {
     const errors = [];
     
@@ -834,6 +895,18 @@ async function crudHandler(context, request, containerName) {
                         case 'surveys':
                             validateSurveysSchema(body);
                             break;
+                        case 'site-staff':
+                            validateSiteStaffSchema(body);
+                            break;
+                        case 'site-survey-definitions':
+                            validateSurveyDefinitionsSchema(body);
+                            break;
+                        case 'site-survey-assignments':
+                            validateSurveyAssignmentsSchema(body);
+                            break;
+                        case 'site-survey-responses':
+                            validateSurveyResponsesSchema(body);
+                            break;
                         case 'time-off-requests':
                             validateTimeOffRequestsSchema(body);
                             break;
@@ -931,6 +1004,18 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'surveys':
                             validateSurveysSchema(requestBody);
+                            break;
+                        case 'site-staff':
+                            validateSiteStaffSchema(requestBody);
+                            break;
+                        case 'site-survey-definitions':
+                            validateSurveyDefinitionsSchema(requestBody);
+                            break;
+                        case 'site-survey-assignments':
+                            validateSurveyAssignmentsSchema(requestBody);
+                            break;
+                        case 'site-survey-responses':
+                            validateSurveyResponsesSchema(requestBody);
                             break;
                         case 'time-off-requests':
                             validateTimeOffRequestsSchema(requestBody);
@@ -1104,6 +1189,60 @@ app.http('surveys', {
     authLevel: 'anonymous', 
     route: 'surveys/{id?}',
     handler: (request, context) => crudHandler(context, request, 'surveys'),
+});
+
+app.http('siteStaff', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'site-staff/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'site-staff'),
+});
+
+app.http('surveyDefinitions', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'site-survey-definitions/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'site-survey-definitions'),
+});
+
+app.http('surveyAssignments', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'site-survey-assignments/{id?}',
+    handler: async (request, context) => {
+        // For POST, set defaults for unique-link behavior
+        if (request.method === 'POST') {
+            try {
+                const body = await request.json();
+                // default status and timestamps
+                if (!body.status) body.status = 'sent';
+                if (!body.createdAt) body.createdAt = new Date().toISOString();
+                // ensure one-time-ish link semantics: each assignment is a unique id
+                request.json = async () => body;
+            } catch (e) {
+                // fall through; crudHandler will return appropriate error
+            }
+        }
+        return crudHandler(context, request, 'site-survey-assignments');
+    },
+});
+
+app.http('surveyResponses', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'site-survey-responses/{id?}',
+    handler: async (request, context) => {
+        if (request.method === 'POST') {
+            try {
+                const body = await request.json();
+                if (!body.submittedAt) body.submittedAt = new Date().toISOString();
+                request.json = async () => body;
+            } catch (e) {
+                // fall through
+            }
+        }
+        return crudHandler(context, request, 'site-survey-responses');
+    },
 });
 
 app.http('travel', {
