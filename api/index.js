@@ -34,22 +34,42 @@ const getContainer = (containerName) => {
     return database.container(containerName);
 };
 
+// Cosmos often returns 404 / Owner resource does not exist when a container was never created
+const isLikelyMissingCosmosContainer = (error) => {
+    const code = error.code || error.statusCode;
+    const msg = String(error.message || '');
+    return (
+        code === 404 ||
+        /Owner resource does not exist/i.test(msg) ||
+        (/not found/i.test(msg) && /container/i.test(msg))
+    );
+};
+
 // Helper function to handle errors
 const handleError = (context, error, message) => {
     context.log.error(`${message}:`, error.message);
     context.log.error(`Stack:`, error.stack);
 
     let errorMessage;
+    let status = 500;
     if (error.message.includes('COSMOS_DB_CONFIG_MISSING')) {
         errorMessage = "API Configuration Error: Database secrets not set in Azure Configuration.";
     } else if (error.message.includes('VALIDATION_ERROR')) {
         errorMessage = error.message.replace('VALIDATION_ERROR: ', '');
+        status = 400;
+    } else if (isLikelyMissingCosmosContainer(error)) {
+        // e.g. GET /api/site-staff returns [] but POST fails until container exists
+        const hint = message.includes('site-staff')
+            ? " Create a Cosmos container named `site-staff` with partition key `/id` (same `DATABASE_ID` as other Artemis data). PI and Coordinator share this container; use field `role`: `pi` or `coordinator`."
+            : ' Ensure the Cosmos container for this API route exists with partition key `/id`.';
+        errorMessage = `Database container missing or not accessible: ${error.message || 'Cosmos error'}.${hint}`;
+        status = 503;
     } else {
         errorMessage = "Internal Server Error during data processing.";
     }
 
     return {
-        status: 500,
+        status,
         jsonBody: { error: errorMessage },
         headers: {
             'Content-Type': 'application/json',
