@@ -420,6 +420,7 @@ let state = {
     authReady: false,
     userId: 'nasa-user', // Simple user ID for NASA
     activeTab: 'crcDashboard',
+    revealPII: false,
     patientSearchTerm: '',
     studySearchTerm: '',
     siteSearchTerm: '',
@@ -442,6 +443,16 @@ let state = {
     studiesExpanded: false, // For the collapsible studies list
 };
 let chartInstances = {}; // To hold chart objects for destruction
+
+// --- PII / PHI MASKING (display-only) ---
+const sparkleMask = '✦✦✦✦✦';
+const maskDOB = (dob) => (dob ? '✦✦✦✦-✦✦-✦✦' : 'N/A');
+const displayPII = (value, kind) => {
+    if (state.revealPII) return value || 'N/A';
+    if (!value) return 'N/A';
+    if (kind === 'dob') return maskDOB(value);
+    return sparkleMask;
+};
 // --- DOM ELEMENTS ---
 const mainContent = document.getElementById('main-content');
 const navMenu = document.getElementById('nav-menu');
@@ -893,6 +904,16 @@ const renderNav = () => {
                     <span class="ml-3">${item.label}</span>
                 </button>`;
     }).join('');
+
+    // PII reveal toggle (display-only; does not affect exports)
+    navMenu.innerHTML += `
+        <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+            <button data-action="toggle-pii" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700">
+                <i data-lucide="${state.revealPII ? 'unlock' : 'lock'}" class="w-5 h-5"></i>
+                <span class="ml-3">${state.revealPII ? 'Hide PII/PHI' : 'Reveal PII/PHI'}</span>
+            </button>
+        </div>
+    `;
 };
 const renderContent = () => {
     const contentMap = {
@@ -2485,13 +2506,13 @@ const getPatientProfileHTML = (patient) => {
                     <div class="space-y-2">
                         <p><strong>Global ID:</strong> ${patient.globalId || 'N/A'}</p>
                         <p><strong>Initials:</strong> ${patient.initials || 'N/A'}</p>
-                        <p><strong>Phone:</strong> ${patient.phoneNumber || 'N/A'}</p>
-                        <p><strong>Email:</strong> ${patient.email || 'N/A'}</p>
-                        <p><strong>DOB:</strong> ${patient.dob || 'N/A'}</p>
-                        <p><strong>Address:</strong> ${patient.address || 'N/A'}</p>
-                        <p><strong>City:</strong> ${patient.city || 'N/A'}</p>
-                        <p><strong>State:</strong> ${patient.state || 'N/A'}</p>
-                        <p><strong>Zip:</strong> ${patient.zipCode || 'N/A'}</p>
+                        <p><strong>Phone:</strong> ${displayPII(patient.phoneNumber, 'phone')}</p>
+                        <p><strong>Email:</strong> ${displayPII(patient.email, 'email')}</p>
+                        <p><strong>DOB:</strong> ${displayPII(patient.dob, 'dob')}</p>
+                        <p><strong>Address:</strong> ${displayPII(patient.address, 'address')}</p>
+                        <p><strong>City:</strong> ${displayPII(patient.city, 'city')}</p>
+                        <p><strong>State:</strong> ${displayPII(patient.state, 'state')}</p>
+                        <p><strong>Zip:</strong> ${displayPII(patient.zipCode, 'zip')}</p>
                     </div>
                     <div class="space-y-2">
                         <p><strong>Age:</strong> ${patient.age || 'N/A'}</p>
@@ -3963,6 +3984,7 @@ document.addEventListener('click', async (e) => {
     const navButton = e.target.closest('.nav-item[data-tab]');
     if (navButton) {
         setState({ activeTab: navButton.dataset.tab });
+        updateDataRefreshInterval();
         if (window.innerWidth < 768) { // Close sidebar on mobile after navigation
             sidebar.classList.add('-translate-x-full');
             overlay.classList.add('opacity-0', 'pointer-events-none');
@@ -4022,6 +4044,10 @@ document.addEventListener('click', async (e) => {
         switch (action) {
             case 'close-modal': closeModal(); break;
             case 'close-side-panel': closeSidePanel(); break;
+            case 'toggle-pii':
+                setState({ revealPII: !state.revealPII });
+                showNotification(state.revealPII ? "PII/PHI revealed (display only)." : "PII/PHI masked.", "info");
+                break;
             case 'create-study-modal': openModal(getCreateStudyModalHTML(), true); break;
             case 'create-site-modal': openModal(getCreateSiteModalHTML()); break;
             case 'set-scheduling-view': setState({ schedulingView: view }); break;
@@ -6031,8 +6057,8 @@ const renderDuplicateResults = (duplicateGroups) => {
                     ${group.map(p => `
                         <tr class="dark:text-gray-300">
                             <td class="px-6 py-4">${p.firstName} ${p.lastName}</td>
-                            <td class="px-6 py-4">${p.dob}</td>
-                            <td class="px-6 py-4">${p.email || 'N/A'}</td>
+                            <td class="px-6 py-4">${displayPII(p.dob, 'dob')}</td>
+                            <td class="px-6 py-4">${displayPII(p.email, 'email')}</td>
                             <td class="px-6 py-4 flex items-center gap-2">
                                 <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">View</button>
                                 <button data-action="delete-patient" data-id="${p.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
@@ -6205,9 +6231,20 @@ const loadAllData = async () => {
     }
 };
 
-// Set up periodic data refresh (every 30 seconds)
+// --- PERIODIC DATA REFRESH ---
+// Default: every minute. Scheduling tab: every 10 minutes.
+let dataRefreshIntervalId = null;
+let currentRefreshMs = null;
+const getRefreshMsForActiveTab = () => (state.activeTab === 'scheduling' ? 10 * 60 * 1000 : 60 * 1000);
 const setupDataRefresh = () => {
-    setInterval(loadAllData, 30000); // Refresh every 30 seconds
+    if (dataRefreshIntervalId) clearInterval(dataRefreshIntervalId);
+    currentRefreshMs = getRefreshMsForActiveTab();
+    dataRefreshIntervalId = setInterval(loadAllData, currentRefreshMs);
+};
+const updateDataRefreshInterval = () => {
+    const desiredMs = getRefreshMsForActiveTab();
+    if (dataRefreshIntervalId && desiredMs === currentRefreshMs) return;
+    setupDataRefresh();
 };
 // --- CTMS INTEGRATION ---
 /**

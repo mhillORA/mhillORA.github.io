@@ -527,7 +527,15 @@ const calculateStudyEnrollment = async (studyId) => {
 const validateSiteStudyRelationship = async (siteId, studyId) => {
     try {
         const studiesContainer = getContainer('studies');
-        const { resource: study } = await studiesContainer.item(studyId).read();
+        // NOTE: `container.item(id).read()` can fail with "not found" if the container uses a partition key
+        // that the SDK requires for point reads. Querying by id is more robust for this app.
+        const { resources } = await studiesContainer.items
+            .query({
+                query: "SELECT * FROM c WHERE c.id = @id",
+                parameters: [{ name: "@id", value: studyId }]
+            })
+            .fetchAll();
+        const study = resources && resources[0];
         
         if (!study) {
             throw new Error('Study not found');
