@@ -1230,6 +1230,52 @@ app.http('surveyAssignments', {
     authLevel: 'anonymous',
     route: 'site-survey-assignments/{id?}',
     handler: async (request, context) => {
+        // Support filtered reads: /site-survey-assignments?siteId=...&surveyId=...&status=...
+        // (keeps data logically "per site" without forcing a full container read)
+        if (request.method === 'GET') {
+            const id = getIdFromRequest(request);
+            if (!id) {
+                let siteId = null;
+                let surveyId = null;
+                let status = null;
+
+                if (request.query && typeof request.query.get === 'function') {
+                    siteId = request.query.get('siteId');
+                    surveyId = request.query.get('surveyId');
+                    status = request.query.get('status');
+                } else if (request.query) {
+                    siteId = request.query.siteId;
+                    surveyId = request.query.surveyId;
+                    status = request.query.status;
+                }
+
+                if (siteId || surveyId || status) {
+                    try {
+                        const container = getContainer('site-survey-assignments');
+                        const where = [];
+                        const parameters = [];
+                        if (siteId) { where.push('c.siteId = @siteId'); parameters.push({ name: '@siteId', value: String(siteId) }); }
+                        if (surveyId) { where.push('c.surveyId = @surveyId'); parameters.push({ name: '@surveyId', value: String(surveyId) }); }
+                        if (status) { where.push('LOWER(c.status) = @status'); parameters.push({ name: '@status', value: String(status).toLowerCase() }); }
+
+                        const query = {
+                            query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.createdAt DESC`
+                                .replace(/\s+/g, ' ')
+                                .trim(),
+                            parameters
+                        };
+
+                        const { resources } = await container.items
+                            .query(query, { enableCrossPartitionQuery: true })
+                            .fetchAll();
+                        return { jsonBody: resources || [] };
+                    } catch (error) {
+                        return handleError(context, error, 'Query site-survey-assignments');
+                    }
+                }
+            }
+        }
+
         // For POST, set defaults for unique-link behavior
         if (request.method === 'POST') {
             try {
@@ -1252,6 +1298,56 @@ app.http('surveyResponses', {
     authLevel: 'anonymous',
     route: 'site-survey-responses/{id?}',
     handler: async (request, context) => {
+        // Support filtered reads: /site-survey-responses?siteId=...&assignmentId=...&surveyId=...
+        // This is the main "stored on each site" retrieval path (responses carry siteId).
+        if (request.method === 'GET') {
+            const id = getIdFromRequest(request);
+            if (!id) {
+                let siteId = null;
+                let assignmentId = null;
+                let surveyId = null;
+                let targetRole = null;
+
+                if (request.query && typeof request.query.get === 'function') {
+                    siteId = request.query.get('siteId');
+                    assignmentId = request.query.get('assignmentId');
+                    surveyId = request.query.get('surveyId');
+                    targetRole = request.query.get('targetRole');
+                } else if (request.query) {
+                    siteId = request.query.siteId;
+                    assignmentId = request.query.assignmentId;
+                    surveyId = request.query.surveyId;
+                    targetRole = request.query.targetRole;
+                }
+
+                if (siteId || assignmentId || surveyId || targetRole) {
+                    try {
+                        const container = getContainer('site-survey-responses');
+                        const where = [];
+                        const parameters = [];
+                        if (siteId) { where.push('c.siteId = @siteId'); parameters.push({ name: '@siteId', value: String(siteId) }); }
+                        if (assignmentId) { where.push('c.assignmentId = @assignmentId'); parameters.push({ name: '@assignmentId', value: String(assignmentId) }); }
+                        if (surveyId) { where.push('c.surveyId = @surveyId'); parameters.push({ name: '@surveyId', value: String(surveyId) }); }
+                        if (targetRole) { where.push('LOWER(c.targetRole) = @targetRole'); parameters.push({ name: '@targetRole', value: String(targetRole).toLowerCase() }); }
+
+                        const query = {
+                            query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.submittedAt DESC`
+                                .replace(/\s+/g, ' ')
+                                .trim(),
+                            parameters
+                        };
+
+                        const { resources } = await container.items
+                            .query(query, { enableCrossPartitionQuery: true })
+                            .fetchAll();
+                        return { jsonBody: resources || [] };
+                    } catch (error) {
+                        return handleError(context, error, 'Query site-survey-responses');
+                    }
+                }
+            }
+        }
+
         if (request.method === 'POST') {
             try {
                 const body = await request.json();
