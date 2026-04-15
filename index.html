@@ -190,7 +190,7 @@
 <script type="module">
 // Azure Cosmos DB API Configuration
 const API_BASE_URL = '/api'; // Use relative path like other files
-const API_KEY = 'your-api-key-here'; // This should be set from environment or config
+const API_KEY = ''; // Optional. Prefer platform auth; leave empty for local/dev.
 
 // API Helper Functions
 const apiCall = async (endpoint, method = 'GET', data = null) => {
@@ -198,10 +198,13 @@ const apiCall = async (endpoint, method = 'GET', data = null) => {
         const options = {
             method,
             headers: {
-                'Content-Type': 'application/json',
-                'x-functions-key': API_KEY
+                'Content-Type': 'application/json'
             }
         };
+
+        if (API_KEY) {
+            options.headers['x-functions-key'] = API_KEY;
+        }
         
         if (data) {
             options.body = JSON.stringify(data);
@@ -260,31 +263,138 @@ const createDocument = async (collection, data) => {
 
 const updateDocument = async (collection, id, data) => {
     try {
+        const resolveExisting = async () => {
+            // Prefer in-memory state to avoid extra API calls.
+            const existingFromState = (() => {
+                switch (collection) {
+                    case 'patients': return state.patients?.find(p => p.id === id);
+                    case 'studies': return state.studies?.find(s => s.id === id);
+                    case 'sites': return state.sites?.find(s => s.id === id);
+                    case 'schedules': return state.schedules?.find(s => s.id === id);
+                    case 'surveys': return state.surveys?.find(s => s.id === id);
+                    default: return null;
+                }
+            })();
+            if (existingFromState) return existingFromState;
+            try {
+                return await getDocument(collection, id);
+            } catch {
+                return null;
+            }
+        };
+
+        const existing = await resolveExisting();
+        const merged = {
+            ...(existing || {}),
+            ...(data || {}),
+            id,
+            lastUpdated: (data && Object.prototype.hasOwnProperty.call(data, 'lastUpdated')) ? data.lastUpdated : (new Date().toISOString())
+        };
+
+        // Ensure Cosmos schema validators receive a full document
+        // (they require specific fields even for updates).
+        const ensureRequiredFields = (doc) => {
+            if (collection === 'studies') {
+                return {
+                    protocolNumber: '',
+                    target: 0,
+                    status: 'Recruiting',
+                    indication: [],
+                    siteIds: [],
+                    washoutDays: 30,
+                    siteEnrollmentGoals: {},
+                    startDate: '',
+                    endDate: '',
+                    fpfv: '',
+                    lplv: '',
+                    enrolled: 0,
+                    screenFails: 0,
+                    ...doc,
+                };
+            }
+            if (collection === 'sites') {
+                return {
+                    name: '',
+                    siteNameAbbreviation: '',
+                    address1: '',
+                    address2: '',
+                    city: '',
+                    state: '',
+                    zipCode: '',
+                    country: '',
+                    pi: '',
+                    piEmail: '',
+                    siteCoordinator: '',
+                    siteCoordinatorEmail: '',
+                    indication: [],
+                    status: 'Active',
+                    latitude: undefined,
+                    longitude: undefined,
+                    ...doc,
+                };
+            }
+            if (collection === 'patients') {
+                // NASA -> Azure conversion happens below. Provide safe defaults before conversion.
+                return {
+                    firstName: '',
+                    lastName: '',
+                    dob: '',
+                    address: '',
+                    city: '',
+                    state: '',
+                    zipCode: '',
+                    age: null,
+                    condition: '',
+                    status: 'Candidate',
+                    registryStatus: 'Active',
+                    source: '',
+                    therapeuticArea: '',
+                    appointment: null,
+                    surveyResults: [],
+                    contactLogs: [],
+                    enrollments: [],
+                    ...doc,
+                };
+            }
+            if (collection === 'schedules') {
+                return {
+                    siteId: '',
+                    studyId: '',
+                    visit: '',
+                    slots: [],
+                    ...doc,
+                };
+            }
+            if (collection === 'surveys') {
+                return {
+                    title: '',
+                    studyId: '',
+                    questions: [],
+                    ...doc,
+                };
+            }
+            return doc;
+        };
+
+        const completeDoc = ensureRequiredFields(merged);
+
         // Convert patient format if needed
-        let dataToSend = data;
+        let dataToSend = completeDoc;
         if (collection === 'patients') {
-            dataToSend = convertPatientToAzureFormat(data);
+            dataToSend = convertPatientToAzureFormat(completeDoc);
         }
+
+        // Remove any system metadata that might have been loaded from Cosmos
+        delete dataToSend._rid;
+        delete dataToSend._self;
+        delete dataToSend._etag;
+        delete dataToSend._attachments;
+        delete dataToSend._ts;
+
         return await apiCall(`${collection}/${id}`, 'PUT', dataToSend);
     } catch (error) {
         console.error(`Error updating ${collection}:`, error);
-        console.log(`NASA: Updating ${collection} locally as fallback`);
-        
-        try {
-            const existingData = JSON.parse(localStorage.getItem(`nasa_${collection}_fallback`) || '[]');
-            const index = existingData.findIndex(item => item.id === id);
-            if (index >= 0) {
-                existingData[index] = { ...existingData[index], ...data, lastUpdated: new Date().toISOString() };
-                localStorage.setItem(`nasa_${collection}_fallback`, JSON.stringify(existingData));
-                console.log(`NASA: Updated ${collection} locally with ID: ${id}`);
-                return existingData[index];
-            } else {
-                throw new Error(`Document with ID ${id} not found in local storage`);
-            }
-        } catch (localError) {
-            console.error(`Error updating ${collection} locally:`, localError);
-            throw error;
-        }
+        throw error;
     }
 };
 
@@ -293,18 +403,7 @@ const deleteDocument = async (collection, id) => {
         return await apiCall(`${collection}/${id}`, 'DELETE');
     } catch (error) {
         console.error(`Error deleting ${collection}:`, error);
-        console.log(`NASA: Deleting ${collection} locally as fallback`);
-        
-        try {
-            const existingData = JSON.parse(localStorage.getItem(`nasa_${collection}_fallback`) || '[]');
-            const filteredData = existingData.filter(item => item.id !== id);
-            localStorage.setItem(`nasa_${collection}_fallback`, JSON.stringify(filteredData));
-            console.log(`NASA: Deleted ${collection} locally with ID: ${id}`);
-            return { success: true };
-        } catch (localError) {
-            console.error(`Error deleting ${collection} locally:`, localError);
-            throw error;
-        }
+        throw error;
     }
 };
 
@@ -313,21 +412,7 @@ const getDocument = async (collection, id) => {
         return await apiCall(`${collection}/${id}`);
     } catch (error) {
         console.error(`Error getting ${collection}:`, error);
-        console.log(`NASA: Getting ${collection} from local storage as fallback`);
-        
-        try {
-            const existingData = JSON.parse(localStorage.getItem(`nasa_${collection}_fallback`) || '[]');
-            const document = existingData.find(item => item.id === id);
-            if (document) {
-                console.log(`NASA: Found ${collection} locally with ID: ${id}`);
-                return document;
-            } else {
-                throw new Error(`Document with ID ${id} not found`);
-            }
-        } catch (localError) {
-            console.error(`Error getting ${collection} locally:`, localError);
-            throw error;
-        }
+        throw error;
     }
 };
 // --- GLOBAL STATE & CONSTANTS ---
@@ -338,7 +423,7 @@ let state = {
     patientSearchTerm: '',
     studySearchTerm: '',
     siteSearchTerm: '',
-    schedulingView: 'calendar', // 'creator', 'calendar', 'day', 'booked'
+    schedulingView: 'creator', // 'creator', 'calendar', 'day', 'booked'
     schedulingVisitFilter: 'all', // 'all', 'Visit 1', etc.
     schedulingSiteFilter: 'all',
     schedulingStudyFilter: 'all',
@@ -766,8 +851,6 @@ const renderNav = () => {
         { id: 'studies', label: 'Studies', icon: 'file-text', hasDropdown: true },
         { id: 'patients', label: 'Patients', icon: 'users' },
         { id: 'sites', label: 'Sites', icon: 'building' },
-        { id: 'ctms', label: 'CTMS', icon: 'database', href: `https://mhillORA.github.io/CTMS.html?userId=${state.userId}` },
-        { id: 'crcs', label: 'CRCs', icon: 'map-pin', href: 'crc_scheduler.html' }, // Link to new page
         { id: 'surveys', label: 'Surveys', icon: 'clipboard-list' },
         { id: 'scheduling', label: 'Scheduling', icon: 'calendar' },
         { id: 'reporting', label: 'Reporting', icon: 'trending-up' },
@@ -2131,7 +2214,10 @@ const getSchedulingHTML = () => {
                             <option value="Visit 5">Visit 5</option>
                         </select>
                     </div>
-                    <div></div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Shift ID (CHAOS) <span class="text-xs text-gray-400">(optional)</span></label>
+                        <input type="text" name="shiftId" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., chaos-shift-123" />
+                    </div>
                     <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Start Date</label><input type="date" name="startDate" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"/></div>
                     <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">End Date</label><input type="date" name="endDate" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"/></div>
                 </div>
@@ -2796,6 +2882,16 @@ const getAppointmentDetailsModalHTML = (schedule, slot) => {
     const scheduledPatients = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id);
     const study = state.studies.find(s => s.id === schedule.studyId);
     const site = state.sites.find(s => s.id === schedule.siteId);
+    const eligiblePatients = state.patients
+        .filter(p => {
+            const currentEnrollment = (p.enrollments || []).find(e => e.status === 'current');
+            if (!currentEnrollment) return false;
+            if (currentEnrollment.studyId !== schedule.studyId) return false;
+            if (currentEnrollment.siteId !== schedule.siteId) return false;
+            if (p.appointment) return false; // already scheduled somewhere
+            return true;
+        })
+        .sort((a, b) => `${a.firstName || ''} ${a.lastName || ''}`.localeCompare(`${b.firstName || ''} ${b.lastName || ''}`));
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-2">Appointment Details</h2>
         <p class="text-gray-600 dark:text-gray-400 mb-4">${new Date(slot.startTime).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</p>
@@ -2815,6 +2911,27 @@ const getAppointmentDetailsModalHTML = (schedule, slot) => {
                 ${scheduledPatients.map(p => `<li><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${p.firstName} ${p.lastName}</button></li>`).join('')}
             </ul>
         ` : '<p class="text-gray-500 dark:text-gray-400">No participants scheduled for this slot.</p>'}
+        <div class="mt-6 border-t dark:border-gray-700 pt-4">
+            <h3 class="font-semibold dark:text-white mb-2">Add Participants</h3>
+            ${(scheduledPatients.length >= slot.capacity)
+                ? `<p class="text-sm text-gray-500 dark:text-gray-400">This slot is full.</p>`
+                : (eligiblePatients.length === 0
+                    ? `<p class="text-sm text-gray-500 dark:text-gray-400">No eligible patients found for this Study + Site who are not already scheduled.</p>`
+                    : `<div class="max-h-64 overflow-y-auto space-y-2">
+                            ${eligiblePatients.map(p => `
+                                <div class="flex items-center justify-between gap-3 p-2 border dark:border-gray-600 rounded">
+                                    <button data-action="view-patient" data-id="${p.id}" class="text-left text-blue-600 dark:text-blue-400 hover:underline">
+                                        ${p.firstName || ''} ${p.lastName || ''}
+                                    </button>
+                                    <button data-action="book-appointment" data-patient-id="${p.id}" data-schedule-id="${schedule.id}" data-slot-id="${slot.id}"
+                                        class="px-3 py-1.5 rounded bg-purple-600 text-white text-xs hover:bg-purple-700">
+                                        Add to slot
+                                    </button>
+                                </div>
+                            `).join('')}
+                       </div>`)
+            }
+        </div>
         <div class="mt-6 border-t dark:border-gray-700 pt-4">
             <button data-action="delete-slot" data-schedule-id="${schedule.id}" data-slot-id="${slot.id}" class="text-sm text-red-600 hover:underline" ${slot.booked > 0 ? 'disabled' : ''}>Delete Slot</button>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1" ${slot.booked > 0 ? '' : 'hidden'}>Cannot delete a slot that is booked.</p>
@@ -3982,12 +4099,13 @@ document.addEventListener('click', async (e) => {
                 try {
                     const patient = state.patients.find(p => p.id === patientId);
                     if (patient && patient.appointment) {
-                        const patientRef = doc(db, "patients", patientId);
-                        await updateDoc(patientRef, {
-                            'appointment.checkInStatus': 'not-checked-in',
-                            'appointment.checkInTime': null,
-                            'appointment.checkInNotes': null
-                        });
+                        const updatedAppointment = {
+                            ...patient.appointment,
+                            checkInStatus: 'not-checked-in',
+                            checkInTime: null,
+                            checkInNotes: null
+                        };
+                        await updateDocument('patients', patientId, { appointment: updatedAppointment });
                         showNotification("Check-in status reset.", "success");
                     }
                 } catch (error) {
@@ -4151,6 +4269,8 @@ document.addEventListener('click', async (e) => {
                     // For now, we'll just update the appointment
                     await updateDocument('patients', patientId, updatedPatient);
                     
+                    // Refresh state from Azure so UI stays consistent across tabs/views
+                    await loadAllData();
                     showNotification("Appointment booked successfully!", "success");
                     closeModal();
                 } catch (error) {
@@ -4833,12 +4953,9 @@ document.addEventListener('submit', async (e) => {
                         }
                         patientsToImport.push(finalPatient);
                     }
-                    const batch = writeBatch(db);
-                    patientsToImport.forEach(patient => {
-                        const newPatientRef = doc(collection(db, "patients"));
-                        batch.set(newPatientRef, patient);
-                    });
-                    await batch.commit();
+                    for (const patient of patientsToImport) {
+                        await createDocument('patients', patient);
+                    }
                     statusEl.textContent = `Successfully imported ${patientsToImport.length} new patients.`;
                     statusEl.className = "text-green-500";
                     setTimeout(closeModal, 2000);
@@ -5083,8 +5200,11 @@ document.addEventListener('submit', async (e) => {
                 });
                 updatedPatient.enrollments = newEnrollments;
                 
-                // Save to database
-                await updateDoc(doc(db, "patients", patientId), updatedPatient);
+                // Save to database (Azure Cosmos)
+                await updateDocument('patients', patientId, {
+                    ...updatedPatient,
+                    lastUpdated: new Date().toISOString()
+                });
                 closeModal();
                 showNotification("Patient updated successfully (washout override applied).", "success");
             } catch (error) {
@@ -5104,17 +5224,23 @@ document.addEventListener('submit', async (e) => {
                 status: data.status,
                 target: parseInt(data.target),
                 washoutDays: data.washoutDays ? parseInt(data.washoutDays) : 30,
-                siteIds: selectedSiteIds
+                siteIds: selectedSiteIds,
+                lastUpdated: new Date().toISOString()
             };
-            await updateDoc(doc(db, "studies", studyId), updatedStudy);
+            await updateDocument('studies', studyId, updatedStudy);
             closeModal();
             showNotification("Study updated successfully!", "success");
             break;
         }
         case 'edit-site-form': {
             const siteId = form.dataset.id;
-            const updatedSite = { name: data.name, location: data.location, status: data.status };
-            await updateDoc(doc(db, "sites", siteId), updatedSite);
+            const updatedSite = { 
+                name: data.name, 
+                location: data.location, 
+                status: data.status,
+                lastUpdated: new Date().toISOString()
+            };
+            await updateDocument('sites', siteId, updatedSite);
             closeModal();
             break;
         }
@@ -5132,9 +5258,10 @@ document.addEventListener('submit', async (e) => {
                 washoutDays: data.washoutDays ? parseInt(data.washoutDays) : 30,
                 enrolled: 0,
                 screenFails: 0,
-                siteIds: selectedSiteIds
+                siteIds: selectedSiteIds,
+                lastUpdated: new Date().toISOString()
             };
-            await addDoc(collection(db, "studies"), newStudy);
+            await createDocument('studies', newStudy);
             closeModal();
             showNotification("Study created successfully!", "success");
             break;
@@ -5164,9 +5291,13 @@ document.addEventListener('submit', async (e) => {
                 siteId: data.siteId, 
                 studyId: data.studyId, 
                 visit: data.visit,
-                slots: slots 
+                shiftId: data.shiftId || null,
+                slots: slots,
+                lastUpdated: new Date().toISOString()
             };
-            await addDoc(getCollectionRef("schedules"), newSchedule);
+            await createDocument('schedules', newSchedule);
+            await loadAllData();
+            showNotification("Schedule created.", "success");
             form.reset();
             break;
         }
