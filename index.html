@@ -23793,6 +23793,7 @@
                 const startDate = new Date(startDateInput.value + 'T00:00:00');
                 const endDate = new Date((endDateInput.value || startDateInput.value) + 'T00:00:00');
                 const selectedPeriod = periodSelect.value;
+                const currentlySelectedCrcIds = new Set(Array.from(crcSelect.selectedOptions || []).map(o => o.value).filter(Boolean));
 
                 const scheduledPeriodsByCrc = {};
                 const dateRange = [];
@@ -23814,7 +23815,16 @@
                     if (option.value) {
                         const crcId = option.value;
                         const crc = state.crcs.find(c => c.id === crcId);
-                        option.textContent = crc ? crc.name : 'Unknown CRC';
+                        const isInactive = crc && crc.active === false;
+                        // Hide inactive CRCs from selection lists so they can't be scheduled going forward.
+                        // If an inactive CRC is already selected on an existing event, keep it visible (read-only) to avoid data loss.
+                        if (isInactive && !currentlySelectedCrcIds.has(crcId)) {
+                            option.hidden = true;
+                            option.disabled = true;
+                            continue;
+                        }
+                        option.hidden = false;
+                        option.textContent = crc ? `${crc.name}${isInactive ? ' (Inactive)' : ''}` : 'Unknown CRC';
                         option.classList.remove('text-red-500', 'font-bold', 'text-gray-400', 'dark:text-gray-500');
 
                         const scheduledEvents = scheduledPeriodsByCrc[crcId] || [];
@@ -23861,7 +23871,12 @@
                         
                         // For Travel Day events or when override is checked, allow selecting unavailable people
                         // They should be selectable but marked as unavailable
-                        if (isTravelDay || allowOverride) {
+                        if (isInactive) {
+                            // Inactive CRCs should never be selectable.
+                            option.disabled = true;
+                            option.classList.add('text-gray-400', 'dark:text-gray-500');
+                            if (!option.textContent.includes('Inactive')) option.textContent += ' (Inactive)';
+                        } else if (isTravelDay || allowOverride) {
                             // Don't disable - allow selection but show warning
                             option.disabled = false;
                             if (!isAvailable || hasTimeOff) {
@@ -36308,8 +36323,7 @@
                                         if (updatedEvent && updatedEvent.id) {
                                             if (isGroupEvent && existingGroupId && applyToAllDays) {
                                                 // Group update: state was already updated in the loop above
-                                                setState({ crc_events: [...state.crc_events] }, { skipRender: false });
-                                                renderContentPreservingScroll();
+                                                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                                                 setTimeout(() => markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(updatePayload)), 0);
                                             } else {
                                                 // CRITICAL: Preserve present state - always replace by id, never create duplicate.
@@ -36319,8 +36333,7 @@
                                                     state.crc_events = state.crc_events.filter(e => e.id !== idToKeep);
                                                     state.crc_events.push(updatedEvent);
                                                 }
-                                                setState({ crc_events: [...state.crc_events] }, { skipRender: false });
-                                                renderContentPreservingScroll();
+                                                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                                                 setTimeout(() => markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(updatePayload)), 0);
                                             }
                                         } else {
@@ -36337,7 +36350,6 @@
                                                     state.crc_events = state.crc_events.filter(e => e.id !== recoveredEvent.id);
                                                     state.crc_events.push(recoveredEvent);
                                                     setState({ crc_events: [...state.crc_events] }, { skipRender: true });
-                                                    renderContentPreservingScroll();
                                                     showNotification('Shift recovered from server.', 'success');
                                                 }
                                             } catch (recoveryError) {
@@ -36733,30 +36745,30 @@
                                                     });
                                                     
                                                     console.log(`[TRAVEL DELETE] Found ${travelDaysToDelete.length} travel days to delete for CRC ${removedCrcId}`);
-                                                    
-                                                    for (const travelDay of travelDaysToDelete) {
-                                                        try {
-                                                            await apiService.deleteEvent(travelDay.id);
-                                                            // Remove from state
-                                                            const index = state.crc_events.findIndex(e => e.id === travelDay.id);
-                                                            if (index !== -1) {
-                                                                state.crc_events.splice(index, 1);
-                                                            }
-                                                            console.log(`[TRAVEL DELETE] Deleted travel day ${travelDay.id} for removed CRC ${removedCrcId}`);
-                                                        } catch (deleteError) {
-                                                            console.error(`[TRAVEL DELETE] Error deleting travel day ${travelDay.id} for removed CRC ${removedCrcId}:`, deleteError);
+
+                                                    // Delete in parallel (travel-day deletes can dominate save time)
+                                                    const results = await Promise.allSettled(
+                                                        travelDaysToDelete.map(td => apiService.deleteEvent(td.id))
+                                                    );
+                                                    results.forEach((res, i) => {
+                                                        const td = travelDaysToDelete[i];
+                                                        if (res.status === 'fulfilled') {
+                                                            const index = state.crc_events.findIndex(e => e.id === td.id);
+                                                            if (index !== -1) state.crc_events.splice(index, 1);
+                                                            console.log(`[TRAVEL DELETE] Deleted travel day ${td.id} for removed CRC ${removedCrcId}`);
+                                                        } else {
+                                                            console.error(`[TRAVEL DELETE] Error deleting travel day ${td.id} for removed CRC ${removedCrcId}:`, res.reason);
                                                         }
-                                                    }
+                                                    });
                                                 }
                                             }
                                             
-                                            // Refresh state after travel days are updated
-                                            if (assignedCrcsForTravel.size > 0 || removedCrcs.length > 0) {
-                                                setState({ crc_events: [...state.crc_events] }, { skipRender: false });
-                                                renderContentPreservingScroll();
-                                            }
+                                            // Defer rendering until the end of save (avoid multiple full re-renders during one submit).
                                         }
                                         
+                                        // Single render after all updates (shift + travel days) are complete.
+                                        setState({ crc_events: [...state.crc_events] }, { skipRender: false });
+                                        renderContentPreservingScroll();
                                         showNotification('Shift updated successfully!', 'success');
                                         closeModal();
                                         // If manager just accepted a volunteer, prompt for travel
