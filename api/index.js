@@ -1482,6 +1482,19 @@ const validateCrcsSchema = (data) => {
     if (data.trainings && !Array.isArray(data.trainings)) {
         errors.push('trainings must be an array');
     }
+
+    // Department is optional for backward compatibility, but if present enforce allowed values
+    if (data.department !== undefined && data.department !== null) {
+        if (typeof data.department !== 'string') {
+            errors.push('department must be a string');
+        } else {
+            const dep = data.department.trim().toLowerCase();
+            const allowed = new Set(['drivers', 'reading center', 'crc']);
+            if (dep && !allowed.has(dep)) {
+                errors.push('department must be one of: Drivers, Reading Center, CRC');
+            }
+        }
+    }
     
     if (errors.length > 0) {
         throw new Error(`VALIDATION_ERROR: CRCs validation failed: ${errors.join(', ')}`);
