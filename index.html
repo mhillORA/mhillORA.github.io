@@ -15,6 +15,7 @@
     </script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://alcdn.msauth.net/browser/2.39.0/js/msal-browser.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
@@ -192,6 +193,127 @@
 const API_BASE_URL = '/api'; // Use relative path like other files
 const API_KEY = ''; // Optional. Prefer platform auth; leave empty for local/dev.
 
+// --- MICROSOFT ENTRA ID (MSAL) ---
+// TODO: Fill these in from your Entra app registrations.
+// SPA (this frontend) needs a Client ID. The API scope should match what your API app exposes.
+const ENTRA_TENANT_ID = ''; // e.g. 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+const ENTRA_SPA_CLIENT_ID = ''; // e.g. 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+const ENTRA_API_SCOPES = []; // e.g. ['api://<API_APP_ID>/access_as_user']
+
+let msalInstance = null;
+let entraAccount = null;
+let entraAccessToken = null;
+
+const parseJwtPayload = (token) => {
+    try {
+        const parts = String(token || '').split('.');
+        if (parts.length < 2) return null;
+        const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+        const json = decodeURIComponent(atob(base64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+        return JSON.parse(json);
+    } catch {
+        return null;
+    }
+};
+
+const loadCurrentUserProfile = async () => {
+    try {
+        if (!entraAccessToken) return;
+        const claims = parseJwtPayload(entraAccessToken);
+        const oid = claims && claims.oid ? String(claims.oid) : '';
+        const email = claims && (claims.preferred_username || claims.upn) ? String(claims.preferred_username || claims.upn) : '';
+        if (!oid && !email) return;
+
+        const allUsers = await fetchData('users');
+        state.users = Array.isArray(allUsers) ? allUsers : [];
+
+        const match = state.users.find(u => (oid && u.entraOid === oid) || (email && u.email && String(u.email).toLowerCase() === email.toLowerCase()));
+        state.currentUser = match || null;
+    } catch (e) {
+        console.warn('Failed to load current user profile:', e);
+        state.currentUser = null;
+    }
+};
+
+const initEntra = async () => {
+    try {
+        if (!ENTRA_TENANT_ID || !ENTRA_SPA_CLIENT_ID || !Array.isArray(ENTRA_API_SCOPES) || ENTRA_API_SCOPES.length === 0) {
+            console.warn('Entra: Not configured (tenant/client/scopes missing). Running unauthenticated.');
+            return;
+        }
+        if (typeof msal === 'undefined' || !msal.PublicClientApplication) {
+            console.warn('Entra: MSAL not loaded.');
+            return;
+        }
+        msalInstance = new msal.PublicClientApplication({
+            auth: {
+                clientId: ENTRA_SPA_CLIENT_ID,
+                authority: `https://login.microsoftonline.com/${ENTRA_TENANT_ID}`,
+                redirectUri: window.location.origin + window.location.pathname,
+            },
+            cache: {
+                cacheLocation: 'sessionStorage',
+                storeAuthStateInCookie: false,
+            }
+        });
+
+        // Handle redirect response if login used redirect flow.
+        const resp = await msalInstance.handleRedirectPromise();
+        if (resp && resp.account) {
+            entraAccount = resp.account;
+        } else {
+            const accounts = msalInstance.getAllAccounts();
+            entraAccount = accounts && accounts[0] ? accounts[0] : null;
+        }
+
+        if (entraAccount) {
+            await acquireApiToken();
+            await loadCurrentUserProfile();
+        }
+    } catch (e) {
+        console.error('Entra init failed:', e);
+    }
+};
+
+const acquireApiToken = async () => {
+    if (!msalInstance || !entraAccount) return null;
+    try {
+        const result = await msalInstance.acquireTokenSilent({
+            account: entraAccount,
+            scopes: ENTRA_API_SCOPES
+        });
+        entraAccessToken = result && result.accessToken ? result.accessToken : null;
+        return entraAccessToken;
+    } catch (e) {
+        // Silent may fail when consent needed or session expired.
+        console.warn('Entra silent token failed, user interaction required:', e);
+        entraAccessToken = null;
+        return null;
+    }
+};
+
+const entraLogin = async () => {
+    if (!msalInstance) return;
+    await msalInstance.loginPopup({ scopes: ENTRA_API_SCOPES });
+    const accounts = msalInstance.getAllAccounts();
+    entraAccount = accounts && accounts[0] ? accounts[0] : null;
+    await acquireApiToken();
+    await loadCurrentUserProfile();
+    render();
+};
+
+const entraLogout = async () => {
+    try {
+        entraAccessToken = null;
+        entraAccount = null;
+        if (msalInstance) {
+            await msalInstance.logoutPopup();
+        }
+    } finally {
+        render();
+    }
+};
+
 // API Helper Functions
 const apiCall = async (endpoint, method = 'GET', data = null) => {
     try {
@@ -204,6 +326,16 @@ const apiCall = async (endpoint, method = 'GET', data = null) => {
 
         if (API_KEY) {
             options.headers['x-functions-key'] = API_KEY;
+        }
+
+        // Attach Entra bearer token if available/configured.
+        if (ENTRA_TENANT_ID && ENTRA_SPA_CLIENT_ID && ENTRA_API_SCOPES.length > 0) {
+            if (!entraAccessToken && entraAccount) {
+                await acquireApiToken();
+            }
+            if (entraAccessToken) {
+                options.headers['Authorization'] = `Bearer ${entraAccessToken}`;
+            }
         }
         
         if (data) {
@@ -421,6 +553,8 @@ let state = {
     userId: 'nasa-user', // Simple user ID for NASA
     activeTab: 'crcDashboard',
     revealPII: false,
+    currentUser: null, // Loaded from /api/users by Entra oid/email when configured
+    users: [],
     patientSearchTerm: '',
     studySearchTerm: '',
     siteSearchTerm: '',
@@ -454,6 +588,9 @@ const displayPII = (value, kind) => {
     if (kind === 'dob') return maskDOB(value);
     return piiMask;
 };
+
+// Intentionally no auto-timeout: once revealed, stays revealed until reload
+// (users can still manually re-hide).
 // --- DOM ELEMENTS ---
 const mainContent = document.getElementById('main-content');
 const navMenu = document.getElementById('nav-menu');
@@ -865,6 +1002,7 @@ const renderNav = () => {
         { id: 'sites', label: 'Sites', icon: 'building' },
         { id: 'surveys', label: 'Surveys', icon: 'clipboard-list' },
         { id: 'scheduling', label: 'Scheduling', icon: 'calendar' },
+        { id: 'users', label: 'Users', icon: 'users-round' },
         { id: 'reporting', label: 'Reporting', icon: 'trending-up' },
         { id: 'duplicates', label: 'Duplicates', icon: 'copy-x' },
     ];
@@ -915,6 +1053,28 @@ const renderNav = () => {
             </button>
         </div>
     `;
+
+    // Entra sign-in/out (only shown when configured)
+    if (ENTRA_TENANT_ID && ENTRA_SPA_CLIENT_ID && Array.isArray(ENTRA_API_SCOPES) && ENTRA_API_SCOPES.length > 0) {
+        navMenu.innerHTML += `
+            <div class="mt-2">
+                ${entraAccount ? `
+                    <div class="px-4 py-2 text-xs text-gray-500 dark:text-gray-400 truncate">
+                        Signed in: ${entraAccount.username || entraAccount.name || 'User'}
+                    </div>
+                    <button data-action="entra-logout" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700">
+                        <i data-lucide="log-out" class="w-5 h-5"></i>
+                        <span class="ml-3">Sign out</span>
+                    </button>
+                ` : `
+                    <button data-action="entra-login" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700">
+                        <i data-lucide="log-in" class="w-5 h-5"></i>
+                        <span class="ml-3">Sign in</span>
+                    </button>
+                `}
+            </div>
+        `;
+    }
 };
 const renderContent = () => {
     const contentMap = {
@@ -925,6 +1085,7 @@ const renderContent = () => {
         sites: getSitesHTML,
         surveys: getSurveysHTML,
         scheduling: getSchedulingHTML,
+        users: getUsersHTML,
         reporting: getReportingHTML,
         duplicates: getDuplicatesHTML,
     };
@@ -2058,6 +2219,11 @@ const getSitesHTML = () => `
         <div class="flex justify-between items-center mb-6">
             <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Clinical Sites</h2>
         </div>
+        ${state.currentUser ? `
+            <div class="mb-4 p-3 rounded-md bg-blue-50 dark:bg-blue-900/20 text-blue-800 dark:text-blue-200 text-sm">
+                Viewing sites for: <strong>${state.currentUser.displayName || state.currentUser.email || 'User'}</strong>
+            </div>
+        ` : ''}
         <div class="mb-4">
             <input type="text" id="site-search" value="${state.siteSearchTerm}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Search for a site...">
         </div>
@@ -2080,7 +2246,10 @@ const getSitesHTML = () => `
 const renderSiteTable = () => {
     const tableBody = document.getElementById('site-table-body');
     if (!tableBody) return;
-    const filteredSites = state.sites.filter(s => s.name.toLowerCase().includes(state.siteSearchTerm.toLowerCase()));
+    const allowedSiteIds = state.currentUser && Array.isArray(state.currentUser.allowedSiteIds) ? state.currentUser.allowedSiteIds : null;
+    const filteredSites = state.sites
+        .filter(s => s.name.toLowerCase().includes(state.siteSearchTerm.toLowerCase()))
+        .filter(s => !allowedSiteIds || allowedSiteIds.includes(s.id));
     
     tableBody.innerHTML = filteredSites.map(site => {
         // Calculate screen fail rate for this site
@@ -2322,6 +2491,114 @@ const getSchedulingHTML = () => {
         </div>
     </div>
     ${currentViewHTML}
+    `;
+};
+
+// =================================================================================
+// USER / MANAGER SECTION
+// =================================================================================
+
+const getUsersHTML = () => {
+    const currentLabel = state.currentUser ? (state.currentUser.displayName || state.currentUser.email || 'User') : 'Not linked';
+    return `
+        <div class="flex justify-between items-center mb-6 flex-wrap gap-4">
+            <div>
+                <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">User Manager</h2>
+                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Controls which sites each user can see. Optionally link users to Entra by OID.</p>
+            </div>
+            <div class="flex items-center gap-2">
+                <button data-action="refresh-users" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-700 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-600 text-sm">Refresh</button>
+                <button data-action="create-user-modal" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700 text-sm">New User</button>
+            </div>
+        </div>
+
+        <div class="mb-4 p-3 rounded-md bg-gray-50 dark:bg-gray-800 text-sm text-gray-700 dark:text-gray-300">
+            <strong>Current user link:</strong> ${currentLabel}
+        </div>
+
+        <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden">
+            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                <thead class="bg-gray-50 dark:bg-gray-700">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Display Name</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Email</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Entra OID</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Sites</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                    ${(state.users || []).map(u => {
+                        const siteCount = Array.isArray(u.allowedSiteIds) ? u.allowedSiteIds.length : 0;
+                        return `
+                            <tr class="dark:text-gray-300">
+                                <td class="px-6 py-4 font-medium">${u.displayName || 'N/A'}</td>
+                                <td class="px-6 py-4">${u.email || 'N/A'}</td>
+                                <td class="px-6 py-4 text-xs">${u.entraOid || '—'}</td>
+                                <td class="px-6 py-4">${u.role || 'user'}</td>
+                                <td class="px-6 py-4">${siteCount}</td>
+                                <td class="px-6 py-4 flex items-center gap-3">
+                                    <button data-action="edit-user" data-id="${u.id}" class="text-blue-600 dark:text-blue-400 hover:underline text-sm">Edit</button>
+                                    <button data-action="delete-user" data-id="${u.id}" class="text-red-600 dark:text-red-400 hover:underline text-sm">Delete</button>
+                                </td>
+                            </tr>
+                        `;
+                    }).join('')}
+                    ${(state.users || []).length === 0 ? `
+                        <tr><td colspan="6" class="px-6 py-10 text-center text-gray-500 dark:text-gray-400">No users yet.</td></tr>
+                    ` : ''}
+                </tbody>
+            </table>
+        </div>
+    `;
+};
+
+const getUserModalHTML = (user = null) => {
+    const isEdit = !!user;
+    const allowed = user && Array.isArray(user.allowedSiteIds) ? user.allowedSiteIds : [];
+    return `
+        <h2 class="text-2xl font-bold dark:text-white mb-4">${isEdit ? 'Edit User' : 'Create User'}</h2>
+        <form id="${isEdit ? 'edit-user-form' : 'create-user-form'}" ${isEdit ? `data-id="${user.id}"` : ''} class="space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Display Name</label>
+                    <input type="text" name="displayName" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${user?.displayName || ''}" required>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Email</label>
+                    <input type="email" name="email" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${user?.email || ''}">
+                </div>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Entra OID (optional)</label>
+                    <input type="text" name="entraOid" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${user?.entraOid || ''}" placeholder="GUID from Entra user objectId">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Role</label>
+                    <select name="role" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        ${['user','manager','admin','external'].map(r => `<option value="${r}" ${user?.role === r ? 'selected' : ''}>${r}</option>`).join('')}
+                    </select>
+                </div>
+            </div>
+            <div>
+                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Allowed Sites</label>
+                <div class="max-h-48 overflow-y-auto border dark:border-gray-600 rounded p-2 bg-white dark:bg-gray-800">
+                    ${(state.sites || []).map(s => `
+                        <label class="flex items-center gap-2 py-1 px-2 rounded hover:bg-gray-50 dark:hover:bg-gray-700">
+                            <input type="checkbox" name="allowedSiteIds" value="${s.id}" ${allowed.includes(s.id) ? 'checked' : ''}>
+                            <span class="text-sm dark:text-gray-200">${s.name}</span>
+                        </label>
+                    `).join('')}
+                    ${(state.sites || []).length === 0 ? `<div class="text-sm text-gray-500 dark:text-gray-400">No sites loaded yet.</div>` : ''}
+                </div>
+            </div>
+            <div class="flex justify-end gap-4 pt-2">
+                <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                <button type="submit" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">${isEdit ? 'Save' : 'Create'}</button>
+            </div>
+        </form>
     `;
 };
 // --- MODAL HTML GETTERS ---
@@ -4048,11 +4325,56 @@ document.addEventListener('click', async (e) => {
     if (actionButton) {
         const { action, id, view, patientId, surveyId, qId, scheduleId, slotId, date, eventId, enrollmentIndex } = actionButton.dataset;
         switch (action) {
-            case 'close-modal': closeModal(); break;
-            case 'close-side-panel': closeSidePanel(); break;
+            case 'close-modal':
+                closeModal();
+                break;
+            case 'close-side-panel':
+                closeSidePanel();
+                break;
             case 'toggle-pii':
                 setState({ revealPII: !state.revealPII });
                 showNotification(state.revealPII ? "PII/PHI revealed (display only)." : "PII/PHI masked.", "info");
+                break;
+            case 'entra-login':
+                await entraLogin();
+                break;
+            case 'entra-logout':
+                await entraLogout();
+                break;
+            case 'refresh-users':
+                try {
+                    const allUsers = await fetchData('users');
+                    state.users = Array.isArray(allUsers) ? allUsers : [];
+                    await loadCurrentUserProfile();
+                    render();
+                    showNotification('Users refreshed.', 'success');
+                } catch (e) {
+                    console.error('Failed to refresh users:', e);
+                    showNotification('Failed to refresh users.', 'error');
+                }
+                break;
+            case 'create-user-modal':
+                openModal(getUserModalHTML(null), true);
+                break;
+            case 'edit-user': {
+                const u = (state.users || []).find(x => x.id === id);
+                openModal(getUserModalHTML(u || null), true);
+                break;
+            }
+            case 'delete-user':
+                if (confirm('Delete this user?')) {
+                    try {
+                        await deleteDocument('users', id);
+                        const allUsers = await fetchData('users');
+                        state.users = Array.isArray(allUsers) ? allUsers : [];
+                        await loadCurrentUserProfile();
+                        render();
+                        showNotification('User deleted.', 'success');
+                    } catch (e) {
+                        console.error('Failed to delete user:', e);
+                        showNotification('Failed to delete user.', 'error');
+                    }
+                }
                 break;
             case 'create-study-modal': openModal(getCreateStudyModalHTML(), true); break;
             case 'create-site-modal': openModal(getCreateSiteModalHTML()); break;
@@ -4678,6 +5000,55 @@ document.addEventListener('submit', async (e) => {
     const data = Object.fromEntries(formData.entries());
     // Removed Firebase collection reference - using Azure Cosmos DB API directly
     switch (form.id) {
+        case 'create-user-form': {
+            try {
+                const allowedSiteIds = formData.getAll('allowedSiteIds');
+                const newUser = {
+                    displayName: data.displayName || '',
+                    email: (data.email || '').trim(),
+                    entraOid: (data.entraOid || '').trim(),
+                    role: data.role || 'user',
+                    allowedSiteIds,
+                    lastUpdated: new Date().toISOString(),
+                };
+                await createDocument('users', newUser);
+                const allUsers = await fetchData('users');
+                state.users = Array.isArray(allUsers) ? allUsers : [];
+                await loadCurrentUserProfile();
+                closeModal();
+                render();
+                showNotification('User created.', 'success');
+            } catch (e) {
+                console.error('Create user failed:', e);
+                showNotification(`Failed to create user: ${e.message}`, 'error');
+            }
+            break;
+        }
+        case 'edit-user-form': {
+            try {
+                const userId = form.dataset.id;
+                const allowedSiteIds = formData.getAll('allowedSiteIds');
+                const updated = {
+                    displayName: data.displayName || '',
+                    email: (data.email || '').trim(),
+                    entraOid: (data.entraOid || '').trim(),
+                    role: data.role || 'user',
+                    allowedSiteIds,
+                    lastUpdated: new Date().toISOString(),
+                };
+                await updateDocument('users', userId, updated);
+                const allUsers = await fetchData('users');
+                state.users = Array.isArray(allUsers) ? allUsers : [];
+                await loadCurrentUserProfile();
+                closeModal();
+                render();
+                showNotification('User updated.', 'success');
+            } catch (e) {
+                console.error('Edit user failed:', e);
+                showNotification(`Failed to update user: ${e.message}`, 'error');
+            }
+            break;
+        }
         case 'add-contact-log-form': {
             const patientId = form.dataset.patientId;
             const newLog = {
@@ -4867,10 +5238,17 @@ document.addEventListener('submit', async (e) => {
                 
                 // Update the patient
                 await updateDocument('patients', patientId, { enrollments: newEnrollments });
-                
+
+                // Update local state immediately so UI reflects enrollment without waiting for polling.
+                const patientIndex = state.patients.findIndex(p => p.id === patientId);
+                if (patientIndex > -1) {
+                    state.patients[patientIndex] = { ...state.patients[patientIndex], enrollments: newEnrollments };
+                }
+
                 closeModal();
                 const overrideMsg = data.overrideWashout ? " (washout override applied)" : "";
                 showNotification(`Patient successfully enrolled!${overrideMsg}`, "success");
+                await loadAllData();
             } catch (error) {
                 console.error("Error enrolling patient:", error);
                 showNotification(`Failed to enroll patient: ${error.message}`, "error");
@@ -4924,9 +5302,16 @@ document.addEventListener('submit', async (e) => {
                 
                 // Update the patient
                 await updateDocument('patients', patientId, { enrollments: newEnrollments });
-                
+
+                // Update local state immediately so UI reflects enrollment without waiting for polling.
+                const patientIndex = state.patients.findIndex(p => p.id === patientId);
+                if (patientIndex > -1) {
+                    state.patients[patientIndex] = { ...state.patients[patientIndex], enrollments: newEnrollments };
+                }
+
                 closeModal();
                 showNotification("Patient successfully enrolled (washout override applied).", "success");
+                await loadAllData();
             } catch (error) {
                 console.error("Error enrolling patient with override:", error);
                 showNotification(`Failed to enroll patient: ${error.message}`, "error");
@@ -6194,13 +6579,19 @@ const loadAllData = async () => {
     try {
         console.log('Loading data from Azure Cosmos DB...');
         
-        // Load all collections in parallel
-        const [studies, sites, patients, schedules, surveys] = await Promise.all([
+        // Load core collections first; defer heavier collections until needed by a tab.
+        const [studies, sites, patients, users] = await Promise.all([
             fetchData('studies'),
             fetchData('sites'),
             fetchData('patients'),
-            fetchData('schedules'),
-            fetchData('surveys')
+            fetchData('users'),
+        ]);
+
+        const needsSchedules = state.activeTab === 'scheduling' || state.activeTab === 'crcDashboard';
+        const needsSurveys = state.activeTab === 'surveys';
+        const [schedules, surveys] = await Promise.all([
+            needsSchedules ? fetchData('schedules') : Promise.resolve(state.schedules || []),
+            needsSurveys ? fetchData('surveys') : Promise.resolve(state.surveys || []),
         ]);
         
         // Sort data appropriately
@@ -6212,8 +6603,12 @@ const loadAllData = async () => {
         state.studies = sortedStudies;
         state.sites = sortedSites;
         state.patients = sortedPatients;
+        state.users = Array.isArray(users) ? users : [];
         state.schedules = schedules;
         state.surveys = surveys;
+
+        // Refresh current user link after users loaded
+        await loadCurrentUserProfile();
         
         console.log('Data loaded successfully:', {
             studies: state.studies.length,
@@ -6318,6 +6713,7 @@ const init = async () => {
     
     // Initialize NASA with Azure Cosmos DB
     try {
+        await initEntra();
         state.authReady = true;
         state.userId = 'nasa-user';
         

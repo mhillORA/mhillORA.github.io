@@ -1,10 +1,88 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
+const { jwtVerify, createRemoteJWKSet } = require('jose');
 
 // Helper function to generate unique IDs
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
+
+// =================================================================================
+// ENTRA AUTH + AUDIT LOGGING (initial scaffolding)
+// =================================================================================
+
+const ENTRA_TENANT_ID = process.env.ENTRA_TENANT_ID;
+const ENTRA_API_AUDIENCE = process.env.ENTRA_API_AUDIENCE; // typically your API app's clientId or Application ID URI
+const ENTRA_AUTH_DISABLED = String(process.env.ENTRA_AUTH_DISABLED || '').toLowerCase() === 'true';
+
+let jwks = null;
+const getJwks = () => {
+    if (!ENTRA_TENANT_ID) return null;
+    if (!jwks) {
+        const jwksUrl = new URL(`https://login.microsoftonline.com/${ENTRA_TENANT_ID}/discovery/v2.0/keys`);
+        jwks = createRemoteJWKSet(jwksUrl);
+    }
+    return jwks;
+};
+
+const getBearerToken = (request) => {
+    const h = request.headers && (request.headers.get ? request.headers.get('authorization') : request.headers.authorization);
+    const auth = h || '';
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    return m ? m[1] : null;
+};
+
+const requireUser = async (request) => {
+    if (ENTRA_AUTH_DISABLED) return { claims: null };
+    if (!ENTRA_TENANT_ID || !ENTRA_API_AUDIENCE) {
+        // Not configured yet; keep behavior permissive for now.
+        return { claims: null };
+    }
+    const token = getBearerToken(request);
+    if (!token) {
+        const err = new Error('UNAUTHORIZED: Missing bearer token');
+        err.status = 401;
+        throw err;
+    }
+    const issuer = `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/v2.0`;
+    const { payload } = await jwtVerify(token, getJwks(), {
+        issuer,
+        audience: ENTRA_API_AUDIENCE,
+    });
+    return { claims: payload };
+};
+
+const buildActor = (claims) => ({
+    oid: claims && claims.oid,
+    upn: claims && (claims.preferred_username || claims.upn),
+    name: claims && claims.name,
+    tid: claims && claims.tid,
+});
+
+const safeJson = async (request) => {
+    try { return await request.json(); } catch { return null; }
+};
+
+const writeAudit = async ({ action, containerName, method, targetId, actor, before, after }) => {
+    try {
+        const audits = getContainer('audits');
+        const record = {
+            id: generateId(),
+            ts: new Date().toISOString(),
+            action,
+            method,
+            containerName,
+            targetId: targetId || null,
+            actor: actor || null,
+            before: before || null,
+            after: after || null,
+        };
+        await audits.items.create(record);
+    } catch (e) {
+        // Do not block primary operation on audit failure.
+        console.warn('Audit write failed:', e && e.message ? e.message : e);
+    }
+};
 
 // Helper function to get Cosmos DB client (lazy initialization)
 let cosmosClient = null;
@@ -42,12 +120,14 @@ const handleError = (context, error, message) => {
         errorMessage = "API Configuration Error: Database secrets not set in Azure Configuration.";
     } else if (error.message.includes('VALIDATION_ERROR')) {
         errorMessage = error.message.replace('VALIDATION_ERROR: ', '');
+    } else if (error.message.includes('UNAUTHORIZED')) {
+        errorMessage = error.message.replace('UNAUTHORIZED: ', '');
     } else {
         errorMessage = "Internal Server Error during data processing.";
     }
 
     return {
-        status: 500,
+        status: error.status || 500,
         jsonBody: { error: errorMessage },
         headers: {
             'Content-Type': 'application/json',
@@ -503,6 +583,29 @@ const validateSurveysSchema = (data) => {
     return true;
 };
 
+const validateUsersSchema = (data) => {
+    const errors = [];
+    if (!data.displayName || typeof data.displayName !== 'string') {
+        errors.push('displayName is required and must be a string');
+    }
+    if (data.email !== undefined && data.email !== null && typeof data.email !== 'string') {
+        errors.push('email must be a string');
+    }
+    if (data.entraOid !== undefined && data.entraOid !== null && typeof data.entraOid !== 'string') {
+        errors.push('entraOid must be a string');
+    }
+    if (data.role !== undefined && data.role !== null && typeof data.role !== 'string') {
+        errors.push('role must be a string');
+    }
+    if (data.allowedSiteIds !== undefined && data.allowedSiteIds !== null && !Array.isArray(data.allowedSiteIds)) {
+        errors.push('allowedSiteIds must be an array');
+    }
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Users validation failed: ${errors.join(', ')}`);
+    }
+    return true;
+};
+
 // =================================================================================
 // BUSINESS LOGIC FUNCTIONS
 // =================================================================================
@@ -561,6 +664,11 @@ async function crudHandler(context, request, containerName) {
     const id = getIdFromRequest(request);
 
     try {
+        // Entra auth (initial): if configured, require bearer token for non-OPTIONS.
+        // Claims are used for audits.
+        const user = (method === 'OPTIONS') ? { claims: null } : await requireUser(request);
+        const actor = buildActor(user.claims);
+
         switch (method) {
             case 'GET':
                 if (id) {
@@ -604,6 +712,9 @@ async function crudHandler(context, request, containerName) {
                         case 'surveys':
                             validateSurveysSchema(body);
                             break;
+                        case 'users':
+                            validateUsersSchema(body);
+                            break;
                     }
                 } catch (validationError) {
                     console.error(`Validation error for ${containerName}:`, validationError.message);
@@ -616,6 +727,16 @@ async function crudHandler(context, request, containerName) {
                 
                 const newItem = { ...body, id: generateId() };
                 const { resource: createdItem } = await container.items.create(newItem);
+
+                await writeAudit({
+                    action: `${containerName}.create`,
+                    containerName,
+                    method,
+                    targetId: createdItem && createdItem.id,
+                    actor,
+                    before: null,
+                    after: createdItem,
+                });
                 
                 // Calculate enrollment for studies
                 if (containerName === 'studies') {
@@ -628,6 +749,15 @@ async function crudHandler(context, request, containerName) {
             case 'PUT':
                 const requestBody = await request.json();
                 const updateId = id || requestBody.id;
+
+                // Capture before for audit (best-effort).
+                let before = null;
+                try {
+                    if (updateId) {
+                        const readRes = await container.item(updateId).read();
+                        before = readRes && readRes.resource ? readRes.resource : null;
+                    }
+                } catch {}
                 
                 // Validate schema based on container
                 try {
@@ -658,6 +788,9 @@ async function crudHandler(context, request, containerName) {
                         case 'surveys':
                             validateSurveysSchema(requestBody);
                             break;
+                        case 'users':
+                            validateUsersSchema(requestBody);
+                            break;
                     }
                 } catch (validationError) {
                     console.error(`Validation error for ${containerName}:`, validationError.message);
@@ -670,6 +803,16 @@ async function crudHandler(context, request, containerName) {
                 
                 const updatedItem = { ...requestBody, id: updateId };
                 const { resource: result } = await container.items.upsert(updatedItem);
+
+                await writeAudit({
+                    action: `${containerName}.update`,
+                    containerName,
+                    method,
+                    targetId: result && result.id,
+                    actor,
+                    before,
+                    after: result,
+                });
                 
                 // Calculate enrollment for studies
                 if (containerName === 'studies') {
@@ -680,7 +823,26 @@ async function crudHandler(context, request, containerName) {
                 return { jsonBody: result };
 
             case 'DELETE':
+                // Capture before for audit (best-effort).
+                let beforeDelete = null;
+                try {
+                    if (id) {
+                        const readRes = await container.item(id).read();
+                        beforeDelete = readRes && readRes.resource ? readRes.resource : null;
+                    }
+                } catch {}
+
                 await container.item(id).delete();
+
+                await writeAudit({
+                    action: `${containerName}.delete`,
+                    containerName,
+                    method,
+                    targetId: id,
+                    actor,
+                    before: beforeDelete,
+                    after: null,
+                });
                 return { status: 204 };
 
             case 'OPTIONS':
@@ -759,4 +921,11 @@ app.http('surveys', {
     authLevel: 'anonymous', 
     route: 'surveys/{id?}',
     handler: (request, context) => crudHandler(context, request, 'surveys'),
+});
+
+app.http('users', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'users'),
 });
