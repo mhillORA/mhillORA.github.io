@@ -15,7 +15,6 @@
     </script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://alcdn.msauth.net/browser/2.39.0/js/msal-browser.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
@@ -193,127 +192,6 @@
 const API_BASE_URL = '/api'; // Use relative path like other files
 const API_KEY = ''; // Optional. Prefer platform auth; leave empty for local/dev.
 
-// --- MICROSOFT ENTRA ID (MSAL) ---
-// TODO: Fill these in from your Entra app registrations.
-// SPA (this frontend) needs a Client ID. The API scope should match what your API app exposes.
-const ENTRA_TENANT_ID = ''; // e.g. 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-const ENTRA_SPA_CLIENT_ID = ''; // e.g. 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-const ENTRA_API_SCOPES = []; // e.g. ['api://<API_APP_ID>/access_as_user']
-
-let msalInstance = null;
-let entraAccount = null;
-let entraAccessToken = null;
-
-const parseJwtPayload = (token) => {
-    try {
-        const parts = String(token || '').split('.');
-        if (parts.length < 2) return null;
-        const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-        const json = decodeURIComponent(atob(base64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
-        return JSON.parse(json);
-    } catch {
-        return null;
-    }
-};
-
-const loadCurrentUserProfile = async () => {
-    try {
-        if (!entraAccessToken) return;
-        const claims = parseJwtPayload(entraAccessToken);
-        const oid = claims && claims.oid ? String(claims.oid) : '';
-        const email = claims && (claims.preferred_username || claims.upn) ? String(claims.preferred_username || claims.upn) : '';
-        if (!oid && !email) return;
-
-        const allUsers = await fetchData('users');
-        state.users = Array.isArray(allUsers) ? allUsers : [];
-
-        const match = state.users.find(u => (oid && u.entraOid === oid) || (email && u.email && String(u.email).toLowerCase() === email.toLowerCase()));
-        state.currentUser = match || null;
-    } catch (e) {
-        console.warn('Failed to load current user profile:', e);
-        state.currentUser = null;
-    }
-};
-
-const initEntra = async () => {
-    try {
-        if (!ENTRA_TENANT_ID || !ENTRA_SPA_CLIENT_ID || !Array.isArray(ENTRA_API_SCOPES) || ENTRA_API_SCOPES.length === 0) {
-            console.warn('Entra: Not configured (tenant/client/scopes missing). Running unauthenticated.');
-            return;
-        }
-        if (typeof msal === 'undefined' || !msal.PublicClientApplication) {
-            console.warn('Entra: MSAL not loaded.');
-            return;
-        }
-        msalInstance = new msal.PublicClientApplication({
-            auth: {
-                clientId: ENTRA_SPA_CLIENT_ID,
-                authority: `https://login.microsoftonline.com/${ENTRA_TENANT_ID}`,
-                redirectUri: window.location.origin + window.location.pathname,
-            },
-            cache: {
-                cacheLocation: 'sessionStorage',
-                storeAuthStateInCookie: false,
-            }
-        });
-
-        // Handle redirect response if login used redirect flow.
-        const resp = await msalInstance.handleRedirectPromise();
-        if (resp && resp.account) {
-            entraAccount = resp.account;
-        } else {
-            const accounts = msalInstance.getAllAccounts();
-            entraAccount = accounts && accounts[0] ? accounts[0] : null;
-        }
-
-        if (entraAccount) {
-            await acquireApiToken();
-            await loadCurrentUserProfile();
-        }
-    } catch (e) {
-        console.error('Entra init failed:', e);
-    }
-};
-
-const acquireApiToken = async () => {
-    if (!msalInstance || !entraAccount) return null;
-    try {
-        const result = await msalInstance.acquireTokenSilent({
-            account: entraAccount,
-            scopes: ENTRA_API_SCOPES
-        });
-        entraAccessToken = result && result.accessToken ? result.accessToken : null;
-        return entraAccessToken;
-    } catch (e) {
-        // Silent may fail when consent needed or session expired.
-        console.warn('Entra silent token failed, user interaction required:', e);
-        entraAccessToken = null;
-        return null;
-    }
-};
-
-const entraLogin = async () => {
-    if (!msalInstance) return;
-    await msalInstance.loginPopup({ scopes: ENTRA_API_SCOPES });
-    const accounts = msalInstance.getAllAccounts();
-    entraAccount = accounts && accounts[0] ? accounts[0] : null;
-    await acquireApiToken();
-    await loadCurrentUserProfile();
-    render();
-};
-
-const entraLogout = async () => {
-    try {
-        entraAccessToken = null;
-        entraAccount = null;
-        if (msalInstance) {
-            await msalInstance.logoutPopup();
-        }
-    } finally {
-        render();
-    }
-};
-
 // API Helper Functions
 const apiCall = async (endpoint, method = 'GET', data = null) => {
     try {
@@ -326,16 +204,6 @@ const apiCall = async (endpoint, method = 'GET', data = null) => {
 
         if (API_KEY) {
             options.headers['x-functions-key'] = API_KEY;
-        }
-
-        // Attach Entra bearer token if available/configured.
-        if (ENTRA_TENANT_ID && ENTRA_SPA_CLIENT_ID && ENTRA_API_SCOPES.length > 0) {
-            if (!entraAccessToken && entraAccount) {
-                await acquireApiToken();
-            }
-            if (entraAccessToken) {
-                options.headers['Authorization'] = `Bearer ${entraAccessToken}`;
-            }
         }
         
         if (data) {
@@ -552,9 +420,6 @@ let state = {
     authReady: false,
     userId: 'nasa-user', // Simple user ID for NASA
     activeTab: 'crcDashboard',
-    revealPII: false,
-    currentUser: null, // Loaded from /api/users by Entra oid/email when configured
-    users: [],
     patientSearchTerm: '',
     studySearchTerm: '',
     siteSearchTerm: '',
@@ -575,22 +440,77 @@ let state = {
     selectedStudyId: null, // For the studies dropdown selector
     participantSearchTerm: '', // For searching participants within a study
     studiesExpanded: false, // For the collapsible studies list
+
+    // --- lightweight access-request + user management (local only for now) ---
+    showLoginGate: false, // short-term "login page" gate (off by default)
+    accessRequests: [],
+    managedUsers: [],
+    currentUser: null, // local session user
 };
 let chartInstances = {}; // To hold chart objects for destruction
 
-// --- PII / PHI MASKING (display-only) ---
-// "Little eyeballs" mask per request.
-const piiMask = '👁️👁️👁️👁️';
-const maskDOB = (dob) => (dob ? '👁️👁️👁️👁️-👁️👁️-👁️👁️' : 'N/A');
-const displayPII = (value, kind) => {
-    if (state.revealPII) return value || 'N/A';
-    if (!value) return 'N/A';
-    if (kind === 'dob') return maskDOB(value);
-    return piiMask;
+// --- LOCAL PERSISTENCE (short-term until Cosmos container exists) ---
+const LS_KEYS = {
+    accessRequests: 'nasa_access_requests_v1',
+    managedUsers: 'nasa_managed_users_v1',
 };
 
-// Intentionally no auto-timeout: once revealed, stays revealed until reload
-// (users can still manually re-hide).
+const safeJsonParse = (text, fallback) => {
+    try { return JSON.parse(text); } catch { return fallback; }
+};
+
+const loadLocalState = () => {
+    const requests = safeJsonParse(localStorage.getItem(LS_KEYS.accessRequests) || '[]', []);
+    const users = safeJsonParse(localStorage.getItem(LS_KEYS.managedUsers) || '[]', []);
+    state.accessRequests = Array.isArray(requests) ? requests : [];
+    state.managedUsers = Array.isArray(users) ? users : [];
+
+    // Seed a default local login user if missing (short-term bootstrap)
+    const hasDefault = (state.managedUsers || []).some(u =>
+        String(u.email || '').toLowerCase() === 'mhill@oraclinical.com' ||
+        String(u.username || '').toLowerCase() === 'mhill@oraclinical.com'
+    );
+    if (!hasDefault) {
+        state.managedUsers = [{
+            id: ensureId('usr'),
+            createdAt: new Date().toISOString(),
+            username: 'mhill@oraclinical.com',
+            email: 'mhill@oraclinical.com',
+            role: 'Internal',
+            password: 'Password1!',
+            allowedSiteIds: [],
+            access: { always: true, startDate: '', endDate: '' },
+        }, ...(state.managedUsers || [])];
+        saveLocalState();
+    }
+};
+
+const authenticateLocalUser = (identifier, password) => {
+    const id = String(identifier || '').trim().toLowerCase();
+    const pw = String(password || '');
+    if (!id || !pw) return null;
+    return (state.managedUsers || []).find(u => {
+        const email = String(u.email || '').trim().toLowerCase();
+        const user = String(u.username || '').trim().toLowerCase();
+        return (email === id || user === id) && String(u.password || '') === pw;
+    }) || null;
+};
+
+const saveLocalState = () => {
+    localStorage.setItem(LS_KEYS.accessRequests, JSON.stringify(state.accessRequests || []));
+    localStorage.setItem(LS_KEYS.managedUsers, JSON.stringify(state.managedUsers || []));
+};
+
+const randomPassword = (length = 14) => {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%*?';
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    let out = '';
+    for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
+    return out;
+};
+
+const ensureId = (prefix = 'id') => `${prefix}_${Math.random().toString(36).slice(2, 10)}_${Date.now()}`;
 // --- DOM ELEMENTS ---
 const mainContent = document.getElementById('main-content');
 const navMenu = document.getElementById('nav-menu');
@@ -950,6 +870,13 @@ const render = () => {
                 </div>`;
             return;
         }
+
+        if (state.showLoginGate) {
+            mainContent.innerHTML = getLoginGateHTML();
+            if (typeof lucide !== 'undefined') lucide.createIcons();
+            setTimeout(() => setupLoginGate(), 50);
+            return;
+        }
         
         renderNav();
         renderContent();
@@ -1000,9 +927,10 @@ const renderNav = () => {
         { id: 'studies', label: 'Studies', icon: 'file-text', hasDropdown: true },
         { id: 'patients', label: 'Patients', icon: 'users' },
         { id: 'sites', label: 'Sites', icon: 'building' },
+        { id: 'requestAccess', label: 'Request Access', icon: 'user-plus' },
+        { id: 'manageR', label: 'ManageR', icon: 'shield-check' },
         { id: 'surveys', label: 'Surveys', icon: 'clipboard-list' },
         { id: 'scheduling', label: 'Scheduling', icon: 'calendar' },
-        { id: 'users', label: 'Users', icon: 'users-round' },
         { id: 'reporting', label: 'Reporting', icon: 'trending-up' },
         { id: 'duplicates', label: 'Duplicates', icon: 'copy-x' },
     ];
@@ -1043,38 +971,6 @@ const renderNav = () => {
                     <span class="ml-3">${item.label}</span>
                 </button>`;
     }).join('');
-
-    // PII reveal toggle (display-only; does not affect exports)
-    navMenu.innerHTML += `
-        <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-            <button data-action="toggle-pii" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700">
-                <i data-lucide="${state.revealPII ? 'unlock' : 'lock'}" class="w-5 h-5"></i>
-                <span class="ml-3">${state.revealPII ? 'Hide PII/PHI' : 'Reveal PII/PHI'}</span>
-            </button>
-        </div>
-    `;
-
-    // Entra sign-in/out (only shown when configured)
-    if (ENTRA_TENANT_ID && ENTRA_SPA_CLIENT_ID && Array.isArray(ENTRA_API_SCOPES) && ENTRA_API_SCOPES.length > 0) {
-        navMenu.innerHTML += `
-            <div class="mt-2">
-                ${entraAccount ? `
-                    <div class="px-4 py-2 text-xs text-gray-500 dark:text-gray-400 truncate">
-                        Signed in: ${entraAccount.username || entraAccount.name || 'User'}
-                    </div>
-                    <button data-action="entra-logout" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700">
-                        <i data-lucide="log-out" class="w-5 h-5"></i>
-                        <span class="ml-3">Sign out</span>
-                    </button>
-                ` : `
-                    <button data-action="entra-login" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700">
-                        <i data-lucide="log-in" class="w-5 h-5"></i>
-                        <span class="ml-3">Sign in</span>
-                    </button>
-                `}
-            </div>
-        `;
-    }
 };
 const renderContent = () => {
     const contentMap = {
@@ -1083,9 +979,10 @@ const renderContent = () => {
         studies: getStudiesHTML,
         patients: getPatientsHTML,
         sites: getSitesHTML,
+        requestAccess: getRequestAccessHTML,
+        manageR: getManageRHTML,
         surveys: getSurveysHTML,
         scheduling: getSchedulingHTML,
-        users: getUsersHTML,
         reporting: getReportingHTML,
         duplicates: getDuplicatesHTML,
     };
@@ -1125,6 +1022,12 @@ const renderContent = () => {
     if (state.activeTab === 'sites') {
         renderSiteTable();
         setTimeout(() => setupSearchInputs(), 100);
+    }
+    if (state.activeTab === 'requestAccess') {
+        setTimeout(() => setupRequestAccessForm(), 50);
+    }
+    if (state.activeTab === 'manageR') {
+        setTimeout(() => setupManageR(), 50);
     }
     if (state.activeTab === 'surveys' && !document.getElementById('questions-container')?.children.length) {
         addQuestionToSurveyForm();
@@ -2219,11 +2122,6 @@ const getSitesHTML = () => `
         <div class="flex justify-between items-center mb-6">
             <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Clinical Sites</h2>
         </div>
-        ${state.currentUser ? `
-            <div class="mb-4 p-3 rounded-md bg-blue-50 dark:bg-blue-900/20 text-blue-800 dark:text-blue-200 text-sm">
-                Viewing sites for: <strong>${state.currentUser.displayName || state.currentUser.email || 'User'}</strong>
-            </div>
-        ` : ''}
         <div class="mb-4">
             <input type="text" id="site-search" value="${state.siteSearchTerm}" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Search for a site...">
         </div>
@@ -2246,10 +2144,7 @@ const getSitesHTML = () => `
 const renderSiteTable = () => {
     const tableBody = document.getElementById('site-table-body');
     if (!tableBody) return;
-    const allowedSiteIds = state.currentUser && Array.isArray(state.currentUser.allowedSiteIds) ? state.currentUser.allowedSiteIds : null;
-    const filteredSites = state.sites
-        .filter(s => s.name.toLowerCase().includes(state.siteSearchTerm.toLowerCase()))
-        .filter(s => !allowedSiteIds || allowedSiteIds.includes(s.id));
+    const filteredSites = state.sites.filter(s => s.name.toLowerCase().includes(state.siteSearchTerm.toLowerCase()));
     
     tableBody.innerHTML = filteredSites.map(site => {
         // Calculate screen fail rate for this site
@@ -2433,9 +2328,8 @@ const getSchedulingHTML = () => {
        <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Generated Schedules</h3>
             <div id="schedules-list" class="space-y-4">${state.schedules.length === 0 ? '<p class="text-center text-gray-500 dark:text-gray-400 py-8">No schedules created yet.</p>' : state.schedules.map(s => {
-                const slots = Array.isArray(s.slots) ? s.slots : [];
-                const totalCapacity = slots.reduce((sum, slot) => sum + (slot.capacity || 0), 0);
-                const totalBooked = slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
+                const totalCapacity = s.slots.reduce((sum, slot) => sum + slot.capacity, 0);
+                const totalBooked = s.slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
                 const availableSlots = totalCapacity - totalBooked;
                 return `<div class="p-4 border dark:border-gray-700 rounded-lg dark:text-gray-300 flex justify-between items-center">
                     <div>
@@ -2491,114 +2385,6 @@ const getSchedulingHTML = () => {
         </div>
     </div>
     ${currentViewHTML}
-    `;
-};
-
-// =================================================================================
-// USER / MANAGER SECTION
-// =================================================================================
-
-const getUsersHTML = () => {
-    const currentLabel = state.currentUser ? (state.currentUser.displayName || state.currentUser.email || 'User') : 'Not linked';
-    return `
-        <div class="flex justify-between items-center mb-6 flex-wrap gap-4">
-            <div>
-                <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">User Manager</h2>
-                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Controls which sites each user can see. Optionally link users to Entra by OID.</p>
-            </div>
-            <div class="flex items-center gap-2">
-                <button data-action="refresh-users" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-700 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-600 text-sm">Refresh</button>
-                <button data-action="create-user-modal" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700 text-sm">New User</button>
-            </div>
-        </div>
-
-        <div class="mb-4 p-3 rounded-md bg-gray-50 dark:bg-gray-800 text-sm text-gray-700 dark:text-gray-300">
-            <strong>Current user link:</strong> ${currentLabel}
-        </div>
-
-        <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden">
-            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                <thead class="bg-gray-50 dark:bg-gray-700">
-                    <tr>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Display Name</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Email</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Entra OID</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Sites</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th>
-                    </tr>
-                </thead>
-                <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                    ${(state.users || []).map(u => {
-                        const siteCount = Array.isArray(u.allowedSiteIds) ? u.allowedSiteIds.length : 0;
-                        return `
-                            <tr class="dark:text-gray-300">
-                                <td class="px-6 py-4 font-medium">${u.displayName || 'N/A'}</td>
-                                <td class="px-6 py-4">${u.email || 'N/A'}</td>
-                                <td class="px-6 py-4 text-xs">${u.entraOid || '—'}</td>
-                                <td class="px-6 py-4">${u.role || 'user'}</td>
-                                <td class="px-6 py-4">${siteCount}</td>
-                                <td class="px-6 py-4 flex items-center gap-3">
-                                    <button data-action="edit-user" data-id="${u.id}" class="text-blue-600 dark:text-blue-400 hover:underline text-sm">Edit</button>
-                                    <button data-action="delete-user" data-id="${u.id}" class="text-red-600 dark:text-red-400 hover:underline text-sm">Delete</button>
-                                </td>
-                            </tr>
-                        `;
-                    }).join('')}
-                    ${(state.users || []).length === 0 ? `
-                        <tr><td colspan="6" class="px-6 py-10 text-center text-gray-500 dark:text-gray-400">No users yet.</td></tr>
-                    ` : ''}
-                </tbody>
-            </table>
-        </div>
-    `;
-};
-
-const getUserModalHTML = (user = null) => {
-    const isEdit = !!user;
-    const allowed = user && Array.isArray(user.allowedSiteIds) ? user.allowedSiteIds : [];
-    return `
-        <h2 class="text-2xl font-bold dark:text-white mb-4">${isEdit ? 'Edit User' : 'Create User'}</h2>
-        <form id="${isEdit ? 'edit-user-form' : 'create-user-form'}" ${isEdit ? `data-id="${user.id}"` : ''} class="space-y-4">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                    <label class="block text-sm font-medium dark:text-gray-300">Display Name</label>
-                    <input type="text" name="displayName" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${user?.displayName || ''}" required>
-                </div>
-                <div>
-                    <label class="block text-sm font-medium dark:text-gray-300">Email</label>
-                    <input type="email" name="email" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${user?.email || ''}">
-                </div>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                    <label class="block text-sm font-medium dark:text-gray-300">Entra OID (optional)</label>
-                    <input type="text" name="entraOid" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${user?.entraOid || ''}" placeholder="GUID from Entra user objectId">
-                </div>
-                <div>
-                    <label class="block text-sm font-medium dark:text-gray-300">Role</label>
-                    <select name="role" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                        ${['user','manager','admin','external'].map(r => `<option value="${r}" ${user?.role === r ? 'selected' : ''}>${r}</option>`).join('')}
-                    </select>
-                </div>
-            </div>
-            <div>
-                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Allowed Sites</label>
-                <div class="max-h-48 overflow-y-auto border dark:border-gray-600 rounded p-2 bg-white dark:bg-gray-800">
-                    ${(state.sites || []).map(s => `
-                        <label class="flex items-center gap-2 py-1 px-2 rounded hover:bg-gray-50 dark:hover:bg-gray-700">
-                            <input type="checkbox" name="allowedSiteIds" value="${s.id}" ${allowed.includes(s.id) ? 'checked' : ''}>
-                            <span class="text-sm dark:text-gray-200">${s.name}</span>
-                        </label>
-                    `).join('')}
-                    ${(state.sites || []).length === 0 ? `<div class="text-sm text-gray-500 dark:text-gray-400">No sites loaded yet.</div>` : ''}
-                </div>
-            </div>
-            <div class="flex justify-end gap-4 pt-2">
-                <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
-                <button type="submit" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">${isEdit ? 'Save' : 'Create'}</button>
-            </div>
-        </form>
     `;
 };
 // --- MODAL HTML GETTERS ---
@@ -2742,12 +2528,7 @@ const getPatientProfileHTML = (patient) => {
     }
     return `
         <div class="flex justify-between items-start mb-6">
-            <div class="flex items-center gap-3">
-                <h2 class="text-2xl font-bold dark:text-white">${patient.firstName} ${patient.lastName}</h2>
-                <button data-action="toggle-pii" class="text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">
-                    ${state.revealPII ? 'Hide PII/PHI' : 'Reveal PII/PHI'}
-                </button>
-            </div>
+            <h2 class="text-2xl font-bold dark:text-white">${patient.firstName} ${patient.lastName}</h2>
             <button data-action="close-side-panel" class="text-gray-500 dark:text-gray-300 hover:text-gray-800 dark:hover:text-white">
                 <i data-lucide="x"></i>
             </button>
@@ -2789,10 +2570,10 @@ const getPatientProfileHTML = (patient) => {
                     <div class="space-y-2">
                         <p><strong>Global ID:</strong> ${patient.globalId || 'N/A'}</p>
                         <p><strong>Initials:</strong> ${patient.initials || 'N/A'}</p>
-                        <p><strong>Phone:</strong> ${displayPII(patient.phoneNumber, 'phone')}</p>
-                        <p><strong>Email:</strong> ${displayPII(patient.email, 'email')}</p>
-                        <p><strong>DOB:</strong> ${displayPII(patient.dob, 'dob')}</p>
-                        <p><strong>Address:</strong> ${displayPII(patient.address, 'address')}</p>
+                        <p><strong>Phone:</strong> ${patient.phoneNumber || 'N/A'}</p>
+                        <p><strong>Email:</strong> ${patient.email || 'N/A'}</p>
+                        <p><strong>DOB:</strong> ${patient.dob || 'N/A'}</p>
+                        <p><strong>Address:</strong> ${patient.address || 'N/A'}</p>
                         <p><strong>City:</strong> ${patient.city || 'N/A'}</p>
                         <p><strong>State:</strong> ${patient.state || 'N/A'}</p>
                         <p><strong>Zip:</strong> ${patient.zipCode || 'N/A'}</p>
@@ -3036,6 +2817,512 @@ const getEditPatientModalHTML = (patient) => {
     `;
 };
 
+const getLoginGateHTML = () => {
+    return `
+        <div class="min-h-[70vh] flex items-center justify-center">
+            <div class="max-w-xl w-full bg-white dark:bg-gray-800 p-8 rounded-lg shadow-xl">
+                <div class="flex items-center gap-3 mb-4">
+                    <div class="p-3 rounded-full bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-200">
+                        <i data-lucide="lock" class="w-6 h-6"></i>
+                    </div>
+                    <div>
+                        <h2 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Welcome to N.A.S.A.</h2>
+                        <p class="text-sm text-gray-600 dark:text-gray-400">Sign in to continue, or request access if you’re new.</p>
+                    </div>
+                </div>
+
+                <form id="login-gate-form" class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email / Username</label>
+                        <input id="login-gate-identifier" name="identifier" type="text" autocomplete="username" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="mhill@oraclinical.com">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Password</label>
+                        <input id="login-gate-password" name="password" type="password" autocomplete="current-password" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="Password1!">
+                    </div>
+
+                    <button type="submit" data-action="login-gate-signin" class="w-full px-4 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 flex items-center justify-center gap-2">
+                        <i data-lucide="log-in" class="w-5 h-5"></i>
+                        <span>Sign in</span>
+                    </button>
+
+                    <button type="button" data-action="login-gate-request-access" class="w-full px-4 py-3 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
+                        <i data-lucide="user-plus" class="w-5 h-5"></i>
+                        <span>Request Access</span>
+                    </button>
+                </form>
+
+                <div class="mt-4 text-xs text-gray-500 dark:text-gray-400">
+                    Local login is enabled as a short-term placeholder until Entra auth is wired in.
+                </div>
+            </div>
+        </div>
+    `;
+};
+
+const setupLoginGate = () => {
+    const form = document.getElementById('login-gate-form');
+    if (!form || form.dataset.bound === 'true') return;
+    form.dataset.bound = 'true';
+    form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        // Delegate to global click handler action to keep behavior consistent
+        const btn = document.querySelector('button[data-action="login-gate-signin"]');
+        if (btn) btn.click();
+    });
+};
+
+const getRequestAccessHTML = () => {
+    const activeSites = (state.sites || []).filter(s => (s.status || 'Active') === 'Active');
+    const siteOptions = (() => {
+        if (!state.sites || state.sites.length === 0) {
+            return `<option value="">Loading sites...</option>`;
+        }
+        if (activeSites.length === 0) {
+            return `<option value="">No active sites available</option>`;
+        }
+        return `
+            <option value="">Select a site</option>
+            ${activeSites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}
+        `;
+    })();
+
+    return `
+        <div class="max-w-3xl">
+            <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-2">Request Access</h2>
+            <p class="text-gray-600 dark:text-gray-400 mb-6">
+                Use this page to request access to one or more clinical sites. This is a stub UI—wire it to your preferred backend/workflow when ready.
+            </p>
+
+            <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
+                <form id="request-access-form" class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Requested Site</label>
+                        <select id="request-site-id" name="siteId" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                            ${siteOptions}
+                        </select>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Sites are sourced from the same Sites collection (Artemis/NASA) used elsewhere in the app.</p>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Full Name</label>
+                            <input id="request-full-name" name="fullName" type="text" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="Jane Doe">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email</label>
+                            <input id="request-email" name="email" type="email" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="jane.doe@company.com">
+                        </div>
+                    </div>
+
+                    <div class="bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-md p-4">
+                        <div class="flex items-center justify-between gap-4">
+                            <div>
+                                <div class="font-semibold text-gray-800 dark:text-gray-200">Dates of access</div>
+                                <div class="text-xs text-gray-500 dark:text-gray-400">If “Always allow access” is checked, dates are ignored.</div>
+                            </div>
+                            <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                                <input id="request-access-always" type="checkbox" name="alwaysAllowAccess" class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                                <span>Always allow access</span>
+                            </label>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Start date</label>
+                                <input id="request-access-start" name="accessStartDate" type="date" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">End date</label>
+                                <input id="request-access-end" name="accessEndDate" type="date" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Reason / Notes</label>
+                        <textarea id="request-notes" name="notes" rows="4" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="Describe what you need access to and why."></textarea>
+                    </div>
+
+                    <div class="flex items-center justify-between gap-3">
+                        <div class="text-xs text-gray-500 dark:text-gray-400">
+                            Submitting currently only shows a confirmation (no server call yet).
+                        </div>
+                        <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">
+                            Submit Request
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+};
+
+const setupRequestAccessForm = () => {
+    const form = document.getElementById('request-access-form');
+    if (!form) return;
+
+    // Avoid duplicate bindings on re-render
+    if (form.dataset.bound === 'true') return;
+    form.dataset.bound = 'true';
+
+    form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const siteId = document.getElementById('request-site-id')?.value || '';
+        const siteName = state.sites.find(s => s.id === siteId)?.name || siteId || 'Unknown site';
+        const email = document.getElementById('request-email')?.value || '';
+        const fullName = document.getElementById('request-full-name')?.value || '';
+        const notes = document.getElementById('request-notes')?.value || '';
+        const alwaysAllowAccess = Boolean(document.getElementById('request-access-always')?.checked);
+        const accessStartDate = document.getElementById('request-access-start')?.value || '';
+        const accessEndDate = document.getElementById('request-access-end')?.value || '';
+
+        const req = {
+            id: ensureId('req'),
+            createdAt: new Date().toISOString(),
+            status: 'pending',
+            siteId,
+            siteName,
+            email,
+            fullName,
+            notes,
+            access: {
+                always: alwaysAllowAccess,
+                startDate: alwaysAllowAccess ? '' : accessStartDate,
+                endDate: alwaysAllowAccess ? '' : accessEndDate,
+            },
+        };
+        state.accessRequests = [req, ...(state.accessRequests || [])];
+        saveLocalState();
+
+        console.log('Request Access (local):', req);
+        showNotification(`Request submitted for: ${siteName}`, 'success');
+
+        // Keep values for the user (they may want to copy/paste into another workflow)
+    });
+};
+
+const getManageRHTML = () => {
+    const pending = (state.accessRequests || []).filter(r => (r.status || 'pending') === 'pending');
+    const users = (state.managedUsers || []);
+    const activeSites = (state.sites || []).filter(s => (s.status || 'Active') === 'Active');
+
+    const sitesChecklistHTML = (selectedIds = [], name = 'allowedSiteIds') => {
+        if (!activeSites.length) return `<div class="text-sm text-gray-500 dark:text-gray-400">No active sites loaded yet.</div>`;
+        const selected = new Set(selectedIds || []);
+        return `
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-64 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
+                ${activeSites.map(s => `
+                    <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                        <input type="checkbox" name="${name}" value="${s.id}" ${selected.has(s.id) ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                        <span>${s.name}</span>
+                    </label>
+                `).join('')}
+            </div>
+        `;
+    };
+
+    return `
+        <div class="space-y-6">
+            <div>
+                <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">ManageR</h2>
+                <p class="text-gray-600 dark:text-gray-400">Review access requests and manage local users/roles/site permissions.</p>
+            </div>
+
+            <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-xl font-semibold text-gray-800 dark:text-gray-200">Pending Requests</h3>
+                        <span class="text-xs px-2 py-1 rounded-full bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200">${pending.length} pending</span>
+                    </div>
+                    ${pending.length ? `
+                        <div class="space-y-3">
+                            ${pending.map(r => `
+                                <div class="border border-gray-200 dark:border-gray-700 rounded-md p-4">
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div>
+                                            <div class="font-semibold text-gray-800 dark:text-gray-200">${r.fullName || '(no name)'} <span class="text-sm font-normal text-gray-500 dark:text-gray-400">${r.email || ''}</span></div>
+                                            <div class="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                                <strong>Site:</strong> ${r.siteName || r.siteId || 'N/A'}
+                                            </div>
+                                            ${r.notes ? `<div class="text-sm text-gray-600 dark:text-gray-300 mt-2 whitespace-pre-wrap">${r.notes}</div>` : ''}
+                                            <div class="text-xs text-gray-500 dark:text-gray-500 mt-2">
+                                                Submitted: ${new Date(r.createdAt).toLocaleString()}
+                                                ${r.access ? ` • Access: ${r.access.always ? 'Always' : `${r.access.startDate || 'N/A'} → ${r.access.endDate || 'N/A'}`}` : ''}
+                                            </div>
+                                        </div>
+                                        <div class="flex flex-col gap-2">
+                                            <button data-action="manageR-approve-request" data-request-id="${r.id}" class="px-3 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 text-sm">Approve</button>
+                                            <button data-action="manageR-deny-request" data-request-id="${r.id}" class="px-3 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 text-sm">Deny</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No pending requests.</div>`}
+                </div>
+
+                <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
+                    <h3 class="text-xl font-semibold text-gray-800 dark:text-gray-200 mb-4">Create User</h3>
+                    <form id="manageR-create-user-form" class="space-y-4">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Username</label>
+                                <input name="username" id="manageR-username" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="jdoe">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email</label>
+                                <input name="email" id="manageR-email" type="email" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="jdoe@company.com">
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Role</label>
+                                <select name="role" id="manageR-role" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="coordinator">coordinator</option>
+                                    <option value="PI">PI</option>
+                                    <option value="Site">Site</option>
+                                    <option value="Internal">Internal</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Password</label>
+                                <div class="mt-1 flex gap-2">
+                                    <input name="password" id="manageR-password" required class="flex-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="Click Generate">
+                                    <button type="button" data-action="manageR-generate-password" class="px-3 py-2 bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-100 rounded-md hover:bg-gray-300 dark:hover:bg-gray-500 text-sm">Generate</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-md p-4">
+                            <div class="flex items-center justify-between gap-4">
+                                <div>
+                                    <div class="font-semibold text-gray-800 dark:text-gray-200">Dates of access</div>
+                                    <div class="text-xs text-gray-500 dark:text-gray-400">If “Always allow access” is checked, dates are ignored.</div>
+                                </div>
+                                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                                    <input id="manageR-access-always" type="checkbox" name="alwaysAllowAccess" class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                                    <span>Always allow access</span>
+                                </label>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Start date</label>
+                                    <input id="manageR-access-start" name="accessStartDate" type="date" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">End date</label>
+                                    <input id="manageR-access-end" name="accessEndDate" type="date" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Site Access</label>
+                            ${sitesChecklistHTML([], 'allowedSiteIds')}
+                        </div>
+
+                        <div class="flex justify-end">
+                            <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">Create User</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xl font-semibold text-gray-800 dark:text-gray-200">Users</h3>
+                    <span class="text-xs px-2 py-1 rounded-full bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200">${users.length} users</span>
+                </div>
+                ${users.length ? `
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="text-left text-gray-600 dark:text-gray-300 border-b border-gray-200 dark:border-gray-700">
+                                    <th class="py-2 pr-3">Username</th>
+                                    <th class="py-2 pr-3">Role</th>
+                                    <th class="py-2 pr-3">Sites</th>
+                                    <th class="py-2 pr-3">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${users.map(u => {
+                                    const siteCount = (u.allowedSiteIds || []).length;
+                                    return `
+                                        <tr class="border-b border-gray-100 dark:border-gray-700 text-gray-700 dark:text-gray-200">
+                                            <td class="py-2 pr-3 font-medium">${u.username}</td>
+                                            <td class="py-2 pr-3">${u.role || ''}</td>
+                                            <td class="py-2 pr-3">${siteCount}</td>
+                                            <td class="py-2 pr-3">
+                                                <button data-action="manageR-edit-user" data-user-id="${u.id}" class="px-3 py-1.5 bg-gray-200 dark:bg-gray-600 rounded-md hover:bg-gray-300 dark:hover:bg-gray-500 text-sm">Edit</button>
+                                                <button data-action="manageR-delete-user" data-user-id="${u.id}" class="px-3 py-1.5 bg-red-600 text-white rounded-md hover:bg-red-700 text-sm ml-2">Delete</button>
+                                            </td>
+                                        </tr>
+                                    `;
+                                }).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No users created yet.</div>`}
+            </div>
+        </div>
+    `;
+};
+
+const setupManageR = () => {
+    const form = document.getElementById('manageR-create-user-form');
+    if (form && form.dataset.bound !== 'true') {
+        form.dataset.bound = 'true';
+        form.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const fd = new FormData(form);
+            const allowedSiteIds = fd.getAll('allowedSiteIds').map(String);
+            const alwaysAllowAccess = String(fd.get('alwaysAllowAccess') || '') === 'on';
+            const accessStartDate = String(fd.get('accessStartDate') || '');
+            const accessEndDate = String(fd.get('accessEndDate') || '');
+            const user = {
+                id: ensureId('usr'),
+                createdAt: new Date().toISOString(),
+                username: String(fd.get('username') || '').trim(),
+                email: String(fd.get('email') || '').trim(),
+                role: String(fd.get('role') || '').trim(),
+                password: String(fd.get('password') || ''),
+                allowedSiteIds,
+                access: {
+                    always: alwaysAllowAccess,
+                    startDate: alwaysAllowAccess ? '' : accessStartDate,
+                    endDate: alwaysAllowAccess ? '' : accessEndDate,
+                },
+            };
+            if (!user.username) {
+                showNotification('Username is required.', 'error');
+                return;
+            }
+            state.managedUsers = [user, ...(state.managedUsers || [])];
+            saveLocalState();
+            showNotification(`User created: ${user.username}`, 'success');
+            render();
+        });
+    }
+};
+
+const getEditManagedUserModalHTML = (user) => {
+    const activeSites = (state.sites || []).filter(s => (s.status || 'Active') === 'Active');
+    const selected = new Set(user.allowedSiteIds || []);
+    const access = user.access || {};
+    const accessAlways = Boolean(access.always);
+    const accessStart = access.startDate || '';
+    const accessEnd = access.endDate || '';
+    const sitesHTML = activeSites.length ? `
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-72 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
+            ${activeSites.map(s => `
+                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                    <input type="checkbox" name="allowedSiteIds" value="${s.id}" ${selected.has(s.id) ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                    <span>${s.name}</span>
+                </label>
+            `).join('')}
+        </div>
+    ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No active sites loaded yet.</div>`;
+
+    return `
+        <h2 class="text-2xl font-bold text-gray-800 dark:text-gray-200 mb-4">Edit User: ${user.username}</h2>
+        <form id="manageR-edit-user-form" data-user-id="${user.id}" class="space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Username</label>
+                    <input name="username" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="${user.username || ''}">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email</label>
+                    <input name="email" type="email" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="${user.email || ''}">
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Role</label>
+                    <select name="role" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                        ${['coordinator','PI','Site','Internal'].map(r => `<option value="${r}" ${String(user.role) === r ? 'selected' : ''}>${r}</option>`).join('')}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Password</label>
+                    <div class="mt-1 flex gap-2">
+                        <input name="password" id="manageR-edit-password" required class="flex-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="${user.password || ''}">
+                        <button type="button" data-action="manageR-generate-edit-password" class="px-3 py-2 bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-100 rounded-md hover:bg-gray-300 dark:hover:bg-gray-500 text-sm">Generate</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-md p-4">
+                <div class="flex items-center justify-between gap-4">
+                    <div>
+                        <div class="font-semibold text-gray-800 dark:text-gray-200">Dates of access</div>
+                        <div class="text-xs text-gray-500 dark:text-gray-400">If “Always allow access” is checked, dates are ignored.</div>
+                    </div>
+                    <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                        <input id="manageR-edit-access-always" type="checkbox" name="alwaysAllowAccess" ${accessAlways ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                        <span>Always allow access</span>
+                    </label>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Start date</label>
+                        <input id="manageR-edit-access-start" name="accessStartDate" type="date" value="${accessStart}" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">End date</label>
+                        <input id="manageR-edit-access-end" name="accessEndDate" type="date" value="${accessEnd}" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                    </div>
+                </div>
+            </div>
+
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Site Access</label>
+                ${sitesHTML}
+            </div>
+
+            <div class="flex justify-end gap-3 pt-2">
+                <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">Save</button>
+            </div>
+        </form>
+    `;
+};
+
+const setupEditManagedUserForm = (userId) => {
+    const form = document.getElementById('manageR-edit-user-form');
+    if (!form || form.dataset.bound === 'true') return;
+    form.dataset.bound = 'true';
+
+    form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const fd = new FormData(form);
+        const allowedSiteIds = fd.getAll('allowedSiteIds').map(String);
+        const alwaysAllowAccess = String(fd.get('alwaysAllowAccess') || '') === 'on';
+        const accessStartDate = String(fd.get('accessStartDate') || '');
+        const accessEndDate = String(fd.get('accessEndDate') || '');
+        const next = {
+            username: String(fd.get('username') || '').trim(),
+            email: String(fd.get('email') || '').trim(),
+            role: String(fd.get('role') || '').trim(),
+            password: String(fd.get('password') || ''),
+            allowedSiteIds,
+            access: {
+                always: alwaysAllowAccess,
+                startDate: alwaysAllowAccess ? '' : accessStartDate,
+                endDate: alwaysAllowAccess ? '' : accessEndDate,
+            },
+            lastUpdated: new Date().toISOString(),
+        };
+        state.managedUsers = (state.managedUsers || []).map(u => u.id === userId ? { ...u, ...next } : u);
+        saveLocalState();
+        showNotification('User updated.', 'success');
+        closeModal();
+        render();
+    });
+};
 const getEditStudyModalHTML = (study) => {
     const studySiteIds = study.siteIds || [];
     const assignedSites = state.sites.filter(site => studySiteIds.includes(site.id));
@@ -3123,9 +3410,8 @@ const getEditScheduleModalHTML = (schedule) => {
     
     const study = state.studies.find(s => s.id === schedule.studyId);
     const site = state.sites.find(s => s.id === schedule.siteId);
-    const slots = Array.isArray(schedule.slots) ? schedule.slots : [];
-    const totalCapacity = slots.reduce((sum, slot) => sum + (slot.capacity || 0), 0);
-    const totalBooked = slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
+    const totalCapacity = schedule.slots.reduce((sum, slot) => sum + slot.capacity, 0);
+    const totalBooked = schedule.slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
     const availableSlots = totalCapacity - totalBooked;
     
     return `
@@ -3135,7 +3421,7 @@ const getEditScheduleModalHTML = (schedule) => {
             <p class="dark:text-gray-300"><strong>Visit:</strong> ${schedule.visit || 'General'}</p>
             <p class="dark:text-gray-300"><strong>Study:</strong> ${study?.title || 'N/A'}</p>
             <p class="dark:text-gray-300"><strong>Site:</strong> ${site?.name || 'N/A'}</p>
-            <p class="dark:text-gray-300"><strong>Total Slots:</strong> ${slots.length}</p>
+            <p class="dark:text-gray-300"><strong>Total Slots:</strong> ${schedule.slots.length}</p>
             <p class="dark:text-gray-300"><strong>Total Capacity:</strong> ${totalCapacity}</p>
             <p class="dark:text-gray-300"><strong>Booked:</strong> ${totalBooked}</p>
             <p class="dark:text-gray-300"><strong>Available:</strong> ${availableSlots}</p>
@@ -3158,7 +3444,7 @@ const getEditScheduleModalHTML = (schedule) => {
         <div class="mt-8">
             <h3 class="font-semibold text-lg dark:text-white mb-4">Individual Slots</h3>
             <div class="max-h-96 overflow-y-auto space-y-2">
-                ${slots.map((slot, index) => {
+                ${schedule.slots.map((slot, index) => {
                     const slotDate = new Date(slot.startTime);
                     const isBooked = (slot.booked || 0) > 0;
                     return `
@@ -4267,7 +4553,6 @@ document.addEventListener('click', async (e) => {
     const navButton = e.target.closest('.nav-item[data-tab]');
     if (navButton) {
         setState({ activeTab: navButton.dataset.tab });
-        updateDataRefreshInterval();
         if (window.innerWidth < 768) { // Close sidebar on mobile after navigation
             sidebar.classList.add('-translate-x-full');
             overlay.classList.add('opacity-0', 'pointer-events-none');
@@ -4325,57 +4610,33 @@ document.addEventListener('click', async (e) => {
     if (actionButton) {
         const { action, id, view, patientId, surveyId, qId, scheduleId, slotId, date, eventId, enrollmentIndex } = actionButton.dataset;
         switch (action) {
-            case 'close-modal':
-                closeModal();
-                break;
-            case 'close-side-panel':
-                closeSidePanel();
-                break;
-            case 'toggle-pii':
-                setState({ revealPII: !state.revealPII });
-                showNotification(state.revealPII ? "PII/PHI revealed (display only)." : "PII/PHI masked.", "info");
-                break;
-            case 'entra-login':
-                await entraLogin();
-                break;
-            case 'entra-logout':
-                await entraLogout();
-                break;
-            case 'refresh-users':
-                try {
-                    const allUsers = await fetchData('users');
-                    state.users = Array.isArray(allUsers) ? allUsers : [];
-                    await loadCurrentUserProfile();
-                    render();
-                    showNotification('Users refreshed.', 'success');
-                } catch (e) {
-                    console.error('Failed to refresh users:', e);
-                    showNotification('Failed to refresh users.', 'error');
-                }
-                break;
-            case 'create-user-modal':
-                openModal(getUserModalHTML(null), true);
-                break;
-            case 'edit-user': {
-                const u = (state.users || []).find(x => x.id === id);
-                openModal(getUserModalHTML(u || null), true);
+            case 'close-modal': closeModal(); break;
+            case 'close-side-panel': closeSidePanel(); break;
+            case 'login-gate-request-access': {
+                state.showLoginGate = false;
+                setState({ activeTab: 'requestAccess' });
                 break;
             }
-            case 'delete-user':
-                if (confirm('Delete this user?')) {
-                    try {
-                        await deleteDocument('users', id);
-                        const allUsers = await fetchData('users');
-                        state.users = Array.isArray(allUsers) ? allUsers : [];
-                        await loadCurrentUserProfile();
-                        render();
-                        showNotification('User deleted.', 'success');
-                    } catch (e) {
-                        console.error('Failed to delete user:', e);
-                        showNotification('Failed to delete user.', 'error');
-                    }
+            case 'login-gate-signin': {
+                const identifier = document.getElementById('login-gate-identifier')?.value || '';
+                const password = document.getElementById('login-gate-password')?.value || '';
+                const user = authenticateLocalUser(identifier, password);
+                if (!user) {
+                    showNotification('Invalid username/email or password.', 'error');
+                    break;
                 }
+                state.currentUser = {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    role: user.role,
+                };
+                state.userId = user.id || user.username || 'nasa-user';
+                state.showLoginGate = false;
+                showNotification(`Signed in as ${user.email || user.username}`, 'success');
+                render();
                 break;
+            }
             case 'create-study-modal': openModal(getCreateStudyModalHTML(), true); break;
             case 'create-site-modal': openModal(getCreateSiteModalHTML()); break;
             case 'set-scheduling-view': setState({ schedulingView: view }); break;
@@ -4650,6 +4911,90 @@ document.addEventListener('click', async (e) => {
             case 'export-csv': exportToCSV(); break;
             case 'export-surveys-csv': exportSurveysToCSV(); break;
             case 'export-participants': exportParticipants(); break;
+            case 'manageR-generate-password': {
+                const pw = randomPassword(14);
+                const pwInput = document.getElementById('manageR-password');
+                if (pwInput) pwInput.value = pw;
+                showNotification('Password generated.', 'success');
+                break;
+            }
+            case 'manageR-generate-edit-password': {
+                const pw = randomPassword(14);
+                const pwInput = document.getElementById('manageR-edit-password');
+                if (pwInput) pwInput.value = pw;
+                showNotification('Password generated.', 'success');
+                break;
+            }
+            case 'manageR-approve-request': {
+                const requestId = actionButton.dataset.requestId;
+                const req = (state.accessRequests || []).find(r => r.id === requestId);
+                if (!req) {
+                    showNotification('Request not found.', 'error');
+                    break;
+                }
+                // Prefill create-user form with request info
+                setState({ activeTab: 'manageR' });
+                setTimeout(() => {
+                    const emailEl = document.getElementById('manageR-email');
+                    const userEl = document.getElementById('manageR-username');
+                    const pwEl = document.getElementById('manageR-password');
+                    const alwaysEl = document.getElementById('manageR-access-always');
+                    const startEl = document.getElementById('manageR-access-start');
+                    const endEl = document.getElementById('manageR-access-end');
+                    if (emailEl && !emailEl.value) emailEl.value = req.email || '';
+                    if (userEl && !userEl.value && req.email) userEl.value = String(req.email).split('@')[0];
+                    if (pwEl && !pwEl.value) pwEl.value = randomPassword(14);
+
+                    // Auto-check requested site
+                    const cb = document.querySelector(`#manageR-create-user-form input[type="checkbox"][name="allowedSiteIds"][value="${req.siteId}"]`);
+                    if (cb) cb.checked = true;
+
+                    // Prefill requested access window (if present)
+                    const access = req.access || {};
+                    if (alwaysEl && typeof access.always === 'boolean') alwaysEl.checked = access.always;
+                    if (startEl && access.startDate && !startEl.value) startEl.value = access.startDate;
+                    if (endEl && access.endDate && !endEl.value) endEl.value = access.endDate;
+                }, 50);
+                req.status = 'approved';
+                req.approvedAt = new Date().toISOString();
+                saveLocalState();
+                showNotification('Request approved. Create the user on the right.', 'success');
+                render();
+                break;
+            }
+            case 'manageR-deny-request': {
+                const requestId = actionButton.dataset.requestId;
+                const req = (state.accessRequests || []).find(r => r.id === requestId);
+                if (!req) {
+                    showNotification('Request not found.', 'error');
+                    break;
+                }
+                req.status = 'denied';
+                req.deniedAt = new Date().toISOString();
+                saveLocalState();
+                showNotification('Request denied.', 'info');
+                render();
+                break;
+            }
+            case 'manageR-delete-user': {
+                const userId = actionButton.dataset.userId;
+                state.managedUsers = (state.managedUsers || []).filter(u => u.id !== userId);
+                saveLocalState();
+                showNotification('User deleted.', 'success');
+                render();
+                break;
+            }
+            case 'manageR-edit-user': {
+                const userId = actionButton.dataset.userId;
+                const user = (state.managedUsers || []).find(u => u.id === userId);
+                if (!user) {
+                    showNotification('User not found.', 'error');
+                    break;
+                }
+                openModal(getEditManagedUserModalHTML(user), true);
+                setTimeout(() => setupEditManagedUserForm(userId), 50);
+                break;
+            }
             case 'toggle-studies': {
                 setState({ studiesExpanded: !state.studiesExpanded });
                 break;
@@ -5000,55 +5345,6 @@ document.addEventListener('submit', async (e) => {
     const data = Object.fromEntries(formData.entries());
     // Removed Firebase collection reference - using Azure Cosmos DB API directly
     switch (form.id) {
-        case 'create-user-form': {
-            try {
-                const allowedSiteIds = formData.getAll('allowedSiteIds');
-                const newUser = {
-                    displayName: data.displayName || '',
-                    email: (data.email || '').trim(),
-                    entraOid: (data.entraOid || '').trim(),
-                    role: data.role || 'user',
-                    allowedSiteIds,
-                    lastUpdated: new Date().toISOString(),
-                };
-                await createDocument('users', newUser);
-                const allUsers = await fetchData('users');
-                state.users = Array.isArray(allUsers) ? allUsers : [];
-                await loadCurrentUserProfile();
-                closeModal();
-                render();
-                showNotification('User created.', 'success');
-            } catch (e) {
-                console.error('Create user failed:', e);
-                showNotification(`Failed to create user: ${e.message}`, 'error');
-            }
-            break;
-        }
-        case 'edit-user-form': {
-            try {
-                const userId = form.dataset.id;
-                const allowedSiteIds = formData.getAll('allowedSiteIds');
-                const updated = {
-                    displayName: data.displayName || '',
-                    email: (data.email || '').trim(),
-                    entraOid: (data.entraOid || '').trim(),
-                    role: data.role || 'user',
-                    allowedSiteIds,
-                    lastUpdated: new Date().toISOString(),
-                };
-                await updateDocument('users', userId, updated);
-                const allUsers = await fetchData('users');
-                state.users = Array.isArray(allUsers) ? allUsers : [];
-                await loadCurrentUserProfile();
-                closeModal();
-                render();
-                showNotification('User updated.', 'success');
-            } catch (e) {
-                console.error('Edit user failed:', e);
-                showNotification(`Failed to update user: ${e.message}`, 'error');
-            }
-            break;
-        }
         case 'add-contact-log-form': {
             const patientId = form.dataset.patientId;
             const newLog = {
@@ -5238,17 +5534,10 @@ document.addEventListener('submit', async (e) => {
                 
                 // Update the patient
                 await updateDocument('patients', patientId, { enrollments: newEnrollments });
-
-                // Update local state immediately so UI reflects enrollment without waiting for polling.
-                const patientIndex = state.patients.findIndex(p => p.id === patientId);
-                if (patientIndex > -1) {
-                    state.patients[patientIndex] = { ...state.patients[patientIndex], enrollments: newEnrollments };
-                }
-
+                
                 closeModal();
                 const overrideMsg = data.overrideWashout ? " (washout override applied)" : "";
                 showNotification(`Patient successfully enrolled!${overrideMsg}`, "success");
-                await loadAllData();
             } catch (error) {
                 console.error("Error enrolling patient:", error);
                 showNotification(`Failed to enroll patient: ${error.message}`, "error");
@@ -5302,16 +5591,9 @@ document.addEventListener('submit', async (e) => {
                 
                 // Update the patient
                 await updateDocument('patients', patientId, { enrollments: newEnrollments });
-
-                // Update local state immediately so UI reflects enrollment without waiting for polling.
-                const patientIndex = state.patients.findIndex(p => p.id === patientId);
-                if (patientIndex > -1) {
-                    state.patients[patientIndex] = { ...state.patients[patientIndex], enrollments: newEnrollments };
-                }
-
+                
                 closeModal();
                 showNotification("Patient successfully enrolled (washout override applied).", "success");
-                await loadAllData();
             } catch (error) {
                 console.error("Error enrolling patient with override:", error);
                 showNotification(`Failed to enroll patient: ${error.message}`, "error");
@@ -6448,8 +6730,8 @@ const renderDuplicateResults = (duplicateGroups) => {
                     ${group.map(p => `
                         <tr class="dark:text-gray-300">
                             <td class="px-6 py-4">${p.firstName} ${p.lastName}</td>
-                            <td class="px-6 py-4">${displayPII(p.dob, 'dob')}</td>
-                            <td class="px-6 py-4">${displayPII(p.email, 'email')}</td>
+                            <td class="px-6 py-4">${p.dob}</td>
+                            <td class="px-6 py-4">${p.email || 'N/A'}</td>
                             <td class="px-6 py-4 flex items-center gap-2">
                                 <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">View</button>
                                 <button data-action="delete-patient" data-id="${p.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
@@ -6579,19 +6861,13 @@ const loadAllData = async () => {
     try {
         console.log('Loading data from Azure Cosmos DB...');
         
-        // Load core collections first; defer heavier collections until needed by a tab.
-        const [studies, sites, patients, users] = await Promise.all([
+        // Load all collections in parallel
+        const [studies, sites, patients, schedules, surveys] = await Promise.all([
             fetchData('studies'),
             fetchData('sites'),
             fetchData('patients'),
-            fetchData('users'),
-        ]);
-
-        const needsSchedules = state.activeTab === 'scheduling' || state.activeTab === 'crcDashboard';
-        const needsSurveys = state.activeTab === 'surveys';
-        const [schedules, surveys] = await Promise.all([
-            needsSchedules ? fetchData('schedules') : Promise.resolve(state.schedules || []),
-            needsSurveys ? fetchData('surveys') : Promise.resolve(state.surveys || []),
+            fetchData('schedules'),
+            fetchData('surveys')
         ]);
         
         // Sort data appropriately
@@ -6603,12 +6879,8 @@ const loadAllData = async () => {
         state.studies = sortedStudies;
         state.sites = sortedSites;
         state.patients = sortedPatients;
-        state.users = Array.isArray(users) ? users : [];
         state.schedules = schedules;
         state.surveys = surveys;
-
-        // Refresh current user link after users loaded
-        await loadCurrentUserProfile();
         
         console.log('Data loaded successfully:', {
             studies: state.studies.length,
@@ -6632,20 +6904,9 @@ const loadAllData = async () => {
     }
 };
 
-// --- PERIODIC DATA REFRESH ---
-// Default: every minute. Scheduling tab: every 10 minutes.
-let dataRefreshIntervalId = null;
-let currentRefreshMs = null;
-const getRefreshMsForActiveTab = () => (state.activeTab === 'scheduling' ? 10 * 60 * 1000 : 60 * 1000);
+// Set up periodic data refresh (every 30 seconds)
 const setupDataRefresh = () => {
-    if (dataRefreshIntervalId) clearInterval(dataRefreshIntervalId);
-    currentRefreshMs = getRefreshMsForActiveTab();
-    dataRefreshIntervalId = setInterval(loadAllData, currentRefreshMs);
-};
-const updateDataRefreshInterval = () => {
-    const desiredMs = getRefreshMsForActiveTab();
-    if (dataRefreshIntervalId && desiredMs === currentRefreshMs) return;
-    setupDataRefresh();
+    setInterval(loadAllData, 30000); // Refresh every 30 seconds
 };
 // --- CTMS INTEGRATION ---
 /**
@@ -6713,9 +6974,10 @@ const init = async () => {
     
     // Initialize NASA with Azure Cosmos DB
     try {
-        await initEntra();
+        loadLocalState();
         state.authReady = true;
         state.userId = 'nasa-user';
+        state.showLoginGate = true;
         
         // Load initial data
         await loadAllData();
