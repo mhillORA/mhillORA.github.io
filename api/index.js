@@ -8,7 +8,7 @@ function generateId() {
 }
 
 // =================================================================================
-// ENTRA AUTH + AUDIT LOGGING (initial scaffolding)
+// ENTRA AUTH + AUDIT LOGGING
 // =================================================================================
 
 const ENTRA_TENANT_ID = process.env.ENTRA_TENANT_ID;
@@ -35,7 +35,6 @@ const getBearerToken = (request) => {
 const requireUser = async (request) => {
     if (ENTRA_AUTH_DISABLED) return { claims: null };
     if (!ENTRA_TENANT_ID || !ENTRA_API_AUDIENCE) {
-        // Not configured yet; keep behavior permissive for now.
         return { claims: null };
     }
     const token = getBearerToken(request);
@@ -147,15 +146,9 @@ const getIdFromRequest = (request) => {
 
 const validateStudiesSchema = (data) => {
     const errors = [];
-    
-    // Debug logging
-    console.log('Validating study data:', JSON.stringify(data, null, 2));
-    
-    // Check if this is CHAOS format (has name, color, requiredRoles, sites)
+
     const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
-    
-    console.log('Is CHAOS format:', isChaosFormat);
-    
+
     if (isChaosFormat) {
         // CHAOS format validation
         if (!data.name || typeof data.name !== 'string') {
@@ -249,11 +242,8 @@ const validateStudiesSchema = (data) => {
     }
     
     if (errors.length > 0) {
-        console.error('Study validation errors:', errors);
         throw new Error(`VALIDATION_ERROR: Studies validation failed: ${errors.join(', ')}`);
     }
-    
-    console.log('Study validation passed');
     return true;
 };
 
