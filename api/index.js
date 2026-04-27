@@ -2,14 +2,9 @@ const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 const { jwtVerify, createRemoteJWKSet } = require('jose');
 
-// Helper function to generate unique IDs
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
-
-// =================================================================================
-// ENTRA AUTH + AUDIT LOGGING
-// =================================================================================
 
 const ENTRA_TENANT_ID = process.env.ENTRA_TENANT_ID;
 const ENTRA_API_AUDIENCE = process.env.ENTRA_API_AUDIENCE; // typically your API app's clientId or Application ID URI
@@ -78,12 +73,10 @@ const writeAudit = async ({ action, containerName, method, targetId, actor, befo
         };
         await audits.items.create(record);
     } catch (e) {
-        // Do not block primary operation on audit failure.
         console.warn('Audit write failed:', e && e.message ? e.message : e);
     }
 };
 
-// Helper function to get Cosmos DB client (lazy initialization)
 let cosmosClient = null;
 let database = null;
 
@@ -103,13 +96,11 @@ const getCosmosClient = () => {
     return { client: cosmosClient, database };
 };
 
-// Helper function to get container
 const getContainer = (containerName) => {
     const { database } = getCosmosClient();
     return database.container(containerName);
 };
 
-// Helper function to handle errors
 const handleError = (context, error, message) => {
     context.log.error(`${message}:`, error.message);
     context.log.error(`Stack:`, error.stack);
@@ -135,14 +126,9 @@ const handleError = (context, error, message) => {
     };
 };
 
-// Helper to get ID from V4 route parameter
 const getIdFromRequest = (request) => {
     return request.params.id;
 };
-
-// =================================================================================
-// SCHEMA VALIDATION FUNCTIONS
-// =================================================================================
 
 const validateStudiesSchema = (data) => {
     const errors = [];
@@ -150,7 +136,6 @@ const validateStudiesSchema = (data) => {
     const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
 
     if (isChaosFormat) {
-        // CHAOS format validation
         if (!data.name || typeof data.name !== 'string') {
             errors.push('name is required and must be a string');
         }
@@ -191,7 +176,6 @@ const validateStudiesSchema = (data) => {
             errors.push('lastUpdated must be a string');
         }
     } else {
-        // ARTEMIS/NASA format validation
         if (!data.title || typeof data.title !== 'string') {
             errors.push('title is required and must be a string');
         }
@@ -596,10 +580,6 @@ const validateUsersSchema = (data) => {
     return true;
 };
 
-// =================================================================================
-// BUSINESS LOGIC FUNCTIONS
-// =================================================================================
-
 const calculateStudyEnrollment = async (studyId) => {
     try {
         const patientsContainer = getContainer('patients');
@@ -620,8 +600,6 @@ const calculateStudyEnrollment = async (studyId) => {
 const validateSiteStudyRelationship = async (siteId, studyId) => {
     try {
         const studiesContainer = getContainer('studies');
-        // NOTE: `container.item(id).read()` can fail with "not found" if the container uses a partition key
-        // that the SDK requires for point reads. Querying by id is more robust for this app.
         const { resources } = await studiesContainer.items
             .query({
                 query: "SELECT * FROM c WHERE c.id = @id",
@@ -644,18 +622,12 @@ const validateSiteStudyRelationship = async (siteId, studyId) => {
     }
 };
 
-// =================================================================================
-// ENHANCED CRUD HANDLERS
-// =================================================================================
-
 async function crudHandler(context, request, containerName) {
     const container = getContainer(containerName);
     const { method } = request;
     const id = getIdFromRequest(request);
 
     try {
-        // Entra auth (initial): if configured, require bearer token for non-OPTIONS.
-        // Claims are used for audits.
         const user = (method === 'OPTIONS') ? { claims: null } : await requireUser(request);
         const actor = buildActor(user.claims);
 
@@ -673,7 +645,6 @@ async function crudHandler(context, request, containerName) {
             case 'POST':
                 const body = await request.json();
                 
-                // Validate schema based on container
                 try {
                     switch (containerName) {
                         case 'studies':
@@ -696,7 +667,6 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'schedules':
                             validateSchedulesSchema(body);
-                            // Validate site-study relationship
                             await validateSiteStudyRelationship(body.siteId, body.studyId);
                             break;
                         case 'surveys':
@@ -728,7 +698,6 @@ async function crudHandler(context, request, containerName) {
                     after: createdItem,
                 });
                 
-                // Calculate enrollment for studies
                 if (containerName === 'studies') {
                     const enrollment = await calculateStudyEnrollment(createdItem.id);
                     createdItem.enrolled = enrollment;
@@ -740,7 +709,6 @@ async function crudHandler(context, request, containerName) {
                 const requestBody = await request.json();
                 const updateId = id || requestBody.id;
 
-                // Capture before for audit (best-effort).
                 let before = null;
                 try {
                     if (updateId) {
@@ -749,7 +717,6 @@ async function crudHandler(context, request, containerName) {
                     }
                 } catch {}
                 
-                // Validate schema based on container
                 try {
                     switch (containerName) {
                         case 'studies':
@@ -772,7 +739,6 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'schedules':
                             validateSchedulesSchema(requestBody);
-                            // Validate site-study relationship
                             await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
                             break;
                         case 'surveys':
@@ -804,7 +770,6 @@ async function crudHandler(context, request, containerName) {
                     after: result,
                 });
                 
-                // Calculate enrollment for studies
                 if (containerName === 'studies') {
                     const enrollment = await calculateStudyEnrollment(result.id);
                     result.enrolled = enrollment;
@@ -813,7 +778,6 @@ async function crudHandler(context, request, containerName) {
                 return { jsonBody: result };
 
             case 'DELETE':
-                // Capture before for audit (best-effort).
                 let beforeDelete = null;
                 try {
                     if (id) {
@@ -845,10 +809,6 @@ async function crudHandler(context, request, containerName) {
         return handleError(context, error, `Database operation failed on ${containerName}`);
     }
 }
-
-// =================================================================================
-// V4 FUNCTION REGISTRATION
-// =================================================================================
 
 app.http('studies', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
