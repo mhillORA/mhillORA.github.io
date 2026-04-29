@@ -6659,36 +6659,52 @@ app.http('users', {
     },
 });
 
-// Initialize default admin user on first run
+// Optional bootstrap: create a default admin user on first run.
+// Disabled by default to avoid accidental insecure deployments.
 const initializeDefaultAdmin = async () => {
+    const enabled = String(process.env.ENABLE_DEFAULT_ADMIN || '').trim().toLowerCase() === 'true';
+    if (!enabled) return;
+
+    const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
+    const COSMOS_KEY = process.env.COSMOS_KEY;
+    const DATABASE_ID = process.env.DATABASE_ID;
+    if (!COSMOS_ENDPOINT || !COSMOS_KEY || !DATABASE_ID) return;
+
+    const username = (process.env.DEFAULT_ADMIN_USERNAME || 'admin').trim();
+    const password = (process.env.DEFAULT_ADMIN_PASSWORD || '').trim();
+    if (!password) {
+        console.warn('ENABLE_DEFAULT_ADMIN=true but DEFAULT_ADMIN_PASSWORD is not set. Skipping default admin initialization.');
+        return;
+    }
+
     try {
         const container = getContainer('users');
         const { resources: users } = await container.items
             .query({
                 query: "SELECT * FROM c WHERE c.username = @username",
-                parameters: [{ name: "@username", value: 'admin' }]
+                parameters: [{ name: "@username", value: username }]
             })
             .fetchAll();
-        
+
         if (users.length === 0) {
             const adminUser = {
                 id: generateId(),
-                username: 'admin',
-                password: hashPassword('backdoor'),
-                permissionLevel: 'Manager',
-                email: '',
+                username,
+                password: hashPassword(password),
+                permissionLevel: process.env.DEFAULT_ADMIN_PERMISSION_LEVEL || 'Manager',
+                email: process.env.DEFAULT_ADMIN_EMAIL || '',
                 entraId: '',
                 createdAt: new Date().toISOString()
             };
             await container.items.create(adminUser);
-            console.log('Default admin user created');
+            console.log(`Default admin user created (${username})`);
         }
     } catch (error) {
         console.error('Error initializing default admin user:', error);
     }
 };
 
-// Call initialization
+// Fire-and-forget; do not block function registration.
 initializeDefaultAdmin();
 
 // Cleanup endpoint removed - events with crcId are valid even if other fields are missing
