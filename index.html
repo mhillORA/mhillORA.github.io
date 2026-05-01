@@ -5132,6 +5132,24 @@
                     ? (getEventWithMergedGroupStaff(event) || event) : event;
                 if (!source) return [];
                 const crcs = [];
+                // If roleAssignments exists, it is the source of truth for who is actually assigned.
+                // Avoid ghost people lingering in crcIds after removals.
+                if (source.roleAssignments && Object.keys(source.roleAssignments).length > 0) {
+                    const ids = new Set();
+                    Object.values(source.roleAssignments).forEach(assignments => {
+                        if (Array.isArray(assignments)) {
+                            assignments.forEach(entry => {
+                                const crcId = normalizeCrcId(entry);
+                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') ids.add(crcId);
+                            });
+                        }
+                    });
+                    for (const id of ids) {
+                        const crc = state.crcs.find(c => c.id === id);
+                        if (crc) crcs.push(crc);
+                    }
+                    return crcs;
+                }
                 const legacyId = normalizeCrcId(source.crcId);
                 if (legacyId && legacyId !== 'SITE_STAFF' && legacyId !== 'UNASSIGNED') {
                     const crc = state.crcs.find(c => c.id === legacyId);
@@ -5143,19 +5161,6 @@
                         if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                             const c = state.crcs.find(c => c.id === crcId);
                             if (c && !crcs.find(x => x.id === c.id)) crcs.push(c);
-                        }
-                    });
-                }
-                if (source.roleAssignments && Object.keys(source.roleAssignments).length > 0) {
-                    Object.values(source.roleAssignments).forEach(assignments => {
-                        if (Array.isArray(assignments)) {
-                            assignments.forEach(entry => {
-                                const crcId = normalizeCrcId(entry);
-                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                    const crc = state.crcs.find(c => c.id === crcId);
-                                    if (crc && !crcs.find(c => c.id === crc.id)) crcs.push(crc);
-                                }
-                            });
                         }
                     });
                 }
@@ -5207,7 +5212,6 @@
                         crcIdsSet.add(ev.crcId);
                         if (!crcIdLegacy) crcIdLegacy = ev.crcId;
                     }
-                    if (ev.crcIds && Array.isArray(ev.crcIds)) ev.crcIds.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') crcIdsSet.add(id); });
                     if (ev.roleAssignments && typeof ev.roleAssignments === 'object') {
                         Object.entries(ev.roleAssignments).forEach(([roleId, assignments]) => {
                             if (!Array.isArray(assignments)) return;
@@ -5218,6 +5222,9 @@
                                 }
                             });
                         });
+                    } else if (ev.crcIds && Array.isArray(ev.crcIds)) {
+                        // Legacy/fallback: only trust crcIds when roleAssignments are missing.
+                        ev.crcIds.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') crcIdsSet.add(id); });
                     }
                 });
                 return {
@@ -41118,7 +41125,7 @@
                         const allowOverrideRole = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                         // Only show CRCs who are active and have valid training for this role (or all if override)
                         // Only active staff are selectable for scheduling, even when overriding restrictions.
-                        let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
+                        let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && !crc.archived && (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         
                         // IMPORTANT: If editing, include assigned CRCs even if they don't have training
@@ -41143,7 +41150,7 @@
                         
                         // If role doesn't require training, include all active CRCs (for new CRCs without training records)
                         if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                            qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false)
+                            qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false && !crc.archived)
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         }
                         
@@ -41171,7 +41178,7 @@
                             
                             return {
                                 crc,
-                                isInactive: crc.active === false,
+                                isInactive: crc.active === false || crc.archived === true,
                                 isUnavailable,
                                 unavailPeriod,
                                 conflictInfo,
@@ -41198,7 +41205,7 @@
                                 
                                 return {
                                     crc,
-                                    isInactive: crc.active === false,
+                                    isInactive: crc.active === false || crc.archived === true,
                                     isUnavailable,
                                     unavailPeriod,
                                     conflictInfo,
@@ -41709,7 +41716,7 @@
                     const allowOverrideReq = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                     // Get CRCs who are active and can fill this role (only show those with valid training, or all if override)
                     // Only active staff are selectable for scheduling, even when overriding restrictions.
-                    let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
+                    let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && !crc.archived && (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
                         .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     
                     const untrainedAssignedCrcs = [];
@@ -41729,7 +41736,7 @@
                     const roleRequiresTraining = requiredTrainingNames.length > 0;
                     
                     if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                        qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false)
+                        qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false && !crc.archived)
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     }
                     
