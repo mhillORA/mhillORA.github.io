@@ -1129,6 +1129,36 @@
                 }
                 return [...map.values()];
             };
+
+            const compareIsoDateOnly = (a, b) => {
+                if (!a || !b) return 0;
+                return String(a).localeCompare(String(b));
+            };
+
+            /** Widen eventsQueryRange so a full-container refresh never shrinks an already-expanded window. */
+            const widenEventsQueryRange = (prevRange, incomingRange) => {
+                const inc = incomingRange && incomingRange.startDate && incomingRange.endDate ? incomingRange : getDefaultEventsDateRange();
+                if (!prevRange || !prevRange.startDate || !prevRange.endDate) return { startDate: inc.startDate, endDate: inc.endDate };
+                const startDate = compareIsoDateOnly(prevRange.startDate, inc.startDate) <= 0 ? prevRange.startDate : inc.startDate;
+                const endDate = compareIsoDateOnly(prevRange.endDate, inc.endDate) >= 0 ? prevRange.endDate : inc.endDate;
+                return { startDate, endDate };
+            };
+
+            /** After server-side deletes, drop removed rows locally (and linked travel) to avoid an extra full /events round trip. */
+            const removeDeletedEventsFromLocalState = (deletedIds) => {
+                const ids = new Set((deletedIds || []).filter(Boolean));
+                if (ids.size === 0) return;
+                const groupIdsRemoved = new Set();
+                (state.crc_events || []).forEach((e) => {
+                    if (e && e.id && ids.has(e.id) && e.groupId) groupIdsRemoved.add(e.groupId);
+                });
+                state.crc_events = (state.crc_events || []).filter((e) => {
+                    if (!e || !e.id) return true;
+                    if (ids.has(e.id)) return false;
+                    if (e.type === 'Travel Day' && e.parentShiftGroupId && groupIdsRemoved.has(e.parentShiftGroupId)) return false;
+                    return true;
+                });
+            };
             
             // --- API Service ---
             class ApiService {
@@ -1280,6 +1310,13 @@
                     }
                 }
 
+                invalidateEventsHttpCache() {
+                    if (state && state.eventsHttpCache) {
+                        state.eventsHttpCache.inflight.clear();
+                        state.eventsHttpCache.entries.clear();
+                    }
+                }
+
                 // CRCs
                 async getCrcs() {
                     return this.request('/crcs');
@@ -1292,21 +1329,49 @@
                 // so planning grid and Backend (All Schedule) tab stay in sync after save and on refresh.
                 // rangeOverride: { startDate, endDate } or { full: true } for admin scans of entire container.
                 async getEvents(rangeOverride) {
-                    if (rangeOverride === 'full' || (rangeOverride && rangeOverride.full === true)) {
-                        return this.request('/events?full=true');
+                    const c = state.eventsHttpCache || { ttl: 2500, inflight: new Map(), entries: new Map() };
+                    const ttl = typeof c.ttl === 'number' ? c.ttl : 2500;
+                    const isFull = rangeOverride === 'full' || (rangeOverride && rangeOverride.full === true);
+                    const endpoint = isFull
+                        ? '/events?full=true'
+                        : (() => {
+                            let startDate;
+                            let endDate;
+                            if (rangeOverride && rangeOverride.startDate && rangeOverride.endDate) {
+                                startDate = rangeOverride.startDate;
+                                endDate = rangeOverride.endDate;
+                            } else {
+                                const r = getDefaultEventsDateRange();
+                                startDate = r.startDate;
+                                endDate = r.endDate;
+                            }
+                            const qs = `?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`;
+                            return `/events${qs}`;
+                        })();
+                    const cacheKey = endpoint;
+                    const now = Date.now();
+                    const ent = c.entries.get(cacheKey);
+                    if (ent && ent.data && typeof ent.ts === 'number' && now - ent.ts < ttl) {
+                        debugLog('CHAOS: Using short-lived cached /events response', cacheKey);
+                        return Array.isArray(ent.data) ? ent.data.slice() : ent.data;
                     }
-                    let startDate;
-                    let endDate;
-                    if (rangeOverride && rangeOverride.startDate && rangeOverride.endDate) {
-                        startDate = rangeOverride.startDate;
-                        endDate = rangeOverride.endDate;
-                    } else {
-                        const r = getDefaultEventsDateRange();
-                        startDate = r.startDate;
-                        endDate = r.endDate;
-                    }
-                    const qs = `?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`;
-                    return this.request(`/events${qs}`);
+                    const inflight = c.inflight.get(cacheKey);
+                    if (inflight) return inflight;
+
+                    const p = this.request(endpoint)
+                        .then((data) => {
+                            try {
+                                c.entries.set(cacheKey, { ts: Date.now(), data: Array.isArray(data) ? data.slice() : data });
+                            } catch (e) {
+                                c.entries.delete(cacheKey);
+                            }
+                            return data;
+                        })
+                        .finally(() => {
+                            c.inflight.delete(cacheKey);
+                        });
+                    c.inflight.set(cacheKey, p);
+                    return p;
                 }
 
                 // Roles
@@ -1771,9 +1836,11 @@
                 }
 
                 async cleanupEvents() {
-                    return this.request('/events/cleanup', {
+                    const out = await this.request('/events/cleanup', {
                         method: 'POST'
                     });
+                    this.invalidateEventsHttpCache();
+                    return out;
                 }
 
                 async importNavanBookingsRange(options = {}) {
@@ -2127,24 +2194,30 @@
 
                 // Event methods
                 async createEvent(data) {
-                    return this.request('/events', {
+                    const out = await this.request('/events', {
                         method: 'POST',
                         body: JSON.stringify(data)
                     });
+                    this.invalidateEventsHttpCache();
+                    return out;
                 }
 
                 // PUT must persist full event including roleAssignments, crcId, crcIds and return them in the response.
                 async updateEvent(eventId, data) {
-                    return this.request(`/events/${eventId}`, {
+                    const out = await this.request(`/events/${eventId}`, {
                         method: 'PUT',
                         body: JSON.stringify(data)
                     });
+                    this.invalidateEventsHttpCache();
+                    return out;
                 }
 
                 async deleteEvent(eventId) {
-                    return this.request(`/events/${eventId}`, {
+                    const out = await this.request(`/events/${eventId}`, {
                         method: 'DELETE'
                     });
+                    this.invalidateEventsHttpCache();
+                    return out;
                 }
 
                 // Role methods
@@ -2476,6 +2549,12 @@
                     data: null,
                     timestamp: null,
                     ttl: 5 * 60 * 1000 // 5 minutes cache
+                },
+                /** Short-lived dedupe cache for identical GET /events queries (parallel renders / saves). Invalidated on event writes. */
+                eventsHttpCache: {
+                    ttl: 2500,
+                    inflight: new Map(),
+                    entries: new Map()
                 }
             };
 
@@ -3944,8 +4023,13 @@
             };
 
             const getDisplayEventHours = (event) => {
-                const h = parseFloat(event?.hours);
-                if (Number.isFinite(h)) return h;
+                if (!event) return 0;
+                // Respect explicit saved hours (0 is valid).
+                const h = (event.hours !== undefined && event.hours !== null && event.hours !== '')
+                    ? Number(event.hours)
+                    : NaN;
+                if (Number.isFinite(h) && h >= 0) return h;
+                // Fallback for legacy rows that only stored period
                 return event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8);
             };
 
@@ -5277,7 +5361,8 @@
                 twoWeeksFromNow.setDate(twoWeeksFromNow.getDate() + 14);
 
                 // Filter events in the next 2 weeks that are Site Assignments
-                const upcomingShifts = state.crc_events.filter(event => {
+                // Use display events so cancelled shifts are excluded unless explicitly shown.
+                const upcomingShifts = (getDisplayEvents ? getDisplayEvents() : state.crc_events || []).filter(event => {
                     if (event.type !== 'Site Assignment') return false;
                     if (!event.date) return false;
                     
@@ -5765,7 +5850,7 @@
                 try {
                     let events = [];
                     try {
-                        events = await apiService.getEvents();
+                        events = await apiService.getEvents({ full: true });
                     } catch (apiErr) {
                         // Fallback to in-memory events when API refresh is temporarily unavailable.
                         console.warn('Travel dedupe: getEvents failed, using current in-memory events:', apiErr);
@@ -5848,7 +5933,9 @@
                     }
                 }
                 const updated = await apiService.getEvents({ full: true });
-                setState({ crc_events: updated, eventsQueryRange: getDefaultEventsDateRange() });
+                const merged = mergeEventsById(state.crc_events, Array.isArray(updated) ? updated : []);
+                const evRange = widenEventsQueryRange(state.eventsQueryRange, getDefaultEventsDateRange());
+                setState({ crc_events: merged, eventsQueryRange: evRange });
                 showNotification(`Removed ${toDelete.length} duplicate PTO/time off event(s). One per person per date kept.`, 'success');
             };
             
@@ -6133,8 +6220,10 @@
                 
                 // Refresh state from server to ensure consistency
                 try {
-                    const updatedEvents = await apiService.getEvents();
-                    setState({ crc_events: updatedEvents });
+                    const rng = state.eventsQueryRange || getDefaultEventsDateRange();
+                    const updatedEvents = await apiService.getEvents(rng);
+                    const merged = mergeEventsById(state.crc_events, Array.isArray(updatedEvents) ? updatedEvents : []);
+                    setState({ crc_events: merged });
                 } catch (err) {
                     console.error('Error refreshing events after cleanup:', err);
                 }
@@ -6920,7 +7009,7 @@
                 
                 const allTabs = [
                     { id: 'scheduler', label: 'Scheduler' },
-                    { id: 'crcs', label: 'CRCs' },
+                    { id: 'crcs', label: 'Staff' },
                     { id: 'sitesStudies', label: 'Sites/Studies' },
                     { id: 'dashboard', label: 'Dashboard' },
                     { id: 'reporting', label: 'Reporting' },
@@ -12035,8 +12124,8 @@
                             </select>
                         </div>
                         <div>
-                            <label for="report-crc-filter" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">CRCs</label>
-                            <input type="text" id="crc-search" placeholder="Search CRCs..." class="w-full p-1.5 text-sm border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white mb-1">
+                            <label for="report-crc-filter" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Staff</label>
+                            <input type="text" id="crc-search" placeholder="Search Staff..." class="w-full p-1.5 text-sm border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white mb-1">
                             <select id="report-crc-filter" multiple class="w-full p-1.5 text-sm border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white h-24">
                                 ${crcOptions}
                             </select>
@@ -12095,8 +12184,8 @@
                                 </div>
                             </div>
                             <div class="md:col-span-2 xl:col-span-1">
-                                <label for="timeoff-report-crc-filter" class="block text-xs font-medium text-indigo-900 dark:text-indigo-200 mb-1">CRCs</label>
-                                <input type="text" id="timeoff-crc-search" placeholder="Search CRCs..." class="w-full p-1.5 text-sm border border-indigo-300 dark:border-indigo-600 rounded-md bg-white dark:bg-indigo-900/40 dark:text-indigo-100 mb-1">
+                                <label for="timeoff-report-crc-filter" class="block text-xs font-medium text-indigo-900 dark:text-indigo-200 mb-1">Staff</label>
+                                <input type="text" id="timeoff-crc-search" placeholder="Search Staff..." class="w-full p-1.5 text-sm border border-indigo-300 dark:border-indigo-600 rounded-md bg-white dark:bg-indigo-900/40 dark:text-indigo-100 mb-1">
                                 <select id="timeoff-report-crc-filter" multiple class="w-full p-1.5 text-sm border border-indigo-300 dark:border-indigo-600 rounded-md bg-white dark:bg-indigo-900/40 dark:text-indigo-100 h-28">
                                     ${state.crcs.map(crc => `<option value="${crc.id}" ${selectedTimeOffCrcs.includes(crc.id) ? 'selected' : ''}>${crc.name}</option>`).join('')}
                                 </select>
@@ -12830,8 +12919,8 @@
                     <div class="w-full bg-white dark:bg-gray-800 p-3 md:p-6 rounded-lg shadow-md">
                         <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 md:mb-6 gap-3">
                             <div>
-                                <h3 class="text-xl md:text-2xl font-bold text-gray-800 dark:text-gray-200">CRC Management</h3>
-                                <p class="text-xs md:text-sm text-gray-600 dark:text-gray-400 mt-1">View and manage all Clinical Research Coordinators</p>
+                                <h3 class="text-xl md:text-2xl font-bold text-gray-800 dark:text-gray-200">Staff Management</h3>
+                                <p class="text-xs md:text-sm text-gray-600 dark:text-gray-400 mt-1">View and manage all staff</p>
                             </div>
                             <div class="flex gap-2">
                                 ${state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser() ? '' : `
@@ -18902,7 +18991,7 @@
                     <div>
                         <div class="border-b border-gray-200 dark:border-gray-700">
                             <nav class="-mb-px flex space-x-6" aria-label="Tabs">
-                                <button data-action="set-sidebar-tab" data-tab-id="crcs" class="${tabIs('crcs') ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">CRCs</button>
+                                <button data-action="set-sidebar-tab" data-tab-id="crcs" class="${tabIs('crcs') ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Staff</button>
                                 <button data-action="set-sidebar-tab" data-tab-id="readingCenter" class="${tabIs('readingCenter') ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Reading Center</button>
                                 <button data-action="set-sidebar-tab" data-tab-id="sites" class="${tabIs('sites') ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Sites</button>
                                 <button data-action="set-sidebar-tab" data-tab-id="studies" class="${tabIs('studies') ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300 dark:hover:border-gray-500'} whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">Studies</button>
@@ -18913,7 +19002,7 @@
                             ${ tabIs('crcs') ? `
                                 <div class="space-y-4">
                                     <form id="add-crc-form" class="space-y-3">
-                                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Manage CRCs</h3>
+                                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Manage Staff</h3>
                                         <input type="text" name="crcName" placeholder="CRC Name" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                         <input type="text" name="crcTitle" placeholder="Title (e.g., Senior CRC, CRC II)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                         <input type="text" name="crcLocation" placeholder="Home Location (e.g., Memphis, TN)" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
@@ -18929,12 +19018,20 @@
                                         </div>
                                     </form>
                                     <div class="space-y-2">
-                                        <div class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">CRCs</div>
-                                        <div id="crcList" class="space-y-2 max-h-44 overflow-y-auto custom-scrollbar pr-2"></div>
+                                        <div class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">CRC</div>
+                                        <div id="staffDeptCrcList" class="space-y-2 max-h-40 overflow-y-auto custom-scrollbar pr-2"></div>
+                                    </div>
+                                    <div class="space-y-2">
+                                        <div class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Drivers</div>
+                                        <div id="staffDeptDriversList" class="space-y-2 max-h-40 overflow-y-auto custom-scrollbar pr-2"></div>
                                     </div>
                                     <div class="space-y-2">
                                         <div class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Reading Center</div>
-                                        <div id="readingCenterList" class="space-y-2 max-h-44 overflow-y-auto custom-scrollbar pr-2"></div>
+                                        <div id="readingCenterList" class="space-y-2 max-h-40 overflow-y-auto custom-scrollbar pr-2"></div>
+                                    </div>
+                                    <div class="space-y-2">
+                                        <div class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Other</div>
+                                        <div id="staffDeptOtherList" class="space-y-2 max-h-40 overflow-y-auto custom-scrollbar pr-2"></div>
                                     </div>
                                 </div>` : '' }
                             ${ tabIs('readingCenter') ? `
@@ -18990,31 +19087,43 @@
             };
 
             const renderCRCLists = () => {
-                const crcList = document.getElementById('crcList');
+                const staffDeptCrcList = document.getElementById('staffDeptCrcList');
+                const staffDeptDriversList = document.getElementById('staffDeptDriversList');
+                const staffDeptOtherList = document.getElementById('staffDeptOtherList');
                 const readingCenterList = document.getElementById('readingCenterList');
                 const readingCenterListOnly = document.getElementById('readingCenterListOnly');
                 const siteList = document.getElementById('crcSiteList');
                 const studyList = document.getElementById('studyList');
                 const roleList = document.getElementById('roleList');
-                if (!crcList && !readingCenterList && !readingCenterListOnly && !siteList && !studyList && !roleList) {
+                if (!staffDeptCrcList && !staffDeptDriversList && !staffDeptOtherList && !readingCenterList && !readingCenterListOnly && !siteList && !studyList && !roleList) {
                     return;
                 }
 
-                if (crcList) {
-                    let filteredCrcs = state.crcs;
-                    if (state.selectedRegionFilter !== 'all') {
-                        filteredCrcs = state.crcs.filter(crc => crc.region === state.selectedRegionFilter);
-                    }
-                    // Split by department: CRC list excludes Reading Center
-                    filteredCrcs = (filteredCrcs || []).filter(c => String(c.department || '').trim().toLowerCase() !== 'reading center');
-                    const canEditCRCs = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC');
-                    crcList.innerHTML = filteredCrcs.map(crc => `
+                const renderStaffList = (el, staff, emptyText) => {
+                    if (!el) return;
+                    const canEdit = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC');
+                    el.innerHTML = (staff || []).map(s => `
                         <div class="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700 rounded-md">
-                            <button data-action="view-crc-profile" data-id="${crc.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${crc.name}</button>
-                            ${canEditCRCs ? `<button data-action="delete-crc" data-id="${crc.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
+                            <button data-action="view-crc-profile" data-id="${s.id}" class="text-sm font-medium text-gray-800 dark:text-gray-200 hover:underline">${s.name}</button>
+                            ${canEdit ? `<button data-action="delete-crc" data-id="${s.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
                         </div>
-                    `).join('') || '<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">No CRCs added yet.</p>';
+                    `).join('') || `<p class="text-sm text-gray-500 dark:text-gray-400 text-center py-2">${emptyText}</p>`;
+                };
+
+                // Department grouping for Staff sidebar
+                const normalized = (s) => String(s || '').trim().toLowerCase();
+                let staff = state.crcs || [];
+                if (state.selectedRegionFilter !== 'all') {
+                    staff = staff.filter(x => x.region === state.selectedRegionFilter);
                 }
+                const dept = (x) => normalized(x.department);
+                const staffCrc = staff.filter(x => dept(x) === 'crc');
+                const staffDrivers = staff.filter(x => dept(x) === 'drivers');
+                const staffOther = staff.filter(x => dept(x) !== 'crc' && dept(x) !== 'drivers' && dept(x) !== 'reading center');
+
+                renderStaffList(staffDeptCrcList, staffCrc, 'No CRC staff found.');
+                renderStaffList(staffDeptDriversList, staffDrivers, 'No Drivers found.');
+                renderStaffList(staffDeptOtherList, staffOther, 'No Other staff found.');
 
                 const renderReadingCenter = (el) => {
                     if (!el) return;
@@ -23997,12 +24106,12 @@
                 const MONTHLY_FT_HOURS = 174;
 
                 const productiveEventTypes = ['Site Assignment', 'Travel Day'];
-                const eventsThisMonth = state.crc_events.filter(e => {
+                const eventsThisMonth = (getDisplayEvents ? getDisplayEvents() : state.crc_events || []).filter(e => {
                     const d = new Date(e.date + 'T00:00:00');
                     return e.crcId === crcId && d.getFullYear() === year && d.getMonth() === month && productiveEventTypes.includes(e.type);
                 });
                 
-                const totalHours = eventsThisMonth.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
+                const totalHours = eventsThisMonth.reduce((sum, e) => sum + getDisplayEventHours(e), 0);
                 
                 let hourText = `Scheduled this month: <strong>${totalHours}</strong> hours.`;
                 if (totalHours > MONTHLY_FT_HOURS) {
@@ -24035,7 +24144,13 @@
                         selectElement.dataset.chaosPrevEventType = eventType;
                     } else if (prevType !== eventType) {
                         selectElement.dataset.chaosPrevEventType = eventType;
-                        hoursInput.value = state.settings[eventType] || 8;
+                        // Only apply a default when creating a new event (or when the input is blank).
+                        // Never clobber an existing shift's saved hours.
+                        const isEditing = !!(form.dataset.eventId && String(form.dataset.eventId).trim() !== '');
+                        const cur = (hoursInput.value || '').toString().trim();
+                        if (!isEditing && cur === '') {
+                            hoursInput.value = state.settings[eventType] || 8;
+                        }
                     }
                 }
 
@@ -25561,7 +25676,12 @@
                 const canViewAs = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager');
                 return `
                     <div class="flex justify-between items-start mb-4">
-                        <h2 class="text-2xl font-bold dark:text-white">CRC Profile: ${crc.name}</h2>
+                        <div>
+                            <h2 class="text-2xl font-bold dark:text-white">Staff Profile: ${crc.name}</h2>
+                            <div class="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                <span class="font-medium">Department:</span> ${(crc.department || '—')}
+                            </div>
+                        </div>
                         <div class="flex gap-2 flex-wrap">
                             ${canViewAs ? `<button data-action="set-view-as-crc" data-crc-id="${crc.id}" class="px-4 py-2 rounded-md bg-amber-500 text-white hover:bg-amber-600 text-sm flex items-center gap-1"><i data-lucide="eye" class="w-4 h-4"></i>View as this CRC</button>` : ''}
                             ${canEditCRCs ? `
@@ -30285,7 +30405,9 @@
                                 
                                 // Refresh events from backend
                                 const events = await apiService.getEvents({ full: true });
-                                setState({ crc_events: events, eventsQueryRange: getDefaultEventsDateRange() });
+                                const merged = mergeEventsById(state.crc_events, Array.isArray(events) ? events : []);
+                                const evRange = widenEventsQueryRange(state.eventsQueryRange, getDefaultEventsDateRange());
+                                setState({ crc_events: merged, eventsQueryRange: evRange });
                                 renderContent();
                             } else {
                                 showNotification('Cleanup completed with errors. Check console for details.', 'warning');
@@ -31054,6 +31176,16 @@
                     case 'remove-current-assignment': {
                         const crcId = actionButton.dataset.crcId;
                         if (!crcId) break;
+                        // Removing a person from a multi-day shift must remove them from the entire shift (all days),
+                        // otherwise group-staff merging will still show them "at the bottom" from other days.
+                        const formEl = document.getElementById('crc-event-form');
+                        if (formEl) {
+                            const applyCb = formEl.querySelector('input[name="applyToAllDaysInShift"]');
+                            if (applyCb) {
+                                applyCb.checked = true;
+                                applyCb.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                        }
                         removeCrcFromRoleAssignments(crcId);
                         if (typeof updateTravelSelectionContainer === 'function') {
                             updateTravelSelectionContainer();
@@ -31068,13 +31200,13 @@
                         }
                         actionButton.disabled = true;
                         // Show pending changes banner
-                        const formEl = document.getElementById('crc-event-form');
-                        if (formEl && !formEl.querySelector('#pending-changes-banner')) {
+                        const formEl2 = document.getElementById('crc-event-form');
+                        if (formEl2 && !formEl2.querySelector('#pending-changes-banner')) {
                             const banner = document.createElement('div');
                             banner.id = 'pending-changes-banner';
                             banner.className = 'mb-3 px-3 py-2 rounded border border-amber-300 bg-amber-50 text-amber-700 text-sm dark:border-amber-600 dark:bg-amber-900/20 dark:text-amber-200';
                             banner.textContent = 'Pending changes — save to apply removals.';
-                            formEl.prepend(banner);
+                            formEl2.prepend(banner);
                         }
                         break;
                     }
@@ -31546,9 +31678,8 @@
                         try {
                             if (operation === 'delete') {
                                 await apiService.deleteEvent(eventId);
-                                // Re-fetch events from DB
-                                const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
-                                setState({ crc_events: updatedEvents });
+                                removeDeletedEventsFromLocalState([eventId]);
+                                setState({ crc_events: [...state.crc_events] });
                                 showNotification('Unavailability removed. Day is now available.', 'success');
                             } else {
                                 const eventData = { 
@@ -31740,9 +31871,8 @@
                                         crcNames
                                     });
                                 }
-                                // Re-fetch events from DB
-                                const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
-                                setState({ crc_events: updatedEvents });
+                                removeDeletedEventsFromLocalState([eventId]);
+                                setState({ crc_events: [...state.crc_events] });
                                 showNotification('Event deleted successfully!', 'success');
                             closeModal();
                                 // Refresh calendar views
@@ -31778,9 +31908,8 @@
                                     crcNames
                                 });
                             }
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
-                            setState({ crc_events: updatedEvents });
+                            removeDeletedEventsFromLocalState([eventId]);
+                            setState({ crc_events: [...state.crc_events] });
                             showNotification('Event deleted successfully!', 'success');
                         closeModal();
                             // Refresh calendar views
@@ -31801,20 +31930,36 @@
                         const eventsToDelete = state.crc_events.filter(event => event.groupId === groupId);
                         // Also delete travel days linked to this shift series via parentShiftGroupId
                         const linkedTravelDays = state.crc_events.filter(e => e.type === 'Travel Day' && e.parentShiftGroupId === groupId);
+                        let seriesDeleteErrors = 0;
                         // Delete each event individually
                         for (const event of eventsToDelete) {
-                            await apiService.deleteEvent(event.id);
+                            try {
+                                await apiService.deleteEvent(event.id);
+                            } catch (seriesDelErr) {
+                                seriesDeleteErrors++;
+                                console.error('Error deleting series event:', event.id, seriesDelErr);
+                            }
                         }
                         for (const td of linkedTravelDays) {
                             try {
                                 await apiService.deleteEvent(td.id);
                             } catch (travelDeleteErr) {
+                                seriesDeleteErrors++;
                                 console.error('Error deleting linked travel day:', td.id, travelDeleteErr);
                             }
                         }
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
-                            setState({ crc_events: updatedEvents });
+                            if (seriesDeleteErrors > 0) {
+                                const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
+                                const merged = mergeEventsById(state.crc_events, Array.isArray(updatedEvents) ? updatedEvents : []);
+                                setState({ crc_events: merged });
+                            } else {
+                                const deletedIds = [
+                                    ...eventsToDelete.map(e => e.id).filter(Boolean),
+                                    ...linkedTravelDays.map(e => e.id).filter(Boolean)
+                                ];
+                                removeDeletedEventsFromLocalState(deletedIds);
+                                setState({ crc_events: [...state.crc_events] });
+                            }
                             const totalDeleted = eventsToDelete.length + linkedTravelDays.length;
                             showNotification(`Successfully deleted ${totalDeleted} event${totalDeleted !== 1 ? 's' : ''} (including linked travel days).`, 'success');
                         closeModal();
@@ -31886,9 +32031,8 @@
                             saveStateToUndoHistory();
                             await apiService.deleteEvent(idToDelete);
                             setState({ pendingDeleteEventId: null });
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
-                            setState({ crc_events: updatedEvents }, { skipRender: true });
+                            removeDeletedEventsFromLocalState([idToDelete]);
+                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             if (eventBeforeDelete && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
                                 setTimeout(() => markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(eventBeforeDelete)), 0);
                             }
@@ -32031,11 +32175,13 @@
                             let deletedCount = 0;
                             let errorCount = 0;
                             
+                            const successfullyDeletedEventIds = [];
                             // Delete regular events
                             for (const eventId of eventIds) {
                                 try {
                                     await apiService.deleteEvent(eventId);
                                     deletedCount++;
+                                    successfullyDeletedEventIds.push(eventId);
                                 } catch (error) {
                                     console.error(`Error deleting event ${eventId}:`, error);
                                     errorCount++;
@@ -32053,15 +32199,21 @@
                                 }
                             }
                             
-                            // Re-fetch events and time off requests from DB
-                            const [updatedEvents, updatedTimeOffRequests] = await Promise.all([
-                                apiService.getEvents(state.eventsQueryRange || undefined),
-                                apiService.getTimeOffRequests()
-                            ]);
-                            setState({ 
-                                crc_events: updatedEvents,
-                                timeOffRequests: updatedTimeOffRequests
-                            });
+                            const updatedTimeOffRequests = await apiService.getTimeOffRequests();
+                            if (errorCount > 0) {
+                                const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
+                                const merged = mergeEventsById(state.crc_events, Array.isArray(updatedEvents) ? updatedEvents : []);
+                                setState({
+                                    crc_events: merged,
+                                    timeOffRequests: updatedTimeOffRequests
+                                });
+                            } else {
+                                removeDeletedEventsFromLocalState(successfullyDeletedEventIds);
+                                setState({
+                                    crc_events: [...state.crc_events],
+                                    timeOffRequests: updatedTimeOffRequests
+                                });
+                            }
                             
                             if (errorCount > 0) {
                                 showNotification(`Deleted ${deletedCount} event${deletedCount !== 1 ? 's' : ''}, but ${errorCount} failed. See console for details.`, 'warning');
@@ -32129,21 +32281,37 @@
                             const groupIds = new Set(eventsToDelete.map(ev => ev.groupId).filter(Boolean));
                             const linkedTravelDays = state.crc_events.filter(e => e.type === 'Travel Day' && e.parentShiftGroupId && groupIds.has(e.parentShiftGroupId));
                             
+                            let wholeShiftErrors = 0;
                             // Delete all events individually
                             for (const event of eventsToDelete) {
-                                await apiService.deleteEvent(event.id);
+                                try {
+                                    await apiService.deleteEvent(event.id);
+                                } catch (wholeShiftDelErr) {
+                                    wholeShiftErrors++;
+                                    console.error('Error deleting shift event:', event.id, wholeShiftDelErr);
+                                }
                             }
                             for (const td of linkedTravelDays) {
                                 try {
                                     await apiService.deleteEvent(td.id);
                                 } catch (travelDeleteErr) {
+                                    wholeShiftErrors++;
                                     console.error('Error deleting linked travel day:', td.id, travelDeleteErr);
                                 }
                             }
                             
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
-                            setState({ crc_events: updatedEvents }, { skipRender: true });
+                            if (wholeShiftErrors > 0) {
+                                const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
+                                const merged = mergeEventsById(state.crc_events, Array.isArray(updatedEvents) ? updatedEvents : []);
+                                setState({ crc_events: merged }, { skipRender: true });
+                            } else {
+                                const deletedIds = [
+                                    ...eventsToDelete.map(ev => ev.id).filter(Boolean),
+                                    ...linkedTravelDays.map(ev => ev.id).filter(Boolean)
+                                ];
+                                removeDeletedEventsFromLocalState(deletedIds);
+                                setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                            }
                             updateUndoButtonState();
                             
                             const totalDeleted = eventsToDelete.length + linkedTravelDays.length;
@@ -32227,20 +32395,27 @@
                             // Delete all events individually
                             let deletedCount = 0;
                             let errorCount = 0;
+                            const successfullyDeletedIds = [];
                             
                             for (const eventId of uniqueEventIds) {
                                 try {
                                     await apiService.deleteEvent(eventId);
                                     deletedCount++;
+                                    successfullyDeletedIds.push(eventId);
                                 } catch (error) {
                                     console.error(`Error deleting event ${eventId}:`, error);
                                     errorCount++;
                                 }
                             }
                             
-                            // Re-fetch events from DB
-                            const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
-                            setState({ crc_events: updatedEvents });
+                            if (errorCount > 0) {
+                                const updatedEvents = await apiService.getEvents(state.eventsQueryRange || undefined);
+                                const merged = mergeEventsById(state.crc_events, Array.isArray(updatedEvents) ? updatedEvents : []);
+                                setState({ crc_events: merged });
+                            } else {
+                                removeDeletedEventsFromLocalState(successfullyDeletedIds);
+                                setState({ crc_events: [...state.crc_events] });
+                            }
                             
                             closeModal();
                             
@@ -38577,8 +38752,10 @@
                                 setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             } else {
                                 // Fallback to canonical refresh if backend omitted updated record.
-                                const refreshedEvents = await apiService.getEvents();
-                                setState({ crc_events: refreshedEvents }, { skipRender: true });
+                                const rng = state.eventsQueryRange || getDefaultEventsDateRange();
+                                const refreshedEvents = await apiService.getEvents(rng);
+                                const merged = mergeEventsById(state.crc_events, Array.isArray(refreshedEvents) ? refreshedEvents : []);
+                                setState({ crc_events: merged }, { skipRender: true });
                             }
                             showNotification('Event updated successfully!', 'success');
                             closeModal();
@@ -40237,13 +40414,15 @@
                             if (crc) {
                                 // Filter CRCs based on the roles in the event
                                 const eventRoles = existingEvent.roles || [];
-                                let qualifiedCrcs = state.crcs;
+                                let qualifiedCrcs = (state.crcs || []).filter(c => c && c.id && c.active !== false);
                                 
                                 // If there are specific roles, filter by training (and active status)
                                 if (eventRoles.length > 0) {
-                                    qualifiedCrcs = state.crcs.filter(c => {
-                                        // CRC must be active and have training for at least one of the roles
-                                        return c.active !== false && eventRoles.some(role => hasValidTraining(c, role));
+                                    qualifiedCrcs = (state.crcs || []).filter(c => {
+                                        if (!c || !c.id) return false;
+                                        // Only active staff are selectable for scheduling.
+                                        if (c.active === false) return false;
+                                        return eventRoles.some(role => hasValidTraining(c, role));
                                     });
                                 }
                                 // Sort alphabetically
@@ -40661,6 +40840,8 @@
                             const allowOverride = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
 
                             let qualifiedCrcs = (state.crcs || [])
+                                // Only active staff are selectable for scheduling (even in override mode).
+                                .filter(crc => crc && crc.id && crc.active !== false)
                                 .filter(crc => allowOverride ? true : hasValidTraining(crc, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
@@ -40888,6 +41069,7 @@
                         
                         const allowOverrideRole = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                         // Only show CRCs who are active and have valid training for this role (or all if override)
+                        // Only active staff are selectable for scheduling, even when overriding restrictions.
                         let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         
@@ -40941,6 +41123,7 @@
                             
                             return {
                                 crc,
+                                isInactive: crc.active === false,
                                 isUnavailable,
                                 unavailPeriod,
                                 conflictInfo,
@@ -40967,6 +41150,7 @@
                                 
                                 return {
                                     crc,
+                                    isInactive: crc.active === false,
                                     isUnavailable,
                                     unavailPeriod,
                                     conflictInfo,
@@ -41029,40 +41213,46 @@
                         
                         const volunteerLabel = ' (volunteer)';
                         // Volunteers (available first)
-                        optionsHtml += volunteerAvailable.map(({ crc, distance, hasPending, isUntrained }) => {
+                        optionsHtml += volunteerAvailable.map(({ crc, distance, hasPending, isUntrained, isInactive }) => {
                             let distanceText = distance !== null ? ` - ${distance} mi` : '';
                             const pendingText = hasPending ? ' (Pending Review)' : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClasses = ['text-green-600 dark:text-green-400'];
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
                             if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${untrainedText}${pendingText}${distanceText}</option>`;
+                            const disabledAttr = isInactive ? 'disabled' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         // Other available CRCs
-                        optionsHtml += otherAvailable.map(({ crc, distance, hasPending, isUntrained }) => {
+                        optionsHtml += otherAvailable.map(({ crc, distance, hasPending, isUntrained, isInactive }) => {
                             let distanceText = distance !== null ? ` - ${distance} mi` : '';
                             const pendingText = hasPending ? ' (Pending Review)' : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClasses = [];
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
                             if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${pendingText}${distanceText}</option>`;
+                            const disabledAttr = isInactive ? 'disabled' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         // Volunteers (unavailable) - still show with (volunteer)
-                        optionsHtml += volunteerUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained }) => {
+                        optionsHtml += volunteerUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
                             let statusText = conflictInfo ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})` : ` (Time Off - ${unavailPeriod || 'Full Day'})`;
                             let distanceText = (distance !== null && !conflictInfo) ? ` - ${distance} mi` : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClasses = ['text-gray-400 dark:text-gray-500', 'text-green-600 dark:text-green-500'];
                             if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${untrainedText}${statusText}${distanceText}</option>`;
+                            const disabledAttr = isInactive ? 'disabled' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
                         // Other unavailable CRCs
-                        optionsHtml += otherUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained }) => {
+                        optionsHtml += otherUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
                             let statusText = '';
                             if (conflictInfo) {
                                 statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
@@ -41072,11 +41262,13 @@
                             }
                             let distanceText = (distance !== null && !conflictInfo) ? ` - ${distance} mi` : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClasses = ['text-gray-400 dark:text-gray-500'];
                             if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${statusText}${distanceText}</option>`;
+                            const disabledAttr = isInactive ? 'disabled' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
 
                         if (qualifiedCrcs.length === 0) {
@@ -41244,6 +41436,7 @@
                                 if (!roleForSlot) return;
                                 
                                 const allowOverrideQty = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
+                                // Only active staff are selectable for scheduling, even when overriding restrictions.
                                 const qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
@@ -41467,6 +41660,7 @@
                     
                     const allowOverrideReq = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                     // Get CRCs who are active and can fill this role (only show those with valid training, or all if override)
+                    // Only active staff are selectable for scheduling, even when overriding restrictions.
                     let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
                         .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     
@@ -41919,6 +42113,7 @@
                             
                             if (newQuantity > currentSlots) {
                                 const allowOverrideInc = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
+                                // Only active staff are selectable for scheduling, even when overriding restrictions.
                                 const qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideInc ? true : hasValidTraining(crc, role.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
@@ -45316,7 +45511,8 @@
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Name</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Active</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Permission Level</th>
-                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Linked CRC</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Linked Staff</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Department</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Permission Set</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Email</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Entra ID</th>
@@ -45329,6 +45525,8 @@
                                         const isActive = user.active !== undefined ? user.active : true;
                                         const fullName = [user.firstName, user.lastName].filter(Boolean).join(' ') || 'N/A';
                                         const displayName = user.title ? `${fullName}${fullName !== 'N/A' ? ', ' : ''}${user.title}` : fullName;
+                                        const linkedStaff = user.crcId ? state.crcs.find(c => c.id === user.crcId) : null;
+                                        const linkedDept = linkedStaff ? (linkedStaff.department || '') : '';
                                         return `
                                         <tr class="user-row ${!isActive ? 'opacity-60' : ''}" 
                                             data-username="${(user.username || '').toLowerCase()}" 
@@ -45352,7 +45550,10 @@
                                                 </span>
                                             </td>
                                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                                ${user.crcId ? (state.crcs.find(c => c.id === user.crcId)?.name || user.crcId) : (user.permissionLevel === 'CRC' ? '<span class="text-yellow-600 dark:text-yellow-400">Not Linked</span>' : 'N/A')}
+                                                ${user.crcId ? (linkedStaff?.name || user.crcId) : (user.permissionLevel === 'CRC' ? '<span class="text-yellow-600 dark:text-yellow-400">Not Linked</span>' : 'N/A')}
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                                ${linkedDept || (user.permissionLevel === 'CRC' ? '<span class="text-yellow-600 dark:text-yellow-400">Not Linked</span>' : 'N/A')}
                                             </td>
                                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                                 ${user.permissionSetId ? (state.permissionSets.find(ps => ps.id === user.permissionSetId)?.name || 'N/A') : 'None'}
