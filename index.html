@@ -2542,6 +2542,8 @@
                 dashboardEndDate: null,
                 dashboardCrcFilter: 'all',
                 dashboardStudyFilter: 'all',
+                /** Staff screen (Staff Management) department filter */
+                crcDepartmentFilter: 'all',
                 initialLoadComplete: false,
                 charts: {}, // To hold chart instances
                 // Cache for sites to improve loading performance
@@ -12972,8 +12974,19 @@
                                     </div>
                                     ` : ''}
                                     
-                                    <div class="mb-4">
-                                        <input type="text" id="crc-search-main" placeholder="Search CRCs..." class="w-full p-2 md:p-3 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm md:text-base">
+                                    <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+                                        <div class="md:col-span-2">
+                                            <input type="text" id="crc-search-main" placeholder="Search staff..." class="w-full p-2 md:p-3 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm md:text-base">
+                                        </div>
+                                        <div>
+                                            <select id="crc-department-filter-main" class="w-full p-2 md:p-3 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm md:text-base">
+                                                <option value="all">All Departments</option>
+                                                <option value="crc">CRC</option>
+                                                <option value="drivers">Drivers</option>
+                                                <option value="reading center">Reading Center</option>
+                                                <option value="other">Other</option>
+                                            </select>
+                                        </div>
                                     </div>
                                     
                                     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 md:gap-4">
@@ -12989,7 +13002,12 @@
                                 }).length;
                                 
                                 return `
-                                    <div class="crc-card bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition-shadow cursor-pointer" data-crc-name="${crc.name.toLowerCase()}" data-crc-title="${(crc.title || '').toLowerCase()}" data-crc-location="${(crc.homeLocation || '').toLowerCase()}" data-crc-region="${(crc.region || '').toLowerCase()}">
+                                    <div class="crc-card bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition-shadow cursor-pointer"
+                                         data-crc-name="${crc.name.toLowerCase()}"
+                                         data-crc-title="${(crc.title || '').toLowerCase()}"
+                                         data-crc-location="${(crc.homeLocation || '').toLowerCase()}"
+                                         data-crc-region="${(crc.region || '').toLowerCase()}"
+                                         data-crc-department="${String(crc.department || '').trim().toLowerCase()}">
                                         <div class="flex justify-between items-start mb-3">
                                             <div class="flex-1 min-w-0">
                                                 <h4 class="text-lg font-semibold text-gray-900 dark:text-gray-100 truncate">${crc.name}</h4>
@@ -20835,26 +20853,49 @@
             
             const setupCRCSearch = () => {
                 const searchInput = document.getElementById('crc-search-main');
-                if (!searchInput) return;
-                
-                searchInput.addEventListener('input', (e) => {
-                    const searchTerm = e.target.value.toLowerCase();
+                const deptSelect = document.getElementById('crc-department-filter-main');
+                if (!searchInput && !deptSelect) return;
+
+                const normalizeDept = (s) => String(s || '').trim().toLowerCase();
+                const resolveDeptBucket = (raw) => {
+                    const d = normalizeDept(raw);
+                    if (d === 'crc') return 'crc';
+                    if (d === 'drivers') return 'drivers';
+                    if (d === 'reading center') return 'reading center';
+                    return 'other';
+                };
+
+                const applyFilters = () => {
+                    const searchTerm = (searchInput?.value || '').toLowerCase();
+                    const selectedDept = deptSelect ? String(deptSelect.value || 'all').toLowerCase() : 'all';
                     const crcCards = document.querySelectorAll('.crc-card');
-                    
                     crcCards.forEach(card => {
                         const name = card.dataset.crcName || '';
                         const title = card.dataset.crcTitle || '';
                         const location = card.dataset.crcLocation || '';
                         const region = card.dataset.crcRegion || '';
-                        
-                        const matches = name.includes(searchTerm) || 
-                                       title.includes(searchTerm) || 
-                                       location.includes(searchTerm) || 
-                                       region.includes(searchTerm);
-                        
-                        card.style.display = matches ? 'block' : 'none';
+                        const deptRaw = card.dataset.crcDepartment || '';
+                        const deptBucket = resolveDeptBucket(deptRaw);
+                        const matchesSearch = !searchTerm || name.includes(searchTerm) ||
+                            title.includes(searchTerm) ||
+                            location.includes(searchTerm) ||
+                            region.includes(searchTerm);
+                        const matchesDept = selectedDept === 'all' ? true : (deptBucket === selectedDept);
+                        card.style.display = (matchesSearch && matchesDept) ? 'block' : 'none';
                     });
-                });
+                };
+                
+                if (searchInput) {
+                    searchInput.addEventListener('input', applyFilters);
+                }
+                if (deptSelect) {
+                    deptSelect.value = state.crcDepartmentFilter || 'all';
+                    deptSelect.addEventListener('change', (e) => {
+                        state.crcDepartmentFilter = e.target.value || 'all';
+                        applyFilters();
+                    });
+                }
+                applyFilters();
             };
             
             const setupBulkTrainingModal = () => {
@@ -34769,8 +34810,15 @@
                                 };
                                 console.log(`Geocoded ${data.crcLocation} to:`, coordinates);
                             }
-                            
-                            await apiService.createCrc(crcData);
+
+                            const created = await apiService.createCrc(crcData);
+                            if (created && created.id) {
+                                const next = [...(state.crcs || []), created].sort((a, b) => (a?.name || '').localeCompare(b?.name || ''));
+                                setState({ crcs: next }, { skipRender: true });
+                                if (typeof renderCRCLists === 'function') renderCRCLists();
+                                if (state.activeTab === 'crcs' && typeof renderContent === 'function') renderContent();
+                                if (state.activeTab === 'users' && typeof renderUsersContent === 'function') renderUsersContent();
+                            }
                             showNotification('CRC added successfully!', 'success');
                             form.reset();
                         } catch (error) {
@@ -38213,6 +38261,9 @@
                                 const updatedCrc = saved && saved.id ? { ...crc, ...saved } : { ...crc, ...updateData };
                                 // Update local state and reflect in UI
                                 state.crcs = state.crcs.map(c => c.id === crcId ? updatedCrc : c);
+                                setState({ crcs: [...state.crcs] }, { skipRender: true });
+                                if (typeof renderCRCLists === 'function') renderCRCLists();
+                                if (state.activeTab === 'users' && typeof renderUsersContent === 'function') renderUsersContent();
                                 showNotification('CRC profile updated!', 'success');
                                 // Re-render the profile so the user sees the saved changes immediately
                                 openModal(getCRCProfileModalHTML(updatedCrc), '4xl');
