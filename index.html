@@ -124,6 +124,17 @@
         .notification.bg-warning { 
             background: linear-gradient(135deg, #F59E0B 0%, #D97706 100%);
         }
+        /* On-screen PHI/PII privacy mask (shoulder-surfing / demos); not a substitute for access control */
+        .privacy-mask-on .phi-sensitive {
+            filter: blur(8px);
+            user-select: none;
+            -webkit-user-select: none;
+            transition: filter 0.2s ease;
+        }
+        .privacy-mask-on .phi-sensitive-input {
+            filter: blur(6px);
+            user-select: none;
+        }
     </style>
     <script>
         (function() {
@@ -133,6 +144,15 @@
             } else {
                 document.documentElement.classList.remove('dark');
             }
+        })();
+    </script>
+    <script>
+        (function () {
+            try {
+                if (localStorage.getItem('nasa_privacy_mask_phi_pii_v1') === '1') {
+                    document.documentElement.classList.add('privacy-mask-on');
+                }
+            } catch (e) {}
         })();
     </script>
 </head>
@@ -169,11 +189,16 @@
                 </div>
             </div>
 
-            <div class="flex justify-between items-center">
-            <p class="text-xs text-gray-500 dark:text-gray-400 px-4">Not Another Scheduling App</p>
-            <button id="dark-mode-toggle" class="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
-                <i id="dark-mode-icon" data-lucide="moon" class="w-5 h-5"></i>
-            </button>
+            <div class="flex justify-between items-center gap-1 flex-wrap">
+            <p class="text-xs text-gray-500 dark:text-gray-400 px-2">Not Another Scheduling App</p>
+            <div class="flex items-center shrink-0">
+                <button type="button" id="privacy-mask-toggle" class="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300" title="Mask PHI/PII on screen" aria-pressed="false">
+                    <i id="privacy-mask-icon" data-lucide="eye" class="w-5 h-5"></i>
+                </button>
+                <button type="button" id="dark-mode-toggle" class="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300">
+                    <i id="dark-mode-icon" data-lucide="moon" class="w-5 h-5"></i>
+                </button>
+            </div>
             </div>
         </div>
     </aside>
@@ -223,6 +248,25 @@ const apiCall = async (endpoint, method = 'GET', data = null) => {
     }
 };
 
+const normalizeScheduleDocument = (s, index) => {
+    const rawSlots = Array.isArray(s.slots) ? s.slots : [];
+    const sid = s.id != null ? String(s.id) : `row-${index}`;
+    const slots = rawSlots.map((slot, idx) => ({
+        ...slot,
+        id: slot && slot.id != null ? String(slot.id) : `slot-${sid}-${idx}`,
+        startTime: slot && slot.startTime ? slot.startTime : new Date().toISOString(),
+        capacity: typeof slot?.capacity === 'number' && slot.capacity > 0 ? slot.capacity : 1,
+        booked: typeof slot?.booked === 'number' && slot.booked >= 0 ? slot.booked : 0,
+    }));
+    return {
+        ...s,
+        studyId: s.studyId != null ? String(s.studyId) : '',
+        siteId: s.siteId != null ? String(s.siteId) : '',
+        visit: s.visit || '',
+        slots,
+    };
+};
+
 const fetchData = async (collection) => {
     try {
         const data = await apiCall(collection);
@@ -230,6 +274,9 @@ const fetchData = async (collection) => {
         
         if (collection === 'patients') {
             result = result.map(patient => convertPatientFromAzureFormat(patient));
+        }
+        if (collection === 'schedules') {
+            result = result.map((s, i) => normalizeScheduleDocument(s, i));
         }
         
         return result;
@@ -434,6 +481,7 @@ let state = {
     accessRequests: [],
     managedUsers: [],
     currentUser: null, // local session user
+    privacyMaskSensitive: false, // blur PHI/PII on screen (persisted in localStorage)
 };
 let chartInstances = {}; // To hold chart objects for destruction
 
@@ -442,6 +490,7 @@ const LS_KEYS = {
     accessRequests: 'nasa_access_requests_v1',
     managedUsers: 'nasa_managed_users_v1',
 };
+const PHI_MASK_LS_KEY = 'nasa_privacy_mask_phi_pii_v1';
 
 const safeJsonParse = (text, fallback) => {
     try { return JSON.parse(text); } catch { return fallback; }
@@ -452,6 +501,11 @@ const loadLocalState = () => {
     const users = safeJsonParse(localStorage.getItem(LS_KEYS.managedUsers) || '[]', []);
     state.accessRequests = Array.isArray(requests) ? requests : [];
     state.managedUsers = Array.isArray(users) ? users : [];
+    try {
+        state.privacyMaskSensitive = localStorage.getItem(PHI_MASK_LS_KEY) === '1';
+    } catch {
+        state.privacyMaskSensitive = false;
+    }
 
     // Seed a default local login user if missing (short-term bootstrap)
     const hasDefault = (state.managedUsers || []).some(u =>
@@ -498,6 +552,45 @@ const randomPassword = (length = 14) => {
 };
 
 const ensureId = (prefix = 'id') => `${prefix}_${Math.random().toString(36).slice(2, 10)}_${Date.now()}`;
+
+const escapeHtmlPhi = (str) => String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+/** Wrap plain text for on-screen PHI/PII blur when privacy mask is enabled */
+const phi = (value) => {
+    const display = value == null || value === '' ? '—' : String(value);
+    return `<span class="phi-sensitive inline-block max-w-full">${escapeHtmlPhi(display)}</span>`;
+};
+
+const phiName = (p) => {
+    if (!p) return phi('—');
+    const name = [p.firstName, p.lastName].filter(Boolean).join(' ').trim();
+    return phi(name || '—');
+};
+
+const syncPrivacyMaskDom = () => {
+    try {
+        document.documentElement.classList.toggle('privacy-mask-on', !!state.privacyMaskSensitive);
+    } catch (e) {
+        console.error('syncPrivacyMaskDom', e);
+    }
+};
+
+const updatePrivacyMaskToggleUi = () => {
+    const btn = document.getElementById('privacy-mask-toggle');
+    if (!btn) return;
+    const on = !!state.privacyMaskSensitive;
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.title = on ? 'Show PHI/PII (names, contact info, identifiers).' : 'Mask PHI/PII on screen (demos, screen sharing).';
+    const i = btn.querySelector('i');
+    if (i) {
+        i.setAttribute('data-lucide', on ? 'eye-off' : 'eye');
+    }
+};
+
 // --- DOM ELEMENTS ---
 const mainContent = document.getElementById('main-content');
 const navMenu = document.getElementById('nav-menu');
@@ -549,6 +642,17 @@ const showNotification = (message, type = 'info', duration = 3000) => {
         console.error('Error showing notification:', error);
     }
 };
+
+const togglePrivacyMaskSensitive = () => {
+    state.privacyMaskSensitive = !state.privacyMaskSensitive;
+    try {
+        localStorage.setItem(PHI_MASK_LS_KEY, state.privacyMaskSensitive ? '1' : '0');
+    } catch {}
+    syncPrivacyMaskDom();
+    updatePrivacyMaskToggleUi();
+    showNotification(state.privacyMaskSensitive ? 'PHI/PII masked on screen.' : 'PHI/PII visible on screen.', 'info', 2200);
+};
+
 // --- THEME MANAGEMENT (Light/Dark Mode) ---
 /**
  * Apply theme to the application with enhanced error handling
@@ -860,11 +964,14 @@ const render = () => {
             return;
         }
 
+        syncPrivacyMaskDom();
+
         if (state.showLoginGate) {
             mainContent.innerHTML = getLoginGateHTML();
             if (typeof lucide !== 'undefined') lucide.createIcons();
             setTimeout(() => setupLoginGate(), 50);
             updateSessionControls();
+            updatePrivacyMaskToggleUi();
             return;
         }
         
@@ -876,6 +983,7 @@ const render = () => {
         if (typeof lucide !== 'undefined') {
             lucide.createIcons();
         }
+        updatePrivacyMaskToggleUi();
         
         // Ensure search inputs are properly initialized after a short delay
         setTimeout(() => {
@@ -900,7 +1008,7 @@ const updateSessionControls = () => {
         }
 
         const label = state.currentUser.email || state.currentUser.username || 'User';
-        if (sessionUserLabel) sessionUserLabel.textContent = label;
+        if (sessionUserLabel) sessionUserLabel.innerHTML = phi(label);
         sessionControls.classList.remove('hidden');
     } catch (e) {
         console.error('Error updating session controls:', e);
@@ -1043,9 +1151,9 @@ const renderContent = () => {
         addQuestionToSurveyForm();
     }
     if (state.activeTab === 'scheduling') {
-        if(state.schedulingView === 'calendar') renderCalendar();
-        if(state.schedulingView === 'day') renderDayView();
-        if(state.schedulingView === 'booked') renderBookedAppointmentsView();
+        if (state.schedulingView === 'calendar') renderCalendar();
+        else if (state.schedulingView === 'day') renderDayView();
+        else if (state.schedulingView === 'booked') renderBookedAppointmentsView();
     }
 };
 // --- MODAL & SIDE PANEL HANDLING ---
@@ -1439,7 +1547,7 @@ const renderDashboardTodaysAppointments = () => {
                                     <tr class="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                                         <td class="px-2 md:px-4 py-2 md:py-3 whitespace-nowrap text-xs md:text-sm font-medium dark:text-gray-200">${time}</td>
                                         <td class="px-2 md:px-4 py-2 md:py-3 whitespace-nowrap text-xs md:text-sm">
-                                            <button data-action="view-patient" data-id="${patient.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${patient.firstName} ${patient.lastName}</button>
+                                            <button data-action="view-patient" data-id="${patient.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${phiName(patient)}</button>
                                         </td>
                                         <td class="px-2 md:px-4 py-2 md:py-3 whitespace-nowrap text-xs md:text-sm dark:text-gray-300 hidden sm:table-cell">${visit}</td>
                                         <td class="px-2 md:px-4 py-2 md:py-3 whitespace-nowrap text-xs md:text-sm">${statusBadge}</td>
@@ -1507,7 +1615,7 @@ const renderTodaysAppointments = () => {
             <tr class="dark:text-gray-300">
                 <td class="px-6 py-4 whitespace-nowrap">${time}</td>
                 <td class="px-6 py-4 whitespace-nowrap">
-                    <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${p.firstName} ${p.lastName}</button>
+                    <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${phiName(p)}</button>
                 </td>
                 <td class="px-6 py-4 whitespace-nowrap">${site}</td>
                 <td class="px-6 py-4 whitespace-nowrap">${study}</td>
@@ -1841,9 +1949,9 @@ const updateEnrollmentNumbers = (studyId) => {
     const studySchedules = state.schedules.filter(s => s.studyId === studyId);
     let openAppointments = 0;
     studySchedules.forEach(schedule => {
-        schedule.slots.forEach(slot => {
+        (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
             const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
-            const availableSlots = slot.capacity - bookedCount;
+            const availableSlots = (slot.capacity || 0) - bookedCount;
             if (availableSlots > 0) {
                 openAppointments += availableSlots;
             }
@@ -1917,7 +2025,7 @@ const renderStudyParticipants = (studyId) => {
         const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
         const siteName = currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A';
         const appointmentInfo = p.appointment ? 
-            `${new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })} (${p.appointment.visit || 'General'})` 
+            phi(`${new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })} (${p.appointment.visit || 'General'})`) 
             : 'Not Scheduled';
         
         // Check washout status
@@ -1929,13 +2037,13 @@ const renderStudyParticipants = (studyId) => {
                 <td class="px-6 py-4">
                     <div>
                         <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">
-                            ${p.firstName} ${p.lastName}
+                            ${phiName(p)}
                         </button>
                         ${washoutIndicator}
                     </div>
                 </td>
                 <td class="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                    ${p.globalId || 'N/A'}
+                    ${phi(p.globalId || 'N/A')}
                 </td>
                 <td class="px-6 py-4">
                     <span class="px-2 py-1 text-xs rounded-full ${
@@ -2067,7 +2175,7 @@ const renderPatientTable = () => {
     });
     tableBody.innerHTML = filteredPatients.map(p => {
         const appointmentInfo = p.appointment ? 
-            `${new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })} (${p.appointment.visit || 'General'})` 
+            phi(`${new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })} (${p.appointment.visit || 'General'})`) 
             : 'Not Scheduled';
         const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
         const siteName = currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A';
@@ -2075,7 +2183,7 @@ const renderPatientTable = () => {
         
         return `<tr class="dark:text-gray-300">
                 <td class="px-6 py-4">
-                    <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium text-left">${p.firstName} ${p.lastName}</button>
+                    <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium text-left">${phiName(p)}</button>
                 </td>
                 <td class="px-6 py-4">${siteName}</td>
                 <td class="px-6 py-4">${studyName}</td>
@@ -2252,8 +2360,9 @@ const getDuplicatesHTML = () => `
         </div>
         `;
 const getSchedulingHTML = () => {
-    // Filter studies to only show active ones
-    const activeStudies = state.studies.filter(s => ['Recruiting', 'Enrolling', 'Active'].includes(s.status));
+    // Filter studies to only show active ones (case-insensitive for API variance)
+    const activeStatuses = new Set(['recruiting', 'enrolling', 'active']);
+    const activeStudies = state.studies.filter(s => activeStatuses.has(String(s.status || '').toLowerCase()));
     
     const creatorView = `
         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
@@ -2300,8 +2409,9 @@ const getSchedulingHTML = () => {
        <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Generated Schedules</h3>
             <div id="schedules-list" class="space-y-4">${state.schedules.length === 0 ? '<p class="text-center text-gray-500 dark:text-gray-400 py-8">No schedules created yet.</p>' : state.schedules.map(s => {
-                const totalCapacity = s.slots.reduce((sum, slot) => sum + slot.capacity, 0);
-                const totalBooked = s.slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
+                const slots = Array.isArray(s.slots) ? s.slots : [];
+                const totalCapacity = slots.reduce((sum, slot) => sum + (slot.capacity || 0), 0);
+                const totalBooked = slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
                 const availableSlots = totalCapacity - totalBooked;
                 return `<div class="p-4 border dark:border-gray-700 rounded-lg dark:text-gray-300 flex justify-between items-center">
                     <div>
@@ -2365,7 +2475,7 @@ const getDayAppointmentsModalHTML = (dateString) => {
     const dayName = date.toLocaleDateString('default', { weekday: 'long', month: 'long', day: 'numeric' });
     const slotsForDay = [];
     state.schedules.forEach(schedule => {
-        schedule.slots.forEach(slot => {
+        (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
             if (new Date(slot.startTime).toISOString().split('T')[0] === dateString) {
                 slotsForDay.push({ schedule, slot });
             }
@@ -2380,7 +2490,7 @@ const getDayAppointmentsModalHTML = (dateString) => {
             const site = state.sites.find(s => s.id === schedule.siteId);
             const patientsInSlot = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id);
             const bookedCount = patientsInSlot.length;
-            const isFull = bookedCount >= slot.capacity;
+            const isFull = bookedCount >= (slot.capacity || 0);
             contentHTML += `
                 <div class="p-4 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-700/50 cursor-pointer appointment-slot" data-schedule-id="${schedule.id}" data-slot-id="${slot.id}">
                     <div class="flex justify-between items-start">
@@ -2391,13 +2501,13 @@ const getDayAppointmentsModalHTML = (dateString) => {
                         </div>
                         <div class="text-right text-sm">
                             <p class="font-semibold ${isFull ? 'text-red-500' : 'text-green-500'}">
-                                ${bookedCount} / ${slot.capacity} Booked
+                                ${bookedCount} / ${slot.capacity || 0} Booked
                             </p>
                         </div>
                     </div>
                     <div class="mt-2 border-t dark:border-gray-600 pt-2 text-sm">
                         ${patientsInSlot.length > 0
-                            ? patientsInSlot.map(p => `<p class="dark:text-gray-300"><i data-lucide="user" class="inline-block w-4 h-4 mr-1"></i><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${p.firstName} ${p.lastName}</button></p>`).join('')
+                            ? patientsInSlot.map(p => `<p class="dark:text-gray-300"><i data-lucide="user" class="inline-block w-4 h-4 mr-1"></i><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${phiName(p)}</button></p>`).join('')
                             : '<p class="text-gray-500 dark:text-gray-400">No participants scheduled.</p>'
                         }
                     </div>
@@ -2437,7 +2547,7 @@ const getPatientProfileHTML = (patient) => {
                         ${outcomeHTML}
                     </div>
                     <ul class="list-disc pl-5 text-sm dark:text-gray-300 mt-2">
-                        ${result.answers.map(ans => `<li><strong>${ans.question}</strong>: ${ans.answer}</li>`).join('')}
+                        ${result.answers.map(ans => `<li><strong>${escapeHtmlPhi(ans.question)}</strong>: ${phi(ans.answer)}</li>`).join('')}
                     </ul>
                 </div>
             `;
@@ -2453,8 +2563,8 @@ const getPatientProfileHTML = (patient) => {
         contactLogHTML += patient.contactLogs.map(log => `
             <div class="mt-4 p-3 border dark:border-gray-700 rounded-lg">
                 <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Logged on: ${new Date(log.date).toLocaleString()}</p>
-                <p class="dark:text-gray-300"><strong>Outcome:</strong> ${log.outcome}</p>
-                <p class="dark:text-gray-300 mt-1"><strong>Notes:</strong> ${log.notes}</p>
+                <p class="dark:text-gray-300"><strong>Outcome:</strong> ${phi(log.outcome)}</p>
+                <p class="dark:text-gray-300 mt-1"><strong>Notes:</strong> ${phi(log.notes)}</p>
             </div>
         `).join('');
     } else {
@@ -2465,8 +2575,8 @@ const getPatientProfileHTML = (patient) => {
     if (patient.appointment) {
         const visitStatus = patient.appointment.visitStatus || 'Scheduled';
         appointmentHTML = `
-            <p><strong>Appointment:</strong> ${new Date(patient.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })} (${patient.appointment.visit || 'General'})</p>
-            <p><strong>Visit Status:</strong> ${visitStatus}</p>
+            <p><strong>Appointment:</strong> ${phi(new Date(patient.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }))} (${patient.appointment.visit || 'General'})</p>
+            <p><strong>Visit Status:</strong> ${phi(visitStatus)}</p>
             <div class="flex gap-2 mt-2">
                 <button data-action="change-appointment" data-patient-id="${patient.id}" class="text-sm bg-yellow-500 text-white px-3 py-1 rounded hover:bg-yellow-600">Change</button>
                 <button data-action="cancel-appointment" data-patient-id="${patient.id}" class="text-sm bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600">Cancel</button>
@@ -2489,8 +2599,8 @@ const getPatientProfileHTML = (patient) => {
                         <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Logged on: ${new Date(log.date).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</p>
                     </div>
                     <div class="text-right">
-                        <p class="text-sm dark:text-gray-300">Completed by: ${log.completedBy}</p>
-                        <p class="text-sm dark:text-gray-300">Signed: ${log.signature}</p>
+                        <p class="text-sm dark:text-gray-300">Completed by: ${phi(log.completedBy)}</p>
+                        <p class="text-sm dark:text-gray-300">Signed: ${phi(log.signature)}</p>
                     </div>
                 </div>
             </div>
@@ -2500,7 +2610,7 @@ const getPatientProfileHTML = (patient) => {
     }
     return `
         <div class="flex justify-between items-start mb-6">
-            <h2 class="text-2xl font-bold dark:text-white">${patient.firstName} ${patient.lastName}</h2>
+            <h2 class="text-2xl font-bold dark:text-white">${phiName(patient)}</h2>
             <button data-action="close-side-panel" class="text-gray-500 dark:text-gray-300 hover:text-gray-800 dark:hover:text-white">
                 <i data-lucide="x"></i>
             </button>
@@ -2540,18 +2650,18 @@ const getPatientProfileHTML = (patient) => {
             <div id="details-content" class="${state.currentPatientProfileTab === 'details' ? '' : 'hidden'}">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 dark:text-gray-300">
                     <div class="space-y-2">
-                        <p><strong>Global ID:</strong> ${patient.globalId || 'N/A'}</p>
-                        <p><strong>Initials:</strong> ${patient.initials || 'N/A'}</p>
-                        <p><strong>Phone:</strong> ${patient.phoneNumber || 'N/A'}</p>
-                        <p><strong>Email:</strong> ${patient.email || 'N/A'}</p>
-                        <p><strong>DOB:</strong> ${patient.dob || 'N/A'}</p>
-                        <p><strong>Address:</strong> ${patient.address || 'N/A'}</p>
-                        <p><strong>City:</strong> ${patient.city || 'N/A'}</p>
-                        <p><strong>State:</strong> ${patient.state || 'N/A'}</p>
-                        <p><strong>Zip:</strong> ${patient.zipCode || 'N/A'}</p>
+                        <p><strong>Global ID:</strong> ${phi(patient.globalId || 'N/A')}</p>
+                        <p><strong>Initials:</strong> ${phi(patient.initials || 'N/A')}</p>
+                        <p><strong>Phone:</strong> ${phi(patient.phoneNumber || 'N/A')}</p>
+                        <p><strong>Email:</strong> ${phi(patient.email || 'N/A')}</p>
+                        <p><strong>DOB:</strong> ${phi(patient.dob || 'N/A')}</p>
+                        <p><strong>Address:</strong> ${phi(patient.address || 'N/A')}</p>
+                        <p><strong>City:</strong> ${phi(patient.city || 'N/A')}</p>
+                        <p><strong>State:</strong> ${phi(patient.state || 'N/A')}</p>
+                        <p><strong>Zip:</strong> ${phi(patient.zipCode || 'N/A')}</p>
                     </div>
                     <div class="space-y-2">
-                        <p><strong>Age:</strong> ${patient.age || 'N/A'}</p>
+                        <p><strong>Age:</strong> ${phi(patient.age != null ? String(patient.age) : 'N/A')}</p>
                         <p><strong>Status:</strong> ${patient.status || 'N/A'}</p>
                         <p><strong>Registry Status:</strong> ${patient.registryStatus || 'N/A'}</p>
                         <p><strong>Source:</strong> ${patient.source || 'N/A'}</p>
@@ -2594,7 +2704,7 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
     const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
     if (!currentEnrollment) {
          return `
-            <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${patient.firstName} ${patient.lastName}</h2>
+            <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${phiName(patient)}</h2>
             <p class="text-red-500">This patient is not currently enrolled in a study and cannot be scheduled.</p>
         `;
     }
@@ -2608,12 +2718,12 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
     const uniqueVisits = [...new Set(availableSchedules.map(s => s.visit).filter(Boolean))].sort();
     if (availableSchedules.length === 0) {
         return `
-            <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${patient.firstName} ${patient.lastName}</h2>
+            <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${phiName(patient)}</h2>
             <p class="text-red-500">No available schedules match the patient's assigned site, study, and visit history.</p>
             <div class="mt-4 p-4 bg-gray-100 dark:bg-gray-800 rounded text-sm">
                 <p><strong>Details:</strong></p>
-                <p>Patient Site ID: ${currentEnrollment.siteId}</p>
-                <p>Patient Study ID: ${currentEnrollment.studyId}</p>
+                <p>Patient Site ID: ${phi(currentEnrollment.siteId)}</p>
+                <p>Patient Study ID: ${phi(currentEnrollment.studyId)}</p>
                 <p>Total Schedules: ${state.schedules.length}</p>
             </div>
         `;
@@ -2634,10 +2744,10 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
             : availableSchedules.filter(s => s.visit === currentFilter);
         const availableSlotsByDay = {};
         filteredSchedules.forEach(schedule => {
-            schedule.slots.forEach(slot => {
+            (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
                 // Calculate booked count by counting patients with appointments in this slot
                 const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
-                if (bookedCount < slot.capacity) {
+                if (bookedCount < (slot.capacity || 0)) {
                     const slotDate = new Date(slot.startTime).toISOString().split('T')[0];
                     if (!availableSlotsByDay[slotDate]) {
                         availableSlotsByDay[slotDate] = [];
@@ -2679,7 +2789,7 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
     };
     return `
         <div class="flex justify-between items-center mb-4">
-             <h2 class="text-2xl font-bold dark:text-white">Schedule for ${patient.firstName} ${patient.lastName}</h2>
+             <h2 class="text-2xl font-bold dark:text-white">Schedule for ${phiName(patient)}</h2>
              <select id="booking-visit-filter" data-patient-id="${patient.id}" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                  <option value="all">Filter by Visit (All)</option>
                  ${uniqueVisits.map(v => `<option value="${v}" ${visitFilter === v ? 'selected' : ''}>${v}</option>`).join('')}
@@ -2705,11 +2815,11 @@ const getQuickAddPatientHTML = () => {
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 ${mappedFields.map(key => {
                     const label = key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
-                    return `<div><label class="block text-sm font-medium dark:text-gray-300">${label}</label><input type="${key === 'dob' ? 'date' : 'text'}" name="${key}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>`;
+                    return `<div><label class="block text-sm font-medium dark:text-gray-300">${label}</label><input type="${key === 'dob' ? 'date' : 'text'}" name="${key}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input"></div>`;
                 }).join('')}
                 <!-- Manually added and special fields -->
-                <div><label class="block text-sm font-medium dark:text-gray-300">Initials</label><input type="text" name="initials" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed" readonly></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Age</label><input type="text" name="age" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed" readonly></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Initials</label><input type="text" name="initials" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed phi-sensitive-input" readonly></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Age</label><input type="text" name="age" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed phi-sensitive-input" readonly></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Status</label><select name="status" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail'].map(s => `<option>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Registry Status</label><select name="registryStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${registryStatuses.map(s => `<option>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Therapeutic Area</label><select name="therapeuticArea" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Area</option>${therapeuticAreas.map(s => `<option>${s}</option>`).join('')}</select></div>
@@ -2734,7 +2844,7 @@ const getEditPatientModalHTML = (patient) => {
     const appointmentWarning = hasAppointment ? `
         <div class="mb-4 p-3 bg-yellow-100 dark:bg-yellow-900 border-l-4 border-yellow-500 text-yellow-700 dark:text-yellow-300">
             <p class="font-semibold">⚠️ Appointment Scheduled</p>
-            <p>This patient has a scheduled appointment on ${new Date(patient.appointment.time).toLocaleString()}. 
+            <p>This patient has a scheduled appointment on ${phi(new Date(patient.appointment.time).toLocaleString())}. 
             Study assignment cannot be changed while an appointment is scheduled.</p>
         </div>
     ` : '';
@@ -2750,21 +2860,21 @@ const getEditPatientModalHTML = (patient) => {
     ` : '';
     
     return `
-        <h2 class="text-2xl font-bold dark:text-white mb-4">Edit Patient: ${patient.firstName} ${patient.lastName}</h2>
+        <h2 class="text-2xl font-bold dark:text-white mb-4">Edit Patient: ${phiName(patient)}</h2>
         ${appointmentWarning}
         ${washoutWarning}
         <form id="edit-patient-form" data-id="${patient.id}" class="space-y-4">
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div><label class="block text-sm font-medium dark:text-gray-300">First Name</label><input type="text" name="firstName" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.firstName || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Last Name</label><input type="text" name="lastName" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.lastName || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Phone Number</label><input type="text" name="phoneNumber" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.phoneNumber || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Email</label><input type="email" name="email" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.email || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Date of Birth</label><input type="date" name="dob" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.dob || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Age</label><input type="text" name="age" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed" readonly value="${patient.age || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Address</label><input type="text" name="address" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.address || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">City</label><input type="text" name="city" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.city || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">State</label><input type="text" name="state" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.state || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Zip Code</label><input type="text" name="zipCode" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${patient.zipCode || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">First Name</label><input type="text" name="firstName" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.firstName || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Last Name</label><input type="text" name="lastName" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.lastName || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Phone Number</label><input type="text" name="phoneNumber" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.phoneNumber || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Email</label><input type="email" name="email" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.email || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Date of Birth</label><input type="date" name="dob" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.dob || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Age</label><input type="text" name="age" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed phi-sensitive-input" readonly value="${patient.age || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Address</label><input type="text" name="address" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.address || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">City</label><input type="text" name="city" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.city || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">State</label><input type="text" name="state" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.state || ''}"></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Zip Code</label><input type="text" name="zipCode" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.zipCode || ''}"></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Status</label><select name="status" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail'].map(s => `<option ${patient.status === s ? 'selected' : ''} ${(washoutStatus && s === 'Pre-Screening') ? 'disabled' : ''}>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Registry Status</label><select name="registryStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${registryStatuses.map(s => `<option ${patient.registryStatus === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Therapeutic Area</label><select name="therapeuticArea" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Area</option>${therapeuticAreas.map(s => `<option ${patient.therapeuticArea === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
@@ -3331,8 +3441,9 @@ const getEditScheduleModalHTML = (schedule) => {
     
     const study = state.studies.find(s => s.id === schedule.studyId);
     const site = state.sites.find(s => s.id === schedule.siteId);
-    const totalCapacity = schedule.slots.reduce((sum, slot) => sum + slot.capacity, 0);
-    const totalBooked = schedule.slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
+    const slots = Array.isArray(schedule.slots) ? schedule.slots : [];
+    const totalCapacity = slots.reduce((sum, slot) => sum + (slot.capacity || 0), 0);
+    const totalBooked = slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
     const availableSlots = totalCapacity - totalBooked;
     
     return `
@@ -3342,7 +3453,7 @@ const getEditScheduleModalHTML = (schedule) => {
             <p class="dark:text-gray-300"><strong>Visit:</strong> ${schedule.visit || 'General'}</p>
             <p class="dark:text-gray-300"><strong>Study:</strong> ${study?.title || 'N/A'}</p>
             <p class="dark:text-gray-300"><strong>Site:</strong> ${site?.name || 'N/A'}</p>
-            <p class="dark:text-gray-300"><strong>Total Slots:</strong> ${schedule.slots.length}</p>
+            <p class="dark:text-gray-300"><strong>Total Slots:</strong> ${slots.length}</p>
             <p class="dark:text-gray-300"><strong>Total Capacity:</strong> ${totalCapacity}</p>
             <p class="dark:text-gray-300"><strong>Booked:</strong> ${totalBooked}</p>
             <p class="dark:text-gray-300"><strong>Available:</strong> ${availableSlots}</p>
@@ -3365,7 +3476,7 @@ const getEditScheduleModalHTML = (schedule) => {
         <div class="mt-8">
             <h3 class="font-semibold text-lg dark:text-white mb-4">Individual Slots</h3>
             <div class="max-h-96 overflow-y-auto space-y-2">
-                ${schedule.slots.map((slot, index) => {
+                ${slots.map((slot, index) => {
                     const slotDate = new Date(slot.startTime);
                     const isBooked = (slot.booked || 0) > 0;
                     return `
@@ -3407,7 +3518,7 @@ const getAppointmentDetailsModalHTML = (schedule, slot) => {
         .sort((a, b) => `${a.firstName || ''} ${a.lastName || ''}`.localeCompare(`${b.firstName || ''} ${b.lastName || ''}`));
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-2">Appointment Details</h2>
-        <p class="text-gray-600 dark:text-gray-400 mb-4">${new Date(slot.startTime).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</p>
+        <p class="text-gray-600 dark:text-gray-400 mb-4">${phi(new Date(slot.startTime).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }))}</p>
         <p class="dark:text-gray-300"><strong>Site:</strong> ${site?.name || 'N/A'}</p>
         <p class="dark:text-gray-300"><strong>Study:</strong> ${study?.title || 'N/A'}</p>
         <p class="dark:text-gray-300"><strong>Visit Type:</strong> ${schedule.visit || 'General'}</p>
@@ -3421,7 +3532,7 @@ const getAppointmentDetailsModalHTML = (schedule, slot) => {
         <h3 class="font-semibold dark:text-white mt-6 mb-2">Scheduled Participants (${scheduledPatients.length}/${slot.capacity})</h3>
         ${scheduledPatients.length > 0 ? `
             <ul class="list-disc pl-5 dark:text-gray-300">
-                ${scheduledPatients.map(p => `<li><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${p.firstName} ${p.lastName}</button></li>`).join('')}
+                ${scheduledPatients.map(p => `<li><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${phiName(p)}</button></li>`).join('')}
             </ul>
         ` : '<p class="text-gray-500 dark:text-gray-400">No participants scheduled for this slot.</p>'}
         <div class="mt-6 border-t dark:border-gray-700 pt-4">
@@ -3434,7 +3545,7 @@ const getAppointmentDetailsModalHTML = (schedule, slot) => {
                             ${eligiblePatients.map(p => `
                                 <div class="flex items-center justify-between gap-3 p-2 border dark:border-gray-600 rounded">
                                     <button data-action="view-patient" data-id="${p.id}" class="text-left text-blue-600 dark:text-blue-400 hover:underline">
-                                        ${p.firstName || ''} ${p.lastName || ''}
+                                        ${phiName(p)}
                                     </button>
                                     <button data-action="book-appointment" data-patient-id="${p.id}" data-schedule-id="${schedule.id}" data-slot-id="${slot.id}"
                                         class="px-3 py-1.5 rounded bg-purple-600 text-white text-xs hover:bg-purple-700">
@@ -3571,14 +3682,14 @@ const getEditSurveyModalHTML = (survey) => {
 const getSelectSurveyModalHTML = (patient) => {
     const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
     if (!currentEnrollment) {
-        return `<h2 class="text-2xl font-bold dark:text-white mb-4">Survey ${patient.firstName} ${patient.lastName}</h2><p class="dark:text-gray-300">Patient is not currently in a study.</p>`;
+        return `<h2 class="text-2xl font-bold dark:text-white mb-4">Survey ${phiName(patient)}</h2><p class="dark:text-gray-300">Patient is not currently in a study.</p>`;
     }
     const availableSurveys = state.surveys.filter(s => s.studyId === currentEnrollment.studyId);
     if (availableSurveys.length === 0) {
-        return `<h2 class="text-2xl font-bold dark:text-white mb-4">Survey ${patient.firstName} ${patient.lastName}</h2><p class="dark:text-gray-300">No surveys available for the patient's assigned study.</p>`;
+        return `<h2 class="text-2xl font-bold dark:text-white mb-4">Survey ${phiName(patient)}</h2><p class="dark:text-gray-300">No surveys available for the patient's assigned study.</p>`;
     }
     return `
-        <h2 class="text-2xl font-bold dark:text-white mb-4">Select Survey for ${patient.firstName} ${patient.lastName}</h2>
+        <h2 class="text-2xl font-bold dark:text-white mb-4">Select Survey for ${phiName(patient)}</h2>
         <div class="space-y-2">
             ${availableSurveys.map(s => `<button data-action="start-survey" data-patient-id="${patient.id}" data-survey-id="${s.id}" class="w-full text-left p-3 border dark:border-gray-600 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 dark:text-white">${s.title}</button>`).join('')}
         </div>
@@ -3647,11 +3758,11 @@ const getAddVisitLogModalHTML = (patientId) => {
             </div>
             <div>
                 <label class="block text-sm font-medium dark:text-gray-300">Completed By</label>
-                <input type="text" name="completedBy" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Your Name">
+                <input type="text" name="completedBy" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="Your Name">
             </div>
              <div>
                 <label class="block text-sm font-medium dark:text-gray-300">Signature</label>
-                <input type="text" name="signature" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Type your name to sign">
+                <input type="text" name="signature" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="Type your name to sign">
             </div>
             <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700">Save Visit Log</button>
         </form>
@@ -3671,7 +3782,7 @@ const getCheckInModalHTML = (patientId) => {
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-4">Check In Patient</h2>
         <div class="mb-6 p-4 bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-500 rounded">
-            <p class="text-lg font-semibold dark:text-white mb-2">${patient.firstName} ${patient.lastName}</p>
+            <p class="text-lg font-semibold dark:text-white mb-2">${phiName(patient)}</p>
             <div class="grid grid-cols-2 gap-4 text-sm dark:text-gray-300">
                 <div>
                     <p><strong>Study:</strong> ${study?.title || 'N/A'}</p>
@@ -3679,7 +3790,7 @@ const getCheckInModalHTML = (patientId) => {
                 </div>
                 <div>
                     <p><strong>Visit:</strong> ${visit}</p>
-                    <p><strong>Scheduled:</strong> ${appointmentTime}</p>
+                    <p><strong>Scheduled:</strong> ${phi(appointmentTime)}</p>
                 </div>
             </div>
         </div>
@@ -3705,7 +3816,7 @@ const getCheckInModalHTML = (patientId) => {
             </div>
             <div>
                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Notes (Optional)</label>
-                <textarea name="checkInNotes" rows="3" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Add any additional notes..."></textarea>
+                <textarea name="checkInNotes" rows="3" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="Add any additional notes..."></textarea>
             </div>
             <div class="flex justify-end gap-4">
                 <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
@@ -3811,7 +3922,7 @@ const renderModalPatientList = (patients, type) => {
     if (type === 'study') {
         tableRowsHTML = patients.map(p => `
             <tr class="dark:text-gray-300">
-                <td class="px-6 py-4"><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${p.firstName} ${p.lastName}</button></td>
+                <td class="px-6 py-4"><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${phiName(p)}</button></td>
                 <td class="px-6 py-4">${p.status || 'N/A'}</td>
                 <td class="px-6 py-4">${p.appointment ? new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : 'Not Scheduled'}</td>
                 <td class="px-6 py-4"><button data-action="survey-patient" data-id="${p.id}" class="text-green-600 dark:text-green-400 hover:underline">Survey</button></td>
@@ -3826,7 +3937,7 @@ const renderModalPatientList = (patients, type) => {
                 <tr class="dark:text-gray-300">
                     <td class="px-6 py-4">
                         <div>
-                            <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${p.firstName} ${p.lastName}</button>
+                            <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">${phiName(p)}</button>
                             ${washoutIndicator}
                         </div>
                     </td>
@@ -3963,11 +4074,11 @@ const getAddContactLogModalHTML = (patientId) => {
         <form id="add-contact-log-form" data-patient-id="${patientId}" class="space-y-4">
             <div>
                 <label class="block text-sm font-medium dark:text-gray-300">Outcome</label>
-                <input type="text" name="outcome" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                <input type="text" name="outcome" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input">
             </div>
             <div>
                 <label class="block text-sm font-medium dark:text-gray-300">Notes</label>
-                <textarea name="notes" rows="4" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></textarea>
+                <textarea name="notes" rows="4" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input"></textarea>
             </div>
             <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700">Save Log</button>
         </form>
@@ -4019,10 +4130,10 @@ const getAddPatientToStudyModalHTML = (studyId) => {
                         return `
                             <tr class="dark:text-gray-300 patient-row" data-patient-name="${p.firstName} ${p.lastName}" data-patient-email="${p.email || ''}" data-patient-phone="${p.phoneNumber || ''}" data-patient-id="${p.globalId || ''}">
                                 <td class="px-6 py-4 whitespace-nowrap">
-                                    ${p.firstName} ${p.lastName}
+                                    ${phiName(p)}
                                     ${washoutStatus ? `<div class="mt-1"><span class="inline-block px-2 py-1 text-xs bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300 rounded-full">Washout: ${washoutStatus.remainingDays}d</span></div>` : ''}
                                 </td>
-                                <td class="px-6 py-4 whitespace-nowrap">${p.globalId || 'N/A'}</td>
+                                <td class="px-6 py-4 whitespace-nowrap">${phi(p.globalId || 'N/A')}</td>
                                 <td class="px-6 py-4 whitespace-nowrap">${p.status || 'N/A'}</td>
                                 <td class="px-6 py-4 whitespace-nowrap">${currentStudy ? currentStudy.title : 'None'}</td>
                                 <td class="px-6 py-4 whitespace-nowrap">
@@ -4063,7 +4174,7 @@ const getEnrollPatientFormModalHTML = (patientId, studyId) => {
             <div class="space-y-3 dark:text-gray-300">
                 <p class="font-semibold">This study (${study.title}) has no active sites assigned.</p>
                 <div class="bg-red-50 dark:bg-red-900/20 border-l-4 border-red-500 p-4">
-                    <p class="text-sm"><strong>Patient:</strong> ${patient.firstName} ${patient.lastName}</p>
+                    <p class="text-sm"><strong>Patient:</strong> ${phiName(patient)}</p>
                     <p class="text-sm"><strong>Study:</strong> ${study.title}</p>
                     <p class="text-sm"><strong>Issue:</strong> No sites are assigned to this study</p>
                 </div>
@@ -4082,7 +4193,7 @@ const getEnrollPatientFormModalHTML = (patientId, studyId) => {
     }
     
     return `
-        <h2 class="text-2xl font-bold dark:text-white mb-4">Enroll ${patient.firstName} ${patient.lastName} in ${study.title}</h2>
+        <h2 class="text-2xl font-bold dark:text-white mb-4">Enroll ${phiName(patient)} in ${study.title}</h2>
         <form id="enroll-patient-form" data-patient-id="${patientId}" data-study-id="${studyId}" class="space-y-4">
             <div>
                 <label class="block text-sm font-medium dark:text-gray-300">Select Site</label>
@@ -4495,8 +4606,11 @@ document.addEventListener('click', async (e) => {
     if (appointmentSlot) {
         const { scheduleId, slotId } = appointmentSlot.dataset;
         const schedule = state.schedules.find(s => s.id === scheduleId);
-        const slot = schedule.slots.find(s => s.id === slotId);
-        openModal(getAppointmentDetailsModalHTML(schedule, slot));
+        const slots = schedule && Array.isArray(schedule.slots) ? schedule.slots : [];
+        const slot = slots.find(s => s.id === slotId);
+        if (schedule && slot) {
+            openModal(getAppointmentDetailsModalHTML(schedule, slot));
+        }
     }
     // Delegated listener for patient profile tabs within the modal
     const tabButton = e.target.closest('#patient-profile-tabs button[data-tab-name]');
@@ -4707,7 +4821,7 @@ document.addEventListener('click', async (e) => {
                 
                 openModal(`
                     <h2 class="text-2xl font-bold text-yellow-600 dark:text-yellow-400 mb-4">Confirm Transfer</h2>
-                    <p class="dark:text-gray-300">Are you sure you want to transfer <strong>${patient.firstName} ${patient.lastName}</strong> to <strong>${study.title}</strong>?</p>
+                    <p class="dark:text-gray-300">Are you sure you want to transfer <strong>${phiName(patient)}</strong> to <strong>${study.title}</strong>?</p>
                     <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">This will mark their current enrollment as past and create a new enrollment.</p>
                     <div class="flex justify-end gap-4 mt-8">
                         <button data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
@@ -4930,7 +5044,7 @@ document.addEventListener('click', async (e) => {
                 const patient = state.patients.find(p => p.id === id);
                 openModal(`
                     <h2 class="text-2xl font-bold text-red-600 dark:text-red-400 mb-4">Confirm Deletion</h2>
-                    <p class="dark:text-gray-300">Are you sure you want to permanently delete the record for <strong>${patient.firstName} ${patient.lastName}</strong>?</p>
+                    <p class="dark:text-gray-300">Are you sure you want to permanently delete the record for <strong>${phiName(patient)}</strong>?</p>
                     <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">This action cannot be undone.</p>
                     <div class="flex justify-end gap-4 mt-8">
                         <button data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
@@ -4963,12 +5077,18 @@ document.addEventListener('click', async (e) => {
             }
             case 'delete-slot': {
                 const schedule = state.schedules.find(s => s.id === scheduleId);
-                const updatedSlots = schedule.slots.filter(s => s.id !== slotId);
+                if (!schedule) {
+                    showNotification('Schedule not found.', 'error');
+                    break;
+                }
+                const prevSlots = Array.isArray(schedule.slots) ? schedule.slots : [];
+                const updatedSlots = prevSlots.filter(s => s.id !== slotId);
                 await updateDocument('schedules', scheduleId, { 
                     slots: updatedSlots,
                     lastUpdated: new Date().toISOString()
                 });
                 closeModal();
+                await loadAllData();
                 break;
             }
             case 'prev-booking-month': {
@@ -4994,10 +5114,10 @@ document.addEventListener('click', async (e) => {
                 );
                 const slotsForDay = [];
                 availableSchedules.forEach(schedule => {
-                    schedule.slots.forEach(slot => {
+                    (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
                         // Calculate actual booked count from patients array instead of using slot.booked
                         const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
-                        if (bookedCount < slot.capacity && new Date(slot.startTime).toISOString().split('T')[0] === date) {
+                        if (bookedCount < (slot.capacity || 0) && new Date(slot.startTime).toISOString().split('T')[0] === date) {
                             slotsForDay.push({scheduleId: schedule.id, scheduleType: schedule.visit, ...slot, booked: bookedCount});
                         }
                     });
@@ -5022,13 +5142,17 @@ document.addEventListener('click', async (e) => {
             }
             case 'delete-schedule': {
                 const schedule = state.schedules.find(s => s.id === id);
+                if (!schedule) {
+                    showNotification('Schedule not found.', 'error');
+                    break;
+                }
                 const study = state.studies.find(s => s.id === schedule.studyId);
                 const site = state.sites.find(s => s.id === schedule.siteId);
                 openModal(`
                     <h2 class="text-2xl font-bold text-red-600 dark:text-red-400 mb-4">Confirm Schedule Deletion</h2>
                     <p class="dark:text-gray-300">Are you sure you want to permanently delete the schedule for:</p>
                     <p class="font-bold dark:text-white mt-2">${schedule.visit || 'General'} - ${study?.title || 'N/A'} at ${site?.name || 'N/A'}</p>
-                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">This will delete all ${schedule.slots.length} appointment slots and cannot be undone.</p>
+                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">This will delete all ${(Array.isArray(schedule.slots) ? schedule.slots : []).length} appointment slots and cannot be undone.</p>
                     <div class="flex justify-end gap-4 mt-8">
                         <button data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                         <button data-action="confirm-delete-schedule" data-id="${id}" class="px-4 py-2 rounded-md bg-red-600 text-white hover:bg-red-700">Confirm Delete</button>
@@ -5049,6 +5173,7 @@ document.addEventListener('click', async (e) => {
                 await deleteDocument('schedules', id);
                 closeModal();
                 showNotification("Schedule deleted successfully.", "success");
+                await loadAllData();
                 break;
             }
         }
@@ -5332,11 +5457,11 @@ document.addEventListener('submit', async (e) => {
                     openModal(`
                         <h2 class="text-2xl font-bold text-orange-600 dark:text-orange-400 mb-4">⚠️ No Show Recorded</h2>
                         <div class="space-y-4 dark:text-gray-300">
-                            <p class="text-lg">Would you like to reschedule <strong>${patient.firstName} ${patient.lastName}</strong>?</p>
+                            <p class="text-lg">Would you like to reschedule <strong>${phiName(patient)}</strong>?</p>
                             <div class="bg-orange-50 dark:bg-orange-900/20 border-l-4 border-orange-500 p-4">
-                                <p class="text-sm"><strong>Patient:</strong> ${patient.firstName} ${patient.lastName}</p>
+                                <p class="text-sm"><strong>Patient:</strong> ${phiName(patient)}</p>
                                 <p class="text-sm"><strong>Missed Visit:</strong> ${patient.appointment.visit || 'General'}</p>
-                                <p class="text-sm"><strong>Original Time:</strong> ${new Date(patient.appointment.time).toLocaleString()}</p>
+                                <p class="text-sm"><strong>Original Time:</strong> ${phi(new Date(patient.appointment.time).toLocaleString())}</p>
                             </div>
                         </div>
                         <div class="flex justify-end gap-4 mt-6">
@@ -5396,7 +5521,7 @@ document.addEventListener('submit', async (e) => {
                     openModal(`
                         <h2 class="text-2xl font-bold text-orange-600 dark:text-orange-400 mb-4">⚠️ Washout Period Warning</h2>
                         <div class="space-y-4 dark:text-gray-300">
-                            <p><strong>${patient.firstName} ${patient.lastName}</strong> is currently in a washout period.</p>
+                            <p><strong>${phiName(patient)}</strong> is currently in a washout period.</p>
                             <div class="bg-orange-50 dark:bg-orange-900/20 border-l-4 border-orange-500 p-4">
                                 <p><strong>Previous Study:</strong> ${washoutStatus.studyTitle}</p>
                                 <p><strong>Exited:</strong> ${new Date(washoutStatus.exitedDate).toLocaleDateString()}</p>
@@ -5699,7 +5824,7 @@ document.addEventListener('submit', async (e) => {
                         openModal(`
                             <h2 class="text-2xl font-bold text-orange-600 dark:text-orange-400 mb-4">⚠️ Washout Period Warning</h2>
                             <div class="space-y-4 dark:text-gray-300">
-                                <p><strong>${patient.firstName} ${patient.lastName}</strong> is currently in a washout period.</p>
+                                <p><strong>${phiName(patient)}</strong> is currently in a washout period.</p>
                                 <div class="bg-orange-50 dark:bg-orange-900/20 border-l-4 border-orange-500 p-4">
                                     <p><strong>Previous Study:</strong> ${washoutStatus.studyTitle}</p>
                                     <p><strong>Exited:</strong> ${new Date(washoutStatus.exitedDate).toLocaleDateString()}</p>
@@ -5956,6 +6081,7 @@ document.addEventListener('submit', async (e) => {
             
             closeModal();
             showNotification("Schedule updated successfully.", "success");
+            await loadAllData();
             break;
         }
         case 'add-site-form': {
@@ -6149,12 +6275,12 @@ document.addEventListener('submit', async (e) => {
                     const outcomeColor = outcome === 'Pass' ? 'text-green-500' : outcome === 'Fail' ? 'text-red-500' : '';
                     return `
                         <tr>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.firstName} ${p.lastName}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.age || 'N/A'}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">${phiName(p)}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">${phi(p.age != null ? String(p.age) : 'N/A')}</td>
                             <td class="px-6 py-4 whitespace-nowrap">${p.status || 'N/A'}</td>
                             <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A'}</td>
                             <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.appointment ? new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : 'Not Scheduled'}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">${p.appointment ? phi(new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })) : 'Not Scheduled'}</td>
                             <td class="px-6 py-4 whitespace-nowrap font-semibold ${outcomeColor}">${outcome}</td>
                         </tr>
                     `;
@@ -6441,6 +6567,9 @@ const renderCalendar = () => {
     if (state.schedulingStudyFilter !== 'all') {
         filteredSchedules = filteredSchedules.filter(s => s.studyId === state.schedulingStudyFilter);
     }
+    if (state.schedulingVisitFilter !== 'all') {
+        filteredSchedules = filteredSchedules.filter(s => s.visit === state.schedulingVisitFilter);
+    }
     let calendarHTML = `
         <div class="flex justify-between items-center mb-4 dark:text-white">
             <button data-action="prev-month" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"><i data-lucide="chevron-left"></i></button>
@@ -6458,12 +6587,12 @@ const renderCalendar = () => {
         const dateString = currentDate.toISOString().split('T')[0];
         let appointmentsHTML = '';
         filteredSchedules.forEach(schedule => {
-            schedule.slots.forEach(slot => {
+            (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
                 const slotDate = new Date(slot.startTime);
                 if (slotDate.toISOString().split('T')[0] === dateString) {
                     const study = state.studies.find(s => s.id === schedule.studyId);
                     const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
-                    const isFull = bookedCount >= slot.capacity;
+                    const isFull = bookedCount >= (slot.capacity || 0);
                     appointmentsHTML += `
                         <div data-schedule-id="${schedule.id}" data-slot-id="${slot.id}" class="appointment-slot p-1.5 mb-1 rounded-md text-xs cursor-pointer ${isFull ? 'bg-red-200 dark:bg-red-800 text-red-900 dark:text-red-100' : 'bg-blue-100 dark:bg-blue-800 hover:bg-blue-200 dark:hover:bg-blue-700 text-blue-900 dark:text-blue-100'}">
                             <p class="font-semibold truncate dark:text-white">${schedule.visit || 'General'}: ${study?.title || 'No Title'}</p>
@@ -6497,9 +6626,12 @@ const renderDayView = () => {
     if (state.schedulingStudyFilter !== 'all') {
         filteredSchedules = filteredSchedules.filter(s => s.studyId === state.schedulingStudyFilter);
     }
+    if (state.schedulingVisitFilter !== 'all') {
+        filteredSchedules = filteredSchedules.filter(s => s.visit === state.schedulingVisitFilter);
+    }
     const slotsForDay = [];
     filteredSchedules.forEach(schedule => {
-        schedule.slots.forEach(slot => {
+        (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
             if (new Date(slot.startTime).toISOString().split('T')[0] === dateString) {
                 slotsForDay.push({schedule, slot});
             }
@@ -6523,7 +6655,7 @@ const renderDayView = () => {
                     <p class="font-bold dark:text-white">${new Date(slot.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</p>
                     <p class="text-sm text-gray-600 dark:text-gray-400">${schedule.visit || 'General'}: ${study?.title || 'N/A'}</p>
                     <div class="mt-2 text-sm">
-                        ${patientsInSlot.length > 0 ? patientsInSlot.map(p => `<p class="dark:text-gray-300">${p.firstName} ${p.lastName}</p>`).join('') : '<p class="text-gray-500 dark:text-gray-500">Open Slot</p>'}
+                        ${patientsInSlot.length > 0 ? patientsInSlot.map(p => `<p class="dark:text-gray-300">${phiName(p)}</p>`).join('') : '<p class="text-gray-500 dark:text-gray-500">Open Slot</p>'}
                     </div>
                 </div>
             `;
@@ -6576,8 +6708,8 @@ const renderBookedAppointmentsView = () => {
                 <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                 ${bookedAppointments.map(({patient, schedule, slot}) => `
                     <tr class="dark:text-gray-300">
-                        <td class="px-6 py-4">${new Date(slot.startTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</td>
-                        <td class="px-6 py-4"><button data-action="view-patient" data-id="${patient.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${patient.firstName} ${patient.lastName}</button></td>
+                        <td class="px-6 py-4">${phi(new Date(slot.startTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }))}</td>
+                        <td class="px-6 py-4"><button data-action="view-patient" data-id="${patient.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${phiName(patient)}</button></td>
                         <td class="px-6 py-4">${state.studies.find(s => s.id === schedule.studyId)?.title || 'N/A'}</td>
                         <td class="px-6 py-4">${schedule.visit || 'General'}</td>
                     </tr>
@@ -6638,9 +6770,9 @@ const renderDuplicateResults = (duplicateGroups) => {
                 <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                     ${group.map(p => `
                         <tr class="dark:text-gray-300">
-                            <td class="px-6 py-4">${p.firstName} ${p.lastName}</td>
-                            <td class="px-6 py-4">${p.dob}</td>
-                            <td class="px-6 py-4">${p.email || 'N/A'}</td>
+                            <td class="px-6 py-4">${phiName(p)}</td>
+                            <td class="px-6 py-4">${phi(p.dob || 'N/A')}</td>
+                            <td class="px-6 py-4">${phi(p.email || 'N/A')}</td>
                             <td class="px-6 py-4 flex items-center gap-2">
                                 <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">View</button>
                                 <button data-action="delete-patient" data-id="${p.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
@@ -6853,6 +6985,7 @@ const init = async () => {
     document.getElementById('logo-container').addEventListener('click', toggleTheme);
     document.getElementById('mobile-logo-container').addEventListener('click', toggleTheme);
     document.getElementById('dark-mode-toggle').addEventListener('click', toggleTheme);
+    document.getElementById('privacy-mask-toggle').addEventListener('click', togglePrivacyMaskSensitive);
     overlay.addEventListener('click', () => {
         closeSidePanel();
         if (sidebar.classList.contains('-translate-x-full') === false) {
@@ -6873,6 +7006,8 @@ const init = async () => {
     // Initialize NASA with Azure Cosmos DB
     try {
         loadLocalState();
+        syncPrivacyMaskDom();
+        updatePrivacyMaskToggleUi();
         state.authReady = true;
         state.userId = 'nasa-user';
         state.showLoginGate = true;
