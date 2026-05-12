@@ -5134,9 +5134,10 @@
                     ? (getEventWithMergedGroupStaff(event) || event) : event;
                 if (!source) return [];
                 const crcs = [];
-                // If roleAssignments exists, it is the source of truth for who is actually assigned.
-                // Avoid ghost people lingering in crcIds after removals.
-                if (source.roleAssignments && Object.keys(source.roleAssignments).length > 0) {
+                // Site Assignment: whenever roleAssignments exists as an object, it is the only source of truth
+                // (including `{}` or slots cleared to UNASSIGNED). Do not fall back to legacy crcId/crcIds — those
+                // often stay populated after removals and cause ghost names on calendar/scheduler.
+                if (source.type === 'Site Assignment' && source.roleAssignments != null && typeof source.roleAssignments === 'object') {
                     const ids = new Set();
                     Object.values(source.roleAssignments).forEach(assignments => {
                         if (Array.isArray(assignments)) {
@@ -5199,12 +5200,25 @@
                 return { roles, trainingInfo };
             };
 
-            // For multi-day shifts (same groupId), merge roleAssignments/crcIds from all days so every day shows full staff and CRCs see their role
+            // Site Assignment rows in a multi-day *group* share groupId but each row has its own `date`.
+            // Only merge staff from events on the **same calendar day** as `anchorEvent` so per-day removals
+            // do not show ghost CRCs at the bottom of cells (scheduler/calendar/list).
+            const getSameCalendarDayGroupSiteAssignments = (anchorEvent, eventList) => {
+                if (!anchorEvent || !anchorEvent.groupId || anchorEvent.type !== 'Site Assignment') return [];
+                const src = Array.isArray(eventList) ? eventList : [];
+                const anchorDay = toDateOnlyString(parseDateFlexible(anchorEvent.date || anchorEvent.startDate));
+                return src.filter(e => {
+                    if (!e || e.groupId !== anchorEvent.groupId || e.type !== 'Site Assignment' || isCancelledShift(e)) return false;
+                    if (!anchorDay) return e.id === anchorEvent.id;
+                    return toDateOnlyString(parseDateFlexible(e.date || e.startDate)) === anchorDay;
+                });
+            };
+
+            // For multi-day shifts (same groupId, same calendar day), merge roleAssignments from same-day rows only.
             const getEventWithMergedGroupStaff = (event) => {
                 if (!event || !event.groupId || event.type !== 'Site Assignment') return event;
-                const events = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events || []).filter(e =>
-                    e && e.groupId === event.groupId && e.type === 'Site Assignment' && !isCancelledShift(e)
-                );
+                const list = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events) || [];
+                const events = getSameCalendarDayGroupSiteAssignments(event, list);
                 if (events.length <= 1) return event;
                 const mergedRoleAssignments = {};
                 const crcIdsSet = new Set();
@@ -6649,11 +6663,10 @@
                     }
                 }
                 
-                // Multi-day shift: if this event has groupId but missing this CRC (e.g. day 2 payload incomplete), check other days in same group
+                // Multi-day shift: same calendar day only — do not treat sibling *dates* as carrying this cell's roster
                 if (event.groupId && event.type === 'Site Assignment') {
-                    const events = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events || []).filter(e =>
-                        e && e.groupId === event.groupId && e.type === 'Site Assignment' && !isCancelledShift(e)
-                    );
+                    const list = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events) || [];
+                    const events = getSameCalendarDayGroupSiteAssignments(event, list);
                     const anyHasCrc = events.some(e => {
                         if (e.crcId === crcId) return true;
                         if (e.crcIds && Array.isArray(e.crcIds) && e.crcIds.includes(crcId)) return true;
@@ -11323,24 +11336,32 @@
                                     // Get CRC names with location for entire schedule view (location beside name for travel)
                                     let crcNames = [];
                                     if (dashboardView === 'entireSchedule') {
-                                        if (event.crcId) {
-                                            const crc = state.crcs.find(c => c.id === event.crcId);
-                                            if (crc) crcNames.push(locationStr ? crc.name.split(' ')[0] + ' · ' + locationStr : crc.name.split(' ')[0]);
-                                        }
-                                        if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                                            Object.values(event.roleAssignments).forEach(assignments => {
-                                                if (Array.isArray(assignments)) {
-                                                    assignments.forEach(crcId => {
-                                                        if (crcId) {
-                                                            const crc = state.crcs.find(c => c.id === crcId);
-                                                            if (crc) {
-                                                                const label = locationStr ? crc.name.split(' ')[0] + ' · ' + locationStr : crc.name.split(' ')[0];
-                                                                if (!crcNames.includes(label)) crcNames.push(label);
-                                                            }
-                                                        }
-                                                    });
-                                                }
+                                        if (event.type === 'Site Assignment' && typeof getEventCRCs === 'function') {
+                                            getEventCRCs(event).forEach(crc => {
+                                                if (!crc) return;
+                                                const label = locationStr ? crc.name.split(' ')[0] + ' · ' + locationStr : crc.name.split(' ')[0];
+                                                if (!crcNames.includes(label)) crcNames.push(label);
                                             });
+                                        } else {
+                                            if (event.crcId) {
+                                                const crc = state.crcs.find(c => c.id === event.crcId);
+                                                if (crc) crcNames.push(locationStr ? crc.name.split(' ')[0] + ' · ' + locationStr : crc.name.split(' ')[0]);
+                                            }
+                                            if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
+                                                Object.values(event.roleAssignments).forEach(assignments => {
+                                                    if (Array.isArray(assignments)) {
+                                                        assignments.forEach(crcId => {
+                                                            if (crcId) {
+                                                                const crc = state.crcs.find(c => c.id === crcId);
+                                                                if (crc) {
+                                                                    const label = locationStr ? crc.name.split(' ')[0] + ' · ' + locationStr : crc.name.split(' ')[0];
+                                                                    if (!crcNames.includes(label)) crcNames.push(label);
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                            }
                                         }
                                     }
                                     const crcNameDisplay = crcNames.length > 0 ? crcNames.join(', ') : '';
@@ -11616,6 +11637,16 @@
                 const isDarkMode = document.documentElement.classList.contains('dark');
 
                 const getStaffNames = (event) => {
+                    if (!event) return '—';
+                    if (event.type === 'Site Assignment' && typeof getEventCRCs === 'function') {
+                        const crcs = getEventCRCs(event);
+                        if (crcs.length > 0) {
+                            return crcs.map(c => c.name).filter(Boolean).join(', ');
+                        }
+                        if (event.crcId === 'SITE_STAFF') return 'Site Staff';
+                        if (event.crcId === 'UNASSIGNED' || (typeof isOpenShift === 'function' && isOpenShift(event))) return 'Open';
+                        return 'Open';
+                    }
                     const names = [];
                     const legacyId = normalizeCrcId(event.crcId);
                     if (legacyId && legacyId !== 'SITE_STAFF' && legacyId !== 'UNASSIGNED') {
@@ -12605,6 +12636,8 @@
                             } else if (event.crcId === 'SITE_STAFF') {
                                 crcDisplayName = 'Site Staff';
                             } else if (event.crcId === 'UNASSIGNED') {
+                                crcDisplayName = 'Open until filled';
+                            } else if (event.type === 'Site Assignment' && event.roleAssignments != null && typeof event.roleAssignments === 'object') {
                                 crcDisplayName = 'Open until filled';
                             } else if (crc) {
                                 crcDisplayName = crc.name;
@@ -16810,26 +16843,47 @@
                                 const group = shiftGroups.get(shiftKey);
                                 group.events.push(event);
                                 
-                                // Collect all CRCs from this event (skip SITE_STAFF and UNASSIGNED)
-                                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
-                                    group.allCrcIds.add(event.crcId);
-                                }
-                                if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                // Staff: for Site Assignment, use roleAssignments only when the field exists (even {}),
+                                // so stale top-level crcId/crcIds from removed people are not shown in this cell.
+                                if (event.type === 'Site Assignment' && event.roleAssignments != null && typeof event.roleAssignments === 'object') {
                                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                                         if (!group.allRoles.has(roleId)) {
                                             group.allRoles.set(roleId, new Set());
                                         }
                                         if (Array.isArray(assignments)) {
                                             assignments.forEach(crcId => {
-                                                if (crcId && crcId !== 'SITE_STAFF') {
+                                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                                     group.allCrcIds.add(crcId);
                                                     group.allRoles.get(roleId).add(crcId);
                                                 } else if (crcId === 'SITE_STAFF') {
                                                     group.allRoles.get(roleId).add('SITE_STAFF');
+                                                } else if (crcId === 'UNASSIGNED') {
+                                                    group.allRoles.get(roleId).add('UNASSIGNED');
                                                 }
                                             });
                                         }
                                     });
+                                } else {
+                                    if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
+                                        group.allCrcIds.add(event.crcId);
+                                    }
+                                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                            if (!group.allRoles.has(roleId)) {
+                                                group.allRoles.set(roleId, new Set());
+                                            }
+                                            if (Array.isArray(assignments)) {
+                                                assignments.forEach(crcId => {
+                                                    if (crcId && crcId !== 'SITE_STAFF') {
+                                                        group.allCrcIds.add(crcId);
+                                                        group.allRoles.get(roleId).add(crcId);
+                                                    } else if (crcId === 'SITE_STAFF') {
+                                                        group.allRoles.get(roleId).add('SITE_STAFF');
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    }
                                 }
                                 
                                 if (event.notes && !group.allNotes.includes(event.notes)) {
@@ -17295,26 +17349,45 @@
                             const group = shiftGroups.get(shiftKey);
                             group.events.push(event);
                             
-                            // Collect all CRCs from this event
-                            if (event.crcId && event.crcId !== 'SITE_STAFF') {
-                                group.allCrcIds.add(event.crcId);
-                            }
-                            if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                            if (event.type === 'Site Assignment' && event.roleAssignments != null && typeof event.roleAssignments === 'object') {
                                 Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                                     if (!group.allRoles.has(roleId)) {
                                         group.allRoles.set(roleId, new Set());
                                     }
                                     if (Array.isArray(assignments)) {
                                         assignments.forEach(crcId => {
-                                            if (crcId && crcId !== 'SITE_STAFF') {
+                                            if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                                 group.allCrcIds.add(crcId);
                                                 group.allRoles.get(roleId).add(crcId);
                                             } else if (crcId === 'SITE_STAFF') {
                                                 group.allRoles.get(roleId).add('SITE_STAFF');
+                                            } else if (crcId === 'UNASSIGNED') {
+                                                group.allRoles.get(roleId).add('UNASSIGNED');
                                             }
                                         });
                                     }
                                 });
+                            } else {
+                                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
+                                    group.allCrcIds.add(event.crcId);
+                                }
+                                if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                        if (!group.allRoles.has(roleId)) {
+                                            group.allRoles.set(roleId, new Set());
+                                        }
+                                        if (Array.isArray(assignments)) {
+                                            assignments.forEach(crcId => {
+                                                if (crcId && crcId !== 'SITE_STAFF') {
+                                                    group.allCrcIds.add(crcId);
+                                                    group.allRoles.get(roleId).add(crcId);
+                                                } else if (crcId === 'SITE_STAFF') {
+                                                    group.allRoles.get(roleId).add('SITE_STAFF');
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
                             }
                             
                             if (event.notes && !group.allNotes.includes(event.notes)) {
@@ -17999,26 +18072,45 @@
                                 const group = shiftGroups.get(shiftKey);
                                 group.events.push(event);
                                 
-                                // Collect all CRCs from this event (skip SITE_STAFF and UNASSIGNED)
-                                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
-                                    group.allCrcIds.add(event.crcId);
-                                }
-                                if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                if (event.type === 'Site Assignment' && event.roleAssignments != null && typeof event.roleAssignments === 'object') {
                                     Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
                                         if (!group.allRoles.has(roleId)) {
                                             group.allRoles.set(roleId, new Set());
                                         }
                                         if (Array.isArray(assignments)) {
                                             assignments.forEach(crcId => {
-                                                if (crcId && crcId !== 'SITE_STAFF') {
+                                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
                                                     group.allCrcIds.add(crcId);
                                                     group.allRoles.get(roleId).add(crcId);
                                                 } else if (crcId === 'SITE_STAFF') {
                                                     group.allRoles.get(roleId).add('SITE_STAFF');
+                                                } else if (crcId === 'UNASSIGNED') {
+                                                    group.allRoles.get(roleId).add('UNASSIGNED');
                                                 }
                                             });
                                         }
                                     });
+                                } else {
+                                    if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
+                                        group.allCrcIds.add(event.crcId);
+                                    }
+                                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                                            if (!group.allRoles.has(roleId)) {
+                                                group.allRoles.set(roleId, new Set());
+                                            }
+                                            if (Array.isArray(assignments)) {
+                                                assignments.forEach(crcId => {
+                                                    if (crcId && crcId !== 'SITE_STAFF') {
+                                                        group.allCrcIds.add(crcId);
+                                                        group.allRoles.get(roleId).add(crcId);
+                                                    } else if (crcId === 'SITE_STAFF') {
+                                                        group.allRoles.get(roleId).add('SITE_STAFF');
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    }
                                 }
                                 
                                 if (event.notes && !group.allNotes.includes(event.notes)) {
@@ -24680,10 +24772,10 @@
                         ${isEditing && event?.groupId && !readOnly && (isMultiDayEvent || isGroupSeriesMultiDay) ? `
                         <div class="p-3 rounded-md border border-amber-200 dark:border-amber-700 bg-amber-50/60 dark:bg-amber-900/20">
                             <label class="flex items-center gap-2 cursor-pointer">
-                                <input type="checkbox" name="applyToAllDaysInShift" checked class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
+                                <input type="checkbox" name="applyToAllDaysInShift" class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
                                 <span class="text-sm font-medium text-amber-800 dark:text-amber-200">Apply changes to all days in this shift</span>
                             </label>
-                            <p class="text-xs text-amber-700/80 dark:text-amber-300/80 mt-1 ml-6">Checked by default so roster and travel stay in sync across the series. Uncheck to edit only this calendar day (roster changes still copy to other days when you change staff).</p>
+                            <p class="text-xs text-amber-700/80 dark:text-amber-300/80 mt-1 ml-6">Leave unchecked to edit <strong>only this calendar day</strong> (site, hours, notes, and who is on shift for this day only). Check this when you want the same roster and details applied to <strong>every</strong> day in the series.</p>
                         </div>
                         ` : ''}
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -24924,13 +25016,16 @@
                     const crc = state.crcs.find(c => c.id === event.crcId);
                     const site = state.crc_sites.find(s => s.id === event.siteId);
                     const eventColors = { 'Site Assignment': 'bg-blue-500', 'Travel Day': 'bg-orange-500', 'Paid Time Off': 'bg-purple-500', 'Unavailable': 'bg-gray-500', 'Open Shift': 'bg-red-500' };
+                    const staffLine = (event.type === 'Site Assignment' && typeof getEventCRCs === 'function')
+                        ? getEventCRCs(event).map(c => c.name).filter(Boolean).join(', ')
+                        : (crc ? crc.name : '');
                     return `
                         <div class="p-3 border-b dark:border-gray-700 flex items-center gap-4">
                             <div class="w-4 h-4 rounded-full ${eventColors[event.type] || 'bg-gray-500'}"></div>
                             <div class="flex-grow">
                                 <p class="font-semibold">${event.type} (${event.hours || 'N/A'} hrs)</p>
                                 <p class="text-sm text-gray-600 dark:text-gray-300">
-                                    ${crc ? crc.name : ''} ${site ? `at ${site.name}` : ''} ${getEventRoles(event).length > 0 ? `(${getEventRoles(event).join(', ')})` : ''}
+                                    ${staffLine} ${site ? `at ${site.name}` : ''} ${getEventRoles(event).length > 0 ? `(${getEventRoles(event).join(', ')})` : ''}
                                     ${event.groupNumber ? `<br>Group: ${event.groupNumber}` : ''}
                                     ${event.visitNumber ? `<br>Visit: ${getVisitDisplayName(event.visitNumber, event.studyIds)}` : ''}
                                     ${event.numberOfPatients ? `<br>Patients: ${event.numberOfPatients}` : ''}
@@ -24965,15 +25060,17 @@
             const getPlanningGridQuickViewModalHTML = (event) => {
                 // Get all assigned CRCs from roleAssignments or fall back to crcId
                 const getAllAssignedCRCs = (evt) => {
+                    if (evt.type === 'Site Assignment' && evt.roleAssignments != null && typeof evt.roleAssignments === 'object' && typeof getEventCRCs === 'function') {
+                        return getEventCRCs(evt);
+                    }
                     const assignedCrcs = [];
-                    const assignedCrcIds = new Set(); // Track IDs to avoid duplicates
+                    const assignedCrcIds = new Set();
                     
-                    // First, check roleAssignments
                     if (evt.roleAssignments && typeof evt.roleAssignments === 'object' && Object.keys(evt.roleAssignments).length > 0) {
                         Object.values(evt.roleAssignments).forEach(assignments => {
                             if (Array.isArray(assignments)) {
                                 assignments.forEach(crcId => {
-                                    if (crcId && crcId !== 'SITE_STAFF' && !assignedCrcIds.has(crcId)) {
+                                    if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED' && !assignedCrcIds.has(crcId)) {
                                         const crc = state.crcs.find(c => c.id === crcId);
                                         if (crc) {
                                             assignedCrcs.push(crc);
@@ -24984,8 +25081,7 @@
                             }
                         });
                     }
-                    // Also check legacy crcId (even if roleAssignments exist, to handle mixed data)
-                    if (evt.crcId && evt.crcId !== 'SITE_STAFF' && !assignedCrcIds.has(evt.crcId)) {
+                    if (evt.crcId && evt.crcId !== 'SITE_STAFF' && evt.crcId !== 'UNASSIGNED' && !assignedCrcIds.has(evt.crcId)) {
                         const crc = state.crcs.find(c => c.id === evt.crcId);
                         if (crc) {
                             assignedCrcs.push(crc);
@@ -31255,16 +31351,7 @@
                     case 'remove-current-assignment': {
                         const crcId = actionButton.dataset.crcId;
                         if (!crcId) break;
-                        // Removing a person from a multi-day shift must remove them from the entire shift (all days),
-                        // otherwise group-staff merging will still show them "at the bottom" from other days.
-                        const formEl = document.getElementById('crc-event-form');
-                        if (formEl) {
-                            const applyCb = formEl.querySelector('input[name="applyToAllDaysInShift"]');
-                            if (applyCb) {
-                                applyCb.checked = true;
-                                applyCb.dispatchEvent(new Event('change', { bubbles: true }));
-                            }
-                        }
+                        // Removes this CRC from the form's role slots only. With "Apply to all days" off, save updates this calendar day only; check that box if you need the same removal on every day in the series.
                         removeCrcFromRoleAssignments(crcId);
                         if (typeof updateTravelSelectionContainer === 'function') {
                             updateTravelSelectionContainer();
@@ -36123,13 +36210,29 @@
                                     // Check if this event is part of a group (multi-day event)
                                     const isGroupEvent = existingGroupId && existingEvent.groupId;
                                     
-                                    // Get old date range
-                                    const oldStartDate = existingEvent.date || existingEvent.startDate;
-                                    const oldEndDate = existingEvent.endDate || existingEvent.date;
-                                    const oldStartDateObj = parseDateFlexible(oldStartDate);
-                                    const oldEndDateObj = parseDateFlexible(oldEndDate || oldStartDate);
-                                    const oldStartDateStr = toDateOnlyString(oldStartDateObj);
-                                    const oldEndDateStr = toDateOnlyString(oldEndDateObj || oldStartDateObj);
+                                    // Get old date range for comparison with the form.
+                                    // Multi-day *grouped* shifts store one event per calendar day (`date`), but each row often
+                                    // still carries `startDate`/`endDate` denormalized to the full series. Comparing the form
+                                    // (which defaults to *this row's* day only) against that series end incorrectly flags
+                                    // `dateRangeChanged` and runs the "delete entire group and recreate" path — blocking normal per-day edits.
+                                    const groupSeriesRows = existingGroupId
+                                        ? state.crc_events.filter(e => e.groupId === existingGroupId && e.type !== 'Travel Day')
+                                        : [];
+                                    const isGroupedMultiDaySeries = !!(existingGroupId && existingEvent.groupId && groupSeriesRows.length > 1);
+                                    let oldStartDateStr;
+                                    let oldEndDateStr;
+                                    if (isGroupedMultiDaySeries) {
+                                        const rowDay = toDateOnlyString(parseDateFlexible(existingEvent.date || existingEvent.startDate));
+                                        oldStartDateStr = rowDay;
+                                        oldEndDateStr = rowDay;
+                                    } else {
+                                        const oldStartDate = existingEvent.date || existingEvent.startDate;
+                                        const oldEndDate = existingEvent.endDate || existingEvent.date;
+                                        const oldStartDateObj = parseDateFlexible(oldStartDate);
+                                        const oldEndDateObj = parseDateFlexible(oldEndDate || oldStartDate);
+                                        oldStartDateStr = toDateOnlyString(oldStartDateObj);
+                                        oldEndDateStr = toDateOnlyString(oldEndDateObj || oldStartDateObj);
+                                    }
                                     const newStartDateStr = toDateOnlyString(startDateObj);
                                     const newEndDateStr = toDateOnlyString(endDateObj);
                                     
@@ -36768,13 +36871,6 @@
                                             skipTravelDayProcessing: isLegacyShiftEdit && !hasSelectedTravel
                                         };
                                         
-                                        const serializeRoleAssignmentsForStaffDiff = (ra) => {
-                                            if (!ra || typeof ra !== 'object' || Object.keys(ra).length === 0) return '';
-                                            return Object.keys(ra).sort().map(k => `${k}:${(Array.isArray(ra[k]) ? ra[k] : []).map(String).sort().join('|')}`).join(';');
-                                        };
-                                        const staffRosterChangedFromExisting =
-                                            serializeRoleAssignmentsForStaffDiff(existingEvent?.roleAssignments) !== serializeRoleAssignmentsForStaffDiff(finalRoleAssignments);
-                                        
                                         // CRITICAL: This UPDATE preserves the existing shift - it does NOT delete it
                                         // The shift will remain on the schedule with all its data intact
                                         // Only update all days in the shift when user checked "Apply to all days"
@@ -36838,32 +36934,7 @@
                                                 setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                                                 setTimeout(() => markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(updatePayload)), 0);
                                             }
-                                            if (isGroupEvent && existingGroupId && !applyToAllDays && staffRosterChangedFromExisting) {
-                                                const otherGroupEvents = state.crc_events.filter(e =>
-                                                    e.groupId === existingGroupId && e.type !== 'Travel Day' && e.id !== updatedEvent.id
-                                                );
-                                                for (const groupEvent of otherGroupEvents) {
-                                                    const payloadForDay = {
-                                                        ...groupEvent,
-                                                        roleAssignments: updatePayload.roleAssignments,
-                                                        trainingAssignments: updatePayload.trainingAssignments,
-                                                        trainingModes: updatePayload.trainingModes,
-                                                        roleQuantityOverrides: updatePayload.roleQuantityOverrides,
-                                                        travelDayPreferences: updatePayload.travelDayPreferences,
-                                                        skipTravelDayProcessing: updatePayload.skipTravelDayProcessing,
-                                                    };
-                                                    try {
-                                                        const updatedOther = await apiService.updateEvent(groupEvent.id, payloadForDay);
-                                                        if (updatedOther && updatedOther.id) {
-                                                            const mergedOther = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(updatedOther, payloadForDay) : updatedOther;
-                                                            const idx = state.crc_events.findIndex(e => e.id === groupEvent.id);
-                                                            if (idx !== -1) state.crc_events[idx] = mergedOther;
-                                                        }
-                                                    } catch (propErr) {
-                                                        console.error('Error propagating roster to series day', groupEvent.id, propErr);
-                                                    }
-                                                }
-                                            }
+                                            // Per-day edits (!applyToAllDays): do NOT push roster/training to sibling series days—each calendar row keeps its own assignments.
                                         } else {
                                             console.error('CRITICAL ERROR: Shift update failed - updatedEvent is missing or has no ID!', updatedEvent);
                                             console.error('Update payload that was sent:', updatePayload);
@@ -37208,6 +37279,18 @@
                                             
                                             // Find CRCs that were in the previous event but are not in the current assignment
                                             const removedCrcs = Array.from(previousCrcs).filter(crcId => !assignedCrcsForTravel.has(crcId));
+
+                                            const eventAssignsCrcId = (ev, crc) => {
+                                                if (!ev || !crc) return false;
+                                                if (ev.crcId === crc) return true;
+                                                if (Array.isArray(ev.crcIds) && ev.crcIds.includes(crc)) return true;
+                                                if (ev.roleAssignments && typeof ev.roleAssignments === 'object') {
+                                                    return Object.values(ev.roleAssignments).some(assignments =>
+                                                        Array.isArray(assignments) && assignments.includes(crc)
+                                                    );
+                                                }
+                                                return false;
+                                            };
                                             
                                             // Delete travel days for removed CRCs
                                             if (removedCrcs.length > 0) {
@@ -37238,6 +37321,27 @@
                                                 }
                                                 
                                                 for (const removedCrcId of removedCrcs) {
+                                                    const stillOnSiblingDay = !!(shiftGroupId && state.crc_events.some(e =>
+                                                        e &&
+                                                        e.id !== eventId &&
+                                                        e.groupId === shiftGroupId &&
+                                                        e.type === 'Site Assignment' &&
+                                                        eventAssignsCrcId(e, removedCrcId)
+                                                    ));
+                                                    const thisRowDateStr = toDateOnlyString(parseDateFlexible(updatedEvent.date || existingEvent?.date || ''));
+                                                    const narrowTravelDates = new Set();
+                                                    if (thisRowDateStr) {
+                                                        narrowTravelDates.add(thisRowDateStr);
+                                                        const rowD = parseDateOnly(thisRowDateStr);
+                                                        if (rowD) {
+                                                            const prevD = new Date(rowD);
+                                                            prevD.setDate(prevD.getDate() - 1);
+                                                            narrowTravelDates.add(toDateOnlyString(prevD));
+                                                            const nextD = new Date(rowD);
+                                                            nextD.setDate(nextD.getDate() + 1);
+                                                            narrowTravelDates.add(toDateOnlyString(nextD));
+                                                        }
+                                                    }
                                                     console.log(`[TRAVEL DELETE] Looking for travel days to delete for removed CRC ${removedCrcId}, shiftGroupId: ${shiftGroupId}`);
                                                     
                                                     // Find travel days for this CRC linked to this shift
@@ -37249,12 +37353,14 @@
                                                         
                                                         // Primary: Check parentShiftGroupId match
                                                         if (shiftGroupId && e.parentShiftGroupId === shiftGroupId) {
+                                                            if (stillOnSiblingDay && !narrowTravelDates.has(e.date)) return false;
                                                             console.log(`[TRAVEL DELETE] Found travel day ${e.id} linked by parentShiftGroupId`);
                                                             return true;
                                                         }
                                                         
                                                         // Fallback: Check date range for legacy travel days without parentShiftGroupId
                                                         if (!e.parentShiftGroupId && eventDateRange.length > 0 && eventDateRange.includes(e.date)) {
+                                                            if (stillOnSiblingDay && !narrowTravelDates.has(e.date)) return false;
                                                             console.log(`[TRAVEL DELETE] Found legacy travel day ${e.id} by date match: ${e.date}`);
                                                             return true;
                                                         }
