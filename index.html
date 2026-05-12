@@ -4628,6 +4628,7 @@
                 // Check for ANY Site Assignment on this date (excluding the current event if editing)
                 // Only consider valid Site Assignments (with CRC assigned or valid role assignments)
                 const conflictingSiteAssignments = state.crc_events.filter(event => {
+                    if (isCancelledShift(event)) return false;
                     // Exclude the current event being edited
                     if (excludeEventId && event.id === excludeEventId) return false;
                     
@@ -4755,6 +4756,7 @@
             // Helper function to get conflicting appointment info for display
             const getConflictingAppointmentInfo = (crcId, date, excludeEventId = null, excludeGroupId = null) => {
                 const conflictingEvents = state.crc_events.filter(event => {
+                    if (isCancelledShift(event)) return false;
                     if (excludeEventId && event.id === excludeEventId) return false;
                     // Also exclude all events in the same group (for multi-day shifts)
                     if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
@@ -5201,7 +5203,7 @@
             const getEventWithMergedGroupStaff = (event) => {
                 if (!event || !event.groupId || event.type !== 'Site Assignment') return event;
                 const events = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events || []).filter(e =>
-                    e && e.groupId === event.groupId && e.type === 'Site Assignment'
+                    e && e.groupId === event.groupId && e.type === 'Site Assignment' && !isCancelledShift(e)
                 );
                 if (events.length <= 1) return event;
                 const mergedRoleAssignments = {};
@@ -6650,7 +6652,7 @@
                 // Multi-day shift: if this event has groupId but missing this CRC (e.g. day 2 payload incomplete), check other days in same group
                 if (event.groupId && event.type === 'Site Assignment') {
                     const events = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events || []).filter(e =>
-                        e && e.groupId === event.groupId && e.type === 'Site Assignment'
+                        e && e.groupId === event.groupId && e.type === 'Site Assignment' && !isCancelledShift(e)
                     );
                     const anyHasCrc = events.some(e => {
                         if (e.crcId === crcId) return true;
@@ -14294,8 +14296,13 @@
             /** Events for calendar/planning grid. CRCs see the same list: deduplicated in setState (by id, travel by crc+date, PTO by crc+date) so no duplicate events. */
             const isCancelledShift = (e) => {
                 if (!e) return false;
-                if (e.type !== 'Site Assignment') return false;
-                return e.cancelled === true || e.canceled === true || String(e.status || '').toLowerCase() === 'cancelled';
+                if (e.type === 'Travel Day') {
+                    return e.cancelled === true || e.canceled === true;
+                }
+                if (e.type === 'Site Assignment') {
+                    return e.cancelled === true || e.canceled === true || String(e.status || '').toLowerCase() === 'cancelled';
+                }
+                return false;
             };
 
             const getDisplayEvents = () => {
@@ -30676,7 +30683,8 @@
                                 const shiftEvents = state.crc_events.filter(e => 
                                     e.groupId === clickedEvent.groupId && 
                                     e.date === clickedEvent.date &&
-                                    e.type === clickedEvent.type
+                                    e.type === clickedEvent.type &&
+                                    !isCancelledShift(e)
                                 );
                                 
                                 // Aggregate all roleAssignments from all events in the shift
@@ -30762,7 +30770,8 @@
                                 // Get series date range (for multi-day shifts)
                                 const seriesEvents = state.crc_events.filter(e =>
                                     e.groupId === clickedEvent.groupId &&
-                                    e.type === clickedEvent.type
+                                    e.type === clickedEvent.type &&
+                                    !isCancelledShift(e)
                                 );
                                 if (seriesEvents.length > 0) {
                                     const dates = seriesEvents.map(e => new Date(e.date + 'T00:00:00'));
@@ -30824,7 +30833,8 @@
                         const existingEvents = state.crc_events.filter(e => 
                             e.date === shiftDate &&
                             e.siteId === siteId &&
-                            e.studyIds && Array.isArray(e.studyIds) && e.studyIds.includes(studyId)
+                            e.studyIds && Array.isArray(e.studyIds) && e.studyIds.includes(studyId) &&
+                            !isCancelledShift(e)
                         );
                         
                         let mergedEvent = null;
@@ -30946,8 +30956,11 @@
                                 const shiftEvents = state.crc_events.filter(e => 
                                     e.groupId === clickedEvent.groupId && 
                                     e.date === clickedEvent.date &&
-                                    e.type === clickedEvent.type
+                                    e.type === clickedEvent.type &&
+                                    !isCancelledShift(e)
                                 );
+                                const aggregatedTravelDayPreferences = {};
+                                const aggregatedVisitNumber = shiftEvents.map(e => e.visitNumber).find(v => v && v !== '');
                                 
                                 // Aggregate all roleAssignments from all events in the shift
                                 const aggregatedRoleAssignments = {};
@@ -31028,7 +31041,8 @@
                                 // Get series date range (for multi-day shifts)
                                 const seriesEvents = state.crc_events.filter(e =>
                                     e.groupId === clickedEvent.groupId &&
-                                    e.type === clickedEvent.type
+                                    e.type === clickedEvent.type &&
+                                    !isCancelledShift(e)
                                 );
                                 if (seriesEvents.length > 0) {
                                     const dates = seriesEvents.map(e => new Date(e.date + 'T00:00:00'));
@@ -31083,7 +31097,10 @@
                             let seriesEndDate = null;
                             
                             if (eventToCopy.groupId) {
-                                const groupEvents = state.crc_events.filter(e => e.groupId === eventToCopy.groupId);
+                                const groupEvents = state.crc_events.filter(e =>
+                                    e.groupId === eventToCopy.groupId &&
+                                    (!isCancelledShift(e) || e.id === eventToCopy.id)
+                                );
                                 if (groupEvents.length > 1) {
                                     const clickedEvent = eventToCopy;
                                     const aggregatedRoleAssignments = {};
@@ -31292,17 +31309,25 @@
                         const targets = groupId
                             ? state.crc_events.filter(e => e.type === 'Site Assignment' && e.groupId === groupId)
                             : [target];
+                        const linkedTravelDays = groupId
+                            ? state.crc_events.filter(e => e.type === 'Travel Day' && e.parentShiftGroupId === groupId)
+                            : [];
+                        const toPatch = [...targets, ...linkedTravelDays];
 
-                        const confirmed = confirm(`${nextCancelled ? 'Cancel' : 'Uncancel'} ${groupId ? 'the entire multi-day shift' : 'this shift'}? This will not delete any data.`);
+                        const scopeLabel = groupId ? 'the entire multi-day shift' : 'this shift';
+                        const cancelExplain = nextCancelled
+                            ? `Cancel ${scopeLabel}?\n\n• All rows stay in the database for history.\n• Assigned CRCs become available for other shifts (and linked travel rows are cancelled too).\n• Turn on "Show cancelled shifts" in filters if you need to review them.`
+                            : `Restore ${scopeLabel}?\n\n• The shift (and linked travel rows) will show as active again and may block CRC availability.`;
+                        const confirmed = confirm(cancelExplain);
                         if (!confirmed) break;
 
                         try {
                             saveStateToUndoHistory();
                             // Update in parallel for speed; keep payload small to avoid clobbering fields.
-                            const results = await Promise.allSettled(targets.map(ev => apiService.updateEvent(ev.id, { cancelled: nextCancelled })));
+                            const results = await Promise.allSettled(toPatch.map(ev => apiService.updateEvent(ev.id, { cancelled: nextCancelled })));
                             const updatedIds = new Set();
                             results.forEach((res, idx) => {
-                                const ev = targets[idx];
+                                const ev = toPatch[idx];
                                 if (res.status === 'fulfilled' && res.value && res.value.id) {
                                     const i = state.crc_events.findIndex(e => e.id === ev.id);
                                     if (i !== -1) state.crc_events[i] = { ...state.crc_events[i], ...res.value };
@@ -31316,7 +31341,9 @@
 
                             setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             renderContentPreservingScroll();
-                            showNotification(`${nextCancelled ? 'Shift cancelled' : 'Shift restored'}.`, 'success');
+                            const travelN = linkedTravelDays.length;
+                            const travelSuffix = travelN ? ` Linked travel: ${travelN} row${travelN === 1 ? '' : 's'} ${nextCancelled ? 'cancelled' : 'restored'}.` : '';
+                            showNotification(`${nextCancelled ? 'Shift cancelled' : 'Shift restored'}.${travelSuffix}`, 'success');
                             closeModal();
                         } catch (err) {
                             console.error('Cancel shift failed:', err);
@@ -40998,7 +41025,9 @@
                             optionsHtml += `<option value="SITE_STAFF" ${assignedCrcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
                             optionsHtml += `<option value="UNASSIGNED" ${assignedCrcId === 'UNASSIGNED' ? 'selected' : ''} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>`;
                             optionsHtml += available.map(crc => `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
+                            // Omit unselected unavailable CRCs from shift staff pickers (same as study-configured role path).
                             optionsHtml += unavailable.map(crc => {
+                                if (assignedCrcId !== crc.id) return '';
                                 const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
                                 const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId);
                                 let statusText = '';
@@ -41008,7 +41037,7 @@
                                     const periodText = unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Unavailable';
                                     statusText = ` (Time Off - ${periodText})`;
                                 }
-                                return `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''} class="text-gray-400 dark:text-gray-500">${crc.name}${statusText}</option>`;
+                                return `<option value="${crc.id}" selected class="text-gray-400 dark:text-gray-500">${crc.name}${statusText}</option>`;
                             }).join('');
 
                             if (!optionsHtml) {
@@ -41215,7 +41244,7 @@
                         const untrainedAssignedCrcs = [];
                         if (isEditing && existingAssignmentsRaw.length > 0) {
                             existingAssignmentsRaw.forEach(assignedCrcId => {
-                                if (assignedCrcId && assignedCrcId !== 'SITE_STAFF') {
+                                if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED') {
                                     const assignedCrc = state.crcs.find(c => c.id === assignedCrcId);
                                     if (assignedCrc && !qualifiedCrcs.find(c => c.id === assignedCrcId)) {
                                         // This CRC is assigned but doesn't have training - add to separate list
@@ -41245,7 +41274,7 @@
                         // Calculate availability and distance for each CRC, then sort
                         const excludeEventId = existingEvent ? existingEvent.id : null;
                         const excludeGroupId = existingEvent ? existingEvent.groupId : null;
-                        const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
+                        let crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
                             const isUnavailable = allowOverrideRole ? false : isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                             const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
                             const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
@@ -41276,7 +41305,7 @@
                             const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
                                 const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                                 const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId) : null;
+                                const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                                 let distance = null;
                                 
                                 if (site) {
@@ -41325,6 +41354,18 @@
                             const bName = (b.crc?.name || '').toString();
                             return aName.localeCompare(bName);
                         });
+
+                        const volunteerCrcIdsForRole = (existingEvent && existingEvent.volunteerApplications && Array.isArray(existingEvent.volunteerApplications))
+                            ? existingEvent.volunteerApplications.filter(a => a.status === 'pending' && (a.roleId === role.id || !a.roleId)).map(a => a.crcId)
+                            : [];
+                        // Do not list unselected unavailable CRCs: they sat at the bottom with gray "(Time Off / Scheduled)" and read as still on the shift after removal.
+                        // Keep selected slots, untrained-but-still-assigned, volunteers, and everyone who is actually available to pick.
+                        crcsWithInfo = crcsWithInfo.filter(entry =>
+                            entry.isSelected ||
+                            entry.isUntrained ||
+                            !entry.isUnavailable ||
+                            volunteerCrcIdsForRole.includes(entry.crc.id)
+                        );
                         
                         const buildRoleOptions = (slotIndex, roleIdForSlot) => {
                         // Treat null/empty as UNASSIGNED so the spot shows as "Unassigned" when a CRC was removed
@@ -41595,23 +41636,9 @@
                                     else availableCrcs.push(crc);
                                 });
                                 
-                                // Add available CRCs first
+                                // New slots: only list CRCs who can actually be assigned (omit unselected unavailable).
                                 availableCrcs.forEach(crc => {
                                     optionsHtml += `<option value="${crc.id}">${crc.name}</option>`;
-                                });
-                                
-                                // Add unavailable CRCs at the bottom (grayed out but selectable)
-                                unavailableCrcs.forEach(crc => {
-                                    const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic, excludeGroupIdForDynamic);
-                                    let statusText = '';
-                                    if (conflictInfo) {
-                                        statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
-                                    } else {
-                                        const periodText = unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Unavailable';
-                                        statusText = ` (Time Off - ${periodText})`;
-                                    }
-                                    optionsHtml += `<option value="${crc.id}" class="text-gray-400 dark:text-gray-500">${crc.name}${statusText}</option>`;
                                 });
                                 
                                 const isTraining = isTrainingRoleName(roleForSlot.name);
@@ -41804,7 +41831,7 @@
                     const untrainedAssignedCrcs = [];
                     if (isEditing && existingAssignmentsRaw.length > 0) {
                         existingAssignmentsRaw.forEach(assignedCrcId => {
-                            if (assignedCrcId && assignedCrcId !== 'SITE_STAFF') {
+                            if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED') {
                                 const assignedCrc = state.crcs.find(c => c.id === assignedCrcId);
                                 if (assignedCrc && !qualifiedCrcs.find(c => c.id === assignedCrcId)) {
                                     untrainedAssignedCrcs.push(assignedCrc);
@@ -41825,7 +41852,7 @@
                     const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
                     const excludeEventId = existingEvent ? existingEvent.id : null;
                     const excludeGroupId = existingEvent ? existingEvent.groupId : null;
-                    const crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
+                    let crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
                         const isUnavailable = allowOverrideReq ? false : isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
                         const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
                         const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
@@ -41903,6 +41930,16 @@
                         const bName = (b.crc?.name || '').toString();
                         return aName.localeCompare(bName);
                     });
+
+                    const volunteerCrcIdsForReqRole = (existingEvent && existingEvent.volunteerApplications && Array.isArray(existingEvent.volunteerApplications))
+                        ? existingEvent.volunteerApplications.filter(a => a.status === 'pending' && (a.roleId === roleId || !a.roleId)).map(a => a.crcId)
+                        : [];
+                    crcsWithInfo = crcsWithInfo.filter(entry =>
+                        entry.isSelected ||
+                        entry.isUntrained ||
+                        !entry.isUnavailable ||
+                        volunteerCrcIdsForReqRole.includes(entry.crc.id)
+                    );
                     
                     const buildRoleOptions = (slotIndex, roleIdForSlot) => {
                         const assignedCrcId = (existingAssignmentsRaw[slotIndex] && existingAssignmentsRaw[slotIndex].trim() !== '') ? existingAssignmentsRaw[slotIndex] : '';
@@ -42273,12 +42310,6 @@
                                 });
                                 
                                 availableCrcs.forEach(crc => { optionsHtml += `<option value="${crc.id}">${crc.name}</option>`; });
-                                unavailableCrcs.forEach(crc => {
-                                    const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic, excludeGroupIdForDynamic);
-                                    let statusText = conflictInfo ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})` : ` (Time Off - ${unavailPeriod || 'Full Day'})`;
-                                    optionsHtml += `<option value="${crc.id}" class="text-gray-400 dark:text-gray-500">${crc.name}${statusText}</option>`;
-                                });
                                 
                                 const isTraining = isTrainingRoleName(role.name);
                                 
