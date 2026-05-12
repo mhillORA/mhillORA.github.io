@@ -4015,13 +4015,14 @@ async function crudHandler(context, request, containerName) {
                                         const prefs = hasTravel && typeof hasTravel === 'object' ? hasTravel : {};
                                         const startDate = prefs.startTravelDate || shiftDate;
                                         const endDate = prefs.endTravelDate || shiftDate;
-                                        const datesToCheck = Array.from(new Set([startDate, endDate].filter(Boolean)));
+                                        const defaultsRm = computeDefaultTravelDates();
+                                        const datesToCheck = Array.from(new Set([startDate, endDate, defaultsRm.start, defaultsRm.end, shiftDate].filter(Boolean)));
                                         for (const travelDate of datesToCheck) {
                                             const travelDaysOnDate = await getTravelDaysForDate(travelDate);
                                             const travelDayToDelete = (travelDaysOnDate || []).find(td => {
                                                 if (!td || td.type !== 'Travel Day') return false;
                                                 if (td.crcId === crcId) return true;
-                                                if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.length === 1 && td.crcIds[0] === crcId) return true;
+                                                if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
                                                 return false;
                                             });
                                             if (travelDayToDelete && travelDayToDelete.id) {

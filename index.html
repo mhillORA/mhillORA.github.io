@@ -24673,10 +24673,10 @@
                         ${isEditing && event?.groupId && !readOnly && (isMultiDayEvent || isGroupSeriesMultiDay) ? `
                         <div class="p-3 rounded-md border border-amber-200 dark:border-amber-700 bg-amber-50/60 dark:bg-amber-900/20">
                             <label class="flex items-center gap-2 cursor-pointer">
-                                <input type="checkbox" name="applyToAllDaysInShift" class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
+                                <input type="checkbox" name="applyToAllDaysInShift" checked class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
                                 <span class="text-sm font-medium text-amber-800 dark:text-amber-200">Apply changes to all days in this shift</span>
                             </label>
-                            <p class="text-xs text-amber-700/80 dark:text-amber-300/80 mt-1 ml-6">Leave unchecked to edit only this day; check to update every day in the multi-day shift (and sync travel days).</p>
+                            <p class="text-xs text-amber-700/80 dark:text-amber-300/80 mt-1 ml-6">Checked by default so roster and travel stay in sync across the series. Uncheck to edit only this calendar day (roster changes still copy to other days when you change staff).</p>
                         </div>
                         ` : ''}
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -36687,17 +36687,66 @@
                                             date: startDateStr,
                                             startDate: startDateStr,
                                             endDate: toDateOnlyString(endDateObj),
-                                            // Keep travel prefs only for CRCs still assigned (do not retain prefs for removed staff)
+                                            // Keep prefs for assigned CRCs; also include removed CRCs so the API can delete their travel (see api travelDayPreferences cleanup loop).
                                             travelDayPreferences: (() => {
                                                 const merged = { ...(existingEvent?.travelDayPreferences || {}), ...travelDayPreferences };
-                                                const scoped = Object.fromEntries(
-                                                    Object.entries(merged).filter(([id]) => assignedCrcsForTravelPrefs.has(id))
-                                                );
+                                                const hintStart = (() => {
+                                                    if (!startDateStr) return '';
+                                                    const o = parseDateOnly(startDateStr);
+                                                    if (!o) return '';
+                                                    const d = new Date(o);
+                                                    d.setDate(d.getDate() - 1);
+                                                    return toDateOnlyString(d);
+                                                })();
+                                                const hintEnd = (() => {
+                                                    const ed = toDateOnlyString(endDateObj);
+                                                    if (!ed) return '';
+                                                    const o = parseDateOnly(ed);
+                                                    if (!o) return '';
+                                                    const d = new Date(o);
+                                                    d.setDate(d.getDate() + 1);
+                                                    return toDateOnlyString(d);
+                                                })();
+                                                const prevCrcs = new Set();
+                                                if (existingEvent?.roleAssignments) {
+                                                    Object.values(existingEvent.roleAssignments).forEach(assignments => {
+                                                        if (Array.isArray(assignments)) {
+                                                            assignments.forEach(cid => {
+                                                                if (cid && cid !== 'SITE_STAFF' && cid !== 'UNASSIGNED') prevCrcs.add(cid);
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                                if (existingEvent?.crcId && existingEvent.crcId !== 'SITE_STAFF' && existingEvent.crcId !== 'UNASSIGNED') {
+                                                    prevCrcs.add(existingEvent.crcId);
+                                                }
+                                                const scoped = {};
+                                                assignedCrcsForTravelPrefs.forEach((id) => {
+                                                    if (travelDayPreferences[id] !== undefined) scoped[id] = travelDayPreferences[id];
+                                                    else if (merged[id] !== undefined) scoped[id] = merged[id];
+                                                });
+                                                prevCrcs.forEach((id) => {
+                                                    if (!assignedCrcsForTravelPrefs.has(id)) {
+                                                        scoped[id] = merged[id] || {
+                                                            includeStartTravel: true,
+                                                            includeEndTravel: true,
+                                                            startTravelDate: hintStart,
+                                                            endTravelDate: hintEnd
+                                                        };
+                                                    }
+                                                });
                                                 return Object.keys(scoped).length > 0 ? scoped : undefined;
                                             })(),
                                             // Legacy safety: skip travel-day processing only if no travel is selected
                                             skipTravelDayProcessing: isLegacyShiftEdit && !hasSelectedTravel
                                         };
+                                        
+                                        const serializeRoleAssignmentsForStaffDiff = (ra) => {
+                                            if (!ra || typeof ra !== 'object' || Object.keys(ra).length === 0) return '';
+                                            return Object.keys(ra).sort().map(k => `${k}:${(Array.isArray(ra[k]) ? ra[k] : []).map(String).sort().join('|')}`).join(';');
+                                        };
+                                        const staffRosterChangedFromExisting =
+                                            serializeRoleAssignmentsForStaffDiff(existingEvent?.roleAssignments) !== serializeRoleAssignmentsForStaffDiff(finalRoleAssignments);
                                         
                                         // CRITICAL: This UPDATE preserves the existing shift - it does NOT delete it
                                         // The shift will remain on the schedule with all its data intact
@@ -36762,6 +36811,32 @@
                                                 setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                                                 setTimeout(() => markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(updatePayload)), 0);
                                             }
+                                            if (isGroupEvent && existingGroupId && !applyToAllDays && staffRosterChangedFromExisting) {
+                                                const otherGroupEvents = state.crc_events.filter(e =>
+                                                    e.groupId === existingGroupId && e.type !== 'Travel Day' && e.id !== updatedEvent.id
+                                                );
+                                                for (const groupEvent of otherGroupEvents) {
+                                                    const payloadForDay = {
+                                                        ...groupEvent,
+                                                        roleAssignments: updatePayload.roleAssignments,
+                                                        trainingAssignments: updatePayload.trainingAssignments,
+                                                        trainingModes: updatePayload.trainingModes,
+                                                        roleQuantityOverrides: updatePayload.roleQuantityOverrides,
+                                                        travelDayPreferences: updatePayload.travelDayPreferences,
+                                                        skipTravelDayProcessing: updatePayload.skipTravelDayProcessing,
+                                                    };
+                                                    try {
+                                                        const updatedOther = await apiService.updateEvent(groupEvent.id, payloadForDay);
+                                                        if (updatedOther && updatedOther.id) {
+                                                            const mergedOther = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(updatedOther, payloadForDay) : updatedOther;
+                                                            const idx = state.crc_events.findIndex(e => e.id === groupEvent.id);
+                                                            if (idx !== -1) state.crc_events[idx] = mergedOther;
+                                                        }
+                                                    } catch (propErr) {
+                                                        console.error('Error propagating roster to series day', groupEvent.id, propErr);
+                                                    }
+                                                }
+                                            }
                                         } else {
                                             console.error('CRITICAL ERROR: Shift update failed - updatedEvent is missing or has no ID!', updatedEvent);
                                             console.error('Update payload that was sent:', updatePayload);
@@ -36783,50 +36858,47 @@
                                             }
                                         }
                                         
-                                        // CRITICAL: The shift has been UPDATED above and is preserved on the schedule
-                                        // Now we ADD travel days as SEPARATE events - they do NOT replace the shift
-                                        // Only sync travel days when user chose "Apply to all days" (whole-shift edit)
-                                        if (payloadType === 'Site Assignment' && updatedEvent && applyToAllDays) {
-                                            // CRITICAL: When EDITING, only update existing travel days - don't create new ones
-                                            // Check if travel days already exist for this shift (by parentShiftGroupId)
+                                        // Travel: checkbox-driven create/upsert only when "Apply to all days"; always remove travel for CRCs dropped from roster.
+                                        if (payloadType === 'Site Assignment' && updatedEvent) {
                                             const eventGroupId = updatedEvent.groupId || existingEvent?.groupId || null;
-                                            const existingTravelDaysForShift = eventGroupId ? state.crc_events.filter(e => 
-                                                e.type === 'Travel Day' && e.parentShiftGroupId === eventGroupId
-                                            ) : [];
-                                            
-                                            if (existingTravelDaysForShift.length === 0) {
-                                                debugLog('No existing travel days found for this shift - will create as needed (edit mode)');
-                                            }
-                                            
-                                            // Update/create travel days with new CRC assignments
-                                                // Collect all assigned CRCs from roleAssignments
-                                                const assignedCrcsForTravel = new Set();
-                                                if (updatedEvent.roleAssignments) {
-                                                    Object.values(updatedEvent.roleAssignments).forEach(assignments => {
-                                                        if (Array.isArray(assignments)) {
-                                                            assignments.forEach(crcId => {
-                                                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                                                    assignedCrcsForTravel.add(crcId);
-                                                                }
-                                                            });
-                                                        }
-                                                    });
-                                                }
-                                                // Also check legacy crcId
-                                                if (updatedEvent.crcId && updatedEvent.crcId !== 'SITE_STAFF' && updatedEvent.crcId !== 'UNASSIGNED') {
-                                                    assignedCrcsForTravel.add(updatedEvent.crcId);
-                                                }
-                                                
-                                                // CRITICAL: Also collect from form inputs in case roleAssignments weren't updated yet
-                                                const roleSelects = form.querySelectorAll('select[name^="role-"]');
-                                                roleSelects.forEach(select => {
-                                                    if (select.value && select.value !== 'SITE_STAFF' && select.value !== 'UNASSIGNED') {
-                                                        assignedCrcsForTravel.add(select.value);
+
+                                            const assignedCrcsForTravel = new Set();
+                                            if (updatedEvent.roleAssignments) {
+                                                Object.values(updatedEvent.roleAssignments).forEach(assignments => {
+                                                    if (Array.isArray(assignments)) {
+                                                        assignments.forEach(crcId => {
+                                                            if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
+                                                                assignedCrcsForTravel.add(crcId);
+                                                            }
+                                                        });
                                                     }
                                                 });
-                                                
+                                            }
+                                            if (updatedEvent.crcId && updatedEvent.crcId !== 'SITE_STAFF' && updatedEvent.crcId !== 'UNASSIGNED') {
+                                                assignedCrcsForTravel.add(updatedEvent.crcId);
+                                            }
+                                            const roleSelects = form.querySelectorAll('select[name^="role-"]');
+                                            roleSelects.forEach(select => {
+                                                if (select.value && select.value !== 'SITE_STAFF' && select.value !== 'UNASSIGNED') {
+                                                    assignedCrcsForTravel.add(select.value);
+                                                }
+                                            });
                                             debugLog('Travel day: assignedCrcsForTravel =', Array.from(assignedCrcsForTravel));
-                                            
+
+                                            const eventStartDate = startDateStr;
+                                            const eventEndDate = toDateOnlyString(endDateObj);
+                                            const matchesCrcId = (event, crcId) =>
+                                                event.crcId === crcId || (Array.isArray(event.crcIds) && event.crcIds.includes(crcId));
+
+                                            if (applyToAllDays) {
+                                                const existingTravelDaysForShift = eventGroupId ? state.crc_events.filter(e =>
+                                                    e.type === 'Travel Day' && e.parentShiftGroupId === eventGroupId
+                                                ) : [];
+
+                                                if (existingTravelDaysForShift.length === 0) {
+                                                    debugLog('No existing travel days found for this shift - will create as needed (edit mode)');
+                                                }
+
                                             // Helper functions for travel day creation (same as new event creation)
                                             const getTravelPrimaryDate = (travel) => {
                                                 if (!travel) return null;
@@ -36893,18 +36965,10 @@
                                                 return null;
                                             };
                                             
-                                            // Check for travel day checkboxes and create travel days
-                                            // Use form date range so multi-day edits get correct start/end (updatedEvent may be last day only)
-                                            const eventStartDate = startDateStr;
-                                            const eventEndDate = toDateOnlyString(endDateObj);
-                                            
                                             // Store travel day preferences on the event
                                             if (!updatedEvent.travelDayPreferences) {
                                                 updatedEvent.travelDayPreferences = {};
                                             }
-                                            
-                                            const matchesCrcId = (event, crcId) =>
-                                                event.crcId === crcId || (Array.isArray(event.crcIds) && event.crcIds.includes(crcId));
 
                                             const upsertTravelDay = async ({ crcId, travelDateStr, isBefore }) => {
                                                 if (!travelDateStr) return;
@@ -37090,6 +37154,7 @@
                                                 if (includeEndTravelForCrc && endTravelDateStr) {
                                                     await upsertTravelDay({ crcId, travelDateStr: endTravelDateStr, isBefore: false });
                                                 }
+                                            }
                                             }
                                             
                                             // CRITICAL: Delete travel days for CRCs that were removed from the shift
