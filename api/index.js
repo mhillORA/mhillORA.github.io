@@ -3414,6 +3414,7 @@ async function crudHandler(context, request, containerName) {
                 try {
                     // For events, ensure we preserve all fields when updating (merge with existing event)
                     let updatedItem = { ...requestBody, id: updateId };
+                    let removedFromShiftCrcIds = [];
                     if (containerName === 'studies' && updateId) {
                         try {
                             const { resource: existingStudy } = await container.item(updateId, updateId).read();
@@ -3687,6 +3688,9 @@ async function crudHandler(context, request, containerName) {
                                             
                                             // Find CRCs that were removed
                                             const removedCrcIds = Array.from(originalCrcIds).filter(crcId => !updatedCrcIds.has(crcId));
+                                            if (removedCrcIds.length > 0) {
+                                                removedFromShiftCrcIds = removedCrcIds;
+                                            }
                                             
                                             // If any CRCs were removed, delete their travel days for this date
                                             if (removedCrcIds.length > 0 && existingEvent.date) {
@@ -4195,10 +4199,21 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
-                    // Triggered emails: shift edit
+                    // Triggered emails: shift edit / removed from shift
                     if (containerName === 'events' && result && result.type === 'Site Assignment') {
                         try { await processEmailTriggers(context, { triggerType: 'shift_edit', event: result }); } catch (triggerErr) {
                             context.log.warn('processEmailTriggers (shift_edit) failed:', triggerErr.message);
+                        }
+                        if (removedFromShiftCrcIds.length > 0) {
+                            try {
+                                await processEmailTriggers(context, {
+                                    triggerType: 'removed_from_shift',
+                                    event: result,
+                                    removedCrcIds: removedFromShiftCrcIds
+                                });
+                            } catch (triggerErr) {
+                                context.log.warn('processEmailTriggers (removed_from_shift) failed:', triggerErr.message);
+                            }
                         }
                     }
                     // Triggered emails: schedule finalized
@@ -4776,10 +4791,61 @@ app.http('templates', {
 const TRIGGER_DEFAULTS = {
     new_shift: { subject: 'New shift assigned', body: 'A new shift has been added to the schedule.' },
     shift_edit: { subject: 'Shift updated', body: 'A shift has been updated on the schedule.' },
+    removed_from_shift: { subject: 'Removed from shift', body: 'You have been removed from a shift on {{eventDate}} at {{siteName}} ({{siteLocation}}).' },
     shift_created_missing_role: { subject: 'Shift created without required role', body: 'A shift was created that is missing the required role: {{missingRoleName}}. Date: {{eventDate}}, Site/Study: {{siteId}} / {{studyIds}}.' },
     finalized_schedule: { subject: 'Schedule finalized', body: 'The schedule has been finalized for the month.' },
     pto_request: { subject: 'Time off request submitted', body: 'A time off request has been submitted for approval.' },
     pto_approved: { subject: 'Time off approved', body: 'Your time off request has been approved.' }
+};
+
+const collectCrcIdsFromEvent = (ev) => {
+    const set = new Set();
+    if (!ev) return set;
+    if (ev.crcId && ev.crcId !== 'SITE_STAFF' && ev.crcId !== 'UNASSIGNED') set.add(ev.crcId);
+    if (Array.isArray(ev.crcIds)) ev.crcIds.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') set.add(id); });
+    if (ev.roleAssignments && typeof ev.roleAssignments === 'object') {
+        Object.values(ev.roleAssignments).forEach(assignments => {
+            if (Array.isArray(assignments)) assignments.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') set.add(id); });
+        });
+    }
+    return set;
+};
+
+const loadSiteLookupsForTriggers = async (log) => {
+    const siteNameById = new Map();
+    const siteLocationById = new Map();
+    try {
+        const sitesContainer = getContainer('sites');
+        const { resources: sites } = await sitesContainer.items.readAll().fetchAll();
+        (sites || []).forEach(s => {
+            if (!s || !s.id) return;
+            siteNameById.set(s.id, s.name || s.siteName || s.title || s.id);
+            const location = [s.address1, s.city, s.state, s.zipCode || s.zip, s.country].filter(Boolean).join(', ');
+            const fallbackLocation = [s.city, s.state].filter(Boolean).join(', ');
+            siteLocationById.set(s.id, location || fallbackLocation || '');
+        });
+    } catch (e) {
+        log.warn('processEmailTriggers: failed to load sites:', e.message);
+    }
+    return { siteNameById, siteLocationById };
+};
+
+const buildShiftTriggerContext = (event, siteNameById, siteLocationById, getCrcDisplayName, extra = {}) => {
+    const crcIds = Array.from(collectCrcIdsFromEvent(event));
+    const crcNames = crcIds.map(getCrcDisplayName).filter(Boolean).join(', ') || '—';
+    const eventDate = event.date || event.startDate || '';
+    const siteId = event.siteId || '';
+    return {
+        eventId: event.id || '',
+        eventDate: eventDate ? String(eventDate).split('T')[0] : '',
+        eventType: event.type || event.name || 'Shift',
+        crcNames,
+        siteId,
+        siteName: (siteId && siteNameById.get(siteId)) || siteId || '',
+        siteLocation: (siteId && siteLocationById.get(siteId)) || '',
+        studyIds: Array.isArray(event.studyIds) ? event.studyIds.join(', ') : (event.studyId || ''),
+        ...extra
+    };
 };
 
 // True if event has no assignment for roleId, or role exists but every slot is empty/unassigned
@@ -4792,7 +4858,7 @@ function eventIsMissingRole(event, roleId) {
 }
 
 async function processEmailTriggers(context, payload) {
-    const { triggerType, event, timeOffRequest, scheduleMonthKey, eventsSnapshot } = payload || {};
+    const { triggerType, event, timeOffRequest, scheduleMonthKey, eventsSnapshot, removedCrcIds } = payload || {};
     if (!triggerType || !context) return;
     const log = context.log || console;
     try {
@@ -4842,6 +4908,8 @@ async function processEmailTriggers(context, payload) {
             log.warn('processEmailTriggers: failed to load roles for missing-role context:', e.message);
         }
 
+        const { siteNameById, siteLocationById } = await loadSiteLookupsForTriggers(log);
+
         const resolveToEmails = (crcIds, userIdsOrEmails) => {
             const out = [];
             const seen = new Set();
@@ -4875,19 +4943,6 @@ async function processEmailTriggers(context, payload) {
                 });
             }
             return out;
-        };
-
-        const getCrcIdsFromEvent = (ev) => {
-            const set = new Set();
-            if (!ev) return set;
-            if (ev.crcId && ev.crcId !== 'SITE_STAFF' && ev.crcId !== 'UNASSIGNED') set.add(ev.crcId);
-            if (Array.isArray(ev.crcIds)) ev.crcIds.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') set.add(id); });
-            if (ev.roleAssignments && typeof ev.roleAssignments === 'object') {
-                Object.values(ev.roleAssignments).forEach(assignments => {
-                    if (Array.isArray(assignments)) assignments.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') set.add(id); });
-                });
-            }
-            return set;
         };
 
         const getManagerEmails = () => {
@@ -4928,31 +4983,21 @@ async function processEmailTriggers(context, payload) {
                     requestedBy: timeOffRequest.requestedBy || ''
                 };
             }
-            if ((triggerType === 'new_shift' || triggerType === 'shift_edit') && event) {
-                const crcIds = Array.from(getCrcIdsFromEvent(event));
-                const crcNames = crcIds.map(getCrcDisplayName).filter(Boolean).join(', ') || '—';
-                const eventDate = event.date || event.startDate || '';
+            if ((triggerType === 'new_shift' || triggerType === 'shift_edit' || triggerType === 'removed_from_shift') && event) {
+                const perRecipientCrcId = rule._recipientCrcId || '';
                 return {
                     ...base,
-                    eventId: event.id || '',
-                    eventDate: eventDate ? String(eventDate).split('T')[0] : '',
-                    eventType: event.type || event.name || 'Shift',
-                    crcNames,
-                    siteId: event.siteId || '',
-                    studyIds: Array.isArray(event.studyIds) ? event.studyIds.join(', ') : (event.studyId || '')
+                    ...buildShiftTriggerContext(event, siteNameById, siteLocationById, getCrcDisplayName, {
+                        crcName: perRecipientCrcId ? getCrcDisplayName(perRecipientCrcId) : ''
+                    })
                 };
             }
             if (triggerType === 'shift_created_missing_role' && event && rule) {
-                const eventDate = event.date || event.startDate || '';
                 return {
                     ...base,
+                    ...buildShiftTriggerContext(event, siteNameById, siteLocationById, getCrcDisplayName, {}),
                     missingRoleId: rule.missingRoleId || '',
-                    missingRoleName: roleNameById.get(rule.missingRoleId) || rule.missingRoleId || 'Required role',
-                    eventId: event.id || '',
-                    eventDate: eventDate ? String(eventDate).split('T')[0] : '',
-                    eventType: event.type || event.name || 'Shift',
-                    siteId: event.siteId || '',
-                    studyIds: Array.isArray(event.studyIds) ? event.studyIds.join(', ') : (event.studyId || '')
+                    missingRoleName: roleNameById.get(rule.missingRoleId) || rule.missingRoleId || 'Required role'
                 };
             }
             if (triggerType === 'finalized_schedule') {
@@ -4970,11 +5015,13 @@ async function processEmailTriggers(context, payload) {
             if (rule.sendTo === 'on_shift') {
                 if ((triggerType === 'pto_request' || triggerType === 'pto_approved') && timeOffRequest && timeOffRequest.crcId) {
                     recipients = resolveToEmails([timeOffRequest.crcId], []);
+                } else if (triggerType === 'removed_from_shift' && Array.isArray(removedCrcIds) && removedCrcIds.length > 0) {
+                    recipients = resolveToEmails(removedCrcIds, []);
                 } else if (event) {
-                    recipients = resolveToEmails(Array.from(getCrcIdsFromEvent(event)), []);
+                    recipients = resolveToEmails(Array.from(collectCrcIdsFromEvent(event)), []);
                 } else if (triggerType === 'finalized_schedule' && Array.isArray(eventsSnapshot)) {
                     const allCrcIds = new Set();
-                    eventsSnapshot.forEach(ev => getCrcIdsFromEvent(ev).forEach(id => allCrcIds.add(id)));
+                    eventsSnapshot.forEach(ev => collectCrcIdsFromEvent(ev).forEach(id => allCrcIds.add(id)));
                     recipients = resolveToEmails(Array.from(allCrcIds), []);
                 }
             } else if (rule.sendTo === 'managers') {
@@ -4999,16 +5046,36 @@ async function processEmailTriggers(context, payload) {
                 }
             }
 
-            const triggerContext = buildTriggerContext(rule);
-            subject = renderTemplateString(subject, triggerContext);
-            plainText = renderTemplateString(plainText, triggerContext);
-
             for (const r of recipients) {
                 if (!r.email) continue;
+                // Resolve crc id for per-recipient template vars (crcName)
+                let recipientCrcId = '';
+                if (triggerType === 'removed_from_shift') {
+                    for (const [crcId, crc] of crcsById.entries()) {
+                        const user = usersByCrcId.get(crcId);
+                        const email = (user?.email || crc?.email || '').trim().toLowerCase();
+                        if (email && email === (r.email || '').trim().toLowerCase()) {
+                            recipientCrcId = crcId;
+                            break;
+                        }
+                    }
+                    if (!recipientCrcId && Array.isArray(removedCrcIds)) {
+                        recipientCrcId = removedCrcIds.find(id => {
+                            const user = usersByCrcId.get(id);
+                            const crc = crcsById.get(id);
+                            const email = (user?.email || crc?.email || '').trim().toLowerCase();
+                            return email && email === (r.email || '').trim().toLowerCase();
+                        }) || '';
+                    }
+                }
+                const ruleWithRecipient = recipientCrcId ? { ...rule, _recipientCrcId: recipientCrcId } : rule;
+                const triggerContext = buildTriggerContext(ruleWithRecipient);
+                const personalizedSubject = renderTemplateString(subject, triggerContext);
+                const personalizedPlainText = renderTemplateString(plainText, triggerContext);
                 try {
                     const message = {
                         senderAddress,
-                        content: { subject, plainText },
+                        content: { subject: personalizedSubject, plainText: personalizedPlainText },
                         recipients: { to: [{ address: r.email, displayName: r.displayName || undefined }] }
                     };
                     await emailClient.beginSend(message).then(p => p.pollUntilDone());
