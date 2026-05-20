@@ -3415,6 +3415,15 @@ async function crudHandler(context, request, containerName) {
                     // For events, ensure we preserve all fields when updating (merge with existing event)
                     let updatedItem = { ...requestBody, id: updateId };
                     let removedFromShiftCrcIds = [];
+                    let eventBeforeUpdate = null;
+                    if (containerName === 'events' && updateId) {
+                        try {
+                            const { resource: prior } = await container.item(updateId, updateId).read();
+                            eventBeforeUpdate = prior || null;
+                        } catch (priorReadErr) {
+                            context.log.warn(`Could not read event ${updateId} before update (removed-from-shift detection):`, priorReadErr.message);
+                        }
+                    }
                     if (containerName === 'studies' && updateId) {
                         try {
                             const { resource: existingStudy } = await container.item(updateId, updateId).read();
@@ -4204,12 +4213,16 @@ async function crudHandler(context, request, containerName) {
                         try { await processEmailTriggers(context, { triggerType: 'shift_edit', event: result }); } catch (triggerErr) {
                             context.log.warn('processEmailTriggers (shift_edit) failed:', triggerErr.message);
                         }
-                        if (removedFromShiftCrcIds.length > 0) {
+                        const removedIds = eventBeforeUpdate
+                            ? diffRemovedCrcIdsFromEvents(eventBeforeUpdate, result)
+                            : removedFromShiftCrcIds;
+                        if (removedIds.length > 0) {
+                            context.log.info(`removed_from_shift: ${removedIds.length} CRC(s) removed from event ${result.id}`);
                             try {
                                 await processEmailTriggers(context, {
                                     triggerType: 'removed_from_shift',
                                     event: result,
-                                    removedCrcIds: removedFromShiftCrcIds
+                                    removedCrcIds: removedIds
                                 });
                             } catch (triggerErr) {
                                 context.log.warn('processEmailTriggers (removed_from_shift) failed:', triggerErr.message);
@@ -4347,6 +4360,23 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
+                    // Notify staff removed when an entire Site Assignment shift is deleted
+                    if (containerName === 'events' && resource && resource.type === 'Site Assignment') {
+                        const removedCrcIds = Array.from(collectCrcIdsFromEvent(resource));
+                        if (removedCrcIds.length > 0) {
+                            context.log.info(`removed_from_shift (delete): shift ${id}, notifying ${removedCrcIds.length} CRC(s)`);
+                            try {
+                                await processEmailTriggers(context, {
+                                    triggerType: 'removed_from_shift',
+                                    event: resource,
+                                    removedCrcIds
+                                });
+                            } catch (triggerErr) {
+                                context.log.warn('processEmailTriggers (removed_from_shift on delete) failed:', triggerErr.message);
+                            }
+                        }
+                    }
+
                     // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
                     try {
                         await container.item(id, id).delete();
@@ -4811,6 +4841,85 @@ const collectCrcIdsFromEvent = (ev) => {
     return set;
 };
 
+const diffRemovedCrcIdsFromEvents = (before, after) => {
+    const beforeIds = collectCrcIdsFromEvent(before);
+    const afterIds = collectCrcIdsFromEvent(after);
+    return Array.from(beforeIds).filter(id => !afterIds.has(id));
+};
+
+const buildTriggerRecipientLookups = async (log, { crcIds = [], specificIds = [], needManagers = false } = {}) => {
+    const usersContainer = getContainer('users');
+    const crcsContainer = getContainer('crcs');
+    const usersById = new Map();
+    const usersByCrcId = new Map();
+    const crcsById = new Map();
+
+    const uniqueCrcIds = [...new Set((crcIds || []).filter(Boolean))];
+    await Promise.all(uniqueCrcIds.map(async (crcId) => {
+        try {
+            const { resource: crc } = await crcsContainer.item(crcId, crcId).read();
+            if (crc && crc.id) crcsById.set(crc.id, crc);
+        } catch (e) {
+            log.warn(`processEmailTriggers: could not read CRC ${crcId}: ${e.message}`);
+        }
+    }));
+
+    await Promise.all(uniqueCrcIds.map(async (crcId) => {
+        try {
+            const { resources } = await usersContainer.items.query({
+                query: 'SELECT * FROM c WHERE c.crcId = @crcId',
+                parameters: [{ name: '@crcId', value: crcId }]
+            }).fetchAll();
+            (resources || []).forEach(u => {
+                if (u && u.id) usersById.set(u.id, u);
+                if (u && u.crcId) usersByCrcId.set(u.crcId, u);
+            });
+        } catch (e) {
+            log.warn(`processEmailTriggers: could not query user for crcId ${crcId}: ${e.message}`);
+        }
+    }));
+
+    if (needManagers) {
+        try {
+            const { resources: managers } = await usersContainer.items.query({
+                query: "SELECT * FROM c WHERE LOWER(c.permissionLevel) = 'manager'"
+            }).fetchAll();
+            (managers || []).forEach(u => {
+                if (u && u.id) usersById.set(u.id, u);
+                if (u && u.crcId) usersByCrcId.set(u.crcId, u);
+            });
+        } catch (e) {
+            log.warn(`processEmailTriggers: could not query managers: ${e.message}`);
+        }
+    }
+
+    const specific = Array.isArray(specificIds) ? specificIds : [];
+    await Promise.all(specific.map(async (id) => {
+        if (!id) return;
+        if (String(id).includes('@')) return;
+        if (usersById.has(id) || crcsById.has(id)) return;
+        try {
+            const { resource: user } = await usersContainer.item(id, id).read();
+            if (user) {
+                if (user.id) usersById.set(user.id, user);
+                if (user.crcId) usersByCrcId.set(user.crcId, user);
+                return;
+            }
+        } catch (e) { /* try crc */ }
+        try {
+            const { resource: crc } = await crcsContainer.item(id, id).read();
+            if (crc && crc.id) crcsById.set(crc.id, crc);
+        } catch (e) { /* ignore */ }
+    }));
+
+    return {
+        usersById,
+        usersByCrcId,
+        crcsById,
+        userList: [...usersById.values()]
+    };
+};
+
 const loadSiteLookupsForTriggers = async (log) => {
     const siteNameById = new Map();
     const siteLocationById = new Map();
@@ -4868,7 +4977,10 @@ async function processEmailTriggers(context, payload) {
             query: 'SELECT * FROM c WHERE c.enabled = true AND c.triggerType = @triggerType',
             parameters: [{ name: '@triggerType', value: triggerType }]
         }).fetchAll();
-        if (!rules || rules.length === 0) return;
+        if (!rules || rules.length === 0) {
+            log.info(`processEmailTriggers: no enabled rules for triggerType=${triggerType}`);
+            return;
+        }
 
         // For pto_request and pto_approved, filter rules by ptoTypes if specified (rule applies only to selected types)
         let filteredRules = rules;
@@ -4884,6 +4996,10 @@ async function processEmailTriggers(context, payload) {
         if (triggerType === 'shift_created_missing_role' && event) {
             filteredRules = rules.filter(rule => rule.missingRoleId && eventIsMissingRole(event, rule.missingRoleId));
         }
+        if (filteredRules.length === 0) {
+            log.info(`processEmailTriggers: no matching rules after filters for triggerType=${triggerType}`);
+            return;
+        }
 
         const senderAddress = process.env.EMAIL_SENDER_ADDRESS;
         if (!senderAddress) {
@@ -4891,13 +5007,23 @@ async function processEmailTriggers(context, payload) {
             return;
         }
 
-        const usersContainer = getContainer('users');
-        const crcsContainer = getContainer('crcs');
-        const { resources: userList } = await usersContainer.items.readAll().fetchAll();
-        const { resources: crcList } = await crcsContainer.items.readAll().fetchAll();
-        const usersById = new Map((userList || []).filter(u => u && u.id).map(u => [u.id, u]));
-        const usersByCrcId = new Map((userList || []).filter(u => u && u.crcId).map(u => [u.crcId, u]));
-        const crcsById = new Map((crcList || []).filter(c => c && c.id).map(c => [c.id, c]));
+        const crcIdsNeeded = new Set();
+        if (Array.isArray(removedCrcIds)) removedCrcIds.forEach(id => { if (id) crcIdsNeeded.add(id); });
+        if (timeOffRequest && timeOffRequest.crcId) crcIdsNeeded.add(timeOffRequest.crcId);
+        if (event) collectCrcIdsFromEvent(event).forEach(id => crcIdsNeeded.add(id));
+        if (triggerType === 'finalized_schedule' && Array.isArray(eventsSnapshot)) {
+            eventsSnapshot.forEach(ev => collectCrcIdsFromEvent(ev).forEach(id => crcIdsNeeded.add(id)));
+        }
+        const needManagers = filteredRules.some(r => r.sendTo === 'managers');
+        const specificIds = filteredRules
+            .filter(r => r.sendTo === 'specific' && Array.isArray(r.specificRecipientIds))
+            .flatMap(r => r.specificRecipientIds);
+
+        const { usersById, usersByCrcId, crcsById, userList } = await buildTriggerRecipientLookups(log, {
+            crcIds: [...crcIdsNeeded],
+            specificIds,
+            needManagers
+        });
 
         const roleNameById = new Map();
         try {
