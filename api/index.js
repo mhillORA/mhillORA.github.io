@@ -182,6 +182,57 @@ const renderTemplateString = (template, context) => {
     });
 };
 
+const stripHtmlToPlainText = (html) => {
+    if (!html) return '';
+    return String(html)
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/p>/gi, '\n')
+        .replace(/<\/div>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&amp;/gi, '&')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+};
+
+/** Build subject/body for triggered emails; never return an empty body. */
+const resolveTriggerMessageContent = (rule, template, triggerType, triggerContext) => {
+    const defaults = TRIGGER_DEFAULTS[triggerType] || { subject: 'Notification', body: 'You have a notification.' };
+    let subjectTpl = (rule && rule.subject) || defaults.subject;
+    let bodyTpl = (rule && (rule.body || rule.plainText)) || defaults.body;
+    let htmlTpl = null;
+
+    if (template) {
+        subjectTpl = template.subject || template.title || subjectTpl;
+        htmlTpl = template.html || template.bodyHtml || null;
+        bodyTpl = template.plainText || template.text || bodyTpl;
+        if (!bodyTpl || !String(bodyTpl).trim()) {
+            if (template.body && String(template.body).trim()) bodyTpl = template.body;
+            else if (htmlTpl) bodyTpl = stripHtmlToPlainText(htmlTpl);
+        }
+    }
+
+    let subject = renderTemplateString(subjectTpl, triggerContext).trim();
+    let plainText = renderTemplateString(bodyTpl, triggerContext).trim();
+    let html = htmlTpl ? renderTemplateString(htmlTpl, triggerContext).trim() : '';
+
+    if (!plainText && html) plainText = stripHtmlToPlainText(html);
+    if (!plainText) plainText = renderTemplateString(defaults.body, triggerContext).trim();
+    if (!plainText && triggerType === 'removed_from_shift') {
+        const name = triggerContext.crcName || 'there';
+        const d = triggerContext.eventDate || 'the scheduled date';
+        const site = triggerContext.siteName || triggerContext.siteId || 'the site';
+        const loc = triggerContext.siteLocation ? ` (${triggerContext.siteLocation})` : '';
+        plainText = `Hi ${name},\n\nYou have been removed from a shift on ${d} at ${site}${loc}.\n\nPlease contact your manager if you have questions.`;
+    }
+    if (!plainText) plainText = renderTemplateString(defaults.body, triggerContext).trim() || defaults.body;
+    if (!subject) subject = renderTemplateString(defaults.subject, triggerContext).trim() || defaults.subject;
+
+    return { subject, plainText, html: html || undefined };
+};
+
 const eventBelongsToCrc = (event, crcId) => {
     if (!event || !crcId) return false;
     if (event.crcId === crcId) return true;
@@ -5134,7 +5185,6 @@ async function processEmailTriggers(context, payload) {
         };
 
         const emailClient = getEmailClient();
-        const defaults = TRIGGER_DEFAULTS[triggerType] || { subject: 'Notification', body: 'You have a notification.' };
 
         for (const rule of filteredRules) {
             let recipients = [];
@@ -5157,16 +5207,12 @@ async function processEmailTriggers(context, payload) {
             }
             if (recipients.length === 0) continue;
 
-            let subject = rule.subject || defaults.subject;
-            let plainText = rule.body || rule.plainText || defaults.body;
+            let template = null;
             if (rule.templateId) {
                 try {
                     const templatesContainer = getContainer('templates');
-                    const { resource: template } = await templatesContainer.item(rule.templateId, rule.templateId).read();
-                    if (template) {
-                        subject = template.subject || template.title || subject;
-                        plainText = template.plainText || template.text || template.html || template.bodyHtml || template.body || plainText;
-                    }
+                    const { resource } = await templatesContainer.item(rule.templateId, rule.templateId).read();
+                    template = resource || null;
                 } catch (e) {
                     log.warn(`processEmailTriggers: template ${rule.templateId} not found, using defaults`);
                 }
@@ -5196,12 +5242,16 @@ async function processEmailTriggers(context, payload) {
                 }
                 const ruleWithRecipient = recipientCrcId ? { ...rule, _recipientCrcId: recipientCrcId } : rule;
                 const triggerContext = buildTriggerContext(ruleWithRecipient);
-                const personalizedSubject = renderTemplateString(subject, triggerContext);
-                const personalizedPlainText = renderTemplateString(plainText, triggerContext);
+                const { subject: personalizedSubject, plainText: personalizedPlainText, html: personalizedHtml } =
+                    resolveTriggerMessageContent(ruleWithRecipient, template, triggerType, triggerContext);
                 try {
                     const message = {
                         senderAddress,
-                        content: { subject: personalizedSubject, plainText: personalizedPlainText },
+                        content: {
+                            subject: personalizedSubject,
+                            plainText: personalizedPlainText,
+                            ...(personalizedHtml ? { html: personalizedHtml } : {})
+                        },
                         recipients: { to: [{ address: r.email, displayName: r.displayName || undefined }] }
                     };
                     await emailClient.beginSend(message).then(p => p.pollUntilDone());
@@ -5250,17 +5300,19 @@ app.http('email-triggers', {
             }
             if (method === 'POST') {
                 const body = await request.json();
+                const triggerType = body.triggerType || 'new_shift';
+                const triggerDefaults = TRIGGER_DEFAULTS[triggerType] || TRIGGER_DEFAULTS.new_shift;
                 const newItem = {
                     id: generateId(),
                     name: body.name || '',
-                    triggerType: body.triggerType || 'new_shift',
+                    triggerType,
                     ptoTypes: Array.isArray(body.ptoTypes) ? body.ptoTypes : [],
                     missingRoleId: body.missingRoleId || null,
                     sendTo: body.sendTo || 'managers',
                     specificRecipientIds: Array.isArray(body.specificRecipientIds) ? body.specificRecipientIds : [],
                     templateId: body.templateId || null,
-                    subject: body.subject || null,
-                    body: body.body || null,
+                    subject: body.subject || triggerDefaults.subject,
+                    body: body.body || body.plainText || triggerDefaults.body,
                     enabled: body.enabled !== false,
                     createdAt: new Date().toISOString()
                 };
