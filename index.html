@@ -4811,52 +4811,24 @@
                     return false;
                 });
                 
-                // If there's an approved time off request, check if it covers this period
-                if (approvedTimeOffRequest) {
-                    const requestPeriod = approvedTimeOffRequest.period || 'Full Day';
-                    // If period is 'Full Day', any approved request makes them unavailable
-                    if (period === 'Full Day') return true;
-                    // For specific periods, check if the request covers that period
-                    if (requestPeriod === 'Full Day' || requestPeriod === period) return true;
+                if (approvedTimeOffRequest && timeOffPeriodsConflict(approvedTimeOffRequest.period, period)) {
+                    return true;
                 }
-                
-                // Check if CRC has any event rows on this date that would make them unavailable.
-                // IMPORTANT: We no longer treat legacy `type === 'Unavailable'` events as blocking by themselves,
-                // because they can be "invisible blockers". The source of truth is approved time off requests
-                // (and the approved-event records those requests generate).
-                
+
+                const ptoTypes = getPtoEventTypesSet();
                 const eventsOnDate = state.crc_events.filter(event => {
-                    // Exclude the current event being edited
                     if (excludeEventId && event.id === excludeEventId) return false;
-                    
-                    // Normalize event date for comparison
+                    if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
                     const eventDate = toDateOnlyString(parseDateFlexible(event.date));
                     if (!eventDate || eventDate !== normalizedDate) return false;
-                    
-                    // Check if this is an unavailability event
                     if (event.crcId !== crcId) return false;
-                    if (event.type !== 'Paid Time Off' && event.type !== 'Time Off') return false;
-                    return true;
+                    return ptoTypes.has(event.type);
                 });
-                
-                // If there's an approved time off request, check if it covers this period
-                if (approvedTimeOffRequest) {
-                    const requestPeriod = approvedTimeOffRequest.period || 'Full Day';
-                    // If period is 'Full Day', any approved request makes them unavailable
-                    if (period === 'Full Day') return true;
-                    // For specific periods, check if the request covers that period
-                    if (requestPeriod === 'Full Day' || requestPeriod === period) return true;
-                }
-                
-                // If no approved time off request and no events, they are available
+
                 if (eventsOnDate.length === 0) return false;
-                
-                // If period is 'Full Day', any unavailability makes them unavailable
                 if (period === 'Full Day') return true;
-                
-                // For specific periods, check if the unavailability covers that period
-                return eventsOnDate.some(event => 
-                    !event.period || event.period === 'Full Day' || event.period === period
+                return eventsOnDate.some(event =>
+                    timeOffPeriodsConflict(event.period, period)
                 );
             };
             
@@ -4871,12 +4843,9 @@
                     
                     if (event.crcId === crcId) return true;
                     if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                        return Object.values(event.roleAssignments).some(assignments => {
-                            if (Array.isArray(assignments)) {
-                                return assignments.includes(crcId);
-                            }
-                            return false;
-                        });
+                        return Object.values(event.roleAssignments).some(assignments =>
+                            assignmentsIncludeCrc(assignments, crcId)
+                        );
                     }
                     return false;
                 });
@@ -5242,6 +5211,22 @@
 
             const getSchedulableCrcs = (list) => (list || state.crcs || []).filter(c => c && c.id && c.active !== false && c.archived !== true);
 
+            /** CRC dashboard: show cancelled visits greyed out (still excluded from utilization via isCancelledShift). */
+            const getCrcDashboardEvents = () => (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
+
+            const syncLinkedCrcFromUser = async (user, overrides = {}) => {
+                if (!user?.crcId) return;
+                const crc = state.crcs.find(c => c.id === user.crcId);
+                if (!crc) return;
+                const payload = buildCrcUpdatePayload(crc, {
+                    email: user.email || crc.email,
+                    active: user.active !== false,
+                    ...overrides
+                });
+                const saved = await apiService.updateCrc(user.crcId, payload);
+                setState({ crcs: state.crcs.map(c => c.id === user.crcId ? saved : c) }, { skipRender: true });
+            };
+
             const normalizeTimeOffPeriodBucket = (period) => {
                 const p = String(period || 'Full Day').trim().toLowerCase();
                 if (!p || p === 'full day' || p.includes('full')) return 'full';
@@ -5308,6 +5293,87 @@
                 if (deletedIds.length) removeDeletedEventsFromLocalState(deletedIds);
                 return deletedIds;
             };
+
+            const unassignCrcFromRoleAssignmentsObject = (roleAssignments, crcId) => {
+                if (!roleAssignments || typeof roleAssignments !== 'object') return roleAssignments || {};
+                const out = {};
+                Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                    if (!Array.isArray(assignments)) {
+                        out[roleId] = assignments;
+                        return;
+                    }
+                    out[roleId] = assignments.map(entry =>
+                        normalizeCrcId(entry) === crcId ? 'UNASSIGNED' : entry
+                    );
+                });
+                return out;
+            };
+
+            const deleteTravelDaysForCrcOnShift = async (shiftEvent, crcId) => {
+                if (!shiftEvent || !crcId) return [];
+                const linked = findTravelDaysLinkedToShift(shiftEvent).filter(td => {
+                    const single = normalizeCrcId(td.crcId);
+                    if (single === crcId) return true;
+                    if (Array.isArray(td.crcIds)) {
+                        const ids = td.crcIds.map(normalizeCrcId).filter(Boolean);
+                        return ids.length === 1 ? ids[0] === crcId : ids.includes(crcId);
+                    }
+                    return false;
+                });
+                const deletedIds = [];
+                for (const td of linked) {
+                    if (!td?.id) continue;
+                    try {
+                        await apiService.deleteEvent(td.id);
+                        deletedIds.push(td.id);
+                    } catch (err) {
+                        console.warn('Failed to delete travel for call-out:', td.id, err);
+                    }
+                }
+                if (deletedIds.length) removeDeletedEventsFromLocalState(deletedIds);
+                return deletedIds;
+            };
+
+            const getCallOutModalHTML = (eventId) => {
+                const event = state.crc_events.find(e => e.id === eventId);
+                if (!event || event.type !== 'Site Assignment') {
+                    return '<p class="text-gray-600 dark:text-gray-400">Shift not found.</p>';
+                }
+                const assigned = typeof getEventCRCs === 'function' ? getEventCRCs(event) : [];
+                if (!assigned.length) {
+                    return '<p class="text-gray-600 dark:text-gray-400">No staff assigned to this shift.</p>';
+                }
+                const options = assigned.map(c =>
+                    `<option value="${c.id}">${(c.name || 'Staff').replace(/</g, '&lt;')}</option>`
+                ).join('');
+                const prior = Array.isArray(event.callOuts) ? event.callOuts : [];
+                const history = prior.length
+                    ? `<div class="mb-4 text-xs text-gray-600 dark:text-gray-400"><strong>Prior call-outs:</strong><ul class="list-disc ml-4 mt-1">${prior.map(co => {
+                        const name = state.crcs.find(x => x.id === co.crcId)?.name || co.crcId;
+                        const when = co.at ? new Date(co.at).toLocaleString() : '';
+                        return `<li>${name}${when ? ' — ' + when : ''}${co.reason ? ' — ' + co.reason : ''}</li>`;
+                    }).join('')}</ul></div>`
+                    : '';
+                return `
+                    <h3 class="text-xl font-bold dark:text-white mb-4">Record Call-Out</h3>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Removes the person from this shift, deletes their linked travel for this day, and keeps a record that they called out (needs replacement).</p>
+                    ${history}
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Staff member</label>
+                            <select id="call-out-crc-id" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${options}</select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Reason (optional)</label>
+                            <input type="text" id="call-out-reason" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g. sick, family emergency">
+                        </div>
+                        <div class="flex justify-end gap-2">
+                            <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200">Cancel</button>
+                            <button type="button" data-action="confirm-record-call-out" data-event-id="${eventId}" class="px-4 py-2 rounded-md bg-amber-600 text-white hover:bg-amber-700">Record Call-Out</button>
+                        </div>
+                    </div>
+                `;
+            };
             
             // Helper function to get CRCs assigned to an event from roleAssignments, crcId, or crcIds. For multi-day shifts (groupId), uses merged staff.
             const getEventCRCs = (event) => {
@@ -5355,30 +5421,31 @@
             const getCRCRolesForEvent = (crcId, event) => {
                 const roles = [];
                 const trainingInfo = [];
-                
-                if (!event.roleAssignments || !event.roleAssignments) return { roles, trainingInfo };
-                
-                // Find all roles this CRC is assigned to
+                if (!event?.roleAssignments || typeof event.roleAssignments !== 'object') return { roles, trainingInfo };
                 Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                    if (Array.isArray(assignments) && assignments.includes(crcId)) {
+                    if (!Array.isArray(assignments)) return;
+                    assignments.forEach((entry, idx) => {
+                        if (normalizeCrcId(entry) !== crcId) return;
                         const role = state.roles.find(r => r.id === roleId);
-                        if (role) {
-                            const roleName = role.name;
-                            roles.push(roleName);
-                            
-                            // If this is a Training role, get what they're training for
-                            if (isTrainingRoleName(roleName) && event.trainingAssignments && event.trainingAssignments[roleId]) {
-                                const trainingAssignments = event.trainingAssignments[roleId];
-                                const crcIndex = assignments.indexOf(crcId);
-                                if (crcIndex >= 0 && trainingAssignments[crcIndex]) {
-                                    trainingInfo.push(trainingAssignments[crcIndex]);
-                                }
-                            }
+                        if (!role?.name) return;
+                        roles.push(role.name);
+                        if (isTrainingRoleName(role.name) && event.trainingAssignments?.[roleId]?.[idx]) {
+                            trainingInfo.push(event.trainingAssignments[roleId][idx]);
+                        } else {
+                            trainingInfo.push(null);
                         }
-                    }
+                    });
                 });
-                
                 return { roles, trainingInfo };
+            };
+
+            const getRolesForCrcOnEvent = (crcId, event) => {
+                if (!crcId || !event) return [];
+                const { roles, trainingInfo } = getCRCRolesForEvent(crcId, event);
+                return roles.map((name, i) => {
+                    if (isTrainingRoleName(name) && trainingInfo[i]) return `Training, ${trainingInfo[i]}`;
+                    return name;
+                });
             };
 
             // Site Assignment rows in a multi-day *group* share groupId but each row has its own `date`.
@@ -5940,8 +6007,13 @@
     // CRITICAL: Never add duplicate PTO/time off (one per CRC per date; all formats treated same)
     const ptoTypes = ['Paid Time Off', 'PTO', 'Unavailable', 'Time Off', 'Sick Time', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only'];
     if (ptoTypes.includes(newEvent.type) && newEvent.crcId && newEvent.date) {
-        if (state.crc_events.some(e => ptoTypes.includes(e.type) && e.crcId === newEvent.crcId && e.date === newEvent.date)) {
-            debugWarn('CHAOS: Prevented duplicate PTO/time off:', newEvent.crcId, newEvent.date);
+        if (state.crc_events.some(e =>
+            ptoTypes.includes(e.type) &&
+            e.crcId === newEvent.crcId &&
+            e.date === newEvent.date &&
+            timeOffPeriodsConflict(e.period, newEvent.period)
+        )) {
+            debugWarn('CHAOS: Prevented duplicate PTO/time off:', newEvent.crcId, newEvent.date, newEvent.period);
             return;
         }
     }
@@ -6823,15 +6895,10 @@
                 // Training roles work the same way - CRC is assigned to the Training role in roleAssignments
                 // The trainingAssignments just specify what they're training for (e.g., "ICF")
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                    const foundInRoles = Object.values(event.roleAssignments).some(assignments => {
-                        if (Array.isArray(assignments)) {
-                            return assignments.includes(crcId);
-                        }
-                        return false;
-                    });
-                    if (foundInRoles) {
-                        return true;
-                    }
+                    const foundInRoles = Object.values(event.roleAssignments).some(assignments =>
+                        assignmentsIncludeCrc(assignments, crcId)
+                    );
+                    if (foundInRoles) return true;
                 }
                 
                 // Multi-day shift: same calendar day only — do not treat sibling *dates* as carrying this cell's roster
@@ -6843,7 +6910,7 @@
                         if (e.crcIds && Array.isArray(e.crcIds) && e.crcIds.includes(crcId)) return true;
                         if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
                             return Object.values(e.roleAssignments).some(assignments =>
-                                Array.isArray(assignments) && assignments.includes(crcId)
+                                assignmentsIncludeCrc(assignments, crcId)
                             );
                         }
                         return false;
@@ -7232,7 +7299,7 @@
                     if (state.currentUser && getEffectivePermissionLevel() === 'CRC') {
                         // Remove tabs that CRCs should not access
                         tabs = tabs.filter(tab => !['dashboard', 'scheduler', 'managerView', 'reporting', 'communications'].includes(tab.id));
-                        tabs.unshift({ id: 'dashboard', label: 'CRC Dashboard' });
+                        tabs.unshift({ id: 'dashboard', label: 'Staff Dashboard' });
                         tabs.splice(1, 0, { id: 'crc-schedule', label: 'My Schedule' });
                         tabs.splice(2, 0, { id: 'planning-grid', label: 'Planning Grid' });
                     }
@@ -9519,7 +9586,7 @@
                             const roleName = role ? role.name : 'Role';
                             
                             // Get all qualified CRCs for this role (exclude deactivated)
-                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
+                            const qualifiedCrcs = getSchedulableCrcs().filter(c => hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             // Get existing assignments for this role
@@ -9759,7 +9826,7 @@
                             if (!role) return;
                             
                             const roleName = role.name;
-                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
+                            const qualifiedCrcs = getSchedulableCrcs().filter(c => hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             const container = e.target.previousElementSibling;
@@ -9823,7 +9890,7 @@
                             if (!role) return;
                             
                             const roleName = role.name;
-                            const qualifiedCrcs = state.crcs.filter(c => c.active !== false && hasValidTraining(c, roleName))
+                            const qualifiedCrcs = getSchedulableCrcs().filter(c => hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             const container = e.target.closest('.border').querySelector(`#duplicate-role-${roleId}-assignments`);
@@ -11076,7 +11143,7 @@
                             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Unique site/visit combinations in range.</p>
                         </div>
                         <div class="p-4 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded-lg">
-                            <h3 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-2">CRCs Scheduled</h3>
+                            <h3 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-2">Staff Scheduled</h3>
                             <p id="dashboard-total-crc-days" class="text-2xl font-bold text-gray-900 dark:text-white">--</p>
                             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Unique CRCs working in this range.</p>
                         </div>
@@ -11213,15 +11280,13 @@
                 today.setHours(0, 0, 0, 0);
                 const todayStr = toDateOnlyString(today);
                 
-                const rawCrcEvents = (getDisplayEvents() || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                const rawCrcEvents = getCrcDashboardEvents().filter(e => eventBelongsToCrc(e, matchingCrcId));
                 const seenIds = new Set();
-                const seenDateGroup = new Set(); // (date, groupId) to avoid same shift multiple times
                 const allCrcEvents = rawCrcEvents.filter(e => {
-                    if (e.id && seenIds.has(e.id)) return false;
-                    const key = e.type === 'Site Assignment' && e.groupId ? `${e.date}\t${e.groupId}` : (e.id || `${e.date}\t${e.type}\t${e.crcId || ''}`);
-                    if (seenDateGroup.has(key)) return false;
-                    if (e.id) seenIds.add(e.id);
-                    seenDateGroup.add(key);
+                    if (e.id) {
+                        if (seenIds.has(e.id)) return false;
+                        seenIds.add(e.id);
+                    }
                     return true;
                 });
                 
@@ -11242,7 +11307,7 @@
                 
                 // Find next scheduled shift
                 const nextShifts = crcEvents
-                    .filter(e => e.type === 'Site Assignment' && new Date(e.date + 'T00:00:00') >= today)
+                    .filter(e => e.type === 'Site Assignment' && !isCancelledShift(e) && new Date(e.date + 'T00:00:00') >= today)
                     .sort((a, b) => new Date(a.date) - new Date(b.date));
                 
                 const nextShift = nextShifts[0];
@@ -11251,29 +11316,10 @@
                 const upcomingShifts = crcEvents
                     .filter(e => {
                         const eventDate = new Date(e.date + 'T00:00:00');
-                        return e.type === 'Site Assignment' && eventDate >= today;
+                        return e.type === 'Site Assignment' && !isCancelledShift(e) && eventDate >= today;
                     })
                     .sort((a, b) => new Date(a.date) - new Date(b.date))
                     .slice(0, 5); // Get only the next 5 shifts
-                
-                // Get roles for next shift
-                const getEventRoles = (event) => {
-                    const roles = [];
-                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                            if (Array.isArray(assignments) && assignments.includes(matchingCrcId)) {
-                                const role = state.roles.find(r => r.id === roleId);
-                                if (role) roles.push(role.name);
-                            }
-                        });
-                    }
-                    if (event.roles && event.roles.length > 0) {
-                        event.roles.forEach(roleName => {
-                            if (!roles.includes(roleName)) roles.push(roleName);
-                        });
-                    }
-                    return roles;
-                };
                 
                 let nextShiftHTML = '';
                 let nextSiteHTML = '';
@@ -11285,7 +11331,7 @@
                     const site = state.crc_sites.find(s => s.id === nextShift.siteId);
                     const studies = (nextShift.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                     const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study assigned';
-                    const roles = getEventRoles(nextShift);
+                    const roles = getRolesForCrcOnEvent(matchingCrcId, nextShift);
                     // For travel days, show training roles if available, otherwise show "Travel"
                     const roleNames = nextShift.type === 'Travel Day' 
                         ? (roles.length > 0 ? roles.join(', ') : 'Travel') 
@@ -11361,7 +11407,7 @@
                                     const site = state.crc_sites.find(s => s.id === shift.siteId);
                                     const studies = (shift.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                                     const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
-                                    const roles = getEventRoles(shift);
+                                    const roles = getRolesForCrcOnEvent(matchingCrcId, shift);
                                     const roleNames = roles.length > 0 ? roles.join(', ') : 'No roles';
                                     return `
                                         <div class="p-2 bg-white dark:bg-gray-800 rounded border border-indigo-100 dark:border-indigo-800">
@@ -11385,7 +11431,7 @@
                     <div class="w-full bg-white dark:bg-gray-800 p-4 md:p-6 rounded-lg shadow-md">
                         <div class="mb-6 flex justify-between items-center">
                             <div>
-                                <h2 class="text-2xl font-bold text-gray-800 dark:text-white mb-2">CRC Dashboard</h2>
+                                <h2 class="text-2xl font-bold text-gray-800 dark:text-white mb-2">Staff Dashboard</h2>
                                 <p class="text-gray-600 dark:text-gray-400">Welcome, ${crc.name}!</p>
                             </div>
                             <div class="flex items-center gap-2">
@@ -11446,15 +11492,14 @@
                 // Get events based on view selection; deduplicate by event id so the same shift doesn't show multiple times
                 let filteredEvents = [];
                 if (dashboardView === 'mySchedule') {
-                    const raw = (getDisplayEvents() || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                    const raw = getCrcDashboardEvents().filter(e => eventBelongsToCrc(e, matchingCrcId));
                     const seenIds = new Set();
-                    const seenDateGroup = new Set();
                     filteredEvents = raw.filter(e => {
-                        if (e.id && seenIds.has(e.id)) return false;
-                        const key = e.type === 'Site Assignment' && e.groupId ? `${e.date}\t${e.groupId}` : (e.id || `${e.date}\t${e.type}\t${e.crcId || ''}`);
-                        if (seenDateGroup.has(key)) return false;
-                        if (e.id) seenIds.add(e.id);
-                        seenDateGroup.add(key);
+                        if (e.id) {
+                            if (seenIds.has(e.id)) return false;
+                            seenIds.add(e.id);
+                            return true;
+                        }
                         return true;
                     });
                 } else {
@@ -11570,9 +11615,10 @@
                                     const crcNameDisplay = crcNames.length > 0 ? crcNames.join(', ') : '';
                                     const timeOffTypes = new Set(['Unavailable', 'Paid Time Off', 'Time Off', 'Sick Time', 'PTO', 'Vacation', 'Holiday', 'Bereavement', 'Per Diem', 'Sick', 'Jury Duty', 'Capped - FTE only']);
                                     const isTimeOff = timeOffTypes.has(event.type) || timeOffTypes.has(event.name);
+                                    const isCancelled = typeof isCancelledShift === 'function' && isCancelledShift(event);
                                     const firstStudy = studies.length > 0 ? studies[0] : null;
-                                    const bgColor = isTimeOff ? '#10b981' : (event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : '#8b5cf6'));
-                                    const textColorForEvent = (typeof getContrastColor === 'function') ? getContrastColor(bgColor) : 'white';
+                                    const bgColor = isCancelled ? '#9ca3af' : (isTimeOff ? '#10b981' : (event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : '#8b5cf6')));
+                                    const textColorForEvent = isCancelled ? '#1f2937' : ((typeof getContrastColor === 'function') ? getContrastColor(bgColor) : 'white');
                                     
                                     // For Travel Day events, calculate and display distance from site
                                     let travelDistanceInfo = '';
@@ -11608,7 +11654,7 @@
                                              data-action="view-crc-event" 
                                              data-event-id="${event.id}"
                                              title="${isTimeOff ? 'Time Off' : `${event.type} - ${site ? site.name : 'Unknown Site'}${locationStr ? ' - ' + locationStr : ''}${pi ? ' - PI: ' + pi : ''} - ${studyNames}`}${crcNameDisplay ? ' - ' + crcNameDisplay : ''}">
-                                            <div class="font-medium truncate">${isTimeOff ? '🏖 Time Off' : (event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown'))}</div>
+                                            <div class="font-medium truncate">${isCancelled ? '⊘ Cancelled' : (isTimeOff ? '🏖 Time Off' : (event.type === 'Travel Day' ? '✈ Travel' : (site ? site.name : 'Unknown')))}</div>
                                             ${pi ? `<div class="text-[10px] opacity-90 truncate">PI: ${pi}</div>` : ''}
                                             ${locationStr ? `<div class="text-[10px] opacity-90 truncate">${locationStr}</div>` : ''}
                                             ${event.type === 'Travel Day' && event.crcIds && Array.isArray(event.crcIds) && event.crcIds.length > 1 
@@ -12355,7 +12401,7 @@
                     .map((m, i) => `<option value="${i}" ${i === currentMonthIndex ? 'selected' : ''}>${m}</option>`)
                     .join('');
                 // Map to create CRC options (preselect all by default)
-                const crcOptions = state.crcs.map(crc => `<option value="${crc.id}" selected>${crc.name}</option>`).join('');
+                const crcOptions = getSchedulableCrcs().map(crc => `<option value="${crc.id}" selected>${crc.name}</option>`).join('');
                 const currentMonthValue = `${currentYear}-${String(currentMonthIndex + 1).padStart(2, '0')}`;
                 const timeOffStartValue = state.timeOffReportStartMonth || currentMonthValue;
                 const timeOffEndValue = state.timeOffReportEndMonth || currentMonthValue;
@@ -13232,7 +13278,7 @@
                                                 <option value="Contractor">Contractor</option>
                                             </select>
                                             <div class="flex gap-2">
-                                                <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add CRC</button>
+                                                <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Staff</button>
                                                 <button type="button" data-action="import-crcs-btn" class="w-full bg-purple-600 text-white py-2 rounded-md hover:bg-purple-700 transition-colors">Import CRCs</button>
                                             </div>
                                         </form>
@@ -14342,7 +14388,7 @@
                     return;
                 }
                 
-                const crcOptions = state.crcs.map(crc => `<option value="${crc.id}">${crc.name}</option>`).join('');
+                const crcOptions = getSchedulableCrcs().map(crc => `<option value="${crc.id}">${crc.name}</option>`).join('');
                 const siteOptions = getFilteredSites().map(site => `<option value="${site.id}">${site.name}</option>`).join('');
                 const studyOptions = state.studies.map(study => `<option value="${study.id}">${study.title || study.name}</option>`).join('');
                 const regions = [...new Set(state.crcs.map(crc => crc.region).filter(Boolean))];
@@ -19362,7 +19408,7 @@
                                             <option value="Contractor">Contractor</option>
                                         </select>
                                         <div class="flex gap-2">
-                                            <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add CRC</button>
+                                            <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Staff</button>
                                             <button type="button" data-action="import-crcs-btn" class="w-full bg-purple-600 text-white py-2 rounded-md hover:bg-purple-700 transition-colors">Import CRCs</button>
                                         </div>
                                     </form>
@@ -24811,12 +24857,17 @@
                 
                 // For Site Assignment events, filter CRCs by training when roles are known
                 const dateStr = toDateOnlyString(parseDateFlexible(date));
-                const crcOptions = state.crcs.map(crc => {
+                const schedulableCrcs = getSchedulableCrcs();
+                const crcIdsOnEvent = event && typeof getCrcIdsOnShiftEvent === 'function' ? getCrcIdsOnShiftEvent(event) : new Set();
+                const crcListForPicker = schedulableCrcs.concat(
+                    (state.crcs || []).filter(c => c?.id && crcIdsOnEvent.has(c.id) && !schedulableCrcs.some(s => s.id === c.id))
+                );
+                const crcOptions = crcListForPicker.map(crc => {
                     const isUnavailable = isCRCUnavailable(crc.id, date, period);
                     const unavailableText = isUnavailable ? ' (Unavailable)' : '';
                     
                     // If editing and this CRC is selected, always include them
-                    const isSelected = event && event.crcId === crc.id;
+                    const isSelected = event && (event.crcId === crc.id || crcIdsOnEvent.has(crc.id));
                     
                     // For Site Assignment with known roles, check training
                     let trainingNote = '';
@@ -25208,6 +25259,7 @@
                             <div class="flex items-center gap-4">
                                 ${readOnly ? '' : (isEditing ? `<button type="button" data-action="delete-crc-event" data-event-id="${event.id}" data-group-id="${event.groupId || ''}" class="text-red-600 hover:underline">Delete Event</button>` : '<div></div>')}
                                 ${readOnly ? '' : (isEditing && eventType === 'Site Assignment' ? `<button type="button" data-action="cancel-shift" data-event-id="${event.id}" class="text-amber-700 hover:underline">${event && (event.cancelled === true || event.canceled === true || String(event.status || '').toLowerCase() === 'cancelled') ? 'Uncancel Shift' : 'Cancel Shift'}</button>` : '')}
+                                ${readOnly ? '' : (isEditing && eventType === 'Site Assignment' && !isCancelledShift(event) ? `<button type="button" data-action="record-call-out" data-event-id="${event.id}" class="text-orange-700 hover:underline">Record Call-Out</button>` : '')}
                                 ${readOnly ? '' : (isFullDayEvent ? `<button type="button" data-action="split-shift" data-event-id="${event.id}" class="text-blue-600 hover:underline">Split AM/PM</button>` : '')}
                                 ${readOnly ? '' : (isMultiDayEvent ? `<button type="button" data-action="split-by-day" data-event-id="${event.id}" data-start-date="${startDateValue}" data-end-date="${endDateValue}" class="text-purple-600 hover:underline">Split by Day</button>` : '')}
                                 ${readOnly ? '' : (isEditing ? `<button type="button" data-action="copy-shift" data-event-id="${event.id}" class="text-green-600 hover:underline">Copy Shift</button>` : '')}
@@ -27088,7 +27140,7 @@
                 }
                 
                 // For managers/supervisors, show dropdown with all CRCs
-                const crcOptions = state.crcs.map(crc => `<option value="${crc.id}" ${state.selectedCrcForUnavailability === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
+                const crcOptions = getSchedulableCrcs().map(crc => `<option value="${crc.id}" ${state.selectedCrcForUnavailability === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
                 return `
                     <h2 class="text-2xl font-bold dark:text-white mb-4">Manage Staff Unavailability & Time Off</h2>
                     <div class="mb-4">
@@ -28790,7 +28842,7 @@
                     </label>
                 `).join('');
                 
-                const crcOptions = state.crcs.map(crc => `
+                const crcOptions = getSchedulableCrcs().map(crc => `
                     <label class="flex items-center p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded cursor-pointer crc-checkbox-item">
                         <input type="checkbox" name="selectedCrcs" value="${crc.id}" class="mr-3 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded">
                         <span class="text-sm dark:text-gray-300">${crc.name}</span>
@@ -31648,6 +31700,63 @@
                         }
                         break;
                     }
+                    case 'record-call-out': {
+                        const coEventId = actionButton.dataset.eventId || eventId;
+                        if (!coEventId) break;
+                        openModal(getCallOutModalHTML(coEventId), 'md');
+                        break;
+                    }
+                    case 'confirm-record-call-out': {
+                        const isSupervisorCo = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        if (isSupervisorCo) {
+                            showNotification('Supervisors cannot record call-outs.', 'error');
+                            break;
+                        }
+                        const coEventId = actionButton.dataset.eventId || eventId;
+                        const crcSelect = document.getElementById('call-out-crc-id');
+                        const reasonInput = document.getElementById('call-out-reason');
+                        const crcIdOut = crcSelect?.value;
+                        if (!coEventId || !crcIdOut) {
+                            showNotification('Select a staff member for the call-out.', 'error');
+                            break;
+                        }
+                        const ev = state.crc_events.find(e => e.id === coEventId);
+                        if (!ev || ev.type !== 'Site Assignment') {
+                            showNotification('Shift not found.', 'error');
+                            break;
+                        }
+                        const reason = (reasonInput?.value || '').trim();
+                        try {
+                            saveStateToUndoHistory();
+                            const roleAssignments = unassignCrcFromRoleAssignmentsObject(ev.roleAssignments, crcIdOut);
+                            const callOuts = [...(Array.isArray(ev.callOuts) ? ev.callOuts : []), {
+                                crcId: crcIdOut,
+                                at: new Date().toISOString(),
+                                reason,
+                                needsReplacement: true
+                            }];
+                            const patch = { roleAssignments, callOuts };
+                            if (normalizeCrcId(ev.crcId) === crcIdOut) patch.crcId = 'UNASSIGNED';
+                            if (Array.isArray(ev.crcIds)) {
+                                patch.crcIds = ev.crcIds.map(normalizeCrcId).filter(id => id && id !== crcIdOut);
+                            }
+                            const updated = await apiService.updateEvent(coEventId, patch);
+                            const travelRemoved = await deleteTravelDaysForCrcOnShift(ev, crcIdOut);
+                            const i = state.crc_events.findIndex(e => e.id === coEventId);
+                            if (i !== -1) {
+                                state.crc_events[i] = { ...state.crc_events[i], ...patch, ...(updated || {}) };
+                            }
+                            setState({ crc_events: [...state.crc_events] }, { skipRender: true });
+                            renderContentPreservingScroll();
+                            const name = state.crcs.find(c => c.id === crcIdOut)?.name || 'Staff';
+                            showNotification(`Call-out recorded for ${name}.${travelRemoved.length ? ' Linked travel removed.' : ''}`, 'success');
+                            closeModal();
+                        } catch (err) {
+                            console.error('Record call-out failed:', err);
+                            showNotification('Failed to record call-out.', 'error');
+                        }
+                        break;
+                    }
                     case 'cancel-shift': {
                         const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
                         if (isSupervisor) {
@@ -31668,31 +31777,29 @@
                         const targets = groupId
                             ? state.crc_events.filter(e => e.type === 'Site Assignment' && e.groupId === groupId)
                             : [target];
-                        const linkedTravelDays = groupId
-                            ? state.crc_events.filter(e => e.type === 'Travel Day' && e.parentShiftGroupId === groupId)
-                            : [];
-                        const toPatch = [...targets, ...linkedTravelDays];
-
                         const scopeLabel = groupId ? 'the entire multi-day shift' : 'this shift';
                         const cancelExplain = nextCancelled
-                            ? `Cancel ${scopeLabel}?\n\n• All rows stay in the database for history.\n• Assigned CRCs become available for other shifts (and linked travel rows are cancelled too).\n• Turn on "Show cancelled shifts" in filters if you need to review them.`
-                            : `Restore ${scopeLabel}?\n\n• The shift (and linked travel rows) will show as active again and may block CRC availability.`;
+                            ? `Cancel ${scopeLabel}?\n\n• Shift rows stay in the database (greyed on staff view).\n• Linked travel days will be removed.\n• Turn on "Show cancelled shifts" in manager filters to review them.`
+                            : `Restore ${scopeLabel}?\n\n• The shift will show as active again. Travel days are not recreated automatically.`;
                         const confirmed = confirm(cancelExplain);
                         if (!confirmed) break;
 
                         try {
                             saveStateToUndoHistory();
-                            // Update in parallel for speed; keep payload small to avoid clobbering fields.
-                            const results = await Promise.allSettled(toPatch.map(ev => apiService.updateEvent(ev.id, { cancelled: nextCancelled })));
-                            const updatedIds = new Set();
+                            let travelDeleted = 0;
+                            if (nextCancelled) {
+                                for (const ev of targets) {
+                                    const ids = await deleteTravelDaysLinkedToShift(ev);
+                                    travelDeleted += ids.length;
+                                }
+                            }
+                            const results = await Promise.allSettled(targets.map(ev => apiService.updateEvent(ev.id, { cancelled: nextCancelled })));
                             results.forEach((res, idx) => {
-                                const ev = toPatch[idx];
+                                const ev = targets[idx];
                                 if (res.status === 'fulfilled' && res.value && res.value.id) {
                                     const i = state.crc_events.findIndex(e => e.id === ev.id);
                                     if (i !== -1) state.crc_events[i] = { ...state.crc_events[i], ...res.value };
-                                    updatedIds.add(ev.id);
                                 } else {
-                                    // Best-effort: update local state so UI reflects the change even if server omits fields.
                                     const i = state.crc_events.findIndex(e => e.id === ev.id);
                                     if (i !== -1) state.crc_events[i] = { ...state.crc_events[i], cancelled: nextCancelled };
                                 }
@@ -31700,8 +31807,7 @@
 
                             setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             renderContentPreservingScroll();
-                            const travelN = linkedTravelDays.length;
-                            const travelSuffix = travelN ? ` Linked travel: ${travelN} row${travelN === 1 ? '' : 's'} ${nextCancelled ? 'cancelled' : 'restored'}.` : '';
+                            const travelSuffix = travelDeleted ? ` Removed ${travelDeleted} linked travel day${travelDeleted === 1 ? '' : 's'}.` : '';
                             showNotification(`${nextCancelled ? 'Shift cancelled' : 'Shift restored'}.${travelSuffix}`, 'success');
                             closeModal();
                         } catch (err) {
@@ -32155,11 +32261,11 @@
                         const crc = state.crcs.find(c => c.id === id);
                         if (crc) {
                             openModal(`
-                                <h3 class="text-xl font-bold dark:text-white mb-4">Archive CRC</h3>
+                                <h3 class="text-xl font-bold dark:text-white mb-4">Archive Staff</h3>
                                 <p class="dark:text-gray-300 mb-6">Are you sure you want to archive <strong>${crc.name}</strong>? This will remove the CRC from active lists but preserve historical data.</p>
                                 <div class="flex justify-end gap-4">
                                     <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
-                                    <button data-action="confirm-archive-crc" data-crc-id="${crc.id}" class="py-2 px-4 rounded-md bg-yellow-600 text-white hover:bg-yellow-700">Archive CRC</button>
+                                    <button data-action="confirm-archive-crc" data-crc-id="${crc.id}" class="py-2 px-4 rounded-md bg-yellow-600 text-white hover:bg-yellow-700">Archive Staff</button>
                                 </div>
                             `);
                         }
@@ -32302,6 +32408,9 @@
                         } else {
                             try {
                             const eventToDelete = state.crc_events.find(e => e.id === eventId);
+                            if (eventToDelete?.type === 'Site Assignment') {
+                                await deleteTravelDaysLinkedToShift(eventToDelete);
+                            }
                             await apiService.deleteEvent(eventId);
                                 // Log change for Catch-Up
                                 if (eventToDelete) {
@@ -32339,6 +32448,9 @@
                     case 'delete-single-event': {
                         try {
                         const eventToDelete = state.crc_events.find(e => e.id === eventId);
+                        if (eventToDelete?.type === 'Site Assignment') {
+                            await deleteTravelDaysLinkedToShift(eventToDelete);
+                        }
                         await apiService.deleteEvent(eventId);
                             // Log change for Catch-Up
                             if (eventToDelete) {
@@ -32477,6 +32589,9 @@
                         try {
                             const eventBeforeDelete = state.crc_events.find(e => e.id === idToDelete);
                             saveStateToUndoHistory();
+                            if (eventBeforeDelete?.type === 'Site Assignment') {
+                                await deleteTravelDaysLinkedToShift(eventBeforeDelete);
+                            }
                             await apiService.deleteEvent(idToDelete);
                             setState({ pendingDeleteEventId: null });
                             removeDeletedEventsFromLocalState([idToDelete]);
@@ -39563,7 +39678,8 @@
                                 if (data.permissionLevel === 'CRC' && !crcId && data.newCrcName) {
                                     const newCrcData = {
                                         name: data.newCrcName,
-                                        email: data.newCrcEmail || data.email || ''
+                                        email: data.newCrcEmail || data.email || '',
+                                        active: data.active !== false
                                     };
                                     const newCrc = await apiService.createCrc(newCrcData);
                                     crcId = newCrc.id;
@@ -39587,6 +39703,12 @@
                             setState({
                                 users: [...state.users, newUser]
                             });
+                            if (newUser.crcId) {
+                                await syncLinkedCrcFromUser(newUser, {
+                                    name: newUser.name || data.name,
+                                    email: newUser.email || data.email
+                                });
+                            }
                             showNotification('User created successfully!', 'success');
                             closeModal();
                             renderUsersContent();
@@ -39651,6 +39773,13 @@
                             setState({
                                 users: state.users.map(u => u.id === userId ? updatedUser : u)
                             });
+                            if (updatedUser.crcId) {
+                                await syncLinkedCrcFromUser(updatedUser, {
+                                    name: updatedUser.name || updateData.name,
+                                    email: updatedUser.email || updateData.email,
+                                    active: updatedUser.active
+                                });
+                            }
                             showNotification('User updated successfully!', 'success');
                             closeModal();
                             renderUsersContent();
@@ -40721,7 +40850,7 @@
                                                 const roleName = role ? role.name : '';
                                                 
                                                 const allowOverrideEdit = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                                const qualifiedCrcs = state.crcs.filter(c => c.active !== false && (allowOverrideEdit ? true : hasValidTraining(c, roleName)))
+                                                const qualifiedCrcs = getSchedulableCrcs().filter(c => (allowOverrideEdit ? true : hasValidTraining(c, roleName)))
                                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                                 const trainingTypeValue = (mergedTrainingAssignments[roleId] && mergedTrainingAssignments[roleId][index]) || getExistingTrainingType(roleId, index);
                                                 const trainingModeKey = `${roleId}-${index}`;
@@ -41598,7 +41727,7 @@
                         const allowOverrideRole = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                         // Only show CRCs who are active and have valid training for this role (or all if override)
                         // Only active staff are selectable for scheduling, even when overriding restrictions.
-                        let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && !crc.archived && (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
+                        let qualifiedCrcs = getSchedulableCrcs().filter(crc => (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         
                         // IMPORTANT: If editing, include assigned CRCs even if they don't have training
@@ -41623,7 +41752,7 @@
                         
                         // If role doesn't require training, include all active CRCs (for new CRCs without training records)
                         if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                            qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false && !crc.archived)
+                            qualifiedCrcs = getSchedulableCrcs()
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         }
                         
@@ -41977,7 +42106,7 @@
                                 
                                 const allowOverrideQty = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                                 // Only active staff are selectable for scheduling, even when overriding restrictions.
-                                const qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name)))
+                                const qualifiedCrcs = getSchedulableCrcs().filter(crc => (allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
@@ -42187,7 +42316,7 @@
                     const allowOverrideReq = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                     // Get CRCs who are active and can fill this role (only show those with valid training, or all if override)
                     // Only active staff are selectable for scheduling, even when overriding restrictions.
-                    let qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && !crc.archived && (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
+                    let qualifiedCrcs = getSchedulableCrcs().filter(crc => (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
                         .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     
                     const untrainedAssignedCrcs = [];
@@ -42207,7 +42336,7 @@
                     const roleRequiresTraining = requiredTrainingNames.length > 0;
                     
                     if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                        qualifiedCrcs = state.crcs.filter(crc => crc && crc.id && crc.active !== false && !crc.archived)
+                        qualifiedCrcs = getSchedulableCrcs()
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     }
                     
@@ -42650,7 +42779,7 @@
                             if (newQuantity > currentSlots) {
                                 const allowOverrideInc = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                                 // Only active staff are selectable for scheduling, even when overriding restrictions.
-                                const qualifiedCrcs = state.crcs.filter(crc => crc.active !== false && (allowOverrideInc ? true : hasValidTraining(crc, role.name)))
+                                const qualifiedCrcs = getSchedulableCrcs().filter(crc => (allowOverrideInc ? true : hasValidTraining(crc, role.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
@@ -50799,7 +50928,7 @@
 
             // Travel Modal Functions
             const getAddTravelModalHTML = () => {
-                const crcOptions = state.crcs.map(crc => `<option value="${crc.id}">${crc.name}</option>`).join('');
+                const crcOptions = getSchedulableCrcs().map(crc => `<option value="${crc.id}">${crc.name}</option>`).join('');
                 const studyOptions = state.studies.map(study => {
                     const textColor = study.color ? getContrastColor(study.color) : '';
                     return `<option value="${study.id}" style="${study.color ? `background-color: ${study.color}; color: ${textColor};` : ''}">${study.color ? '● ' : ''}${study.title || study.name}</option>`;
@@ -51040,7 +51169,10 @@
             };
 
             const getEditTravelModalHTML = (travel) => {
-                const crcOptions = state.crcs.map(crc => `<option value="${crc.id}" ${travel.crcId === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
+                const travelCrcPickList = getSchedulableCrcs().concat(
+                    (state.crcs || []).filter(c => c?.id === travel.crcId && !getSchedulableCrcs().some(s => s.id === c.id))
+                );
+                const crcOptions = travelCrcPickList.map(crc => `<option value="${crc.id}" ${travel.crcId === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
                 const studyOptions = state.studies.map(study => {
                     const textColor = study.color ? getContrastColor(study.color) : '';
                     const isSelected = travel.studyId === study.id;
