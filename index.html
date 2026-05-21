@@ -809,6 +809,39 @@
                 display: none;
             }
         }
+
+        /* Scheduler: sidebar left, calendar right (same row on desktop) */
+        #main-app-content.scheduler-layout {
+            display: flex;
+            flex-direction: row;
+            flex-wrap: nowrap;
+            align-items: flex-start;
+            width: 100%;
+        }
+        #main-app-content.scheduler-layout #schedule-sidebar {
+            flex: 0 0 auto;
+            width: 18rem;
+            max-width: 30%;
+        }
+        #main-app-content.scheduler-layout #schedule-sidebar.schedule-sidebar-collapsed {
+            width: 3rem;
+            max-width: 3rem;
+        }
+        #main-app-content.scheduler-layout #schedule-main-content {
+            flex: 1 1 0%;
+            min-width: 0;
+            width: auto;
+        }
+        @media (max-width: 767px) {
+            #main-app-content.scheduler-layout {
+                flex-direction: column;
+                flex-wrap: wrap;
+            }
+            #main-app-content.scheduler-layout #schedule-sidebar {
+                width: 100%;
+                max-width: none;
+            }
+        }
         
     </style>
     <script>
@@ -824,7 +857,7 @@
     </script>
 </head>
 <body class="bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
-    <div id="loading-overlay" class="fixed inset-0 bg-gray-100 dark:bg-gray-900 z-[100] flex items-center justify-center">
+    <div id="loading-overlay" class="fixed inset-0 bg-gray-100 dark:bg-gray-900 z-[100] flex items-center justify-center transition-opacity duration-300">
         <div class="text-center p-4 max-w-2xl mx-auto">
             <div class="flex flex-col items-center justify-center space-y-6">
                 <!-- Logo with rotating circles from login screen -->
@@ -914,7 +947,7 @@
         <div id="mobile-actions-menu" class="mobile-actions-menu"></div>
     </div>
     
-    <div id="chaos-app-root" class="p-4 sm:p-8">
+    <div id="chaos-app-root" class="p-4 sm:p-8" style="visibility:hidden">
         <div class="flex flex-wrap justify-between items-center mb-6 gap-4">
             <div class="flex items-center space-x-3">
                 <button id="theme-toggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300 transition-colors">
@@ -1091,20 +1124,45 @@
                 requestAnimationFrame(() => requestAnimationFrame(fn));
             };
 
+            const showLoadingOverlay = () => {
+                overlayHidden = false;
+                if (loadingOverlay) {
+                    loadingOverlay.classList.remove('hidden');
+                    loadingOverlay.style.display = 'flex';
+                    loadingOverlay.style.visibility = 'visible';
+                    loadingOverlay.style.pointerEvents = 'auto';
+                    loadingOverlay.style.opacity = '1';
+                }
+                startLoadingPhraseRotation();
+            };
+
+            const beginAuthenticatedLoadGate = () => {
+                initialAppRevealed = false;
+                pendingInitialTabPaint = true;
+                initialRevealScheduled = false;
+                overlayHidden = false;
+                initialPaintStartedAt = Date.now();
+                setAppChromeVisible(false);
+                showLoadingOverlay();
+            };
+
             const forceRevealAppFromOverlay = () => {
                 pendingInitialTabPaint = false;
                 initialRevealScheduled = false;
                 initialAppRevealed = true;
+                stopLoadingPhraseRotation();
                 setAppChromeVisible(true);
                 if (loadingOverlay) {
-                    loadingOverlay.classList.add('hidden');
-                    loadingOverlay.style.display = 'none';
+                    loadingOverlay.style.opacity = '0';
                     loadingOverlay.style.pointerEvents = 'none';
+                    setTimeout(() => {
+                        loadingOverlay.classList.add('hidden');
+                        loadingOverlay.style.display = 'none';
+                    }, 280);
                 }
                 if (!overlayHidden) {
                     overlayHidden = true;
                     debugLog('CHAOS: App revealed — schedule ready');
-                    stopLoadingPhraseRotation();
                 }
             };
 
@@ -1130,9 +1188,6 @@
                         forceRevealAppFromOverlay();
                         return;
                     }
-                    if (loadingMessage && tabNeedsSchedulePaintBeforeReveal() && !contentReady) {
-                        loadingMessage.textContent = 'Building schedule view...';
-                    }
                     setTimeout(attemptReveal, 100);
                 };
                 attemptReveal();
@@ -1141,8 +1196,9 @@
             const hideLoadingOverlayIfReady = () => {
                 if (!state.authReady || !state.initialLoadComplete) return;
                 window.requestAnimationFrame(() => render());
+                // Stay on loading screen until schedule/view is painted (see scheduleInitialReveal).
                 if (!initialAppRevealed && pendingInitialTabPaint) return;
-                if (!overlayHidden) forceRevealAppFromOverlay();
+                if (!overlayHidden && !pendingInitialTabPaint) forceRevealAppFromOverlay();
             };
 
             const markInitialTabContentReady = () => {
@@ -1177,26 +1233,106 @@
                 "Today is tomorrow's yesterday.",
                 "I'm not stuck, i'm just thinking",
                 "Wake up every day and run faster than a jaguar.",
-                "\"Shoot for the moon and even if you miss you'll land among the stars.\" — Caitlin Black"
+                "\"Shoot for the moon and even if you miss you'll land among the stars.\" — Caitlin Black",
+                "I feel as useless as a screen door on a submarine."
             ];
-            
-            let loadingPhraseInterval = null;
-            let currentPhraseIndex = 0;
-            
-            const startLoadingPhraseRotation = () => {
-                if (loadingPhraseInterval) return; // Already started
-                
-                // Set initial phrase
+
+            const logoutFarewellPhrases = [
+                "Hope you have a great day.",
+                "Thanks for stopping by.",
+                "Y'all come back soon now, ya hear!",
+                "Don't let the door hit ya on the way out.",
+                "Enjoy your long walk off a short pier."
+            ];
+            let logoutFarewellInterval = null;
+            let logoutFarewellFadeTimeout = null;
+            let logoutFarewellCompleteTimeout = null;
+            const LOGOUT_FAREWELL_DURATION_MS = 2500;
+            const LOGOUT_FAREWELL_CYCLE_MS = 550;
+
+            const stopLogoutFarewell = () => {
+                if (logoutFarewellInterval) {
+                    clearInterval(logoutFarewellInterval);
+                    logoutFarewellInterval = null;
+                }
+                if (logoutFarewellFadeTimeout) {
+                    clearTimeout(logoutFarewellFadeTimeout);
+                    logoutFarewellFadeTimeout = null;
+                }
+                if (logoutFarewellCompleteTimeout) {
+                    clearTimeout(logoutFarewellCompleteTimeout);
+                    logoutFarewellCompleteTimeout = null;
+                }
+            };
+
+            const playLogoutFarewell = (onComplete) => {
+                stopLoadingPhraseRotation();
+                stopLogoutFarewell();
+                if (typeof closeModal === 'function') closeModal();
+                setAppChromeVisible(false);
+                overlayHidden = false;
+                if (loadingOverlay) {
+                    loadingOverlay.classList.remove('hidden');
+                    loadingOverlay.style.display = 'flex';
+                    loadingOverlay.style.visibility = 'visible';
+                    loadingOverlay.style.pointerEvents = 'auto';
+                    loadingOverlay.style.opacity = '1';
+                }
+                let farewellIdx = Math.floor(Math.random() * logoutFarewellPhrases.length);
                 if (loadingMessage) {
-                    // Pick a random starting phrase
-                    currentPhraseIndex = Math.floor(Math.random() * loadingPhrases.length);
-                    loadingMessage.textContent = loadingPhrases[currentPhraseIndex];
+                    loadingMessage.textContent = logoutFarewellPhrases[farewellIdx];
                     loadingMessage.style.opacity = '1';
                 }
-                
-                // Show one phrase per refresh - don't rotate continuously
-                // Just show the initial random phrase and keep it
-                // (No interval needed - phrases only change on page refresh)
+                logoutFarewellInterval = setInterval(() => {
+                    farewellIdx = (farewellIdx + 1) % logoutFarewellPhrases.length;
+                    if (!loadingMessage) return;
+                    loadingMessage.style.opacity = '0';
+                    if (logoutFarewellFadeTimeout) clearTimeout(logoutFarewellFadeTimeout);
+                    logoutFarewellFadeTimeout = setTimeout(() => {
+                        if (loadingMessage) {
+                            loadingMessage.textContent = logoutFarewellPhrases[farewellIdx];
+                            loadingMessage.style.opacity = '1';
+                        }
+                    }, 220);
+                }, LOGOUT_FAREWELL_CYCLE_MS);
+                logoutFarewellCompleteTimeout = setTimeout(async () => {
+                    stopLogoutFarewell();
+                    if (typeof onComplete === 'function') {
+                        await onComplete();
+                    }
+                }, LOGOUT_FAREWELL_DURATION_MS);
+            };
+            
+            let loadingPhraseInterval = null;
+            let loadingPhraseFadeTimeout = null;
+            let currentPhraseIndex = 0;
+            const LOADING_PHRASE_INTERVAL_MS = 4200;
+            
+            const setLoadingPhraseByIndex = (index) => {
+                if (!loadingMessage || !loadingPhrases.length) return;
+                currentPhraseIndex = ((index % loadingPhrases.length) + loadingPhrases.length) % loadingPhrases.length;
+                loadingMessage.textContent = loadingPhrases[currentPhraseIndex];
+                loadingMessage.style.opacity = '1';
+            };
+            
+            const rotateLoadingPhrase = () => {
+                if (!loadingMessage || overlayHidden || !loadingOverlay || loadingOverlay.style.display === 'none') return;
+                loadingMessage.style.opacity = '0';
+                if (loadingPhraseFadeTimeout) clearTimeout(loadingPhraseFadeTimeout);
+                loadingPhraseFadeTimeout = setTimeout(() => {
+                    setLoadingPhraseByIndex(currentPhraseIndex + 1);
+                }, 450);
+            };
+            
+            const startLoadingPhraseRotation = () => {
+                if (loadingPhraseFadeTimeout) {
+                    clearTimeout(loadingPhraseFadeTimeout);
+                    loadingPhraseFadeTimeout = null;
+                }
+                if (!loadingMessage) return;
+                setLoadingPhraseByIndex(Math.floor(Math.random() * loadingPhrases.length));
+                if (loadingPhraseInterval) return;
+                loadingPhraseInterval = setInterval(rotateLoadingPhrase, LOADING_PHRASE_INTERVAL_MS);
             };
             
             const stopLoadingPhraseRotation = () => {
@@ -1204,11 +1340,14 @@
                     clearInterval(loadingPhraseInterval);
                     loadingPhraseInterval = null;
                 }
+                if (loadingPhraseFadeTimeout) {
+                    clearTimeout(loadingPhraseFadeTimeout);
+                    loadingPhraseFadeTimeout = null;
+                }
             };
             
-            // Start phrase rotation when page loads
             if (loadingOverlay && loadingMessage) {
-                startLoadingPhraseRotation();
+                showLoadingOverlay();
             }
 
             // --- STATE MANAGEMENT ---
@@ -5224,18 +5363,188 @@
             /** CRC dashboard: show cancelled visits greyed out (still excluded from utilization via isCancelledShift). */
             const getCrcDashboardEvents = () => (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
 
+            const findUserByCrcId = (crcId) => (state.users || []).find(u => u && u.crcId === crcId);
+
+            const staffWithoutLogin = () => (state.crcs || []).filter(c => c?.id && !findUserByCrcId(c.id));
+
             const syncLinkedCrcFromUser = async (user, overrides = {}) => {
                 if (!user?.crcId) return;
                 const crc = state.crcs.find(c => c.id === user.crcId);
                 if (!crc) return;
+                const nameFromUser = [user.firstName, user.lastName].filter(Boolean).join(' ').trim() || user.username || '';
                 const payload = buildCrcUpdatePayload(crc, {
-                    email: user.email || crc.email,
+                    email: user.email || crc.email || crc.oraEmail,
                     active: user.active !== false,
+                    ...(nameFromUser ? { name: nameFromUser } : {}),
                     ...overrides
                 });
                 const saved = await apiService.updateCrc(user.crcId, payload);
                 setState({ crcs: state.crcs.map(c => c.id === user.crcId ? saved : c) }, { skipRender: true });
+                return saved;
             };
+
+            const syncLinkedUserFromStaff = async (crc, overrides = {}) => {
+                if (!crc?.id) return null;
+                const user = findUserByCrcId(crc.id);
+                if (!user) return null;
+                const userUpdate = {
+                    email: crc.email || crc.oraEmail || user.email,
+                    active: crc.active !== false,
+                    crcId: crc.id,
+                    ...overrides
+                };
+                const saved = await apiService.updateUser(user.id, userUpdate);
+                setState({ users: state.users.map(u => u.id === user.id ? saved : u) }, { skipRender: true });
+                return saved;
+            };
+
+            const STAFF_DEPARTMENT_OPTIONS = `
+                <option value="" disabled selected>Department (required)</option>
+                <option value="Drivers">Drivers</option>
+                <option value="Reading Center">Reading Center</option>
+                <option value="CRC">CRC</option>
+                <option value="VNC">VNC</option>
+                <option value="BCVA">BCVA</option>
+                <option value="Patient Recruiting">Patient Recruiting</option>
+            `;
+
+            const setupAddTeamMemberModal = () => {
+                const loginToggle = document.getElementById('add-team-member-create-login');
+                const loginSection = document.getElementById('add-team-member-login-section');
+                const permSelect = document.getElementById('add-team-member-permission');
+                const syncLogin = () => {
+                    if (!loginSection || !loginToggle) return;
+                    loginSection.classList.toggle('hidden', !loginToggle.checked);
+                };
+                if (loginToggle) {
+                    loginToggle.addEventListener('change', syncLogin);
+                    syncLogin();
+                }
+                if (permSelect) {
+                    permSelect.addEventListener('change', () => {
+                        const hint = document.getElementById('add-team-member-login-hint');
+                        if (hint) {
+                            hint.textContent = permSelect.value === 'CRC'
+                                ? 'Creates their staff profile and login linked together.'
+                                : 'Staff profile is still created; login uses the role you select.';
+                        }
+                    });
+                }
+            };
+
+            const getAddTeamMemberModalHTML = () => `
+                <h2 class="text-2xl font-bold dark:text-white mb-2">Add Team Member</h2>
+                <p class="text-sm text-gray-600 dark:text-gray-400 mb-6">One form for scheduling profile and optional app login. You do not need a separate Users entry.</p>
+                <form id="add-team-member-form" class="space-y-5 max-h-[70vh] overflow-y-auto pr-1 custom-scrollbar">
+                    <div class="space-y-3 p-4 rounded-lg bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700">
+                        <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200">Staff profile (scheduling)</h3>
+                        <input type="text" name="crcName" placeholder="Full name" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        <input type="text" name="crcTitle" placeholder="Title (e.g., Senior CRC)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        <select name="department" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">${STAFF_DEPARTMENT_OPTIONS}</select>
+                        <input type="text" name="crcLocation" placeholder="Home location (e.g., Memphis, TN)" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        <input type="text" name="crcRegion" placeholder="Region (e.g., East, West)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        <select name="employmentType" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            <option value="FTE">FTE</option>
+                            <option value="PTE">PTE</option>
+                            <option value="Contractor">Contractor</option>
+                        </select>
+                        <input type="email" name="email" placeholder="Email (used for login username if blank)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                    </div>
+                    <div class="p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-900/20">
+                        <label class="flex items-center gap-2 cursor-pointer">
+                            <input type="checkbox" id="add-team-member-create-login" name="createLogin" value="true" checked class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                            <span class="text-sm font-medium text-gray-800 dark:text-gray-200">Create app login for this person</span>
+                        </label>
+                        <p id="add-team-member-login-hint" class="text-xs text-gray-600 dark:text-gray-400 mt-2 ml-6">Creates their staff profile and login linked together.</p>
+                        <div id="add-team-member-login-section" class="mt-4 space-y-3 ml-6">
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Username</label>
+                                <input type="text" name="username" placeholder="Defaults to email if empty" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Password</label>
+                                <input type="password" name="password" placeholder="Required for new login" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-1">Permission level</label>
+                                <select name="permissionLevel" id="add-team-member-permission" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="CRC" selected>CRC (field staff)</option>
+                                    <option value="Supervisor">Supervisor (view schedules)</option>
+                                    <option value="Manager">Manager (full access)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-3 pt-2 border-t dark:border-gray-700">
+                        <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                        <button type="submit" class="py-2 px-4 rounded-md bg-blue-600 text-white hover:bg-blue-700">Add Team Member</button>
+                    </div>
+                </form>
+            `;
+
+            const getGrantLoginModalHTML = () => {
+                const candidates = staffWithoutLogin().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+                if (!candidates.length) {
+                    return `
+                        <h2 class="text-2xl font-bold dark:text-white mb-4">Grant Login</h2>
+                        <p class="text-gray-600 dark:text-gray-400">Every staff member already has a login, or add new people under <strong>Staff</strong> first.</p>
+                        <div class="flex justify-end mt-6">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Close</button>
+                        </div>
+                    `;
+                }
+                return `
+                    <h2 class="text-2xl font-bold dark:text-white mb-2">Grant Login to Existing Staff</h2>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Use this only when the person is already on the Staff list but does not have a username yet.</p>
+                    <form id="grant-login-form" class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Staff member</label>
+                            <select name="crcId" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="" disabled selected>Select staff...</option>
+                                ${candidates.map(c => `<option value="${c.id}">${(c.name || c.id).replace(/</g, '&lt;')}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Username</label>
+                            <input type="text" name="username" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white" placeholder="Often same as email">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Password</label>
+                            <input type="password" name="password" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Permission level</label>
+                            <select name="permissionLevel" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="CRC" selected>CRC</option>
+                                <option value="Supervisor">Supervisor</option>
+                                <option value="Manager">Manager</option>
+                            </select>
+                        </div>
+                        <div class="flex justify-end gap-3 pt-2">
+                            <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Cancel</button>
+                            <button type="submit" class="py-2 px-4 rounded-md bg-blue-600 text-white hover:bg-blue-700">Create Login</button>
+                        </div>
+                    </form>
+                `;
+            };
+
+            const getManagerOnlyUserModalHTML = () => `
+                <h2 class="text-2xl font-bold dark:text-white mb-2">Add Manager / Supervisor Login</h2>
+                <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">For people who only need system access and are not scheduled as field staff. Field staff should use <strong>Add Team Member</strong> on the Staff tab.</p>
+                <form id="add-manager-user-form" class="space-y-4">
+                    <input type="text" name="username" required placeholder="Username" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                    <input type="password" name="password" required placeholder="Password" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                    <select name="permissionLevel" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="Manager">Manager</option>
+                        <option value="Supervisor">Supervisor</option>
+                    </select>
+                    <input type="email" name="email" placeholder="Email (optional)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                    <div class="flex justify-end gap-3 pt-2">
+                        <button type="button" data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Cancel</button>
+                        <button type="submit" class="py-2 px-4 rounded-md bg-blue-600 text-white hover:bg-blue-700">Add Login</button>
+                    </div>
+                </form>
+            `;
 
             const normalizeTimeOffPeriodBucket = (period) => {
                 const p = String(period || 'Full Day').trim().toLowerCase();
@@ -5982,16 +6291,13 @@
                 }
                 debugLog('CHAOS: setState called. authReady=', state.authReady, 'initialLoadComplete=', state.initialLoadComplete);
                 if (state.authReady && state.initialLoadComplete) {
-                    if (!wasInitialLoadComplete && state.initialLoadComplete) {
-                        initialPaintStartedAt = Date.now();
+                    if (!initialAppRevealed && state.initialLoadComplete) {
+                        if (!wasInitialLoadComplete) {
+                            initialPaintStartedAt = Date.now();
+                        }
                         pendingInitialTabPaint = true;
                         setAppChromeVisible(false);
-                        if (loadingOverlay) {
-                            loadingOverlay.style.display = 'flex';
-                            loadingOverlay.classList.remove('hidden');
-                            loadingOverlay.style.pointerEvents = 'auto';
-                        }
-                        if (loadingMessage) loadingMessage.textContent = 'Preparing your schedule...';
+                        showLoadingOverlay();
                     }
                     hideLoadingOverlayIfReady();
                 } else {
@@ -7634,7 +7940,6 @@
                                         state.authReady = true;
                                         state.userId = 'chaos-user';
                                         
-                                        setAppChromeVisible(false);
                                         renderNav();
                                         performInitialLoad();
                                         return; // Exit early, don't continue to API call
@@ -7687,7 +7992,6 @@
                                             setState({ activeTab: 'dashboard' });
                                         }
                                         
-                                        setAppChromeVisible(false);
                                         renderNav();
                                         performInitialLoad();
                                     } else {
@@ -7898,10 +8202,10 @@
                     if ((isAdminUser() || getEffectivePermissionLevel() === 'Manager') && state.finalizedMonths[sk] === undefined) ensureFinalizedSnapshotForCurrentMonth();
                     const calendarEl = document.getElementById('crc-calendar-container');
                     const shellReady = _lastRenderedTab === 'scheduler' && calendarEl && calendarEl.innerHTML.trim().length > 80;
+                    mainAppContent.className = 'scheduler-layout gap-6 w-full';
                     if (!shellReady) {
                         _lastRenderedTab = state.activeTab;
                         mainAppContent.innerHTML = getSchedulerHTML();
-                        mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
                         renderSupervisorFilters();
                         renderSidebarTabs();
                     } else {
@@ -7939,10 +8243,10 @@
                     const sk = getScheduleMonthKey(state.crcCalendarDate);
                     const calendarEl = document.getElementById('crc-calendar-container');
                     const shellReady = _lastRenderedTab === 'planning-grid' && calendarEl && calendarEl.innerHTML.trim().length > 80;
+                    mainAppContent.className = 'scheduler-layout gap-6 w-full';
                     if (!shellReady) {
                         _lastRenderedTab = state.activeTab;
                         mainAppContent.innerHTML = getSchedulerHTML();
-                        mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
                     } else {
                         _lastRenderedTab = state.activeTab;
                     }
@@ -11078,7 +11382,7 @@
                 const sidebarHidden = isSupervisor || isCRC || isViewingAsCrc(); // Hide sidebar for supervisors, CRCs, and when viewing as CRC
                 return `
                 ${!sidebarHidden ? `
-                <aside id="schedule-sidebar" class="bg-white dark:bg-gray-800 rounded-lg shadow-md flex flex-col transition-all duration-300 ${isCollapsed ? 'w-12 lg:w-12 p-2' : 'w-full lg:w-1/3 xl:w-1/4 p-3 md:p-6'} ${isCollapsed ? '' : 'space-y-4 md:space-y-6'}">
+                <aside id="schedule-sidebar" class="bg-white dark:bg-gray-800 rounded-lg shadow-md flex flex-col transition-all duration-300 shrink-0 ${isCollapsed ? 'schedule-sidebar-collapsed w-12 p-2' : 'p-3 md:p-6 space-y-4 md:space-y-6'}">
                     ${!isCollapsed ? `
                         <div class="flex items-center justify-between">
                             <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Sidebar</h3>
@@ -11100,7 +11404,7 @@
                     `}
                 </aside>
                 ` : ''}
-                <div id="schedule-main-content" class="bg-white dark:bg-gray-800 p-3 md:p-6 rounded-lg shadow-md transition-all duration-300 ${sidebarHidden ? 'w-full' : (isCollapsed ? 'w-full' : 'w-full lg:w-2/3 xl:w-3/4')}">
+                <div id="schedule-main-content" class="bg-white dark:bg-gray-800 p-3 md:p-6 rounded-lg shadow-md transition-all duration-300 min-w-0 flex-1">
                     <div id="supervisor-filters-container" class="mb-4 md:mb-6"></div>
                     <div id="crc-calendar-container" class="overflow-x-auto"></div>
                 </div>
@@ -13270,33 +13574,11 @@
                             ${currentSubtab === 'crcs' ? `
                                 <div class="space-y-6">
                                     ${state.currentUser && (isAdminUser() || getEffectivePermissionLevel() !== 'CRC') ? `
-                                    <div class="bg-gray-50 dark:bg-gray-700 rounded-lg p-4">
-                                        <form id="add-crc-form" class="space-y-3">
-                                            <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-3">Add New CRC</h3>
-                                            <input type="text" name="crcName" placeholder="CRC Name" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white">
-                                            <input type="text" name="crcTitle" placeholder="Title (e.g., Senior CRC, CRC II)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white">
-                                            <select name="department" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white">
-                                                <option value="" selected disabled>Department (required)</option>
-                                                <option value="Drivers">Drivers</option>
-                                                <option value="Reading Center">Reading Center</option>
-                                                <option value="CRC">CRC</option>
-                                                <option value="VNC">VNC</option>
-                                                <option value="BCVA">BCVA</option>
-                                                <option value="Patient Recruiting">Patient Recruiting</option>
-                                            </select>
-                                            <input type="text" name="crcLocation" placeholder="Home Location (e.g., Memphis, TN)" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white">
-                                            <input type="text" name="crcRegion" placeholder="Region (e.g., East, West)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white">
-                                            <select name="employmentType" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white">
-                                                <option value="FTE">FTE</option>
-                                                <option value="PTE">PTE</option>
-                                                <option value="Contractor">Contractor</option>
-                                            </select>
-                                            <div class="flex gap-2">
-                                                <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Staff</button>
-                                                <button type="button" data-action="import-crcs-btn" class="w-full bg-purple-600 text-white py-2 rounded-md hover:bg-purple-700 transition-colors">Import CRCs</button>
-                                            </div>
-                                        </form>
+                                    <div class="bg-gray-50 dark:bg-gray-700 rounded-lg p-4 flex flex-col sm:flex-row gap-2">
+                                        <button type="button" data-action="open-add-team-member-modal" class="flex-1 bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors font-medium">Add Team Member</button>
+                                        <button type="button" data-action="import-crcs-btn" class="flex-1 bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 transition-colors">Import Staff</button>
                                     </div>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400">Staff profile and app login are created together here. Use Users only to grant login to someone already on the list.</p>
                                     ` : ''}
                                     
                                     <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -19410,22 +19692,8 @@
                         <div class="pt-6">
                             ${ tabIs('crcs') ? `
                                 <div class="space-y-4">
-                                    <form id="add-crc-form" class="space-y-3">
-                                        <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Manage Staff</h3>
-                                        <input type="text" name="crcName" placeholder="CRC Name" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <input type="text" name="crcTitle" placeholder="Title (e.g., Senior CRC, CRC II)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <input type="text" name="crcLocation" placeholder="Home Location (e.g., Memphis, TN)" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <input type="text" name="crcRegion" placeholder="Region (e.g., East, West)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                        <select name="employmentType" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                                            <option value="FTE">FTE</option>
-                                            <option value="PTE">PTE</option>
-                                            <option value="Contractor">Contractor</option>
-                                        </select>
-                                        <div class="flex gap-2">
-                                            <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors">Add Staff</button>
-                                            <button type="button" data-action="import-crcs-btn" class="w-full bg-purple-600 text-white py-2 rounded-md hover:bg-purple-700 transition-colors">Import CRCs</button>
-                                        </div>
-                                    </form>
+                                    <button type="button" data-action="open-add-team-member-modal" class="w-full bg-blue-600 text-white py-2 px-3 rounded-md hover:bg-blue-700 transition-colors text-sm font-medium">Add Team Member</button>
+                                    <button type="button" data-action="import-crcs-btn" class="w-full bg-purple-600 text-white py-2 px-3 rounded-md hover:bg-purple-700 transition-colors text-sm">Import Staff</button>
                                     <div class="space-y-2">
                                         <div class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">CRC</div>
                                         <div id="staffDeptCrcList" class="space-y-2 max-h-40 overflow-y-auto custom-scrollbar pr-2"></div>
@@ -28806,11 +29074,6 @@
                             state.authReady = true;
                             state.userId = 'chaos-user';
                             performInitialLoad();
-                            
-                            // If on login page, re-render to show main content
-                            if (isLoginPage) {
-                                renderContent();
-                            }
                         } else {
                             throw new Error('Authentication failed');
                         }
@@ -34794,17 +35057,10 @@
                         break;
                     }
                     case 'logout': {
-                        // Clear user session from localStorage
-                        localStorage.removeItem('ora_smo_session');
-                        
-                        // Remove announcement banner immediately
-                        const bannerContainer = document.getElementById('announcement-banner-container');
-                        if (bannerContainer) {
-                            bannerContainer.remove();
-                        }
-                        
-                        // Clear user session
-                        (async () => {
+                        playLogoutFarewell(async () => {
+                            localStorage.removeItem('ora_smo_session');
+                            const bannerContainer = document.getElementById('announcement-banner-container');
+                            if (bannerContainer) bannerContainer.remove();
                             if (msalInstance) {
                                 try {
                                     const accounts = msalInstance.getAllAccounts();
@@ -34815,22 +35071,30 @@
                                     console.warn('MSAL logout error:', error);
                                 }
                             }
-                        setState({
-                            currentUser: null,
-                            isAuthenticated: false
-                        });
-                            // No localStorage - just clear memory
-                        showNotification('Logged out successfully', 'success');
-                        renderNav(); // Refresh navigation to show login button
-                        
-                        // Ensure banner is removed after state update
-                        setTimeout(() => {
-                            const bannerContainerAfter = document.getElementById('announcement-banner-container');
-                            if (bannerContainerAfter) {
-                                bannerContainerAfter.remove();
+                            initialAppRevealed = false;
+                            pendingInitialTabPaint = false;
+                            initialRevealScheduled = false;
+                            overlayHidden = true;
+                            initialPaintStartedAt = 0;
+                            setState({
+                                currentUser: null,
+                                isAuthenticated: false,
+                                initialLoadComplete: false
+                            });
+                            renderNav();
+                            setAppChromeVisible(true);
+                            if (loadingOverlay) {
+                                loadingOverlay.style.opacity = '0';
+                                loadingOverlay.style.pointerEvents = 'none';
+                                setTimeout(() => {
+                                    loadingOverlay.classList.add('hidden');
+                                    loadingOverlay.style.display = 'none';
+                                }, 280);
                             }
-                        }, 100);
-                        })();
+                            renderContent();
+                            const bannerAfter = document.getElementById('announcement-banner-container');
+                            if (bannerAfter) bannerAfter.remove();
+                        });
                         break;
                     }
                     case 'open-permission-sets-modal': {
@@ -34916,8 +35180,21 @@
                         })();
                         break;
                     }
+                    case 'open-add-team-member-modal': {
+                        openModal(getAddTeamMemberModalHTML(), '4xl');
+                        setTimeout(setupAddTeamMemberModal, 50);
+                        break;
+                    }
+                    case 'open-grant-login-modal': {
+                        openModal(getGrantLoginModalHTML(), 'md');
+                        break;
+                    }
+                    case 'open-manager-user-modal': {
+                        openModal(getManagerOnlyUserModalHTML(), 'md');
+                        break;
+                    }
                     case 'open-add-user-modal': {
-                        openModal(getAddUserModalHTML());
+                        openModal(getGrantLoginModalHTML(), 'md');
                         // Add event handler for permission level change
                         setTimeout(() => {
                             const usernameInput = document.querySelector('#add-user-form input[name="username"]');
@@ -35326,45 +35603,132 @@
                 // Collection reference function removed - using Azure API directly
 
                 switch (form.id) {
-                    case 'add-crc-form': {
+                    case 'add-team-member-form': {
                         try {
-                            // Geocode the home location
+                            if (!data.crcName || !String(data.crcName).trim()) {
+                                showNotification('Name is required.', 'error');
+                                break;
+                            }
+                            if (!data.crcLocation || !String(data.crcLocation).trim()) {
+                                showNotification('Home location is required.', 'error');
+                                break;
+                            }
+                            const wantsLogin = data.createLogin === 'true' || document.getElementById('add-team-member-create-login')?.checked;
+                            if (wantsLogin && (!data.password || !String(data.password).trim())) {
+                                showNotification('Password is required when creating a login.', 'error');
+                                break;
+                            }
                             const coordinates = await geocodeLocation(data.crcLocation);
-                            
-                            const crcData = { 
-                                name: data.crcName, 
+                            const email = (data.email || '').trim();
+                            const crcData = {
+                                name: String(data.crcName).trim(),
                                 title: data.crcTitle || '',
                                 department: (data.department || '').trim(),
-                                homeLocation: data.crcLocation, 
-                                region: data.crcRegion, 
-                                employmentType: normalizeEmploymentType(data.employmentType), 
-                                trainings: [], 
-                                capabilities: [], 
+                                homeLocation: data.crcLocation,
+                                region: data.crcRegion || '',
+                                employmentType: normalizeEmploymentType(data.employmentType),
+                                email: email || undefined,
+                                oraEmail: email || undefined,
+                                active: true,
+                                trainings: [],
+                                capabilities: [],
                                 trainingLevel: ''
                             };
-                            
-                            // Add coordinates if geocoding succeeded
                             if (coordinates) {
-                                crcData.coordinates = {
-                                    lat: coordinates.lat,
-                                    lng: coordinates.lng
-                                };
-                                console.log(`Geocoded ${data.crcLocation} to:`, coordinates);
+                                crcData.coordinates = { lat: coordinates.lat, lng: coordinates.lng };
                             }
-
                             const created = await apiService.createCrc(crcData);
-                            if (created && created.id) {
-                                const next = [...(state.crcs || []), created].sort((a, b) => (a?.name || '').localeCompare(b?.name || ''));
-                                setState({ crcs: next }, { skipRender: true });
-                                if (typeof renderCRCLists === 'function') renderCRCLists();
-                                if (state.activeTab === 'crcs' && typeof renderContent === 'function') renderContent();
-                                if (state.activeTab === 'users' && typeof renderUsersContent === 'function') renderUsersContent();
+                            if (!created?.id) {
+                                showNotification('Failed to create staff record.', 'error');
+                                break;
                             }
-                            showNotification('CRC added successfully!', 'success');
-                            form.reset();
+                            let users = state.users || [];
+                            if (wantsLogin) {
+                                const username = (data.username || email || '').trim();
+                                if (!username) {
+                                    showNotification('Username or email is required for login.', 'error');
+                                    break;
+                                }
+                                const perm = data.permissionLevel || 'CRC';
+                                const newUser = await apiService.createUser({
+                                    username,
+                                    password: data.password,
+                                    permissionLevel: perm,
+                                    email: email || username,
+                                    crcId: created.id,
+                                    active: true
+                                });
+                                users = [...users, newUser];
+                                await syncLinkedCrcFromUser(newUser, { name: created.name, email: email || username });
+                            }
+                            const next = [...(state.crcs || []), created].sort((a, b) => (a?.name || '').localeCompare(b?.name || ''));
+                            setState({ crcs: next, users });
+                            if (typeof renderCRCLists === 'function') renderCRCLists();
+                            if (state.activeTab === 'crcs') renderContent();
+                            if (state.activeTab === 'users') renderUsersContent();
+                            showNotification(wantsLogin ? 'Team member and login created.' : 'Team member added (no login).', 'success');
+                            closeModal();
                         } catch (error) {
-                            console.error("Error adding CRC:", error);
-                            showNotification('Failed to add CRC. See console for details.', 'error');
+                            console.error('Error adding team member:', error);
+                            showNotification(error.message || 'Failed to add team member.', 'error');
+                        }
+                        break;
+                    }
+                    case 'grant-login-form': {
+                        try {
+                            const crcId = data.crcId;
+                            if (!crcId) {
+                                showNotification('Select a staff member.', 'error');
+                                break;
+                            }
+                            if (!data.username?.trim() || !data.password?.trim()) {
+                                showNotification('Username and password are required.', 'error');
+                                break;
+                            }
+                            if (findUserByCrcId(crcId)) {
+                                showNotification('This staff member already has a login.', 'error');
+                                break;
+                            }
+                            const crc = state.crcs.find(c => c.id === crcId);
+                            const newUser = await apiService.createUser({
+                                username: data.username.trim(),
+                                password: data.password,
+                                permissionLevel: data.permissionLevel || 'CRC',
+                                email: (crc?.email || crc?.oraEmail || data.username).trim(),
+                                crcId,
+                                active: true
+                            });
+                            setState({ users: [...(state.users || []), newUser] });
+                            await syncLinkedCrcFromUser(newUser, { name: crc?.name });
+                            showNotification('Login created and linked to staff.', 'success');
+                            closeModal();
+                            renderUsersContent();
+                        } catch (error) {
+                            console.error('Grant login failed:', error);
+                            showNotification(error.message || 'Failed to create login.', 'error');
+                        }
+                        break;
+                    }
+                    case 'add-manager-user-form': {
+                        try {
+                            if (!data.username?.trim() || !data.password?.trim()) {
+                                showNotification('Username and password are required.', 'error');
+                                break;
+                            }
+                            const newUser = await apiService.createUser({
+                                username: data.username.trim(),
+                                password: data.password,
+                                permissionLevel: data.permissionLevel || 'Manager',
+                                email: data.email || undefined,
+                                active: true
+                            });
+                            setState({ users: [...(state.users || []), newUser] });
+                            showNotification('Login account created.', 'success');
+                            closeModal();
+                            renderUsersContent();
+                        } catch (error) {
+                            console.error('Add manager user failed:', error);
+                            showNotification(error.message || 'Failed to create login.', 'error');
                         }
                         break;
                     }
@@ -38835,9 +39199,9 @@
                                             if (data.password) {
                                                 userUpdateData.password = data.password;
                                             }
-                                            await apiService.updateUser(userToUpdate.id, userUpdateData);
+                                            await apiService.updateUser(userToUpdate.id, { ...userUpdateData, crcId });
                                             updateData.userId = userToUpdate.id;
-                                            // Refresh users list
+                                            await syncLinkedCrcFromUser({ ...userToUpdate, ...userUpdateData, crcId }, { name: crc.name });
                                             const users = await apiService.getUsers();
                                             setState({ users }, { skipRender: true });
                                         } else {
@@ -38854,9 +39218,9 @@
                                                 sitesAccess: data.sitesAccess || 'all',
                                                 sites: data.sitesAccess === 'selected' ? sites : undefined
                                             };
-                                            const newUser = await apiService.createUser(newUserData);
+                                            const newUser = await apiService.createUser({ ...newUserData, crcId });
                                             updateData.userId = newUser.id;
-                                            // Refresh users list
+                                            await syncLinkedCrcFromUser(newUser, { name: crc.name, email: data.userEmail || username });
                                             const users = await apiService.getUsers();
                                             setState({ users }, { skipRender: true });
                                         }
@@ -38884,8 +39248,8 @@
                             try {
                                 const saved = await apiService.updateCrc(crcId, buildCrcUpdatePayload(crc, updateData));
                                 const updatedCrc = saved && saved.id ? { ...crc, ...saved } : { ...crc, ...updateData };
-                                // Update local state and reflect in UI
                                 state.crcs = state.crcs.map(c => c.id === crcId ? updatedCrc : c);
+                                await syncLinkedUserFromStaff(updatedCrc);
                                 setState({ crcs: [...state.crcs] }, { skipRender: true });
                                 if (typeof renderCRCLists === 'function') renderCRCLists();
                                 if (state.activeTab === 'users' && typeof renderUsersContent === 'function') renderUsersContent();
@@ -39794,7 +40158,6 @@
                             });
                             if (updatedUser.crcId) {
                                 await syncLinkedCrcFromUser(updatedUser, {
-                                    name: updatedUser.name || updateData.name,
                                     email: updatedUser.email || updateData.email,
                                     active: updatedUser.active
                                 });
@@ -46122,7 +46485,7 @@
                             <div class="text-gray-500 dark:text-gray-400 mb-4">
                                 <i data-lucide="users" class="w-16 h-16 mx-auto mb-4"></i>
                                 <h3 class="text-lg font-medium">No users available</h3>
-                                <p class="text-sm">Click "Add User" to create a new user account.</p>
+                                <p class="text-sm">Use <strong>Add Team Member</strong> on the Staff tab to add people (profile + login together).</p>
                             </div>
                         </div>
                     `;
@@ -46147,8 +46510,14 @@
                             <button data-action="open-permission-sets-modal" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700 transition-colors flex items-center">
                                 <i data-lucide="shield" class="w-4 h-4 mr-2"></i>Permission Sets
                             </button>
-                            <button data-action="open-add-user-modal" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
-                                <i data-lucide="user-plus" class="w-4 h-4 mr-2"></i>Add User
+                            <button data-action="open-add-team-member-modal" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors flex items-center">
+                                <i data-lucide="user-plus" class="w-4 h-4 mr-2"></i>Add Team Member
+                            </button>
+                            <button data-action="open-grant-login-modal" class="bg-teal-600 text-white py-2 px-4 rounded-md hover:bg-teal-700 transition-colors flex items-center">
+                                <i data-lucide="key" class="w-4 h-4 mr-2"></i>Grant Login
+                            </button>
+                            <button data-action="open-manager-user-modal" class="bg-gray-600 text-white py-2 px-4 rounded-md hover:bg-gray-700 transition-colors flex items-center text-sm">
+                                <i data-lucide="shield" class="w-4 h-4 mr-2"></i>Manager Login Only
                             </button>
                         </div>
                     </div>
@@ -52395,9 +52764,10 @@
             };
             
             const performInitialLoad = async () => {
-                // Don't override the rotating phrases - let them show
                 debugLog('CHAOS: performInitialLoad started');
-                if (state.isAuthenticated) setAppChromeVisible(false);
+                if (state.isAuthenticated && !initialAppRevealed) {
+                    beginAuthenticatedLoadGate();
+                }
                 
                 try {
                     debugLog('CHAOS: Fetching data from Azure API...');
@@ -52709,7 +53079,6 @@
 							setState({ activeTab: 'scheduler' });
 						}
 						
-						setAppChromeVisible(false);
 						renderNav();
 						performInitialLoad();
 					} else {
