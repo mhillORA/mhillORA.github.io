@@ -4331,78 +4331,50 @@ async function crudHandler(context, request, containerName) {
                     if (containerName === 'events' && resource && resource.type === 'Site Assignment' && resource.date) {
                         try {
                             const eventsContainer = getContainer('events');
-                            
-                            // Collect all CRC IDs assigned to this shift
-                            const shiftCrcIds = new Set();
-                            
-                            // Add crcId if present
-                            if (resource.crcId && resource.crcId.trim() !== '' && resource.crcId !== 'SITE_STAFF' && resource.crcId !== 'UNASSIGNED') {
-                                shiftCrcIds.add(resource.crcId);
+                            const shiftCrcIds = collectCrcIdsFromEvent(resource);
+                            const travelIdsToDelete = new Set();
+
+                            if (resource.groupId) {
+                                const { resources: byGroup } = await eventsContainer.items.query({
+                                    query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.parentShiftGroupId = @gid",
+                                    parameters: [{ name: '@gid', value: resource.groupId }]
+                                }).fetchAll();
+                                (byGroup || []).forEach(td => { if (td?.id) travelIdsToDelete.add(td.id); });
                             }
-                            
-                            // Add crcIds array if present
-                            if (resource.crcIds && Array.isArray(resource.crcIds)) {
-                                resource.crcIds.forEach(crcId => {
-                                    if (crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                        shiftCrcIds.add(crcId);
-                                    }
-                                });
+                            if (resource.id) {
+                                const { resources: byParent } = await eventsContainer.items.query({
+                                    query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND (c.parentShiftId = @sid OR c.linkedShiftId = @sid)",
+                                    parameters: [{ name: '@sid', value: resource.id }]
+                                }).fetchAll();
+                                (byParent || []).forEach(td => { if (td?.id) travelIdsToDelete.add(td.id); });
                             }
-                            
-                            // Add CRCs from roleAssignments
-                            if (resource.roleAssignments && typeof resource.roleAssignments === 'object') {
-                                Object.values(resource.roleAssignments).forEach(assignments => {
-                                    if (Array.isArray(assignments)) {
-                                        assignments.forEach(crcId => {
-                                            if (crcId && crcId.trim() !== '' && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                                shiftCrcIds.add(crcId);
-                                            }
-                                        });
-                                    }
-                                });
-                            }
-                            
-                            // Find and delete travel days for these CRCs on this date
+
                             if (shiftCrcIds.size > 0) {
                                 const { resources: travelDays } = await eventsContainer.items.query({
                                     query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
-                                    parameters: [
-                                        { name: "@date", value: resource.date }
-                                    ]
+                                    parameters: [{ name: '@date', value: resource.date }]
                                 }).fetchAll();
-                                
-                                // Delete travel days that belong to CRCs assigned to this shift
+
                                 for (const travelDay of (travelDays || [])) {
-                                    if (!travelDay || travelDay.type !== 'Travel Day') continue;
-                                    
-                                    // Check if this travel day belongs to any CRC in the shift
+                                    if (!travelDay || travelDay.type !== 'Travel Day' || !travelDay.id) continue;
                                     let shouldDelete = false;
-                                    
-                                    if (travelDay.crcId && shiftCrcIds.has(travelDay.crcId)) {
-                                        shouldDelete = true;
-                                    } else if (travelDay.crcIds && Array.isArray(travelDay.crcIds)) {
-                                        // If travel day has multiple CRCs, only delete if ALL of them are in the shift
-                                        // OR if it's a single CRC travel day that matches
-                                        const travelDayCrcs = travelDay.crcIds.filter(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
-                                        if (travelDayCrcs.length === 1 && shiftCrcIds.has(travelDayCrcs[0])) {
-                                            shouldDelete = true;
-                                        } else if (travelDayCrcs.length > 1) {
-                                            // For multi-CRC travel days, only delete if all CRCs are being removed from the shift
-                                            const allCrcsInShift = travelDayCrcs.every(crcId => shiftCrcIds.has(crcId));
-                                            if (allCrcsInShift) {
-                                                shouldDelete = true;
-                                            }
-                                        }
+                                    const tdCrc = normalizeAssignmentCrcId(travelDay.crcId);
+                                    if (tdCrc && shiftCrcIds.has(tdCrc)) shouldDelete = true;
+                                    if (!shouldDelete && Array.isArray(travelDay.crcIds)) {
+                                        const travelDayCrcs = travelDay.crcIds.map(normalizeAssignmentCrcId).filter(Boolean);
+                                        if (travelDayCrcs.length === 1 && shiftCrcIds.has(travelDayCrcs[0])) shouldDelete = true;
+                                        else if (travelDayCrcs.length > 1 && travelDayCrcs.every(cid => shiftCrcIds.has(cid))) shouldDelete = true;
                                     }
-                                    
-                                    if (shouldDelete) {
-                                        try {
-                                            await eventsContainer.item(travelDay.id, travelDay.id).delete();
-                                            context.log.info(`Deleted travel day ${travelDay.id} because shift ${id} was deleted`);
-                                        } catch (deleteTravelError) {
-                                            context.log.warn(`Failed to delete travel day ${travelDay.id}: ${deleteTravelError.message}`);
-                                        }
-                                    }
+                                    if (shouldDelete) travelIdsToDelete.add(travelDay.id);
+                                }
+                            }
+
+                            for (const travelId of travelIdsToDelete) {
+                                try {
+                                    await eventsContainer.item(travelId, travelId).delete();
+                                    context.log.info(`Deleted travel day ${travelId} because shift ${id} was deleted`);
+                                } catch (deleteTravelError) {
+                                    context.log.warn(`Failed to delete travel day ${travelId}: ${deleteTravelError.message}`);
                                 }
                             }
                         } catch (travelDeleteError) {
@@ -4879,17 +4851,48 @@ const TRIGGER_DEFAULTS = {
     pto_approved: { subject: 'Time off approved', body: 'Your time off request has been approved.' }
 };
 
+const normalizeAssignmentCrcId = (entry) => {
+    if (entry == null) return null;
+    if (typeof entry === 'string') {
+        const s = entry.trim();
+        return s && s !== 'SITE_STAFF' && s !== 'UNASSIGNED' ? s : null;
+    }
+    if (typeof entry === 'object') {
+        const s = String(entry.id || entry.crcId || '').trim();
+        return s && s !== 'SITE_STAFF' && s !== 'UNASSIGNED' ? s : null;
+    }
+    return null;
+};
+
 const collectCrcIdsFromEvent = (ev) => {
     const set = new Set();
     if (!ev) return set;
-    if (ev.crcId && ev.crcId !== 'SITE_STAFF' && ev.crcId !== 'UNASSIGNED') set.add(ev.crcId);
-    if (Array.isArray(ev.crcIds)) ev.crcIds.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') set.add(id); });
+    const add = (id) => { if (id) set.add(id); };
+    add(normalizeAssignmentCrcId(ev.crcId));
+    if (Array.isArray(ev.crcIds)) ev.crcIds.forEach(id => add(normalizeAssignmentCrcId(id)));
     if (ev.roleAssignments && typeof ev.roleAssignments === 'object') {
         Object.values(ev.roleAssignments).forEach(assignments => {
-            if (Array.isArray(assignments)) assignments.forEach(id => { if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') set.add(id); });
+            if (Array.isArray(assignments)) assignments.forEach(entry => add(normalizeAssignmentCrcId(entry)));
         });
     }
     return set;
+};
+
+/** AM + PM on the same day are allowed; Full Day blocks any other period. */
+const normalizeTimeOffPeriodBucket = (period) => {
+    const p = String(period || 'Full Day').trim().toLowerCase();
+    if (!p || p === 'full day' || p.includes('full')) return 'full';
+    if (p === 'pm' || p.includes('half day pm') || (p.includes('pm') && !p.includes('am'))) return 'pm';
+    if (p === 'am' || p.includes('half day am') || p.includes('before 2')) return 'am';
+    if (p.includes(':')) return 'full';
+    return 'full';
+};
+
+const timeOffPeriodsConflict = (periodA, periodB) => {
+    const a = normalizeTimeOffPeriodBucket(periodA);
+    const b = normalizeTimeOffPeriodBucket(periodB);
+    if (a === 'full' || b === 'full') return true;
+    return a === b;
 };
 
 const diffRemovedCrcIdsFromEvents = (before, after) => {
@@ -6040,7 +6043,8 @@ app.http('time-off-requests', {
                         // Only block if there's a non-rejected and non-cancelled request
                         const duplicateRequest = (existingRequests || []).find(req => {
                             const status = String(req?.status || '').toLowerCase().trim();
-                            return status !== 'rejected' && status !== 'cancelled';
+                            if (status === 'rejected' || status === 'cancelled') return false;
+                            return timeOffPeriodsConflict(req.period, body.period);
                         });
                         
                         if (duplicateRequest) {
@@ -6048,7 +6052,7 @@ app.http('time-off-requests', {
                                 status: 409,
                                 jsonBody: { 
                                     error: 'Duplicate time off request',
-                                    message: 'A time off request already exists for this employee on the selected date.',
+                                    message: 'A time off request already exists for this employee on the selected date for that time period (AM/PM can be split; Full Day blocks the whole day).',
                                     existingRequestId: duplicateRequest.id
                                 },
                                 headers: { 'Content-Type': 'application/json' }

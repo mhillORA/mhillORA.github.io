@@ -901,7 +901,7 @@
         <div id="mobile-actions-menu" class="mobile-actions-menu"></div>
     </div>
     
-    <div class="p-4 sm:p-8">
+    <div id="chaos-app-root" class="p-4 sm:p-8">
         <div class="flex flex-wrap justify-between items-center mb-6 gap-4">
             <div class="flex items-center space-x-3">
                 <button id="mobile-menu-button" class="mobile-menu-button items-center justify-center p-2 rounded-md text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 mr-2" aria-label="Open menu">
@@ -1041,15 +1041,40 @@
             const loadingMessage = document.getElementById('loading-message');
             const loadingError = document.getElementById('loading-error');
             let overlayHidden = false;
-            /** When true, keep loading overlay until the primary tab calendar/view has painted (prevents empty-shell flash). */
+            /** Stay on loading screen until schedule/view is painted + minimum dwell time. */
             let pendingInitialTabPaint = false;
+            let initialAppRevealed = false;
+            let initialPaintStartedAt = 0;
+            let initialRevealScheduled = false;
+            const MIN_INITIAL_LOADING_MS = 5000;
+            const INITIAL_PAINT_TIMEOUT_MS = 20000;
 
-            const tabNeedsPaintBeforeInitialReveal = () => {
+            const getAppRootEl = () => document.getElementById('chaos-app-root');
+
+            const setAppChromeVisible = (visible) => {
+                const root = getAppRootEl();
+                if (!root) return;
+                root.style.visibility = visible ? 'visible' : 'hidden';
+                root.style.pointerEvents = visible ? '' : 'none';
+            };
+
+            const tabNeedsSchedulePaintBeforeReveal = () => {
                 const tab = state.activeTab;
                 if (tab === 'scheduler') return true;
                 if (tab === 'planning-grid' && typeof effectiveIsCrcView === 'function' && effectiveIsCrcView()) return true;
                 if (tab === 'dashboard' && state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) return true;
                 return false;
+            };
+
+            const isInitialScheduleViewReady = () => {
+                if (!tabNeedsSchedulePaintBeforeReveal()) return true;
+                const tab = state.activeTab;
+                if (tab === 'dashboard') {
+                    const c = document.getElementById('crc-dashboard-calendar-container');
+                    return !!(c && c.innerHTML.trim().length > 80);
+                }
+                const c = document.getElementById('crc-calendar-container');
+                return !!(c && c.innerHTML.trim().length > 80);
             };
 
             const afterNextPaint = (fn) => {
@@ -1058,6 +1083,9 @@
 
             const forceRevealAppFromOverlay = () => {
                 pendingInitialTabPaint = false;
+                initialRevealScheduled = false;
+                initialAppRevealed = true;
+                setAppChromeVisible(true);
                 if (loadingOverlay) {
                     loadingOverlay.classList.add('hidden');
                     loadingOverlay.style.display = 'none';
@@ -1065,26 +1093,51 @@
                 }
                 if (!overlayHidden) {
                     overlayHidden = true;
+                    debugLog('CHAOS: App revealed — schedule ready');
                     stopLoadingPhraseRotation();
                 }
             };
 
+            const scheduleInitialReveal = () => {
+                if (initialRevealScheduled || initialAppRevealed || !pendingInitialTabPaint) return;
+                initialRevealScheduled = true;
+                const attemptReveal = () => {
+                    if (!pendingInitialTabPaint || initialAppRevealed) {
+                        initialRevealScheduled = false;
+                        return;
+                    }
+                    const elapsed = Date.now() - initialPaintStartedAt;
+                    const minDone = elapsed >= MIN_INITIAL_LOADING_MS;
+                    const contentReady = isInitialScheduleViewReady();
+                    if (minDone && contentReady) {
+                        initialRevealScheduled = false;
+                        forceRevealAppFromOverlay();
+                        return;
+                    }
+                    if (elapsed >= INITIAL_PAINT_TIMEOUT_MS) {
+                        debugWarn('CHAOS: Initial reveal timeout — showing app anyway');
+                        initialRevealScheduled = false;
+                        forceRevealAppFromOverlay();
+                        return;
+                    }
+                    if (loadingMessage && tabNeedsSchedulePaintBeforeReveal() && !contentReady) {
+                        loadingMessage.textContent = 'Building schedule view...';
+                    }
+                    setTimeout(attemptReveal, 100);
+                };
+                attemptReveal();
+            };
+
             const hideLoadingOverlayIfReady = () => {
                 if (!state.authReady || !state.initialLoadComplete) return;
-                if (!pendingInitialTabPaint) {
-                    if (!overlayHidden) {
-                        debugLog('CHAOS: Hiding loading overlay...');
-                    }
-                    forceRevealAppFromOverlay();
-                }
                 window.requestAnimationFrame(() => render());
+                if (!initialAppRevealed && pendingInitialTabPaint) return;
+                if (!overlayHidden) forceRevealAppFromOverlay();
             };
 
             const markInitialTabContentReady = () => {
                 if (!pendingInitialTabPaint) return;
-                debugLog('CHAOS: Initial tab content painted, revealing app');
-                pendingInitialTabPaint = false;
-                hideLoadingOverlayIfReady();
+                scheduleInitialReveal();
             };
 
             // --- LOADING PHRASE ROTATION ---
@@ -1188,16 +1241,27 @@
             };
 
             /** After server-side deletes, drop removed rows locally (and linked travel) to avoid an extra full /events round trip. */
-            const removeDeletedEventsFromLocalState = (deletedIds) => {
+            const removeDeletedEventsFromLocalState = (deletedIds, deletedShiftEvents = []) => {
                 const ids = new Set((deletedIds || []).filter(Boolean));
-                if (ids.size === 0) return;
                 const groupIdsRemoved = new Set();
+                const shiftMeta = [];
                 (state.crc_events || []).forEach((e) => {
-                    if (e && e.id && ids.has(e.id) && e.groupId) groupIdsRemoved.add(e.groupId);
+                    if (e && e.id && ids.has(e.id)) {
+                        if (e.groupId) groupIdsRemoved.add(e.groupId);
+                        if (e.type === 'Site Assignment') shiftMeta.push(e);
+                    }
+                });
+                (deletedShiftEvents || []).forEach((e) => {
+                    if (e?.groupId) groupIdsRemoved.add(e.groupId);
+                    if (e?.type === 'Site Assignment') shiftMeta.push(e);
+                });
+                const orphanTravelIds = new Set();
+                shiftMeta.forEach(shift => {
+                    findTravelDaysLinkedToShift(shift).forEach(td => { if (td?.id) orphanTravelIds.add(td.id); });
                 });
                 state.crc_events = (state.crc_events || []).filter((e) => {
                     if (!e || !e.id) return true;
-                    if (ids.has(e.id)) return false;
+                    if (ids.has(e.id) || orphanTravelIds.has(e.id)) return false;
                     if (e.type === 'Travel Day' && e.parentShiftGroupId && groupIdsRemoved.has(e.parentShiftGroupId)) return false;
                     return true;
                 });
@@ -5170,6 +5234,80 @@
                 if (typeof val === 'object' && (val.id != null || val.crcId != null)) return String(val.id || val.crcId).trim();
                 return String(val).trim();
             };
+
+            const assignmentsIncludeCrc = (assignments, crcId) => {
+                if (!Array.isArray(assignments) || !crcId) return false;
+                return assignments.some(entry => normalizeCrcId(entry) === crcId);
+            };
+
+            const getSchedulableCrcs = (list) => (list || state.crcs || []).filter(c => c && c.id && c.active !== false && c.archived !== true);
+
+            const normalizeTimeOffPeriodBucket = (period) => {
+                const p = String(period || 'Full Day').trim().toLowerCase();
+                if (!p || p === 'full day' || p.includes('full')) return 'full';
+                if (p === 'pm' || p.includes('half day pm') || (p.includes('pm') && !p.includes('am'))) return 'pm';
+                if (p === 'am' || p.includes('half day am') || p.includes('before 2')) return 'am';
+                if (p.includes(':')) return 'full';
+                return 'full';
+            };
+
+            const timeOffPeriodsConflict = (periodA, periodB) => {
+                const a = normalizeTimeOffPeriodBucket(periodA);
+                const b = normalizeTimeOffPeriodBucket(periodB);
+                if (a === 'full' || b === 'full') return true;
+                return a === b;
+            };
+
+            const getCrcIdsOnShiftEvent = (shiftEvent) => {
+                const ids = new Set();
+                if (!shiftEvent) return ids;
+                if (typeof getEventCRCs === 'function') {
+                    getEventCRCs(shiftEvent).forEach(c => { if (c?.id) ids.add(c.id); });
+                }
+                const cid = normalizeCrcId(shiftEvent.crcId);
+                if (cid) ids.add(cid);
+                if (Array.isArray(shiftEvent.crcIds)) shiftEvent.crcIds.forEach(e => { const n = normalizeCrcId(e); if (n) ids.add(n); });
+                return ids;
+            };
+
+            const findTravelDaysLinkedToShift = (shiftEvent) => {
+                if (!shiftEvent) return [];
+                const crcIds = getCrcIdsOnShiftEvent(shiftEvent);
+                const date = shiftEvent.date;
+                const groupId = shiftEvent.groupId;
+                const shiftId = shiftEvent.id;
+                return (state.crc_events || []).filter(e => {
+                    if (!e || e.type !== 'Travel Day') return false;
+                    if (groupId && e.parentShiftGroupId === groupId) return true;
+                    if (shiftId && (e.parentShiftId === shiftId || e.linkedShiftId === shiftId)) return true;
+                    if (!date) return false;
+                    if (e.date !== date) return false;
+                    const tdCrc = normalizeCrcId(e.crcId);
+                    if (tdCrc && crcIds.has(tdCrc)) return true;
+                    if (Array.isArray(e.crcIds)) {
+                        const tdCrcs = e.crcIds.map(normalizeCrcId).filter(Boolean);
+                        if (tdCrcs.length === 1 && crcIds.has(tdCrcs[0])) return true;
+                        if (tdCrcs.length > 1 && tdCrcs.every(id => crcIds.has(id))) return true;
+                    }
+                    return false;
+                });
+            };
+
+            const deleteTravelDaysLinkedToShift = async (shiftEvent) => {
+                const linked = findTravelDaysLinkedToShift(shiftEvent);
+                const deletedIds = [];
+                for (const td of linked) {
+                    if (!td?.id) continue;
+                    try {
+                        await apiService.deleteEvent(td.id);
+                        deletedIds.push(td.id);
+                    } catch (err) {
+                        console.warn('Failed to delete linked travel day:', td.id, err);
+                    }
+                }
+                if (deletedIds.length) removeDeletedEventsFromLocalState(deletedIds);
+                return deletedIds;
+            };
             
             // Helper function to get CRCs assigned to an event from roleAssignments, crcId, or crcIds. For multi-day shifts (groupId), uses merged staff.
             const getEventCRCs = (event) => {
@@ -5767,9 +5905,16 @@
                 }
                 debugLog('CHAOS: setState called. authReady=', state.authReady, 'initialLoadComplete=', state.initialLoadComplete);
                 if (state.authReady && state.initialLoadComplete) {
-                    // On first load completion only: wait for calendar/view paint before removing overlay.
-                    if (!wasInitialLoadComplete && state.initialLoadComplete && tabNeedsPaintBeforeInitialReveal()) {
+                    if (!wasInitialLoadComplete && state.initialLoadComplete) {
+                        initialPaintStartedAt = Date.now();
                         pendingInitialTabPaint = true;
+                        setAppChromeVisible(false);
+                        if (loadingOverlay) {
+                            loadingOverlay.style.display = 'flex';
+                            loadingOverlay.classList.remove('hidden');
+                            loadingOverlay.style.pointerEvents = 'auto';
+                        }
+                        if (loadingMessage) loadingMessage.textContent = 'Preparing your schedule...';
                     }
                     hideLoadingOverlayIfReady();
                 } else {
@@ -7298,7 +7443,9 @@
             const renderContent = () => {
                 // Show login page if not authenticated
                 if (!state.isAuthenticated) {
-                    // Hide loading overlay when showing login page
+                    pendingInitialTabPaint = false;
+                    initialAppRevealed = true;
+                    setAppChromeVisible(true);
                     if (loadingOverlay) {
                         loadingOverlay.style.display = 'none';
                     }
@@ -7406,10 +7553,9 @@
                                         state.authReady = true;
                                         state.userId = 'chaos-user';
                                         
-                                        // Auto-launch dashboard for CRC users (admin gets manager view)
-                                        performInitialLoad();
+                                        setAppChromeVisible(false);
                                         renderNav();
-                                        renderContent();
+                                        performInitialLoad();
                                         return; // Exit early, don't continue to API call
                                     }
                                     
@@ -7460,9 +7606,9 @@
                                             setState({ activeTab: 'dashboard' });
                                         }
                                         
-                                        performInitialLoad();
+                                        setAppChromeVisible(false);
                                         renderNav();
-                                        renderContent();
+                                        performInitialLoad();
                                     } else {
                                         // Failed login
                                         currentFailedAttempts++;
@@ -7669,13 +7815,18 @@
                 } else if (state.activeTab === 'scheduler') {
                     const sk = getScheduleMonthKey(state.crcCalendarDate);
                     if ((isAdminUser() || getEffectivePermissionLevel() === 'Manager') && state.finalizedMonths[sk] === undefined) ensureFinalizedSnapshotForCurrentMonth();
-                    _lastRenderedTab = state.activeTab;
-                    mainAppContent.innerHTML = getSchedulerHTML();
-                    mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
-                    // Render lightweight UI synchronously, then defer heavy calendar/list work to next paint.
-                    renderSupervisorFilters();
-                    renderSidebarTabs();
-                    window.requestAnimationFrame(() => {
+                    const calendarEl = document.getElementById('crc-calendar-container');
+                    const shellReady = _lastRenderedTab === 'scheduler' && calendarEl && calendarEl.innerHTML.trim().length > 80;
+                    if (!shellReady) {
+                        _lastRenderedTab = state.activeTab;
+                        mainAppContent.innerHTML = getSchedulerHTML();
+                        mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
+                        renderSupervisorFilters();
+                        renderSidebarTabs();
+                    } else {
+                        _lastRenderedTab = state.activeTab;
+                    }
+                    const paintScheduler = () => {
                         try {
                             renderCRCCalendar();
                             if (typeof renderCRCLists === 'function' && (
@@ -7693,28 +7844,34 @@
                             }
                             renderUtilization();
                             if (typeof lucide !== 'undefined') lucide.createIcons();
-                            afterNextPaint(() => markInitialTabContentReady());
+                            if (pendingInitialTabPaint) afterNextPaint(() => markInitialTabContentReady());
                             if (typeof initializeSchedulerMap === 'function') setTimeout(() => initializeSchedulerMap(), 200);
                             if (typeof initializeDeploymentMap === 'function') setTimeout(() => initializeDeploymentMap(), 300);
                         } catch (e) {
                             console.error('Scheduler deferred render failed:', e);
-                            markInitialTabContentReady();
+                            if (pendingInitialTabPaint) markInitialTabContentReady();
                             try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch (_) {}
                         }
-                    });
+                    };
+                    window.requestAnimationFrame(paintScheduler);
                 } else if (state.activeTab === 'planning-grid' && effectiveIsCrcView()) {
-                    // CRC read-only Planning Grid (or view-as-CRC): same calendar UI, no sidebar; view-only
                     const sk = getScheduleMonthKey(state.crcCalendarDate);
-                    _lastRenderedTab = state.activeTab;
-                    mainAppContent.innerHTML = getSchedulerHTML();
-                    mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
+                    const calendarEl = document.getElementById('crc-calendar-container');
+                    const shellReady = _lastRenderedTab === 'planning-grid' && calendarEl && calendarEl.innerHTML.trim().length > 80;
+                    if (!shellReady) {
+                        _lastRenderedTab = state.activeTab;
+                        mainAppContent.innerHTML = getSchedulerHTML();
+                        mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
+                    } else {
+                        _lastRenderedTab = state.activeTab;
+                    }
                     window.requestAnimationFrame(() => {
                         try {
                             renderCRCCalendar();
-                            afterNextPaint(() => markInitialTabContentReady());
+                            if (pendingInitialTabPaint) afterNextPaint(() => markInitialTabContentReady());
                         } catch (e) {
                             console.error('Planning grid calendar render failed:', e);
-                            markInitialTabContentReady();
+                            if (pendingInitialTabPaint) markInitialTabContentReady();
                         }
                     });
                     setTimeout(() => {
@@ -7791,6 +7948,7 @@
                             }, 200);
                         }
                         renderDashboardCharts();
+                        if (pendingInitialTabPaint) afterNextPaint(() => markInitialTabContentReady());
                     }
                     mainAppContent.className = 'w-full';
                 } else if (state.activeTab === 'crcPreview') {
@@ -7915,10 +8073,14 @@
                     mainAppContent.className = 'w-full';
                     renderUnfilledShiftsContent();
                 }
+                if (pendingInitialTabPaint && !tabNeedsSchedulePaintBeforeReveal()) {
+                    afterNextPaint(() => markInitialTabContentReady());
+                }
                 } catch (err) {
                     console.error('Error rendering tab content:', err);
                     mainAppContent.innerHTML = '<div class="p-6 text-center"><p class="text-red-600 dark:text-red-400 font-medium">Something went wrong loading this view.</p><p class="text-sm text-gray-500 dark:text-gray-400 mt-2">Check the console for details.</p><button type="button" data-action="retry-tab-content" class="mt-4 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm">Try again</button></div>';
                     mainAppContent.className = 'w-full';
+                    if (pendingInitialTabPaint) markInitialTabContentReady();
                 }
             };
 
@@ -52045,7 +52207,12 @@
                 const job = (async () => {
                     const changed = await syncApprovedTimeOffRequests(timeOffRequests, { silent: true });
                     if (changed) {
-                        setState({ crc_events: state.crc_events.slice() });
+                        setState({ crc_events: state.crc_events.slice() }, { skipRender: true });
+                        if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') {
+                            if (typeof renderCRCCalendar === 'function') renderCRCCalendar();
+                        } else {
+                            setState({ crc_events: state.crc_events.slice() });
+                        }
                     }
                     return changed;
                 })();
@@ -52062,19 +52229,24 @@
                 if (deferredPtoSyncScheduled) return;
                 deferredPtoSyncScheduled = true;
                 const run = () => {
+                    if (!initialAppRevealed) {
+                        setTimeout(run, 400);
+                        return;
+                    }
                     deferredPtoSyncScheduled = false;
                     runTimeOffEventSync(timeOffRequests);
                 };
                 if (typeof requestIdleCallback === 'function') {
-                    requestIdleCallback(run, { timeout: 6000 });
+                    requestIdleCallback(run, { timeout: 12000 });
                 } else {
-                    setTimeout(run, 3000);
+                    setTimeout(run, 8000);
                 }
             };
             
             const performInitialLoad = async () => {
                 // Don't override the rotating phrases - let them show
                 debugLog('CHAOS: performInitialLoad started');
+                if (state.isAuthenticated) setAppChromeVisible(false);
                 
                 try {
                     debugLog('CHAOS: Fetching data from Azure API...');
@@ -52265,11 +52437,11 @@
                     setupRealtimeListeners();
                     scheduleDeferredPtoSync(timeOffRequests);
                     setTimeout(() => {
-                        if (pendingInitialTabPaint) {
-                            debugWarn('CHAOS: Initial tab paint timeout — revealing app anyway');
-                            markInitialTabContentReady();
+                        if (pendingInitialTabPaint && !initialAppRevealed) {
+                            debugWarn('CHAOS: Initial load safety timeout — revealing app');
+                            forceRevealAppFromOverlay();
                         }
-                    }, 12000);
+                    }, INITIAL_PAINT_TIMEOUT_MS + MIN_INITIAL_LOADING_MS);
                     
                     debugLog('CHAOS: performInitialLoad completed successfully');
                     
@@ -52386,12 +52558,16 @@
 							setState({ activeTab: 'scheduler' });
 						}
 						
+						setAppChromeVisible(false);
 						renderNav();
 						performInitialLoad();
 					} else {
 						// No valid session - show login page
 						debugLog('CHAOS: No valid session found');
 						state.authReady = true;
+						pendingInitialTabPaint = false;
+						initialAppRevealed = true;
+						setAppChromeVisible(true);
 						// Hide loading overlay to show login page
 						if (loadingOverlay) {
 							loadingOverlay.style.display = 'none';
