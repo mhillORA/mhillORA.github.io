@@ -1041,6 +1041,51 @@
             const loadingMessage = document.getElementById('loading-message');
             const loadingError = document.getElementById('loading-error');
             let overlayHidden = false;
+            /** When true, keep loading overlay until the primary tab calendar/view has painted (prevents empty-shell flash). */
+            let pendingInitialTabPaint = false;
+
+            const tabNeedsPaintBeforeInitialReveal = () => {
+                const tab = state.activeTab;
+                if (tab === 'scheduler') return true;
+                if (tab === 'planning-grid' && typeof effectiveIsCrcView === 'function' && effectiveIsCrcView()) return true;
+                if (tab === 'dashboard' && state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) return true;
+                return false;
+            };
+
+            const afterNextPaint = (fn) => {
+                requestAnimationFrame(() => requestAnimationFrame(fn));
+            };
+
+            const forceRevealAppFromOverlay = () => {
+                pendingInitialTabPaint = false;
+                if (loadingOverlay) {
+                    loadingOverlay.classList.add('hidden');
+                    loadingOverlay.style.display = 'none';
+                    loadingOverlay.style.pointerEvents = 'none';
+                }
+                if (!overlayHidden) {
+                    overlayHidden = true;
+                    stopLoadingPhraseRotation();
+                }
+            };
+
+            const hideLoadingOverlayIfReady = () => {
+                if (!state.authReady || !state.initialLoadComplete) return;
+                if (!pendingInitialTabPaint) {
+                    if (!overlayHidden) {
+                        debugLog('CHAOS: Hiding loading overlay...');
+                    }
+                    forceRevealAppFromOverlay();
+                }
+                window.requestAnimationFrame(() => render());
+            };
+
+            const markInitialTabContentReady = () => {
+                if (!pendingInitialTabPaint) return;
+                debugLog('CHAOS: Initial tab content painted, revealing app');
+                pendingInitialTabPaint = false;
+                hideLoadingOverlayIfReady();
+            };
 
             // --- LOADING PHRASE ROTATION ---
             const loadingPhrases = [
@@ -5616,6 +5661,7 @@
 
             // --- CORE FUNCTIONS ---
             const setState = (newState, options = {}) => {
+                const wasInitialLoadComplete = !!state.initialLoadComplete;
                 // Preserve changeLog if it exists and isn't being explicitly updated
                 const existingChangeLog = state.changeLog;
                 state = { ...state, ...newState };
@@ -5721,36 +5767,18 @@
                 }
                 debugLog('CHAOS: setState called. authReady=', state.authReady, 'initialLoadComplete=', state.initialLoadComplete);
                 if (state.authReady && state.initialLoadComplete) {
-                    // Always force-hide the loading overlay once we're ready.
-                    // This must be idempotent because other code paths can accidentally re-show the overlay,
-                    // which would block all clicks (dashboard filters, tabs, etc.).
-                    if (loadingOverlay) {
-                        loadingOverlay.classList.add('hidden');
-                        loadingOverlay.style.display = 'none';
-                        loadingOverlay.style.pointerEvents = 'none';
+                    // On first load completion only: wait for calendar/view paint before removing overlay.
+                    if (!wasInitialLoadComplete && state.initialLoadComplete && tabNeedsPaintBeforeInitialReveal()) {
+                        pendingInitialTabPaint = true;
                     }
-                    
-                    // Only stop the phrase “rotation” once.
-                    if (!overlayHidden) {
-                        overlayHidden = true;
-                        debugLog('CHAOS: Both flags true, hiding loading overlay and rendering...');
-                        window.requestAnimationFrame(() => {
-                            render();
-                            stopLoadingPhraseRotation();
-                            debugLog('CHAOS: Loading overlay hidden, app should be visible now');
-                        });
-                    } else {
-                        window.requestAnimationFrame(() => {
-                            render();
-                        });
-                    }
+                    hideLoadingOverlayIfReady();
                 } else {
                     debugLog('CHAOS: Not ready to render yet');
                 }
             };
             
             // Helper function to safely add an event to state without duplicates
-            const addEventToState = (newEvent) => {
+            const addEventToState = (newEvent, options = {}) => {
     if (!newEvent) return;
     if (newEvent.id && state.crc_events.some(e => e.id === newEvent.id)) {
         debugWarn('CHAOS: Prevented adding duplicate event:', newEvent.id);
@@ -5774,7 +5802,7 @@
     }
     state.crc_events.push(newEvent);
     // Defer so we don't trigger setState in the middle of add flow (can cause duplicate renders/state issues)
-    if (typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
+    if (!options.silent && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
         const mk = getScheduleMonthKeyFromEvent(newEvent);
         if (mk) setTimeout(() => markScheduleModifiedForMonth(mk), 0);
     }
@@ -7665,11 +7693,12 @@
                             }
                             renderUtilization();
                             if (typeof lucide !== 'undefined') lucide.createIcons();
+                            afterNextPaint(() => markInitialTabContentReady());
                             if (typeof initializeSchedulerMap === 'function') setTimeout(() => initializeSchedulerMap(), 200);
                             if (typeof initializeDeploymentMap === 'function') setTimeout(() => initializeDeploymentMap(), 300);
                         } catch (e) {
                             console.error('Scheduler deferred render failed:', e);
-                            // Fallback: at least try icons so UI isn't blank
+                            markInitialTabContentReady();
                             try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch (_) {}
                         }
                     });
@@ -7679,7 +7708,15 @@
                     _lastRenderedTab = state.activeTab;
                     mainAppContent.innerHTML = getSchedulerHTML();
                     mainAppContent.className = 'flex flex-col lg:flex-row gap-8';
-                    renderCRCCalendar();
+                    window.requestAnimationFrame(() => {
+                        try {
+                            renderCRCCalendar();
+                            afterNextPaint(() => markInitialTabContentReady());
+                        } catch (e) {
+                            console.error('Planning grid calendar render failed:', e);
+                            markInitialTabContentReady();
+                        }
+                    });
                     setTimeout(() => {
                         lucide.createIcons();
                         // Hide all "add event" buttons and make empty cells non-creatable; edit bars show "View" only
@@ -7731,9 +7768,15 @@
                     // Show CRC Dashboard only for actual CRC users on this tab; managers/supervisors always get manager dashboard
                     if (state.currentUser && getEffectivePermissionLevel() === 'CRC' && !isAdminUser()) {
                         mainAppContent.innerHTML = getCRCDashboardHTML();
-                        setTimeout(() => {
-                            renderCRCDashboardCalendar();
-                        }, 100);
+                        window.requestAnimationFrame(() => {
+                            try {
+                                renderCRCDashboardCalendar();
+                                afterNextPaint(() => markInitialTabContentReady());
+                            } catch (e) {
+                                console.error('CRC dashboard calendar render failed:', e);
+                                markInitialTabContentReady();
+                            }
+                        });
                     } else {
                         mainAppContent.innerHTML = getDashboardHTML();
                         // Initialize maps when dashboard is shown
@@ -13015,6 +13058,9 @@
                                                 <option value="Drivers">Drivers</option>
                                                 <option value="Reading Center">Reading Center</option>
                                                 <option value="CRC">CRC</option>
+                                                <option value="VNC">VNC</option>
+                                                <option value="BCVA">BCVA</option>
+                                                <option value="Patient Recruiting">Patient Recruiting</option>
                                             </select>
                                             <input type="text" name="crcLocation" placeholder="Home Location (e.g., Memphis, TN)" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white">
                                             <input type="text" name="crcRegion" placeholder="Region (e.g., East, West)" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 dark:text-white">
@@ -13041,6 +13087,9 @@
                                                 <option value="crc">CRC</option>
                                                 <option value="drivers">Drivers</option>
                                                 <option value="reading center">Reading Center</option>
+                                                <option value="vnc">VNC</option>
+                                                <option value="bcva">BCVA</option>
+                                                <option value="patient recruiting">Patient Recruiting</option>
                                                 <option value="other">Other</option>
                                             </select>
                                         </div>
@@ -14359,7 +14408,6 @@
                     if (_finalizedSnapshotFetchMonthKey === monthKey) return; // already loading this month
                     if (state.finalizedMonths && state.finalizedMonths[monthKey] !== undefined) return; // already have result
                     _finalizedSnapshotFetchMonthKey = monthKey;
-                    setState({ crc_events_display: undefined });
                     try {
                         const recordId = getFinalizationRecordId(monthKey);
                         const record = await apiService.getSchedule(recordId);
@@ -14371,10 +14419,10 @@
                             finalizedMonths: { ...state.finalizedMonths, [monthKey]: finalized },
                             finalizedAtByMonth: snapshotAt ? { ...state.finalizedAtByMonth, [monthKey]: snapshotAt } : state.finalizedAtByMonth,
                             finalizedByByMonth: finalizedBy ? { ...state.finalizedByByMonth, [monthKey]: finalizedBy } : state.finalizedByByMonth
-                        });
+                        }, { skipRender: true });
                     } catch (e) {
                         if (getScheduleMonthKey(state.crcCalendarDate) === monthKey) {
-                            setState({ finalizedMonths: { ...state.finalizedMonths, [monthKey]: false } });
+                            setState({ finalizedMonths: { ...state.finalizedMonths, [monthKey]: false } }, { skipRender: true });
                         }
                     } finally {
                         _finalizedSnapshotFetchMonthKey = null;
@@ -14383,7 +14431,7 @@
                 }
                 const finalized = await loadMonthFinalization(monthKey);
                 if (!finalized) {
-                    setState({ crc_events_display: undefined });
+                    setState({ crc_events_display: undefined }, { skipRender: true });
                     return;
                 }
                 try {
@@ -20983,6 +21031,9 @@
                     if (d === 'crc') return 'crc';
                     if (d === 'drivers') return 'drivers';
                     if (d === 'reading center') return 'reading center';
+                    if (d === 'vnc') return 'vnc';
+                    if (d === 'bcva') return 'bcva';
+                    if (d === 'patient recruiting') return 'patient recruiting';
                     return 'other';
                 };
 
@@ -26045,6 +26096,9 @@
                                 <option value="Drivers" ${String(crc.department || '').toLowerCase() === 'drivers' ? 'selected' : ''}>Drivers</option>
                                 <option value="Reading Center" ${String(crc.department || '').toLowerCase() === 'reading center' ? 'selected' : ''}>Reading Center</option>
                                 <option value="CRC" ${String(crc.department || '').toLowerCase() === 'crc' ? 'selected' : ''}>CRC</option>
+                                <option value="VNC" ${String(crc.department || '').toLowerCase() === 'vnc' ? 'selected' : ''}>VNC</option>
+                                <option value="BCVA" ${String(crc.department || '').toLowerCase() === 'bcva' ? 'selected' : ''}>BCVA</option>
+                                <option value="Patient Recruiting" ${String(crc.department || '').toLowerCase() === 'patient recruiting' ? 'selected' : ''}>Patient Recruiting</option>
                             </select>
                         </div>
                         <div>
@@ -48129,9 +48183,10 @@
                         // Refresh time off requests and sync approved events cleanup
                         try {
                             const updated = await apiService.getTimeOffRequests();
-                            setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
-                            if (typeof syncApprovedTimeOffRequests === 'function') {
-                                syncApprovedTimeOffRequests(Array.isArray(updated) ? updated : []);
+                            const refreshed = Array.isArray(updated) ? updated : [];
+                            setState({ timeOffRequests: refreshed }, { skipRender: true });
+                            if (typeof runTimeOffEventSync === 'function') {
+                                await runTimeOffEventSync(refreshed);
                             }
                         } catch (refreshErr) {
                             console.warn('Failed to refresh time off requests after bulk delete:', refreshErr);
@@ -48212,9 +48267,10 @@
 
                         try {
                             const updated = await apiService.getTimeOffRequests();
-                            setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
-                            if (typeof syncApprovedTimeOffRequests === 'function') {
-                                syncApprovedTimeOffRequests(Array.isArray(updated) ? updated : []);
+                            const refreshed = Array.isArray(updated) ? updated : [];
+                            setState({ timeOffRequests: refreshed }, { skipRender: true });
+                            if (typeof runTimeOffEventSync === 'function') {
+                                await runTimeOffEventSync(refreshed);
                             }
                         } catch (refreshErr) {
                             console.warn('Failed to refresh time off requests after dedupe:', refreshErr);
@@ -48310,9 +48366,10 @@
 
                         try {
                             const updated = await apiService.getTimeOffRequests();
-                            setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
-                            if (typeof syncApprovedTimeOffRequests === 'function') {
-                                syncApprovedTimeOffRequests(Array.isArray(updated) ? updated : []);
+                            const refreshed = Array.isArray(updated) ? updated : [];
+                            setState({ timeOffRequests: refreshed }, { skipRender: true });
+                            if (typeof runTimeOffEventSync === 'function') {
+                                await runTimeOffEventSync(refreshed);
                             }
                         } catch (refreshErr) {
                             console.warn('Failed to refresh time off requests after fix all:', refreshErr);
@@ -51881,39 +51938,49 @@
                 scheduleHourlyNavanImport();
             };
             
+            const runPromisesInChunks = async (items, worker, chunkSize = 8) => {
+                let results = [];
+                for (let i = 0; i < items.length; i += chunkSize) {
+                    const chunk = items.slice(i, i + chunkSize);
+                    const chunkResults = await Promise.all(chunk.map(worker));
+                    results = results.concat(chunkResults);
+                }
+                return results;
+            };
+
             // Sync approved time off requests with unavailability events
-            const syncApprovedTimeOffRequests = async (timeOffRequests) => {
+            const syncApprovedTimeOffRequests = async (timeOffRequests, options = {}) => {
+                const { silent = false } = options;
+                let eventsChanged = false;
                 try {
-                    const approvedRequests = timeOffRequests.filter(req => req.status === 'approved');
+                    const approvedRequests = (timeOffRequests || []).filter(req => req.status === 'approved');
                     const approvedRequestIds = new Set(approvedRequests.map(req => req.id));
                     
-                    // All time-off related event types
                     const timeOffTypes = new Set(['Paid Time Off', 'PTO', 'Time Off', 'Unavailable', 'Vacation', 'Sick Time', 'Sick', 'Holiday', 'Bereavement', 'Jury Duty', 'Per Diem', 'Capped - FTE only']);
                     
-                    // First, remove events for requests that are no longer approved (rejected, deleted, or pending)
                     const eventsToRemove = state.crc_events.filter(e => 
                         e.timeOffRequestId && 
                         !approvedRequestIds.has(e.timeOffRequestId) &&
                         timeOffTypes.has(e.type)
                     );
                     
-                    for (const eventToRemove of eventsToRemove) {
+                    await runPromisesInChunks(eventsToRemove, async (eventToRemove) => {
                         try {
                             await apiService.deleteEvent(eventToRemove.id);
                             state.crc_events = state.crc_events.filter(e => e.id !== eventToRemove.id);
-                            console.log(`Removed event for non-approved time off request: ${eventToRemove.timeOffRequestId}`);
+                            eventsChanged = true;
+                            debugLog(`Removed event for non-approved time off request: ${eventToRemove.timeOffRequestId}`);
                         } catch (deleteError) {
                             console.error('Error deleting event for non-approved request:', deleteError);
                         }
-                    }
+                    });
                     
-                    // Then, create events for approved requests that don't have events yet
+                    const linkUpdates = [];
+                    const createPayloads = [];
                     for (const request of approvedRequests) {
                         const date = request.date || request.startDate;
                         if (!date || !request.crcId) continue;
                         
-                        // DUPLICATE PREVENTION: Check if ANY time-off event already exists for this CRC+date
-                        // This catches both events with matching timeOffRequestId AND legacy events without it
                         const existingEvent = state.crc_events.find(e => 
                             e.crcId === request.crcId && 
                             e.date === date && 
@@ -51921,21 +51988,13 @@
                         );
                         
                         if (existingEvent) {
-                            // Event already exists - just update it with the timeOffRequestId if missing
                             if (!existingEvent.timeOffRequestId) {
-                                try {
-                                    await apiService.updateEvent(existingEvent.id, { timeOffRequestId: request.id });
-                                    existingEvent.timeOffRequestId = request.id;
-                                    console.log(`Linked existing event to time off request: ${request.id}`);
-                                } catch (updateError) {
-                                    console.warn('Could not link existing event to request:', updateError);
-                                }
+                                linkUpdates.push({ existingEvent, requestId: request.id });
                             }
-                            continue; // Skip creating - already exists
+                            continue;
                         }
                         
-                        // No existing event found - create new one
-                        const eventData = {
+                        createPayloads.push({
                             crcId: request.crcId,
                             date: date,
                             type: request.type === 'Paid Time Off' ? 'Paid Time Off' : 'Unavailable',
@@ -51944,19 +52003,72 @@
                             hours: request.hours || (request.period === 'Full Day' ? 8 : 4),
                             notes: request.notes || `Approved time off: ${request.type}`,
                             timeOffRequestId: request.id
-                        };
-                        
+                        });
+                    }
+
+                    await runPromisesInChunks(linkUpdates, async ({ existingEvent, requestId }) => {
+                        try {
+                            await apiService.updateEvent(existingEvent.id, { timeOffRequestId: requestId });
+                            existingEvent.timeOffRequestId = requestId;
+                            eventsChanged = true;
+                            debugLog(`Linked existing event to time off request: ${requestId}`);
+                        } catch (updateError) {
+                            console.warn('Could not link existing event to request:', updateError);
+                        }
+                    });
+
+                    await runPromisesInChunks(createPayloads, async (eventData) => {
                         try {
                             const createdEvent = await apiService.createEvent(eventData);
                             const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
-                            addEventToState(newEvent);
-                            debugLog(`Created event for approved time off request: ${request.id}`);
+                            addEventToState(newEvent, { silent });
+                            eventsChanged = true;
+                            debugLog(`Created event for approved time off request: ${eventData.timeOffRequestId}`);
                         } catch (eventError) {
                             console.error('Error syncing time off request to event:', eventError);
                         }
-                    }
+                    });
                 } catch (error) {
                     console.error('Error syncing approved time off requests:', error);
+                }
+                return eventsChanged;
+            };
+
+            let deferredPtoSyncScheduled = false;
+            let ptoSyncInFlight = null;
+
+            const runTimeOffEventSync = async (timeOffRequests, options = {}) => {
+                if (!state.initialLoadComplete || !state.isAuthenticated) return false;
+                if (ptoSyncInFlight) {
+                    return ptoSyncInFlight;
+                }
+                const job = (async () => {
+                    const changed = await syncApprovedTimeOffRequests(timeOffRequests, { silent: true });
+                    if (changed) {
+                        setState({ crc_events: state.crc_events.slice() });
+                    }
+                    return changed;
+                })();
+                ptoSyncInFlight = job;
+                try {
+                    return await job;
+                } finally {
+                    ptoSyncInFlight = null;
+                }
+            };
+
+            const scheduleDeferredPtoSync = (timeOffRequests) => {
+                if (!Array.isArray(timeOffRequests) || timeOffRequests.length === 0) return;
+                if (deferredPtoSyncScheduled) return;
+                deferredPtoSyncScheduled = true;
+                const run = () => {
+                    deferredPtoSyncScheduled = false;
+                    runTimeOffEventSync(timeOffRequests);
+                };
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(run, { timeout: 6000 });
+                } else {
+                    setTimeout(run, 3000);
                 }
             };
             
@@ -52013,10 +52125,6 @@
                     debugLog('CHAOS: Loaded', travel.length, 'travel records');
                     debugLog('CHAOS: Loaded', announcements.length, 'announcements');
 
-                    if (timeOffRequests && timeOffRequests.length > 0) {
-                        syncApprovedTimeOffRequests(timeOffRequests);
-                    }
-                    
                     debugLog('CHAOS: Data fetched successfully from Azure API');
                     debugLog('CHAOS: Loaded', crcs.length, 'CRCs');
                     debugLog('CHAOS: Loaded', sites.length, 'sites');
@@ -52155,14 +52263,13 @@
                         console.warn('Failed to load Navan import data from localStorage:', e);
                     }
                     setupRealtimeListeners();
-                    
-                    // Sync approved time off requests with unavailability events after state is fully set
-                    if (timeOffRequests && timeOffRequests.length > 0) {
-                        // Wait a bit for state to be fully set
-                        setTimeout(() => {
-                            syncApprovedTimeOffRequests(timeOffRequests);
-                        }, 200);
-                    }
+                    scheduleDeferredPtoSync(timeOffRequests);
+                    setTimeout(() => {
+                        if (pendingInitialTabPaint) {
+                            debugWarn('CHAOS: Initial tab paint timeout — revealing app anyway');
+                            markInitialTabContentReady();
+                        }
+                    }, 12000);
                     
                     debugLog('CHAOS: performInitialLoad completed successfully');
                     
@@ -52175,6 +52282,7 @@
 
                 } catch (error) {
                     console.error("CHAOS: Error during initial data load:", error);
+                    pendingInitialTabPaint = false;
                     loadingMessage.textContent = 'Data Load Error';
                     loadingError.innerHTML = `<strong>Error:</strong> Could not fetch initial data from the Azure API. Please check your connection and try again.<br><small>${error.message}</small>`;
                 }

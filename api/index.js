@@ -1540,9 +1540,9 @@ const validateCrcsSchema = (data) => {
             errors.push('department must be a string');
         } else {
             const dep = data.department.trim().toLowerCase();
-            const allowed = new Set(['drivers', 'reading center', 'crc']);
+            const allowed = new Set(['drivers', 'reading center', 'crc', 'vnc', 'bcva', 'patient recruiting']);
             if (dep && !allowed.has(dep)) {
-                errors.push('department must be one of: Drivers, Reading Center, CRC');
+                errors.push('department must be one of: Drivers, Reading Center, CRC, VNC, BCVA, Patient Recruiting');
             }
         }
     }
