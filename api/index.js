@@ -135,6 +135,38 @@ const validateStudiesSchema = (data) => {
 
     const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
 
+    const isTimeString = (v) => typeof v === 'string' && /^\d{2}:\d{2}$/.test(v);
+    const normalizeVisitProfiles = (visitProfiles) => {
+        if (visitProfiles === undefined || visitProfiles === null) return;
+        if (!Array.isArray(visitProfiles)) {
+            errors.push('visitProfiles must be an array');
+            return;
+        }
+        visitProfiles.forEach((p, idx) => {
+            if (!p || typeof p !== 'object' || Array.isArray(p)) {
+                errors.push(`visitProfiles[${idx}] must be an object`);
+                return;
+            }
+            if (!p.visitName || typeof p.visitName !== 'string') {
+                errors.push(`visitProfiles[${idx}].visitName is required and must be a string`);
+            }
+
+            if (p.defaultStartTime === undefined) p.defaultStartTime = '08:00';
+            if (p.defaultEndTime === undefined) p.defaultEndTime = '16:00';
+            if (p.patientsPerHour === undefined) p.patientsPerHour = 2;
+
+            if (!isTimeString(p.defaultStartTime)) {
+                errors.push(`visitProfiles[${idx}].defaultStartTime must be in HH:MM format`);
+            }
+            if (!isTimeString(p.defaultEndTime)) {
+                errors.push(`visitProfiles[${idx}].defaultEndTime must be in HH:MM format`);
+            }
+            if (typeof p.patientsPerHour !== 'number' || !Number.isFinite(p.patientsPerHour) || p.patientsPerHour <= 0) {
+                errors.push(`visitProfiles[${idx}].patientsPerHour must be a positive number`);
+            }
+        });
+    };
+
     if (isChaosFormat) {
         if (!data.name || typeof data.name !== 'string') {
             errors.push('name is required and must be a string');
@@ -175,6 +207,8 @@ const validateStudiesSchema = (data) => {
         if (data.lastUpdated && typeof data.lastUpdated !== 'string') {
             errors.push('lastUpdated must be a string');
         }
+
+        normalizeVisitProfiles(data.visitProfiles);
     } else {
         if (!data.title || typeof data.title !== 'string') {
             errors.push('title is required and must be a string');
@@ -223,6 +257,8 @@ const validateStudiesSchema = (data) => {
         if (data.lplv && typeof data.lplv !== 'string') {
             errors.push('lplv must be a string');
         }
+
+        normalizeVisitProfiles(data.visitProfiles);
     }
     
     if (errors.length > 0) {
@@ -233,6 +269,35 @@ const validateStudiesSchema = (data) => {
 
 const validateSitesSchema = (data) => {
     const errors = [];
+
+    const isTimeString = (v) => typeof v === 'string' && /^\d{2}:\d{2}$/.test(v);
+    const normalizeSchedulingOverrides = (overrides) => {
+        if (overrides === undefined || overrides === null) return;
+        if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+            errors.push('schedulingOverrides must be an object');
+            return;
+        }
+        Object.keys(overrides).forEach((visitName) => {
+            const o = overrides[visitName];
+            if (!o || typeof o !== 'object' || Array.isArray(o)) {
+                errors.push(`schedulingOverrides.${visitName} must be an object`);
+                return;
+            }
+
+            if (o.startTime === undefined && o.defaultStartTime !== undefined) o.startTime = o.defaultStartTime;
+            if (o.endTime === undefined && o.defaultEndTime !== undefined) o.endTime = o.defaultEndTime;
+
+            if (o.startTime !== undefined && !isTimeString(o.startTime)) {
+                errors.push(`schedulingOverrides.${visitName}.startTime must be in HH:MM format`);
+            }
+            if (o.endTime !== undefined && !isTimeString(o.endTime)) {
+                errors.push(`schedulingOverrides.${visitName}.endTime must be in HH:MM format`);
+            }
+            if (o.patientsPerHour !== undefined && (typeof o.patientsPerHour !== 'number' || !Number.isFinite(o.patientsPerHour) || o.patientsPerHour <= 0)) {
+                errors.push(`schedulingOverrides.${visitName}.patientsPerHour must be a positive number`);
+            }
+        });
+    };
     
     if (!data.name || typeof data.name !== 'string') {
         errors.push('name is required and must be a string');
@@ -297,6 +362,8 @@ const validateSitesSchema = (data) => {
     if (data.longitude !== undefined && (typeof data.longitude !== 'number' || data.longitude < -180 || data.longitude > 180)) {
         errors.push('longitude must be a number between -180 and 180');
     }
+
+    normalizeSchedulingOverrides(data.schedulingOverrides);
     
     if (errors.length > 0) {
         throw new Error(`VALIDATION_ERROR: Sites validation failed: ${errors.join(', ')}`);
@@ -394,6 +461,14 @@ const validatePatientsSchema = (data) => {
     
     if (data.studyHistory && !Array.isArray(data.studyHistory)) {
         errors.push('studyHistory must be an array');
+    }
+
+    if (data.inclusionCriteriaMet === undefined || typeof data.inclusionCriteriaMet !== 'boolean') {
+        errors.push('inclusionCriteriaMet is required and must be a boolean');
+    }
+    
+    if (data.exclusionCriteriaMet === undefined || typeof data.exclusionCriteriaMet !== 'boolean') {
+        errors.push('exclusionCriteriaMet is required and must be a boolean');
     }
     
     if (errors.length > 0) {
