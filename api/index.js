@@ -908,6 +908,7 @@ async function crudHandler(context, request, containerName) {
                             }
                             break;
                         case 'schedules':
+                        case 'patient-schedules':
                             validateSchedulesSchema(body);
                             // Validate site-study relationship
                             await validateSiteStudyRelationship(body.siteId, body.studyId);
@@ -1018,6 +1019,7 @@ async function crudHandler(context, request, containerName) {
                             }
                             break;
                         case 'schedules':
+                        case 'patient-schedules':
                             validateSchedulesSchema(requestBody);
                             // Validate site-study relationship
                             await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
@@ -1201,7 +1203,15 @@ app.http('schedules', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'schedules/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'schedules'),
+    // Back-compat route: keep /schedules, store in patient-schedules
+    handler: (request, context) => crudHandler(context, request, 'patient-schedules'),
+});
+
+app.http('patientSchedules', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patient-schedules/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'patient-schedules'),
 });
 
 app.http('surveys', {
