@@ -246,6 +246,13 @@ const resolveTriggerMessageContent = (rule, template, triggerType, triggerContex
         const loc = triggerContext.siteLocation ? ` (${triggerContext.siteLocation})` : '';
         plainText = `Hi ${name},\n\nYou have been removed from a shift on ${d} at ${site}${loc}.\n\nPlease contact your manager if you have questions.`;
     }
+    if (isEffectivelyEmptyEmailBody(plainText) && triggerType === 'shift_cancelled') {
+        const name = triggerContext.crcName || 'there';
+        const d = triggerContext.eventDate || 'the scheduled date';
+        const site = triggerContext.siteName || triggerContext.siteId || 'the site';
+        const loc = triggerContext.siteLocation ? ` (${triggerContext.siteLocation})` : '';
+        plainText = `Hi ${name},\n\nA shift you were assigned to on ${d} at ${site}${loc} has been cancelled. It no longer counts toward your scheduled hours.\n\nPlease contact your manager if you have questions.`;
+    }
     if (isEffectivelyEmptyEmailBody(plainText)) {
         plainText = renderTemplateString(defaults.body, triggerContext).trim() || defaults.body;
     }
@@ -4252,10 +4259,15 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
-                    // Triggered emails: shift edit / removed from shift
+                    // Triggered emails: shift edit / removed from shift / cancelled
                     if (containerName === 'events' && result && result.type === 'Site Assignment') {
-                        try { await processEmailTriggers(context, { triggerType: 'shift_edit', event: result }); } catch (triggerErr) {
-                            context.log.warn('processEmailTriggers (shift_edit) failed:', triggerErr.message);
+                        const wasCancelledBefore = isEventCancelled(eventBeforeUpdate);
+                        const isCancelledNow = isEventCancelled(result);
+                        const justCancelled = !wasCancelledBefore && isCancelledNow;
+                        if (!justCancelled) {
+                            try { await processEmailTriggers(context, { triggerType: 'shift_edit', event: result }); } catch (triggerErr) {
+                                context.log.warn('processEmailTriggers (shift_edit) failed:', triggerErr.message);
+                            }
                         }
                         const removedIds = eventBeforeUpdate
                             ? diffRemovedCrcIdsFromEvents(eventBeforeUpdate, result)
@@ -4270,6 +4282,17 @@ async function crudHandler(context, request, containerName) {
                                 });
                             } catch (triggerErr) {
                                 context.log.warn('processEmailTriggers (removed_from_shift) failed:', triggerErr.message);
+                            }
+                        }
+                        if (justCancelled) {
+                            try {
+                                const shouldFire = await shouldFireShiftCancelledTrigger(container, result);
+                                if (shouldFire) {
+                                    context.log.info(`shift_cancelled: notifying staff for event ${result.id}`);
+                                    await processEmailTriggers(context, { triggerType: 'shift_cancelled', event: result });
+                                }
+                            } catch (triggerErr) {
+                                context.log.warn('processEmailTriggers (shift_cancelled) failed:', triggerErr.message);
                             }
                         }
                     }
@@ -4505,27 +4528,115 @@ app.http('roles', {
     handler: (request, context) => crudHandler(context, request, 'roles'),
 });
 
+const ensureTrainingTypesContainer = async () => {
+    const { database } = getCosmosClient();
+    await database.containers.createIfNotExists({
+        id: 'training-types',
+        partitionKey: { paths: ['/id'] }
+    });
+};
+
+const collectTrainingTypeNamesFromCrcs = async () => {
+    const container = getContainer('crcs');
+    const { resources: crcs } = await container.items.readAll().fetchAll();
+    const names = new Set();
+    (crcs || []).forEach(crc => {
+        (crc.trainings || []).forEach(t => {
+            if (t && typeof t.name === 'string' && t.name.trim() !== '') {
+                names.add(t.name.trim());
+            }
+        });
+    });
+    return names;
+};
+
+const mergeTrainingTypesList = (storedTypes, crcNames) => {
+    const byName = new Map();
+    (storedTypes || []).forEach(tt => {
+        if (!tt || !tt.name) return;
+        const name = String(tt.name).trim();
+        if (!name) return;
+        byName.set(name.toLowerCase(), { ...tt, id: tt.id || name, name });
+    });
+    (crcNames || []).forEach(name => {
+        const key = String(name).trim().toLowerCase();
+        if (!key || byName.has(key)) return;
+        byName.set(key, {
+            id: name,
+            name,
+            requiredObservations: 0,
+            requiredPerformances: 0,
+            linkedRoles: []
+        });
+    });
+    return Array.from(byName.values()).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+};
+
 app.http('training-types', {
-    methods: ['GET', 'OPTIONS'],
-    authLevel: 'anonymous', 
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
     route: 'training-types/{id?}',
     handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return { status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } };
+        }
         try {
-            // Build training types dynamically from CRC embedded trainings
-            const container = getContainer('crcs');
-            const { resources: crcs } = await container.items.readAll().fetchAll();
-            const names = new Set();
-            (crcs || []).forEach(crc => {
-                (crc.trainings || []).forEach(t => {
-                    if (t && typeof t.name === 'string' && t.name.trim() !== '') {
-                        names.add(t.name.trim());
-                    }
-                });
-            });
-            const result = Array.from(names).sort().map(n => ({ id: n, name: n }));
-            return { jsonBody: result };
+            await ensureTrainingTypesContainer();
+            const container = getContainer('training-types');
+            const id = request.params && request.params.id;
+
+            if (request.method === 'GET' && !id) {
+                const { resources: stored } = await container.items.readAll().fetchAll();
+                const crcNames = await collectTrainingTypeNamesFromCrcs();
+                return { jsonBody: mergeTrainingTypesList(stored, crcNames) };
+            }
+
+            if (request.method === 'GET' && id) {
+                try {
+                    const { resource } = await container.item(id, id).read();
+                    if (resource) return { jsonBody: resource };
+                } catch (_) { /* fall through */ }
+                const crcNames = await collectTrainingTypeNamesFromCrcs();
+                if (crcNames.has(id)) {
+                    return { jsonBody: { id, name: id, requiredObservations: 0, requiredPerformances: 0, linkedRoles: [] } };
+                }
+                return { status: 404, jsonBody: { error: 'Not found' } };
+            }
+
+            if (request.method === 'POST') {
+                const body = await request.json();
+                const name = String(body.name || body.trainingName || '').trim();
+                if (!name) {
+                    return { status: 400, jsonBody: { error: 'Training name is required' } };
+                }
+                const { resources: existing } = await container.items.query({
+                    query: 'SELECT * FROM c WHERE LOWER(c.name) = @name',
+                    parameters: [{ name: '@name', value: name.toLowerCase() }]
+                }).fetchAll();
+                if (existing && existing.length > 0) {
+                    return { status: 409, jsonBody: { error: 'Training type already exists' } };
+                }
+                const newItem = {
+                    id: generateId(),
+                    name,
+                    defaultDuration: parseInt(body.defaultDuration, 10) || 1,
+                    description: String(body.description || '').trim(),
+                    requiredObservations: parseInt(body.requiredObservations, 10) || 0,
+                    requiredPerformances: parseInt(body.requiredPerformances, 10) || 0,
+                    linkedRoles: Array.isArray(body.linkedRoles) ? body.linkedRoles : [],
+                    createdAt: new Date().toISOString()
+                };
+                const { resource } = await container.items.create(newItem);
+                return { status: 201, jsonBody: resource };
+            }
+
+            if (request.method === 'PUT' || request.method === 'DELETE') {
+                return crudHandler(context, request, 'training-types');
+            }
+
+            return { status: 405, jsonBody: { error: 'Method not allowed' } };
         } catch (error) {
-            return handleError(context, error, 'Build training-types from CRCs');
+            return handleError(context, error, 'training-types');
         }
     },
 });
@@ -4837,6 +4948,7 @@ app.http('templates', {
 const TRIGGER_DEFAULTS = {
     new_shift: { subject: 'New shift assigned', body: 'A new shift has been added to the schedule.' },
     shift_edit: { subject: 'Shift updated', body: 'A shift has been updated on the schedule.' },
+    shift_cancelled: { subject: 'Shift cancelled', body: 'A shift on {{eventDate}} at {{siteName}} ({{siteLocation}}) has been cancelled. Staff remain listed on the shift but it no longer counts toward scheduled hours.' },
     removed_from_shift: { subject: 'Removed from shift', body: 'You have been removed from a shift on {{eventDate}} at {{siteName}} ({{siteLocation}}).' },
     shift_created_missing_role: { subject: 'Shift created without required role', body: 'A shift was created that is missing the required role: {{missingRoleName}}. Date: {{eventDate}}, Site/Study: {{siteId}} / {{studyIds}}.' },
     finalized_schedule: { subject: 'Schedule finalized', body: 'The schedule has been finalized for the month.' },
@@ -4869,6 +4981,34 @@ const collectCrcIdsFromEvent = (ev) => {
         });
     }
     return set;
+};
+
+const isEventCancelled = (ev) => {
+    if (!ev) return false;
+    if (ev.type === 'Travel Day') {
+        return ev.cancelled === true || ev.canceled === true;
+    }
+    if (ev.type === 'Site Assignment') {
+        return ev.cancelled === true || ev.canceled === true || String(ev.status || '').toLowerCase() === 'cancelled';
+    }
+    return false;
+};
+
+/** Multi-day cancels update each day; fire the trigger once per group (earliest date row). */
+const shouldFireShiftCancelledTrigger = async (eventsContainer, result) => {
+    if (!result || !result.groupId) return true;
+    try {
+        const { resources } = await eventsContainer.items.query({
+            query: "SELECT c.id, c.date FROM c WHERE c.groupId = @groupId AND c.type = 'Site Assignment'",
+            parameters: [{ name: '@groupId', value: result.groupId }]
+        }).fetchAll();
+        const sorted = (resources || [])
+            .filter(e => e && e.date)
+            .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+        return sorted.length === 0 || sorted[0].id === result.id;
+    } catch (_) {
+        return true;
+    }
 };
 
 const getTravelDayCrcIds = (travelDay) => {
@@ -5132,6 +5272,9 @@ const buildShiftTriggerContext = (event, siteNameById, siteLocationById, getCrcD
     const crcNames = crcIds.map(getCrcDisplayName).filter(Boolean).join(', ') || '—';
     const eventDate = event.date || event.startDate || '';
     const siteId = event.siteId || '';
+    const cancelledHours = event.cancelledHours != null && event.cancelledHours !== ''
+        ? Number(event.cancelledHours)
+        : NaN;
     return {
         eventId: event.id || '',
         eventDate: eventDate ? String(eventDate).split('T')[0] : '',
@@ -5141,6 +5284,12 @@ const buildShiftTriggerContext = (event, siteNameById, siteLocationById, getCrcD
         siteName: (siteId && siteNameById.get(siteId)) || siteId || '',
         siteLocation: (siteId && siteLocationById.get(siteId)) || '',
         studyIds: Array.isArray(event.studyIds) ? event.studyIds.join(', ') : (event.studyId || ''),
+        shiftStatus: isEventCancelled(event) ? 'Cancelled' : (event.status || ''),
+        cancelledHours: Number.isFinite(cancelledHours) && cancelledHours >= 0 ? String(cancelledHours) : '',
+        cancelledAt: event.cancelledAt ? String(event.cancelledAt).split('T')[0] : '',
+        visitNumber: event.visitNumber != null ? String(event.visitNumber) : '',
+        groupNumber: event.groupNumber != null ? String(event.groupNumber) : '',
+        period: event.period || '',
         ...extra
     };
 };
@@ -5315,7 +5464,7 @@ async function processEmailTriggers(context, payload) {
                     requestedBy: timeOffRequest.requestedBy || ''
                 };
             }
-            if ((triggerType === 'new_shift' || triggerType === 'shift_edit' || triggerType === 'removed_from_shift') && event) {
+            if ((triggerType === 'new_shift' || triggerType === 'shift_edit' || triggerType === 'removed_from_shift' || triggerType === 'shift_cancelled') && event) {
                 const perRecipientCrcId = rule._recipientCrcId || '';
                 return {
                     ...base,
