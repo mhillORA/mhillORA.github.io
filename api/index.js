@@ -197,40 +197,61 @@ const stripHtmlToPlainText = (html) => {
         .trim();
 };
 
+/** True when rendered body is empty or only HTML wrappers with no visible text. */
+const isEffectivelyEmptyEmailBody = (text) => {
+    const t = String(text || '').trim();
+    if (!t) return true;
+    const stripped = t.replace(/<[^>]+>/g, '').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+    return !stripped;
+};
+
+/** Match manual send-email template field priority so triggered sends get the same body source. */
+const resolveEmailBodyTemplateString = (rule, template, defaultBody) => {
+    const ruleBody = (rule && (rule.body || rule.plainText)) || '';
+    if (!template) {
+        return (ruleBody && String(ruleBody).trim()) ? ruleBody : defaultBody;
+    }
+    const fromTemplate = template.plainText || template.text || template.html || template.bodyHtml || template.body;
+    if (fromTemplate && String(fromTemplate).trim()) return fromTemplate;
+    if (ruleBody && String(ruleBody).trim()) return ruleBody;
+    return defaultBody;
+};
+
+const resolveEmailSubjectTemplateString = (rule, template, defaultSubject) => {
+    if (template) {
+        return template.subject || template.title || (rule && rule.subject) || defaultSubject;
+    }
+    return (rule && rule.subject) || defaultSubject;
+};
+
 /** Build subject/body for triggered emails; never return an empty body. */
 const resolveTriggerMessageContent = (rule, template, triggerType, triggerContext) => {
     const defaults = TRIGGER_DEFAULTS[triggerType] || { subject: 'Notification', body: 'You have a notification.' };
-    let subjectTpl = (rule && rule.subject) || defaults.subject;
-    let bodyTpl = (rule && (rule.body || rule.plainText)) || defaults.body;
-    let htmlTpl = null;
-
-    if (template) {
-        subjectTpl = template.subject || template.title || subjectTpl;
-        htmlTpl = template.html || template.bodyHtml || null;
-        bodyTpl = template.plainText || template.text || bodyTpl;
-        if (!bodyTpl || !String(bodyTpl).trim()) {
-            if (template.body && String(template.body).trim()) bodyTpl = template.body;
-            else if (htmlTpl) bodyTpl = stripHtmlToPlainText(htmlTpl);
-        }
-    }
+    const subjectTpl = resolveEmailSubjectTemplateString(rule, template, defaults.subject);
+    const bodyTpl = resolveEmailBodyTemplateString(rule, template, defaults.body);
 
     let subject = renderTemplateString(subjectTpl, triggerContext).trim();
     let plainText = renderTemplateString(bodyTpl, triggerContext).trim();
-    let html = htmlTpl ? renderTemplateString(htmlTpl, triggerContext).trim() : '';
 
-    if (!plainText && html) plainText = stripHtmlToPlainText(html);
-    if (!plainText) plainText = renderTemplateString(defaults.body, triggerContext).trim();
-    if (!plainText && triggerType === 'removed_from_shift') {
+    if (isEffectivelyEmptyEmailBody(plainText)) {
+        plainText = stripHtmlToPlainText(renderTemplateString(bodyTpl, triggerContext)).trim();
+    }
+    if (isEffectivelyEmptyEmailBody(plainText)) {
+        plainText = renderTemplateString(defaults.body, triggerContext).trim();
+    }
+    if (isEffectivelyEmptyEmailBody(plainText) && triggerType === 'removed_from_shift') {
         const name = triggerContext.crcName || 'there';
         const d = triggerContext.eventDate || 'the scheduled date';
         const site = triggerContext.siteName || triggerContext.siteId || 'the site';
         const loc = triggerContext.siteLocation ? ` (${triggerContext.siteLocation})` : '';
         plainText = `Hi ${name},\n\nYou have been removed from a shift on ${d} at ${site}${loc}.\n\nPlease contact your manager if you have questions.`;
     }
-    if (!plainText) plainText = renderTemplateString(defaults.body, triggerContext).trim() || defaults.body;
+    if (isEffectivelyEmptyEmailBody(plainText)) {
+        plainText = renderTemplateString(defaults.body, triggerContext).trim() || defaults.body;
+    }
     if (!subject) subject = renderTemplateString(defaults.subject, triggerContext).trim() || defaults.subject;
 
-    return { subject, plainText, html: html || undefined };
+    return { subject, plainText };
 };
 
 const eventBelongsToCrc = (event, crcId) => {
@@ -4993,6 +5014,85 @@ const loadSiteLookupsForTriggers = async (log) => {
     return { siteNameById, siteLocationById };
 };
 
+/** Full site/study/role lookups for template variables (same as manual send-email). */
+const loadEmailTemplateLookups = async (log) => {
+    const siteNameById = new Map();
+    const siteLocationById = new Map();
+    const siteDetailsById = new Map();
+    const studyNameById = new Map();
+    const studyDetailsById = new Map();
+    const roleNameById = new Map();
+    try {
+        const sitesContainer = getContainer('sites');
+        const { resources: sites } = await sitesContainer.items.readAll().fetchAll();
+        (sites || []).forEach(s => {
+            if (!s || !s.id) return;
+            const name = s.name || s.siteName || s.title || s.id;
+            siteNameById.set(s.id, name);
+            siteDetailsById.set(s.id, s);
+            const location = [s.address1, s.city, s.state, s.zipCode || s.zip, s.country].filter(Boolean).join(', ');
+            const fallbackLocation = [s.city, s.state].filter(Boolean).join(', ');
+            siteLocationById.set(s.id, location || fallbackLocation || '');
+        });
+    } catch (e) {
+        log.warn('processEmailTriggers: failed to load sites for template context:', e.message);
+    }
+    try {
+        const studiesContainer = getContainer('studies');
+        const { resources: studies } = await studiesContainer.items.readAll().fetchAll();
+        (studies || []).forEach(st => {
+            if (!st || !st.id) return;
+            const title = st.title || st.name || st.protocolNumber || st.id;
+            studyNameById.set(st.id, title);
+            studyDetailsById.set(st.id, st);
+        });
+    } catch (e) {
+        log.warn('processEmailTriggers: failed to load studies for template context:', e.message);
+    }
+    try {
+        const rolesContainer = getContainer('roles');
+        const { resources: roles } = await rolesContainer.items.readAll().fetchAll();
+        (roles || []).forEach(r => {
+            if (!r || !r.id) return;
+            roleNameById.set(r.id, r.name || r.id);
+        });
+    } catch (e) {
+        log.warn('processEmailTriggers: failed to load roles for template context:', e.message);
+    }
+    return { siteNameById, siteLocationById, siteDetailsById, studyNameById, studyDetailsById, roleNameById };
+};
+
+const resolveCrcIdFromRecipientEmail = (email, crcsById, usersByCrcId) => {
+    const key = String(email || '').trim().toLowerCase();
+    if (!key) return '';
+    for (const [crcId, crc] of crcsById.entries()) {
+        const user = usersByCrcId.get(crcId);
+        const addr = (user?.email || crc?.email || '').trim().toLowerCase();
+        if (addr && addr === key) return crcId;
+    }
+    return '';
+};
+
+const getTriggerDateRange = (triggerType, { event, timeOffRequest, scheduleMonthKey }) => {
+    if ((triggerType === 'pto_request' || triggerType === 'pto_approved') && timeOffRequest) {
+        const start = toDateOnlyString(timeOffRequest.startDate || timeOffRequest.date);
+        const end = toDateOnlyString(timeOffRequest.endDate || timeOffRequest.date || timeOffRequest.startDate);
+        if (start) return { startDate: start, endDate: end || start };
+    }
+    if (event) {
+        const d = toDateOnlyString(event.date || event.startDate);
+        if (d) return { startDate: d, endDate: d };
+    }
+    if (triggerType === 'finalized_schedule' && scheduleMonthKey && /^\d{4}-\d{2}$/.test(String(scheduleMonthKey))) {
+        const [y, m] = String(scheduleMonthKey).split('-').map(Number);
+        const start = `${scheduleMonthKey}-01`;
+        const lastDay = new Date(y, m, 0).getDate();
+        const end = `${scheduleMonthKey}-${String(lastDay).padStart(2, '0')}`;
+        return { startDate: start, endDate: end };
+    }
+    return null;
+};
+
 const buildShiftTriggerContext = (event, siteNameById, siteLocationById, getCrcDisplayName, extra = {}) => {
     const crcIds = Array.from(collectCrcIdsFromEvent(event));
     const crcNames = crcIds.map(getCrcDisplayName).filter(Boolean).join(', ') || '—';
@@ -5088,7 +5188,8 @@ async function processEmailTriggers(context, payload) {
             log.warn('processEmailTriggers: failed to load roles for missing-role context:', e.message);
         }
 
-        const { siteNameById, siteLocationById } = await loadSiteLookupsForTriggers(log);
+        const emailLookups = await loadEmailTemplateLookups(log);
+        const { siteNameById, siteLocationById } = emailLookups;
 
         const resolveToEmails = (crcIds, userIdsOrEmails) => {
             const out = [];
@@ -5100,7 +5201,13 @@ async function processEmailTriggers(context, payload) {
                     const user = usersByCrcId.get(crcId);
                     const crc = crcsById.get(crcId);
                     const email = user?.email || crc?.email;
-                    if (email) out.push({ email: email.trim(), displayName: user?.name || user?.username || crc?.name || email });
+                    if (email) {
+                        out.push({
+                            email: email.trim(),
+                            displayName: user?.name || user?.username || crc?.name || email,
+                            crcId
+                        });
+                    }
                 });
             }
             if (Array.isArray(userIdsOrEmails)) {
@@ -5108,18 +5215,29 @@ async function processEmailTriggers(context, payload) {
                     if (!id || seen.has(id)) return;
                     seen.add(id);
                     if (String(id).includes('@')) {
-                        out.push({ email: id.trim(), displayName: id });
+                        const crcId = resolveCrcIdFromRecipientEmail(id, crcsById, usersByCrcId);
+                        out.push({ email: id.trim(), displayName: id, crcId: crcId || undefined });
                         return;
                     }
                     const user = usersById.get(id);
                     if (user && user.email) {
-                        out.push({ email: user.email.trim(), displayName: user.name || user.username || user.email });
+                        out.push({
+                            email: user.email.trim(),
+                            displayName: user.name || user.username || user.email,
+                            crcId: user.crcId || undefined
+                        });
                         return;
                     }
                     const crc = crcsById.get(id);
                     const u2 = usersByCrcId.get(id);
                     const email = (u2 && u2.email) || (crc && crc.email);
-                    if (email) out.push({ email: email.trim(), displayName: (u2 && (u2.name || u2.username)) || crc?.name || email });
+                    if (email) {
+                        out.push({
+                            email: email.trim(),
+                            displayName: (u2 && (u2.name || u2.username)) || crc?.name || email,
+                            crcId: (crc && crc.id) || id
+                        });
+                    }
                 });
             }
             return out;
@@ -5187,6 +5305,32 @@ async function processEmailTriggers(context, payload) {
             return base;
         };
 
+        const triggerDateRange = getTriggerDateRange(triggerType, { event, timeOffRequest, scheduleMonthKey });
+
+        const buildFullTriggerContext = async (rule, recipient) => {
+            const triggerCtx = buildTriggerContext(rule);
+            const crcId = recipient.crcId || rule._recipientCrcId || resolveCrcIdFromRecipientEmail(recipient.email, crcsById, usersByCrcId);
+            if (!crcId || !triggerDateRange) return triggerCtx;
+            try {
+                const user = usersByCrcId.get(crcId) || usersById.get(crcId);
+                const scheduleCtx = await buildRecipientEmailContext(
+                    {
+                        crcId,
+                        startDate: triggerDateRange.startDate,
+                        endDate: triggerDateRange.endDate,
+                        recipient,
+                        user: user || null
+                    },
+                    context,
+                    emailLookups
+                );
+                return { ...scheduleCtx, ...triggerCtx };
+            } catch (e) {
+                log.warn(`processEmailTriggers: schedule context for crc ${crcId} failed: ${e.message}`);
+                return triggerCtx;
+            }
+        };
+
         const emailClient = getEmailClient();
 
         for (const rule of filteredRules) {
@@ -5223,37 +5367,29 @@ async function processEmailTriggers(context, payload) {
 
             for (const r of recipients) {
                 if (!r.email) continue;
-                // Resolve crc id for per-recipient template vars (crcName)
-                let recipientCrcId = '';
-                if (triggerType === 'removed_from_shift') {
-                    for (const [crcId, crc] of crcsById.entries()) {
-                        const user = usersByCrcId.get(crcId);
+                let recipientCrcId = r.crcId || '';
+                if (!recipientCrcId) {
+                    recipientCrcId = resolveCrcIdFromRecipientEmail(r.email, crcsById, usersByCrcId);
+                }
+                if (!recipientCrcId && triggerType === 'removed_from_shift' && Array.isArray(removedCrcIds)) {
+                    recipientCrcId = removedCrcIds.find(id => {
+                        const user = usersByCrcId.get(id);
+                        const crc = crcsById.get(id);
                         const email = (user?.email || crc?.email || '').trim().toLowerCase();
-                        if (email && email === (r.email || '').trim().toLowerCase()) {
-                            recipientCrcId = crcId;
-                            break;
-                        }
-                    }
-                    if (!recipientCrcId && Array.isArray(removedCrcIds)) {
-                        recipientCrcId = removedCrcIds.find(id => {
-                            const user = usersByCrcId.get(id);
-                            const crc = crcsById.get(id);
-                            const email = (user?.email || crc?.email || '').trim().toLowerCase();
-                            return email && email === (r.email || '').trim().toLowerCase();
-                        }) || '';
-                    }
+                        return email && email === (r.email || '').trim().toLowerCase();
+                    }) || '';
                 }
                 const ruleWithRecipient = recipientCrcId ? { ...rule, _recipientCrcId: recipientCrcId } : rule;
-                const triggerContext = buildTriggerContext(ruleWithRecipient);
-                const { subject: personalizedSubject, plainText: personalizedPlainText, html: personalizedHtml } =
+                const recipientWithCrc = recipientCrcId ? { ...r, crcId: recipientCrcId } : r;
+                const triggerContext = await buildFullTriggerContext(ruleWithRecipient, recipientWithCrc);
+                const { subject: personalizedSubject, plainText: personalizedPlainText } =
                     resolveTriggerMessageContent(ruleWithRecipient, template, triggerType, triggerContext);
                 try {
                     const message = {
                         senderAddress,
                         content: {
                             subject: personalizedSubject,
-                            plainText: personalizedPlainText,
-                            ...(personalizedHtml ? { html: personalizedHtml } : {})
+                            ...(personalizedPlainText ? { plainText: personalizedPlainText } : {})
                         },
                         recipients: { to: [{ address: r.email, displayName: r.displayName || undefined }] }
                     };
