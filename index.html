@@ -4280,15 +4280,53 @@
                 return 8;
             };
 
-            const getDisplayEventHours = (event) => {
+            const getRawEventHours = (event) => {
                 if (!event) return 0;
-                // Respect explicit saved hours (0 is valid).
                 const h = (event.hours !== undefined && event.hours !== null && event.hours !== '')
                     ? Number(event.hours)
                     : NaN;
                 if (Number.isFinite(h) && h >= 0) return h;
-                // Fallback for legacy rows that only stored period
                 return event.period ? getHoursForPeriod(event.period) : (event.type === 'Travel Day' ? 5 : 8);
+            };
+
+            const getDisplayEventHours = (event) => {
+                if (!event) return 0;
+                if (typeof isCancelledShift === 'function' && isCancelledShift(event)) return 0;
+                return getRawEventHours(event);
+            };
+
+            /** Hours credited to cancelled-shift reporting (stored on cancel, or raw hours as fallback). */
+            const getCancelledHoursForCrc = (event, crcId) => {
+                if (!event || typeof isCancelledShift !== 'function' || !isCancelledShift(event)) return 0;
+                const storedTotal = Number(event.cancelledHours);
+                const baseHours = Number.isFinite(storedTotal) && storedTotal >= 0 ? storedTotal : getRawEventHours(event);
+                if (!crcId) return baseHours;
+                const assignedCrcs = new Set();
+                if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') assignedCrcs.add(event.crcId);
+                if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                    Object.values(event.roleAssignments).forEach(assignments => {
+                        if (Array.isArray(assignments)) {
+                            assignments.forEach(id => {
+                                const n = normalizeCrcId(id);
+                                if (n && n !== 'SITE_STAFF' && n !== 'UNASSIGNED') assignedCrcs.add(n);
+                            });
+                        }
+                    });
+                }
+                if (!assignedCrcs.has(crcId)) return 0;
+                const crcCount = assignedCrcs.size;
+                return crcCount > 0 ? baseHours / crcCount : 0;
+            };
+
+            const calculateCancelledCrcHours = (events, crcId = null) => {
+                const seenEventIds = new Set();
+                return (events || []).filter(e => {
+                    if (!e?.id || seenEventIds.has(e.id)) return false;
+                    if (e.type !== 'Site Assignment' || typeof isCancelledShift !== 'function' || !isCancelledShift(e)) return false;
+                    if (crcId && !eventBelongsToCrc(e, crcId)) return false;
+                    seenEventIds.add(e.id);
+                    return true;
+                }).reduce((sum, e) => sum + (crcId ? getCancelledHoursForCrc(e, crcId) : (Number(e.cancelledHours) >= 0 ? Number(e.cancelledHours) : getRawEventHours(e))), 0);
             };
 
             const getTimeOffRequestRange = (request) => {
@@ -5574,27 +5612,51 @@
                 return ids;
             };
 
+            const travelDayIncludesCrc = (travelDay, crcId) => {
+                if (!travelDay || !crcId) return false;
+                const target = normalizeCrcId(crcId);
+                if (!target) return false;
+                const single = normalizeCrcId(travelDay.crcId);
+                if (single === target) return true;
+                if (Array.isArray(travelDay.crcIds)) {
+                    return travelDay.crcIds.map(normalizeCrcId).filter(Boolean).includes(target);
+                }
+                return false;
+            };
+
+            const getTravelDayCrcIdsList = (travelDay) => {
+                const ids = new Set();
+                const add = (id) => { const n = normalizeCrcId(id); if (n) ids.add(n); };
+                add(travelDay?.crcId);
+                if (Array.isArray(travelDay?.crcIds)) travelDay.crcIds.forEach(add);
+                return [...ids];
+            };
+
+            const isTravelDayLinkedToShift = (travelDay, shiftEvent) => {
+                if (!travelDay || travelDay.type !== 'Travel Day' || !shiftEvent) return false;
+                const groupId = shiftEvent.groupId || null;
+                const shiftId = shiftEvent.id || null;
+                if (groupId && travelDay.parentShiftGroupId === groupId) return true;
+                if (shiftId && (travelDay.parentShiftId === shiftId || travelDay.linkedShiftId === shiftId)) return true;
+                return false;
+            };
+
             const findTravelDaysLinkedToShift = (shiftEvent) => {
                 if (!shiftEvent) return [];
-                const crcIds = getCrcIdsOnShiftEvent(shiftEvent);
-                const date = shiftEvent.date;
-                const groupId = shiftEvent.groupId;
-                const shiftId = shiftEvent.id;
-                return (state.crc_events || []).filter(e => {
-                    if (!e || e.type !== 'Travel Day') return false;
-                    if (groupId && e.parentShiftGroupId === groupId) return true;
-                    if (shiftId && (e.parentShiftId === shiftId || e.linkedShiftId === shiftId)) return true;
-                    if (!date) return false;
-                    if (e.date !== date) return false;
-                    const tdCrc = normalizeCrcId(e.crcId);
-                    if (tdCrc && crcIds.has(tdCrc)) return true;
-                    if (Array.isArray(e.crcIds)) {
-                        const tdCrcs = e.crcIds.map(normalizeCrcId).filter(Boolean);
-                        if (tdCrcs.length === 1 && crcIds.has(tdCrcs[0])) return true;
-                        if (tdCrcs.length > 1 && tdCrcs.every(id => crcIds.has(id))) return true;
-                    }
-                    return false;
+                const seen = new Set();
+                const matches = [];
+                (state.crc_events || []).forEach(e => {
+                    if (!e || e.type !== 'Travel Day' || !e.id || seen.has(e.id)) return;
+                    if (!isTravelDayLinkedToShift(e, shiftEvent)) return;
+                    seen.add(e.id);
+                    matches.push(e);
                 });
+                return matches;
+            };
+
+            const findTravelDaysForCrcOnShift = (shiftEvent, crcId) => {
+                if (!shiftEvent || !crcId) return [];
+                return findTravelDaysLinkedToShift(shiftEvent).filter(td => travelDayIncludesCrc(td, crcId));
             };
 
             const deleteTravelDaysLinkedToShift = async (shiftEvent) => {
@@ -5630,23 +5692,30 @@
 
             const deleteTravelDaysForCrcOnShift = async (shiftEvent, crcId) => {
                 if (!shiftEvent || !crcId) return [];
-                const linked = findTravelDaysLinkedToShift(shiftEvent).filter(td => {
-                    const single = normalizeCrcId(td.crcId);
-                    if (single === crcId) return true;
-                    if (Array.isArray(td.crcIds)) {
-                        const ids = td.crcIds.map(normalizeCrcId).filter(Boolean);
-                        return ids.length === 1 ? ids[0] === crcId : ids.includes(crcId);
-                    }
-                    return false;
-                });
+                const target = normalizeCrcId(crcId);
+                const linked = findTravelDaysForCrcOnShift(shiftEvent, target);
                 const deletedIds = [];
+                const updatedIds = [];
                 for (const td of linked) {
                     if (!td?.id) continue;
+                    const onTravel = getTravelDayCrcIdsList(td);
+                    const remaining = onTravel.filter(id => id !== target);
                     try {
-                        await apiService.deleteEvent(td.id);
-                        deletedIds.push(td.id);
+                        if (remaining.length === 0) {
+                            await apiService.deleteEvent(td.id);
+                            deletedIds.push(td.id);
+                        } else if (onTravel.length > 1) {
+                            const patch = { crcIds: remaining, crcId: remaining[0] };
+                            await apiService.updateEvent(td.id, patch);
+                            updatedIds.push(td.id);
+                            const i = state.crc_events.findIndex(e => e.id === td.id);
+                            if (i !== -1) state.crc_events[i] = { ...state.crc_events[i], ...patch };
+                        } else {
+                            await apiService.deleteEvent(td.id);
+                            deletedIds.push(td.id);
+                        }
                     } catch (err) {
-                        console.warn('Failed to delete travel for call-out:', td.id, err);
+                        console.warn('Failed to remove travel for CRC on shift:', td.id, err);
                     }
                 }
                 if (deletedIds.length) removeDeletedEventsFromLocalState(deletedIds);
@@ -5740,21 +5809,27 @@
             const getCRCRolesForEvent = (crcId, event) => {
                 const roles = [];
                 const trainingInfo = [];
-                if (!event?.roleAssignments || typeof event.roleAssignments !== 'object') return { roles, trainingInfo };
-                Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                    if (!Array.isArray(assignments)) return;
-                    assignments.forEach((entry, idx) => {
-                        if (normalizeCrcId(entry) !== crcId) return;
-                        const role = state.roles.find(r => r.id === roleId);
-                        if (!role?.name) return;
-                        roles.push(role.name);
-                        if (isTrainingRoleName(role.name) && event.trainingAssignments?.[roleId]?.[idx]) {
-                            trainingInfo.push(event.trainingAssignments[roleId][idx]);
-                        } else {
-                            trainingInfo.push(null);
-                        }
+                const target = normalizeCrcId(crcId);
+                if (!target || !event) return { roles, trainingInfo };
+                if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        if (!Array.isArray(assignments)) return;
+                        assignments.forEach((entry, idx) => {
+                            if (normalizeCrcId(entry) !== target) return;
+                            const role = state.roles.find(r => r.id === roleId);
+                            if (!role?.name) return;
+                            roles.push(role.name);
+                            if (isTrainingRoleName(role.name) && event.trainingAssignments?.[roleId]?.[idx]) {
+                                trainingInfo.push(event.trainingAssignments[roleId][idx]);
+                            } else {
+                                trainingInfo.push(null);
+                            }
+                        });
                     });
-                });
+                }
+                if (roles.length === 0 && Array.isArray(event.roles) && event.roles.length > 0 && normalizeCrcId(event.crcId) === target) {
+                    event.roles.forEach(name => { if (name) roles.push(String(name)); });
+                }
                 return { roles, trainingInfo };
             };
 
@@ -5799,9 +5874,10 @@
                         Object.entries(ev.roleAssignments).forEach(([roleId, assignments]) => {
                             if (!Array.isArray(assignments)) return;
                             if (!mergedRoleAssignments[roleId]) mergedRoleAssignments[roleId] = [];
-                            assignments.forEach(crcId => {
-                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED' && !mergedRoleAssignments[roleId].includes(crcId)) {
-                                    mergedRoleAssignments[roleId].push(crcId);
+                            assignments.forEach(entry => {
+                                const id = normalizeCrcId(entry);
+                                if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED' && !mergedRoleAssignments[roleId].includes(id)) {
+                                    mergedRoleAssignments[roleId].push(id);
                                 }
                             });
                         });
@@ -7268,7 +7344,8 @@
             // Correctly divides hours when multiple CRCs are assigned to the same event
             const getEventHoursForCrc = (event, crcId) => {
                 if (!event || !crcId) return 0;
-                
+                if (typeof isCancelledShift === 'function' && isCancelledShift(event)) return 0;
+
                 const eventHours = parseFloat(event.hours) || 0;
                 if (eventHours === 0) return 0;
                 
@@ -12073,15 +12150,12 @@
                 const firstDayOfMonth = new Date(year, month, 1).getDay();
 
                 // Get all events for this CRC (crcId, crcIds, and roleAssignments); deduplicate by id and by (date, groupId)
-                const rawCrcEvents = (state.crc_events || []).filter(e => eventBelongsToCrc(e, matchingCrcId));
+                const rawCrcEvents = (getCrcDashboardEvents ? getCrcDashboardEvents() : (state.crc_events || []))
+                    .filter(e => eventBelongsToCrc(e, matchingCrcId));
                 const seenIds = new Set();
-                const seenDateGroup = new Set();
                 const allCrcEvents = rawCrcEvents.filter(e => {
                     if (e.id && seenIds.has(e.id)) return false;
-                    const key = e.type === 'Site Assignment' && e.groupId ? `${e.date}\t${e.groupId}` : (e.id || `${e.date}\t${e.type}\t${e.crcId || ''}`);
-                    if (seenDateGroup.has(key)) return false;
                     if (e.id) seenIds.add(e.id);
-                    seenDateGroup.add(key);
                     return true;
                 });
                 
@@ -12399,9 +12473,10 @@
                                     const locationStr = site ? [site.city, site.state].filter(Boolean).join(', ') : '';
                                     const firstStudy = studies.length > 0 ? studies[0] : null;
                                     const isDarkMode = document.documentElement.classList.contains('dark');
-                                    // Travel Day: blue; Site Assignment: use study color when available
-                                    const bgColor = event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : (isDarkMode ? '#6d28d9' : '#8b5cf6'));
-                                    const textColor = (typeof getContrastColor === 'function') ? getContrastColor(bgColor) : 'white';
+                                    const isCancelled = typeof isCancelledShift === 'function' && isCancelledShift(event);
+                                    // Travel Day: blue; Site Assignment: use study color when available; cancelled = grey
+                                    const bgColor = isCancelled ? '#9ca3af' : (event.type === 'Travel Day' ? '#3b82f6' : (firstStudy && firstStudy.color ? firstStudy.color : (isDarkMode ? '#6d28d9' : '#8b5cf6')));
+                                    const textColor = isCancelled ? '#1f2937' : ((typeof getContrastColor === 'function') ? getContrastColor(bgColor) : 'white');
                                     
                                     // For Travel Day events, calculate and display distance from site
                                     let travelDistanceInfoSchedule = '';
@@ -12493,48 +12568,11 @@
                 const studies = (event.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
                 const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
 
-                // Get all CRCs assigned to this event (merged from same group so all days show everyone)
-                const assignedCrcs = [];
-                const legacyCrcId = normalizeCrcId(event.crcId);
-                if (legacyCrcId && legacyCrcId !== 'SITE_STAFF' && legacyCrcId !== 'UNASSIGNED') {
-                    const crc = state.crcs.find(c => c.id === legacyCrcId);
-                    if (crc) assignedCrcs.push({ crc, roles: event.roles || [] });
-                }
-                
-                if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                        if (Array.isArray(assignments)) {
-                            assignments.forEach(entry => {
-                                const crcId = normalizeCrcId(entry);
-                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED' && !assignedCrcs.find(ac => ac.crc.id === crcId)) {
-                                    const crc = state.crcs.find(c => c.id === crcId);
-                                    const role = state.roles.find(r => r.id === roleId);
-                                    if (crc) {
-                                        const existing = assignedCrcs.find(ac => ac.crc.id === crcId);
-                                        if (existing) {
-                                            if (role) existing.roles.push(role.name);
-                                        } else {
-                                            assignedCrcs.push({ crc, roles: role ? [role.name] : [] });
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    });
-                }
-                
-                // Remove duplicates and sort
-                const uniqueCrcs = [];
-                assignedCrcs.forEach(({ crc, roles }) => {
-                    const existing = uniqueCrcs.find(uc => uc.crc.id === crc.id);
-                    if (existing) {
-                        roles.forEach(role => {
-                            if (!existing.roles.includes(role)) existing.roles.push(role);
-                        });
-                    } else {
-                        uniqueCrcs.push({ crc, roles });
-                    }
-                });
+                const staffCrcs = typeof getEventCRCs === 'function' ? getEventCRCs(event) : [];
+                const uniqueCrcs = staffCrcs.map(crc => ({
+                    crc,
+                    roles: typeof getRolesForCrcOnEvent === 'function' ? getRolesForCrcOnEvent(crc.id, event) : []
+                }));
                 
                 
                 const yourRoleInfo = currentCrcId && typeof getCRCRolesForEvent === 'function' ? getCRCRolesForEvent(currentCrcId, event) : { roles: [], trainingInfo: [] };
@@ -12812,6 +12850,33 @@
                             </button>
                         </div>
                         <div id="timeoff-report-results" class="mt-4"></div>
+                    </div>
+                    <div class="mt-8 pt-4 border-t border-gray-200 dark:border-gray-700">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+                            <div>
+                                <h3 class="text-xl font-bold">Cancelled Shifts</h3>
+                                <p class="text-sm text-gray-500 dark:text-gray-400">Cancelled shifts keep assigned staff visible, count as 0 productive hours, and track cancelled hours separately in utilization reporting.</p>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 p-3 bg-amber-50 dark:bg-amber-900/20 rounded-lg border border-amber-200 dark:border-amber-700">
+                            <div>
+                                <label for="cancelled-report-start" class="block text-xs font-medium text-amber-900 dark:text-amber-200 mb-1">Start Month</label>
+                                <input type="month" id="cancelled-report-start" value="${currentMonthValue}" class="w-full p-1.5 text-sm border border-amber-300 dark:border-amber-600 rounded-md bg-white dark:bg-amber-900/40 dark:text-amber-100">
+                            </div>
+                            <div>
+                                <label for="cancelled-report-end" class="block text-xs font-medium text-amber-900 dark:text-amber-200 mb-1">End Month</label>
+                                <input type="month" id="cancelled-report-end" value="${currentMonthValue}" class="w-full p-1.5 text-sm border border-amber-300 dark:border-amber-600 rounded-md bg-white dark:bg-amber-900/40 dark:text-amber-100">
+                            </div>
+                            <div class="flex items-end">
+                                <button data-action="generate-cancelled-shifts-report" class="w-full bg-amber-600 text-white py-1.5 px-3 text-sm rounded-md hover:bg-amber-700">Generate Cancelled Report</button>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-3 mt-2">
+                            <button id="export-cancelled-shifts-report-btn" data-action="export-cancelled-shifts-report" class="bg-green-600 text-white py-1.5 px-3 text-sm rounded-md hover:bg-green-700 flex items-center gap-1 hidden">
+                                <i data-lucide="download" class="w-3 h-3"></i>Export CSV
+                            </button>
+                        </div>
+                        <div id="cancelled-shifts-report-results" class="mt-4"></div>
                     </div>
                 </div>
             `;
@@ -13921,6 +13986,7 @@
                         }, 0);
 
                         const productiveHours = calculateCrcHours(allEventsForMonth, crcId, { includeTravel: true });
+                        const cancelledHours = calculateCancelledCrcHours(allEventsForMonth, crcId);
                         const REPORT_UTIL_HOURS_PER_WORKDAY = 8;
                         const availableHours = availableWorkDays * REPORT_UTIL_HOURS_PER_WORKDAY;
                         const utilizationPercent = availableHours > 0 ? Math.round((productiveHours / availableHours) * 100) : 0;
@@ -13933,6 +13999,7 @@
                             productiveStudiesDays,
                             productiveTrainingDays,
                             productiveHours,
+                            cancelledHours,
                             nonWorkDays,
                             timeOffDays,
                             travelDays,
@@ -13984,6 +14051,7 @@
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Time Off Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Total Working Days</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Productive Hours</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-amber-600 dark:text-amber-400 uppercase tracking-wider">Cancelled Hours</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Available Hours</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Utilization %</th>
                                     </tr>
@@ -14009,6 +14077,7 @@
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.timeOffDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.availableWorkDays}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${(row.productiveHours ?? 0).toFixed(1)}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-amber-700 dark:text-amber-300">${(row.cancelledHours ?? 0).toFixed(1)}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${(row.availableHours ?? 0).toFixed(1)}</td>
                                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${row.utilizationPercent}%</td>
                                     </tr>
@@ -14029,6 +14098,109 @@
 
                 lucide.createIcons();
             };
+            const renderCancelledShiftsReport = () => {
+                const container = document.getElementById('cancelled-shifts-report-results');
+                const exportBtn = document.getElementById('export-cancelled-shifts-report-btn');
+                if (!container) return;
+                const startVal = document.getElementById('cancelled-report-start')?.value;
+                const endVal = document.getElementById('cancelled-report-end')?.value;
+                if (!startVal || !endVal) {
+                    container.innerHTML = '<p class="p-4 text-center text-gray-500 dark:text-gray-400">Select a start and end month.</p>';
+                    if (exportBtn) exportBtn.classList.add('hidden');
+                    state.cancelledShiftsReportData = null;
+                    return;
+                }
+                if (startVal > endVal) {
+                    container.innerHTML = '<p class="p-4 text-center text-red-500">End month must be on or after start month.</p>';
+                    if (exportBtn) exportBtn.classList.add('hidden');
+                    state.cancelledShiftsReportData = null;
+                    return;
+                }
+                const [sy, sm] = startVal.split('-').map(Number);
+                const [ey, em] = endVal.split('-').map(Number);
+                const rangeStart = `${sy}-${String(sm).padStart(2, '0')}-01`;
+                const rangeEnd = toDateOnlyString(new Date(ey, em, 0));
+                const rows = (state.crc_events || []).filter(e => {
+                    if (!e || e.type !== 'Site Assignment') return false;
+                    if (typeof isCancelledShift !== 'function' || !isCancelledShift(e)) return false;
+                    const d = (e.date || '').substring(0, 10);
+                    return d && d >= rangeStart && d <= rangeEnd;
+                }).map(e => {
+                    const site = state.crc_sites.find(s => s.id === e.siteId);
+                    const studies = (e.studyIds || []).map(id => state.studies.find(s => s.id === id)).filter(Boolean);
+                    const staff = typeof getEventCRCs === 'function' ? getEventCRCs(e).map(c => c.name).filter(Boolean).join(', ') : '';
+                    const cancelledHrs = typeof getRawEventHours === 'function' ? getRawEventHours(e) : (Number(e.cancelledHours) || 0);
+                    return {
+                        date: e.date,
+                        siteName: site?.name || e.siteId || '',
+                        studies: studies.map(s => s.title || s.name).join(', '),
+                        staff: staff || '—',
+                        period: e.period || 'Full Day',
+                        visit: e.visitNumber || '',
+                        cancelledHours: Number(e.cancelledHours) >= 0 ? Number(e.cancelledHours) : cancelledHrs,
+                        groupId: e.groupId || '',
+                        eventId: e.id
+                    };
+                }).sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.siteName).localeCompare(String(b.siteName)));
+                state.cancelledShiftsReportData = rows;
+                if (rows.length === 0) {
+                    container.innerHTML = '<p class="p-4 text-center text-gray-500 dark:text-gray-400">No cancelled shifts in this range.</p>';
+                    if (exportBtn) exportBtn.classList.add('hidden');
+                    return;
+                }
+                if (exportBtn) exportBtn.classList.remove('hidden');
+                container.innerHTML = `
+                    <div class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
+                        <table class="min-w-full text-sm">
+                            <thead class="bg-gray-100 dark:bg-gray-800">
+                                <tr>
+                                    <th class="px-3 py-2 text-left">Date</th>
+                                    <th class="px-3 py-2 text-left">Site</th>
+                                    <th class="px-3 py-2 text-left">Study</th>
+                                    <th class="px-3 py-2 text-left">Staff (kept on shift)</th>
+                                    <th class="px-3 py-2 text-left">Period</th>
+                                    <th class="px-3 py-2 text-left">Visit</th>
+                                    <th class="px-3 py-2 text-left">Cancelled hrs</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${rows.map(r => `
+                                    <tr class="border-t dark:border-gray-700">
+                                        <td class="px-3 py-2">${formatDisplayDate(r.date)}</td>
+                                        <td class="px-3 py-2">${r.siteName}</td>
+                                        <td class="px-3 py-2">${r.studies || '—'}</td>
+                                        <td class="px-3 py-2">${r.staff}</td>
+                                        <td class="px-3 py-2">${r.period}</td>
+                                        <td class="px-3 py-2">${r.visit || '—'}</td>
+                                        <td class="px-3 py-2">${(r.cancelledHours ?? 0).toFixed(1)}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">${rows.length} cancelled shift row(s). Productive/utilization hours are 0; cancelled hours are tracked separately.</p>
+                `;
+            };
+
+            const exportCancelledShiftsReport = () => {
+                const rows = state.cancelledShiftsReportData;
+                if (!rows || !rows.length) {
+                    showNotification('No cancelled shift data to export.', 'info');
+                    return;
+                }
+                const headers = ['Date', 'Site', 'Study', 'Staff', 'Period', 'Visit', 'Cancelled Hours', 'Group ID', 'Event ID'];
+                const csvRows = rows.map(r => [
+                    r.date, r.siteName, r.studies, r.staff, r.period, r.visit, (r.cancelledHours ?? 0).toFixed(1), r.groupId, r.eventId
+                ].map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(','));
+                const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...csvRows].join('\n');
+                const link = document.createElement('a');
+                link.href = encodeURI(csvContent);
+                link.download = `cancelled_shifts_${new Date().toISOString().split('T')[0]}.csv`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
             const exportUtilizationReport = () => {
                 // Force deduplication before export
                 forceDeduplicateState();
@@ -14039,7 +14211,7 @@
                     return;
                 }
 
-                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Studies', 'Training', 'Travel Days', 'Travel Hours', 'Travel (Studies)', 'Travel (Training)', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Productive Hours', 'Available Hours', 'Utilization %'];
+                const headers = ['CRC Name', 'Month', 'Year', 'Productive Days', 'Studies', 'Training', 'Travel Days', 'Travel Hours', 'Travel (Studies)', 'Travel (Training)', 'Travel Records', 'Flights', 'Hotels', 'Cars', 'Travel Cost', 'Non-Working Days', 'Time Off Days', 'Total Working Days', 'Productive Hours', 'Cancelled Hours', 'Available Hours', 'Utilization %'];
                 const rows = data.map(row => [
                     row.crcName,
                     row.month,
@@ -14060,6 +14232,7 @@
                     row.timeOffDays,
                     row.availableWorkDays,
                     (row.productiveHours ?? 0).toFixed(1),
+                    (row.cancelledHours ?? 0).toFixed(1),
                     (row.availableHours ?? 0).toFixed(1),
                     `${row.utilizationPercent}%`
                 ].map(val => `"${(val ?? '').toString().replace(/"/g, '""')}"`).join(','));
@@ -30288,6 +30461,14 @@
                         exportUtilizationReport();
                         break;
                     }
+                    case 'generate-cancelled-shifts-report': {
+                        renderCancelledShiftsReport();
+                        break;
+                    }
+                    case 'export-cancelled-shifts-report': {
+                        exportCancelledShiftsReport();
+                        break;
+                    }
                     case 'export-budget-summary': {
                         const startStr = state.dashboardStartDate || (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`; })();
                         const endStr = state.dashboardEndDate || (() => { const d = new Date(); const last = new Date(d.getFullYear(), d.getMonth() + 1, 0); return `${last.getFullYear()}-${String(last.getMonth() + 1).padStart(2, '0')}-${String(last.getDate()).padStart(2, '0')}`; })();
@@ -31938,8 +32119,8 @@
                             : [target];
                         const scopeLabel = groupId ? 'the entire multi-day shift' : 'this shift';
                         const cancelExplain = nextCancelled
-                            ? `Cancel ${scopeLabel}?\n\n• Shift rows stay in the database (greyed on staff view).\n• Linked travel days will be removed.\n• Turn on "Show cancelled shifts" in manager filters to review them.`
-                            : `Restore ${scopeLabel}?\n\n• The shift will show as active again. Travel days are not recreated automatically.`;
+                            ? `Cancel ${scopeLabel}?\n\n• Staff stay on the shift (greyed on staff view).\n• Hours go to 0 for utilization; cancelled hours are tracked separately.\n• Only travel days linked to this shift (parent shift / group id) are removed.\n• Turn on "Show cancelled shifts" in manager filters to review them.`
+                            : `Restore ${scopeLabel}?\n\n• The shift counts toward utilization again.\n• Cancelled-hours snapshot is cleared.\n• Linked travel days are not recreated automatically.`;
                         const confirmed = confirm(cancelExplain);
                         if (!confirmed) break;
 
@@ -31952,7 +32133,17 @@
                                     travelDeleted += ids.length;
                                 }
                             }
-                            const results = await Promise.allSettled(targets.map(ev => apiService.updateEvent(ev.id, { cancelled: nextCancelled })));
+                            const results = await Promise.allSettled(targets.map(ev => {
+                                const patch = { cancelled: nextCancelled };
+                                if (nextCancelled) {
+                                    patch.cancelledHours = getRawEventHours(ev);
+                                    patch.cancelledAt = new Date().toISOString();
+                                } else {
+                                    patch.cancelledHours = null;
+                                    patch.cancelledAt = null;
+                                }
+                                return apiService.updateEvent(ev.id, patch);
+                            }));
                             results.forEach((res, idx) => {
                                 const ev = targets[idx];
                                 if (res.status === 'fulfilled' && res.value && res.value.id) {
@@ -31960,7 +32151,14 @@
                                     if (i !== -1) state.crc_events[i] = { ...state.crc_events[i], ...res.value };
                                 } else {
                                     const i = state.crc_events.findIndex(e => e.id === ev.id);
-                                    if (i !== -1) state.crc_events[i] = { ...state.crc_events[i], cancelled: nextCancelled };
+                                    if (i !== -1) {
+                                        state.crc_events[i] = {
+                                            ...state.crc_events[i],
+                                            cancelled: nextCancelled,
+                                            cancelledHours: nextCancelled ? getRawEventHours(ev) : null,
+                                            cancelledAt: nextCancelled ? new Date().toISOString() : null
+                                        };
+                                    }
                                 }
                             });
 
@@ -35467,6 +35665,14 @@
                     }
                     case 'generate-utilization-report': {
                         renderReportingTable();
+                        break;
+                    }
+                    case 'generate-cancelled-shifts-report': {
+                        renderCancelledShiftsReport();
+                        break;
+                    }
+                    case 'export-cancelled-shifts-report': {
+                        exportCancelledShiftsReport();
                         break;
                     }
                 }
@@ -41328,16 +41534,17 @@
                             if (crc) {
                                 // Filter CRCs based on the roles in the event
                                 const eventRoles = existingEvent.roles || [];
-                                let qualifiedCrcs = (state.crcs || []).filter(c => c && c.id && c.active !== false);
+                                let qualifiedCrcs = getSchedulableCrcs();
                                 
                                 // If there are specific roles, filter by training (and active status)
                                 if (eventRoles.length > 0) {
-                                    qualifiedCrcs = (state.crcs || []).filter(c => {
-                                        if (!c || !c.id) return false;
-                                        // Only active staff are selectable for scheduling.
-                                        if (c.active === false) return false;
-                                        return eventRoles.some(role => hasValidTraining(c, role));
-                                    });
+                                    qualifiedCrcs = getSchedulableCrcs().filter(c =>
+                                        eventRoles.some(role => hasValidTraining(c, role))
+                                    );
+                                }
+                                if (existingEvent.crcId && existingEvent.crcId !== 'SITE_STAFF' && existingEvent.crcId !== 'UNASSIGNED' && !qualifiedCrcs.some(c => c.id === existingEvent.crcId)) {
+                                    const pinned = (state.crcs || []).find(c => c.id === existingEvent.crcId);
+                                    if (pinned) qualifiedCrcs = [pinned, ...qualifiedCrcs];
                                 }
                                 // Sort alphabetically
                                 qualifiedCrcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
@@ -41753,11 +41960,13 @@
                             const excludeGroupId = existingEvent ? existingEvent.groupId : null;
                             const allowOverride = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
 
-                            let qualifiedCrcs = (state.crcs || [])
-                                // Only active staff are selectable for scheduling (even in override mode).
-                                .filter(crc => crc && crc.id && crc.active !== false)
+                            let qualifiedCrcs = getSchedulableCrcs()
                                 .filter(crc => allowOverride ? true : hasValidTraining(crc, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+                            if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED' && !qualifiedCrcs.some(c => c.id === assignedCrcId)) {
+                                const pinned = (state.crcs || []).find(c => c.id === assignedCrcId);
+                                if (pinned) qualifiedCrcs = [pinned, ...qualifiedCrcs];
+                            }
 
                             let available = [];
                             let unavailable = [];

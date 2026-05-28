@@ -3773,48 +3773,15 @@ async function crudHandler(context, request, containerName) {
                                                 removedFromShiftCrcIds = removedCrcIds;
                                             }
                                             
-                                            // If any CRCs were removed, delete their travel days for this date
-                                            if (removedCrcIds.length > 0 && existingEvent.date) {
-                                                const { resources: travelDays } = await eventsContainer.items.query({
-                                                    query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
-                                                    parameters: [
-                                                        { name: "@date", value: existingEvent.date }
-                                                    ]
-                                                }).fetchAll();
-                                                
-                                                // Delete travel days that belong to removed CRCs
-                                                for (const travelDay of (travelDays || [])) {
-                                                    if (!travelDay || travelDay.type !== 'Travel Day') continue;
-                                                    
-                                                    // Check if this travel day belongs to a removed CRC
-                                                    let shouldDelete = false;
-                                                    
-                                                    if (travelDay.crcId && removedCrcIds.includes(travelDay.crcId)) {
-                                                        // Single CRC travel day for a removed CRC
-                                                        shouldDelete = true;
-                                                    } else if (travelDay.crcIds && Array.isArray(travelDay.crcIds)) {
-                                                        // Multi-CRC travel day - delete if all CRCs in it were removed
-                                                        const travelDayCrcs = travelDay.crcIds.filter(id => id && id.trim() !== '' && id !== 'SITE_STAFF' && id !== 'UNASSIGNED');
-                                                        if (travelDayCrcs.length > 0) {
-                                                            const allCrcsRemoved = travelDayCrcs.every(crcId => removedCrcIds.includes(crcId));
-                                                            const someCrcsRemoved = travelDayCrcs.some(crcId => removedCrcIds.includes(crcId));
-                                                            // If all CRCs in the travel day were removed, delete it
-                                                            // If only some were removed, we keep it (other CRCs still need it)
-                                                            if (allCrcsRemoved) {
-                                                                shouldDelete = true;
-                                                            }
-                                                        }
-                                                    }
-                                    
-                                                    if (shouldDelete) {
-                                                        try {
-                                                            await eventsContainer.item(travelDay.id, travelDay.id).delete();
-                                                            context.log.info(`Deleted travel day ${travelDay.id} because CRC(s) were removed from shift ${updateId}`);
-                                                        } catch (deleteTravelError) {
-                                                            context.log.warn(`Failed to delete travel day ${travelDay.id}: ${deleteTravelError.message}`);
-                                                        }
-                                                    }
-                                                }
+                                            // If any CRCs were removed, delete or update their travel days for this date
+                                            if (removedCrcIds.length > 0 && existingEvent) {
+                                                const shiftForTravel = { ...existingEvent, ...result, id: updateId };
+                                                await cleanupTravelDaysForRemovedCrcs(
+                                                    eventsContainer,
+                                                    context.log,
+                                                    shiftForTravel,
+                                                    removedCrcIds
+                                                );
                                             }
                                         } catch (travelDeleteError) {
                                             // Log but don't fail the shift update if travel day deletion fails
@@ -4102,10 +4069,12 @@ async function crudHandler(context, request, containerName) {
                                         const endDate = prefs.endTravelDate || shiftDate;
                                         const defaultsRm = computeDefaultTravelDates();
                                         const datesToCheck = Array.from(new Set([startDate, endDate, defaultsRm.start, defaultsRm.end, shiftDate].filter(Boolean)));
+                                        const shiftForTravel = { ...result, id: updateId };
                                         for (const travelDate of datesToCheck) {
                                             const travelDaysOnDate = await getTravelDaysForDate(travelDate);
                                             const travelDayToDelete = (travelDaysOnDate || []).find(td => {
                                                 if (!td || td.type !== 'Travel Day') return false;
+                                                if (!isTravelDayLinkedToShift(td, shiftForTravel)) return false;
                                                 if (td.crcId === crcId) return true;
                                                 if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
                                                 return false;
@@ -4214,7 +4183,10 @@ async function crudHandler(context, request, containerName) {
                                                         crcIds: [crcId],
                                                         name: 'Travel Day',
                                                         siteId: result.siteId || null,
-                                                        studyIds: Array.isArray(result.studyIds) ? result.studyIds : (result.studyId ? [result.studyId] : [])
+                                                        studyIds: Array.isArray(result.studyIds) ? result.studyIds : (result.studyId ? [result.studyId] : []),
+                                                        parentShiftId: updateId || result.id || null,
+                                                        parentShiftGroupId: result.groupId || null,
+                                                        linkedShiftId: updateId || result.id || null
                                                     };
                                                     
                                                     Object.keys(travelDayEvent).forEach(key => {
@@ -4897,6 +4869,68 @@ const collectCrcIdsFromEvent = (ev) => {
         });
     }
     return set;
+};
+
+const getTravelDayCrcIds = (travelDay) => {
+    const set = new Set();
+    if (!travelDay) return [];
+    const add = (id) => {
+        const n = normalizeAssignmentCrcId(id);
+        if (n) set.add(n);
+    };
+    add(travelDay.crcId);
+    if (Array.isArray(travelDay.crcIds)) travelDay.crcIds.forEach(add);
+    return [...set];
+};
+
+/** Travel day is tied to a shift only when parent/group/shift id fields match (not merely same date + CRC). */
+const isTravelDayLinkedToShift = (travelDay, shiftEvent) => {
+    if (!travelDay || travelDay.type !== 'Travel Day' || !shiftEvent) return false;
+    const groupId = shiftEvent.groupId || null;
+    const shiftId = shiftEvent.id || null;
+    if (groupId && travelDay.parentShiftGroupId === groupId) return true;
+    if (shiftId && (travelDay.parentShiftId === shiftId || travelDay.linkedShiftId === shiftId)) return true;
+    return false;
+};
+
+/** When staff are removed from a shift, delete or update their connected travel day(s) only. */
+const cleanupTravelDaysForRemovedCrcs = async (eventsContainer, log, shiftEvent, removedCrcIds) => {
+    const removed = [...new Set((removedCrcIds || []).map(normalizeAssignmentCrcId).filter(Boolean))];
+    if (!shiftEvent || removed.length === 0) return;
+    const shiftDate = shiftEvent.date;
+    if (!shiftDate) return;
+    try {
+        const { resources: travelDays } = await eventsContainer.items.query({
+            query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
+            parameters: [{ name: '@date', value: shiftDate }]
+        }).fetchAll();
+        for (const travelDay of (travelDays || [])) {
+            if (!travelDay?.id || travelDay.type !== 'Travel Day') continue;
+            if (!isTravelDayLinkedToShift(travelDay, shiftEvent)) continue;
+            const onTravel = getTravelDayCrcIds(travelDay);
+            const removedOnThis = removed.filter(id => onTravel.includes(id));
+            if (removedOnThis.length === 0) continue;
+            const remaining = onTravel.filter(id => !removed.includes(id));
+            try {
+                if (remaining.length === 0) {
+                    await eventsContainer.item(travelDay.id, travelDay.id).delete();
+                    log.info(`Deleted travel day ${travelDay.id} (CRC(s) removed from shift)`);
+                } else {
+                    await eventsContainer.items.upsert({
+                        ...travelDay,
+                        id: travelDay.id,
+                        crcIds: remaining,
+                        crcId: remaining[0]
+                    });
+                    log.info(`Updated travel day ${travelDay.id}; removed CRC(s): ${removedOnThis.join(', ')}`);
+                }
+            } catch (e) {
+                log.warn(`Travel cleanup failed for ${travelDay.id}: ${e.message}`);
+            }
+        }
+    } catch (e) {
+        log.warn(`cleanupTravelDaysForRemovedCrcs failed for date ${shiftDate}: ${e.message}`);
+    }
 };
 
 /** AM + PM on the same day are allowed; Full Day blocks any other period. */
