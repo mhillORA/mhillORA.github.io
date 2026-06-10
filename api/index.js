@@ -10,6 +10,9 @@ const ENTRA_TENANT_ID = process.env.ENTRA_TENANT_ID;
 const ENTRA_API_AUDIENCE = process.env.ENTRA_API_AUDIENCE; // typically your API app's clientId or Application ID URI
 const ENTRA_AUTH_DISABLED = String(process.env.ENTRA_AUTH_DISABLED || '').toLowerCase() === 'true';
 
+// NASA logins are isolated from CHAOS (which uses the `users` container on chaos-scheduler deploy).
+const NASA_USERS_CONTAINER = 'nasa-users';
+
 let jwks = null;
 const getJwks = () => {
     if (!ENTRA_TENANT_ID) return null;
@@ -760,7 +763,7 @@ async function crudHandler(context, request, containerName) {
                         case 'surveys':
                             validateSurveysSchema(body);
                             break;
-                        case 'users':
+                        case 'nasa-users':
                             validateUsersSchema(body);
                             break;
                     }
@@ -773,7 +776,7 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
                 
-                if (containerName === 'users') {
+                if (containerName === NASA_USERS_CONTAINER) {
                     if (body.entraId && !body.entraOid) body.entraOid = body.entraId;
                     if (body.entraOid && !body.entraId) body.entraId = body.entraOid;
                 }
@@ -838,7 +841,7 @@ async function crudHandler(context, request, containerName) {
                         case 'surveys':
                             validateSurveysSchema(requestBody);
                             break;
-                        case 'users':
+                        case 'nasa-users':
                             validateUsersSchema(requestBody);
                             break;
                     }
@@ -851,7 +854,7 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
 
-                if (containerName === 'users') {
+                if (containerName === NASA_USERS_CONTAINER) {
                     if (requestBody.entraId && !requestBody.entraOid) requestBody.entraOid = requestBody.entraId;
                     if (requestBody.entraOid && !requestBody.entraId) requestBody.entraId = requestBody.entraOid;
                 }
@@ -1056,7 +1059,7 @@ app.http('usersAuthenticateEntra', {
                 return { status: 400, jsonBody: { error: 'Invalid token: missing user identifier' }, headers: jsonHeaders };
             }
 
-            const container = getContainer('users');
+            const container = getContainer(NASA_USERS_CONTAINER);
             let user = await findUserByEntraOid(container, entraOid);
 
             if (!user) {
@@ -1108,7 +1111,7 @@ app.http('usersAuthenticate', {
                 return { status: 400, jsonBody: { error: 'Username and password are required' }, headers: jsonHeaders };
             }
 
-            const container = getContainer('users');
+            const container = getContainer(NASA_USERS_CONTAINER);
             const { resources } = await container.items.query({
                 query: 'SELECT * FROM c WHERE LOWER(c.email) = @id OR LOWER(c.username) = @id',
                 parameters: [{ name: '@id', value: identifier }],
@@ -1140,5 +1143,5 @@ app.http('users', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'users/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'users'),
+    handler: (request, context) => crudHandler(context, request, NASA_USERS_CONTAINER),
 });
