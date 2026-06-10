@@ -12,6 +12,7 @@
         }
     </script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -213,6 +214,26 @@
 const API_BASE_URL = '/api'; // Use relative path like other files
 const API_KEY = ''; // Optional. Prefer platform auth; leave empty for local/dev.
 
+let msalInstance = null;
+let entraConfig = { enabled: false, clientId: '', tenantId: '', authority: '' };
+let entraIdToken = null;
+
+const getApiBearerToken = async () => {
+    if (entraIdToken) return entraIdToken;
+    if (!msalInstance) return null;
+    try {
+        const accounts = msalInstance.getAllAccounts();
+        if (!accounts.length) return null;
+        const result = await msalInstance.acquireTokenSilent({
+            account: accounts[0],
+            scopes: entraConfig.clientId ? [`api://${entraConfig.clientId}/access_as_user`, 'openid', 'profile', 'email'] : ['openid', 'profile', 'email'],
+        });
+        return result.idToken || result.accessToken || null;
+    } catch {
+        return entraIdToken;
+    }
+};
+
 const apiCall = async (endpoint, method = 'GET', data = null) => {
     try {
         const options = {
@@ -224,6 +245,11 @@ const apiCall = async (endpoint, method = 'GET', data = null) => {
 
         if (API_KEY) {
             options.headers['x-functions-key'] = API_KEY;
+        }
+
+        const bearer = await getApiBearerToken();
+        if (bearer) {
+            options.headers['Authorization'] = `Bearer ${bearer}`;
         }
         
         if (data) {
@@ -317,6 +343,7 @@ const updateDocument = async (collection, id, data) => {
                     case 'sites': return state.sites?.find(s => s.id === id);
                     case 'schedules': return state.schedules?.find(s => s.id === id);
                     case 'surveys': return state.surveys?.find(s => s.id === id);
+                    case 'users': return state.managedUsers?.find(u => u.id === id);
                     default: return null;
                 }
             })();
@@ -496,11 +523,12 @@ let state = {
     participantSearchTerm: '', // For searching participants within a study
     studiesExpanded: false, // For the collapsible studies list
 
-    // --- lightweight access-request + user management (local only for now) ---
-    showLoginGate: false, // short-term "login page" gate (off by default)
+    // --- access-request + user management ---
+    showLoginGate: false,
     accessRequests: [],
     managedUsers: [],
-    currentUser: null, // local session user
+    currentUser: null,
+    entraSignInEnabled: false,
     privacyMaskSensitive: false, // blur PHI/PII on screen (persisted in localStorage)
 };
 let chartInstances = {}; // To hold chart objects for destruction
@@ -556,6 +584,130 @@ const authenticateLocalUser = (identifier, password) => {
         const user = String(u.username || '').trim().toLowerCase();
         return (email === id || user === id) && String(u.password || '') === pw;
     }) || null;
+};
+
+const normalizeApiUser = (user) => {
+    if (!user) return null;
+    return {
+        ...user,
+        username: user.username || user.displayName || '',
+        entraId: user.entraId || user.entraOid || '',
+        entraOid: user.entraOid || user.entraId || '',
+    };
+};
+
+const toApiUserPayload = (user) => ({
+    id: user.id,
+    displayName: user.username || user.displayName || user.email || 'User',
+    username: user.username || '',
+    email: user.email || '',
+    role: user.role || 'coordinator',
+    password: user.password || '',
+    allowedSiteIds: user.allowedSiteIds || [],
+    entraId: String(user.entraId || user.entraOid || '').trim(),
+    entraOid: String(user.entraOid || user.entraId || '').trim(),
+    active: user.active !== false,
+    createdAt: user.createdAt || new Date().toISOString(),
+    lastUpdated: new Date().toISOString(),
+});
+
+const setSignedInUser = (user) => {
+    const normalized = normalizeApiUser(user);
+    if (!normalized) return;
+    state.currentUser = {
+        id: normalized.id,
+        username: normalized.username,
+        email: normalized.email,
+        role: normalized.role,
+        allowedSiteIds: normalized.allowedSiteIds || [],
+        entraId: normalized.entraId || '',
+    };
+    state.userId = normalized.id || normalized.username || 'nasa-user';
+    state.showLoginGate = false;
+};
+
+const loadManagedUsersFromApi = async () => {
+    try {
+        const users = await apiCall('users');
+        if (Array.isArray(users) && users.length) {
+            state.managedUsers = users.map(normalizeApiUser);
+            saveLocalState();
+            return true;
+        }
+    } catch (error) {
+        console.warn('NASA: Could not load users from API; using local cache.', error);
+    }
+    return false;
+};
+
+const loadEntraConfig = async () => {
+    try {
+        const config = await apiCall('entra-config');
+        entraConfig = {
+            enabled: !!(config && config.enabled && config.clientId),
+            clientId: (config && config.clientId) || '',
+            tenantId: (config && config.tenantId) || '',
+            authority: (config && config.authority) || 'https://login.microsoftonline.com/common',
+        };
+        state.entraSignInEnabled = entraConfig.enabled;
+    } catch (error) {
+        console.warn('NASA: Entra config unavailable.', error);
+        entraConfig = { enabled: false, clientId: '', tenantId: '', authority: '' };
+        state.entraSignInEnabled = false;
+    }
+};
+
+const initMsal = async () => {
+    if (!entraConfig.enabled || typeof msal === 'undefined') return;
+    try {
+        msalInstance = new msal.PublicClientApplication({
+            auth: {
+                clientId: entraConfig.clientId,
+                authority: entraConfig.authority,
+                redirectUri: window.location.origin,
+            },
+            cache: {
+                cacheLocation: 'sessionStorage',
+                storeAuthStateInCookie: false,
+            },
+        });
+        await msalInstance.initialize();
+    } catch (error) {
+        console.warn('NASA: MSAL init failed.', error);
+        msalInstance = null;
+        state.entraSignInEnabled = false;
+    }
+};
+
+const handleEntraLogin = async () => {
+    if (!msalInstance) {
+        showNotification('Microsoft sign-in is not configured yet. Ask an admin to set ENTRA_CLIENT_ID and ENTRA_TENANT_ID on the API.', 'error');
+        return;
+    }
+    try {
+        const loginResponse = await msalInstance.loginPopup({
+            scopes: ['openid', 'profile', 'email'],
+        });
+        const token = loginResponse.idToken;
+        if (!token) throw new Error('No ID token returned from Microsoft');
+        entraIdToken = token;
+        const user = await apiCall('users/authenticate-entra', 'POST', { token });
+        setSignedInUser(user);
+        showNotification(`Signed in as ${user.email || user.username || user.displayName}`, 'success');
+        render();
+    } catch (error) {
+        console.error('Entra login failed:', error);
+        entraIdToken = null;
+        let message = error.message || 'Microsoft sign-in failed.';
+        try {
+            const jsonStart = message.indexOf('{');
+            if (jsonStart >= 0) {
+                const parsed = JSON.parse(message.slice(jsonStart));
+                if (parsed.error) message = parsed.error;
+            }
+        } catch {}
+        showNotification(message, 'error');
+    }
 };
 
 const saveLocalState = () => {
@@ -3076,6 +3228,13 @@ const getLoginGateHTML = () => {
                         <span>Sign in</span>
                     </button>
 
+                    ${state.entraSignInEnabled ? `
+                    <button type="button" data-action="login-gate-entra" class="w-full px-4 py-3 bg-white dark:bg-gray-800 text-gray-900 dark:text-white border-2 border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700 flex items-center justify-center gap-3">
+                        <svg class="w-5 h-5" viewBox="0 0 21 21" aria-hidden="true"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
+                        <span>Sign in with Microsoft</span>
+                    </button>
+                    ` : ''}
+
                     <button type="button" data-action="login-gate-request-access" class="w-full px-4 py-3 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
                         <i data-lucide="user-plus" class="w-5 h-5"></i>
                         <span>Request Access</span>
@@ -3083,7 +3242,7 @@ const getLoginGateHTML = () => {
                 </form>
 
                 <div class="mt-4 text-xs text-gray-500 dark:text-gray-400">
-                    Local login is enabled.
+                    ${state.entraSignInEnabled ? 'Sign in with Microsoft or username/password.' : 'Username/password login. Microsoft sign-in appears when Entra is configured on the API.'}
                 </div>
             </div>
         </div>
@@ -3419,7 +3578,7 @@ const setupManageR = () => {
     const form = document.getElementById('manageR-create-user-form');
     if (form && form.dataset.bound !== 'true') {
         form.dataset.bound = 'true';
-        form.addEventListener('submit', (e) => {
+        form.addEventListener('submit', async (e) => {
             e.preventDefault();
             const fd = new FormData(form);
             const allowedSiteIds = fd.getAll('allowedSiteIds').map(String);
@@ -3437,7 +3596,14 @@ const setupManageR = () => {
                 showNotification('Username is required.', 'error');
                 return;
             }
-            state.managedUsers = [user, ...(state.managedUsers || [])];
+            try {
+                const created = await createDocument('users', toApiUserPayload(user));
+                const normalized = normalizeApiUser(created);
+                state.managedUsers = [normalized, ...(state.managedUsers || [])];
+            } catch (error) {
+                console.warn('NASA: User API create failed; saving locally.', error);
+                state.managedUsers = [user, ...(state.managedUsers || [])];
+            }
             saveLocalState();
             showNotification(`User created: ${user.username}`, 'success');
             render();
@@ -3513,11 +3679,17 @@ const setupEditManagedUserForm = (userId) => {
     if (!form || form.dataset.bound === 'true') return;
     form.dataset.bound = 'true';
 
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('submit', async (e) => {
         e.preventDefault();
         const fd = new FormData(form);
         const allowedSiteIds = fd.getAll('allowedSiteIds').map(String);
+        const existing = (state.managedUsers || []).find(u => u.id === userId);
+        if (!existing) {
+            showNotification('User not found.', 'error');
+            return;
+        }
         const next = {
+            ...existing,
             username: String(fd.get('username') || '').trim(),
             email: String(fd.get('email') || '').trim(),
             entraId: String(fd.get('entraId') || '').trim(),
@@ -3526,7 +3698,14 @@ const setupEditManagedUserForm = (userId) => {
             allowedSiteIds,
             lastUpdated: new Date().toISOString(),
         };
-        state.managedUsers = (state.managedUsers || []).map(u => u.id === userId ? { ...u, ...next } : u);
+        try {
+            const updated = await updateDocument('users', userId, toApiUserPayload(next));
+            const normalized = normalizeApiUser(updated);
+            state.managedUsers = (state.managedUsers || []).map(u => u.id === userId ? normalized : u);
+        } catch (error) {
+            console.warn('NASA: User API update failed; saving locally.', error);
+            state.managedUsers = (state.managedUsers || []).map(u => u.id === userId ? next : u);
+        }
         saveLocalState();
         showNotification('User updated.', 'success');
         closeModal();
@@ -4830,16 +5009,26 @@ document.addEventListener('click', async (e) => {
             case 'close-modal': closeModal(); break;
             case 'close-side-panel': closeSidePanel(); break;
             case 'logout': {
-                // Local-only session logout
                 state.currentUser = null;
                 state.userId = 'nasa-user';
                 state.selectedStudyId = null;
                 state.studiesExpanded = false;
+                entraIdToken = null;
                 state.showLoginGate = true;
                 closeModal();
                 closeSidePanel();
+                if (msalInstance) {
+                    const accounts = msalInstance.getAllAccounts();
+                    if (accounts.length) {
+                        try { await msalInstance.logoutPopup({ account: accounts[0] }); } catch {}
+                    }
+                }
                 showNotification('Signed out.', 'success');
                 render();
+                break;
+            }
+            case 'login-gate-entra': {
+                await handleEntraLogin();
                 break;
             }
             case 'login-gate-request-access': {
@@ -4850,20 +5039,23 @@ document.addEventListener('click', async (e) => {
             case 'login-gate-signin': {
                 const identifier = document.getElementById('login-gate-identifier')?.value || '';
                 const password = document.getElementById('login-gate-password')?.value || '';
-                const user = authenticateLocalUser(identifier, password);
-                if (!user) {
+                let signedIn = false;
+                try {
+                    const apiUser = await apiCall('users/authenticate', 'POST', { username: identifier, password });
+                    setSignedInUser(apiUser);
+                    signedIn = true;
+                } catch {
+                    const localUser = authenticateLocalUser(identifier, password);
+                    if (localUser) {
+                        setSignedInUser(localUser);
+                        signedIn = true;
+                    }
+                }
+                if (!signedIn) {
                     showNotification('Invalid username/email or password.', 'error');
                     break;
                 }
-                state.currentUser = {
-                    id: user.id,
-                    username: user.username,
-                    email: user.email,
-                    role: user.role,
-                };
-                state.userId = user.id || user.username || 'nasa-user';
-                state.showLoginGate = false;
-                showNotification(`Signed in as ${user.email || user.username}`, 'success');
+                showNotification(`Signed in as ${state.currentUser.email || state.currentUser.username}`, 'success');
                 render();
                 break;
             }
@@ -5202,6 +5394,11 @@ document.addEventListener('click', async (e) => {
             }
             case 'manageR-delete-user': {
                 const userId = actionButton.dataset.userId;
+                try {
+                    await deleteDocument('users', userId);
+                } catch (error) {
+                    console.warn('NASA: User API delete failed; removing locally.', error);
+                }
                 state.managedUsers = (state.managedUsers || []).filter(u => u.id !== userId);
                 saveLocalState();
                 showNotification('User deleted.', 'success');
@@ -7215,17 +7412,28 @@ const init = async () => {
     // Initialize NASA with Azure Cosmos DB
     try {
         loadLocalState();
+        await loadEntraConfig();
+        await initMsal();
+        const loadedUsers = await loadManagedUsersFromApi();
+        if (!loadedUsers && (state.managedUsers || []).length) {
+            for (const user of state.managedUsers) {
+                try {
+                    await createDocument('users', toApiUserPayload(user));
+                } catch (error) {
+                    console.warn('NASA: Could not migrate local user to API:', user.username, error);
+                }
+            }
+            await loadManagedUsersFromApi();
+        }
         syncPrivacyMaskDom();
         updatePrivacyMaskToggleUi();
         state.authReady = true;
         state.userId = 'nasa-user';
         state.showLoginGate = true;
         
-        // Load initial data
         await loadAllData();
-        
-        // Set up periodic data refresh
         setupDataRefresh();
+        render();
         
     } catch (error) {
         console.error("NASA initialization failed:", error);

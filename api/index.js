@@ -634,14 +634,26 @@ const validateSurveysSchema = (data) => {
 
 const validateUsersSchema = (data) => {
     const errors = [];
+    if ((!data.displayName || typeof data.displayName !== 'string') && data.username && typeof data.username === 'string') {
+        data.displayName = data.username;
+    }
     if (!data.displayName || typeof data.displayName !== 'string') {
         errors.push('displayName is required and must be a string');
     }
     if (data.email !== undefined && data.email !== null && typeof data.email !== 'string') {
         errors.push('email must be a string');
     }
+    if (data.username !== undefined && data.username !== null && typeof data.username !== 'string') {
+        errors.push('username must be a string');
+    }
+    if (data.password !== undefined && data.password !== null && typeof data.password !== 'string') {
+        errors.push('password must be a string');
+    }
     if (data.entraOid !== undefined && data.entraOid !== null && typeof data.entraOid !== 'string') {
         errors.push('entraOid must be a string');
+    }
+    if (data.entraId !== undefined && data.entraId !== null && typeof data.entraId !== 'string') {
+        errors.push('entraId must be a string');
     }
     if (data.role !== undefined && data.role !== null && typeof data.role !== 'string') {
         errors.push('role must be a string');
@@ -741,6 +753,7 @@ async function crudHandler(context, request, containerName) {
                             validateRolesSchema(body);
                             break;
                         case 'schedules':
+                        case 'patient-schedules':
                             validateSchedulesSchema(body);
                             await validateSiteStudyRelationship(body.siteId, body.studyId);
                             break;
@@ -760,7 +773,12 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
                 
-                const newItem = { ...body, id: generateId() };
+                if (containerName === 'users') {
+                    if (body.entraId && !body.entraOid) body.entraOid = body.entraId;
+                    if (body.entraOid && !body.entraId) body.entraId = body.entraOid;
+                }
+
+                const newItem = { ...body, id: body.id || generateId() };
                 const { resource: createdItem } = await container.items.create(newItem);
 
                 await writeAudit({
@@ -813,6 +831,7 @@ async function crudHandler(context, request, containerName) {
                             validateRolesSchema(requestBody);
                             break;
                         case 'schedules':
+                        case 'patient-schedules':
                             validateSchedulesSchema(requestBody);
                             await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
                             break;
@@ -830,6 +849,11 @@ async function crudHandler(context, request, containerName) {
                         jsonBody: { error: validationError.message },
                         headers: { 'Content-Type': 'application/json' }
                     };
+                }
+
+                if (containerName === 'users') {
+                    if (requestBody.entraId && !requestBody.entraOid) requestBody.entraOid = requestBody.entraId;
+                    if (requestBody.entraOid && !requestBody.entraId) requestBody.entraId = requestBody.entraOid;
                 }
                 
                 const updatedItem = { ...requestBody, id: updateId };
@@ -938,7 +962,171 @@ app.http('schedules', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'schedules/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'schedules'),
+    handler: (request, context) => crudHandler(context, request, 'patient-schedules'),
+});
+
+app.http('patientSchedules', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patient-schedules/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'patient-schedules'),
+});
+
+const jsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+
+const stripUserSecrets = (user) => {
+    if (!user) return user;
+    const { password, ...safe } = user;
+    return safe;
+};
+
+const findUserByEntraOid = async (container, entraOid) => {
+    const { resources } = await container.items.query({
+        query: 'SELECT * FROM c WHERE c.entraOid = @oid OR c.entraId = @oid',
+        parameters: [{ name: '@oid', value: entraOid }],
+    }).fetchAll();
+    return resources && resources[0] ? resources[0] : null;
+};
+
+const verifyEntraIdToken = async (token) => {
+    const spaClientId = process.env.ENTRA_CLIENT_ID || process.env.ENTRA_SPA_CLIENT_ID || '';
+    if (!ENTRA_TENANT_ID || (!spaClientId && !ENTRA_API_AUDIENCE)) {
+        const err = new Error('UNAUTHORIZED: Entra ID is not configured on the API');
+        err.status = 503;
+        throw err;
+    }
+    const issuer = `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/v2.0`;
+    const audiences = [spaClientId, ENTRA_API_AUDIENCE].filter(Boolean);
+    let lastError = null;
+    for (const audience of audiences) {
+        try {
+            const { payload } = await jwtVerify(token, getJwks(), { issuer, audience });
+            return payload;
+        } catch (e) {
+            lastError = e;
+        }
+    }
+    const err = new Error(`UNAUTHORIZED: ${lastError && lastError.message ? lastError.message : 'Invalid token'}`);
+    err.status = 401;
+    throw err;
+};
+
+app.http('entraConfig', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'entra-config',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+        const clientId = process.env.ENTRA_CLIENT_ID || process.env.ENTRA_SPA_CLIENT_ID || '';
+        const tenantId = ENTRA_TENANT_ID || '';
+        const authority = tenantId
+            ? `https://login.microsoftonline.com/${tenantId}`
+            : 'https://login.microsoftonline.com/common';
+        return {
+            jsonBody: {
+                clientId,
+                tenantId,
+                authority,
+                enabled: !!(clientId && tenantId),
+            },
+            headers: jsonHeaders,
+        };
+    },
+});
+
+app.http('usersAuthenticateEntra', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/authenticate-entra',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const body = await safeJson(request);
+            const token = body && body.token;
+            if (!token) {
+                return { status: 400, jsonBody: { error: 'Token is required' }, headers: jsonHeaders };
+            }
+
+            const payload = await verifyEntraIdToken(token);
+            const entraOid = payload.oid || payload.sub;
+            const email = payload.email || payload.preferred_username || payload.upn || '';
+            const name = payload.name || `${payload.given_name || ''} ${payload.family_name || ''}`.trim();
+
+            if (!entraOid) {
+                return { status: 400, jsonBody: { error: 'Invalid token: missing user identifier' }, headers: jsonHeaders };
+            }
+
+            const container = getContainer('users');
+            let user = await findUserByEntraOid(container, entraOid);
+
+            if (!user) {
+                return {
+                    status: 403,
+                    jsonBody: {
+                        error: 'No NASA account is linked to this Microsoft sign-in. Ask a manager to add your Entra Object ID in Manager → Users.',
+                        entraOid,
+                        email,
+                    },
+                    headers: jsonHeaders,
+                };
+            }
+
+            const updates = {};
+            if (email && user.email !== email) updates.email = email;
+            if (name && user.displayName !== name) updates.displayName = name;
+            if (!user.entraOid) updates.entraOid = entraOid;
+            if (!user.entraId) updates.entraId = entraOid;
+
+            if (Object.keys(updates).length > 0) {
+                const updated = { ...user, ...updates, lastUpdated: new Date().toISOString() };
+                const { resource } = await container.items.upsert(updated);
+                user = resource;
+            }
+
+            if (user.active === false) {
+                return { status: 403, jsonBody: { error: 'User account is deactivated.' }, headers: jsonHeaders };
+            }
+
+            return { jsonBody: stripUserSecrets(user), headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Entra ID authentication failed');
+        }
+    },
+});
+
+app.http('usersAuthenticate', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/authenticate',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const body = await safeJson(request);
+            const identifier = String((body && body.username) || '').trim().toLowerCase();
+            const password = String((body && body.password) || '');
+            if (!identifier || !password) {
+                return { status: 400, jsonBody: { error: 'Username and password are required' }, headers: jsonHeaders };
+            }
+
+            const container = getContainer('users');
+            const { resources } = await container.items.query({
+                query: 'SELECT * FROM c WHERE LOWER(c.email) = @id OR LOWER(c.username) = @id',
+                parameters: [{ name: '@id', value: identifier }],
+            }).fetchAll();
+
+            const user = (resources || []).find((u) => String(u.password || '') === password);
+            if (!user) {
+                return { status: 401, jsonBody: { error: 'Invalid username/email or password' }, headers: jsonHeaders };
+            }
+            if (user.active === false) {
+                return { status: 403, jsonBody: { error: 'User account is deactivated.' }, headers: jsonHeaders };
+            }
+
+            return { jsonBody: stripUserSecrets(user), headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'User authentication failed');
+        }
+    },
 });
 
 app.http('surveys', {
