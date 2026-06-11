@@ -3170,7 +3170,7 @@
                 const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
                 return {
                     crc,
-                    isInactive: crc.active === false || crc.archived === true,
+                    isInactive: !isCrcSchedulable(crc),
                     isUnavailable: isSchedulingConflict,
                     isOnTimeOff,
                     unavailPeriod: getUnavailabilityPeriod(crc.id, date),
@@ -5180,33 +5180,16 @@
                 });
                 if (rejectedTimeOffRequest) return false;
 
-                const approvedTimeOffRequest = state.timeOffRequests.find(req => {
-                    if (req.crcId !== crcId) return false;
-                    const normalizedStatus = normalizeTimeOffStatus(req.status);
-                    if (normalizedStatus !== 'approved') return false;
-                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
-                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
-                    if (!reqStart) return false;
-                    if (normalizedDate === reqStart) return true;
-                    if (reqEnd && normalizedDate >= reqStart && normalizedDate <= reqEnd) return true;
-                    return false;
-                });
-                if (approvedTimeOffRequest && timeOffPeriodsConflict(approvedTimeOffRequest.period, period)) {
+                if (dateHasBlockingTimeOffForPeriod(crcId, normalizedDate, period, {
+                    includePending: false,
+                    includeApproved: true,
+                    excludeEventId,
+                    excludeGroupId
+                })) {
                     return true;
                 }
 
-                const ptoTypes = getPtoEventTypesSet();
-                const eventsOnDate = state.crc_events.filter(event => {
-                    if (excludeEventId && event.id === excludeEventId) return false;
-                    if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
-                    const eventDate = toDateOnlyString(parseDateFlexible(event.date));
-                    if (!eventDate || eventDate !== normalizedDate) return false;
-                    if (event.crcId !== crcId) return false;
-                    return ptoTypes.has(event.type);
-                });
-                if (eventsOnDate.length === 0) return false;
-                if (period === 'Full Day') return true;
-                return eventsOnDate.some(event => timeOffPeriodsConflict(event.period, period));
+                return false;
             };
 
             const isCRCUnavailable = (crcId, date, period, excludeEventId = null, excludeGroupId = null) =>
@@ -5590,7 +5573,15 @@
                 return assignments.some(entry => normalizeCrcId(entry) === crcId);
             };
 
-            const getSchedulableCrcs = (list) => (list || state.crcs || []).filter(c => c && c.id && c.active !== false && c.archived !== true);
+            const isCrcSchedulable = (crc) => !!(crc && crc.id && crc.active !== false && crc.archived !== true);
+            const getSchedulableCrcs = (list) => (list || state.crcs || []).filter(isCrcSchedulable);
+            /** Active staff only; keep inactive/archived visible when already assigned on this slot (read-only). */
+            const includeCrcInShiftRolePicker = (crc, assignedCrcId) => {
+                if (!crc?.id) return false;
+                if (isCrcSchedulable(crc)) return true;
+                const assigned = assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED';
+                return assigned && crc.id === assignedCrcId;
+            };
 
             /** CRC dashboard: show cancelled visits greyed out (still excluded from utilization via isCancelledShift). */
             const getCrcDashboardEvents = () => (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
@@ -5792,6 +5783,93 @@
                 const b = normalizeTimeOffPeriodBucket(periodB);
                 if (a === 'full' || b === 'full') return true;
                 return a === b;
+            };
+
+            const timeOffRequestCoversDate = (req, dateStr) => {
+                if (!req || !dateStr) return false;
+                const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
+                const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.startDate || req.date)) || reqStart;
+                if (!reqStart) return false;
+                return dateStr >= reqStart && dateStr <= reqEnd;
+            };
+
+            const getTimeOffRequestsForCrcOnDate = (crcId, dateStr, options = {}) => {
+                const { statuses = ['approved', 'pending'], excludeRequestId = null } = options;
+                const statusSet = new Set(statuses.map(s => normalizeTimeOffStatus(s)));
+                return (state.timeOffRequests || []).filter(req => {
+                    if (!crcId || req.crcId !== crcId) return false;
+                    if (excludeRequestId && req.id === excludeRequestId) return false;
+                    if (!statusSet.has(normalizeTimeOffStatus(req.status))) return false;
+                    return timeOffRequestCoversDate(req, dateStr);
+                });
+            };
+
+            const dateHasBlockingTimeOffForPeriod = (crcId, dateStr, period, options = {}) => {
+                if (!crcId || !dateStr || !period) return false;
+                const {
+                    includePending = true,
+                    includeApproved = true,
+                    excludeRequestId = null,
+                    excludeEventId = null,
+                    excludeGroupId = null
+                } = options;
+                const statuses = [];
+                if (includeApproved) statuses.push('approved');
+                if (includePending) statuses.push('pending');
+                const requests = getTimeOffRequestsForCrcOnDate(crcId, dateStr, { statuses, excludeRequestId });
+                if (requests.some(req => timeOffPeriodsConflict(req.period, period))) return true;
+
+                const ptoTypes = getPtoEventTypesSet();
+                const eventsOnDate = (state.crc_events || []).filter(event => {
+                    if (excludeEventId && event.id === excludeEventId) return false;
+                    if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
+                    const eventDate = toDateOnlyString(parseDateFlexible(event.date));
+                    if (!eventDate || eventDate !== dateStr) return false;
+                    if (event.crcId !== crcId) return false;
+                    return ptoTypes.has(event.type);
+                });
+                return eventsOnDate.some(event => timeOffPeriodsConflict(event.period, period));
+            };
+
+            const getDateTimeOffCalendarState = (crcId, dateStr, selectedPeriod) => {
+                const approved = getTimeOffRequestsForCrcOnDate(crcId, dateStr, { statuses: ['approved'] });
+                const pending = getTimeOffRequestsForCrcOnDate(crcId, dateStr, { statuses: ['pending'] });
+                const blocksForPeriod = (reqs) => reqs.some(r => timeOffPeriodsConflict(r.period, selectedPeriod));
+                const isBlocked = blocksForPeriod(approved) || blocksForPeriod(pending);
+
+                let statusLabel = '';
+                if (isBlocked) {
+                    if (blocksForPeriod(approved)) {
+                        statusLabel = '<div class="text-[10px] text-blue-700 dark:text-blue-300">Approved</div>';
+                    } else {
+                        statusLabel = '<div class="text-[10px] text-yellow-700 dark:text-yellow-300">Pending</div>';
+                    }
+                } else if (approved.length || pending.length) {
+                    const parts = [];
+                    const all = [...approved, ...pending];
+                    const hasFull = all.some(r => normalizeTimeOffPeriodBucket(r.period) === 'full');
+                    if (hasFull) {
+                        const st = normalizeTimeOffStatus(all.find(r => normalizeTimeOffPeriodBucket(r.period) === 'full').status);
+                        parts.push(st === 'approved' ? 'Full ✓' : 'Full …');
+                    } else {
+                        if (all.some(r => normalizeTimeOffPeriodBucket(r.period) === 'am')) {
+                            const am = all.find(r => normalizeTimeOffPeriodBucket(r.period) === 'am');
+                            parts.push(normalizeTimeOffStatus(am.status) === 'approved' ? 'AM ✓' : 'AM …');
+                        }
+                        if (all.some(r => normalizeTimeOffPeriodBucket(r.period) === 'pm')) {
+                            const pm = all.find(r => normalizeTimeOffPeriodBucket(r.period) === 'pm');
+                            parts.push(normalizeTimeOffStatus(pm.status) === 'approved' ? 'PM ✓' : 'PM …');
+                        }
+                    }
+                    statusLabel = `<div class="text-[10px] text-gray-600 dark:text-gray-400">${parts.join(' ')}</div>`;
+                }
+
+                return {
+                    isBlocked,
+                    statusLabel,
+                    hasPartial: !isBlocked && (approved.length > 0 || pending.length > 0),
+                    blockedByPending: isBlocked && !blocksForPeriod(approved) && blocksForPeriod(pending)
+                };
             };
 
             const getCrcIdsOnShiftEvent = (shiftEvent) => {
@@ -6507,9 +6585,11 @@
                     if (state.crc_events.length < beforeTravel) {
                         debugWarn(`CHAOS: Collapsed ${beforeTravel - state.crc_events.length} duplicate travel days for display (one per person per date)`);
                     }
-                    // PTO/TIME OFF DISPLAY DEDUPE: Keep only one per (crcId, date) across all legacy formats (see CONFIG.ptoEventTypes)
+                    // PTO/TIME OFF DISPLAY DEDUPE: one per (crcId, date, period bucket) so AM/PM can coexist
                     const ptoTypes = getPtoEventTypesSet();
-                    const ptoKey = (e) => e.crcId && e.date ? `pto:${e.crcId}::${e.date}` : null;
+                    const ptoKey = (e) => e.crcId && e.date
+                        ? `pto:${e.crcId}::${e.date}::${normalizeTimeOffPeriodBucket(e.period)}`
+                        : null;
                     const seenPtoKeys = new Set();
                     const beforePto = state.crc_events.length;
                     state.crc_events = state.crc_events.filter(event => {
@@ -6539,7 +6619,7 @@
                     if (beforeCount !== afterCount) {
                         debugWarn(`CHAOS: Deduplicated ${beforeCount - afterCount} duplicate time off requests`);
                     }
-                    // PTO REQUESTS DISPLAY DEDUPE: Keep one per (crcId, startDate) so multiple formats don't flood the UI
+                    // PTO REQUESTS DISPLAY DEDUPE: one per (crcId, startDate, period bucket) so AM/PM can coexist
                     const reqStart = (r) => toDateOnlyString(parseDateFlexible(r.startDate || r.date));
                     const seenReqKeys = new Set();
                     const beforeReq = state.timeOffRequests.length;
@@ -6547,13 +6627,13 @@
                         const crcId = request.crcId;
                         const start = reqStart(request);
                         if (!crcId || !start) return true;
-                        const key = `req:${crcId}::${start}`;
+                        const key = `req:${crcId}::${start}::${normalizeTimeOffPeriodBucket(request.period)}`;
                         if (seenReqKeys.has(key)) return false;
                         seenReqKeys.add(key);
                         return true;
                     });
                     if (state.timeOffRequests.length < beforeReq) {
-                        debugWarn(`CHAOS: Collapsed ${beforeReq - state.timeOffRequests.length} duplicate time off requests for display (one per person per start date)`);
+                        debugWarn(`CHAOS: Collapsed ${beforeReq - state.timeOffRequests.length} duplicate time off requests for display (one per person per date per period)`);
                     }
                 }
                 if (options.skipRender) {
@@ -6756,7 +6836,7 @@
                 }
             };
             
-            // Remove duplicate PTO/time off EVENTS from crc_events (one per person per date). Keeps one, deletes extras. All legacy formats (Paid Time Off, Unavailable, PTO, Time Off, Sick Time, etc.) treated as same for dedupe.
+            // Remove duplicate PTO/time off EVENTS from crc_events (same person, date, period). AM/PM on same day are kept.
             const PTO_EVENT_TYPES = getPtoEventTypesSet();
             const cleanDuplicatePTOInApi = async () => {
                 const events = await apiService.getEvents({ full: true });
@@ -6764,7 +6844,7 @@
                 const groups = new Map();
                 ptoEvents.forEach(e => {
                     if (!e.crcId || !e.date) return;
-                    const key = `${e.crcId}::${e.date}`;
+                    const key = `${e.crcId}::${e.date}::${normalizeTimeOffPeriodBucket(e.period)}`;
                     if (!groups.has(key)) groups.set(key, []);
                     groups.get(key).push(e);
                 });
@@ -6793,7 +6873,7 @@
                 showNotification(`Removed ${toDelete.length} duplicate PTO/time off event(s). One per person per date kept.`, 'success');
             };
             
-            // Remove duplicate time off REQUESTS (one per person per start date). Keeps one, deletes extras.
+            // Remove duplicate time off REQUESTS (same person, date, and period). AM/PM on same day are kept.
             const cleanDuplicateTimeOffRequestsInApi = async () => {
                 const requests = await apiService.getTimeOffRequests();
                 const list = Array.isArray(requests) ? requests : [];
@@ -6803,7 +6883,7 @@
                     const crcId = r.crcId;
                     const start = reqStart(r);
                     if (!crcId || !start) return;
-                    const key = `${crcId}::${start}`;
+                    const key = `${crcId}::${start}::${normalizeTimeOffPeriodBucket(r.period)}`;
                     if (!groups.has(key)) groups.set(key, []);
                     groups.get(key).push(r);
                 });
@@ -6827,7 +6907,7 @@
                 }
                 const updated = await apiService.getTimeOffRequests();
                 setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
-                showNotification(`Removed ${toDelete.length} duplicate time off request(s). One per person per start date kept.`, 'success');
+                showNotification(`Removed ${toDelete.length} duplicate time off request(s). One per person per date per period kept.`, 'success');
             };
             
             // Find and report duplicates in the data - returns detailed info for cleanup
@@ -11013,7 +11093,9 @@
                 let createdCount = 0;
 
                 const existingRequestKeys = new Set(
-                    (state.timeOffRequests || []).map(req => `${req.crcId}_${req.date || req.startDate}`)
+                    (state.timeOffRequests || []).map(req =>
+                        `${req.crcId}_${req.date || req.startDate}_${normalizeTimeOffPeriodBucket(req.period)}`
+                    )
                 );
 
                 const crcMap = new Map(
@@ -11087,7 +11169,7 @@
 
                     while (cursor <= limit) {
                         const dateStr = toDateOnlyString(cursor);
-                        const duplicateKey = `${crcId}_${dateStr}`;
+                        const duplicateKey = `${crcId}_${dateStr}_${normalizeTimeOffPeriodBucket(period)}`;
                         if (existingRequestKeys.has(duplicateKey)) {
                             cursor.setDate(cursor.getDate() + 1);
                             continue;
@@ -25021,8 +25103,8 @@
                     if (option.value) {
                         const crcId = option.value;
                         const crc = state.crcs.find(c => c.id === crcId);
-                        const isInactive = crc && crc.active === false;
-                        // Hide inactive CRCs from selection lists so they can't be scheduled going forward.
+                        const isInactive = crc && !isCrcSchedulable(crc);
+                        // Hide inactive/archived CRCs from selection lists so they can't be scheduled going forward.
                         // If an inactive CRC is already selected on an existing event, keep it visible (read-only) to avoid data loss.
                         if (isInactive && !currentlySelectedCrcIds.has(crcId)) {
                             option.hidden = true;
@@ -25456,6 +25538,7 @@
                     
                     // If editing and this CRC is selected, always include them
                     const isSelected = event && (event.crcId === crc.id || crcIdsOnEvent.has(crc.id));
+                    if (!isCrcSchedulable(crc) && !isSelected) return '';
                     
                     // For Site Assignment with known roles, check training
                     let trainingNote = '';
@@ -25467,8 +25550,10 @@
                     }
                     
                     const pendingText = hasPendingTimeOffOnDate(crc.id, dateStr) ? ' (Pending Review)' : '';
-                    return `<option value="${crc.id}" ${isSelected ? 'selected' : ''}>${crc.name}${pendingText}${unavailableText}${trainingNote}</option>`;
-                }).join('');
+                    const inactiveAttr = !isCrcSchedulable(crc) ? 'disabled' : '';
+                    const inactiveLabel = !isCrcSchedulable(crc) ? ' (Inactive)' : '';
+                    return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} ${inactiveAttr}>${crc.name}${inactiveLabel}${pendingText}${unavailableText}${trainingNote}</option>`;
+                }).filter(Boolean).join('');
                 // Debug site loading for shift creation
                 debugLog('CHAOS: Sites available for shift creation:', state.crc_sites.length);
                 if (state.crc_sites.length === 0) {
@@ -27344,6 +27429,8 @@
                 // Store for navigation
                 window._ptoCalendarYear = selectedYear;
                 window._ptoCalendarMonth = selectedMonth;
+                window._ptoCurrentType = ptoType;
+                const selectedPeriod = window._ptoSelectedPeriod || 'Full Day';
                 
                 // Use selectedYear and selectedMonth (avoid redeclaring year/month)
                 const calendarYear = selectedYear;
@@ -27362,11 +27449,12 @@
                     <div class="mb-4">
                         <label class="block text-sm font-medium dark:text-gray-300 mb-2">Time Period (applies to all selected days)</label>
                         <select id="pto-period-select" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                            <option value="Full Day">Full Day (8 hours)</option>
-                            <option value="AM">AM Half Day (4 hours)</option>
-                            <option value="PM">PM Half Day (4 hours)</option>
-                            <option value="Before 2pm">Before 2pm (4 hours)</option>
+                            <option value="Full Day" ${selectedPeriod === 'Full Day' ? 'selected' : ''}>Full Day (8 hours)</option>
+                            <option value="AM" ${selectedPeriod === 'AM' ? 'selected' : ''}>AM Half Day (4 hours)</option>
+                            <option value="PM" ${selectedPeriod === 'PM' ? 'selected' : ''}>PM Half Day (4 hours)</option>
+                            <option value="Before 2pm" ${selectedPeriod === 'Before 2pm' ? 'selected' : ''}>Before 2pm (4 hours)</option>
                         </select>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">AM and PM can be different types on the same day. Full Day blocks the entire day.</p>
                     </div>
                     <div class="mb-4 flex items-center justify-between">
                         <button data-action="pto-prev-month" data-pto-type="${ptoType}" class="p-2 rounded-md bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600">
@@ -27403,39 +27491,18 @@
                 const loggedInCrcId = getLoggedInCrcId();
                 const crcId = isCrcUser && loggedInCrcId ? loggedInCrcId : state.selectedCrcForUnavailability;
                 
-                // Build maps of existing time off requests (exclude rejected)
-                const approvedDates = new Set();
-                const pendingDates = new Set();
-                if (crcId) {
-                    (state.timeOffRequests || []).forEach(req => {
-                        if (req.crcId !== crcId) return;
-                        const status = String(req?.status || '').toLowerCase().trim();
-                        if (status === 'rejected') return; // Ignore rejected
-                        const reqDate = toDateOnlyString(parseDateFlexible(req.date || req.startDate));
-                        const reqEndDate = toDateOnlyString(parseDateFlexible(req.endDate || req.startDate || req.date)) || reqDate;
-                        if (!reqDate) return;
-                        const start = new Date(reqDate + 'T00:00:00');
-                        const end = new Date(reqEndDate + 'T00:00:00');
-                        const cursor = new Date(start);
-                        while (cursor <= end) {
-                            const d = toDateOnlyString(cursor);
-                            if (status === 'approved') {
-                                approvedDates.add(d);
-                            } else if (status === 'pending') {
-                                pendingDates.add(d);
-                            }
-                            cursor.setDate(cursor.getDate() + 1);
-                        }
-                    });
-                }
-                
                 for (let day = 1; day <= daysInMonth; day++) {
                     const dateStr = `${calendarYear}-${String(calendarMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                     const isPast = dateStr < today;
                     const isToday = dateStr === today;
                     const isSelected = selectedDates.has(dateStr);
-                    const isApproved = approvedDates.has(dateStr);
-                    const isPending = pendingDates.has(dateStr);
+                    const calendarState = crcId
+                        ? getDateTimeOffCalendarState(crcId, dateStr, selectedPeriod)
+                        : { isBlocked: false, statusLabel: '', hasPartial: false, blockedByPending: false };
+                    const isPeriodBlocked = calendarState.isBlocked;
+                    const hasPartialTimeOff = calendarState.hasPartial;
+                    const statusLabel = calendarState.statusLabel;
+                    const blockedByPending = calendarState.blockedByPending;
                     // CRCs can select past dates up to 30 days ago; fully backdate Capped - FTE only
                     const isCappedFtePto = ptoType === 'Capped - FTE only';
                     const isPastWithin30ForCrc = isPast && isCrcUser && dateStr >= thirtyDaysAgoStr;
@@ -27443,17 +27510,16 @@
                     const isPastAndBlocked = isPast && !isPastAndSelectable;
                     
                     let buttonClass = '';
-                    let statusLabel = '';
                     if (isPastAndBlocked) {
                         buttonClass = 'opacity-50 cursor-not-allowed bg-gray-100 dark:bg-gray-800 border-gray-300 dark:border-gray-600';
                     } else if (isSelected) {
                         buttonClass = 'bg-blue-600 text-white border-blue-500';
-                    } else if (isApproved) {
-                        buttonClass = 'bg-blue-100 dark:bg-blue-900/40 border-blue-300 dark:border-blue-600 cursor-not-allowed';
-                        statusLabel = '<div class="text-[10px] text-blue-700 dark:text-blue-300">Approved</div>';
-                    } else if (isPending) {
+                    } else if (isPeriodBlocked && blockedByPending) {
                         buttonClass = 'bg-yellow-100 dark:bg-yellow-900/40 border-yellow-300 dark:border-yellow-600 cursor-not-allowed';
-                        statusLabel = '<div class="text-[10px] text-yellow-700 dark:text-yellow-300">Pending</div>';
+                    } else if (isPeriodBlocked) {
+                        buttonClass = 'bg-blue-100 dark:bg-blue-900/40 border-blue-300 dark:border-blue-600 cursor-not-allowed';
+                    } else if (hasPartialTimeOff) {
+                        buttonClass = 'border-violet-300 dark:border-violet-600 bg-violet-50 dark:bg-violet-900/20 hover:border-violet-400 dark:hover:border-violet-500 hover:bg-violet-100 dark:hover:bg-violet-900/30 text-gray-900 dark:text-gray-100';
                     } else if (isToday) {
                         buttonClass = 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/30';
                     } else if (isPastAndSelectable) {
@@ -27470,9 +27536,9 @@
                             data-date="${dateStr}" 
                             data-pto-type="${ptoType}"
                             class="min-h-[60px] p-2 rounded-md border-2 transition-all ${buttonClass} font-medium flex flex-col items-center justify-center"
-                            ${isPastAndBlocked || isApproved || isPending ? 'disabled' : ''}
-                            ${isPastAndSelectable && !isApproved && !isPending ? 'style="pointer-events: auto;"' : ''}
-                            title="${isApproved ? dateStr + ' (Already approved)' : isPending ? dateStr + ' (Pending approval)' : pastTitle}"
+                            ${isPastAndBlocked || isPeriodBlocked ? 'disabled' : ''}
+                            ${isPastAndSelectable && !isPeriodBlocked ? 'style="pointer-events: auto;"' : ''}
+                            title="${isPeriodBlocked ? dateStr + ' (Time off already covers this period)' : hasPartialTimeOff ? dateStr + ' (Other half of day has time off)' : pastTitle}"
                         >
                             <span>${day}</span>
                             ${statusLabel}
@@ -27545,14 +27611,18 @@
                     }
                 };
                 
-                // Update period on submit button
                 const periodSelect = document.getElementById('pto-period-select');
                 if (periodSelect) {
+                    window._ptoSelectedPeriod = periodSelect.value;
                     periodSelect.addEventListener('change', (e) => {
-                        const submitBtn = document.getElementById('pto-submit-selected-dates');
-                        if (submitBtn) {
-                            submitBtn.dataset.period = e.target.value;
-                        }
+                        window._ptoSelectedPeriod = e.target.value;
+                        const ptoType = window._ptoCurrentType;
+                        if (!ptoType) return;
+                        openModal(getPTOCalendarSelectionModalHTML(ptoType, window._ptoCalendarYear, window._ptoCalendarMonth), '4xl');
+                        setTimeout(() => {
+                            setupPTOCalendarSelection(ptoType);
+                            lucide.createIcons();
+                        }, 50);
                     });
                 }
                 
@@ -30873,37 +30943,23 @@
                         const ptoType = actionButton.dataset.ptoType;
                         if (!dateStr || !ptoType) return;
                         
-                        // Check if date is disabled (approved/pending/rejected)
                         if (actionButton.disabled) {
-                            showNotification('This date already has a time off request (approved or pending).', 'info');
+                            showNotification('This date already has time off for the selected period.', 'info');
                             return;
                         }
                         
-                        // Check if date is in the past - managers can select past dates
                         const today = toDateOnlyString(new Date());
                         const canSelectPastDates = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
-                        if (dateStr < today && !canSelectPastDates) return; // Non-managers can't select past dates
+                        if (dateStr < today && !canSelectPastDates) return;
                         
-                        // Check if date already has approved/pending time off
                         const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
                         const loggedInCrcId = getLoggedInCrcId();
                         const crcId = isCrcUser && loggedInCrcId ? loggedInCrcId : state.selectedCrcForUnavailability;
-                        if (crcId) {
-                            const existingRequest = (state.timeOffRequests || []).find(req => {
-                                if (req.crcId !== crcId) return false;
-                                const status = String(req?.status || '').toLowerCase().trim();
-                                if (status === 'rejected') return false; // Rejected don't block
-                                const reqDate = toDateOnlyString(parseDateFlexible(req.date || req.startDate));
-                                const reqEndDate = toDateOnlyString(parseDateFlexible(req.endDate || req.startDate || req.date)) || reqDate;
-                                return dateStr >= reqDate && dateStr <= reqEndDate;
-                            });
-                            if (existingRequest) {
-                                const status = String(existingRequest.status || '').toLowerCase().trim();
-                                if (status === 'approved' || status === 'pending') {
-                                    showNotification(`This date already has a ${status} time off request.`, 'info');
-                                    return;
-                                }
-                            }
+                        const periodSelect = document.getElementById('pto-period-select');
+                        const selectedPeriod = periodSelect ? periodSelect.value : (window._ptoSelectedPeriod || 'Full Day');
+                        if (crcId && dateHasBlockingTimeOffForPeriod(crcId, dateStr, selectedPeriod)) {
+                            showNotification(`This date already has time off for ${selectedPeriod === 'Full Day' ? 'the full day' : selectedPeriod}.`, 'info');
+                            return;
                         }
                         
                         // Toggle selection state for this date
@@ -41615,7 +41671,7 @@
                                                                 <option value="">Select Staff</option>
                                                                 <option value="SITE_STAFF" ${crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
                                                                 <option value="UNASSIGNED" ${crcId === 'UNASSIGNED' ? 'selected' : ''} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>
-                                                                ${qualifiedCrcs.map(c => {
+                                                                ${qualifiedCrcs.filter(c => includeCrcInShiftRolePicker(c, crcId)).map(c => {
                                                                     const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
                                                                     const excludeGroupIdForEdit = existingEvent ? existingEvent.groupId : null;
                                                                     const isUnavailable = allowOverrideEdit ? false : isCRCScheduledOnDate(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
@@ -41625,8 +41681,9 @@
                                                                         const periodText = unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Unavailable';
                                                                         statusText = ` (Time Off - ${periodText})`;
                                                                     }
+                                                                    const isInactive = !isCrcSchedulable(c);
                                                                     const styleClass = isUnavailable && c.id !== crcId ? 'text-red-600 dark:text-red-400' : '';
-                                                                    return `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''} class="${styleClass}">${c.name}${statusText}</option>`;
+                                                                    return `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''} ${isInactive ? 'disabled' : ''} class="${styleClass}">${c.name}${isInactive ? ' (Inactive)' : ''}${statusText}</option>`;
                                                                 }).join('')}
                                                                 ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
                                                             </select>
@@ -41829,7 +41886,9 @@
                                 }
                                 if (existingEvent.crcId && existingEvent.crcId !== 'SITE_STAFF' && existingEvent.crcId !== 'UNASSIGNED' && !qualifiedCrcs.some(c => c.id === existingEvent.crcId)) {
                                     const pinned = (state.crcs || []).find(c => c.id === existingEvent.crcId);
-                                    if (pinned) qualifiedCrcs = [pinned, ...qualifiedCrcs];
+                                    if (pinned && includeCrcInShiftRolePicker(pinned, existingEvent.crcId)) {
+                                        qualifiedCrcs = [pinned, ...qualifiedCrcs];
+                                    }
                                 }
                                 // Sort alphabetically
                                 qualifiedCrcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
@@ -41844,7 +41903,7 @@
                                                     <option value="">Select Staff</option>
                                                     <option value="SITE_STAFF" ${existingEvent.crcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>
                                                     <option value="UNASSIGNED" ${existingEvent.crcId === 'UNASSIGNED' ? 'selected' : ''} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>
-                                                    ${qualifiedCrcs.map(c => {
+                                                    ${qualifiedCrcs.filter(c => includeCrcInShiftRolePicker(c, existingEvent.crcId)).map(c => {
                                                         // Pass excludeEventId and excludeGroupId to avoid showing CRCs on this shift as unavailable
                                                         const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
                                                         const excludeGroupIdForEdit = existingEvent ? existingEvent.groupId : null;
@@ -41855,8 +41914,9 @@
                                                             const periodText = unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Unavailable';
                                                             statusText = ` (Time Off - ${periodText})`;
                                                         }
+                                                        const isInactive = !isCrcSchedulable(c);
                                                         const styleClass = isUnavailable && c.id !== existingEvent.crcId ? 'text-red-600 dark:text-red-400' : '';
-                                                        return `<option value="${c.id}" ${c.id === existingEvent.crcId ? 'selected' : ''} class="${styleClass}">${c.name}${statusText}</option>`;
+                                                        return `<option value="${c.id}" ${c.id === existingEvent.crcId ? 'selected' : ''} ${isInactive ? 'disabled' : ''} class="${styleClass}">${c.name}${isInactive ? ' (Inactive)' : ''}${statusText}</option>`;
                                                     }).join('')}
                                                     ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
                                                 </select>
@@ -42250,15 +42310,18 @@
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED' && !qualifiedCrcs.some(c => c.id === assignedCrcId)) {
                                 const pinned = (state.crcs || []).find(c => c.id === assignedCrcId);
-                                if (pinned) qualifiedCrcs = [pinned, ...qualifiedCrcs];
+                                if (pinned && includeCrcInShiftRolePicker(pinned, assignedCrcId)) {
+                                    qualifiedCrcs = [pinned, ...qualifiedCrcs];
+                                }
                             }
 
                             let available = [];
                             let unavailable = [];
                             if (allowOverride) {
-                                available = qualifiedCrcs;
+                                available = qualifiedCrcs.filter(crc => includeCrcInShiftRolePicker(crc, assignedCrcId));
                             } else {
                                 qualifiedCrcs.forEach(crc => {
+                                    if (!includeCrcInShiftRolePicker(crc, assignedCrcId)) return;
                                     const isSchedulingConflict = isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
                                     if (isSchedulingConflict) unavailable.push(crc);
                                     else available.push(crc);
@@ -42498,9 +42561,10 @@
                                 if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED') {
                                     const assignedCrc = state.crcs.find(c => c.id === assignedCrcId);
                                     if (assignedCrc && !qualifiedCrcs.find(c => c.id === assignedCrcId)) {
-                                        // This CRC is assigned but doesn't have training - add to separate list
-                                        untrainedAssignedCrcs.push(assignedCrc);
-                                        console.log(`Including assigned CRC ${assignedCrc.name} even though they don't have training for ${roleName}`);
+                                        if (isCrcSchedulable(assignedCrc) || existingAssignmentsRaw.includes(assignedCrcId)) {
+                                            untrainedAssignedCrcs.push(assignedCrc);
+                                            console.log(`Including assigned CRC ${assignedCrc.name} even though they don't have training for ${roleName}`);
+                                        }
                                     }
                                 }
                             });
@@ -42575,10 +42639,11 @@
                         // Do not list unselected unavailable CRCs: they sat at the bottom with gray "(Time Off / Scheduled)" and read as still on the shift after removal.
                         // Keep selected slots, untrained-but-still-assigned, volunteers, and everyone who is actually available to pick.
                         crcsWithInfo = crcsWithInfo.filter(entry =>
-                            entry.isSelected ||
+                            (isCrcSchedulable(entry.crc) || existingAssignmentsRaw.includes(entry.crc.id)) &&
+                            (entry.isSelected ||
                             entry.isUntrained ||
                             !entry.isUnavailable ||
-                            volunteerCrcIdsForRole.includes(entry.crc.id)
+                            volunteerCrcIdsForRole.includes(entry.crc.id))
                         );
                         
                         const buildRoleOptions = (slotIndex, roleIdForSlot) => {
@@ -42604,8 +42669,9 @@
                         const otherUnavailable = unavailableCrcs.filter(c => !volunteerCrcIds.includes(c.crc.id));
                         
                         const volunteerLabel = ' (volunteer)';
+                        const pickerVisible = (entry) => includeCrcInShiftRolePicker(entry.crc, assignedCrcId);
                         // Volunteers (available first)
-                        optionsHtml += volunteerAvailable.map(({ crc, distance, hasPending, isUntrained, isInactive }) => {
+                        optionsHtml += volunteerAvailable.filter(pickerVisible).map(({ crc, distance, hasPending, isUntrained, isInactive }) => {
                             let distanceText = distance !== null ? ` - ${distance} mi` : '';
                             const pendingText = hasPending ? ' (Pending Review)' : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
@@ -42618,7 +42684,7 @@
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         // Other available CRCs (includes staff on PTO — selectable with warning label)
-                        optionsHtml += otherAvailable.map(({ crc, distance, hasPending, isUntrained, isInactive, isOnTimeOff, unavailPeriod }) => {
+                        optionsHtml += otherAvailable.filter(pickerVisible).map(({ crc, distance, hasPending, isUntrained, isInactive, isOnTimeOff, unavailPeriod }) => {
                             let distanceText = distance !== null ? ` - ${distance} mi` : '';
                             const pendingText = hasPending ? ' (Pending Review)' : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
@@ -42636,7 +42702,7 @@
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${timeOffText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         // Volunteers (scheduling conflict) - still show with (volunteer)
-                        optionsHtml += volunteerUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
+                        optionsHtml += volunteerUnavailable.filter(pickerVisible).map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
                             let statusText = conflictInfo ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})` : ` (Time Off - ${unavailPeriod || 'Full Day'})`;
                             let distanceText = (distance !== null && !conflictInfo) ? ` - ${distance} mi` : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
@@ -42648,7 +42714,7 @@
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
                         // Other unavailable CRCs
-                        optionsHtml += otherUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
+                        optionsHtml += otherUnavailable.filter(pickerVisible).map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
                             let statusText = '';
                             if (conflictInfo) {
                                 statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
@@ -43056,8 +43122,10 @@
                             if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED') {
                                 const assignedCrc = state.crcs.find(c => c.id === assignedCrcId);
                                 if (assignedCrc && !qualifiedCrcs.find(c => c.id === assignedCrcId)) {
-                                    untrainedAssignedCrcs.push(assignedCrc);
-                                    console.log(`Tracking assigned CRC ${assignedCrc.name} who doesn't have training for ${role.name}`);
+                                    if (isCrcSchedulable(assignedCrc) || existingAssignmentsRaw.includes(assignedCrcId)) {
+                                        untrainedAssignedCrcs.push(assignedCrc);
+                                        console.log(`Tracking assigned CRC ${assignedCrc.name} who doesn't have training for ${role.name}`);
+                                    }
                                 }
                             }
                         });
@@ -43123,10 +43191,11 @@
                         ? existingEvent.volunteerApplications.filter(a => a.status === 'pending' && (a.roleId === roleId || !a.roleId)).map(a => a.crcId)
                         : [];
                     crcsWithInfo = crcsWithInfo.filter(entry =>
-                        entry.isSelected ||
+                        (isCrcSchedulable(entry.crc) || existingAssignmentsRaw.includes(entry.crc.id)) &&
+                        (entry.isSelected ||
                         entry.isUntrained ||
                         !entry.isUnavailable ||
-                        volunteerCrcIdsForReqRole.includes(entry.crc.id)
+                        volunteerCrcIdsForReqRole.includes(entry.crc.id))
                     );
                     
                     const buildRoleOptions = (slotIndex, roleIdForSlot) => {
@@ -43148,17 +43217,20 @@
                         const volunteerUnavailable = unavailableCrcs.filter(c => volunteerCrcIds.includes(c.crc.id));
                         const otherUnavailable = unavailableCrcs.filter(c => !volunteerCrcIds.includes(c.crc.id));
                         const volunteerLabel = ' (volunteer)';
-                        optionsHtml += volunteerAvailable.map(({ crc, distance, hasPending, isUntrained }) => {
+                        const pickerVisibleReq = (entry) => includeCrcInShiftRolePicker(entry.crc, assignedCrcId);
+                        optionsHtml += volunteerAvailable.filter(pickerVisibleReq).map(({ crc, distance, hasPending, isUntrained, isInactive }) => {
                             let distanceText = distance !== null ? ` - ${distance} mi` : '';
                             const pendingText = hasPending ? ' (Pending Review)' : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClasses = ['text-green-600 dark:text-green-400'];
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
                             if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${untrainedText}${pendingText}${distanceText}</option>`;
+                            const disabledAttr = isInactive ? 'disabled' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${pendingText}${distanceText}</option>`;
                         }).join('');
-                        optionsHtml += otherAvailable.map(({ crc, distance, hasPending, isUntrained, isOnTimeOff, unavailPeriod }) => {
+                        optionsHtml += otherAvailable.filter(pickerVisibleReq).map(({ crc, distance, hasPending, isUntrained, isInactive, isOnTimeOff, unavailPeriod }) => {
                             let distanceText = distance !== null ? ` - ${distance} mi` : '';
                             const pendingText = hasPending ? ' (Pending Review)' : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
@@ -43169,28 +43241,34 @@
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
                             if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
                             if (isOnTimeOff) styleClasses.push('text-amber-600 dark:text-amber-400');
+                            const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${timeOffText}${pendingText}${distanceText}</option>`;
+                            const disabledAttr = isInactive ? 'disabled' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${timeOffText}${pendingText}${distanceText}</option>`;
                         }).join('');
-                        optionsHtml += volunteerUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained }) => {
+                        optionsHtml += volunteerUnavailable.filter(pickerVisibleReq).map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
                             let statusText = conflictInfo ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})` : ` (Time Off - ${unavailPeriod || 'Full Day'})`;
                             let distanceText = (distance !== null && !conflictInfo) ? ` - ${distance} mi` : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClasses = ['text-gray-400 dark:text-gray-500', 'text-green-600 dark:text-green-500'];
                             if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${untrainedText}${statusText}${distanceText}</option>`;
+                            const disabledAttr = isInactive ? 'disabled' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
-                        optionsHtml += otherUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained }) => {
+                        optionsHtml += otherUnavailable.filter(pickerVisibleReq).map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
                             let statusText = conflictInfo ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})` : ` (Time Off - ${unavailPeriod || 'Full Day'})`;
                             let distanceText = (distance !== null && !conflictInfo) ? ` - ${distance} mi` : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClasses = ['text-gray-400 dark:text-gray-500'];
                             if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${statusText}${distanceText}</option>`;
+                            const disabledAttr = isInactive ? 'disabled' : '';
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
 
                         // Only include untrained assigned CRCs if they're currently assigned to this specific slot

@@ -6424,31 +6424,26 @@ app.http('time-off-requests', {
                             })
                             .fetchAll();
                         
-                        // Check if there's already an approved time off request for this CRC on the same date(s)
                         const duplicateApproved = existingRequests.find(req => {
                             if (!req.date && !req.startDate) return false;
-                            
-                            const reqDate = req.date || req.startDate;
+
                             const reqStartDate = req.startDate || req.date;
                             const reqEndDate = req.endDate || req.date || req.startDate;
-                            
-                            // Check for exact date match
-                            if (reqDate === normalizedDate || reqStartDate === normalizedStartDate) {
-                                return true;
-                            }
-                            
-                            // Check for date range overlap
-                            const reqStart = new Date(reqStartDate);
-                            const reqEnd = new Date(reqEndDate);
                             const newStart = new Date(normalizedStartDate);
                             const newEnd = new Date(normalizedEndDate);
-                            
-                            // Check if date ranges overlap
-                            if (newStart <= reqEnd && newEnd >= reqStart) {
-                                return true;
+                            const reqStart = new Date(reqStartDate);
+                            const reqEnd = new Date(reqEndDate);
+
+                            if (newStart > reqEnd || newEnd < reqStart) return false;
+
+                            if (normalizedStartDate === normalizedEndDate && reqStartDate === reqEndDate) {
+                                if (normalizedStartDate === reqStartDate) {
+                                    return timeOffPeriodsConflict(req.period, requestBody.period);
+                                }
+                                return false;
                             }
-                            
-                            return false;
+
+                            return timeOffPeriodsConflict(req.period, requestBody.period);
                         });
                         
                         if (duplicateApproved) {
@@ -6456,7 +6451,7 @@ app.http('time-off-requests', {
                                 status: 409,
                                 jsonBody: { 
                                     error: 'Duplicate approved time off request',
-                                    message: 'An approved time off request already exists for this employee on the selected date(s).',
+                                    message: 'An approved time off request already exists for this employee on the selected date(s) for that time period (AM/PM can be split; Full Day blocks the whole day).',
                                     existingRequestId: duplicateApproved.id
                                 },
                                 headers: { 'Content-Type': 'application/json' }
