@@ -242,6 +242,13 @@ const validateSitesSchema = (data) => {
     if (data.piEmail !== undefined && data.piEmail !== null && typeof data.piEmail !== 'string') {
         errors.push('piEmail must be a string');
     }
+
+    const optionalPiFields = ['pi2Name', 'pi2Email', 'pi3Name', 'pi3Email'];
+    optionalPiFields.forEach((field) => {
+        if (data[field] !== undefined && data[field] !== null && typeof data[field] !== 'string') {
+            errors.push(`${field} must be a string`);
+        }
+    });
     
     // Coordinator fields are optional (legacy string fields)
     if (data.siteCoordinator !== undefined && data.siteCoordinator !== null && typeof data.siteCoordinator !== 'string') {
