@@ -2824,6 +2824,7 @@
                 navanBackdoorMode: false, // Backdoor mode: cache only, don't write to DB
                 crcStats: {},
                 announcements: [], // System announcements for CRCs
+                deferredAppDataLoaded: false,
                 announcementViews: {}, // Track which announcements each user has seen (userId -> {announcementId: timestamp})
                 timeOffSummaryRange: 'month',
                 timeOffSummaryCustomStart: null,
@@ -3132,32 +3133,93 @@
                 return addressParts.join(', ');
             };
 
-            // Calculate distance between CRC and site (using geocoding and Haversine)
-            const calculateCrcToSiteDistance = async (crc, site) => {
+            // Calculate distance between CRC and site (cached geocoding + Haversine)
+            const calculateCrcToSiteDistance = async (crc, site, siteCoordsPreloaded = null) => {
                 try {
-                    const crcAddress = getCrcAddress(crc);
-                    const siteAddress = getSiteAddress(site);
-                    
-                    if (!crcAddress || !siteAddress) return null;
-                    
-                    // Geocode both addresses
-                    const crcGeocode = await geocodeLocation(crcAddress);
-                    const siteGeocode = await geocodeLocation(siteAddress);
-                    
-                    if (!crcGeocode || !siteGeocode) return null;
-                    
-                    // Calculate distance using Haversine formula
+                    const [crcCoords, siteCoords] = await Promise.all([
+                        resolveCrcCoordinates(crc),
+                        siteCoordsPreloaded ? Promise.resolve(siteCoordsPreloaded) : resolveSiteCoordinates(site),
+                    ]);
+                    if (!crcCoords || !siteCoords) return null;
                     const distance = calculateHaversineDistance(
-                        crcGeocode.lat,
-                        crcGeocode.lng,
-                        siteGeocode.lat,
-                        siteGeocode.lng
+                        crcCoords.lat,
+                        crcCoords.lng,
+                        siteCoords.lat,
+                        siteCoords.lng
                     );
-                    
-                    return Math.round(distance * 10) / 10; // Round to 1 decimal place
+                    return Math.round(distance * 10) / 10;
                 } catch (error) {
                     console.error('Error calculating CRC to site distance:', error);
                     return null;
+                }
+            };
+
+            const buildCrcPickerInfoEntry = (crc, opts) => {
+                const {
+                    date,
+                    period,
+                    allowOverride = false,
+                    excludeEventId = null,
+                    excludeGroupId = null,
+                    existingAssignmentsRaw = [],
+                    isUntrained = false,
+                } = opts || {};
+                const isSchedulingConflict = allowOverride
+                    ? false
+                    : isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
+                const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
+                return {
+                    crc,
+                    isInactive: crc.active === false || crc.archived === true,
+                    isUnavailable: isSchedulingConflict,
+                    isOnTimeOff,
+                    unavailPeriod: getUnavailabilityPeriod(crc.id, date),
+                    conflictInfo: isSchedulingConflict
+                        ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId)
+                        : null,
+                    distance: null,
+                    isSelected: existingAssignmentsRaw.includes(crc.id),
+                    hasPending: hasPendingTimeOffOnDate(crc.id, date),
+                    isUntrained,
+                };
+            };
+
+            let distanceLabelJobCounter = 0;
+            const scheduleDeferredDistanceLabels = (container, site) => {
+                if (!container || !site) return;
+                const jobId = ++distanceLabelJobCounter;
+                const run = async () => {
+                    const siteCoords = await resolveSiteCoordinates(site);
+                    if (!siteCoords || jobId !== distanceLabelJobCounter) return;
+                    const selects = container.querySelectorAll('select[name^="role-"]');
+                    const crcIds = new Set();
+                    selects.forEach((sel) => {
+                        Array.from(sel.options).forEach((opt) => {
+                            const v = opt.value;
+                            if (v && v !== 'SITE_STAFF' && v !== 'UNASSIGNED') crcIds.add(v);
+                        });
+                    });
+                    const distances = new Map();
+                    await Promise.all([...crcIds].map(async (crcId) => {
+                        const crc = state.crcs.find((c) => c.id === crcId);
+                        if (!crc) return;
+                        const d = await calculateCrcToSiteDistance(crc, site, siteCoords);
+                        if (d != null) distances.set(crcId, d);
+                    }));
+                    if (jobId !== distanceLabelJobCounter) return;
+                    selects.forEach((sel) => {
+                        Array.from(sel.options).forEach((opt) => {
+                            const d = distances.get(opt.value);
+                            if (d == null) return;
+                            const base = opt.textContent.replace(/\s*-\s*\d+(\.\d+)?\s*mi\s*$/i, '').trim();
+                            opt.textContent = `${base} - ${d} mi`;
+                        });
+                    });
+                };
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(() => run(), { timeout: 3000 });
+                } else {
+                    setTimeout(run, 50);
                 }
             };
 
@@ -3192,29 +3254,74 @@
             let _lastRenderedTab = null;
             
             // --- HELPER FUNCTIONS ---
-            // Geocode location using Azure Maps Search API
+            const geocodeCache = new Map();
+            const siteGeocodeCache = new Map();
+            const GEOCODE_CACHE_MISS = '__miss__';
+
+            // Geocode location using Azure Maps Search API (in-memory cache per session)
             const geocodeLocation = async (locationString) => {
                 try {
-                    if (!locationString || !locationString.trim()) return null;
-                    
-                    // Use backend proxy to avoid CORS issues
+                    const key = (locationString || '').trim().toLowerCase();
+                    if (!key) return null;
+                    if (geocodeCache.has(key)) {
+                        const cached = geocodeCache.get(key);
+                        return cached === GEOCODE_CACHE_MISS ? null : cached;
+                    }
+
                     const response = await fetch(
-                        `/api/geocode?api-version=1.0&query=${encodeURIComponent(locationString)}&limit=1`
+                        `/api/geocode?api-version=1.0&query=${encodeURIComponent(locationString.trim())}&limit=1`
                     );
                     const data = await response.json();
                     if (data && data.results && data.results.length > 0) {
                         const result = data.results[0];
-                        return {
+                        const coords = {
                             lat: result.position.lat,
                             lng: result.position.lon,
                             displayName: result.address?.freeformAddress || locationString
                         };
+                        geocodeCache.set(key, coords);
+                        return coords;
                     }
+                    geocodeCache.set(key, GEOCODE_CACHE_MISS);
                     return null;
                 } catch (error) {
                     console.error('Geocoding error:', error);
                     return null;
                 }
+            };
+
+            const resolveCrcCoordinates = async (crc) => {
+                if (!crc) return null;
+                if (crc.coordinates && crc.coordinates.latitude != null && crc.coordinates.longitude != null) {
+                    return { lat: crc.coordinates.latitude, lng: crc.coordinates.longitude };
+                }
+                const home = (crc.homeLocation || '').trim();
+                const crcLocation = home || getCrcAddress(crc);
+                if (!crcLocation) return null;
+                const geocode = await geocodeLocation(crcLocation);
+                return geocode ? { lat: geocode.lat, lng: geocode.lng } : null;
+            };
+
+            const resolveSiteCoordinates = async (site) => {
+                if (!site) return null;
+                if (site.id && siteGeocodeCache.has(site.id)) {
+                    const cached = siteGeocodeCache.get(site.id);
+                    return cached === GEOCODE_CACHE_MISS ? null : cached;
+                }
+                if (site.coordinates && site.coordinates.latitude != null && site.coordinates.longitude != null) {
+                    const coords = { lat: site.coordinates.latitude, lng: site.coordinates.longitude };
+                    if (site.id) siteGeocodeCache.set(site.id, coords);
+                    return coords;
+                }
+                const siteAddress = getSiteAddress(site);
+                if (!siteAddress) {
+                    if (site.id) siteGeocodeCache.set(site.id, GEOCODE_CACHE_MISS);
+                    return null;
+                }
+                const geocode = await geocodeLocation(siteAddress);
+                const coords = geocode ? { lat: geocode.lat, lng: geocode.lng } : null;
+                if (site.id) siteGeocodeCache.set(site.id, coords || GEOCODE_CACHE_MISS);
+                return coords;
             };
             
             // Helper function to parse route response
@@ -22017,7 +22124,8 @@
                 }, 0);
             };
 
-            const renderTrucksContent = () => {
+            const renderTrucksContent = async () => {
+                await ensureDeferredAppDataLoaded();
                 const container = document.getElementById('trucks-content-container');
                 if (!container) return;
                 
@@ -35303,10 +35411,12 @@
                             initialRevealScheduled = false;
                             overlayHidden = true;
                             initialPaintStartedAt = 0;
+                            deferredAppDataPromise = null;
                             setState({
                                 currentUser: null,
                                 isAuthenticated: false,
-                                initialLoadComplete: false
+                                initialLoadComplete: false,
+                                deferredAppDataLoaded: false,
                             });
                             renderNav();
                             setAppChromeVisible(true);
@@ -42412,68 +42522,25 @@
                         // Get site for distance calculation
                         const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
                         
-                        // Calculate availability and distance for each CRC, then sort
                         const excludeEventId = existingEvent ? existingEvent.id : null;
                         const excludeGroupId = existingEvent ? existingEvent.groupId : null;
-                        let crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                            const isSchedulingConflict = allowOverrideRole ? false : isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
-                            const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
-                            const isUnavailable = isSchedulingConflict;
-                            const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                            const conflictInfo = isSchedulingConflict ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
-                            let distance = null;
-                            
-                            // Calculate distance if site is available
-                            if (site) {
-                                distance = await calculateCrcToSiteDistance(crc, site);
-                            }
-                            
-                            const hasPending = hasPendingTimeOffOnDate(crc.id, date);
-                            
-                            return {
-                                crc,
-                                isInactive: crc.active === false || crc.archived === true,
-                                isUnavailable,
-                                isOnTimeOff,
-                                unavailPeriod,
-                                conflictInfo,
-                                distance,
-                                isSelected: existingAssignmentsRaw.includes(crc.id),
-                                hasPending,
-                                isUntrained: false
-                            };
-                        }));
-                        
-                        // Add untrained assigned CRCs to the list (marked as untrained)
+                        const pickerOpts = {
+                            date,
+                            period,
+                            allowOverride: allowOverrideRole,
+                            excludeEventId,
+                            excludeGroupId,
+                            existingAssignmentsRaw,
+                        };
+                        let crcsWithInfo = qualifiedCrcs.map((crc) =>
+                            buildCrcPickerInfoEntry(crc, { ...pickerOpts, isUntrained: false })
+                        );
                         if (untrainedAssignedCrcs.length > 0) {
-                            const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
-                                const isSchedulingConflict = isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
-                                const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
-                                const isUnavailable = isSchedulingConflict;
-                                const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                const conflictInfo = isSchedulingConflict ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
-                                let distance = null;
-                                
-                                if (site) {
-                                    distance = await calculateCrcToSiteDistance(crc, site);
-                                }
-                                
-                                const hasPending = hasPendingTimeOffOnDate(crc.id, date);
-                                
-                                return {
-                                    crc,
-                                    isInactive: crc.active === false || crc.archived === true,
-                                    isUnavailable,
-                                    isOnTimeOff,
-                                    unavailPeriod,
-                                    conflictInfo,
-                                    distance,
-                                    isSelected: existingAssignmentsRaw.includes(crc.id),
-                                    hasPending,
-                                    isUntrained: true
-                                };
-                            }));
-                            crcsWithInfo.push(...untrainedCrcsWithInfo);
+                            crcsWithInfo.push(
+                                ...untrainedAssignedCrcs.map((crc) =>
+                                    buildCrcPickerInfoEntry(crc, { ...pickerOpts, isUntrained: true })
+                                )
+                            );
                         }
                         
                         // Sort: selected first, then available (by distance), then scheduling conflicts at bottom
@@ -42662,6 +42729,10 @@
                     
                     roleAssignmentHTML += '</div>';
                     roleAssignmentContainer.innerHTML = roleAssignmentHTML;
+                    scheduleDeferredDistanceLabels(
+                        roleAssignmentContainer,
+                        selectedSiteId ? state.crc_sites.find((s) => s.id === selectedSiteId) : null
+                    );
                     console.log('Manual role assignment HTML generated and inserted');
                     
                     // Explicitly set select values to ensure existing assignments are displayed - use merged data to preserve form state
@@ -43003,63 +43074,23 @@
                     const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
                     const excludeEventId = existingEvent ? existingEvent.id : null;
                     const excludeGroupId = existingEvent ? existingEvent.groupId : null;
-                    let crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                        const isSchedulingConflict = allowOverrideReq ? false : isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
-                        const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
-                        const isUnavailable = isSchedulingConflict;
-                        const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                        const conflictInfo = isSchedulingConflict ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
-                        let distance = null;
-                        
-                        // Calculate distance if site is available
-                        if (site) {
-                            distance = await calculateCrcToSiteDistance(crc, site);
-                        }
-                        
-                        const hasPending = hasPendingTimeOffOnDate(crc.id, date);
-                        
-                        return {
-                            crc,
-                            isUnavailable,
-                            isOnTimeOff,
-                            unavailPeriod,
-                            conflictInfo,
-                            distance,
-                            isSelected: existingAssignmentsRaw.includes(crc.id),
-                            hasPending,
-                            isUntrained: false
-                        };
-                    }));
-                    
-                    // Add untrained assigned CRCs to the list (marked as untrained)
+                    const pickerOptsReq = {
+                        date,
+                        period,
+                        allowOverride: allowOverrideReq,
+                        excludeEventId,
+                        excludeGroupId,
+                        existingAssignmentsRaw,
+                    };
+                    let crcsWithInfo = qualifiedCrcs.map((crc) =>
+                        buildCrcPickerInfoEntry(crc, { ...pickerOptsReq, isUntrained: false })
+                    );
                     if (untrainedAssignedCrcs.length > 0) {
-                        const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
-                            const isSchedulingConflict = isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
-                            const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
-                            const isUnavailable = isSchedulingConflict;
-                            const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                            const conflictInfo = isSchedulingConflict ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
-                            let distance = null;
-                            
-                            if (site) {
-                                distance = await calculateCrcToSiteDistance(crc, site);
-                            }
-                            
-                            const hasPending = hasPendingTimeOffOnDate(crc.id, date);
-                            
-                            return {
-                                crc,
-                                isUnavailable,
-                                isOnTimeOff,
-                                unavailPeriod,
-                                conflictInfo,
-                                distance,
-                                isSelected: existingAssignmentsRaw.includes(crc.id),
-                                hasPending,
-                                isUntrained: true
-                            };
-                        }));
-                        crcsWithInfo.push(...untrainedCrcsWithInfo);
+                        crcsWithInfo.push(
+                            ...untrainedAssignedCrcs.map((crc) =>
+                                buildCrcPickerInfoEntry(crc, { ...pickerOptsReq, isUntrained: true })
+                            )
+                        );
                     }
                     
                     // Sort: selected first, then available (by distance), then scheduling conflicts at bottom
@@ -43236,6 +43267,10 @@
                     note: 'Roles should be visible and selectable immediately - travel selection is separate'
                 });
                 roleAssignmentContainer.innerHTML = roleAssignmentHTML;
+                scheduleDeferredDistanceLabels(
+                    roleAssignmentContainer,
+                    selectedSiteId ? state.crc_sites.find((s) => s.id === selectedSiteId) : null
+                );
 
                 const adhocAddButton = roleAssignmentContainer.querySelector('#adhoc-add-role');
                 const adhocRoleSelect = roleAssignmentContainer.querySelector('#adhoc-role-select');
@@ -46748,7 +46783,8 @@
                 `;
             };
 
-            const renderUsersContent = () => {
+            const renderUsersContent = async () => {
+                await ensureDeferredAppDataLoaded();
                 const container = document.getElementById('users-content');
                 if (!container) return;
 
@@ -46974,7 +47010,8 @@
                 `;
             };
 
-            const renderTimeOffContent = () => {
+            const renderTimeOffContent = async () => {
+                await ensureDeferredAppDataLoaded();
                 const container = document.getElementById('time-off-content');
                 if (!container) return;
 
@@ -48524,7 +48561,8 @@
                 showNotification('Time off days exported successfully.', 'success');
             };
 
-            const renderTimeOffRequestsContent = () => {
+            const renderTimeOffRequestsContent = async () => {
+                await ensureDeferredAppDataLoaded();
                 const container = document.getElementById('time-off-requests-content');
                 if (!container) return;
 
@@ -49674,6 +49712,7 @@
             const renderTravelContent = async () => {
                 const container = document.getElementById('travel-content');
                 if (!container) return;
+                await ensureDeferredAppDataLoaded();
 
                 // Helper function to parse travel date values
                 const parseTravelDateValue = (value) => {
@@ -53071,6 +53110,69 @@
                 }
             };
             
+            let deferredAppDataPromise = null;
+
+            const loadDeferredAppData = async () => {
+                if (deferredAppDataPromise) return deferredAppDataPromise;
+                deferredAppDataPromise = (async () => {
+                    debugLog('CHAOS: Loading deferred app data (travel, trucks, time off, announcements, users)...');
+                    const needUsers = state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager');
+                    const [trucks, truck_events, timeOffRequests, travel, announcements, users] = await Promise.all([
+                        apiService.getTrucks().catch((err) => {
+                            debugWarn('CHAOS: Trucks endpoint not available or returned error:', err.message);
+                            return [];
+                        }),
+                        apiService.getTruckEvents().catch((err) => {
+                            debugWarn('CHAOS: Truck events endpoint not available or returned error:', err.message);
+                            return [];
+                        }),
+                        apiService.getTimeOffRequests().catch((error) => {
+                            debugWarn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
+                            return [];
+                        }),
+                        apiService.getTravel().catch((error) => {
+                            console.error('CHAOS: Error loading travel:', error);
+                            return [];
+                        }),
+                        apiService.getAnnouncements().catch((error) => {
+                            debugWarn('CHAOS: Failed to load announcements:', error);
+                            return [];
+                        }),
+                        needUsers
+                            ? apiService.getUsers().catch((error) => {
+                                console.error('CHAOS: Error loading users:', error);
+                                return [];
+                            })
+                            : Promise.resolve(state.users || []),
+                    ]);
+                    if (Array.isArray(trucks)) trucks.sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
+                    const patch = {
+                        trucks: trucks || [],
+                        truck_events: truck_events || [],
+                        timeOffRequests: timeOffRequests || [],
+                        travel: travel || [],
+                        announcements: announcements || [],
+                        deferredAppDataLoaded: true,
+                    };
+                    if (needUsers) patch.users = users || [];
+                    const needsRender = ['travel', 'trucks', 'time-off', 'time-off-requests', 'users', 'communications'].includes(state.activeTab);
+                    setState(patch, { skipRender: !needsRender });
+                    debugLog('CHAOS: Deferred load complete —', patch.travel.length, 'travel,', patch.timeOffRequests.length, 'time off,', patch.trucks.length, 'trucks');
+                    scheduleDeferredPtoSync(patch.timeOffRequests);
+                    if (typeof checkAndShowAnnouncementPopup === 'function') {
+                        setTimeout(() => checkAndShowAnnouncementPopup(), 500);
+                    }
+                    return patch;
+                })().catch((err) => {
+                    deferredAppDataPromise = null;
+                    console.error('CHAOS: Deferred app data load failed:', err);
+                    throw err;
+                });
+                return deferredAppDataPromise;
+            };
+
+            const ensureDeferredAppDataLoaded = () => loadDeferredAppData();
+
             const performInitialLoad = async () => {
                 debugLog('CHAOS: performInitialLoad started');
                 if (state.isAuthenticated && !initialAppRevealed) {
@@ -53078,53 +53180,16 @@
                 }
                 
                 try {
-                    debugLog('CHAOS: Fetching data from Azure API...');
+                    debugLog('CHAOS: Fetching scheduler-critical data from Azure API...');
                     
-                    // Load data from Azure API
-                    const [crcs, sites, studies, events, roles, training_types, trucks, truck_events] = await Promise.all([
+                    const [crcs, sites, studies, events, roles, training_types] = await Promise.all([
                         apiService.getCrcs(),
                         apiService.getSites(), 
                         apiService.getStudies(),
-                        // Load only a bounded date window for performance; expanded on navigation as needed.
                         apiService.getEvents(getDefaultEventsDateRange()),
                         apiService.getRoles(),
                         apiService.getTrainingTypes(),
-                        apiService.getTrucks().catch(err => {
-                            debugWarn('CHAOS: Trucks endpoint not available or returned error:', err.message);
-                            return [];
-                        }),
-                        apiService.getTruckEvents().catch(err => {
-                            debugWarn('CHAOS: Truck events endpoint not available or returned error:', err.message);
-                            return [];
-                        })
                     ]);
-                    
-                    const usersPromise = (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'))
-                        ? apiService.getUsers().catch(error => {
-                            console.error('CHAOS: Error loading users:', error);
-                            return [];
-                        })
-                        : Promise.resolve([]);
-
-                    const [users, timeOffRequests, travel, announcements] = await Promise.all([
-                        usersPromise,
-                        apiService.getTimeOffRequests().catch(error => {
-                            debugWarn('CHAOS: Time off requests endpoint not available or returned error:', error.message);
-                            return [];
-                        }),
-                        apiService.getTravel().catch(error => {
-                            console.error('CHAOS: Error loading travel:', error);
-                            return [];
-                        }),
-                        apiService.getAnnouncements().catch(error => {
-                            debugWarn('CHAOS: Failed to load announcements:', error);
-                            return [];
-                        })
-                    ]);
-                    debugLog('CHAOS: Loaded', users.length, 'users');
-                    debugLog('CHAOS: Loaded', timeOffRequests.length, 'time off requests');
-                    debugLog('CHAOS: Loaded', travel.length, 'travel records');
-                    debugLog('CHAOS: Loaded', announcements.length, 'announcements');
 
                     debugLog('CHAOS: Data fetched successfully from Azure API');
                     debugLog('CHAOS: Loaded', crcs.length, 'CRCs');
@@ -53151,9 +53216,6 @@
                         debugWarn('CHAOS: No studies loaded from ARTEMIS API');
                     }
                     
-                    // Trucks + truck events loaded above (or defaulted to [])
-                    
-                    // Sort the data
                     debugLog('CHAOS: Sorting data...');
                     crcs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     sites.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
@@ -53181,7 +53243,6 @@
                     sanitizedStudies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
                     ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                    trucks.sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
                     const sanitizedEvents = sanitizeEventsFromApi(events, artemisStudyIdsSet);
 
@@ -53196,12 +53257,13 @@
                         eventsQueryRange: evRange,
                         roles, 
                         training_types,
-                        trucks, 
-                        truck_events,
-                        users,
-                        timeOffRequests,
-                        travel,
-                        announcements,
+                        trucks: [],
+                        truck_events: [],
+                        users: [],
+                        timeOffRequests: [],
+                        travel: [],
+                        announcements: [],
+                        deferredAppDataLoaded: false,
                         initialLoadComplete: true 
                     });
                     loadChangeLog(); // Load change log from localStorage
@@ -53219,7 +53281,7 @@
                         console.warn('Failed to load Navan import data from localStorage:', e);
                     }
                     setupRealtimeListeners();
-                    scheduleDeferredPtoSync(timeOffRequests);
+                    loadDeferredAppData();
                     setTimeout(() => {
                         if (pendingInitialTabPaint && !initialAppRevealed) {
                             debugWarn('CHAOS: Initial load safety timeout — revealing app');
@@ -53227,14 +53289,7 @@
                         }
                     }, INITIAL_PAINT_TIMEOUT_MS + MIN_INITIAL_LOADING_MS);
                     
-                    debugLog('CHAOS: performInitialLoad completed successfully');
-                    
-                    // Check and show announcement popup after initial load and render
-                    setTimeout(() => {
-                        if (typeof checkAndShowAnnouncementPopup === 'function') {
-                            checkAndShowAnnouncementPopup();
-                        }
-                    }, 1000);
+                    debugLog('CHAOS: performInitialLoad completed successfully (deferred data loading in background)');
 
                 } catch (error) {
                     console.error("CHAOS: Error during initial data load:", error);
