@@ -251,6 +251,18 @@ const validateSitesSchema = (data) => {
     if (data.siteCoordinatorEmail !== undefined && data.siteCoordinatorEmail !== null && typeof data.siteCoordinatorEmail !== 'string') {
         errors.push('siteCoordinatorEmail must be a string');
     }
+
+    const optionalCoordFields = [
+        'siteCoordinator2Name',
+        'siteCoordinator2Email',
+        'siteCoordinator3Name',
+        'siteCoordinator3Email',
+    ];
+    optionalCoordFields.forEach((field) => {
+        if (data[field] !== undefined && data[field] !== null && typeof data[field] !== 'string') {
+            errors.push(`${field} must be a string`);
+        }
+    });
     
     // New relational staff references (optional)
     if (data.piStaffId !== undefined && data.piStaffId !== null && typeof data.piStaffId !== 'string') {
