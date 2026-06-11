@@ -1378,13 +1378,59 @@
             // --- Azure API Configuration ---
             const API_BASE_URL = '/api';
 
-            /** Single calendar year (Jan 1 – Dec 31). Other years load on demand when the user navigates there. */
-            const getCalendarYearRange = (year) => {
-                const y = typeof year === 'number' ? year : new Date().getFullYear();
-                return { startDate: `${y}-01-01`, endDate: `${y}-12-31` };
+            /** Single calendar month. Only the visible month is loaded; navigating months fetches that month. */
+            const getCalendarMonthRange = (dateInput) => {
+                const d = dateInput instanceof Date ? new Date(dateInput.getTime()) : new Date(dateInput || Date.now());
+                const y = d.getFullYear();
+                const m = d.getMonth();
+                const monthStr = String(m + 1).padStart(2, '0');
+                const lastDay = new Date(y, m + 1, 0).getDate();
+                return {
+                    startDate: `${y}-${monthStr}-01`,
+                    endDate: `${y}-${monthStr}-${String(lastDay).padStart(2, '0')}`,
+                };
             };
 
-            const getDefaultEventsDateRange = () => getCalendarYearRange(new Date().getFullYear());
+            const getDefaultEventsDateRange = () => {
+                const calDate = (typeof state !== 'undefined' && state && state.crcCalendarDate)
+                    ? state.crcCalendarDate
+                    : new Date();
+                return getCalendarMonthRange(calDate);
+            };
+
+            const sanitizeEventsFromApi = (events, artemisStudyIdsSet) => {
+                const seenEventIds = new Set();
+                return Array.isArray(events) ? events.reduce((acc, event) => {
+                    if (event.id && seenEventIds.has(event.id)) return acc;
+                    if (event.id) seenEventIds.add(event.id);
+                    if (event.type === 'Travel Day') {
+                        const normalizedEvent = { ...event };
+                        if (normalizedEvent.date) {
+                            normalizedEvent.startDate = normalizedEvent.date;
+                            normalizedEvent.endDate = normalizedEvent.date;
+                        }
+                        if (!normalizedEvent.crcIds && normalizedEvent.crcId) {
+                            normalizedEvent.crcIds = [normalizedEvent.crcId];
+                        }
+                        acc.push(normalizedEvent);
+                        return acc;
+                    }
+                    if (Array.isArray(event.studyIds) && event.studyIds.length > 0) {
+                        const filteredIds = event.studyIds.filter(studyId => artemisStudyIdsSet.has(studyId));
+                        if (filteredIds.length === 0) {
+                            if (event.type === 'Site Assignment') return acc;
+                            acc.push({ ...event, studyIds: [] });
+                            return acc;
+                        }
+                        if (filteredIds.length !== event.studyIds.length) {
+                            acc.push({ ...event, studyIds: filteredIds });
+                            return acc;
+                        }
+                    }
+                    acc.push(event);
+                    return acc;
+                }, []) : [];
+            };
 
             const mergeEventsById = (existing, incoming) => {
                 const map = new Map();
@@ -2728,7 +2774,7 @@
                 crc_sites: [],
                 studies: [],
                 crc_events: [],
-                /** Server date range last loaded for crc_events; expanded when user navigates the grid outside this window. */
+                /** Server date range last loaded for crc_events (one calendar month at a time). */
                 eventsQueryRange: null,
                 roles: [],
                 training_types: [],
@@ -4954,36 +5000,12 @@
                 return null;
             };
 
-            const isCRCUnavailable = (crcId, date, period, excludeEventId = null, excludeGroupId = null) => {
+            const isCRCScheduledOnDate = (crcId, date, period, excludeEventId = null, excludeGroupId = null) => {
                 if (!crcId || !date) return false;
-                
-                // Normalize the date parameter to YYYY-MM-DD format for comparison
+
                 const normalizedDate = toDateOnlyString(parseDateFlexible(date));
                 if (!normalizedDate) return false;
-                
-                // Check for rejected time off requests - if rejected, they should be available
-                const rejectedTimeOffRequest = state.timeOffRequests.find(req => {
-                    if (req.crcId !== crcId) return false;
-                    const normalizedStatus = normalizeTimeOffStatus(req.status);
-                    if (normalizedStatus !== 'rejected') return false;
-                    
-                    // Normalize request dates
-                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
-                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
-                    
-                    if (!reqStart) return false;
-                    
-                    // Check if normalized date falls within rejected request range
-                    if (normalizedDate === reqStart) return true;
-                    if (reqEnd && normalizedDate >= reqStart && normalizedDate <= reqEnd) return true;
-                    return false;
-                });
-                
-                // If there's a rejected time off request for this date, they are available
-                if (rejectedTimeOffRequest) return false;
-                
-                // Check for ANY Site Assignment on this date (excluding the current event if editing)
-                // Only consider valid Site Assignments (with CRC assigned or valid role assignments)
+
                 const conflictingSiteAssignments = state.crc_events.filter(event => {
                     if (isCancelledShift(event)) return false;
                     // Exclude the current event being edited
@@ -5028,39 +5050,40 @@
                     return false;
                 });
                 
-                // If there's a conflicting Site Assignment, they are unavailable
-                if (conflictingSiteAssignments.length > 0) return true;
-                
-                // Get approved time off request IDs (using normalized status check)
-                const approvedRequestIds = new Set(
-                    state.timeOffRequests
-                        .filter(req => {
-                            const normalizedStatus = normalizeTimeOffStatus(req.status);
-                            return normalizedStatus === 'approved';
-                        })
-                        .map(req => req.id)
-                );
-                
-                // Check for approved time off requests (including multi-day ranges)
-                // IMPORTANT: Only check approved requests, NOT pending or rejected
-                const approvedTimeOffRequest = state.timeOffRequests.find(req => {
+                return conflictingSiteAssignments.length > 0;
+            };
+
+            /** PTO / approved time off — informational for calendar; does not block shift assignment. */
+            const isCRCOnTimeOff = (crcId, date, period, excludeEventId = null, excludeGroupId = null) => {
+                if (!crcId || !date) return false;
+
+                const normalizedDate = toDateOnlyString(parseDateFlexible(date));
+                if (!normalizedDate) return false;
+
+                const rejectedTimeOffRequest = state.timeOffRequests.find(req => {
                     if (req.crcId !== crcId) return false;
-                    // Only check approved requests - pending/rejected should not make them unavailable
                     const normalizedStatus = normalizeTimeOffStatus(req.status);
-                    if (normalizedStatus !== 'approved') return false;
-                    
-                    // Normalize request dates
+                    if (normalizedStatus !== 'rejected') return false;
                     const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
                     const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
-                    
                     if (!reqStart) return false;
-                    
-                    // Check if normalized date falls within the request range
                     if (normalizedDate === reqStart) return true;
                     if (reqEnd && normalizedDate >= reqStart && normalizedDate <= reqEnd) return true;
                     return false;
                 });
-                
+                if (rejectedTimeOffRequest) return false;
+
+                const approvedTimeOffRequest = state.timeOffRequests.find(req => {
+                    if (req.crcId !== crcId) return false;
+                    const normalizedStatus = normalizeTimeOffStatus(req.status);
+                    if (normalizedStatus !== 'approved') return false;
+                    const reqStart = toDateOnlyString(parseDateFlexible(req.startDate || req.date));
+                    const reqEnd = toDateOnlyString(parseDateFlexible(req.endDate || req.date || req.startDate));
+                    if (!reqStart) return false;
+                    if (normalizedDate === reqStart) return true;
+                    if (reqEnd && normalizedDate >= reqStart && normalizedDate <= reqEnd) return true;
+                    return false;
+                });
                 if (approvedTimeOffRequest && timeOffPeriodsConflict(approvedTimeOffRequest.period, period)) {
                     return true;
                 }
@@ -5074,13 +5097,14 @@
                     if (event.crcId !== crcId) return false;
                     return ptoTypes.has(event.type);
                 });
-
                 if (eventsOnDate.length === 0) return false;
                 if (period === 'Full Day') return true;
-                return eventsOnDate.some(event =>
-                    timeOffPeriodsConflict(event.period, period)
-                );
+                return eventsOnDate.some(event => timeOffPeriodsConflict(event.period, period));
             };
+
+            const isCRCUnavailable = (crcId, date, period, excludeEventId = null, excludeGroupId = null) =>
+                isCRCScheduledOnDate(crcId, date, period, excludeEventId, excludeGroupId) ||
+                isCRCOnTimeOff(crcId, date, period, excludeEventId, excludeGroupId);
             
             // Helper function to get conflicting appointment info for display
             const getConflictingAppointmentInfo = (crcId, date, excludeEventId = null, excludeGroupId = null) => {
@@ -6341,7 +6365,7 @@
                 ['crc_events', 'timeOffRequests', 'crcs', 'studies', 'crc_sites', 'roles', 'users', 'travel', 'trucks', 'truck_events', 'training_types'].forEach(ensureArray);
 
                 // DEDUPLICATION: Only when crc_events / timeOffRequests are part of this update (full passes are expensive on large schedules)
-                const dedupeEvents = Object.prototype.hasOwnProperty.call(newState, 'crc_events');
+                const dedupeEvents = Object.prototype.hasOwnProperty.call(newState, 'crc_events') && !options.skipEventDedupe;
                 const dedupeTimeOffRequests = Object.prototype.hasOwnProperty.call(newState, 'timeOffRequests');
 
                 // DEDUPLICATION: crc_events by ID when state includes that slice
@@ -25596,7 +25620,7 @@
                             <h3 class="text-lg font-semibold dark:text-white">Step 2: Assign Staff to Roles</h3>
                             <label class="flex items-center gap-2 ${readOnly ? 'hidden' : ''}">
                                 <input type="checkbox" name="overrideCrcRestrictions" class="rounded border-gray-300 text-amber-600 focus:ring-amber-500">
-                                <span class="text-sm text-gray-600 dark:text-gray-400">Override: allow selecting anyone (ignore availability &amp; training)</span>
+                                <span class="text-sm text-gray-600 dark:text-gray-400">Override: ignore training &amp; double-booking conflicts (PTO / partial day off can always be scheduled)</span>
                             </label>
                             ${isEditing && event ? `
                                 <div id="current-assignments-preview" class="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
@@ -36350,7 +36374,7 @@
                         }
                         const selectedSiteId = data.siteId;
                         // selectedStudyIds already defined above
-                        const unavailabilityConflicts = [];
+                        const schedulingConflicts = [];
                         const siteStudyConflicts = [];
                         // Initialize early - allow same person in multiple roles, so we don't track duplicate role assignments
                         const duplicateRoleAssignments = [];
@@ -36416,10 +36440,10 @@
                             // Skip SITE_STAFF and UNASSIGNED - can be used unlimited times
                             if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') return;
                             // Pass excludeEventId and excludeGroupId to properly exclude current event and all events in same group when editing
-                            const isUnavailable = isCRCUnavailable(crcId, startDateStr, period, excludeEventId, existingGroupId);
-                            if (isUnavailable) {
+                            const isSchedulingConflict = isCRCScheduledOnDate(crcId, startDateStr, period, excludeEventId, existingGroupId);
+                            if (isSchedulingConflict) {
                                 const p = getUnavailabilityPeriod(crcId, startDateStr);
-                                unavailabilityConflicts.push({ crcId, period: p || 'Full Day' });
+                                schedulingConflicts.push({ crcId, period: p || 'Full Day' });
                             }
                             
                             // Check if this CRC is already scheduled for a different site/study on this date
@@ -36448,12 +36472,12 @@
                         
                         // Exclude Site Staff and Unassigned from all override checks - can be used unlimited times
                         // Filter out Site Staff and Unassigned from conflicts
-                        const filteredUnavailabilityConflicts = unavailabilityConflicts.filter(c => c.crcId !== 'SITE_STAFF' && c.crcId !== 'UNASSIGNED');
+                        const filteredSchedulingConflicts = schedulingConflicts.filter(c => c.crcId !== 'SITE_STAFF' && c.crcId !== 'UNASSIGNED');
                         const filteredSiteStudyConflicts = siteStudyConflicts.filter(c => c.crcId !== 'SITE_STAFF' && c.crcId !== 'UNASSIGNED');
                         const filteredDuplicateDayAssignments = duplicateDayAssignments.filter(c => c.crcId !== 'SITE_STAFF' && c.crcId !== 'UNASSIGNED');
                         
-                        // For Travel Day events, don't require override - allow same day scheduling
-                        const needsOverride = eventType === 'Travel Day' ? false : (filteredUnavailabilityConflicts.length > 0 || filteredSiteStudyConflicts.length > 0 || duplicateRoleAssignments.length > 0 || filteredDuplicateDayAssignments.length > 0);
+                        // PTO / partial day off does not require override — only double-booking and site conflicts do
+                        const needsOverride = eventType === 'Travel Day' ? false : (filteredSchedulingConflicts.length > 0 || filteredSiteStudyConflicts.length > 0 || duplicateRoleAssignments.length > 0 || filteredDuplicateDayAssignments.length > 0);
 
                         const handleDuplicateSchedule = async (config, baseEventBlueprint) => {
                             if (!config) return;
@@ -39221,7 +39245,7 @@
                                 }
                                 // Force UI refreshes so schedule and calendar reflect new events immediately (preserve scroll)
                                 try {
-                                    setState({ crc_events: state.crc_events.slice() }, { skipRender: true });
+                                    setState({ crc_events: state.crc_events.slice() }, { skipRender: true, skipEventDedupe: true });
                                     renderContentPreservingScroll();
                                 } catch (e) {
                                     // Ignore errors in UI refresh
@@ -39278,7 +39302,7 @@
                             openModal(`
                                 <h3 class="text-xl font-bold text-yellow-500 mb-4">Override Required</h3>
                                 <div class="space-y-2 dark:text-gray-300 mb-4">
-                                    ${filteredUnavailabilityConflicts.length ? `<div><strong>Time Off Conflicts:</strong> ${filteredUnavailabilityConflicts.map(c => {
+                                    ${filteredSchedulingConflicts.length ? `<div><strong>Scheduling Conflicts:</strong> ${filteredSchedulingConflicts.map(c => {
                                         const crcName = state.crcs.find(x=>x.id===c.crcId)?.name || c.crcId;
                                         const periodText = c.period ? (c.period === 'Full Day' ? 'Full Day' : c.period) : 'Unavailable';
                                         return `${crcName} (${periodText})`;
@@ -40688,27 +40712,26 @@
                 }
             });
 
-            /** Load the calendar year being viewed if it is not already in eventsQueryRange (e.g. user goes to next year). */
+            /** Load only the calendar month being viewed (replaces prior month data in memory). */
             const ensureEventsCoverVisibleMonth = async () => {
                 if (!state.initialLoadComplete) return;
-                const visYear = (state.crcCalendarDate || new Date()).getFullYear();
-                const { startDate: yearStart, endDate: yearEnd } = getCalendarYearRange(visYear);
-                const rng = state.eventsQueryRange || getDefaultEventsDateRange();
-                if (yearStart >= rng.startDate && yearEnd <= rng.endDate) return;
+                const range = getCalendarMonthRange(state.crcCalendarDate || new Date());
+                const rng = state.eventsQueryRange;
+                if (rng && rng.startDate === range.startDate && rng.endDate === range.endDate) return;
 
                 try {
-                    const extra = await apiService.getEvents({ startDate: yearStart, endDate: yearEnd });
-                    const arr = Array.isArray(extra) ? extra : [];
-                    const merged = mergeEventsById(state.crc_events, arr);
-                    const newStart = compareIsoDateOnly(yearStart, rng.startDate) < 0 ? yearStart : rng.startDate;
-                    const newEnd = compareIsoDateOnly(yearEnd, rng.endDate) > 0 ? yearEnd : rng.endDate;
+                    const fetched = await apiService.getEvents(range);
+                    const arr = Array.isArray(fetched) ? fetched : [];
+                    const artemisStudyIdsSet = new Set((state.studies || []).map(study => study.id));
+                    const sanitized = sanitizeEventsFromApi(arr, artemisStudyIdsSet);
                     setState({
-                        crc_events: merged,
-                        eventsQueryRange: { startDate: newStart, endDate: newEnd }
+                        crc_events: sanitized,
+                        crc_events_display: undefined,
+                        eventsQueryRange: { startDate: range.startDate, endDate: range.endDate },
                     });
-                    debugLog('CHAOS: Loaded events for calendar year', visYear, `(${arr.length} fetched, range ${newStart} – ${newEnd})`);
+                    debugLog('CHAOS: Loaded events for month', range.startDate.slice(0, 7), `(${arr.length} fetched)`);
                 } catch (err) {
-                    console.error('CHAOS: Failed to load events for calendar year', visYear, err);
+                    console.error('CHAOS: Failed to load events for month', range.startDate, err);
                 }
             };
 
@@ -40849,7 +40872,7 @@
                     
                     // Check for time off (using isCRCUnavailable which checks both events and time off requests)
                     // Exclude current event and group when editing
-                    const isUnavailable = isCRCUnavailable(selectedCrcId, date, period, excludeEventIdForChange, excludeGroupIdForChange);
+                    const isSchedulingConflict = isCRCScheduledOnDate(selectedCrcId, date, period, excludeEventIdForChange, excludeGroupIdForChange);
                     const unavailPeriod = getUnavailabilityPeriod(selectedCrcId, date);
                     
                     // Check for conflicts: same CRC can be in multiple roles for same shift, but not different sites/studies on same day
@@ -40899,12 +40922,11 @@
                         duplicateRoles.add(roleNameFromSelect);
                     }
                     
-                    if (isUnavailable || hasConflict || hasDuplicateSelection) {
+                    if (isSchedulingConflict || hasConflict || hasDuplicateSelection) {
                         const crcName = (state.crcs.find(c => c.id === selectedCrcId)?.name) || 'This CRC';
                         const reasons = [];
-                        if (isUnavailable) {
-                            const periodText = unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Unavailable';
-                            reasons.push(`has time off (${periodText})`);
+                        if (isSchedulingConflict) {
+                            reasons.push('is already scheduled on another shift this day');
                         }
                         if (hasConflict) {
                             reasons.push(conflictReason);
@@ -41486,7 +41508,7 @@
                                                                 ${qualifiedCrcs.map(c => {
                                                                     const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
                                                                     const excludeGroupIdForEdit = existingEvent ? existingEvent.groupId : null;
-                                                                    const isUnavailable = allowOverrideEdit ? false : isCRCUnavailable(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
+                                                                    const isUnavailable = allowOverrideEdit ? false : isCRCScheduledOnDate(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
                                                                     const unavailPeriod = getUnavailabilityPeriod(c.id, date);
                                                                     let statusText = '';
                                                                     if (isUnavailable) {
@@ -41716,7 +41738,7 @@
                                                         // Pass excludeEventId and excludeGroupId to avoid showing CRCs on this shift as unavailable
                                                         const excludeEventIdForEdit = existingEvent ? existingEvent.id : null;
                                                         const excludeGroupIdForEdit = existingEvent ? existingEvent.groupId : null;
-                                                        const isUnavailable = isCRCUnavailable(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
+                                                        const isUnavailable = isCRCScheduledOnDate(c.id, date, period, excludeEventIdForEdit, excludeGroupIdForEdit);
                                                         const unavailPeriod = getUnavailabilityPeriod(c.id, date);
                                                         let statusText = '';
                                                         if (isUnavailable) {
@@ -42127,8 +42149,8 @@
                                 available = qualifiedCrcs;
                             } else {
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
-                                    if (isUnavailable) unavailable.push(crc);
+                                    const isSchedulingConflict = isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
+                                    if (isSchedulingConflict) unavailable.push(crc);
                                     else available.push(crc);
                                 });
                             }
@@ -42136,7 +42158,14 @@
                             let optionsHtml = '';
                             optionsHtml += `<option value="SITE_STAFF" ${assignedCrcId === 'SITE_STAFF' ? 'selected' : ''} class="text-blue-600 dark:text-blue-400 font-medium">Site Staff</option>`;
                             optionsHtml += `<option value="UNASSIGNED" ${assignedCrcId === 'UNASSIGNED' ? 'selected' : ''} class="text-red-600 dark:text-red-400 font-medium">⚠ Unassigned</option>`;
-                            optionsHtml += available.map(crc => `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''}>${crc.name}</option>`).join('');
+                            optionsHtml += available.map(crc => {
+                                const onTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
+                                const unavailPeriod = onTimeOff ? getUnavailabilityPeriod(crc.id, date) : null;
+                                const timeOffText = onTimeOff
+                                    ? ` (Time Off - ${unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Partial'})`
+                                    : '';
+                                return `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''}>${crc.name}${timeOffText}</option>`;
+                            }).join('');
                             // Omit unselected unavailable CRCs from shift staff pickers (same as study-configured role path).
                             optionsHtml += unavailable.map(crc => {
                                 if (assignedCrcId !== crc.id) return '';
@@ -42387,9 +42416,11 @@
                         const excludeEventId = existingEvent ? existingEvent.id : null;
                         const excludeGroupId = existingEvent ? existingEvent.groupId : null;
                         let crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                            const isUnavailable = allowOverrideRole ? false : isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
+                            const isSchedulingConflict = allowOverrideRole ? false : isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
+                            const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
+                            const isUnavailable = isSchedulingConflict;
                             const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                            const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
+                            const conflictInfo = isSchedulingConflict ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                             let distance = null;
                             
                             // Calculate distance if site is available
@@ -42403,6 +42434,7 @@
                                 crc,
                                 isInactive: crc.active === false || crc.archived === true,
                                 isUnavailable,
+                                isOnTimeOff,
                                 unavailPeriod,
                                 conflictInfo,
                                 distance,
@@ -42415,9 +42447,11 @@
                         // Add untrained assigned CRCs to the list (marked as untrained)
                         if (untrainedAssignedCrcs.length > 0) {
                             const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
-                                const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
+                                const isSchedulingConflict = isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
+                                const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
+                                const isUnavailable = isSchedulingConflict;
                                 const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                                const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
+                                const conflictInfo = isSchedulingConflict ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                                 let distance = null;
                                 
                                 if (site) {
@@ -42430,6 +42464,7 @@
                                     crc,
                                     isInactive: crc.active === false || crc.archived === true,
                                     isUnavailable,
+                                    isOnTimeOff,
                                     unavailPeriod,
                                     conflictInfo,
                                     distance,
@@ -42441,13 +42476,13 @@
                             crcsWithInfo.push(...untrainedCrcsWithInfo);
                         }
                         
-                        // Sort: selected first, then available (by distance), then unavailable at bottom (by name)
+                        // Sort: selected first, then available (by distance), then scheduling conflicts at bottom
                         crcsWithInfo.sort((a, b) => {
                             // Selected items always come first
                             if (a.isSelected !== b.isSelected) {
                                 return a.isSelected ? -1 : 1;
                             }
-                            // Available before unavailable (unavailable goes to bottom)
+                            // Available before scheduling conflicts
                             if (a.isUnavailable !== b.isUnavailable) {
                                 return a.isUnavailable ? 1 : -1;
                             }
@@ -42515,21 +42550,25 @@
                             const disabledAttr = isInactive ? 'disabled' : '';
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${pendingText}${distanceText}</option>`;
                         }).join('');
-                        // Other available CRCs
-                        optionsHtml += otherAvailable.map(({ crc, distance, hasPending, isUntrained, isInactive }) => {
+                        // Other available CRCs (includes staff on PTO — selectable with warning label)
+                        optionsHtml += otherAvailable.map(({ crc, distance, hasPending, isUntrained, isInactive, isOnTimeOff, unavailPeriod }) => {
                             let distanceText = distance !== null ? ` - ${distance} mi` : '';
                             const pendingText = hasPending ? ' (Pending Review)' : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
                             const inactiveText = isInactive ? ' (Inactive)' : '';
+                            const timeOffText = isOnTimeOff
+                                ? ` (Time Off - ${unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Partial'})`
+                                : '';
                             const styleClasses = [];
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
                             if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
+                            if (isOnTimeOff) styleClasses.push('text-amber-600 dark:text-amber-400');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
                             const disabledAttr = isInactive ? 'disabled' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${pendingText}${distanceText}</option>`;
+                            return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${timeOffText}${pendingText}${distanceText}</option>`;
                         }).join('');
-                        // Volunteers (unavailable) - still show with (volunteer)
+                        // Volunteers (scheduling conflict) - still show with (volunteer)
                         optionsHtml += volunteerUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
                             let statusText = conflictInfo ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})` : ` (Time Off - ${unavailPeriod || 'Full Day'})`;
                             let distanceText = (distance !== null && !conflictInfo) ? ` - ${distance} mi` : '';
@@ -42743,7 +42782,7 @@
                                 const availableCrcs = [];
                                 const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = allowOverrideQty ? false : isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
+                                    const isUnavailable = allowOverrideQty ? false : isCRCScheduledOnDate(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
                                     if (isUnavailable) unavailableCrcs.push(crc);
                                     else availableCrcs.push(crc);
                                 });
@@ -42965,9 +43004,11 @@
                     const excludeEventId = existingEvent ? existingEvent.id : null;
                     const excludeGroupId = existingEvent ? existingEvent.groupId : null;
                     let crcsWithInfo = await Promise.all(qualifiedCrcs.map(async (crc) => {
-                        const isUnavailable = allowOverrideReq ? false : isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
+                        const isSchedulingConflict = allowOverrideReq ? false : isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
+                        const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
+                        const isUnavailable = isSchedulingConflict;
                         const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                        const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
+                        const conflictInfo = isSchedulingConflict ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                         let distance = null;
                         
                         // Calculate distance if site is available
@@ -42980,6 +43021,7 @@
                         return {
                             crc,
                             isUnavailable,
+                            isOnTimeOff,
                             unavailPeriod,
                             conflictInfo,
                             distance,
@@ -42992,9 +43034,11 @@
                     // Add untrained assigned CRCs to the list (marked as untrained)
                     if (untrainedAssignedCrcs.length > 0) {
                         const untrainedCrcsWithInfo = await Promise.all(untrainedAssignedCrcs.map(async (crc) => {
-                            const isUnavailable = isCRCUnavailable(crc.id, date, period, excludeEventId, excludeGroupId);
+                            const isSchedulingConflict = isCRCScheduledOnDate(crc.id, date, period, excludeEventId, excludeGroupId);
+                            const isOnTimeOff = isCRCOnTimeOff(crc.id, date, period, excludeEventId, excludeGroupId);
+                            const isUnavailable = isSchedulingConflict;
                             const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
-                            const conflictInfo = isUnavailable ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
+                            const conflictInfo = isSchedulingConflict ? getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId) : null;
                             let distance = null;
                             
                             if (site) {
@@ -43006,6 +43050,7 @@
                             return {
                                 crc,
                                 isUnavailable,
+                                isOnTimeOff,
                                 unavailPeriod,
                                 conflictInfo,
                                 distance,
@@ -43017,13 +43062,13 @@
                         crcsWithInfo.push(...untrainedCrcsWithInfo);
                     }
                     
-                    // Sort: selected first, then available (by distance), then unavailable at bottom (by name)
+                    // Sort: selected first, then available (by distance), then scheduling conflicts at bottom
                     crcsWithInfo.sort((a, b) => {
                         // Selected items always come first
                         if (a.isSelected !== b.isSelected) {
                             return a.isSelected ? -1 : 1;
                         }
-                        // Available before unavailable (unavailable goes to bottom)
+                        // Available before scheduling conflicts
                         if (a.isUnavailable !== b.isUnavailable) {
                             return a.isUnavailable ? 1 : -1;
                         }
@@ -43037,7 +43082,7 @@
                             if (a.distance === null && b.distance !== null) return 1;
                         }
                         
-                        // For unavailable CRCs at bottom, or if no distance info: sort by name
+                        // For scheduling conflicts at bottom, or if no distance info: sort by name
                         const aName = (a.crc?.name || '').toString();
                         const bName = (b.crc?.name || '').toString();
                         return aName.localeCompare(bName);
@@ -43082,16 +43127,20 @@
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
                             return `<option value="${crc.id}" ${selectedAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${untrainedText}${pendingText}${distanceText}</option>`;
                         }).join('');
-                        optionsHtml += otherAvailable.map(({ crc, distance, hasPending, isUntrained }) => {
+                        optionsHtml += otherAvailable.map(({ crc, distance, hasPending, isUntrained, isOnTimeOff, unavailPeriod }) => {
                             let distanceText = distance !== null ? ` - ${distance} mi` : '';
                             const pendingText = hasPending ? ' (Pending Review)' : '';
                             const untrainedText = isUntrained ? ' (No Training - Currently Assigned)' : '';
+                            const timeOffText = isOnTimeOff
+                                ? ` (Time Off - ${unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Partial'})`
+                                : '';
                             const styleClasses = [];
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
                             if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
+                            if (isOnTimeOff) styleClasses.push('text-amber-600 dark:text-amber-400');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${pendingText}${distanceText}</option>`;
+                            return `<option value="${crc.id}" ${selectedAttr} class="${styleClass}">${crc.name}${untrainedText}${timeOffText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         optionsHtml += volunteerUnavailable.map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained }) => {
                             let statusText = conflictInfo ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})` : ` (Time Off - ${unavailPeriod || 'Full Day'})`;
@@ -43416,7 +43465,7 @@
                                 const availableCrcs = [];
                                 const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
-                                    const isUnavailable = allowOverrideInc ? false : isCRCUnavailable(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
+                                    const isUnavailable = allowOverrideInc ? false : isCRCScheduledOnDate(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
                                     if (isUnavailable) unavailableCrcs.push(crc);
                                     else availableCrcs.push(crc);
                                 });
@@ -53134,52 +53183,7 @@
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     trucks.sort((a, b) => (a.unitNumber || '').localeCompare(b.unitNumber || ''));
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
-                    
-                    // DEDUPLICATION: Track seen event IDs to prevent duplicate events in state
-                    const seenEventIds = new Set();
-                    
-                    const sanitizedEvents = Array.isArray(events) ? events.reduce((acc, event) => {
-                        // Skip duplicate events by ID
-                        if (event.id && seenEventIds.has(event.id)) {
-                            console.warn('Initial load: Skipping duplicate event ID:', event.id);
-                            return acc;
-                        }
-                        if (event.id) seenEventIds.add(event.id);
-                        
-                        // CRITICAL: Normalize Travel Day events to ensure proper display
-                        // This fixes previously created travel days that may have incorrect startDate/endDate
-                        if (event.type === 'Travel Day') {
-                            const normalizedEvent = { ...event };
-                            // Ensure startDate and endDate are set to the single date (not a range)
-                            if (normalizedEvent.date) {
-                                normalizedEvent.startDate = normalizedEvent.date;
-                                normalizedEvent.endDate = normalizedEvent.date;
-                            }
-                            // Ensure crcIds array exists
-                            if (!normalizedEvent.crcIds && normalizedEvent.crcId) {
-                                normalizedEvent.crcIds = [normalizedEvent.crcId];
-                            }
-                            acc.push(normalizedEvent);
-                            return acc;
-                        }
-                        
-                        if (Array.isArray(event.studyIds) && event.studyIds.length > 0) {
-                            const filteredIds = event.studyIds.filter(studyId => artemisStudyIdsSet.has(studyId));
-                            if (filteredIds.length === 0) {
-                                if (event.type === 'Site Assignment') {
-                                    return acc;
-                                }
-                                acc.push({ ...event, studyIds: [] });
-                                return acc;
-                            }
-                            if (filteredIds.length !== event.studyIds.length) {
-                                acc.push({ ...event, studyIds: filteredIds });
-                                return acc;
-                            }
-                        }
-                        acc.push(event);
-                        return acc;
-                    }, []) : events;
+                    const sanitizedEvents = sanitizeEventsFromApi(events, artemisStudyIdsSet);
 
                     debugLog('CHAOS: Setting state with initialLoadComplete=true');
                     debugLog('CHAOS: authReady=', state.authReady, 'initialLoadComplete will be=', true);
