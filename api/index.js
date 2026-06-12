@@ -1594,11 +1594,117 @@ app.http('sites', {
     handler: (request, context) => crudHandler(context, request, 'sites'),
 });
 
+// Sub-routes under /patients/* must not be handled as patient IDs by patients/{id?}.
+const PATIENT_SUBROUTES = new Set(['query', 'today', 'actions', 'reindex']);
+
+const runPatientsQuery = async (request, context) => {
+    const requestContext = await resolveRequestContext(request);
+    const body = await safeJson(request) || {};
+    const result = await queryPatients({ ...body, scope: requestContext.scope });
+    return { jsonBody: result, headers: jsonHeaders };
+};
+
+const runPatientsToday = async (request, context) => {
+    const requestContext = await resolveRequestContext(request);
+    const today = new Date().toISOString().split('T')[0];
+    const result = await queryPatients({
+        scope: requestContext.scope,
+        criteria: {
+            logic: 'AND',
+            conditions: [{ field: 'primaryAppointmentDate', op: 'appointment_on_date', value: today }],
+        },
+        limit: 500,
+        offset: 0,
+        includeTotal: true,
+    });
+    return { jsonBody: result, headers: jsonHeaders };
+};
+
+const runPatientsActions = async (request, context) => {
+    const requestContext = await resolveRequestContext(request);
+    const body = await safeJson(request) || {};
+    const { action, patientId, studyId, siteId } = body;
+    if (!action || !patientId) {
+        return { status: 400, jsonBody: { error: 'action and patientId are required' }, headers: jsonHeaders };
+    }
+    const container = getContainer('patients');
+    const patient = await safeItemRead(container, patientId);
+    if (!patient) return { status: 404, jsonBody: { error: 'Patient not found' }, headers: jsonHeaders };
+    if (!patientAccessibleToScope(enrichPatientDocument(patient), requestContext.scope)) {
+        return scopeForbiddenResponse();
+    }
+    const actorLabel = requestContext.actor?.upn || requestContext.actor?.name || requestContext.scope?.userId || 'system';
+    let updated;
+    if (action === 'promote_candidate') {
+        if (!studyId) return { status: 400, jsonBody: { error: 'studyId is required' }, headers: jsonHeaders };
+        updated = promoteCandidateEnrollment(patient, studyId, siteId, actorLabel);
+    } else if (action === 'claim_lead') {
+        const userId = requestContext.scope?.userId || body.userId;
+        if (!userId) return { status: 400, jsonBody: { error: 'Authenticated user required to claim' }, headers: jsonHeaders };
+        updated = claimPatientLead(patient, userId, body.homeSiteId, actorLabel);
+    } else if (action === 'withdraw_candidate') {
+        if (!studyId) return { status: 400, jsonBody: { error: 'studyId is required' }, headers: jsonHeaders };
+        updated = withdrawCandidateEnrollment(patient, studyId, actorLabel);
+    } else if (action === 'release_claim') {
+        updated = enrichPatientDocument({
+            ...patient,
+            claimedByUserId: null,
+            claimedAt: null,
+            auditTrail: [...(patient.auditTrail || []), appendPatientAudit(patient, 'release_claim', '', actorLabel)],
+            lastUpdated: new Date().toISOString(),
+        });
+    } else {
+        return { status: 400, jsonBody: { error: `Unknown action: ${action}` }, headers: jsonHeaders };
+    }
+    const { resource: result } = await container.items.upsert(updated);
+    return { jsonBody: enrichPatientDocument(result), headers: jsonHeaders };
+};
+
+const runPatientsReindex = async (request, context) => {
+    const requestContext = await resolveRequestContext(request);
+    if (requestContext.scope && requestContext.scope.role !== 'Internal') {
+        return { status: 403, jsonBody: { error: 'Internal role required' }, headers: jsonHeaders };
+    }
+    const body = await safeJson(request) || {};
+    const limit = Math.min(parseInt(body.limit, 10) || 100, 500);
+    const offset = parseInt(body.offset, 10) || 0;
+    const container = getContainer('patients');
+    const resources = await safeQueryAll(container, {
+        query: `SELECT * FROM c ORDER BY c._ts DESC OFFSET ${offset} LIMIT ${limit}`,
+    });
+    let updated = 0;
+    for (const p of resources) {
+        await container.items.upsert(enrichPatientDocument(p));
+        updated += 1;
+    }
+    return { jsonBody: { updated, offset, limit, hasMore: resources.length === limit }, headers: jsonHeaders };
+};
+
+const handlePatientsSubRoute = async (context, request) => {
+    const subPath = request.params.id;
+    if (!subPath || !PATIENT_SUBROUTES.has(subPath)) return null;
+    const method = request.method;
+    if (method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+    try {
+        if (subPath === 'query' && method === 'POST') return await runPatientsQuery(request, context);
+        if (subPath === 'today' && method === 'GET') return await runPatientsToday(request, context);
+        if (subPath === 'actions' && method === 'POST') return await runPatientsActions(request, context);
+        if (subPath === 'reindex' && method === 'POST') return await runPatientsReindex(request, context);
+        return { status: 405, jsonBody: { error: 'Method Not Allowed' }, headers: jsonHeaders };
+    } catch (error) {
+        return handleError(context, error, `Patient ${subPath} failed`);
+    }
+};
+
 app.http('patients', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'patients/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'patients'),
+    handler: async (request, context) => {
+        const delegated = await handlePatientsSubRoute(context, request);
+        if (delegated) return delegated;
+        return crudHandler(context, request, 'patients');
+    },
 });
 
 app.http('crcs', {
@@ -1740,10 +1846,7 @@ app.http('patientsQuery', {
     handler: async (request, context) => {
         try {
             if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            const requestContext = await resolveRequestContext(request);
-            const body = await safeJson(request) || {};
-            const result = await queryPatients({ ...body, scope: requestContext.scope });
-            return { jsonBody: result, headers: jsonHeaders };
+            return await runPatientsQuery(request, context);
         } catch (error) {
             return handleError(context, error, 'Patient query failed');
         }
@@ -1757,19 +1860,7 @@ app.http('patientsToday', {
     handler: async (request, context) => {
         try {
             if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            const requestContext = await resolveRequestContext(request);
-            const today = new Date().toISOString().split('T')[0];
-            const result = await queryPatients({
-                scope: requestContext.scope,
-                criteria: {
-                    logic: 'AND',
-                    conditions: [{ field: 'primaryAppointmentDate', op: 'appointment_on_date', value: today }],
-                },
-                limit: 500,
-                offset: 0,
-                includeTotal: true,
-            });
-            return { jsonBody: result, headers: jsonHeaders };
+            return await runPatientsToday(request, context);
         } catch (error) {
             return handleError(context, error, 'Patients today query failed');
         }
@@ -1783,43 +1874,7 @@ app.http('patientsActions', {
     handler: async (request, context) => {
         try {
             if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            const requestContext = await resolveRequestContext(request);
-            const body = await safeJson(request) || {};
-            const { action, patientId, studyId, siteId } = body;
-            if (!action || !patientId) {
-                return { status: 400, jsonBody: { error: 'action and patientId are required' }, headers: jsonHeaders };
-            }
-            const container = getContainer('patients');
-            const { resource: patient } = await container.item(patientId).read();
-            if (!patient) return { status: 404, jsonBody: { error: 'Patient not found' }, headers: jsonHeaders };
-            if (!patientAccessibleToScope(enrichPatientDocument(patient), requestContext.scope)) {
-                return scopeForbiddenResponse();
-            }
-            const actorLabel = requestContext.actor?.upn || requestContext.actor?.name || requestContext.scope?.userId || 'system';
-            let updated;
-            if (action === 'promote_candidate') {
-                if (!studyId) return { status: 400, jsonBody: { error: 'studyId is required' }, headers: jsonHeaders };
-                updated = promoteCandidateEnrollment(patient, studyId, siteId, actorLabel);
-            } else if (action === 'claim_lead') {
-                const userId = requestContext.scope?.userId || body.userId;
-                if (!userId) return { status: 400, jsonBody: { error: 'Authenticated user required to claim' }, headers: jsonHeaders };
-                updated = claimPatientLead(patient, userId, body.homeSiteId, actorLabel);
-            } else if (action === 'withdraw_candidate') {
-                if (!studyId) return { status: 400, jsonBody: { error: 'studyId is required' }, headers: jsonHeaders };
-                updated = withdrawCandidateEnrollment(patient, studyId, actorLabel);
-            } else if (action === 'release_claim') {
-                updated = enrichPatientDocument({
-                    ...patient,
-                    claimedByUserId: null,
-                    claimedAt: null,
-                    auditTrail: [...(patient.auditTrail || []), appendPatientAudit(patient, 'release_claim', '', actorLabel)],
-                    lastUpdated: new Date().toISOString(),
-                });
-            } else {
-                return { status: 400, jsonBody: { error: `Unknown action: ${action}` }, headers: jsonHeaders };
-            }
-            const { resource: result } = await container.items.upsert(updated);
-            return { jsonBody: enrichPatientDocument(result), headers: jsonHeaders };
+            return await runPatientsActions(request, context);
         } catch (error) {
             return handleError(context, error, 'Patient action failed');
         }
@@ -1833,23 +1888,7 @@ app.http('patientsReindex', {
     handler: async (request, context) => {
         try {
             if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            const requestContext = await resolveRequestContext(request);
-            if (requestContext.scope && requestContext.scope.role !== 'Internal') {
-                return { status: 403, jsonBody: { error: 'Internal role required' }, headers: jsonHeaders };
-            }
-            const body = await safeJson(request) || {};
-            const limit = Math.min(parseInt(body.limit, 10) || 100, 500);
-            const offset = parseInt(body.offset, 10) || 0;
-            const container = getContainer('patients');
-            const { resources } = await container.items.query({
-                query: `SELECT * FROM c ORDER BY c._ts DESC OFFSET ${offset} LIMIT ${limit}`,
-            }).fetchAll();
-            let updated = 0;
-            for (const p of resources || []) {
-                await container.items.upsert(enrichPatientDocument(p));
-                updated += 1;
-            }
-            return { jsonBody: { updated, offset, limit, hasMore: (resources || []).length === limit }, headers: jsonHeaders };
+            return await runPatientsReindex(request, context);
         } catch (error) {
             return handleError(context, error, 'Patient reindex failed');
         }
