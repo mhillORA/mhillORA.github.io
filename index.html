@@ -12,7 +12,6 @@
         }
     </script>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -214,26 +213,6 @@
 const API_BASE_URL = '/api'; // Use relative path like other files
 const API_KEY = ''; // Optional. Prefer platform auth; leave empty for local/dev.
 
-let msalInstance = null;
-let entraConfig = { enabled: false, clientId: '', tenantId: '', authority: '' };
-let entraIdToken = null;
-
-const getApiBearerToken = async () => {
-    if (entraIdToken) return entraIdToken;
-    if (!msalInstance) return null;
-    try {
-        const accounts = msalInstance.getAllAccounts();
-        if (!accounts.length) return null;
-        const result = await msalInstance.acquireTokenSilent({
-            account: accounts[0],
-            scopes: entraConfig.clientId ? [`api://${entraConfig.clientId}/access_as_user`, 'openid', 'profile', 'email'] : ['openid', 'profile', 'email'],
-        });
-        return result.idToken || result.accessToken || null;
-    } catch {
-        return entraIdToken;
-    }
-};
-
 const apiCall = async (endpoint, method = 'GET', data = null) => {
     try {
         const options = {
@@ -247,9 +226,8 @@ const apiCall = async (endpoint, method = 'GET', data = null) => {
             options.headers['x-functions-key'] = API_KEY;
         }
 
-        const bearer = await getApiBearerToken();
-        if (bearer) {
-            options.headers['Authorization'] = `Bearer ${bearer}`;
+        if (state.currentUser?.id) {
+            options.headers['X-NASA-User-Id'] = state.currentUser.id;
         }
         
         if (data) {
@@ -442,6 +420,9 @@ const updateDocument = async (collection, id, data) => {
                     assignedToUserId: '',
                     eligibilityStatus: 'unknown',
                     doNotContact: false,
+                    homeSiteId: '',
+                    claimedByUserId: '',
+                    claimedAt: null,
                     tasks: [],
                     consentRecords: [],
                     communications: [],
@@ -563,7 +544,6 @@ let state = {
     accessRequests: [],
     managedUsers: [],
     currentUser: null,
-    entraSignInEnabled: false,
     privacyMaskSensitive: false, // blur PHI/PII on screen (persisted in localStorage)
 };
 let chartInstances = {}; // To hold chart objects for destruction
@@ -604,7 +584,6 @@ const loadLocalState = () => {
             role: 'Internal',
             password: 'Password1!',
             allowedSiteIds: [],
-            entraId: '',
         }, ...(state.managedUsers || [])];
         saveLocalState();
     }
@@ -626,8 +605,6 @@ const normalizeApiUser = (user) => {
     return {
         ...user,
         username: user.username || user.displayName || '',
-        entraId: user.entraId || user.entraOid || '',
-        entraOid: user.entraOid || user.entraId || '',
     };
 };
 
@@ -640,8 +617,6 @@ const toApiUserPayload = (user) => ({
     password: user.password || '',
     allowedSiteIds: user.allowedSiteIds || [],
     allowedStudyIds: user.allowedStudyIds || [],
-    entraId: String(user.entraId || user.entraOid || '').trim(),
-    entraOid: String(user.entraOid || user.entraId || '').trim(),
     active: user.active !== false,
     createdAt: user.createdAt || new Date().toISOString(),
     lastUpdated: new Date().toISOString(),
@@ -657,7 +632,6 @@ const setSignedInUser = (user) => {
         role: normalized.role,
         allowedSiteIds: normalized.allowedSiteIds || [],
         allowedStudyIds: normalized.allowedStudyIds || [],
-        entraId: normalized.entraId || '',
     };
     state.userId = normalized.id || normalized.username || 'nasa-user';
     state.showLoginGate = false;
@@ -675,76 +649,6 @@ const loadManagedUsersFromApi = async () => {
         console.warn('NASA: Could not load users from API; using local cache.', error);
     }
     return false;
-};
-
-const loadEntraConfig = async () => {
-    try {
-        const config = await apiCall('entra-config');
-        entraConfig = {
-            enabled: !!(config && config.enabled && config.clientId),
-            clientId: (config && config.clientId) || '',
-            tenantId: (config && config.tenantId) || '',
-            authority: (config && config.authority) || 'https://login.microsoftonline.com/common',
-        };
-        state.entraSignInEnabled = entraConfig.enabled;
-    } catch (error) {
-        console.warn('NASA: Entra config unavailable.', error);
-        entraConfig = { enabled: false, clientId: '', tenantId: '', authority: '' };
-        state.entraSignInEnabled = false;
-    }
-};
-
-const initMsal = async () => {
-    if (!entraConfig.enabled || typeof msal === 'undefined') return;
-    try {
-        msalInstance = new msal.PublicClientApplication({
-            auth: {
-                clientId: entraConfig.clientId,
-                authority: entraConfig.authority,
-                redirectUri: window.location.origin,
-            },
-            cache: {
-                cacheLocation: 'sessionStorage',
-                storeAuthStateInCookie: false,
-            },
-        });
-        await msalInstance.initialize();
-    } catch (error) {
-        console.warn('NASA: MSAL init failed.', error);
-        msalInstance = null;
-        state.entraSignInEnabled = false;
-    }
-};
-
-const handleEntraLogin = async () => {
-    if (!msalInstance) {
-        showNotification('Microsoft sign-in is not configured yet. Ask an admin to set ENTRA_CLIENT_ID and ENTRA_TENANT_ID on the API.', 'error');
-        return;
-    }
-    try {
-        const loginResponse = await msalInstance.loginPopup({
-            scopes: ['openid', 'profile', 'email'],
-        });
-        const token = loginResponse.idToken;
-        if (!token) throw new Error('No ID token returned from Microsoft');
-        entraIdToken = token;
-        const user = await apiCall('users/authenticate-entra', 'POST', { token });
-        setSignedInUser(user);
-        showNotification(`Signed in as ${user.email || user.username || user.displayName}`, 'success');
-        render();
-    } catch (error) {
-        console.error('Entra login failed:', error);
-        entraIdToken = null;
-        let message = error.message || 'Microsoft sign-in failed.';
-        try {
-            const jsonStart = message.indexOf('{');
-            if (jsonStart >= 0) {
-                const parsed = JSON.parse(message.slice(jsonStart));
-                if (parsed.error) message = parsed.error;
-            }
-        } catch {}
-        showNotification(message, 'error');
-    }
 };
 
 const saveLocalState = () => {
@@ -1074,12 +978,18 @@ const convertPatientToAzureFormat = (patient) => {
         exitedDate: enrollment.exitedDate
     }));
     const denorm = computePatientDenormalized(normalized);
+    const primaryAppt = getPrimaryAppointment(normalized);
+    let primaryAppointmentDate = normalized.primaryAppointmentDate || null;
+    if (primaryAppt?.time) {
+        try { primaryAppointmentDate = new Date(primaryAppt.time).toISOString().split('T')[0]; } catch { /* ignore */ }
+    }
     return {
         ...normalized,
         ...denorm,
+        primaryAppointmentDate,
         studyId: currentEnrollment?.studyId || null,
         siteId: currentEnrollment?.siteId || null,
-        appointment: getPrimaryAppointment(normalized),
+        appointment: primaryAppt,
         appointments: getPatientAppointments(normalized),
         studyHistory
     };
@@ -1238,20 +1148,46 @@ const patientVisibleToCurrentUser = (patient) => {
     const allowedSites = getUserAllowedSiteIds();
     const allowedStudies = getUserAllowedStudyIds();
     if (allowedSites === null && allowedStudies === null) return true;
-    const enrollment = patient.enrollments?.find(e => e.status === 'current');
     const denorm = computePatientDenormalized(patient);
-    const siteId = enrollment?.siteId || denorm.currentSiteId;
-    const studyId = enrollment?.studyId || denorm.currentStudyId;
-    if (!siteId && !studyId) return true;
-    if (allowedSites !== null && siteId && !allowedSites.includes(siteId)) return false;
-    if (allowedStudies !== null && studyId && !allowedStudies.includes(studyId)) return false;
-    return true;
+    const siteId = denorm.currentSiteId;
+    const studyId = denorm.currentStudyId;
+
+    if (siteId || studyId) {
+        if (allowedSites !== null && siteId && !allowedSites.includes(siteId)) return false;
+        if (allowedStudies !== null && studyId && !allowedStudies.includes(studyId)) return false;
+        return true;
+    }
+
+    const homeSiteId = patient.homeSiteId;
+    const userId = state.currentUser?.id;
+    if (allowedSites !== null && homeSiteId && allowedSites.includes(homeSiteId)) return true;
+    if (userId && (patient.claimedByUserId === userId || patient.assignedToUserId === userId)) return true;
+    return false;
+};
+
+const patientActionServer = async (action, patientId, extra = {}) =>
+    apiCall('patients/actions', 'POST', { action, patientId, ...extra });
+
+const loadCrcTodayPatients = async () => {
+    try {
+        const result = await apiCall('patients/today');
+        return (result.items || []).map(p => normalizePatientRecord(convertPatientFromAzureFormat(p)));
+    } catch (err) {
+        console.warn('CRC today query failed, using local filter:', err.message);
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        return filterPatientsForCurrentUser(state.patients).filter(p => {
+            if (!p.appointment?.time) return false;
+            const apptDate = new Date(p.appointment.time);
+            apptDate.setHours(0, 0, 0, 0);
+            return apptDate.getTime() === todayStart.getTime();
+        });
+    }
 };
 
 const queryPatientsServer = async (options = {}) => {
     const body = {
         criteria: options.criteria || { logic: 'AND', conditions: [] },
-        scope: options.scope !== undefined ? options.scope : getUserScopeForApi(),
         search: options.search || '',
         limit: options.limit || 50,
         offset: options.offset || 0,
@@ -1262,20 +1198,11 @@ const queryPatientsServer = async (options = {}) => {
     return { ...result, items };
 };
 
-const previewCohortServer = async (criteria) => {
-    return apiCall('cohorts/preview', 'POST', {
-        criteria,
-        scope: getUserScopeForApi(),
-        sampleLimit: 25,
-    });
-};
+const previewCohortServer = async (criteria) =>
+    apiCall('cohorts/preview', 'POST', { criteria, sampleLimit: 25 });
 
-const runCohortAssignServer = async (payload) => {
-    return apiCall('cohorts/assign', 'POST', {
-        ...payload,
-        scope: getUserScopeForApi(),
-    });
-};
+const runCohortAssignServer = async (payload) =>
+    apiCall('cohorts/assign', 'POST', payload);
 
 const continueBulkJobServer = async (jobId) => apiCall(`bulk-jobs/${jobId}/continue`, 'POST', {});
 
@@ -1301,10 +1228,14 @@ const COHORT_CRITERIA_FIELD_DEFS = [
     { field: 'pipelineStage', label: 'Pipeline Stage', ops: ['equals', 'in'] },
     { field: 'doNotContact', label: 'Do Not Contact', ops: ['is_false', 'is_true'] },
     { field: '_enrollment', label: 'Enrollment Rule', ops: ['not_enrolled_in', 'has_current_enrollment', 'no_current_enrollment'] },
+    { field: 'primaryAppointmentDate', label: 'Appointment Date', ops: ['appointment_on_date', 'has_appointment'] },
+    { field: 'homeSiteId', label: 'Home Site', ops: ['equals', 'in'] },
 ];
 
 const filterPatientsForCurrentUser = (patients) =>
     (patients || []).filter(patientVisibleToCurrentUser);
+
+const getScopedPatients = () => filterPatientsForCurrentUser(state.patients || []);
 
 const findPatientById = (id) =>
     state.patients.find(p => p.id === id)
@@ -1508,7 +1439,7 @@ const getOpenTasksForPatients = (patients, options = {}) => {
     return tasks.sort((a, b) => new Date(a.task.dueDate || 0) - new Date(b.task.dueDate || 0));
 };
 
-const countPatientsInSlot = (slotId) => (state.patients || []).filter(p =>
+const countPatientsInSlot = (slotId) => filterPatientsForCurrentUser(state.patients || []).filter(p =>
     getPatientAppointments(p).some(a => a.slotId === slotId && (a.status || 'scheduled') !== 'cancelled')
 ).length;
 
@@ -2049,23 +1980,15 @@ const getRecruiterDashboardHTML = () => {
 };
 
 const renderDashboardCharts = () => {
-    // Render Today's Appointments
     renderDashboardTodaysAppointments();
 };
 
-const renderDashboardTodaysAppointments = () => {
+const renderDashboardTodaysAppointments = async () => {
     const container = document.getElementById('todays-appointments-container');
     if (!container) return;
-    
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    
-    let todaysAppointments = state.patients.filter(p => {
-        if (!p.appointment || !p.appointment.time) return false;
-        const apptDate = new Date(p.appointment.time);
-        apptDate.setHours(0, 0, 0, 0);
-        return apptDate.getTime() === todayStart.getTime();
-    });
+
+    container.innerHTML = `<div class="text-center py-6 text-gray-500 dark:text-gray-400">Loading today's appointments...</div>`;
+    const todaysAppointments = await loadCrcTodayPatients();
     
     if (todaysAppointments.length === 0) {
         container.innerHTML = `
@@ -2776,9 +2699,10 @@ const getPatientsHTML = () => {
         <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Patients${totalLabel}</h2>
         <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-4">
             <input type="text" id="patient-search" value="${state.patientSearchTerm}" class="p-2 border dark:border-gray-600 rounded-md md:col-span-2 bg-white dark:bg-gray-700 dark:text-white" placeholder="Search by Name, Email, Phone, or Global ID...">
-            <div class="flex gap-2">
-                <button data-action="import-patients-modal" class="w-full bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 flex items-center justify-center"><i data-lucide="upload" class="w-4 h-4 mr-2"></i> Import</button>
-                <button data-action="quick-add-patient-modal" class="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">Quick Add</button>
+            <div class="flex gap-2 flex-wrap">
+                <button data-action="import-patients-modal" class="flex-1 min-w-[120px] bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 flex items-center justify-center"><i data-lucide="upload" class="w-4 h-4 mr-2"></i> Import</button>
+                <button data-action="quick-add-patient-modal" class="flex-1 min-w-[120px] bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">Quick Add</button>
+                <button data-action="patients-my-leads" class="flex-1 min-w-[120px] bg-amber-600 text-white px-4 py-2 rounded-md hover:bg-amber-700">My Leads</button>
             </div>
         </div>
         ${state.patientsUseServerQuery ? `
@@ -3123,6 +3047,12 @@ const buildRegistryConditionRowHTML = (cond, index) => {
         valueInput = `<div class="flex gap-2"><input type="number" data-registry-value="0" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" placeholder="Min" value="${arr[0] ?? ''}"><input type="number" data-registry-value="1" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" placeholder="Max" value="${arr[1] ?? ''}"></div>`;
     } else if (op === 'not_enrolled_in') {
         valueInput = `<select class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full">${state.studies.map(s => `<option value="${s.id}" ${value === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select>`;
+    } else if (op === 'appointment_on_date') {
+        valueInput = `<input type="date" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" value="${value || ''}">`;
+    } else if (op === 'has_appointment') {
+        valueInput = `<span class="text-sm text-gray-500 dark:text-gray-400 p-2">Has any appointment date</span>`;
+    } else if (field === 'homeSiteId') {
+        valueInput = `<select class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full">${state.sites.map(s => `<option value="${s.id}" ${value === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}</select>`;
     } else if (op === 'in') {
         valueInput = `<input type="text" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" placeholder="Comma-separated values" value="${Array.isArray(value) ? value.join(', ') : value}">`;
     } else if (def.presets) {
@@ -3164,6 +3094,13 @@ const collectRegistryCriteriaFromDom = () => {
             return;
         } else if (field === '_enrollment') {
             conditions.push({ field: '_enrollment', op, value: null });
+            return;
+        } else if (op === 'has_appointment') {
+            conditions.push({ field: 'primaryAppointmentDate', op, value: null });
+            return;
+        } else if (op === 'appointment_on_date') {
+            value = row.querySelector('.registry-cond-value')?.value || '';
+            conditions.push({ field: 'primaryAppointmentDate', op, value });
             return;
         } else {
             value = row.querySelector('.registry-cond-value')?.value ?? '';
@@ -3801,6 +3738,10 @@ const getPatientProfileHTML = (patient) => {
                         <p><strong>Therapeutic Area:</strong> ${patient.therapeuticArea || 'N/A'}</p>
                         <p><strong>Current Study:</strong> ${study?.title || 'N/A'}</p>
                         <p><strong>Site:</strong> ${site?.name || 'N/A'}</p>
+                        <p><strong>Home Site:</strong> ${patient.homeSiteId ? (state.sites.find(s => s.id === patient.homeSiteId)?.name || patient.homeSiteId) : '—'}</p>
+                        ${patient.claimedByUserId ? `<p><strong>Claimed by:</strong> ${(state.managedUsers || []).find(u => u.id === patient.claimedByUserId)?.username || patient.claimedByUserId}</p>` : ''}
+                        ${!currentEnrollment && !patient.claimedByUserId ? `<button type="button" data-action="claim-lead" data-patient-id="${patient.id}" class="mt-2 text-sm bg-amber-600 text-white px-3 py-1 rounded hover:bg-amber-700">Claim Lead</button>` : ''}
+                        ${patient.claimedByUserId === state.currentUser?.id ? `<button type="button" data-action="release-claim" data-patient-id="${patient.id}" class="mt-2 ml-2 text-sm text-gray-600 dark:text-gray-300 hover:underline">Release claim</button>` : ''}
                         <p><strong>In-Clinic Status:</strong> ${phi(patient.inClinicStatus || 'N/A')}</p>
                         <p><strong>Visit Outcome:</strong> ${phi(patient.visitOutcome || 'N/A')}</p>
                         <p><strong>Next Visit Date:</strong> ${phi(patient.nextVisitDate || 'N/A')}</p>
@@ -3813,10 +3754,16 @@ const getPatientProfileHTML = (patient) => {
                 <div class="mt-6">
                     <h3 class="font-semibold text-lg dark:text-white mb-2 border-t dark:border-gray-700 pt-4">Study Candidates</h3>
                     ${candidateEnrollments.map(e => `
-                        <div class="p-2 border-l-2 border-amber-400 pl-3 mb-2">
-                            <p><strong>Study:</strong> ${state.studies.find(s => s.id === e.studyId)?.title || 'N/A'}</p>
-                            <p><strong>Site:</strong> ${state.sites.find(s => s.id === e.siteId)?.name || 'N/A'}</p>
-                            <p class="text-sm text-amber-700 dark:text-amber-300">Candidate${e.assignedAt ? ` — assigned ${new Date(e.assignedAt).toLocaleDateString()}` : ''}</p>
+                        <div class="p-2 border-l-2 border-amber-400 pl-3 mb-2 flex justify-between items-start gap-2">
+                            <div>
+                                <p><strong>Study:</strong> ${state.studies.find(s => s.id === e.studyId)?.title || 'N/A'}</p>
+                                <p><strong>Site:</strong> ${state.sites.find(s => s.id === e.siteId)?.name || 'N/A'}</p>
+                                <p class="text-sm text-amber-700 dark:text-amber-300">Candidate${e.assignedAt ? ` — assigned ${new Date(e.assignedAt).toLocaleDateString()}` : ''}</p>
+                            </div>
+                            <div class="flex flex-col gap-1 shrink-0">
+                                <button type="button" data-action="promote-candidate" data-patient-id="${patient.id}" data-study-id="${e.studyId}" data-site-id="${e.siteId || ''}" class="text-xs bg-green-600 text-white px-2 py-1 rounded hover:bg-green-700">Promote to Current</button>
+                                <button type="button" data-action="withdraw-candidate" data-patient-id="${patient.id}" data-study-id="${e.studyId}" class="text-xs text-red-600 hover:underline">Withdraw</button>
+                            </div>
                         </div>
                     `).join('')}
                 </div>` : ''}
@@ -3996,6 +3943,7 @@ const getQuickAddPatientHTML = () => {
                 <div><label class="block text-sm font-medium dark:text-gray-300">Source</label><select name="source" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Source</option>${sources.map(s => `<option>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Site</label><select name="siteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Home Site (lead pool)</label><select name="homeSiteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
                 <div class="md:col-span-2">
                     <label class="block text-sm font-medium dark:text-gray-300 mb-2">Eligibility (Automated Review)</label>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 p-3 border dark:border-gray-600 rounded bg-gray-50 dark:bg-gray-800">
@@ -4073,6 +4021,7 @@ const getEditPatientModalHTML = (patient) => {
                 <div><label class="block text-sm font-medium dark:text-gray-300">Source</label><select name="source" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Source</option>${sources.map(s => `<option ${patient.source === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.studies.map(s => `<option ${currentEnrollment?.studyId === s.id ? 'selected' : ''} value="${s.id}">${s.title}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Site</label><select name="siteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option ${currentEnrollment?.siteId === s.id ? 'selected' : ''} value="${s.id}">${s.name}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Home Site (lead pool)</label><select name="homeSiteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option value="${s.id}" ${patient.homeSiteId === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Pipeline Stage</label><select name="pipelineStage" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${PIPELINE_STAGES.map(s => `<option value="${s.id}" ${(patient.pipelineStage || inferPipelineStage(patient)) === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Eligibility Status</label><select name="eligibilityStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${['unknown','eligible','ineligible','pi_review'].map(s => `<option value="${s}" ${(patient.eligibilityStatus || 'unknown') === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assigned To</label><select name="assignedToUserId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Unassigned</option>${(state.managedUsers || []).map(u => `<option value="${u.id}" ${patient.assignedToUserId === u.id ? 'selected' : ''}>${u.username || u.email}</option>`).join('')}</select></div>
@@ -4131,13 +4080,6 @@ const getLoginGateHTML = () => {
                         <span>Sign in</span>
                     </button>
 
-                    ${state.entraSignInEnabled ? `
-                    <button type="button" data-action="login-gate-entra" class="w-full px-4 py-3 bg-white dark:bg-gray-800 text-gray-900 dark:text-white border-2 border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700 flex items-center justify-center gap-3">
-                        <svg class="w-5 h-5" viewBox="0 0 21 21" aria-hidden="true"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
-                        <span>Sign in with Microsoft</span>
-                    </button>
-                    ` : ''}
-
                     <button type="button" data-action="login-gate-request-access" class="w-full px-4 py-3 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
                         <i data-lucide="user-plus" class="w-5 h-5"></i>
                         <span>Request Access</span>
@@ -4145,7 +4087,7 @@ const getLoginGateHTML = () => {
                 </form>
 
                 <div class="mt-4 text-xs text-gray-500 dark:text-gray-400">
-                    ${state.entraSignInEnabled ? 'Sign in with Microsoft or username/password.' : 'Username/password login. Microsoft sign-in appears when Entra is configured on the API.'}
+                    Sign in with the username and password created in Manager → Users.
                 </div>
             </div>
         </div>
@@ -4304,6 +4246,12 @@ const getManageRHTML = () => {
             <div>
                 <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Manager</h2>
                 <p class="text-gray-600 dark:text-gray-400">Review access requests and manage recruitment users (stored separately from CHAOS in Cosmos <code class="text-xs">recruitment-users</code>).</p>
+                ${state.currentUser?.role === 'Internal' ? `
+                    <div class="mt-3">
+                        <button type="button" data-action="patients-reindex" class="text-sm bg-gray-700 text-white px-3 py-2 rounded hover:bg-gray-800">Reindex patient search fields (batch)</button>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Backfills denormalized enrollment and appointment fields for registry queries.</p>
+                    </div>
+                ` : ''}
             </div>
 
             <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -4351,12 +4299,6 @@ const getManageRHTML = () => {
                                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email</label>
                                 <input name="email" id="manageR-email" type="email" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="jdoe@company.com">
                             </div>
-                        </div>
-
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Microsoft Entra ID (Object ID)</label>
-                            <input name="entraId" id="manageR-entra-id" type="text" autocomplete="off" spellcheck="false" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white font-mono text-sm" placeholder="e.g. a1b2c3d4-e5f6-7890-abcd-ef1234567890">
-                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Optional. The user’s object ID in Entra ID (Azure AD) for SSO, Graph, or API correlation.</p>
                         </div>
 
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -4407,7 +4349,6 @@ const getManageRHTML = () => {
                                 <tr class="text-left text-gray-600 dark:text-gray-300 border-b border-gray-200 dark:border-gray-700">
                                     <th class="py-2 pr-3">Username</th>
                                     <th class="py-2 pr-3">Email</th>
-                                    <th class="py-2 pr-3">Entra ID</th>
                                     <th class="py-2 pr-3">Role</th>
                                     <th class="py-2 pr-3">Sites</th>
                                     <th class="py-2 pr-3">Studies</th>
@@ -4418,15 +4359,10 @@ const getManageRHTML = () => {
                                 ${users.map(u => {
                                     const siteCount = (u.allowedSiteIds || []).length;
                                     const studyCount = (u.allowedStudyIds || []).length;
-                                    const entra = String(u.entraId || '').trim();
-                                    const entraCell = entra
-                                        ? `<span class="font-mono text-xs break-all" title="${escapeHtmlPhi(entra)}">${escapeHtmlPhi(entra)}</span>`
-                                        : '<span class="text-gray-400 dark:text-gray-500">—</span>';
                                     return `
                                         <tr class="border-b border-gray-100 dark:border-gray-700 text-gray-700 dark:text-gray-200">
                                             <td class="py-2 pr-3 font-medium">${u.username}</td>
                                             <td class="py-2 pr-3 text-xs break-all">${u.email ? escapeHtmlPhi(u.email) : '<span class="text-gray-400 dark:text-gray-500">—</span>'}</td>
-                                            <td class="py-2 pr-3 max-w-[14rem]">${entraCell}</td>
                                             <td class="py-2 pr-3">${u.role || ''}</td>
                                             <td class="py-2 pr-3">${siteCount}</td>
                                             <td class="py-2 pr-3">${studyCount}</td>
@@ -4522,7 +4458,6 @@ const setupManageR = () => {
                 createdAt: new Date().toISOString(),
                 username: String(fd.get('username') || '').trim(),
                 email: String(fd.get('email') || '').trim(),
-                entraId: String(fd.get('entraId') || '').trim(),
                 role: String(fd.get('role') || '').trim(),
                 password: String(fd.get('password') || ''),
                 allowedSiteIds,
@@ -4586,12 +4521,6 @@ const getEditManagedUserModalHTML = (user) => {
                 </div>
             </div>
 
-            <div>
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Microsoft Entra ID (Object ID)</label>
-                <input name="entraId" type="text" autocomplete="off" spellcheck="false" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white font-mono text-sm" value="${String(user.entraId || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" placeholder="Object ID (GUID)">
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Optional. Used to link this account to Microsoft Entra ID.</p>
-            </div>
-
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Role</label>
@@ -4645,7 +4574,6 @@ const setupEditManagedUserForm = (userId) => {
             ...existing,
             username: String(fd.get('username') || '').trim(),
             email: String(fd.get('email') || '').trim(),
-            entraId: String(fd.get('entraId') || '').trim(),
             role: String(fd.get('role') || '').trim(),
             password: String(fd.get('password') || ''),
             allowedSiteIds,
@@ -4815,10 +4743,10 @@ const getEditScheduleModalHTML = (schedule) => {
     `;
 };
 const getAppointmentDetailsModalHTML = (schedule, slot) => {
-    const scheduledPatients = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id);
+    const scheduledPatients = getScopedPatients().filter(p => p.appointment && p.appointment.slotId === slot.id);
     const study = state.studies.find(s => s.id === schedule.studyId);
     const site = state.sites.find(s => s.id === schedule.siteId);
-    const eligiblePatients = state.patients
+    const eligiblePatients = getScopedPatients()
         .filter(p => {
             const currentEnrollment = (p.enrollments || []).find(e => e.status === 'current');
             if (!currentEnrollment) return false;
@@ -5441,9 +5369,8 @@ const getAddPatientToStudyModalHTML = (studyId) => {
     if (!study) return `<h2>Study not found</h2>`;
     
     // Get patients that are NOT currently enrolled in this study
-    const availablePatients = state.patients.filter(p => {
+    const availablePatients = getScopedPatients().filter(p => {
         const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-        // Include patients with no current enrollment OR enrolled in a different study
         return !currentEnrollment || currentEnrollment.studyId !== studyId;
     });
     
@@ -5933,6 +5860,7 @@ const patientTemplate = () => ({
     inclusionCriteriaMet: false, exclusionCriteriaMet: false,
     inClinicStatus: '', visitOutcome: '', nextVisitDate: '', sfReason: '', pcp: '', comments: '',
     pipelineStage: 'lead', assignedToUserId: '', eligibilityStatus: 'unknown', doNotContact: false,
+    homeSiteId: '', claimedByUserId: '', claimedAt: null,
     enrollments: [], appointment: null, appointments: [], surveyResults: [], contactLogs: [],
     completedVisits: [], visitLogs: [], tasks: [], consentRecords: [], communications: [], waitlist: [], auditTrail: []
 });
@@ -6008,22 +5936,11 @@ document.addEventListener('click', async (e) => {
                 state.userId = 'nasa-user';
                 state.selectedStudyId = null;
                 state.studiesExpanded = false;
-                entraIdToken = null;
                 state.showLoginGate = true;
                 closeModal();
                 closeSidePanel();
-                if (msalInstance) {
-                    const accounts = msalInstance.getAllAccounts();
-                    if (accounts.length) {
-                        try { await msalInstance.logoutPopup({ account: accounts[0] }); } catch {}
-                    }
-                }
                 showNotification('Signed out.', 'success');
                 render();
-                break;
-            }
-            case 'login-gate-entra': {
-                await handleEntraLogin();
                 break;
             }
             case 'login-gate-request-access': {
@@ -6233,6 +6150,51 @@ document.addEventListener('click', async (e) => {
                 }
                 break;
             }
+            case 'patients-my-leads': {
+                state.patientSearchTerm = '';
+                try {
+                    const uid = state.currentUser?.id;
+                    const result = await queryPatientsServer({
+                        criteria: {
+                            logic: 'OR',
+                            conditions: [
+                                { field: 'claimedByUserId', op: 'equals', value: uid },
+                                { field: 'assignedToUserId', op: 'equals', value: uid },
+                            ],
+                        },
+                        limit: state.patientsPageSize,
+                        offset: 0,
+                    });
+                    state.patients = result.items;
+                    state.patientsServerTotal = result.total;
+                    state.patientsPageOffset = 0;
+                    renderPatientTable();
+                    showNotification(`Showing ${result.items.length} of ${result.total || 0} leads assigned/claimed to you.`, 'info');
+                } catch (err) {
+                    showNotification(`Lead filter failed: ${err.message}`, 'error');
+                }
+                break;
+            }
+            case 'patients-reindex': {
+                if (state.currentUser?.role !== 'Internal') {
+                    showNotification('Internal role required.', 'error');
+                    break;
+                }
+                try {
+                    let offset = 0;
+                    let total = 0;
+                    let batch;
+                    do {
+                        batch = await apiCall('patients/reindex', 'POST', { limit: 200, offset });
+                        total += batch.updated || 0;
+                        offset += batch.limit || 200;
+                    } while (batch.hasMore);
+                    showNotification(`Reindexed ${total} patient records.`, 'success');
+                } catch (err) {
+                    showNotification(`Reindex failed: ${err.message}`, 'error');
+                }
+                break;
+            }
             case 'patients-prev-page': {
                 const prev = Math.max(0, (state.patientsPageOffset || 0) - (state.patientsPageSize || 50));
                 await loadPatientsPage(prev);
@@ -6244,6 +6206,62 @@ document.addEventListener('click', async (e) => {
                 if (next < (state.patientsServerTotal || 0)) {
                     await loadPatientsPage(next);
                     renderPatientTable();
+                }
+                break;
+            }
+            case 'claim-lead': {
+                try {
+                    const pid = actionButton.dataset.patientId;
+                    const homeSiteId = state.currentUser?.allowedSiteIds?.[0] || '';
+                    await patientActionServer('claim_lead', pid, { homeSiteId });
+                    showNotification('Lead claimed.', 'success');
+                    await loadAllData();
+                    const p = findPatientById(pid);
+                    if (p) openSidePanel(getPatientProfileHTML(p), true);
+                } catch (err) {
+                    showNotification(`Claim failed: ${err.message}`, 'error');
+                }
+                break;
+            }
+            case 'release-claim': {
+                try {
+                    const pid = actionButton.dataset.patientId;
+                    await patientActionServer('release_claim', pid);
+                    showNotification('Claim released.', 'success');
+                    await loadAllData();
+                    const p = findPatientById(pid);
+                    if (p) openSidePanel(getPatientProfileHTML(p), true);
+                } catch (err) {
+                    showNotification(`Release failed: ${err.message}`, 'error');
+                }
+                break;
+            }
+            case 'promote-candidate': {
+                try {
+                    const pid = actionButton.dataset.patientId;
+                    const sid = actionButton.dataset.studyId;
+                    const site = actionButton.dataset.siteId || undefined;
+                    await patientActionServer('promote_candidate', pid, { studyId: sid, siteId: site });
+                    showNotification('Candidate promoted to current enrollment.', 'success');
+                    await loadAllData();
+                    const p = findPatientById(pid);
+                    if (p) openSidePanel(getPatientProfileHTML(p), true);
+                } catch (err) {
+                    showNotification(`Promote failed: ${err.message}`, 'error');
+                }
+                break;
+            }
+            case 'withdraw-candidate': {
+                try {
+                    const pid = actionButton.dataset.patientId;
+                    const sid = actionButton.dataset.studyId;
+                    await patientActionServer('withdraw_candidate', pid, { studyId: sid });
+                    showNotification('Candidate enrollment withdrawn.', 'success');
+                    await loadAllData();
+                    const p = findPatientById(pid);
+                    if (p) openSidePanel(getPatientProfileHTML(p), true);
+                } catch (err) {
+                    showNotification(`Withdraw failed: ${err.message}`, 'error');
                 }
                 break;
             }
@@ -7945,7 +7963,7 @@ document.addEventListener('submit', async (e) => {
             break;
         }
         case 'report-filter-form': {
-            let filteredPatients = [...state.patients];
+            let filteredPatients = [...filterPatientsForCurrentUser(state.patients)];
             // Apply filters
             if (data.studyId !== 'all') {
                 filteredPatients = filteredPatients.filter(p => p.enrollments?.some(e => e.studyId === data.studyId));
@@ -8750,8 +8768,6 @@ const init = async () => {
     // Initialize NASA with Azure Cosmos DB
     try {
         loadLocalState();
-        await loadEntraConfig();
-        await initMsal();
         const loadedUsers = await loadManagedUsersFromApi();
         if (!loadedUsers && (state.managedUsers || []).length) {
             for (const user of state.managedUsers) {

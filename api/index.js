@@ -1,59 +1,18 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
-const { jwtVerify, createRemoteJWKSet } = require('jose');
 
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
-const ENTRA_TENANT_ID = process.env.ENTRA_TENANT_ID;
-const ENTRA_API_AUDIENCE = process.env.ENTRA_API_AUDIENCE; // typically your API app's clientId or Application ID URI
-const ENTRA_AUTH_DISABLED = String(process.env.ENTRA_AUTH_DISABLED || '').toLowerCase() === 'true';
-
 // NASA / recruitment logins are isolated from CHAOS (`users` container on chaos-scheduler deploy).
 const RECRUITMENT_USERS_CONTAINER = 'recruitment-users';
 
-let jwks = null;
-const getJwks = () => {
-    if (!ENTRA_TENANT_ID) return null;
-    if (!jwks) {
-        const jwksUrl = new URL(`https://login.microsoftonline.com/${ENTRA_TENANT_ID}/discovery/v2.0/keys`);
-        jwks = createRemoteJWKSet(jwksUrl);
-    }
-    return jwks;
-};
+const requireUser = async () => ({ claims: null });
 
-const getBearerToken = (request) => {
-    const h = request.headers && (request.headers.get ? request.headers.get('authorization') : request.headers.authorization);
-    const auth = h || '';
-    const m = auth.match(/^Bearer\s+(.+)$/i);
-    return m ? m[1] : null;
-};
-
-const requireUser = async (request) => {
-    if (ENTRA_AUTH_DISABLED) return { claims: null };
-    if (!ENTRA_TENANT_ID || !ENTRA_API_AUDIENCE) {
-        return { claims: null };
-    }
-    const token = getBearerToken(request);
-    if (!token) {
-        const err = new Error('UNAUTHORIZED: Missing bearer token');
-        err.status = 401;
-        throw err;
-    }
-    const issuer = `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/v2.0`;
-    const { payload } = await jwtVerify(token, getJwks(), {
-        issuer,
-        audience: ENTRA_API_AUDIENCE,
-    });
-    return { claims: payload };
-};
-
-const buildActor = (claims) => ({
-    oid: claims && claims.oid,
-    upn: claims && (claims.preferred_username || claims.upn),
-    name: claims && claims.name,
-    tid: claims && claims.tid,
+const buildActor = (actor) => ({
+    upn: actor && (actor.upn || actor.email || actor.username),
+    name: actor && (actor.name || actor.displayName || actor.username),
 });
 
 const safeJson = async (request) => {
@@ -505,6 +464,15 @@ const validatePatientsSchema = (data) => {
     if (data.currentSiteId !== undefined && data.currentSiteId !== null && typeof data.currentSiteId !== 'string') {
         errors.push('currentSiteId must be a string or null');
     }
+    if (data.homeSiteId !== undefined && data.homeSiteId !== null && typeof data.homeSiteId !== 'string') {
+        errors.push('homeSiteId must be a string or null');
+    }
+    if (data.claimedByUserId !== undefined && data.claimedByUserId !== null && typeof data.claimedByUserId !== 'string') {
+        errors.push('claimedByUserId must be a string or null');
+    }
+    if (data.primaryAppointmentDate !== undefined && data.primaryAppointmentDate !== null && typeof data.primaryAppointmentDate !== 'string') {
+        errors.push('primaryAppointmentDate must be a string or null');
+    }
     
     if (errors.length > 0) {
         throw new Error(`VALIDATION_ERROR: Patients validation failed: ${errors.join(', ')}`);
@@ -516,7 +484,8 @@ const validatePatientsSchema = (data) => {
 const PATIENT_QUERY_FIELDS = new Set([
     'registryStatus', 'status', 'therapeuticArea', 'condition', 'source', 'state', 'city', 'zipCode',
     'age', 'eligibilityStatus', 'pipelineStage', 'doNotContact', 'inclusionCriteriaMet', 'exclusionCriteriaMet',
-    'currentStudyId', 'currentSiteId', 'assignedToUserId', 'group', 'globalId',
+    'currentStudyId', 'currentSiteId', 'assignedToUserId', 'group', 'globalId', 'homeSiteId',
+    'claimedByUserId', 'primaryAppointmentDate',
 ]);
 
 const computePatientDenormalized = (patient) => {
@@ -545,33 +514,109 @@ const computePatientDenormalized = (patient) => {
 const enrichPatientDocument = (patient) => {
     if (!patient || typeof patient !== 'object') return patient;
     const denorm = computePatientDenormalized(patient);
-    return { ...patient, ...denorm };
+    let primaryAppointmentDate = patient.primaryAppointmentDate || null;
+    const apptTime = patient.appointment?.time
+        || (Array.isArray(patient.appointments) && patient.appointments.find(a => a?.time)?.time);
+    if (apptTime) {
+        try { primaryAppointmentDate = new Date(apptTime).toISOString().split('T')[0]; } catch { /* ignore */ }
+    }
+    return { ...patient, ...denorm, primaryAppointmentDate };
 };
+
+const scopeFromUserRecord = (user) => ({
+    role: user?.role || '',
+    allowedSiteIds: Array.isArray(user?.allowedSiteIds) ? user.allowedSiteIds : [],
+    allowedStudyIds: Array.isArray(user?.allowedStudyIds) ? user.allowedStudyIds : [],
+    userId: user?.id || null,
+});
+
+const patientAccessibleToScope = (patient, scope) => {
+    if (!scope || scope.role === 'Internal') return true;
+    const denorm = computePatientDenormalized(patient);
+    const siteId = denorm.currentSiteId;
+    const studyId = denorm.currentStudyId;
+    const allowedSites = scope.allowedSiteIds || [];
+    const allowedStudies = scope.allowedStudyIds || [];
+
+    if (siteId || studyId) {
+        if (allowedSites.length && siteId && !allowedSites.includes(siteId)) return false;
+        if (allowedStudies.length && studyId && !allowedStudies.includes(studyId)) return false;
+        return true;
+    }
+
+    const homeSiteId = patient.homeSiteId;
+    const claimedBy = patient.claimedByUserId;
+    const assignedTo = patient.assignedToUserId;
+    if (allowedSites.length && homeSiteId && allowedSites.includes(homeSiteId)) return true;
+    if (scope.userId && (claimedBy === scope.userId || assignedTo === scope.userId)) return true;
+    return false;
+};
+
+const resolveRequestContext = async (request) => {
+    const userId = request.headers && (request.headers.get ? request.headers.get('x-nasa-user-id') : request.headers['x-nasa-user-id']);
+    if (userId) {
+        try {
+            const { resource: user } = await getContainer(RECRUITMENT_USERS_CONTAINER).item(String(userId)).read();
+            if (user && user.active !== false) {
+                const actor = { upn: user.email || user.username, name: user.displayName || user.username };
+                return { user, actor, scope: scopeFromUserRecord(user), authenticated: true };
+            }
+        } catch { /* fall through */ }
+    }
+    return { user: null, actor: null, scope: null, authenticated: false };
+};
+
+const scopeForbiddenResponse = () => ({
+    status: 403,
+    jsonBody: { error: 'You do not have access to this patient record' },
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+});
 
 const buildScopeClause = (scope, parameters, paramIndexRef) => {
     if (!scope || scope.role === 'Internal') return { clause: '', parameters };
-    const clauses = [];
     const allowedSites = Array.isArray(scope.allowedSiteIds) ? scope.allowedSiteIds.filter(Boolean) : [];
     const allowedStudies = Array.isArray(scope.allowedStudyIds) ? scope.allowedStudyIds.filter(Boolean) : [];
+    const enrolledParts = [];
 
     if (allowedSites.length) {
-        const names = allowedSites.map((siteId, idx) => {
+        const siteKeys = allowedSites.map((siteId) => {
             const key = `@scopeSite${paramIndexRef.i++}`;
             parameters.push({ name: key, value: siteId });
             return key;
         });
-        clauses.push(`(NOT IS_DEFINED(c.currentSiteId) OR c.currentSiteId = null OR c.currentSiteId IN (${names.join(', ')}))`);
+        enrolledParts.push(`(IS_DEFINED(c.currentSiteId) AND c.currentSiteId != null AND c.currentSiteId IN (${siteKeys.join(', ')}))`);
     }
     if (allowedStudies.length) {
-        const names = allowedStudies.map((studyId, idx) => {
+        const studyKeys = allowedStudies.map((studyId) => {
             const key = `@scopeStudy${paramIndexRef.i++}`;
             parameters.push({ name: key, value: studyId });
             return key;
         });
-        clauses.push(`(NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId IN (${names.join(', ')}))`);
+        enrolledParts.push(`(IS_DEFINED(c.currentStudyId) AND c.currentStudyId != null AND c.currentStudyId IN (${studyKeys.join(', ')}))`);
     }
-    if (!clauses.length) return { clause: '', parameters };
-    return { clause: `(${clauses.join(' AND ')})`, parameters };
+
+    const leadParts = [];
+    if (allowedSites.length) {
+        const homeKeys = allowedSites.map((siteId) => {
+            const key = `@scopeHome${paramIndexRef.i++}`;
+            parameters.push({ name: key, value: siteId });
+            return key;
+        });
+        leadParts.push(`(IS_DEFINED(c.homeSiteId) AND c.homeSiteId IN (${homeKeys.join(', ')}))`);
+    }
+    if (scope.userId) {
+        const uidKey = `@scopeUser${paramIndexRef.i++}`;
+        parameters.push({ name: uidKey, value: scope.userId });
+        leadParts.push(`(c.claimedByUserId = ${uidKey} OR c.assignedToUserId = ${uidKey})`);
+    }
+
+    const enrolledClause = enrolledParts.length ? `(${enrolledParts.join(' AND ')})` : '';
+    const leadClause = leadParts.length
+        ? `((NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId = "") AND (${leadParts.join(' OR ')}))`
+        : '';
+    const parts = [enrolledClause, leadClause].filter(Boolean);
+    if (!parts.length) return { clause: '', parameters };
+    return { clause: `(${parts.join(' OR ')})`, parameters };
 };
 
 const buildCriteriaClause = (criteria, parameters, paramIndexRef) => {
@@ -597,6 +642,16 @@ const buildCriteriaClause = (criteria, parameters, paramIndexRef) => {
         }
         if (op === 'no_current_enrollment') {
             parts.push('(NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId = "")');
+            return;
+        }
+        if (op === 'appointment_on_date') {
+            const dateKey = `@p${paramIndexRef.i++}`;
+            parameters.push({ name: dateKey, value: String(value || '') });
+            parts.push(`(IS_DEFINED(c.primaryAppointmentDate) AND c.primaryAppointmentDate = ${dateKey})`);
+            return;
+        }
+        if (op === 'has_appointment') {
+            parts.push('(IS_DEFINED(c.primaryAppointmentDate) AND c.primaryAppointmentDate != null AND c.primaryAppointmentDate != "")');
             return;
         }
         if (!PATIENT_QUERY_FIELDS.has(field) && field !== 'search') return;
@@ -877,6 +932,66 @@ const processBulkAssignBatch = async (job, context) => {
     return job;
 };
 
+const appendPatientAudit = (patient, action, details, actorLabel) => ({
+    id: generateId(),
+    at: new Date().toISOString(),
+    action,
+    details,
+    user: actorLabel || 'system',
+});
+
+const promoteCandidateEnrollment = (patient, studyId, siteId, actorLabel) => {
+    const enrollments = Array.isArray(patient.enrollments) ? [...patient.enrollments] : [];
+    const now = new Date().toISOString();
+    const candidateIdx = enrollments.findIndex(e => e && e.status === 'candidate' && e.studyId === studyId);
+    if (candidateIdx < 0) throw new Error('No candidate enrollment found for this study');
+    enrollments.forEach((e) => {
+        if (e && e.status === 'current') {
+            e.status = 'past';
+            e.exitedDate = now;
+        }
+    });
+    const candidate = enrollments[candidateIdx];
+    enrollments[candidateIdx] = {
+        ...candidate,
+        status: 'current',
+        siteId: siteId || candidate.siteId,
+        enrolledDate: now,
+        promotedAt: now,
+        promotedBy: actorLabel,
+    };
+    const auditTrail = [...(patient.auditTrail || []), appendPatientAudit(patient, 'promote_candidate', `${studyId} @ ${siteId || candidate.siteId}`, actorLabel)];
+    return enrichPatientDocument({
+        ...patient,
+        enrollments,
+        auditTrail,
+        studyId,
+        siteId: siteId || candidate.siteId,
+        pipelineStage: patient.pipelineStage === 'lead' ? 'contacted' : patient.pipelineStage,
+        lastUpdated: now,
+    });
+};
+
+const claimPatientLead = (patient, userId, homeSiteId, actorLabel) => {
+    const now = new Date().toISOString();
+    const auditTrail = [...(patient.auditTrail || []), appendPatientAudit(patient, 'claim_lead', `claimed by ${userId}`, actorLabel)];
+    return enrichPatientDocument({
+        ...patient,
+        claimedByUserId: userId,
+        claimedAt: now,
+        homeSiteId: homeSiteId || patient.homeSiteId || null,
+        assignedToUserId: patient.assignedToUserId || userId,
+        auditTrail,
+        lastUpdated: now,
+    });
+};
+
+const withdrawCandidateEnrollment = (patient, studyId, actorLabel) => {
+    const enrollments = (patient.enrollments || []).filter(e => !(e && e.status === 'candidate' && e.studyId === studyId));
+    const auditTrail = [...(patient.auditTrail || []), appendPatientAudit(patient, 'withdraw_candidate', studyId, actorLabel)];
+    return enrichPatientDocument({ ...patient, enrollments, auditTrail, lastUpdated: new Date().toISOString() });
+};
+
 const validateCrcsSchema = (data) => {
     const errors = [];
     
@@ -1048,12 +1163,6 @@ const validateUsersSchema = (data) => {
     if (data.password !== undefined && data.password !== null && typeof data.password !== 'string') {
         errors.push('password must be a string');
     }
-    if (data.entraOid !== undefined && data.entraOid !== null && typeof data.entraOid !== 'string') {
-        errors.push('entraOid must be a string');
-    }
-    if (data.entraId !== undefined && data.entraId !== null && typeof data.entraId !== 'string') {
-        errors.push('entraId must be a string');
-    }
     if (data.role !== undefined && data.role !== null && typeof data.role !== 'string') {
         errors.push('role must be a string');
     }
@@ -1127,11 +1236,31 @@ async function crudHandler(context, request, containerName) {
     const id = getIdFromRequest(request);
 
     try {
-        const user = (method === 'OPTIONS') ? { claims: null } : await requireUser(request);
-        const actor = buildActor(user.claims);
+        let requestContext = null;
+        if (containerName === 'patients' && method !== 'OPTIONS') {
+            requestContext = await resolveRequestContext(request);
+        }
+        if (method !== 'OPTIONS') await requireUser();
+        const actor = requestContext?.actor || null;
 
         switch (method) {
             case 'GET':
+                if (containerName === 'patients') {
+                    if (id) {
+                        const { resource } = await container.item(id).read();
+                        if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
+                        const enriched = enrichPatientDocument(resource);
+                        if (!patientAccessibleToScope(enriched, requestContext?.scope)) return scopeForbiddenResponse();
+                        return { jsonBody: enriched };
+                    }
+                    const result = await queryPatients({
+                        scope: requestContext?.scope || null,
+                        limit: Math.min(parseInt(request.query.get('limit'), 10) || 3000, 3000),
+                        offset: 0,
+                        includeTotal: false,
+                    });
+                    return { jsonBody: result.items };
+                }
                 if (id) {
                     const { resource } = await container.item(id).read(); 
                     if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
@@ -1185,14 +1314,12 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
                 
-                if (containerName === RECRUITMENT_USERS_CONTAINER) {
-                    if (body.entraId && !body.entraOid) body.entraOid = body.entraId;
-                    if (body.entraOid && !body.entraId) body.entraId = body.entraOid;
-                }
-
                 let newItem = { ...body, id: body.id || generateId() };
                 if (containerName === 'patients') {
                     newItem = enrichPatientDocument(newItem);
+                    if (requestContext?.scope && !patientAccessibleToScope(newItem, requestContext.scope)) {
+                        return scopeForbiddenResponse();
+                    }
                 }
                 const { resource: createdItem } = await container.items.create(newItem);
 
@@ -1224,6 +1351,12 @@ async function crudHandler(context, request, containerName) {
                         before = readRes && readRes.resource ? readRes.resource : null;
                     }
                 } catch {}
+
+                if (containerName === 'patients') {
+                    if (before && !patientAccessibleToScope(enrichPatientDocument(before), requestContext?.scope)) {
+                        return scopeForbiddenResponse();
+                    }
+                }
                 
                 try {
                     switch (containerName) {
@@ -1266,14 +1399,12 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
 
-                if (containerName === RECRUITMENT_USERS_CONTAINER) {
-                    if (requestBody.entraId && !requestBody.entraOid) requestBody.entraOid = requestBody.entraId;
-                    if (requestBody.entraOid && !requestBody.entraId) requestBody.entraId = requestBody.entraOid;
-                }
-                
                 let updatedItem = { ...requestBody, id: updateId };
                 if (containerName === 'patients') {
                     updatedItem = enrichPatientDocument(updatedItem);
+                    if (!patientAccessibleToScope(updatedItem, requestContext?.scope)) {
+                        return scopeForbiddenResponse();
+                    }
                 }
                 const { resource: result } = await container.items.upsert(updatedItem);
 
@@ -1302,6 +1433,11 @@ async function crudHandler(context, request, containerName) {
                         beforeDelete = readRes && readRes.resource ? readRes.resource : null;
                     }
                 } catch {}
+
+                if (containerName === 'patients' && beforeDelete
+                    && !patientAccessibleToScope(enrichPatientDocument(beforeDelete), requestContext?.scope)) {
+                    return scopeForbiddenResponse();
+                }
 
                 await container.item(id).delete();
 
@@ -1398,120 +1534,6 @@ const stripUserSecrets = (user) => {
     return safe;
 };
 
-const findUserByEntraOid = async (container, entraOid) => {
-    const { resources } = await container.items.query({
-        query: 'SELECT * FROM c WHERE c.entraOid = @oid OR c.entraId = @oid',
-        parameters: [{ name: '@oid', value: entraOid }],
-    }).fetchAll();
-    return resources && resources[0] ? resources[0] : null;
-};
-
-const verifyEntraIdToken = async (token) => {
-    const spaClientId = process.env.ENTRA_CLIENT_ID || process.env.ENTRA_SPA_CLIENT_ID || '';
-    if (!ENTRA_TENANT_ID || (!spaClientId && !ENTRA_API_AUDIENCE)) {
-        const err = new Error('UNAUTHORIZED: Entra ID is not configured on the API');
-        err.status = 503;
-        throw err;
-    }
-    const issuer = `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/v2.0`;
-    const audiences = [spaClientId, ENTRA_API_AUDIENCE].filter(Boolean);
-    let lastError = null;
-    for (const audience of audiences) {
-        try {
-            const { payload } = await jwtVerify(token, getJwks(), { issuer, audience });
-            return payload;
-        } catch (e) {
-            lastError = e;
-        }
-    }
-    const err = new Error(`UNAUTHORIZED: ${lastError && lastError.message ? lastError.message : 'Invalid token'}`);
-    err.status = 401;
-    throw err;
-};
-
-app.http('entraConfig', {
-    methods: ['GET', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'entra-config',
-    handler: async (request, context) => {
-        if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-        const clientId = process.env.ENTRA_CLIENT_ID || process.env.ENTRA_SPA_CLIENT_ID || '';
-        const tenantId = ENTRA_TENANT_ID || '';
-        const authority = tenantId
-            ? `https://login.microsoftonline.com/${tenantId}`
-            : 'https://login.microsoftonline.com/common';
-        return {
-            jsonBody: {
-                clientId,
-                tenantId,
-                authority,
-                enabled: !!(clientId && tenantId),
-            },
-            headers: jsonHeaders,
-        };
-    },
-});
-
-app.http('usersAuthenticateEntra', {
-    methods: ['POST', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'users/authenticate-entra',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            const body = await safeJson(request);
-            const token = body && body.token;
-            if (!token) {
-                return { status: 400, jsonBody: { error: 'Token is required' }, headers: jsonHeaders };
-            }
-
-            const payload = await verifyEntraIdToken(token);
-            const entraOid = payload.oid || payload.sub;
-            const email = payload.email || payload.preferred_username || payload.upn || '';
-            const name = payload.name || `${payload.given_name || ''} ${payload.family_name || ''}`.trim();
-
-            if (!entraOid) {
-                return { status: 400, jsonBody: { error: 'Invalid token: missing user identifier' }, headers: jsonHeaders };
-            }
-
-            const container = getContainer(RECRUITMENT_USERS_CONTAINER);
-            let user = await findUserByEntraOid(container, entraOid);
-
-            if (!user) {
-                return {
-                    status: 403,
-                    jsonBody: {
-                        error: 'No NASA account is linked to this Microsoft sign-in. Ask a manager to add your Entra Object ID in Manager → Users.',
-                        entraOid,
-                        email,
-                    },
-                    headers: jsonHeaders,
-                };
-            }
-
-            const updates = {};
-            if (email && user.email !== email) updates.email = email;
-            if (name && user.displayName !== name) updates.displayName = name;
-            if (!user.entraOid) updates.entraOid = entraOid;
-            if (!user.entraId) updates.entraId = entraOid;
-
-            if (Object.keys(updates).length > 0) {
-                const updated = { ...user, ...updates, lastUpdated: new Date().toISOString() };
-                const { resource } = await container.items.upsert(updated);
-                user = resource;
-            }
-
-            if (user.active === false) {
-                return { status: 403, jsonBody: { error: 'User account is deactivated.' }, headers: jsonHeaders };
-            }
-
-            return { jsonBody: stripUserSecrets(user), headers: jsonHeaders };
-        } catch (error) {
-            return handleError(context, error, 'Entra ID authentication failed');
-        }
-    },
-});
-
 app.http('usersAuthenticate', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
@@ -1594,12 +1616,118 @@ app.http('patientsQuery', {
     handler: async (request, context) => {
         try {
             if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            await requireUser(request);
+            const requestContext = await resolveRequestContext(request);
             const body = await safeJson(request) || {};
-            const result = await queryPatients(body);
+            const result = await queryPatients({ ...body, scope: requestContext.scope });
             return { jsonBody: result, headers: jsonHeaders };
         } catch (error) {
             return handleError(context, error, 'Patient query failed');
+        }
+    },
+});
+
+app.http('patientsToday', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patients/today',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const requestContext = await resolveRequestContext(request);
+            const today = new Date().toISOString().split('T')[0];
+            const result = await queryPatients({
+                scope: requestContext.scope,
+                criteria: {
+                    logic: 'AND',
+                    conditions: [{ field: 'primaryAppointmentDate', op: 'appointment_on_date', value: today }],
+                },
+                limit: 500,
+                offset: 0,
+                includeTotal: true,
+            });
+            return { jsonBody: result, headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Patients today query failed');
+        }
+    },
+});
+
+app.http('patientsActions', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patients/actions',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const requestContext = await resolveRequestContext(request);
+            const body = await safeJson(request) || {};
+            const { action, patientId, studyId, siteId } = body;
+            if (!action || !patientId) {
+                return { status: 400, jsonBody: { error: 'action and patientId are required' }, headers: jsonHeaders };
+            }
+            const container = getContainer('patients');
+            const { resource: patient } = await container.item(patientId).read();
+            if (!patient) return { status: 404, jsonBody: { error: 'Patient not found' }, headers: jsonHeaders };
+            if (!patientAccessibleToScope(enrichPatientDocument(patient), requestContext.scope)) {
+                return scopeForbiddenResponse();
+            }
+            const actorLabel = requestContext.actor?.upn || requestContext.actor?.name || requestContext.scope?.userId || 'system';
+            let updated;
+            if (action === 'promote_candidate') {
+                if (!studyId) return { status: 400, jsonBody: { error: 'studyId is required' }, headers: jsonHeaders };
+                updated = promoteCandidateEnrollment(patient, studyId, siteId, actorLabel);
+            } else if (action === 'claim_lead') {
+                const userId = requestContext.scope?.userId || body.userId;
+                if (!userId) return { status: 400, jsonBody: { error: 'Authenticated user required to claim' }, headers: jsonHeaders };
+                updated = claimPatientLead(patient, userId, body.homeSiteId, actorLabel);
+            } else if (action === 'withdraw_candidate') {
+                if (!studyId) return { status: 400, jsonBody: { error: 'studyId is required' }, headers: jsonHeaders };
+                updated = withdrawCandidateEnrollment(patient, studyId, actorLabel);
+            } else if (action === 'release_claim') {
+                updated = enrichPatientDocument({
+                    ...patient,
+                    claimedByUserId: null,
+                    claimedAt: null,
+                    auditTrail: [...(patient.auditTrail || []), appendPatientAudit(patient, 'release_claim', '', actorLabel)],
+                    lastUpdated: new Date().toISOString(),
+                });
+            } else {
+                return { status: 400, jsonBody: { error: `Unknown action: ${action}` }, headers: jsonHeaders };
+            }
+            const { resource: result } = await container.items.upsert(updated);
+            return { jsonBody: enrichPatientDocument(result), headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Patient action failed');
+        }
+    },
+});
+
+app.http('patientsReindex', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patients/reindex',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const requestContext = await resolveRequestContext(request);
+            if (requestContext.scope && requestContext.scope.role !== 'Internal') {
+                return { status: 403, jsonBody: { error: 'Internal role required' }, headers: jsonHeaders };
+            }
+            const body = await safeJson(request) || {};
+            const limit = Math.min(parseInt(body.limit, 10) || 100, 500);
+            const offset = parseInt(body.offset, 10) || 0;
+            const container = getContainer('patients');
+            const { resources } = await container.items.query({
+                query: `SELECT * FROM c ORDER BY c._ts DESC OFFSET ${offset} LIMIT ${limit}`,
+            }).fetchAll();
+            let updated = 0;
+            for (const p of resources || []) {
+                await container.items.upsert(enrichPatientDocument(p));
+                updated += 1;
+            }
+            return { jsonBody: { updated, offset, limit, hasMore: (resources || []).length === limit }, headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Patient reindex failed');
         }
     },
 });
@@ -1611,11 +1739,12 @@ app.http('cohortsPreview', {
     handler: async (request, context) => {
         try {
             if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            await requireUser(request);
+            const requestContext = await resolveRequestContext(request);
             const body = await safeJson(request) || {};
             const sampleLimit = Math.min(Math.max(parseInt(body.sampleLimit, 10) || 25, 1), 100);
             const result = await queryPatients({
                 ...body,
+                scope: requestContext.scope,
                 limit: sampleLimit,
                 offset: 0,
                 includeTotal: true,
@@ -1641,8 +1770,8 @@ app.http('cohortsAssign', {
     handler: async (request, context) => {
         try {
             if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            const user = await requireUser(request);
-            const actor = buildActor(user.claims);
+            const requestContext = await resolveRequestContext(request);
+            const actor = requestContext.actor;
             const body = await safeJson(request) || {};
             if (!body.studyId || !body.siteId) {
                 return { status: 400, jsonBody: { error: 'studyId and siteId are required' }, headers: jsonHeaders };
@@ -1655,7 +1784,7 @@ app.http('cohortsAssign', {
                 ruleId: body.ruleId || null,
                 cohortId: body.cohortId || null,
                 criteria: body.criteria || { logic: 'AND', conditions: [] },
-                scope: body.scope || null,
+                scope: requestContext.scope,
                 assign: {
                     studyId: body.studyId,
                     siteId: body.siteId,
