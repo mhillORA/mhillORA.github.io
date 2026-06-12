@@ -297,6 +297,7 @@ const normalizeScheduleDocument = (s, index) => {
 // Keep logical names in the UI code, map to Cosmos API routes (NASA deploy stores users in `recruitment-users`, not CHAOS `users`).
 const COLLECTION_API_NAME = {
     schedules: 'patient-schedules',
+    accessRequests: 'access-requests',
 };
 const toApiCollectionName = (logicalCollection) => COLLECTION_API_NAME[logicalCollection] || logicalCollection;
 
@@ -306,7 +307,7 @@ const fetchData = async (collection) => {
         let result = Array.isArray(data) ? data : [];
         
         if (collection === 'patients') {
-            result = result.map(patient => convertPatientFromAzureFormat(patient));
+            result = result.map(patient => normalizePatientRecord(convertPatientFromAzureFormat(patient)));
         }
         if (collection === 'schedules') {
             result = result.map((s, i) => normalizeScheduleDocument(s, i));
@@ -344,6 +345,7 @@ const updateDocument = async (collection, id, data) => {
                     case 'schedules': return state.schedules?.find(s => s.id === id);
                     case 'surveys': return state.surveys?.find(s => s.id === id);
                     case 'users': return state.managedUsers?.find(u => u.id === id);
+                    case 'accessRequests': return state.accessRequests?.find(r => r.id === id);
                     default: return null;
                 }
             })();
@@ -404,7 +406,7 @@ const updateDocument = async (collection, id, data) => {
                 };
             }
             if (collection === 'patients') {
-                return {
+                return normalizePatientRecord({
                     firstName: '',
                     lastName: '',
                     initials: '',
@@ -429,11 +431,25 @@ const updateDocument = async (collection, id, data) => {
                     pcp: '',
                     comments: '',
                     appointment: null,
+                    appointments: [],
                     surveyResults: [],
                     contactLogs: [],
                     enrollments: [],
+                    inclusionCriteriaMet: false,
+                    exclusionCriteriaMet: false,
+                    pipelineStage: 'lead',
+                    assignedToUserId: '',
+                    eligibilityStatus: 'unknown',
+                    doNotContact: false,
+                    tasks: [],
+                    consentRecords: [],
+                    communications: [],
+                    waitlist: [],
+                    auditTrail: [],
+                    visitLogs: [],
+                    completedVisits: [],
                     ...doc,
-                };
+                });
             }
             if (collection === 'schedules') {
                 return {
@@ -522,6 +538,7 @@ let state = {
     selectedStudyId: null, // For the studies dropdown selector
     participantSearchTerm: '', // For searching participants within a study
     studiesExpanded: false, // For the collapsible studies list
+    taskView: 'due', // due | all | mine
 
     // --- access-request + user management ---
     showLoginGate: false,
@@ -1010,53 +1027,24 @@ const setupScheduleFormDependencies = () => {
  * @returns {Object} - Patient object with Azure format
  */
 const convertPatientToAzureFormat = (patient) => {
-    const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
-    const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
-    
-    // Build studyHistory from past enrollments
+    const normalized = normalizePatientRecord(patient);
+    const currentEnrollment = normalized.enrollments?.find(e => e.status === 'current');
+    const pastEnrollments = normalized.enrollments?.filter(e => e.status === 'past') || [];
     const studyHistory = pastEnrollments.map(enrollment => ({
         studyId: enrollment.studyId,
         siteId: enrollment.siteId,
         enrolledDate: enrollment.enrolledDate,
         exitedDate: enrollment.exitedDate
     }));
-    
-    // Create Azure-formatted patient
-    const azurePatient = {
-        firstName: patient.firstName,
-        lastName: patient.lastName,
-        initials: patient.initials || "",
-        globalId: patient.globalId || "",
-        screeningNumber: patient.screeningNumber || "",
-        group: patient.group || "",
-        phoneNumber: patient.phoneNumber || "",
-        email: patient.email || "",
-        dob: patient.dob,
-        address: patient.address || "",
-        city: patient.city || "",
-        state: patient.state || "",
-        zipCode: patient.zipCode || "",
-        age: patient.age || null,
-        condition: patient.condition || "",
-        status: patient.status || "Candidate",
-        registryStatus: patient.registryStatus || "Active",
-        source: patient.source || "",
-        therapeuticArea: patient.therapeuticArea || "",
-        inClinicStatus: patient.inClinicStatus || "",
-        visitOutcome: patient.visitOutcome || "",
-        nextVisitDate: patient.nextVisitDate || "",
-        sfReason: patient.sfReason || "",
-        pcp: patient.pcp || "",
-        comments: patient.comments || "",
+    const { enrollments, ...rest } = normalized;
+    return {
+        ...rest,
         studyId: currentEnrollment?.studyId || null,
         siteId: currentEnrollment?.siteId || null,
-        appointment: patient.appointment || null,
-        surveyResults: patient.surveyResults || [],
-        contactLogs: patient.contactLogs || [],
-        studyHistory: studyHistory
+        appointment: getPrimaryAppointment(normalized),
+        appointments: getPatientAppointments(normalized),
+        studyHistory
     };
-    
-    return azurePatient;
 };
 
 /**
@@ -1091,44 +1079,13 @@ const convertPatientFromAzureFormat = (azurePatient) => {
         });
     }
     
-    // Create NASA-formatted patient
-    const nasaPatient = {
-        firstName: azurePatient.firstName,
-        lastName: azurePatient.lastName,
-        initials: azurePatient.initials,
-        globalId: azurePatient.globalId,
-        screeningNumber: azurePatient.screeningNumber,
-        group: azurePatient.group,
-        phoneNumber: azurePatient.phoneNumber,
-        email: azurePatient.email,
-        dob: azurePatient.dob,
-        address: azurePatient.address,
-        city: azurePatient.city,
-        state: azurePatient.state,
-        zipCode: azurePatient.zipCode,
-        age: azurePatient.age,
-        condition: azurePatient.condition,
-        status: azurePatient.status,
-        registryStatus: azurePatient.registryStatus,
-        source: azurePatient.source,
-        therapeuticArea: azurePatient.therapeuticArea,
-        inClinicStatus: azurePatient.inClinicStatus,
-        visitOutcome: azurePatient.visitOutcome,
-        nextVisitDate: azurePatient.nextVisitDate,
-        sfReason: azurePatient.sfReason,
-        pcp: azurePatient.pcp,
-        comments: azurePatient.comments,
-        appointment: azurePatient.appointment,
-        surveyResults: azurePatient.surveyResults,
-        contactLogs: azurePatient.contactLogs,
-        enrollments: enrollments
-    };
-    
-    if (azurePatient.id) {
-        nasaPatient.id = azurePatient.id;
-    }
-    
-    return nasaPatient;
+    const { studyId, siteId, studyHistory, ...rest } = azurePatient;
+    return normalizePatientRecord({
+        ...rest,
+        enrollments,
+        inclusionCriteriaMet: azurePatient.inclusionCriteriaMet === true,
+        exclusionCriteriaMet: azurePatient.exclusionCriteriaMet === true
+    });
 };
 
 const getWashoutStatus = (patient) => {
@@ -1175,6 +1132,268 @@ const getWashoutStatus = (patient) => {
     
     return null;
 };
+
+// --- RECRUITMENT PIPELINE, ELIGIBILITY, VISITS, CONSENT, COMMS ---
+const PIPELINE_STAGES = [
+    { id: 'lead', label: 'Lead', color: 'bg-gray-100 dark:bg-gray-700' },
+    { id: 'contacted', label: 'Contacted', color: 'bg-sky-100 dark:bg-sky-900/40' },
+    { id: 'pre_screened', label: 'Pre-Screened', color: 'bg-indigo-100 dark:bg-indigo-900/40' },
+    { id: 'scheduled', label: 'Scheduled', color: 'bg-blue-100 dark:bg-blue-900/40' },
+    { id: 'showed', label: 'Showed', color: 'bg-violet-100 dark:bg-violet-900/40' },
+    { id: 'consented', label: 'Consented', color: 'bg-purple-100 dark:bg-purple-900/40' },
+    { id: 'enrolled', label: 'Enrolled', color: 'bg-green-100 dark:bg-green-900/40' },
+    { id: 'screen_fail', label: 'Screen Fail', color: 'bg-red-100 dark:bg-red-900/40' },
+    { id: 'inactive', label: 'Inactive', color: 'bg-gray-200 dark:bg-gray-600' },
+];
+
+const COMMUNICATION_TEMPLATES = {
+    appointment_confirmation: {
+        label: 'Appointment Confirmation',
+        subject: 'Your study visit is confirmed',
+        body: 'Hello {{firstName}}, your {{visit}} appointment for {{study}} at {{site}} is scheduled for {{appointmentTime}}. Please arrive 15 minutes early.'
+    },
+    reminder_24h: {
+        label: '24-Hour Reminder',
+        subject: 'Reminder: visit tomorrow',
+        body: 'Hello {{firstName}}, this is a reminder for your {{visit}} visit tomorrow at {{appointmentTime}} at {{site}}.'
+    },
+    reminder_2h: {
+        label: '2-Hour Reminder',
+        subject: 'Reminder: visit today',
+        body: 'Hello {{firstName}}, your {{visit}} visit is today at {{appointmentTime}} at {{site}}.'
+    },
+    no_show_followup: {
+        label: 'No-Show Follow-up',
+        subject: 'We missed you — reschedule',
+        body: 'Hello {{firstName}}, we missed you at your scheduled visit. Please contact us to reschedule your {{visit}} appointment.'
+    },
+    pre_visit_instructions: {
+        label: 'Pre-Visit Instructions',
+        subject: 'Before your visit',
+        body: 'Hello {{firstName}}, before your {{visit}} visit: bring photo ID, arrive 15 minutes early, and follow any fasting instructions provided by the site.'
+    }
+};
+
+const getCurrentActor = () => state.currentUser?.email || state.currentUser?.username || state.userId || 'system';
+
+const getUserAllowedSiteIds = () => {
+    if (!state.currentUser || state.currentUser.role === 'Internal') return null;
+    const ids = state.currentUser.allowedSiteIds;
+    return Array.isArray(ids) ? ids : [];
+};
+
+const patientVisibleToCurrentUser = (patient) => {
+    const allowed = getUserAllowedSiteIds();
+    if (allowed === null) return true;
+    const enrollment = patient.enrollments?.find(e => e.status === 'current');
+    if (!enrollment?.siteId) return true;
+    return allowed.includes(enrollment.siteId);
+};
+
+const filterPatientsForCurrentUser = (patients) =>
+    (patients || []).filter(patientVisibleToCurrentUser);
+
+const getPatientAppointments = (patient) => {
+    if (!patient) return [];
+    if (Array.isArray(patient.appointments) && patient.appointments.length) {
+        return [...patient.appointments].sort((a, b) => new Date(a.time) - new Date(b.time));
+    }
+    if (patient.appointment?.time) {
+        return [{ ...patient.appointment, id: patient.appointment.id || 'legacy-appt' }];
+    }
+    return [];
+};
+
+const getPrimaryAppointment = (patient) => {
+    const now = Date.now();
+    const appts = getPatientAppointments(patient);
+    const upcoming = appts.filter(a => a.time && new Date(a.time).getTime() >= now && (a.status || 'scheduled') !== 'cancelled');
+    if (upcoming.length) return upcoming[0];
+    return appts.length ? appts[appts.length - 1] : null;
+};
+
+const normalizePatientRecord = (patient) => {
+    if (!patient) return patient;
+    const normalized = { ...patient };
+    if (!Array.isArray(normalized.tasks)) normalized.tasks = [];
+    if (!Array.isArray(normalized.consentRecords)) normalized.consentRecords = [];
+    if (!Array.isArray(normalized.communications)) normalized.communications = [];
+    if (!Array.isArray(normalized.waitlist)) normalized.waitlist = [];
+    if (!Array.isArray(normalized.auditTrail)) normalized.auditTrail = [];
+    if (!Array.isArray(normalized.visitLogs)) normalized.visitLogs = [];
+    if (!Array.isArray(normalized.completedVisits)) normalized.completedVisits = [];
+    if (!normalized.pipelineStage) normalized.pipelineStage = inferPipelineStage(normalized);
+    if (!normalized.eligibilityStatus) normalized.eligibilityStatus = 'unknown';
+    const appts = getPatientAppointments(normalized);
+    normalized.appointments = appts;
+    normalized.appointment = getPrimaryAppointment(normalized);
+    return normalized;
+};
+
+const inferPipelineStage = (patient) => {
+    if (patient.status === 'Screen Fail') return 'screen_fail';
+    if (patient.status === 'Enrolled') return 'enrolled';
+    if (patient.consentRecords?.some(c => c.status === 'signed')) return 'consented';
+    const appt = getPrimaryAppointment(patient);
+    if (appt?.checkInStatus === 'checked-in') return 'showed';
+    if (appt?.time && new Date(appt.time) > new Date()) return 'scheduled';
+    if (patient.surveyResults?.length || patient.status === 'Pre-Screening') return 'pre_screened';
+    if (patient.contactLogs?.length) return 'contacted';
+    if (patient.registryStatus === 'Inactive') return 'inactive';
+    return 'lead';
+};
+
+const getPipelineStageMeta = (stageId) =>
+    PIPELINE_STAGES.find(s => s.id === stageId) || PIPELINE_STAGES[0];
+
+const mergeCommunicationTemplate = (templateKey, patient) => {
+    const tpl = COMMUNICATION_TEMPLATES[templateKey];
+    if (!tpl) return { subject: '', body: '' };
+    const enrollment = patient.enrollments?.find(e => e.status === 'current');
+    const study = enrollment ? state.studies.find(s => s.id === enrollment.studyId) : null;
+    const site = enrollment ? state.sites.find(s => s.id === enrollment.siteId) : null;
+    const appt = getPrimaryAppointment(patient);
+    const vars = {
+        firstName: patient.firstName || '',
+        study: study?.title || 'your study',
+        site: site?.name || 'the site',
+        visit: appt?.visit || 'visit',
+        appointmentTime: appt?.time ? new Date(appt.time).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'TBD'
+    };
+    const replace = (s) => String(s).replace(/\{\{(\w+)\}\}/g, (_, k) => vars[k] || '');
+    return { subject: replace(tpl.subject), body: replace(tpl.body) };
+};
+
+const evaluateSurveyEligibility = (survey, answers) => {
+    const rules = Array.isArray(survey?.eligibilityRules) ? survey.eligibilityRules : [];
+    if (!rules.length) return { status: 'unknown', reasons: [] };
+    const answerMap = {};
+    (answers || []).forEach(a => { answerMap[String(a.question || '').trim().toLowerCase()] = a.answer; });
+    const reasons = [];
+    let status = 'eligible';
+    for (const rule of rules) {
+        const qText = String(rule.questionText || '').trim().toLowerCase();
+        const answer = answerMap[qText];
+        if (answer === undefined || answer === null || answer === '') continue;
+        const actual = String(answer).trim().toLowerCase();
+        const expected = String(rule.value || '').trim().toLowerCase();
+        let match = false;
+        if (rule.operator === 'equals') match = actual === expected;
+        else if (rule.operator === 'not_equals') match = actual !== expected;
+        else if (rule.operator === 'contains') match = actual.includes(expected);
+        else if (rule.operator === 'gte') match = parseFloat(actual) >= parseFloat(expected);
+        else if (rule.operator === 'lte') match = parseFloat(actual) <= parseFloat(expected);
+        if (!match) continue;
+        if (rule.result === 'fail') { status = 'ineligible'; reasons.push(rule.reason || `Failed: ${rule.questionText}`); }
+        else if (rule.result === 'pi_review' && status === 'eligible') { status = 'pi_review'; reasons.push(rule.reason || `PI review: ${rule.questionText}`); }
+    }
+    return { status, reasons };
+};
+
+const getSchedulingBlockReason = (patient) => {
+    if (!patient) return 'Patient not found';
+    if (patient.doNotContact) return 'Patient is marked do-not-contact';
+    if (patient.eligibilityStatus === 'ineligible') return 'Patient is ineligible per survey/rules';
+    if (patient.eligibilityStatus === 'pi_review') return 'Patient requires PI review before scheduling';
+    if (patient.inclusionCriteriaMet !== true) return 'Inclusion criteria not met';
+    if (patient.exclusionCriteriaMet === true) return 'Exclusion criteria met';
+    if (isWashoutPeriodActive(patient)) return 'Washout period active';
+    return null;
+};
+
+const canSchedulePatient = (patient) => !getSchedulingBlockReason(patient);
+
+const generateScreeningNumber = (patient, study, site) => {
+    if (patient.screeningNumber) return patient.screeningNumber;
+    const siteAbbr = (site?.siteNameAbbreviation || site?.name || 'SITE').replace(/\W+/g, '').slice(0, 4).toUpperCase();
+    const studyAbbr = (study?.protocolNumber || study?.title || 'STD').replace(/\W+/g, '').slice(0, 6).toUpperCase();
+    const seq = String((state.patients || []).filter(p => {
+        const e = p.enrollments?.find(en => en.status === 'current');
+        return e?.studyId === study?.id && e?.siteId === site?.id;
+    }).length + 1).padStart(3, '0');
+    return `${siteAbbr}-${studyAbbr}-${seq}`;
+};
+
+const appendPatientAuditEntry = (patient, action, details = '') => ({
+    id: ensureId('audit'),
+    at: new Date().toISOString(),
+    action,
+    details,
+    user: getCurrentActor()
+});
+
+const updatePatientFields = async (patientId, fields, auditAction = null, auditDetails = '') => {
+    const patient = state.patients.find(p => p.id === patientId);
+    if (!patient) throw new Error('Patient not found');
+    const updates = { ...fields, lastUpdated: new Date().toISOString() };
+    if (auditAction) {
+        updates.auditTrail = [...(patient.auditTrail || []), appendPatientAuditEntry(patient, auditAction, auditDetails)];
+    }
+    await updateDocument('patients', patientId, updates);
+};
+
+const getStudyVisitMatrix = (study) => {
+    if (Array.isArray(study?.visitMatrix) && study.visitMatrix.length) return study.visitMatrix;
+    const fromProfiles = (study?.visitProfiles || []).map((v, i) => ({
+        visitName: v.visitName || `Visit ${i + 1}`,
+        windowDaysMin: v.windowDaysMin ?? null,
+        windowDaysMax: v.windowDaysMax ?? null,
+        anchorVisit: v.anchorVisit || null
+    }));
+    if (fromProfiles.length) return fromProfiles;
+    return [1, 2, 3, 4, 5].map(n => ({ visitName: `Visit ${n}`, windowDaysMin: null, windowDaysMax: null, anchorVisit: n > 1 ? `Visit ${n - 1}` : null }));
+};
+
+const computeRecruitmentFunnel = (patients, filters = {}) => {
+    let list = filterPatientsForCurrentUser([...patients]);
+    if (filters.studyId && filters.studyId !== 'all') {
+        list = list.filter(p => p.enrollments?.some(e => e.studyId === filters.studyId));
+    }
+    if (filters.siteId && filters.siteId !== 'all') {
+        list = list.filter(p => p.enrollments?.some(e => e.siteId === filters.siteId));
+    }
+    const stageIds = PIPELINE_STAGES.map(s => s.id);
+    const counts = Object.fromEntries(stageIds.map(id => [id, 0]));
+    list.forEach(p => {
+        const stage = p.pipelineStage || inferPipelineStage(p);
+        if (counts[stage] !== undefined) counts[stage]++;
+    });
+    const leads = list.length;
+    const scheduled = list.filter(p => getPatientAppointments(p).some(a => a.time && new Date(a.time) > new Date())).length;
+    const enrolled = list.filter(p => p.status === 'Enrolled').length;
+    const screenFails = list.filter(p => p.status === 'Screen Fail').length;
+    const conversion = (from, to) => from > 0 ? Math.round((to / from) * 100) : 0;
+    return {
+        counts,
+        totals: { leads, scheduled, enrolled, screenFails, preScreened: counts.pre_screened + counts.scheduled + counts.showed + counts.consented + counts.enrolled },
+        rates: {
+            leadToPreScreen: conversion(leads, counts.pre_screened + counts.scheduled + counts.showed + counts.consented + counts.enrolled + counts.screen_fail),
+            preScreenToScheduled: conversion(counts.pre_screened, scheduled),
+            scheduledToEnrolled: conversion(scheduled, enrolled),
+            screenFailRate: conversion(leads, screenFails)
+        }
+    };
+};
+
+const getOpenTasksForPatients = (patients, options = {}) => {
+    const { dueOnly = false, assigneeId = null } = options;
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
+    const tasks = [];
+    filterPatientsForCurrentUser(patients || []).forEach(patient => {
+        (patient.tasks || []).forEach(task => {
+            if ((task.status || 'open') === 'completed') return;
+            if (assigneeId && task.assignedToUserId !== assigneeId) return;
+            if (dueOnly && task.dueDate && new Date(task.dueDate) > todayEnd) return;
+            tasks.push({ patient, task });
+        });
+    });
+    return tasks.sort((a, b) => new Date(a.task.dueDate || 0) - new Date(b.task.dueDate || 0));
+};
+
+const countPatientsInSlot = (slotId) => (state.patients || []).filter(p =>
+    getPatientAppointments(p).some(a => a.slotId === slotId && (a.status || 'scheduled') !== 'cancelled')
+).length;
 
 /**
  * Update chart colors based on theme
@@ -1299,6 +1518,9 @@ const renderNav = () => {
     const navItems = [
         { id: 'crcDashboard', label: 'CRC Dashboard', icon: 'calendar-check' },
         { id: 'recruiterDashboard', label: 'Recruiter Dashboard', icon: 'layout-dashboard' },
+        { id: 'pipeline', label: 'Pipeline', icon: 'git-branch' },
+        { id: 'tasks', label: 'Tasks', icon: 'list-checks' },
+        { id: 'funnel', label: 'Funnel', icon: 'filter' },
         { id: 'studies', label: 'Studies', icon: 'file-text', hasDropdown: true },
         { id: 'patients', label: 'Patients', icon: 'users' },
         { id: 'sites', label: 'Sites', icon: 'building' },
@@ -1351,6 +1573,9 @@ const renderContent = () => {
     const contentMap = {
         crcDashboard: getCRCDashboardHTML,
         recruiterDashboard: getRecruiterDashboardHTML,
+        pipeline: getPipelineHTML,
+        tasks: getTasksHTML,
+        funnel: getFunnelHTML,
         studies: getStudiesHTML,
         patients: getPatientsHTML,
         sites: getSitesHTML,
@@ -1369,6 +1594,15 @@ const renderContent = () => {
     }
     if (state.activeTab === 'recruiterDashboard') {
         // Recruiter Dashboard is static HTML, no post-render needed
+    }
+    if (state.activeTab === 'pipeline') {
+        renderPipelineBoard();
+    }
+    if (state.activeTab === 'tasks') {
+        renderTasksView();
+    }
+    if (state.activeTab === 'funnel') {
+        renderFunnelView();
     }
     if (state.activeTab === 'patients') {
         renderPatientTable();
@@ -2415,7 +2649,7 @@ const renderPatientTable = () => {
         return phone.replace(/\D/g, ''); // Remove all non-digits
     };
     
-    const filteredPatients = state.patients.filter(p => {
+    const filteredPatients = filterPatientsForCurrentUser(state.patients).filter(p => {
         const nameMatch = `${p.firstName} ${p.lastName}`.toLowerCase().includes(searchTerm);
         const emailMatch = p.email && p.email.toLowerCase().includes(searchTerm);
         const globalIdMatch = p.globalId && p.globalId.toLowerCase().includes(searchTerm);
@@ -2546,6 +2780,183 @@ const getSurveysHTML = () => `
                 <tbody class="dark:text-gray-300">${state.surveys.map(s => `<tr><td class="px-6 py-4">${s.title}</td><td class="px-6 py-4">${state.studies.find(study => study.id == s.studyId)?.title || 'N/A'}</td><td class="px-6 py-4"><button data-action="view-survey" data-id="${s.id}" class="text-blue-600 dark:text-blue-400 hover:underline">View Survey</button></td></tr>`).join('')}${state.surveys.length === 0 ? `<tr><td colspan="3" class="text-center text-gray-500 dark:text-gray-400 py-8">No surveys created yet.</td></tr>` : ''}</tbody>
             </table>
         </div>`;
+const getPipelineHTML = () => `
+    <div class="flex justify-between items-center mb-6 flex-wrap gap-4">
+        <div>
+            <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Recruitment Pipeline</h2>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Move patients through stages from lead to enrolled.</p>
+        </div>
+        <div class="flex gap-2 flex-wrap">
+            <select id="pipeline-study-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                <option value="all">All Studies</option>
+                ${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
+            </select>
+            <select id="pipeline-assignee-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                <option value="all">All Assignees</option>
+                ${(state.managedUsers || []).map(u => `<option value="${u.id}">${u.username || u.email}</option>`).join('')}
+            </select>
+        </div>
+    </div>
+    <div id="pipeline-board" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4"></div>
+`;
+
+const renderPipelineBoard = () => {
+    const board = document.getElementById('pipeline-board');
+    if (!board) return;
+    const studyFilter = document.getElementById('pipeline-study-filter')?.value || 'all';
+    const assigneeFilter = document.getElementById('pipeline-assignee-filter')?.value || 'all';
+    let patients = filterPatientsForCurrentUser(state.patients);
+    if (studyFilter !== 'all') {
+        patients = patients.filter(p => p.enrollments?.some(e => e.status === 'current' && e.studyId === studyFilter));
+    }
+    if (assigneeFilter !== 'all') {
+        patients = patients.filter(p => p.assignedToUserId === assigneeFilter);
+    }
+    board.innerHTML = PIPELINE_STAGES.map(stage => {
+        const inStage = patients.filter(p => (p.pipelineStage || inferPipelineStage(p)) === stage.id);
+        return `
+            <div class="rounded-lg border dark:border-gray-700 ${stage.color} p-3 min-h-[200px]">
+                <div class="flex justify-between items-center mb-3">
+                    <h3 class="font-semibold text-gray-800 dark:text-gray-200">${stage.label}</h3>
+                    <span class="text-xs px-2 py-0.5 rounded-full bg-white/70 dark:bg-gray-800">${inStage.length}</span>
+                </div>
+                <div class="space-y-2 max-h-80 overflow-y-auto custom-scrollbar">
+                    ${inStage.length ? inStage.map(p => `
+                        <div class="bg-white dark:bg-gray-800 rounded-md p-2 shadow-sm border dark:border-gray-700">
+                            <button data-action="view-patient" data-id="${p.id}" class="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline text-left">${phiName(p)}</button>
+                            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">${p.eligibilityStatus || 'unknown'} · ${p.status || 'Candidate'}</div>
+                            <select data-action="set-pipeline-stage" data-patient-id="${p.id}" class="mt-2 w-full text-xs p-1 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                ${PIPELINE_STAGES.map(s => `<option value="${s.id}" ${(p.pipelineStage || inferPipelineStage(p)) === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}
+                            </select>
+                        </div>
+                    `).join('') : '<p class="text-xs text-gray-500 dark:text-gray-400">No patients</p>'}
+                </div>
+            </div>
+        `;
+    }).join('');
+    lucide.createIcons();
+};
+
+const getTasksHTML = () => `
+    <div class="flex justify-between items-center mb-6">
+        <div>
+            <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Task Queue</h2>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Callbacks and follow-ups across all patients.</p>
+        </div>
+        <button data-action="open-global-task-modal" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 text-sm">+ Add Task</button>
+    </div>
+    <div class="flex gap-2 mb-4">
+        <button data-action="set-task-view" data-view="due" class="px-3 py-1.5 rounded-md text-sm bg-blue-600 text-white">Due Today</button>
+        <button data-action="set-task-view" data-view="all" class="px-3 py-1.5 rounded-md text-sm bg-gray-200 dark:bg-gray-700 dark:text-gray-300">All Open</button>
+        <button data-action="set-task-view" data-view="mine" class="px-3 py-1.5 rounded-md text-sm bg-gray-200 dark:bg-gray-700 dark:text-gray-300">Mine</button>
+    </div>
+    <div id="tasks-list-container" class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden"></div>
+`;
+
+const renderTasksView = () => {
+    const container = document.getElementById('tasks-list-container');
+    if (!container) return;
+    const view = state.taskView || 'due';
+    const options = { dueOnly: view === 'due' };
+    if (view === 'mine' && state.currentUser?.id) options.assigneeId = state.currentUser.id;
+    const rows = getOpenTasksForPatients(state.patients, options);
+    if (!rows.length) {
+        container.innerHTML = '<p class="text-center text-gray-500 dark:text-gray-400 py-10">No open tasks for this view.</p>';
+        return;
+    }
+    container.innerHTML = `
+        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+            <thead class="bg-gray-50 dark:bg-gray-700">
+                <tr>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Due</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Patient</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Task</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Type</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-200 dark:divide-gray-700 dark:text-gray-300">
+                ${rows.map(({ patient, task }) => `
+                    <tr>
+                        <td class="px-4 py-3 text-sm whitespace-nowrap">${task.dueDate ? new Date(task.dueDate).toLocaleDateString() : '—'}</td>
+                        <td class="px-4 py-3 text-sm"><button data-action="view-patient" data-id="${patient.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${phiName(patient)}</button></td>
+                        <td class="px-4 py-3 text-sm">${task.title || 'Task'}${task.notes ? `<div class="text-xs text-gray-500">${task.notes}</div>` : ''}</td>
+                        <td class="px-4 py-3 text-sm">${task.type || 'follow-up'}</td>
+                        <td class="px-4 py-3 text-sm space-x-2">
+                            <button data-action="complete-task" data-patient-id="${patient.id}" data-task-id="${task.id}" class="text-green-600 hover:underline">Complete</button>
+                        </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+    lucide.createIcons();
+};
+
+const getFunnelHTML = () => `
+    <div class="mb-6">
+        <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Recruitment Funnel</h2>
+        <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Conversion metrics from lead through enrollment.</p>
+    </div>
+    <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md mb-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <select id="funnel-study-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+            <option value="all">All Studies</option>
+            ${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
+        </select>
+        <select id="funnel-site-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+            <option value="all">All Sites</option>
+            ${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}
+        </select>
+    </div>
+    <div id="funnel-metrics-container"></div>
+`;
+
+const renderFunnelView = () => {
+    const container = document.getElementById('funnel-metrics-container');
+    if (!container) return;
+    const funnel = computeRecruitmentFunnel(state.patients, {
+        studyId: document.getElementById('funnel-study-filter')?.value || 'all',
+        siteId: document.getElementById('funnel-site-filter')?.value || 'all'
+    });
+    container.innerHTML = `
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center">
+                <p class="text-sm text-gray-500 dark:text-gray-400">Total Leads</p>
+                <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">${funnel.totals.leads}</p>
+            </div>
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center">
+                <p class="text-sm text-gray-500 dark:text-gray-400">Scheduled</p>
+                <p class="text-3xl font-bold text-blue-600 dark:text-blue-400">${funnel.totals.scheduled}</p>
+            </div>
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center">
+                <p class="text-sm text-gray-500 dark:text-gray-400">Enrolled</p>
+                <p class="text-3xl font-bold text-green-600 dark:text-green-400">${funnel.totals.enrolled}</p>
+            </div>
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center">
+                <p class="text-sm text-gray-500 dark:text-gray-400">Screen Fails</p>
+                <p class="text-3xl font-bold text-red-600 dark:text-red-400">${funnel.totals.screenFails}</p>
+            </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md">
+                <h3 class="font-semibold dark:text-white mb-2">Conversion Rates</h3>
+                <ul class="text-sm dark:text-gray-300 space-y-1">
+                    <li>Lead → Pre-Screen: <strong>${funnel.rates.leadToPreScreen}%</strong></li>
+                    <li>Pre-Screen → Scheduled: <strong>${funnel.rates.preScreenToScheduled}%</strong></li>
+                    <li>Scheduled → Enrolled: <strong>${funnel.rates.scheduledToEnrolled}%</strong></li>
+                    <li>Screen Fail Rate: <strong>${funnel.rates.screenFailRate}%</strong></li>
+                </ul>
+            </div>
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md">
+                <h3 class="font-semibold dark:text-white mb-2">By Pipeline Stage</h3>
+                <ul class="text-sm dark:text-gray-300 space-y-1">
+                    ${PIPELINE_STAGES.map(s => `<li>${s.label}: <strong>${funnel.counts[s.id] || 0}</strong></li>`).join('')}
+                </ul>
+            </div>
+        </div>
+    `;
+};
+
 const getReportingHTML = () => {
     const sources = ['Facebook', 'Instagram', 'Reddit', 'Site', 'Marketing', 'Email'];
     return `
@@ -2865,6 +3276,66 @@ const getPatientProfileHTML = (patient) => {
     } else {
         visitDetailsHTML += '<p class="text-center text-gray-500 dark:text-gray-400 py-8">No visit logs have been recorded.</p>';
     }
+    const stageMeta = getPipelineStageMeta(patient.pipelineStage || inferPipelineStage(patient));
+    const assignee = (state.managedUsers || []).find(u => u.id === patient.assignedToUserId);
+    const appointmentsTabHTML = `
+        <div class="space-y-3">
+            ${getPatientAppointments(patient).length ? getPatientAppointments(patient).map(a => `
+                <div class="p-3 border dark:border-gray-700 rounded-lg">
+                    <p class="font-medium dark:text-white">${a.visit || 'Visit'} — ${a.time ? new Date(a.time).toLocaleString() : 'TBD'}</p>
+                    <p class="text-sm text-gray-500 dark:text-gray-400">Status: ${a.visitStatus || a.status || 'scheduled'} · Check-in: ${a.checkInStatus || 'not-checked-in'}</p>
+                </div>
+            `).join('') : '<p class="text-gray-500 dark:text-gray-400">No appointments on record.</p>'}
+            ${(patient.waitlist || []).length ? `<div class="mt-4"><h4 class="font-semibold dark:text-white">Waitlist</h4>${patient.waitlist.map(w => `<p class="text-sm dark:text-gray-300">${w.visit} — requested ${new Date(w.requestedAt).toLocaleDateString()}</p>`).join('')}</div>` : ''}
+        </div>
+    `;
+    const tasksTabHTML = `
+        <div class="flex justify-end mb-4">
+            <button data-action="add-task" data-patient-id="${patient.id}" class="text-sm bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700">Add Task</button>
+        </div>
+        ${(patient.tasks || []).length ? (patient.tasks || []).map(t => `
+            <div class="p-3 border dark:border-gray-700 rounded-lg mb-2 ${(t.status || 'open') === 'completed' ? 'opacity-60' : ''}">
+                <p class="font-medium dark:text-white">${t.title} <span class="text-xs text-gray-500">(${t.type || 'follow-up'})</span></p>
+                <p class="text-sm text-gray-500">Due: ${t.dueDate ? new Date(t.dueDate).toLocaleDateString() : '—'} · ${t.status || 'open'}</p>
+                ${t.notes ? `<p class="text-sm dark:text-gray-300 mt-1">${t.notes}</p>` : ''}
+                ${(t.status || 'open') !== 'completed' ? `<button data-action="complete-task" data-patient-id="${patient.id}" data-task-id="${t.id}" class="text-sm text-green-600 mt-2 hover:underline">Mark complete</button>` : ''}
+            </div>
+        `).join('') : '<p class="text-gray-500 dark:text-gray-400">No tasks.</p>'}
+    `;
+    const consentTabHTML = `
+        <div class="flex justify-end mb-4">
+            <button data-action="add-consent" data-patient-id="${patient.id}" class="text-sm bg-purple-600 text-white px-3 py-1 rounded hover:bg-purple-700">Record Consent</button>
+        </div>
+        ${(patient.consentRecords || []).length ? (patient.consentRecords || []).map(c => `
+            <div class="p-3 border dark:border-gray-700 rounded-lg mb-2">
+                <p class="font-medium dark:text-white">Version ${c.version || '—'} — ${c.status || 'signed'}</p>
+                <p class="text-sm text-gray-500">Signed: ${c.signedAt ? new Date(c.signedAt).toLocaleString() : '—'} by ${phi(c.signedBy || 'N/A')}</p>
+                <p class="text-sm dark:text-gray-300">Obtained by: ${phi(c.obtainedBy || 'N/A')}</p>
+                ${c.notes ? `<p class="text-sm dark:text-gray-300 mt-1">${c.notes}</p>` : ''}
+            </div>
+        `).join('') : '<p class="text-gray-500 dark:text-gray-400">No consent records.</p>'}
+    `;
+    const communicationsTabHTML = `
+        <div class="flex justify-end mb-4">
+            <button data-action="schedule-communication" data-patient-id="${patient.id}" class="text-sm bg-indigo-600 text-white px-3 py-1 rounded hover:bg-indigo-700">Schedule Message</button>
+        </div>
+        ${(patient.communications || []).length ? (patient.communications || []).map(c => `
+            <div class="p-3 border dark:border-gray-700 rounded-lg mb-2">
+                <p class="font-medium dark:text-white">${c.subject || c.templateKey || 'Message'} <span class="text-xs px-2 py-0.5 rounded ${c.status === 'sent' ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'}">${c.status || 'scheduled'}</span></p>
+                <p class="text-sm text-gray-500">${c.channel || 'manual'} · ${c.scheduledAt ? new Date(c.scheduledAt).toLocaleString() : ''}</p>
+                <p class="text-sm dark:text-gray-300 mt-2 whitespace-pre-wrap">${phi(c.body || '')}</p>
+                ${c.status !== 'sent' ? `<button data-action="mark-communication-sent" data-patient-id="${patient.id}" data-comm-id="${c.id}" class="text-sm text-green-600 mt-2 hover:underline">Mark sent</button>` : ''}
+            </div>
+        `).join('') : '<p class="text-gray-500 dark:text-gray-400">No communications scheduled.</p>'}
+    `;
+    const auditTabHTML = (patient.auditTrail || []).length
+        ? [...(patient.auditTrail || [])].reverse().map(a => `
+            <div class="p-2 border-b dark:border-gray-700 text-sm dark:text-gray-300">
+                <span class="text-gray-500">${new Date(a.at).toLocaleString()}</span> — <strong>${a.action}</strong> by ${a.user || 'system'}
+                ${a.details ? `<div class="text-xs text-gray-500 mt-1">${a.details}</div>` : ''}
+            </div>
+        `).join('')
+        : '<p class="text-gray-500 dark:text-gray-400">No audit entries yet.</p>';
     return `
         <div class="flex justify-between items-start mb-6">
             <h2 class="text-2xl font-bold dark:text-white">${phiName(patient)}</h2>
@@ -2901,6 +3372,26 @@ const getPatientProfileHTML = (patient) => {
                     <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'visitDetails' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
                         id="visit-details-tab" data-tab-name="visitDetails" data-patient-id="${patient.id}" type="button" role="tab">Visit Details</button>
                 </li>
+                <li class="mr-2" role="presentation">
+                    <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'appointments' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
+                        data-tab-name="appointments" data-patient-id="${patient.id}" type="button" role="tab">Appointments</button>
+                </li>
+                <li class="mr-2" role="presentation">
+                    <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'tasks' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
+                        data-tab-name="tasks" data-patient-id="${patient.id}" type="button" role="tab">Tasks</button>
+                </li>
+                <li class="mr-2" role="presentation">
+                    <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'consent' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
+                        data-tab-name="consent" data-patient-id="${patient.id}" type="button" role="tab">Consent</button>
+                </li>
+                <li class="mr-2" role="presentation">
+                    <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'communications' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
+                        data-tab-name="communications" data-patient-id="${patient.id}" type="button" role="tab">Communications</button>
+                </li>
+                <li class="mr-2" role="presentation">
+                    <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'audit' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
+                        data-tab-name="audit" data-patient-id="${patient.id}" type="button" role="tab">Audit</button>
+                </li>
             </ul>
         </div>
         <div id="patient-profile-tab-content-container">
@@ -2923,7 +3414,11 @@ const getPatientProfileHTML = (patient) => {
                     <div class="space-y-2">
                         <p><strong>Age:</strong> ${phi(patient.age != null ? String(patient.age) : 'N/A')}</p>
                         <p><strong>Status:</strong> ${patient.status || 'N/A'}</p>
+                        <p><strong>Pipeline:</strong> ${stageMeta.label}</p>
+                        <p><strong>Eligibility:</strong> ${patient.eligibilityStatus || 'unknown'}</p>
+                        <p><strong>Assigned To:</strong> ${assignee ? (assignee.username || assignee.email) : 'Unassigned'}</p>
                         <p><strong>Registry Status:</strong> ${patient.registryStatus || 'N/A'}</p>
+                        ${patient.doNotContact ? '<p class="text-red-600 dark:text-red-400"><strong>Do Not Contact</strong></p>' : ''}
                         <p><strong>Source:</strong> ${patient.source || 'N/A'}</p>
                         <p><strong>Therapeutic Area:</strong> ${patient.therapeuticArea || 'N/A'}</p>
                         <p><strong>Current Study:</strong> ${study?.title || 'N/A'}</p>
@@ -2961,11 +3456,23 @@ const getPatientProfileHTML = (patient) => {
             <div id="visitDetails-content" class="${state.currentPatientProfileTab === 'visitDetails' ? '' : 'hidden'} dark:text-gray-300">
                 ${visitDetailsHTML}
             </div>
+            <div id="appointments-content" class="${state.currentPatientProfileTab === 'appointments' ? '' : 'hidden'} dark:text-gray-300">${appointmentsTabHTML}</div>
+            <div id="tasks-content" class="${state.currentPatientProfileTab === 'tasks' ? '' : 'hidden'} dark:text-gray-300">${tasksTabHTML}</div>
+            <div id="consent-content" class="${state.currentPatientProfileTab === 'consent' ? '' : 'hidden'} dark:text-gray-300">${consentTabHTML}</div>
+            <div id="communications-content" class="${state.currentPatientProfileTab === 'communications' ? '' : 'hidden'} dark:text-gray-300">${communicationsTabHTML}</div>
+            <div id="audit-content" class="${state.currentPatientProfileTab === 'audit' ? '' : 'hidden'} dark:text-gray-300 max-h-96 overflow-y-auto">${auditTabHTML}</div>
         </div>
     `;
 };
 const getBookingModalHTML = (patient, visitFilter = 'all') => {
     if (!patient) return `<h2>Patient not found</h2>`;
+    const blockReason = getSchedulingBlockReason(patient);
+    if (blockReason) {
+        return `
+            <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule for ${phiName(patient)}</h2>
+            <p class="text-red-500">${blockReason}</p>
+        `;
+    }
     const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
     if (!currentEnrollment) {
          return `
@@ -3011,7 +3518,7 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
         filteredSchedules.forEach(schedule => {
             (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
                 // Calculate booked count by counting patients with appointments in this slot
-                const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
+                const bookedCount = countPatientsInSlot(slot.id);
                 if (bookedCount < (slot.capacity || 0)) {
                     const slotDate = new Date(slot.startTime).toISOString().split('T')[0];
                     if (!availableSlotsByDay[slotDate]) {
@@ -3177,6 +3684,9 @@ const getEditPatientModalHTML = (patient) => {
                 <div><label class="block text-sm font-medium dark:text-gray-300">Source</label><select name="source" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Source</option>${sources.map(s => `<option ${patient.source === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.studies.map(s => `<option ${currentEnrollment?.studyId === s.id ? 'selected' : ''} value="${s.id}">${s.title}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Site</label><select name="siteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option ${currentEnrollment?.siteId === s.id ? 'selected' : ''} value="${s.id}">${s.name}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Pipeline Stage</label><select name="pipelineStage" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${PIPELINE_STAGES.map(s => `<option value="${s.id}" ${(patient.pipelineStage || inferPipelineStage(patient)) === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Eligibility Status</label><select name="eligibilityStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${['unknown','eligible','ineligible','pi_review'].map(s => `<option value="${s}" ${(patient.eligibilityStatus || 'unknown') === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Assigned To</label><select name="assignedToUserId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Unassigned</option>${(state.managedUsers || []).map(u => `<option value="${u.id}" ${patient.assignedToUserId === u.id ? 'selected' : ''}>${u.username || u.email}</option>`).join('')}</select></div>
                 <div class="md:col-span-2">
                     <label class="block text-sm font-medium dark:text-gray-300 mb-2">Eligibility (Automated Review)</label>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 p-3 border dark:border-gray-600 rounded bg-gray-50 dark:bg-gray-800">
@@ -3187,6 +3697,10 @@ const getEditPatientModalHTML = (patient) => {
                         <label class="flex items-start gap-2 dark:text-gray-300">
                             <input type="checkbox" name="exclusionCriteriaMet" ${patient.exclusionCriteriaMet === true ? 'checked' : ''} class="mt-1 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                             <span class="text-sm">Exclusion criteria met</span>
+                        </label>
+                        <label class="flex items-start gap-2 dark:text-gray-300 md:col-span-2">
+                            <input type="checkbox" name="doNotContact" ${patient.doNotContact ? 'checked' : ''} class="mt-1 h-4 w-4 rounded border-gray-300 text-red-600 focus:ring-red-500">
+                            <span class="text-sm">Do not contact</span>
                         </label>
                     </div>
                 </div>
@@ -3346,10 +3860,17 @@ const setupRequestAccessForm = () => {
             requestedLogin: emailOrUsername,
             notes,
         };
-        state.accessRequests = [req, ...(state.accessRequests || [])];
-        saveLocalState();
-
-        showNotification(`Request submitted for: ${siteName}`, 'success');
+        (async () => {
+            try {
+                await createDocument('accessRequests', req);
+                state.accessRequests = [req, ...(state.accessRequests || [])];
+                showNotification(`Request submitted for: ${siteName}`, 'success');
+            } catch (error) {
+                state.accessRequests = [req, ...(state.accessRequests || [])];
+                saveLocalState();
+                showNotification(`Request saved locally (API pending): ${siteName}`, 'warning');
+            }
+        })();
     });
 };
 
@@ -4443,6 +4964,45 @@ const getAddContactLogModalHTML = (patientId) => {
     `;
 };
 
+const getAddTaskModalHTML = (patientId) => {
+    const users = state.managedUsers || [];
+    return `
+        <h2 class="text-2xl font-bold dark:text-white mb-4">Add Task</h2>
+        <form id="add-task-form" data-patient-id="${patientId || ''}" class="space-y-4">
+            ${!patientId ? `<div><label class="block text-sm font-medium dark:text-gray-300">Patient</label><select name="patientId" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${filterPatientsForCurrentUser(state.patients).map(p => `<option value="${p.id}">${phiName(p)}</option>`).join('')}</select></div>` : ''}
+            <div><label class="block text-sm font-medium dark:text-gray-300">Title</label><input type="text" name="title" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Call back re: screening"></div>
+            <div><label class="block text-sm font-medium dark:text-gray-300">Type</label><select name="type" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="follow-up">Follow-up</option><option value="callback">Callback</option><option value="scheduling">Scheduling</option><option value="consent">Consent</option></select></div>
+            <div><label class="block text-sm font-medium dark:text-gray-300">Due Date</label><input type="date" name="dueDate" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
+            <div><label class="block text-sm font-medium dark:text-gray-300">Assign To</label><select name="assignedToUserId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Unassigned</option>${users.map(u => `<option value="${u.id}">${u.username || u.email}</option>`).join('')}</select></div>
+            <div><label class="block text-sm font-medium dark:text-gray-300">Notes</label><textarea name="notes" rows="3" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></textarea></div>
+            <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700">Save Task</button>
+        </form>
+    `;
+};
+
+const getAddConsentModalHTML = (patientId) => `
+    <h2 class="text-2xl font-bold dark:text-white mb-4">Record Consent</h2>
+    <form id="add-consent-form" data-patient-id="${patientId}" class="space-y-4">
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF Version</label><input type="text" name="version" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., v2.1 / 15-Mar-2026"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Signed Date</label><input type="datetime-local" name="signedAt" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Participant Name (signed as)</label><input type="text" name="signedBy" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Obtained By</label><input type="text" name="obtainedBy" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="${getCurrentActor()}"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Notes</label><textarea name="notes" rows="2" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></textarea></div>
+        <button type="submit" class="w-full bg-purple-600 text-white py-2 rounded-md hover:bg-purple-700">Save Consent</button>
+    </form>
+`;
+
+const getScheduleCommunicationModalHTML = (patientId) => `
+    <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule Communication</h2>
+    <form id="schedule-communication-form" data-patient-id="${patientId}" class="space-y-4">
+        <div><label class="block text-sm font-medium dark:text-gray-300">Template</label><select name="templateKey" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${Object.entries(COMMUNICATION_TEMPLATES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Channel</label><select name="channel" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="manual">Manual (copy/send yourself)</option><option value="email">Email (planned)</option><option value="sms">SMS (planned)</option></select></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Schedule For</label><input type="datetime-local" name="scheduledAt" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
+        <p class="text-xs text-gray-500 dark:text-gray-400">Message body is generated from the template when saved. Mark as sent after you deliver it.</p>
+        <button type="submit" class="w-full bg-indigo-600 text-white py-2 rounded-md hover:bg-indigo-700">Schedule</button>
+    </form>
+`;
+
 const getAddPatientToStudyModalHTML = (studyId) => {
     const study = state.studies.find(s => s.id === studyId);
     if (!study) return `<h2>Study not found</h2>`;
@@ -4939,7 +5499,9 @@ const patientTemplate = () => ({
     age: null, status: 'Candidate', registryStatus: 'Active', source: '', therapeuticArea: '',
     inclusionCriteriaMet: false, exclusionCriteriaMet: false,
     inClinicStatus: '', visitOutcome: '', nextVisitDate: '', sfReason: '', pcp: '', comments: '',
-    enrollments: [], appointment: null, surveyResults: [], contactLogs: [], completedVisits: [], visitLogs: []
+    pipelineStage: 'lead', assignedToUserId: '', eligibilityStatus: 'unknown', doNotContact: false,
+    enrollments: [], appointment: null, appointments: [], surveyResults: [], contactLogs: [],
+    completedVisits: [], visitLogs: [], tasks: [], consentRecords: [], communications: [], waitlist: [], auditTrail: []
 });
 // --- EVENT HANDLERS ---
 document.addEventListener('click', async (e) => {
@@ -5233,107 +5795,122 @@ document.addEventListener('click', async (e) => {
                 try {
                     const patient = state.patients.find(p => p.id === patientId);
                     const schedule = state.schedules.find(s => s.id === scheduleId);
-                    const slot = schedule.slots.find(s => s.id === slotId);
-                    
-                    if (!patient) {
-                        showNotification("Patient not found.", "error");
+                    const slot = schedule?.slots?.find(s => s.id === slotId);
+                    if (!patient || !schedule || !slot) {
+                        showNotification('Patient, schedule, or slot not found.', 'error');
                         return;
                     }
-                    if (!schedule) {
-                        showNotification("Schedule not found.", "error");
+                    const blockReason = getSchedulingBlockReason(patient);
+                    if (blockReason) {
+                        showNotification(blockReason, 'error');
                         return;
                     }
-                    if (!slot) {
-                        showNotification("Slot not found.", "error");
-                        return;
-                    }
-
-                    if (patient.inclusionCriteriaMet !== true) {
-                        showNotification("Cannot schedule patient: inclusion criteria not met.", "error");
-                        return;
-                    }
-                    if (patient.exclusionCriteriaMet === true) {
-                        showNotification("Cannot schedule patient: exclusion criteria met.", "error");
-                        return;
-                    }
-                    if (isWashoutPeriodActive(patient)) {
-                        const washoutStatus = typeof getWashoutStatus === 'function' ? getWashoutStatus(patient) : null;
-                        if (washoutStatus && washoutStatus.remainingDays != null) {
-                            showNotification(`Cannot schedule patient: washout period active. ${washoutStatus.remainingDays} days remaining.`, "error");
-                        } else {
-                            showNotification("Cannot schedule patient: washout period active.", "error");
-                        }
-                        return;
-                    }
-                    
-                    // Use the reliable patient list to count, not the 'booked' property which might be stale
-                    const currentBookings = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
+                    const currentBookings = countPatientsInSlot(slot.id);
                     if (currentBookings >= slot.capacity) {
-                        showNotification("This slot is already full.", "error");
+                        showNotification('This slot is full. Use Join Waitlist instead.', 'warning');
                         return;
                     }
-                    
-                    // Update schedule slot booked count
-                    const updatedSlots = schedule.slots.map(s => {
-                        if (s.id === slotId) {
-                            return { ...s, booked: (s.booked || 0) + 1 };
-                        }
-                        return s;
-                    });
-                    // Merge required schedule fields to satisfy API validation (siteId, studyId, visit, slots)
-                    const updatedSchedule = {
-                        ...schedule,
-                        slots: updatedSlots,
-                        name: schedule.name || `${schedule.visit || 'Appointment'} - ${schedule.siteId || ''}`.trim(),
-                        lastUpdated: new Date().toISOString()
+                    const newAppt = {
+                        id: ensureId('appt'),
+                        scheduleId,
+                        slotId,
+                        time: slot.startTime,
+                        visit: schedule.visit || null,
+                        status: 'scheduled',
+                        visitStatus: 'Scheduled',
+                        checkInStatus: 'not-checked-in',
+                        createdAt: new Date().toISOString()
                     };
-                    // Remove any system metadata
-                    delete updatedSchedule._rid;
-                    delete updatedSchedule._self;
-                    delete updatedSchedule._etag;
-                    delete updatedSchedule._attachments;
-                    delete updatedSchedule._ts;
+                    const appointments = [...getPatientAppointments(patient).filter(a => a.status !== 'cancelled'), newAppt];
+                    const updatedSlots = schedule.slots.map(s => s.id === slotId ? { ...s, booked: countPatientsInSlot(slot.id) + 1 } : s);
+                    const updatedSchedule = { ...schedule, slots: updatedSlots, name: schedule.name || `${schedule.visit || 'Appointment'} - ${schedule.siteId || ''}`.trim(), lastUpdated: new Date().toISOString() };
+                    delete updatedSchedule._rid; delete updatedSchedule._self; delete updatedSchedule._etag; delete updatedSchedule._attachments; delete updatedSchedule._ts;
                     try {
                         await updateDocument('schedules', scheduleId, updatedSchedule);
                     } catch (err) {
-                        // If schedule update fails due to cross-environment validation (e.g., Study not found),
-                        // proceed with booking by updating the patient and local state, and warn the user.
-                        const msg = (err && err.message) ? err.message : '';
-                        if (msg.includes('Study not found')) {
-                            console.warn('NASA: Schedule update skipped due to Study not found. Proceeding with patient booking.');
-                            // Update local state to reflect booked count so UI is accurate
-                            const scheduleIndex = state.schedules.findIndex(s => s.id === scheduleId);
-                            if (scheduleIndex >= 0) {
-                                state.schedules[scheduleIndex] = { ...state.schedules[scheduleIndex], slots: updatedSlots };
-                            }
-                        } else {
-                            throw err;
-                        }
+                        if (!(err?.message || '').includes('Study not found')) throw err;
+                        const idx = state.schedules.findIndex(s => s.id === scheduleId);
+                        if (idx >= 0) state.schedules[idx] = { ...state.schedules[idx], slots: updatedSlots };
                     }
-                    
-                    // Update patient with appointment - merge with existing patient data
-                    const updatedPatient = {
-                        ...patient,
-                        appointment: {
-                            scheduleId,
-                            slotId,
-                            time: slot.startTime,
-                            visit: schedule.visit || null
-                        }
+                    const tpl = mergeCommunicationTemplate('appointment_confirmation', { ...patient, appointment: newAppt, appointments });
+                    const comm = {
+                        id: ensureId('comm'),
+                        templateKey: 'appointment_confirmation',
+                        channel: 'manual',
+                        subject: tpl.subject,
+                        body: tpl.body,
+                        scheduledAt: new Date().toISOString(),
+                        status: 'scheduled'
                     };
-                    
-                    // Note: completedVisits array management can be handled on the backend if needed
-                    // For now, we'll just update the appointment
-                    await updateDocument('patients', patientId, updatedPatient);
-                    
-                    // Refresh state from Azure so UI stays consistent across tabs/views
+                    await updatePatientFields(patientId, {
+                        appointments,
+                        appointment: newAppt,
+                        pipelineStage: 'scheduled',
+                        communications: [...(patient.communications || []), comm]
+                    }, 'appointment_booked', `${schedule.visit} ${new Date(slot.startTime).toLocaleString()}`);
                     await loadAllData();
-                    showNotification("Appointment booked successfully!", "success");
+                    showNotification('Appointment booked. Confirmation message queued in Communications tab.', 'success');
                     closeModal();
                 } catch (error) {
-                    console.error("Error booking appointment:", error);
-                    showNotification(`Failed to book appointment: ${error.message}`, "error");
+                    console.error('Error booking appointment:', error);
+                    showNotification(`Failed to book appointment: ${error.message}`, 'error');
                 }
+                break;
+            }
+            case 'join-waitlist': {
+                try {
+                    const patient = state.patients.find(p => p.id === patientId);
+                    const schedule = state.schedules.find(s => s.id === scheduleId);
+                    const slot = schedule?.slots?.find(s => s.id === slotId);
+                    if (!patient || !schedule || !slot) return;
+                    const entry = {
+                        id: ensureId('wl'),
+                        scheduleId,
+                        slotId,
+                        visit: schedule.visit,
+                        requestedAt: new Date().toISOString(),
+                        priority: (patient.waitlist || []).length + 1
+                    };
+                    await updatePatientFields(patientId, {
+                        waitlist: [...(patient.waitlist || []), entry],
+                        tasks: [...(patient.tasks || []), {
+                            id: ensureId('task'),
+                            title: `Waitlist: ${schedule.visit} slot`,
+                            type: 'scheduling',
+                            dueDate: new Date().toISOString().split('T')[0],
+                            status: 'open',
+                            createdAt: new Date().toISOString()
+                        }]
+                    }, 'waitlist_joined', schedule.visit);
+                    await loadAllData();
+                    showNotification('Added to waitlist for this slot.', 'success');
+                } catch (error) {
+                    showNotification(`Waitlist failed: ${error.message}`, 'error');
+                }
+                break;
+            }
+            case 'add-task': openModal(getAddTaskModalHTML(patientId)); break;
+            case 'open-global-task-modal': openModal(getAddTaskModalHTML(null)); break;
+            case 'add-consent': openModal(getAddConsentModalHTML(patientId)); break;
+            case 'schedule-communication': openModal(getScheduleCommunicationModalHTML(patientId)); break;
+            case 'set-task-view': setState({ taskView: view }); break;
+            case 'complete-task': {
+                const patient = state.patients.find(p => p.id === patientId);
+                if (!patient) return;
+                const tasks = (patient.tasks || []).map(t => t.id === actionButton.dataset.taskId ? { ...t, status: 'completed', completedAt: new Date().toISOString() } : t);
+                await updatePatientFields(patientId, { tasks }, 'task_completed', actionButton.dataset.taskId);
+                await loadAllData();
+                showNotification('Task completed.', 'success');
+                break;
+            }
+            case 'mark-communication-sent': {
+                const patient = state.patients.find(p => p.id === patientId);
+                if (!patient) return;
+                const commId = actionButton.dataset.commId;
+                const communications = (patient.communications || []).map(c => c.id === commId ? { ...c, status: 'sent', sentAt: new Date().toISOString() } : c);
+                await updatePatientFields(patientId, { communications }, 'communication_sent', commId);
+                await loadAllData();
+                openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === patientId)), true);
                 break;
             }
             case 'quick-add-patient-modal': openModal(getQuickAddPatientHTML(), true); break;
@@ -5510,21 +6087,26 @@ document.addEventListener('click', async (e) => {
                     !completedVisits.includes(s.visit)
                 );
                 const slotsForDay = [];
+                const allSlotsForDay = [];
                 availableSchedules.forEach(schedule => {
                     (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
-                        // Calculate actual booked count from patients array instead of using slot.booked
-                        const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
-                        if (bookedCount < (slot.capacity || 0) && new Date(slot.startTime).toISOString().split('T')[0] === date) {
-                            slotsForDay.push({scheduleId: schedule.id, scheduleType: schedule.visit, ...slot, booked: bookedCount});
-                        }
+                        if (new Date(slot.startTime).toISOString().split('T')[0] !== date) return;
+                        const bookedCount = countPatientsInSlot(slot.id);
+                        allSlotsForDay.push({ scheduleId: schedule.id, scheduleType: schedule.visit, ...slot, booked: bookedCount });
                     });
                 });
                 const slotsContainer = document.getElementById('booking-slots-container');
-                slotsContainer.innerHTML = slotsForDay.length > 0 ? slotsForDay.map(slot => `
-                    <button data-action="book-appointment" data-patient-id="${patient.id}" data-schedule-id="${slot.scheduleId}" data-slot-id="${slot.id}" class="w-full text-left p-2 border dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 dark:text-white mb-2">
-                        ${new Date(slot.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - ${slot.scheduleType || 'General'} (${slot.booked}/${slot.capacity})
-                    </button>
-                `).join('') : '<p class="text-gray-500 dark:text-gray-400">No available slots for this day.</p>';
+                slotsContainer.innerHTML = allSlotsForDay.length > 0 ? allSlotsForDay.map(slot => {
+                    const isFull = slot.booked >= (slot.capacity || 0);
+                    return isFull
+                        ? `<div class="p-2 border dark:border-gray-600 rounded mb-2 dark:text-gray-300 flex justify-between items-center">
+                            <span>${new Date(slot.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - ${slot.scheduleType} (FULL ${slot.booked}/${slot.capacity})</span>
+                            <button data-action="join-waitlist" data-patient-id="${patient.id}" data-schedule-id="${slot.scheduleId}" data-slot-id="${slot.id}" class="text-sm text-indigo-600 hover:underline">Join Waitlist</button>
+                           </div>`
+                        : `<button data-action="book-appointment" data-patient-id="${patient.id}" data-schedule-id="${slot.scheduleId}" data-slot-id="${slot.id}" class="w-full text-left p-2 border dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 dark:text-white mb-2">
+                            ${new Date(slot.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - ${slot.scheduleType || 'General'} (${slot.booked}/${slot.capacity})
+                           </button>`;
+                }).join('') : '<p class="text-gray-500 dark:text-gray-400">No slots for this day.</p>';
                 break;
             }
             case 'edit-past-enrollment': {
@@ -5590,6 +6172,23 @@ document.addEventListener('change', async (e) => {
     }
     if (e.target.id === 'scheduling-study-filter') {
         setState({ schedulingStudyFilter: e.target.value });
+    }
+    if (e.target.id === 'pipeline-study-filter' || e.target.id === 'pipeline-assignee-filter') {
+        if (state.activeTab === 'pipeline') renderPipelineBoard();
+    }
+    if (e.target.id === 'funnel-study-filter' || e.target.id === 'funnel-site-filter') {
+        if (state.activeTab === 'funnel') renderFunnelView();
+    }
+    if (e.target.dataset.action === 'set-pipeline-stage') {
+        const pid = e.target.dataset.patientId;
+        const stage = e.target.value;
+        try {
+            await updatePatientFields(pid, { pipelineStage: stage }, 'pipeline_stage_changed', stage);
+            await loadAllData();
+            if (state.activeTab === 'pipeline') renderPipelineBoard();
+        } catch (err) {
+            showNotification(`Failed to update stage: ${err.message}`, 'error');
+        }
     }
      if (e.target.id === 'booking-visit-filter') {
          const patientId = e.target.dataset.patientId;
@@ -5786,13 +6385,77 @@ document.addEventListener('submit', async (e) => {
             };
             const patient = state.patients.find(p => p.id === patientId);
             if (patient) {
-                const updatedContactLogs = [...(patient.contactLogs || []), newLog];
-                await updateDocument('patients', patientId, {
-                    contactLogs: updatedContactLogs
-                });
+                const pipelineStage = patient.pipelineStage === 'lead' ? 'contacted' : patient.pipelineStage;
+                await updatePatientFields(patientId, {
+                    contactLogs: [...(patient.contactLogs || []), newLog],
+                    pipelineStage
+                }, 'contact_log_added', data.outcome);
+                await loadAllData();
                 closeModal();
-                openModal(getPatientProfileHTML(state.patients.find(p => p.id === patientId)), true);
+                openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === patientId)), true);
             }
+            break;
+        }
+        case 'add-task-form': {
+            const pid = form.dataset.patientId || data.patientId;
+            const patient = state.patients.find(p => p.id === pid);
+            if (!patient) return;
+            const task = {
+                id: ensureId('task'),
+                title: data.title,
+                type: data.type || 'follow-up',
+                dueDate: data.dueDate,
+                assignedToUserId: data.assignedToUserId || '',
+                notes: data.notes || '',
+                status: 'open',
+                createdAt: new Date().toISOString()
+            };
+            await updatePatientFields(pid, { tasks: [...(patient.tasks || []), task] }, 'task_created', data.title);
+            await loadAllData();
+            closeModal();
+            showNotification('Task created.', 'success');
+            break;
+        }
+        case 'add-consent-form': {
+            const pid = form.dataset.patientId;
+            const patient = state.patients.find(p => p.id === pid);
+            if (!patient) return;
+            const record = {
+                id: ensureId('consent'),
+                version: data.version,
+                signedAt: new Date(data.signedAt).toISOString(),
+                signedBy: data.signedBy,
+                obtainedBy: data.obtainedBy,
+                status: 'signed',
+                notes: data.notes || ''
+            };
+            await updatePatientFields(pid, {
+                consentRecords: [...(patient.consentRecords || []), record],
+                pipelineStage: 'consented'
+            }, 'consent_recorded', data.version);
+            await loadAllData();
+            closeModal();
+            openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === pid)), true);
+            break;
+        }
+        case 'schedule-communication-form': {
+            const pid = form.dataset.patientId;
+            const patient = state.patients.find(p => p.id === pid);
+            if (!patient) return;
+            const tpl = mergeCommunicationTemplate(data.templateKey, patient);
+            const comm = {
+                id: ensureId('comm'),
+                templateKey: data.templateKey,
+                channel: data.channel || 'manual',
+                subject: tpl.subject,
+                body: tpl.body,
+                scheduledAt: new Date(data.scheduledAt).toISOString(),
+                status: 'scheduled'
+            };
+            await updatePatientFields(pid, { communications: [...(patient.communications || []), comm] }, 'communication_scheduled', data.templateKey);
+            await loadAllData();
+            closeModal();
+            showNotification('Communication scheduled. Mark sent after delivery.', 'success');
             break;
         }
         case 'add-visit-log-form': {
@@ -5839,10 +6502,36 @@ document.addEventListener('submit', async (e) => {
                     checkInTime: new Date().toISOString(),
                     checkInNotes: checkInNotes
                 };
-                
-                await updateDocument('patients', patientId, {
-                    appointment: updatedAppointment
-                });
+                const appointments = getPatientAppointments(patient).map(a =>
+                    a.slotId === updatedAppointment.slotId ? { ...a, ...updatedAppointment } : a
+                );
+                const pipelineStage = checkInStatus === 'checked-in' ? 'showed' : patient.pipelineStage;
+                const extra = checkInStatus === 'no-show' ? {
+                    communications: [...(patient.communications || []), {
+                        id: ensureId('comm'),
+                        templateKey: 'no_show_followup',
+                        channel: 'manual',
+                        ...mergeCommunicationTemplate('no_show_followup', patient),
+                        scheduledAt: new Date().toISOString(),
+                        status: 'scheduled'
+                    }],
+                    tasks: [...(patient.tasks || []), {
+                        id: ensureId('task'),
+                        title: 'No-show follow-up call',
+                        type: 'callback',
+                        dueDate: new Date().toISOString().split('T')[0],
+                        status: 'open',
+                        createdAt: new Date().toISOString()
+                    }]
+                } : {};
+
+                await updatePatientFields(patientId, {
+                    appointment: updatedAppointment,
+                    appointments,
+                    pipelineStage,
+                    ...extra
+                }, 'check_in', checkInStatus);
+                await loadAllData();
                 
                 closeModal();
                 
@@ -5964,12 +6653,18 @@ document.addEventListener('submit', async (e) => {
                     exitedDate: null
                 });
                 
-                // Update the patient
-                await updateDocument('patients', patientId, { enrollments: newEnrollments });
-                
+                const site = state.sites.find(s => s.id === siteId);
+                const screeningNumber = generateScreeningNumber(patient, study, site);
+                await updatePatientFields(patientId, {
+                    enrollments: newEnrollments,
+                    screeningNumber,
+                    pipelineStage: patient.pipelineStage === 'enrolled' ? 'enrolled' : 'pre_screened',
+                    status: patient.status === 'Enrolled' ? 'Enrolled' : 'Pre-Screening'
+                }, 'patient_enrolled', `${study.title} @ ${site?.name || siteId}`);
+                await loadAllData();
                 closeModal();
                 const overrideMsg = data.overrideWashout ? " (washout override applied)" : "";
-                showNotification(`Patient successfully enrolled!${overrideMsg}`, "success");
+                showNotification(`Patient enrolled. Screening #: ${screeningNumber}${overrideMsg}`, "success");
             } catch (error) {
                 console.error("Error enrolling patient:", error);
                 showNotification(`Failed to enroll patient: ${error.message}`, "error");
@@ -6119,16 +6814,42 @@ document.addEventListener('submit', async (e) => {
                     answers: answers,
                     outcome: outcome
                 };
-                const updates = { 
-                    surveyResults: [...(patient.surveyResults || []), surveyResult],
-                    lastUpdated: new Date().toISOString()
+                const eligibility = evaluateSurveyEligibility(survey, answers);
+                const updates = {
+                    surveyResults: [...(patient.surveyResults || []), surveyResult]
                 };
-                if (outcome === 'Pass') {
-                    updates.status = 'Pre-Screening';
-                } else if (outcome === 'Fail') {
+                if (eligibility.status === 'ineligible' || outcome === 'Fail') {
+                    updates.eligibilityStatus = 'ineligible';
                     updates.status = 'Screen Fail';
+                    updates.pipelineStage = 'screen_fail';
+                    updates.sfReason = eligibility.reasons.join('; ') || 'Failed pre-screen survey';
+                } else if (eligibility.status === 'pi_review') {
+                    updates.eligibilityStatus = 'pi_review';
+                    updates.tasks = [...(patient.tasks || []), {
+                        id: ensureId('task'),
+                        title: 'PI eligibility review required',
+                        type: 'follow-up',
+                        dueDate: new Date().toISOString().split('T')[0],
+                        status: 'open',
+                        createdAt: new Date().toISOString()
+                    }];
+                } else if (outcome === 'Pass') {
+                    updates.eligibilityStatus = 'eligible';
+                    updates.inclusionCriteriaMet = true;
+                    updates.exclusionCriteriaMet = false;
+                    updates.status = 'Pre-Screening';
+                    updates.pipelineStage = 'pre_screened';
+                    updates.tasks = [...(patient.tasks || []), {
+                        id: ensureId('task'),
+                        title: 'Schedule screening visit',
+                        type: 'scheduling',
+                        dueDate: new Date(Date.now() + 86400000).toISOString().split('T')[0],
+                        status: 'open',
+                        createdAt: new Date().toISOString()
+                    }];
                 }
-                await updateDocument('patients', patientId, updates);
+                await updatePatientFields(patient.id, updates, 'survey_completed', survey.title);
+                await loadAllData();
                 closeModal();
             };
             if (nextQuestionTarget === 'pass') {
@@ -6194,6 +6915,10 @@ document.addEventListener('submit', async (e) => {
                 updatedPatient.age = data.age ? parseInt(data.age) : null;
                 updatedPatient.inclusionCriteriaMet = form.querySelector('input[name="inclusionCriteriaMet"]')?.checked === true;
                 updatedPatient.exclusionCriteriaMet = form.querySelector('input[name="exclusionCriteriaMet"]')?.checked === true;
+                updatedPatient.doNotContact = form.querySelector('input[name="doNotContact"]')?.checked === true;
+                if (data.pipelineStage) updatedPatient.pipelineStage = data.pipelineStage;
+                if (data.eligibilityStatus) updatedPatient.eligibilityStatus = data.eligibilityStatus;
+                if (data.assignedToUserId !== undefined) updatedPatient.assignedToUserId = data.assignedToUserId || '';
                 
                 // Check if trying to set status to Pre-Screening while in washout
                 if (data.status === 'Pre-Screening' && isWashoutPeriodActive(patient)) {
@@ -6579,7 +7304,29 @@ document.addEventListener('submit', async (e) => {
                 if (table) question.table = table;
                 questions.push(question);
             });
-            const newSurvey = { title: data.title, studyId: data.studyId, questions };
+            const eligibilityRules = [];
+            questions.forEach(q => {
+                (q.options || []).forEach(opt => {
+                    if (opt.next === 'fail') {
+                        eligibilityRules.push({
+                            questionText: q.text,
+                            operator: 'equals',
+                            value: opt.text,
+                            result: 'fail',
+                            reason: `DNQ: ${q.text}`
+                        });
+                    } else if (opt.next === 'pass') {
+                        eligibilityRules.push({
+                            questionText: q.text,
+                            operator: 'equals',
+                            value: opt.text,
+                            result: 'pass',
+                            reason: `Met: ${q.text}`
+                        });
+                    }
+                });
+            });
+            const newSurvey = { title: data.title, studyId: data.studyId, questions, eligibilityRules };
             await createDocument('surveys', newSurvey);
             form.reset();
             document.getElementById('questions-container').innerHTML = '';
@@ -7311,7 +8058,13 @@ const loadAllData = async () => {
         ]);
         
         // Sort data appropriately
-        const normalizedPatients = patients.map(p => ({
+        let accessRequests = [];
+        try {
+            accessRequests = await fetchData('accessRequests');
+        } catch {
+            accessRequests = state.accessRequests || [];
+        }
+        const normalizedPatients = patients.map(p => normalizePatientRecord({
             ...p,
             inclusionCriteriaMet: p.inclusionCriteriaMet === true,
             exclusionCriteriaMet: p.exclusionCriteriaMet === true
@@ -7326,6 +8079,7 @@ const loadAllData = async () => {
         state.patients = sortedPatients;
         state.schedules = schedules;
         state.surveys = surveys;
+        if (accessRequests.length) state.accessRequests = accessRequests;
         
         // Check if we're running in offline mode
         const isOfflineMode = state.studies.length === 0 && state.sites.length === 0 && state.patients.length === 0;

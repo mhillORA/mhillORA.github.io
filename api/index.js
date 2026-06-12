@@ -466,12 +466,28 @@ const validatePatientsSchema = (data) => {
         errors.push('studyHistory must be an array');
     }
 
-    if (data.inclusionCriteriaMet === undefined || typeof data.inclusionCriteriaMet !== 'boolean') {
-        errors.push('inclusionCriteriaMet is required and must be a boolean');
+    if (data.inclusionCriteriaMet !== undefined && typeof data.inclusionCriteriaMet !== 'boolean') {
+        errors.push('inclusionCriteriaMet must be a boolean');
     }
     
-    if (data.exclusionCriteriaMet === undefined || typeof data.exclusionCriteriaMet !== 'boolean') {
-        errors.push('exclusionCriteriaMet is required and must be a boolean');
+    if (data.exclusionCriteriaMet !== undefined && typeof data.exclusionCriteriaMet !== 'boolean') {
+        errors.push('exclusionCriteriaMet must be a boolean');
+    }
+
+    ['appointments', 'tasks', 'consentRecords', 'communications', 'waitlist', 'auditTrail', 'visitLogs', 'completedVisits'].forEach((field) => {
+        if (data[field] !== undefined && !Array.isArray(data[field])) {
+            errors.push(`${field} must be an array`);
+        }
+    });
+
+    if (data.pipelineStage !== undefined && typeof data.pipelineStage !== 'string') {
+        errors.push('pipelineStage must be a string');
+    }
+    if (data.eligibilityStatus !== undefined && typeof data.eligibilityStatus !== 'string') {
+        errors.push('eligibilityStatus must be a string');
+    }
+    if (data.doNotContact !== undefined && typeof data.doNotContact !== 'boolean') {
+        errors.push('doNotContact must be a boolean');
     }
     
     if (errors.length > 0) {
@@ -1144,4 +1160,30 @@ app.http('users', {
     authLevel: 'anonymous',
     route: 'users/{id?}',
     handler: (request, context) => crudHandler(context, request, RECRUITMENT_USERS_CONTAINER),
+});
+
+const validateAccessRequestsSchema = (data) => {
+    const errors = [];
+    if (!data.requestedLogin || typeof data.requestedLogin !== 'string') {
+        errors.push('requestedLogin is required and must be a string');
+    }
+    if (data.status && !['pending', 'approved', 'denied'].includes(data.status)) {
+        errors.push('status must be one of: pending, approved, denied');
+    }
+    if (errors.length) throw new Error(`VALIDATION_ERROR: Access request validation failed: ${errors.join(', ')}`);
+    return true;
+};
+
+app.http('accessRequests', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'access-requests/{id?}',
+    handler: async (request, context) => {
+        const method = request.method;
+        if (method === 'POST' || method === 'PUT') {
+            const body = method === 'PUT' ? await safeJson(request) : await request.json();
+            if (body) validateAccessRequestsSchema(body);
+        }
+        return crudHandler(context, request, 'access-requests');
+    },
 });
