@@ -10,6 +10,59 @@ const RECRUITMENT_USERS_CONTAINER = 'recruitment-users';
 
 const requireUser = async () => ({ claims: null });
 
+const corsJsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+
+const isCosmosNotFound = (error) => {
+    if (!error) return false;
+    const code = error.code ?? error.statusCode;
+    if (code === 404) return true;
+    const msg = String(error.message || '').toLowerCase();
+    return msg.includes('notfound') || msg.includes('not found') || msg.includes('could not be found');
+};
+
+const safeReadAll = async (container) => {
+    try {
+        const { resources } = await container.items.readAll().fetchAll();
+        return resources || [];
+    } catch (error) {
+        if (isCosmosNotFound(error)) return [];
+        throw error;
+    }
+};
+
+const safeQueryAll = async (container, querySpec) => {
+    try {
+        const { resources } = await container.items.query(querySpec).fetchAll();
+        return resources || [];
+    } catch (error) {
+        if (isCosmosNotFound(error)) return [];
+        throw error;
+    }
+};
+
+const safeItemRead = async (container, id) => {
+    try {
+        const { resource } = await container.item(id).read();
+        return resource || null;
+    } catch (error) {
+        if (isCosmosNotFound(error)) return null;
+        throw error;
+    }
+};
+
+const wrapCosmosWrite = async (operation, containerName) => {
+    try {
+        return await operation();
+    } catch (error) {
+        if (isCosmosNotFound(error)) {
+            const err = new Error(`VALIDATION_ERROR: Cosmos container "${containerName}" does not exist. Create it in Azure Portal with partition key /id.`);
+            err.status = 503;
+            throw err;
+        }
+        throw error;
+    }
+};
+
 const buildActor = (actor) => ({
     upn: actor && (actor.upn || actor.email || actor.username),
     name: actor && (actor.name || actor.displayName || actor.username),
@@ -74,6 +127,8 @@ const handleError = (context, error, message) => {
         errorMessage = error.message.replace('VALIDATION_ERROR: ', '');
     } else if (error.message.includes('UNAUTHORIZED')) {
         errorMessage = error.message.replace('UNAUTHORIZED: ', '');
+    } else if (error.status === 503 || error.message.includes('does not exist')) {
+        errorMessage = error.message.replace('VALIDATION_ERROR: ', '');
     } else {
         errorMessage = "Internal Server Error during data processing.";
     }
@@ -1300,13 +1355,12 @@ async function crudHandler(context, request, containerName) {
                     return { jsonBody: allItems };
                 }
                 if (id) {
-                    const { resource } = await container.item(id).read(); 
-                    if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
-                    return { jsonBody: resource };
-                } else {
-                    const { resources } = await container.items.readAll().fetchAll();
-                    return { jsonBody: resources };
+                    const resource = await safeItemRead(container, id);
+                    if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` }, headers: corsJsonHeaders };
+                    return { jsonBody: resource, headers: corsJsonHeaders };
                 }
+                const resources = await safeReadAll(container);
+                return { jsonBody: resources, headers: corsJsonHeaders };
             
             case 'POST':
                 const body = containerName === 'patients'
@@ -1344,24 +1398,35 @@ async function crudHandler(context, request, containerName) {
                         case 'recruitment-users':
                             validateUsersSchema(body);
                             break;
+                        case 'access-requests':
+                            validateAccessRequestsSchema(body);
+                            break;
+                        case 'cohort-rules':
+                            validateCohortRulesSchema(body);
+                            break;
                     }
                 } catch (validationError) {
                     console.error(`Validation error for ${containerName}:`, validationError.message);
                     return {
                         status: 400,
                         jsonBody: { error: validationError.message },
-                        headers: { 'Content-Type': 'application/json' }
+                        headers: corsJsonHeaders
                     };
                 }
                 
-                let newItem = { ...body, id: body.id || generateId() };
+                let newItem = containerName === 'access-requests'
+                    ? { ...normalizeAccessRequestInput(body), id: body.id || generateId() }
+                    : { ...body, id: body.id || generateId() };
                 if (containerName === 'patients') {
                     newItem = enrichPatientDocument(newItem);
                     if (requestContext?.scope && !patientAccessibleToScope(newItem, requestContext.scope)) {
                         return scopeForbiddenResponse();
                     }
                 }
-                const { resource: createdItem } = await container.items.create(newItem);
+                const { resource: createdItem } = await wrapCosmosWrite(
+                    () => container.items.create(newItem),
+                    containerName
+                );
 
                 await writeAudit({
                     action: `${containerName}.create`,
@@ -1378,23 +1443,22 @@ async function crudHandler(context, request, containerName) {
                     createdItem.enrolled = enrollment;
                 }
                 
-                return { status: 201, jsonBody: createdItem };
+                return { status: 201, jsonBody: createdItem, headers: corsJsonHeaders };
             
             case 'PUT':
                 const rawRequestBody = await request.json();
                 const updateId = id || rawRequestBody.id;
 
-                let before = null;
-                try {
-                    if (updateId) {
-                        const readRes = await container.item(updateId).read();
-                        before = readRes && readRes.resource ? readRes.resource : null;
-                    }
-                } catch {}
+                const before = updateId ? await safeItemRead(container, updateId) : null;
 
-                const requestBody = containerName === 'patients'
-                    ? normalizePatientInput(before ? { ...before, ...rawRequestBody, id: updateId } : { ...rawRequestBody, id: updateId })
-                    : rawRequestBody;
+                let requestBody = rawRequestBody;
+                if (containerName === 'patients') {
+                    requestBody = normalizePatientInput(before ? { ...before, ...rawRequestBody, id: updateId } : { ...rawRequestBody, id: updateId });
+                } else if (containerName === 'access-requests') {
+                    requestBody = normalizeAccessRequestInput(before ? { ...before, ...rawRequestBody, id: updateId } : { ...rawRequestBody, id: updateId });
+                } else if (before) {
+                    requestBody = { ...before, ...rawRequestBody, id: updateId };
+                }
 
                 if (containerName === 'patients') {
                     if (before && !patientAccessibleToScope(enrichPatientDocument(before), requestContext?.scope)) {
@@ -1433,13 +1497,19 @@ async function crudHandler(context, request, containerName) {
                         case 'recruitment-users':
                             validateUsersSchema(requestBody);
                             break;
+                        case 'access-requests':
+                            validateAccessRequestsSchema(requestBody);
+                            break;
+                        case 'cohort-rules':
+                            validateCohortRulesSchema(requestBody);
+                            break;
                     }
                 } catch (validationError) {
                     console.error(`Validation error for ${containerName}:`, validationError.message);
                     return {
                         status: 400,
                         jsonBody: { error: validationError.message },
-                        headers: { 'Content-Type': 'application/json' }
+                        headers: corsJsonHeaders
                     };
                 }
 
@@ -1450,7 +1520,10 @@ async function crudHandler(context, request, containerName) {
                         return scopeForbiddenResponse();
                     }
                 }
-                const { resource: result } = await container.items.upsert(updatedItem);
+                const { resource: result } = await wrapCosmosWrite(
+                    () => container.items.upsert(updatedItem),
+                    containerName
+                );
 
                 await writeAudit({
                     action: `${containerName}.update`,
@@ -1467,7 +1540,7 @@ async function crudHandler(context, request, containerName) {
                     result.enrolled = enrollment;
                 }
                 
-                return { jsonBody: result };
+                return { jsonBody: result, headers: corsJsonHeaders };
 
             case 'DELETE':
                 let beforeDelete = null;
@@ -1494,13 +1567,13 @@ async function crudHandler(context, request, containerName) {
                     before: beforeDelete,
                     after: null,
                 });
-                return { status: 204 };
+                return { status: 204, headers: corsJsonHeaders };
 
             case 'OPTIONS':
-                return { status: 200 };
+                return { status: 200, headers: corsJsonHeaders };
 
             default:
-                return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+                return { status: 405, jsonBody: { error: 'Method Not Allowed' }, headers: corsJsonHeaders };
         }
     } catch (error) {
         return handleError(context, error, `Database operation failed on ${containerName}`);
@@ -1627,15 +1700,29 @@ app.http('users', {
     handler: (request, context) => crudHandler(context, request, RECRUITMENT_USERS_CONTAINER),
 });
 
+const normalizeAccessRequestInput = (data) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+    const normalized = { ...data };
+    if (normalized.requestedLogin != null) normalized.requestedLogin = String(normalized.requestedLogin).trim();
+    if (normalized.notes != null) normalized.notes = String(normalized.notes).trim();
+    if (normalized.siteName != null) normalized.siteName = String(normalized.siteName).trim();
+    if (normalized.siteId != null) normalized.siteId = String(normalized.siteId).trim();
+    return normalized;
+};
+
 const validateAccessRequestsSchema = (data) => {
     const errors = [];
-    if (!data.requestedLogin || typeof data.requestedLogin !== 'string') {
+    const request = normalizeAccessRequestInput(data);
+    if (!request.requestedLogin) {
+        errors.push('requestedLogin is required and must be a string');
+    } else if (typeof request.requestedLogin !== 'string') {
         errors.push('requestedLogin is required and must be a string');
     }
-    if (data.status && !['pending', 'approved', 'denied'].includes(data.status)) {
+    if (request.status && !['pending', 'approved', 'denied'].includes(request.status)) {
         errors.push('status must be one of: pending, approved, denied');
     }
     if (errors.length) throw new Error(`VALIDATION_ERROR: Access request validation failed: ${errors.join(', ')}`);
+    Object.assign(data, request);
     return true;
 };
 
@@ -1643,14 +1730,7 @@ app.http('accessRequests', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'access-requests/{id?}',
-    handler: async (request, context) => {
-        const method = request.method;
-        if (method === 'POST' || method === 'PUT') {
-            const body = method === 'PUT' ? await safeJson(request) : await request.json();
-            if (body) validateAccessRequestsSchema(body);
-        }
-        return crudHandler(context, request, 'access-requests');
-    },
+    handler: (request, context) => crudHandler(context, request, 'access-requests'),
 });
 
 app.http('patientsQuery', {
@@ -1870,14 +1950,14 @@ app.http('bulkJobs', {
             const jobsContainer = getContainer('bulk-jobs');
             if (request.method === 'GET') {
                 if (id) {
-                    const { resource } = await jobsContainer.item(id).read();
+                    const resource = await safeItemRead(jobsContainer, id);
                     if (!resource) return { status: 404, jsonBody: { error: 'Job not found' }, headers: jsonHeaders };
                     return { jsonBody: resource, headers: jsonHeaders };
                 }
-                const { resources } = await jobsContainer.items.query({
+                const resources = await safeQueryAll(jobsContainer, {
                     query: 'SELECT TOP 50 * FROM c ORDER BY c.startedAt DESC',
-                }).fetchAll();
-                return { jsonBody: resources || [], headers: jsonHeaders };
+                });
+                return { jsonBody: resources, headers: jsonHeaders };
             }
             return { status: 405, jsonBody: { error: 'Method Not Allowed' }, headers: jsonHeaders };
         } catch (error) {
@@ -1896,7 +1976,7 @@ app.http('bulkJobsContinue', {
             await requireUser(request);
             const id = request.params.id;
             const jobsContainer = getContainer('bulk-jobs');
-            const { resource: job } = await jobsContainer.item(id).read();
+            const job = await safeItemRead(jobsContainer, id);
             if (!job) return { status: 404, jsonBody: { error: 'Job not found' }, headers: jsonHeaders };
             if (job.status === 'completed') return { jsonBody: job, headers: jsonHeaders };
             const updatedJob = await processBulkAssignBatch(job, context);
@@ -1911,14 +1991,7 @@ app.http('cohortRules', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'cohort-rules/{id?}',
-    handler: async (request, context) => {
-        const method = request.method;
-        if (method === 'POST' || method === 'PUT') {
-            const body = method === 'PUT' ? await safeJson(request) : await request.json();
-            if (body) validateCohortRulesSchema(body);
-        }
-        return crudHandler(context, request, 'cohort-rules');
-    },
+    handler: (request, context) => crudHandler(context, request, 'cohort-rules'),
 });
 
 app.http('cohortMemberships', {
@@ -1933,14 +2006,12 @@ app.http('cohortMemberships', {
             const container = getContainer('cohort-memberships');
             let resources = [];
             if (studyId) {
-                const result = await container.items.query({
+                resources = await safeQueryAll(container, {
                     query: 'SELECT TOP 500 * FROM c WHERE c.studyId = @studyId ORDER BY c.assignedAt DESC',
                     parameters: [{ name: '@studyId', value: studyId }],
-                }).fetchAll();
-                resources = result.resources || [];
+                });
             } else {
-                const result = await container.items.readAll().fetchAll();
-                resources = (result.resources || []).slice(0, 500);
+                resources = (await safeReadAll(container)).slice(0, 500);
             }
             return { jsonBody: resources, headers: jsonHeaders };
         } catch (error) {
