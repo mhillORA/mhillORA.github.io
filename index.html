@@ -298,6 +298,7 @@ const normalizeScheduleDocument = (s, index) => {
 const COLLECTION_API_NAME = {
     schedules: 'patient-schedules',
     accessRequests: 'access-requests',
+    cohortRules: 'cohort-rules',
 };
 const toApiCollectionName = (logicalCollection) => COLLECTION_API_NAME[logicalCollection] || logicalCollection;
 
@@ -540,6 +541,23 @@ let state = {
     studiesExpanded: false, // For the collapsible studies list
     taskView: 'due', // due | all | mine
 
+    // --- participant registry / cohort builder ---
+    registryCriteria: { logic: 'AND', conditions: [] },
+    registryResults: [],
+    registryTotal: 0,
+    registryOffset: 0,
+    registryPageSize: 50,
+    registryAssignStudyId: '',
+    registryAssignSiteId: '',
+    registryAssignType: 'candidate',
+    cohortRules: [],
+    bulkJobs: [],
+    activeBulkJobId: null,
+    patientsServerTotal: null,
+    patientsUseServerQuery: true,
+    patientsPageOffset: 0,
+    patientsPageSize: 50,
+
     // --- access-request + user management ---
     showLoginGate: false,
     accessRequests: [],
@@ -621,6 +639,7 @@ const toApiUserPayload = (user) => ({
     role: user.role || 'coordinator',
     password: user.password || '',
     allowedSiteIds: user.allowedSiteIds || [],
+    allowedStudyIds: user.allowedStudyIds || [],
     entraId: String(user.entraId || user.entraOid || '').trim(),
     entraOid: String(user.entraOid || user.entraId || '').trim(),
     active: user.active !== false,
@@ -637,6 +656,7 @@ const setSignedInUser = (user) => {
         email: normalized.email,
         role: normalized.role,
         allowedSiteIds: normalized.allowedSiteIds || [],
+        allowedStudyIds: normalized.allowedStudyIds || [],
         entraId: normalized.entraId || '',
     };
     state.userId = normalized.id || normalized.username || 'nasa-user';
@@ -1026,6 +1046,23 @@ const setupScheduleFormDependencies = () => {
  * @param {Object} patient - Patient object with enrollments array
  * @returns {Object} - Patient object with Azure format
  */
+const computePatientDenormalized = (patient) => {
+    const enrollments = Array.isArray(patient?.enrollments) ? patient.enrollments : [];
+    const current = enrollments.find(e => e && e.status === 'current');
+    const enrolledStudyIds = [...new Set(
+        enrollments.filter(e => e && ['current', 'past'].includes(e.status) && e.studyId).map(e => e.studyId)
+    )];
+    const candidateStudyIds = [...new Set(
+        enrollments.filter(e => e && e.status === 'candidate' && e.studyId).map(e => e.studyId)
+    )];
+    return {
+        currentStudyId: current?.studyId || null,
+        currentSiteId: current?.siteId || null,
+        enrolledStudyIds,
+        candidateStudyIds,
+    };
+};
+
 const convertPatientToAzureFormat = (patient) => {
     const normalized = normalizePatientRecord(patient);
     const currentEnrollment = normalized.enrollments?.find(e => e.status === 'current');
@@ -1036,9 +1073,10 @@ const convertPatientToAzureFormat = (patient) => {
         enrolledDate: enrollment.enrolledDate,
         exitedDate: enrollment.exitedDate
     }));
-    const { enrollments, ...rest } = normalized;
+    const denorm = computePatientDenormalized(normalized);
     return {
-        ...rest,
+        ...normalized,
+        ...denorm,
         studyId: currentEnrollment?.studyId || null,
         siteId: currentEnrollment?.siteId || null,
         appointment: getPrimaryAppointment(normalized),
@@ -1053,33 +1091,32 @@ const convertPatientToAzureFormat = (patient) => {
  * @returns {Object} - Patient object with NASA format
  */
 const convertPatientFromAzureFormat = (azurePatient) => {
-    const enrollments = [];
-    
-    // Add current enrollment if exists
-    if (azurePatient.studyId && azurePatient.siteId) {
-        enrollments.push({
-            studyId: azurePatient.studyId,
-            siteId: azurePatient.siteId,
-            status: 'current',
-            enrolledDate: new Date().toISOString(),
-            exitedDate: null
-        });
-    }
-    
-    // Add past enrollments from studyHistory
-    if (azurePatient.studyHistory && Array.isArray(azurePatient.studyHistory)) {
-        azurePatient.studyHistory.forEach(history => {
+    let enrollments = [];
+    if (Array.isArray(azurePatient.enrollments) && azurePatient.enrollments.length) {
+        enrollments = azurePatient.enrollments.map(e => ({ ...e }));
+    } else {
+        if (azurePatient.studyId && azurePatient.siteId) {
             enrollments.push({
-                studyId: history.studyId,
-                siteId: history.siteId,
-                status: 'past',
-                enrolledDate: history.enrolledDate,
-                exitedDate: history.exitedDate
+                studyId: azurePatient.studyId,
+                siteId: azurePatient.siteId,
+                status: 'current',
+                enrolledDate: new Date().toISOString(),
+                exitedDate: null
             });
-        });
+        }
+        if (azurePatient.studyHistory && Array.isArray(azurePatient.studyHistory)) {
+            azurePatient.studyHistory.forEach(history => {
+                enrollments.push({
+                    studyId: history.studyId,
+                    siteId: history.siteId,
+                    status: 'past',
+                    enrolledDate: history.enrolledDate,
+                    exitedDate: history.exitedDate
+                });
+            });
+        }
     }
-    
-    const { studyId, siteId, studyHistory, ...rest } = azurePatient;
+    const { studyId, siteId, studyHistory, currentStudyId, currentSiteId, enrolledStudyIds, candidateStudyIds, ...rest } = azurePatient;
     return normalizePatientRecord({
         ...rest,
         enrollments,
@@ -1182,16 +1219,96 @@ const getUserAllowedSiteIds = () => {
     return Array.isArray(ids) ? ids : [];
 };
 
-const patientVisibleToCurrentUser = (patient) => {
-    const allowed = getUserAllowedSiteIds();
-    if (allowed === null) return true;
-    const enrollment = patient.enrollments?.find(e => e.status === 'current');
-    if (!enrollment?.siteId) return true;
-    return allowed.includes(enrollment.siteId);
+const getUserAllowedStudyIds = () => {
+    if (!state.currentUser || state.currentUser.role === 'Internal') return null;
+    const ids = state.currentUser.allowedStudyIds;
+    return Array.isArray(ids) ? ids : [];
 };
+
+const getUserScopeForApi = () => {
+    if (!state.currentUser) return null;
+    return {
+        role: state.currentUser.role || '',
+        allowedSiteIds: state.currentUser.allowedSiteIds || [],
+        allowedStudyIds: state.currentUser.allowedStudyIds || [],
+    };
+};
+
+const patientVisibleToCurrentUser = (patient) => {
+    const allowedSites = getUserAllowedSiteIds();
+    const allowedStudies = getUserAllowedStudyIds();
+    if (allowedSites === null && allowedStudies === null) return true;
+    const enrollment = patient.enrollments?.find(e => e.status === 'current');
+    const denorm = computePatientDenormalized(patient);
+    const siteId = enrollment?.siteId || denorm.currentSiteId;
+    const studyId = enrollment?.studyId || denorm.currentStudyId;
+    if (!siteId && !studyId) return true;
+    if (allowedSites !== null && siteId && !allowedSites.includes(siteId)) return false;
+    if (allowedStudies !== null && studyId && !allowedStudies.includes(studyId)) return false;
+    return true;
+};
+
+const queryPatientsServer = async (options = {}) => {
+    const body = {
+        criteria: options.criteria || { logic: 'AND', conditions: [] },
+        scope: options.scope !== undefined ? options.scope : getUserScopeForApi(),
+        search: options.search || '',
+        limit: options.limit || 50,
+        offset: options.offset || 0,
+        includeTotal: options.includeTotal !== false,
+    };
+    const result = await apiCall('patients/query', 'POST', body);
+    const items = (result.items || []).map(p => normalizePatientRecord(convertPatientFromAzureFormat(p)));
+    return { ...result, items };
+};
+
+const previewCohortServer = async (criteria) => {
+    return apiCall('cohorts/preview', 'POST', {
+        criteria,
+        scope: getUserScopeForApi(),
+        sampleLimit: 25,
+    });
+};
+
+const runCohortAssignServer = async (payload) => {
+    return apiCall('cohorts/assign', 'POST', {
+        ...payload,
+        scope: getUserScopeForApi(),
+    });
+};
+
+const continueBulkJobServer = async (jobId) => apiCall(`bulk-jobs/${jobId}/continue`, 'POST', {});
+
+const pollBulkJobUntilDone = async (jobId, onProgress) => {
+    let job = await apiCall(`bulk-jobs/${jobId}`);
+    let guard = 0;
+    while (job && job.status === 'running' && guard < 500) {
+        if (onProgress) onProgress(job);
+        job = await continueBulkJobServer(jobId);
+        guard += 1;
+    }
+    return job;
+};
+
+const COHORT_CRITERIA_FIELD_DEFS = [
+    { field: 'registryStatus', label: 'Registry Status', ops: ['equals', 'in'], presets: ['Active', 'Inactive', 'Do Not Call'] },
+    { field: 'therapeuticArea', label: 'Therapeutic Area', ops: ['equals', 'contains', 'in'] },
+    { field: 'state', label: 'State', ops: ['equals', 'in'] },
+    { field: 'age', label: 'Age', ops: ['between'] },
+    { field: 'eligibilityStatus', label: 'Eligibility', ops: ['equals', 'in'], presets: ['unknown', 'eligible', 'ineligible', 'pi_review'] },
+    { field: 'source', label: 'Source', ops: ['equals', 'contains'] },
+    { field: 'condition', label: 'Condition', ops: ['contains'] },
+    { field: 'pipelineStage', label: 'Pipeline Stage', ops: ['equals', 'in'] },
+    { field: 'doNotContact', label: 'Do Not Contact', ops: ['is_false', 'is_true'] },
+    { field: '_enrollment', label: 'Enrollment Rule', ops: ['not_enrolled_in', 'has_current_enrollment', 'no_current_enrollment'] },
+];
 
 const filterPatientsForCurrentUser = (patients) =>
     (patients || []).filter(patientVisibleToCurrentUser);
+
+const findPatientById = (id) =>
+    state.patients.find(p => p.id === id)
+    || (state.registryResults || []).find(p => p.id === id);
 
 const getPatientAppointments = (patient) => {
     if (!patient) return [];
@@ -1521,6 +1638,7 @@ const renderNav = () => {
         { id: 'pipeline', label: 'Pipeline', icon: 'git-branch' },
         { id: 'tasks', label: 'Tasks', icon: 'list-checks' },
         { id: 'funnel', label: 'Funnel', icon: 'filter' },
+        { id: 'registry', label: 'Registry', icon: 'database' },
         { id: 'studies', label: 'Studies', icon: 'file-text', hasDropdown: true },
         { id: 'patients', label: 'Patients', icon: 'users' },
         { id: 'sites', label: 'Sites', icon: 'building' },
@@ -1576,6 +1694,7 @@ const renderContent = () => {
         pipeline: getPipelineHTML,
         tasks: getTasksHTML,
         funnel: getFunnelHTML,
+        registry: getRegistryHTML,
         studies: getStudiesHTML,
         patients: getPatientsHTML,
         sites: getSitesHTML,
@@ -1604,8 +1723,19 @@ const renderContent = () => {
     if (state.activeTab === 'funnel') {
         renderFunnelView();
     }
+    if (state.activeTab === 'registry') {
+        renderRegistryResults();
+        loadCohortRules().then(() => {
+            if (state.activeTab === 'registry') render();
+        });
+        loadBulkJobs();
+    }
     if (state.activeTab === 'patients') {
-        renderPatientTable();
+        if (state.patientsUseServerQuery) {
+            loadPatientsPage(state.patientsPageOffset || 0).then(() => renderPatientTable());
+        } else {
+            renderPatientTable();
+        }
         setTimeout(() => setupSearchInputs(), 100);
     }
     if (state.activeTab === 'studies') {
@@ -2621,9 +2751,29 @@ const exportParticipants = () => {
     }
 };
 
+const loadPatientsPage = async (offset = 0) => {
+    try {
+        const result = await queryPatientsServer({
+            search: state.patientSearchTerm || '',
+            offset,
+            limit: state.patientsPageSize,
+            includeTotal: true,
+        });
+        state.patients = result.items;
+        state.patientsServerTotal = result.total;
+        state.patientsPageOffset = offset;
+        return result;
+    } catch (err) {
+        console.warn('Server patient query failed, using cached patients:', err.message);
+        state.patientsUseServerQuery = false;
+        return null;
+    }
+};
+
 const getPatientsHTML = () => {
+    const totalLabel = state.patientsServerTotal != null ? ` (${state.patientsServerTotal.toLocaleString()} total)` : '';
     return `
-        <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Patients</h2>
+        <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Patients${totalLabel}</h2>
         <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-4">
             <input type="text" id="patient-search" value="${state.patientSearchTerm}" class="p-2 border dark:border-gray-600 rounded-md md:col-span-2 bg-white dark:bg-gray-700 dark:text-white" placeholder="Search by Name, Email, Phone, or Global ID...">
             <div class="flex gap-2">
@@ -2631,6 +2781,12 @@ const getPatientsHTML = () => {
                 <button data-action="quick-add-patient-modal" class="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">Quick Add</button>
             </div>
         </div>
+        ${state.patientsUseServerQuery ? `
+            <div class="flex justify-end gap-2 mb-2">
+                <button type="button" data-action="patients-prev-page" class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-600 rounded dark:text-white">Prev</button>
+                <button type="button" data-action="patients-next-page" class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-600 rounded dark:text-white">Next</button>
+            </div>
+        ` : ''}
         <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden">
             <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                 <thead class="bg-gray-50 dark:bg-gray-700"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Name</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Site</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Appointment</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th></tr></thead>
@@ -2643,27 +2799,25 @@ const renderPatientTable = () => {
     if (!tableBody) return;
     const searchTerm = state.patientSearchTerm.toLowerCase();
     
-    // Helper function to normalize phone numbers for searching
     const normalizePhoneForSearch = (phone) => {
         if (!phone) return '';
-        return phone.replace(/\D/g, ''); // Remove all non-digits
+        return phone.replace(/\D/g, '');
     };
     
-    const filteredPatients = filterPatientsForCurrentUser(state.patients).filter(p => {
-        const nameMatch = `${p.firstName} ${p.lastName}`.toLowerCase().includes(searchTerm);
-        const emailMatch = p.email && p.email.toLowerCase().includes(searchTerm);
-        const globalIdMatch = p.globalId && p.globalId.toLowerCase().includes(searchTerm);
-        
-        // Phone number matching with format normalization
-        let phoneMatch = false;
-        if (p.phoneNumber) {
-            const normalizedSearchTerm = searchTerm.replace(/\D/g, ''); // Remove non-digits from search term
-            const normalizedPhone = normalizePhoneForSearch(p.phoneNumber);
-            phoneMatch = normalizedPhone.includes(normalizedSearchTerm);
-        }
-        
-        return nameMatch || emailMatch || phoneMatch || globalIdMatch;
-    });
+    let filteredPatients = filterPatientsForCurrentUser(state.patients);
+    if (!state.patientsUseServerQuery && searchTerm) {
+        filteredPatients = filteredPatients.filter(p => {
+            const nameMatch = `${p.firstName} ${p.lastName}`.toLowerCase().includes(searchTerm);
+            const emailMatch = p.email && p.email.toLowerCase().includes(searchTerm);
+            const globalIdMatch = p.globalId && p.globalId.toLowerCase().includes(searchTerm);
+            let phoneMatch = false;
+            if (p.phoneNumber) {
+                const normalizedSearchTerm = searchTerm.replace(/\D/g, '');
+                phoneMatch = normalizePhoneForSearch(p.phoneNumber).includes(normalizedSearchTerm);
+            }
+            return nameMatch || emailMatch || phoneMatch || globalIdMatch;
+        });
+    }
     tableBody.innerHTML = filteredPatients.map(p => {
         const appointmentInfo = p.appointment ? 
             phi(`${new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })} (${p.appointment.visit || 'General'})`) 
@@ -2957,6 +3111,229 @@ const renderFunnelView = () => {
     `;
 };
 
+const buildRegistryConditionRowHTML = (cond, index) => {
+    const def = COHORT_CRITERIA_FIELD_DEFS.find(d => d.field === cond.field) || COHORT_CRITERIA_FIELD_DEFS[0];
+    const op = cond.op || def.ops[0];
+    const value = cond.value ?? '';
+    const fieldOptions = COHORT_CRITERIA_FIELD_DEFS.map(d => `<option value="${d.field}" ${cond.field === d.field ? 'selected' : ''}>${d.label}</option>`).join('');
+    const opOptions = (COHORT_CRITERIA_FIELD_DEFS.find(d => d.field === cond.field) || def).ops.map(o => `<option value="${o}" ${op === o ? 'selected' : ''}>${o}</option>`).join('');
+    let valueInput = '';
+    if (op === 'between') {
+        const arr = Array.isArray(value) ? value : ['', ''];
+        valueInput = `<div class="flex gap-2"><input type="number" data-registry-value="0" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" placeholder="Min" value="${arr[0] ?? ''}"><input type="number" data-registry-value="1" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" placeholder="Max" value="${arr[1] ?? ''}"></div>`;
+    } else if (op === 'not_enrolled_in') {
+        valueInput = `<select class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full">${state.studies.map(s => `<option value="${s.id}" ${value === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select>`;
+    } else if (op === 'in') {
+        valueInput = `<input type="text" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" placeholder="Comma-separated values" value="${Array.isArray(value) ? value.join(', ') : value}">`;
+    } else if (def.presets) {
+        valueInput = `<select class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full">${def.presets.map(p => `<option value="${p}" ${value === p ? 'selected' : ''}>${p}</option>`).join('')}</select>`;
+    } else if (op === 'is_true' || op === 'is_false') {
+        valueInput = `<span class="text-sm text-gray-500 dark:text-gray-400 p-2">No value needed</span>`;
+    } else {
+        valueInput = `<input type="text" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" value="${value}">`;
+    }
+    return `
+        <div class="registry-condition-row grid grid-cols-1 md:grid-cols-12 gap-2 items-center" data-index="${index}">
+            <select data-registry-field class="md:col-span-3 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${fieldOptions}</select>
+            <select data-registry-op class="md:col-span-2 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${opOptions}</select>
+            <div class="md:col-span-6 registry-value-cell">${valueInput}</div>
+            <button type="button" data-action="registry-remove-condition" data-index="${index}" class="md:col-span-1 text-red-600 hover:text-red-800 text-sm">Remove</button>
+        </div>`;
+};
+
+const collectRegistryCriteriaFromDom = () => {
+    const logic = document.getElementById('registry-criteria-logic')?.value || 'AND';
+    const rows = document.querySelectorAll('.registry-condition-row');
+    const conditions = [];
+    rows.forEach((row) => {
+        const field = row.querySelector('[data-registry-field]')?.value;
+        const op = row.querySelector('[data-registry-op]')?.value;
+        if (!field || !op) return;
+        let value = null;
+        if (op === 'between') {
+            const inputs = row.querySelectorAll('.registry-cond-value');
+            value = [parseFloat(inputs[0]?.value), parseFloat(inputs[1]?.value)];
+        } else if (op === 'is_true' || op === 'is_false') {
+            value = null;
+        } else if (op === 'in') {
+            const raw = row.querySelector('.registry-cond-value')?.value || '';
+            value = raw.split(',').map(s => s.trim()).filter(Boolean);
+        } else if (field === '_enrollment' && op === 'not_enrolled_in') {
+            value = row.querySelector('.registry-cond-value')?.value || '';
+            conditions.push({ field: '_enrollment', op, value });
+            return;
+        } else if (field === '_enrollment') {
+            conditions.push({ field: '_enrollment', op, value: null });
+            return;
+        } else {
+            value = row.querySelector('.registry-cond-value')?.value ?? '';
+            if (field === 'age' && op !== 'between') value = parseFloat(value);
+        }
+        conditions.push({ field, op, value });
+    });
+    return { logic, conditions };
+};
+
+const getRegistryHTML = () => {
+    const conditions = state.registryCriteria?.conditions?.length
+        ? state.registryCriteria.conditions
+        : [{ field: 'registryStatus', op: 'equals', value: 'Active' }];
+    const conditionRows = conditions.map((c, i) => buildRegistryConditionRowHTML(c, i)).join('');
+    const savedRules = state.cohortRules || [];
+    const recentJobs = (state.bulkJobs || []).slice(0, 10);
+    return `
+        <div class="mb-6">
+            <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200">Participant Registry</h2>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Query the master participant repository and bulk-assign matching profiles to studies. Designed for large cohorts — results are paginated server-side.</p>
+        </div>
+        <div class="grid grid-cols-1 xl:grid-cols-3 gap-6 mb-6">
+            <div class="xl:col-span-2 bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md space-y-4">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-lg font-semibold dark:text-white">Criteria Builder</h3>
+                    <select id="registry-criteria-logic" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm">
+                        <option value="AND" ${(state.registryCriteria?.logic || 'AND') === 'AND' ? 'selected' : ''}>Match ALL (AND)</option>
+                        <option value="OR" ${state.registryCriteria?.logic === 'OR' ? 'selected' : ''}>Match ANY (OR)</option>
+                    </select>
+                </div>
+                <div id="registry-conditions-container" class="space-y-2">${conditionRows}</div>
+                <button type="button" data-action="registry-add-condition" class="text-sm text-blue-600 dark:text-blue-400 hover:underline">+ Add condition</button>
+                <div class="flex flex-wrap gap-2 pt-2">
+                    <button type="button" data-action="registry-preview" class="bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700">Preview Matches</button>
+                    <button type="button" data-action="registry-search-page" class="bg-gray-200 dark:bg-gray-600 px-4 py-2 rounded-md hover:bg-gray-300 dark:hover:bg-gray-500 dark:text-white">Search / Page Results</button>
+                </div>
+                <div id="registry-preview-stats" class="text-sm text-gray-600 dark:text-gray-300"></div>
+            </div>
+            <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md space-y-4">
+                <h3 class="text-lg font-semibold dark:text-white">Assign to Study</h3>
+                <div>
+                    <label class="block text-sm dark:text-gray-300 mb-1">Study</label>
+                    <select id="registry-assign-study" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="">Select study</option>
+                        ${state.studies.map(s => `<option value="${s.id}" ${state.registryAssignStudyId === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm dark:text-gray-300 mb-1">Site</label>
+                    <select id="registry-assign-site" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="">Select site</option>
+                        ${state.sites.map(s => `<option value="${s.id}" ${state.registryAssignSiteId === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm dark:text-gray-300 mb-1">Assignment type</label>
+                    <select id="registry-assign-type" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="candidate" ${state.registryAssignType === 'candidate' ? 'selected' : ''}>Candidate (pool for outreach)</option>
+                        <option value="current" ${state.registryAssignType === 'current' ? 'selected' : ''}>Current (active recruitment)</option>
+                    </select>
+                </div>
+                <button type="button" data-action="registry-run-assign" class="w-full bg-green-600 text-white py-2 rounded-md hover:bg-green-700">Run Bulk Assign</button>
+                <div id="registry-job-status" class="text-xs text-gray-500 dark:text-gray-400"></div>
+                <hr class="border-gray-200 dark:border-gray-700">
+                <h4 class="font-medium dark:text-white text-sm">Save Rule</h4>
+                <input type="text" id="registry-rule-name" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm" placeholder="Rule name e.g. Oncology MA 40-65">
+                <button type="button" data-action="registry-save-rule" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 text-sm">Save Criteria Rule</button>
+                ${savedRules.length ? `
+                    <div class="mt-2 space-y-1 max-h-40 overflow-y-auto">
+                        ${savedRules.map(r => `
+                            <div class="flex justify-between items-center text-xs dark:text-gray-300 border-b border-gray-100 dark:border-gray-700 py-1">
+                                <span>${r.name}</span>
+                                <button type="button" data-action="registry-load-rule" data-rule-id="${r.id}" class="text-blue-600 hover:underline">Load</button>
+                            </div>
+                        `).join('')}
+                    </div>
+                ` : ''}
+            </div>
+        </div>
+        <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md mb-4">
+            <div class="flex justify-between items-center mb-3">
+                <h3 class="font-semibold dark:text-white">Results <span id="registry-results-count" class="text-sm font-normal text-gray-500"></span></h3>
+                <div class="flex gap-2">
+                    <button type="button" data-action="registry-prev-page" class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-600 rounded dark:text-white">Prev</button>
+                    <button type="button" data-action="registry-next-page" class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-600 rounded dark:text-white">Next</button>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="min-w-full text-sm">
+                    <thead class="bg-gray-50 dark:bg-gray-700"><tr>
+                        <th class="px-3 py-2 text-left text-xs uppercase text-gray-500 dark:text-gray-300">Name</th>
+                        <th class="px-3 py-2 text-left text-xs uppercase text-gray-500 dark:text-gray-300">State</th>
+                        <th class="px-3 py-2 text-left text-xs uppercase text-gray-500 dark:text-gray-300">TA</th>
+                        <th class="px-3 py-2 text-left text-xs uppercase text-gray-500 dark:text-gray-300">Eligibility</th>
+                        <th class="px-3 py-2 text-left text-xs uppercase text-gray-500 dark:text-gray-300">Current Study</th>
+                    </tr></thead>
+                    <tbody id="registry-results-body" class="divide-y divide-gray-200 dark:divide-gray-700 dark:text-gray-300"></tbody>
+                </table>
+            </div>
+        </div>
+        ${recentJobs.length ? `
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md">
+                <h3 class="font-semibold dark:text-white mb-2">Recent Bulk Jobs</h3>
+                <div class="text-xs space-y-1 dark:text-gray-300">
+                    ${recentJobs.map(j => `<div>${j.status} — ${j.succeeded || 0} assigned, ${j.skipped || 0} skipped, ${j.failed || 0} failed (${j.processed || 0}/${j.total || '?'})</div>`).join('')}
+                </div>
+            </div>
+        ` : ''}
+    `;
+};
+
+const renderRegistryResults = () => {
+    const body = document.getElementById('registry-results-body');
+    const countEl = document.getElementById('registry-results-count');
+    if (!body) return;
+    const total = state.registryTotal ?? 0;
+    const offset = state.registryOffset || 0;
+    const pageSize = state.registryPageSize || 50;
+    if (countEl) countEl.textContent = total ? `(showing ${offset + 1}–${Math.min(offset + pageSize, total)} of ${total.toLocaleString()})` : '';
+    body.innerHTML = (state.registryResults || []).map(p => {
+        const denorm = computePatientDenormalized(p);
+        const studyTitle = denorm.currentStudyId ? (state.studies.find(s => s.id === denorm.currentStudyId)?.title || denorm.currentStudyId) : '—';
+        return `<tr>
+            <td class="px-3 py-2"><button data-action="view-patient" data-id="${p.id}" class="text-blue-600 hover:underline">${phiName(p)}</button></td>
+            <td class="px-3 py-2">${p.state || '—'}</td>
+            <td class="px-3 py-2">${p.therapeuticArea || '—'}</td>
+            <td class="px-3 py-2">${p.eligibilityStatus || '—'}</td>
+            <td class="px-3 py-2">${studyTitle}</td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="5" class="px-3 py-4 text-gray-500">Run Preview or Search to see participants.</td></tr>';
+};
+
+const loadRegistryPage = async (offset = 0) => {
+    const criteria = collectRegistryCriteriaFromDom();
+    state.registryCriteria = criteria;
+    try {
+        const result = await queryPatientsServer({
+            criteria,
+            offset,
+            limit: state.registryPageSize,
+            includeTotal: true,
+        });
+        state.registryResults = result.items;
+        state.registryTotal = result.total;
+        state.registryOffset = offset;
+        renderRegistryResults();
+    } catch (err) {
+        showNotification(`Registry query failed: ${err.message}`, 'error');
+    }
+};
+
+const loadCohortRules = async () => {
+    try {
+        const rules = await apiCall('cohort-rules');
+        state.cohortRules = Array.isArray(rules) ? rules : [];
+    } catch {
+        state.cohortRules = state.cohortRules || [];
+    }
+};
+
+const loadBulkJobs = async () => {
+    try {
+        const jobs = await apiCall('bulk-jobs');
+        state.bulkJobs = Array.isArray(jobs) ? jobs : [];
+    } catch {
+        state.bulkJobs = state.bulkJobs || [];
+    }
+};
+
 const getReportingHTML = () => {
     const sources = ['Facebook', 'Instagram', 'Reddit', 'Site', 'Marketing', 'Email'];
     return `
@@ -3191,6 +3568,7 @@ const getDayAppointmentsModalHTML = (dateString) => {
 const getPatientProfileHTML = (patient) => {
     if (!patient) return `<h2 class="text-2xl font-bold dark:text-white mb-4">Patient not found</h2>`;
     const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
+    const candidateEnrollments = patient.enrollments?.filter(e => e.status === 'candidate') || [];
     const pastEnrollments = patient.enrollments?.filter(e => e.status === 'past') || [];
     const study = currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId) : null;
     const site = currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId) : null;
@@ -3431,6 +3809,17 @@ const getPatientProfileHTML = (patient) => {
                         ${appointmentHTML}
                     </div>
                 </div>
+                ${candidateEnrollments.length ? `
+                <div class="mt-6">
+                    <h3 class="font-semibold text-lg dark:text-white mb-2 border-t dark:border-gray-700 pt-4">Study Candidates</h3>
+                    ${candidateEnrollments.map(e => `
+                        <div class="p-2 border-l-2 border-amber-400 pl-3 mb-2">
+                            <p><strong>Study:</strong> ${state.studies.find(s => s.id === e.studyId)?.title || 'N/A'}</p>
+                            <p><strong>Site:</strong> ${state.sites.find(s => s.id === e.siteId)?.name || 'N/A'}</p>
+                            <p class="text-sm text-amber-700 dark:text-amber-300">Candidate${e.assignedAt ? ` — assigned ${new Date(e.assignedAt).toLocaleDateString()}` : ''}</p>
+                        </div>
+                    `).join('')}
+                </div>` : ''}
                 <div class="mt-6">
                     <h3 class="font-semibold text-lg dark:text-white mb-2 border-t dark:border-gray-700 pt-4">Enrollment History</h3>
                     ${pastEnrollments.length > 0 ? pastEnrollments.map((e, index) => `
@@ -3894,6 +4283,22 @@ const getManageRHTML = () => {
         `;
     };
 
+    const studiesChecklistHTML = (selectedIds = [], name = 'allowedStudyIds') => {
+        const recruiting = (state.studies || []).filter(s => (s.status || 'Recruiting') === 'Recruiting' || !s.status);
+        if (!recruiting.length) return `<div class="text-sm text-gray-500 dark:text-gray-400">No studies loaded yet.</div>`;
+        const selected = new Set(selectedIds || []);
+        return `
+            <div class="grid grid-cols-1 gap-2 max-h-64 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
+                ${recruiting.map(s => `
+                    <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                        <input type="checkbox" name="${name}" value="${s.id}" ${selected.has(s.id) ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                        <span>${s.title}</span>
+                    </label>
+                `).join('')}
+            </div>
+        `;
+    };
+
     return `
         <div class="space-y-6">
             <div>
@@ -3978,6 +4383,11 @@ const getManageRHTML = () => {
                             ${sitesChecklistHTML([], 'allowedSiteIds')}
                         </div>
 
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Study Access</label>
+                            ${studiesChecklistHTML([], 'allowedStudyIds')}
+                        </div>
+
                         <div class="flex justify-end">
                             <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">Create User</button>
                         </div>
@@ -4000,12 +4410,14 @@ const getManageRHTML = () => {
                                     <th class="py-2 pr-3">Entra ID</th>
                                     <th class="py-2 pr-3">Role</th>
                                     <th class="py-2 pr-3">Sites</th>
+                                    <th class="py-2 pr-3">Studies</th>
                                     <th class="py-2 pr-3">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 ${users.map(u => {
                                     const siteCount = (u.allowedSiteIds || []).length;
+                                    const studyCount = (u.allowedStudyIds || []).length;
                                     const entra = String(u.entraId || '').trim();
                                     const entraCell = entra
                                         ? `<span class="font-mono text-xs break-all" title="${escapeHtmlPhi(entra)}">${escapeHtmlPhi(entra)}</span>`
@@ -4017,6 +4429,7 @@ const getManageRHTML = () => {
                                             <td class="py-2 pr-3 max-w-[14rem]">${entraCell}</td>
                                             <td class="py-2 pr-3">${u.role || ''}</td>
                                             <td class="py-2 pr-3">${siteCount}</td>
+                                            <td class="py-2 pr-3">${studyCount}</td>
                                             <td class="py-2 pr-3">
                                                 <button data-action="manageR-edit-user" data-user-id="${u.id}" class="px-3 py-1.5 bg-gray-200 dark:bg-gray-600 rounded-md hover:bg-gray-300 dark:hover:bg-gray-500 text-sm">Edit</button>
                                                 <button data-action="manageR-delete-user" data-user-id="${u.id}" class="px-3 py-1.5 bg-red-600 text-white rounded-md hover:bg-red-700 text-sm ml-2">Delete</button>
@@ -4103,6 +4516,7 @@ const setupManageR = () => {
             e.preventDefault();
             const fd = new FormData(form);
             const allowedSiteIds = fd.getAll('allowedSiteIds').map(String);
+            const allowedStudyIds = fd.getAll('allowedStudyIds').map(String);
             const user = {
                 id: ensureId('usr'),
                 createdAt: new Date().toISOString(),
@@ -4112,6 +4526,7 @@ const setupManageR = () => {
                 role: String(fd.get('role') || '').trim(),
                 password: String(fd.get('password') || ''),
                 allowedSiteIds,
+                allowedStudyIds,
             };
             if (!user.username) {
                 showNotification('Username is required.', 'error');
@@ -4134,17 +4549,28 @@ const setupManageR = () => {
 
 const getEditManagedUserModalHTML = (user) => {
     const activeSites = (state.sites || []).filter(s => (s.status || 'Active') === 'Active');
-    const selected = new Set(user.allowedSiteIds || []);
+    const selectedSites = new Set(user.allowedSiteIds || []);
+    const selectedStudies = new Set(user.allowedStudyIds || []);
     const sitesHTML = activeSites.length ? `
         <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-72 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
             ${activeSites.map(s => `
                 <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
-                    <input type="checkbox" name="allowedSiteIds" value="${s.id}" ${selected.has(s.id) ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                    <input type="checkbox" name="allowedSiteIds" value="${s.id}" ${selectedSites.has(s.id) ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
                     <span>${s.name}</span>
                 </label>
             `).join('')}
         </div>
     ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No active sites loaded yet.</div>`;
+    const studiesHTML = (state.studies || []).length ? `
+        <div class="grid grid-cols-1 gap-2 max-h-72 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
+            ${state.studies.map(s => `
+                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                    <input type="checkbox" name="allowedStudyIds" value="${s.id}" ${selectedStudies.has(s.id) ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                    <span>${s.title}</span>
+                </label>
+            `).join('')}
+        </div>
+    ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No studies loaded yet.</div>`;
 
     return `
         <h2 class="text-2xl font-bold text-gray-800 dark:text-gray-200 mb-4">Edit User: ${user.username}</h2>
@@ -4187,6 +4613,11 @@ const getEditManagedUserModalHTML = (user) => {
                 ${sitesHTML}
             </div>
 
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Study Access</label>
+                ${studiesHTML}
+            </div>
+
             <div class="flex justify-end gap-3 pt-2">
                 <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                 <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">Save</button>
@@ -4204,6 +4635,7 @@ const setupEditManagedUserForm = (userId) => {
         e.preventDefault();
         const fd = new FormData(form);
         const allowedSiteIds = fd.getAll('allowedSiteIds').map(String);
+        const allowedStudyIds = fd.getAll('allowedStudyIds').map(String);
         const existing = (state.managedUsers || []).find(u => u.id === userId);
         if (!existing) {
             showNotification('User not found.', 'error');
@@ -4217,6 +4649,7 @@ const setupEditManagedUserForm = (userId) => {
             role: String(fd.get('role') || '').trim(),
             password: String(fd.get('password') || ''),
             allowedSiteIds,
+            allowedStudyIds,
             lastUpdated: new Date().toISOString(),
         };
         try {
@@ -5628,10 +6061,12 @@ document.addEventListener('click', async (e) => {
             case 'next-month': state.calendarDate.setMonth(state.calendarDate.getMonth() + 1); render(); break;
             case 'prev-day': state.calendarDate.setDate(state.calendarDate.getDate() - 1); render(); break;
             case 'next-day': state.calendarDate.setDate(state.calendarDate.getDate() + 1); render(); break;
-            case 'view-patient': 
-                closeModal(); // Close any open modal first
-                openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === id)), true); 
+            case 'view-patient': {
+                closeModal();
+                const viewPatient = findPatientById(id);
+                if (viewPatient) openSidePanel(getPatientProfileHTML(viewPatient), true);
                 break;
+            }
             case 'view-study-patients': {
                 const study = state.studies.find(s => s.id === id);
                 openModal(getViewStudyPatientsModalHTML(study), true);
@@ -5683,6 +6118,135 @@ document.addEventListener('click', async (e) => {
                 break;
             case 'survey-patient': openModal(getSelectSurveyModalHTML(state.patients.find(p => p.id === id))); break;
             case 'import-patients-modal': openModal(getImportPatientsModalHTML()); break;
+            case 'registry-add-condition': {
+                state.registryCriteria = collectRegistryCriteriaFromDom();
+                state.registryCriteria.conditions.push({ field: 'registryStatus', op: 'equals', value: 'Active' });
+                if (state.activeTab === 'registry') {
+                    mainContent.innerHTML = getRegistryHTML();
+                    renderRegistryResults();
+                }
+                break;
+            }
+            case 'registry-remove-condition': {
+                state.registryCriteria = collectRegistryCriteriaFromDom();
+                const idx = parseInt(actionButton.dataset.index, 10);
+                state.registryCriteria.conditions.splice(idx, 1);
+                if (state.activeTab === 'registry') {
+                    mainContent.innerHTML = getRegistryHTML();
+                    renderRegistryResults();
+                }
+                break;
+            }
+            case 'registry-preview': {
+                const criteria = collectRegistryCriteriaFromDom();
+                state.registryCriteria = criteria;
+                const statsEl = document.getElementById('registry-preview-stats');
+                if (statsEl) statsEl.textContent = 'Counting matches...';
+                try {
+                    const preview = await previewCohortServer(criteria);
+                    if (statsEl) statsEl.textContent = `${(preview.total || 0).toLocaleString()} participants match these criteria.`;
+                    state.registryResults = (preview.sample || []).map(p => normalizePatientRecord(convertPatientFromAzureFormat(p)));
+                    state.registryTotal = preview.total || 0;
+                    state.registryOffset = 0;
+                    renderRegistryResults();
+                } catch (err) {
+                    if (statsEl) statsEl.textContent = `Preview failed: ${err.message}`;
+                    showNotification(`Preview failed: ${err.message}`, 'error');
+                }
+                break;
+            }
+            case 'registry-search-page':
+                await loadRegistryPage(0);
+                break;
+            case 'registry-prev-page': {
+                const prev = Math.max(0, (state.registryOffset || 0) - (state.registryPageSize || 50));
+                await loadRegistryPage(prev);
+                break;
+            }
+            case 'registry-next-page': {
+                const next = (state.registryOffset || 0) + (state.registryPageSize || 50);
+                if (next < (state.registryTotal || 0)) await loadRegistryPage(next);
+                break;
+            }
+            case 'registry-run-assign': {
+                const studyId = document.getElementById('registry-assign-study')?.value;
+                const siteId = document.getElementById('registry-assign-site')?.value;
+                const assignmentType = document.getElementById('registry-assign-type')?.value || 'candidate';
+                if (!studyId || !siteId) {
+                    showNotification('Select study and site before assigning.', 'error');
+                    break;
+                }
+                const criteria = collectRegistryCriteriaFromDom();
+                state.registryCriteria = criteria;
+                const statusEl = document.getElementById('registry-job-status');
+                if (statusEl) statusEl.textContent = 'Starting bulk assign job...';
+                try {
+                    let job = await runCohortAssignServer({ criteria, studyId, siteId, assignmentType });
+                    job = await pollBulkJobUntilDone(job.id, (j) => {
+                        if (statusEl) statusEl.textContent = `Processing ${j.processed || 0}/${j.total || '?'} — ${j.succeeded || 0} assigned, ${j.skipped || 0} skipped`;
+                    });
+                    if (statusEl) statusEl.textContent = `Done: ${job.succeeded || 0} assigned, ${job.skipped || 0} skipped, ${job.failed || 0} failed.`;
+                    showNotification(`Bulk assign complete: ${job.succeeded || 0} participants assigned.`, 'success');
+                    await loadBulkJobs();
+                    await loadAllData();
+                    if (state.activeTab === 'registry') render();
+                } catch (err) {
+                    if (statusEl) statusEl.textContent = `Failed: ${err.message}`;
+                    showNotification(`Bulk assign failed: ${err.message}`, 'error');
+                }
+                break;
+            }
+            case 'registry-save-rule': {
+                const name = document.getElementById('registry-rule-name')?.value?.trim();
+                const studyId = document.getElementById('registry-assign-study')?.value;
+                const defaultSiteId = document.getElementById('registry-assign-site')?.value;
+                if (!name || !studyId || !defaultSiteId) {
+                    showNotification('Rule name, study, and site are required to save.', 'error');
+                    break;
+                }
+                const criteria = collectRegistryCriteriaFromDom();
+                try {
+                    const rule = await apiCall('cohort-rules', 'POST', {
+                        name,
+                        studyId,
+                        defaultSiteId,
+                        criteria,
+                        createdAt: new Date().toISOString(),
+                    });
+                    state.cohortRules = [rule, ...(state.cohortRules || [])];
+                    showNotification(`Saved rule: ${name}`, 'success');
+                    if (state.activeTab === 'registry') render();
+                } catch (err) {
+                    showNotification(`Save rule failed: ${err.message}`, 'error');
+                }
+                break;
+            }
+            case 'registry-load-rule': {
+                const rule = (state.cohortRules || []).find(r => r.id === actionButton.dataset.ruleId);
+                if (!rule) break;
+                state.registryCriteria = rule.criteria || { logic: 'AND', conditions: [] };
+                state.registryAssignStudyId = rule.studyId || '';
+                state.registryAssignSiteId = rule.defaultSiteId || '';
+                if (state.activeTab === 'registry') {
+                    mainContent.innerHTML = getRegistryHTML();
+                    renderRegistryResults();
+                }
+                break;
+            }
+            case 'patients-prev-page': {
+                const prev = Math.max(0, (state.patientsPageOffset || 0) - (state.patientsPageSize || 50));
+                await loadPatientsPage(prev);
+                renderPatientTable();
+                break;
+            }
+            case 'patients-next-page': {
+                const next = (state.patientsPageOffset || 0) + (state.patientsPageSize || 50);
+                if (next < (state.patientsServerTotal || 0)) {
+                    await loadPatientsPage(next);
+                    renderPatientTable();
+                }
+                break;
+            }
             case 'add-contact-log': openModal(getAddContactLogModalHTML(patientId)); break;
             case 'add-visit-log': openModal(getAddVisitLogModalHTML(patientId)); break;
             case 'open-check-in-modal': openModal(getCheckInModalHTML(patientId)); break;
@@ -6254,7 +6818,15 @@ document.addEventListener('change', async (e) => {
 document.addEventListener('input', (e) => {
     if (e.target.id === 'patient-search') {
         state.patientSearchTerm = e.target.value;
-        renderPatientTable();
+        if (state.patientsUseServerQuery) {
+            clearTimeout(state._patientSearchTimer);
+            state._patientSearchTimer = setTimeout(async () => {
+                await loadPatientsPage(0);
+                renderPatientTable();
+            }, 400);
+        } else {
+            renderPatientTable();
+        }
     }
     if (e.target.id === 'study-search') {
         state.studySearchTerm = e.target.value;
@@ -8046,16 +8618,28 @@ const exportSurveysToCSV = () => {
     }
 };
 /// --- AZURE COSMOS DB DATA INTERACTIONS ---
+const loadOperationalPatients = async () => {
+    try {
+        const result = await queryPatientsServer({ limit: 3000, offset: 0, includeTotal: true });
+        return { patients: result.items, total: result.total };
+    } catch (err) {
+        console.warn('Operational patient query unavailable, falling back to full fetch:', err.message);
+        const patients = await fetchData('patients');
+        return { patients, total: patients.length };
+    }
+};
+
 const loadAllData = async () => {
     try {
-        // Load all collections in parallel
-        const [studies, sites, patients, schedules, surveys] = await Promise.all([
+        const [studies, sites, schedules, surveys, patientLoad] = await Promise.all([
             fetchData('studies'),
             fetchData('sites'),
-            fetchData('patients'),
             fetchData('schedules'),
-            fetchData('surveys')
+            fetchData('surveys'),
+            loadOperationalPatients(),
         ]);
+        const patients = patientLoad.patients;
+        state.patientsServerTotal = patientLoad.total;
         
         // Sort data appropriately
         let accessRequests = [];

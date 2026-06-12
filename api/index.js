@@ -489,12 +489,392 @@ const validatePatientsSchema = (data) => {
     if (data.doNotContact !== undefined && typeof data.doNotContact !== 'boolean') {
         errors.push('doNotContact must be a boolean');
     }
+
+    if (data.enrollments !== undefined && !Array.isArray(data.enrollments)) {
+        errors.push('enrollments must be an array');
+    }
+    if (data.enrolledStudyIds !== undefined && !Array.isArray(data.enrolledStudyIds)) {
+        errors.push('enrolledStudyIds must be an array');
+    }
+    if (data.candidateStudyIds !== undefined && !Array.isArray(data.candidateStudyIds)) {
+        errors.push('candidateStudyIds must be an array');
+    }
+    if (data.currentStudyId !== undefined && data.currentStudyId !== null && typeof data.currentStudyId !== 'string') {
+        errors.push('currentStudyId must be a string or null');
+    }
+    if (data.currentSiteId !== undefined && data.currentSiteId !== null && typeof data.currentSiteId !== 'string') {
+        errors.push('currentSiteId must be a string or null');
+    }
     
     if (errors.length > 0) {
         throw new Error(`VALIDATION_ERROR: Patients validation failed: ${errors.join(', ')}`);
     }
     
     return true;
+};
+
+const PATIENT_QUERY_FIELDS = new Set([
+    'registryStatus', 'status', 'therapeuticArea', 'condition', 'source', 'state', 'city', 'zipCode',
+    'age', 'eligibilityStatus', 'pipelineStage', 'doNotContact', 'inclusionCriteriaMet', 'exclusionCriteriaMet',
+    'currentStudyId', 'currentSiteId', 'assignedToUserId', 'group', 'globalId',
+]);
+
+const computePatientDenormalized = (patient) => {
+    const enrollments = Array.isArray(patient.enrollments) ? patient.enrollments : [];
+    let current = enrollments.find((e) => e && e.status === 'current');
+    if (!current && patient.studyId && patient.siteId) {
+        current = { studyId: patient.studyId, siteId: patient.siteId, status: 'current' };
+    }
+    const enrolledStudyIds = [...new Set(
+        enrollments
+            .filter((e) => e && ['current', 'past'].includes(e.status) && e.studyId)
+            .map((e) => e.studyId)
+            .concat(patient.studyId ? [patient.studyId] : [])
+    )];
+    const candidateStudyIds = [...new Set(
+        enrollments.filter((e) => e && e.status === 'candidate' && e.studyId).map((e) => e.studyId)
+    )];
+    return {
+        currentStudyId: current?.studyId || patient.studyId || null,
+        currentSiteId: current?.siteId || patient.siteId || null,
+        enrolledStudyIds,
+        candidateStudyIds,
+    };
+};
+
+const enrichPatientDocument = (patient) => {
+    if (!patient || typeof patient !== 'object') return patient;
+    const denorm = computePatientDenormalized(patient);
+    return { ...patient, ...denorm };
+};
+
+const buildScopeClause = (scope, parameters, paramIndexRef) => {
+    if (!scope || scope.role === 'Internal') return { clause: '', parameters };
+    const clauses = [];
+    const allowedSites = Array.isArray(scope.allowedSiteIds) ? scope.allowedSiteIds.filter(Boolean) : [];
+    const allowedStudies = Array.isArray(scope.allowedStudyIds) ? scope.allowedStudyIds.filter(Boolean) : [];
+
+    if (allowedSites.length) {
+        const names = allowedSites.map((siteId, idx) => {
+            const key = `@scopeSite${paramIndexRef.i++}`;
+            parameters.push({ name: key, value: siteId });
+            return key;
+        });
+        clauses.push(`(NOT IS_DEFINED(c.currentSiteId) OR c.currentSiteId = null OR c.currentSiteId IN (${names.join(', ')}))`);
+    }
+    if (allowedStudies.length) {
+        const names = allowedStudies.map((studyId, idx) => {
+            const key = `@scopeStudy${paramIndexRef.i++}`;
+            parameters.push({ name: key, value: studyId });
+            return key;
+        });
+        clauses.push(`(NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId IN (${names.join(', ')}))`);
+    }
+    if (!clauses.length) return { clause: '', parameters };
+    return { clause: `(${clauses.join(' AND ')})`, parameters };
+};
+
+const buildCriteriaClause = (criteria, parameters, paramIndexRef) => {
+    const conditions = criteria && Array.isArray(criteria.conditions) ? criteria.conditions : [];
+    const logic = (criteria && criteria.logic === 'OR') ? 'OR' : 'AND';
+    const parts = [];
+
+    conditions.forEach((cond) => {
+        if (!cond || !cond.field || !cond.op) return;
+        const field = String(cond.field);
+        const op = String(cond.op);
+        const value = cond.value;
+
+        if (op === 'not_enrolled_in') {
+            const studyKey = `@p${paramIndexRef.i++}`;
+            parameters.push({ name: studyKey, value: String(value || '') });
+            parts.push(`((NOT IS_DEFINED(c.enrolledStudyIds) OR NOT ARRAY_CONTAINS(c.enrolledStudyIds, ${studyKey})) AND (NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId != ${studyKey}) AND (NOT IS_DEFINED(c.candidateStudyIds) OR NOT ARRAY_CONTAINS(c.candidateStudyIds, ${studyKey})))`);
+            return;
+        }
+        if (op === 'has_current_enrollment') {
+            parts.push('(IS_DEFINED(c.currentStudyId) AND c.currentStudyId != null AND c.currentStudyId != "")');
+            return;
+        }
+        if (op === 'no_current_enrollment') {
+            parts.push('(NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId = "")');
+            return;
+        }
+        if (!PATIENT_QUERY_FIELDS.has(field) && field !== 'search') return;
+
+        if (op === 'between' && Array.isArray(value) && value.length === 2) {
+            const minKey = `@p${paramIndexRef.i++}`;
+            const maxKey = `@p${paramIndexRef.i++}`;
+            parameters.push({ name: minKey, value: value[0] });
+            parameters.push({ name: maxKey, value: value[1] });
+            parts.push(`(IS_DEFINED(c.${field}) AND c.${field} >= ${minKey} AND c.${field} <= ${maxKey})`);
+            return;
+        }
+        if (op === 'in' && Array.isArray(value) && value.length) {
+            const keys = value.map((v) => {
+                const key = `@p${paramIndexRef.i++}`;
+                parameters.push({ name: key, value: v });
+                return key;
+            });
+            parts.push(`(IS_DEFINED(c.${field}) AND c.${field} IN (${keys.join(', ')}))`);
+            return;
+        }
+        if (op === 'contains') {
+            const key = `@p${paramIndexRef.i++}`;
+            parameters.push({ name: key, value: String(value || '').toLowerCase() });
+            parts.push(`(IS_DEFINED(c.${field}) AND CONTAINS(LOWER(c.${field}), ${key}))`);
+            return;
+        }
+        if (op === 'equals' || op === 'not_equals') {
+            const key = `@p${paramIndexRef.i++}`;
+            parameters.push({ name: key, value });
+            const comparator = op === 'equals' ? '=' : '!=';
+            if (value === null) {
+                parts.push(op === 'equals'
+                    ? `(NOT IS_DEFINED(c.${field}) OR c.${field} = null)`
+                    : `(IS_DEFINED(c.${field}) AND c.${field} != null)`);
+            } else {
+                parts.push(`(IS_DEFINED(c.${field}) AND c.${field} ${comparator} ${key})`);
+            }
+            return;
+        }
+        if (op === 'is_true') {
+            parts.push(`(c.${field} = true)`);
+            return;
+        }
+        if (op === 'is_false') {
+            parts.push(`(NOT IS_DEFINED(c.${field}) OR c.${field} = false)`);
+            return;
+        }
+    });
+
+    if (!parts.length) return { clause: '', parameters };
+    return { clause: `(${parts.join(` ${logic} `)})`, parameters };
+};
+
+const buildPatientSearchClause = (searchTerm, parameters, paramIndexRef) => {
+    const term = String(searchTerm || '').trim().toLowerCase();
+    if (!term) return { clause: '', parameters };
+    const key = `@p${paramIndexRef.i++}`;
+    parameters.push({ name: key, value: term });
+    return {
+        clause: `(CONTAINS(LOWER(c.firstName), ${key}) OR CONTAINS(LOWER(c.lastName), ${key}) OR CONTAINS(LOWER(c.email), ${key}) OR CONTAINS(LOWER(c.globalId), ${key}) OR CONTAINS(LOWER(c.phoneNumber), ${key}))`,
+        parameters,
+    };
+};
+
+const buildPatientQuery = (body = {}) => {
+    const parameters = [];
+    const paramIndexRef = { i: 0 };
+    const whereParts = ['1=1'];
+
+    const scopePart = buildScopeClause(body.scope, parameters, paramIndexRef);
+    if (scopePart.clause) whereParts.push(scopePart.clause);
+
+    const criteriaPart = buildCriteriaClause(body.criteria, parameters, paramIndexRef);
+    if (criteriaPart.clause) whereParts.push(criteriaPart.clause);
+
+    if (body.search) {
+        const searchPart = buildPatientSearchClause(body.search, parameters, paramIndexRef);
+        if (searchPart.clause) whereParts.push(searchPart.clause);
+    }
+
+    const limit = Math.min(Math.max(parseInt(body.limit, 10) || 50, 1), 500);
+    const query = `SELECT * FROM c WHERE ${whereParts.join(' AND ')} ORDER BY c._ts DESC OFFSET ${parseInt(body.offset, 10) || 0} LIMIT ${limit}`;
+    const countQuery = `SELECT VALUE COUNT(1) FROM c WHERE ${whereParts.join(' AND ')}`;
+    return { query, countQuery, parameters, limit };
+};
+
+const queryPatients = async (body = {}) => {
+    const container = getContainer('patients');
+    const { query, countQuery, parameters, limit } = buildPatientQuery(body);
+    const iterator = container.items.query({ query, parameters });
+    const { resources } = await iterator.fetchNext();
+    let total = null;
+    if (body.includeTotal !== false) {
+        const countIterator = container.items.query({ query: countQuery, parameters });
+        const countResult = await countIterator.fetchNext();
+        total = countResult.resources && countResult.resources[0] != null ? countResult.resources[0] : 0;
+    }
+    return {
+        items: (resources || []).map(enrichPatientDocument),
+        total,
+        limit,
+        offset: parseInt(body.offset, 10) || 0,
+    };
+};
+
+const shouldSkipCohortAssign = (patient, assignBody) => {
+    if (!patient) return 'not_found';
+    if (patient.doNotContact) return 'do_not_contact';
+    if (patient.registryStatus === 'Inactive') return 'inactive';
+    const studyId = assignBody.studyId;
+    const siteId = assignBody.siteId;
+    const enrollments = Array.isArray(patient.enrollments) ? patient.enrollments : [];
+    const denorm = computePatientDenormalized(patient);
+    if (denorm.enrolledStudyIds.includes(studyId)) return 'already_enrolled';
+    if (denorm.candidateStudyIds.includes(studyId)) return 'already_candidate';
+    const hasCurrent = enrollments.some((e) => e && e.status === 'current');
+    if (assignBody.assignmentType === 'current' && hasCurrent) {
+        const current = enrollments.find((e) => e.status === 'current');
+        if (current && current.studyId === studyId && current.siteId === siteId) return 'already_current';
+    }
+    return null;
+};
+
+const applyCohortAssignmentToPatient = (patient, assignBody, actor) => {
+    const studyId = assignBody.studyId;
+    const siteId = assignBody.siteId;
+    const assignmentType = assignBody.assignmentType === 'current' ? 'current' : 'candidate';
+    const enrollments = Array.isArray(patient.enrollments) ? [...patient.enrollments] : [];
+    const now = new Date().toISOString();
+    const actorLabel = actor?.upn || actor?.name || 'system';
+
+    if (assignmentType === 'current') {
+        enrollments.forEach((e) => {
+            if (e && e.status === 'current') {
+                e.status = 'past';
+                e.exitedDate = now;
+            }
+        });
+        enrollments.push({
+            studyId,
+            siteId,
+            status: 'current',
+            enrolledDate: now,
+            exitedDate: null,
+            assignmentSource: assignBody.ruleId || assignBody.cohortId || 'cohort_assign',
+        });
+    } else {
+        enrollments.push({
+            studyId,
+            siteId,
+            status: 'candidate',
+            assignedAt: now,
+            assignedBy: actorLabel,
+            assignmentSource: assignBody.ruleId || assignBody.cohortId || 'cohort_assign',
+        });
+    }
+
+    const auditEntry = {
+        id: generateId(),
+        at: now,
+        action: 'cohort_assign',
+        details: `${assignmentType} → ${studyId} @ ${siteId}`,
+        user: actorLabel,
+    };
+    const auditTrail = [...(Array.isArray(patient.auditTrail) ? patient.auditTrail : []), auditEntry];
+    const updates = enrichPatientDocument({
+        ...patient,
+        enrollments,
+        auditTrail,
+        studyId: assignmentType === 'current' ? studyId : patient.studyId,
+        siteId: assignmentType === 'current' ? siteId : patient.siteId,
+        lastUpdated: now,
+    });
+    if (assignBody.pipelineStage) updates.pipelineStage = assignBody.pipelineStage;
+    if (assignBody.assignedToUserId) updates.assignedToUserId = assignBody.assignedToUserId;
+    return updates;
+};
+
+const collectMatchingPatientIds = async (criteria, scope, maxIds = 50000) => {
+    const container = getContainer('patients');
+    const ids = [];
+    let offset = 0;
+    const pageSize = 500;
+    while (ids.length < maxIds) {
+        const { query, parameters } = buildPatientQuery({
+            criteria,
+            scope,
+            limit: pageSize,
+            offset,
+            includeTotal: false,
+        });
+        const idQuery = query.replace('SELECT * FROM c', 'SELECT c.id FROM c');
+        const { resources } = await container.items.query({ query: idQuery, parameters }).fetchAll();
+        if (!resources || !resources.length) break;
+        resources.forEach((row) => { if (row.id) ids.push(row.id); });
+        if (resources.length < pageSize) break;
+        offset += pageSize;
+    }
+    return ids;
+};
+
+const processBulkAssignBatch = async (job, context) => {
+    const patientsContainer = getContainer('patients');
+    const membershipsContainer = getContainer('cohort-memberships');
+    const jobsContainer = getContainer('bulk-jobs');
+    const batchSize = 50;
+    const assignBody = job.assign || {};
+    const criteria = job.criteria || { logic: 'AND', conditions: [] };
+    const scope = job.scope || null;
+    let processed = job.processed || 0;
+    let succeeded = job.succeeded || 0;
+    let skipped = job.skipped || 0;
+    let failed = job.failed || 0;
+    const errors = Array.isArray(job.errors) ? [...job.errors] : [];
+
+    if (!Array.isArray(job.patientIds)) {
+        job.patientIds = await collectMatchingPatientIds(criteria, scope);
+        job.total = job.patientIds.length;
+        await jobsContainer.items.upsert(job);
+    }
+
+    const slice = job.patientIds.slice(processed, processed + batchSize);
+    if (!slice.length) {
+        job.status = 'completed';
+        job.completedAt = new Date().toISOString();
+        await jobsContainer.items.upsert(job);
+        return job;
+    }
+
+    for (const patientId of slice) {
+        processed += 1;
+        job.processed = processed;
+        let patient = null;
+        try {
+            const readRes = await patientsContainer.item(patientId).read();
+            patient = readRes.resource;
+        } catch {
+            failed += 1;
+            if (errors.length < 200) errors.push({ patientId, reason: 'not_found' });
+            continue;
+        }
+        try {
+            const skipReason = shouldSkipCohortAssign(patient, assignBody);
+            if (skipReason) {
+                skipped += 1;
+                if (errors.length < 200) errors.push({ patientId: patient.id, reason: skipReason });
+                continue;
+            }
+            const updated = applyCohortAssignmentToPatient(patient, assignBody, job.actor || null);
+            await patientsContainer.items.upsert(updated);
+            const membership = {
+                id: generateId(),
+                patientId: patient.id,
+                studyId: assignBody.studyId,
+                siteId: assignBody.siteId,
+                status: assignBody.assignmentType === 'current' ? 'current' : 'candidate',
+                cohortId: job.cohortId || job.ruleId || job.id,
+                jobId: job.id,
+                assignedAt: new Date().toISOString(),
+            };
+            await membershipsContainer.items.create(membership);
+            succeeded += 1;
+        } catch (e) {
+            failed += 1;
+            if (errors.length < 200) errors.push({ patientId: patient.id, reason: e.message || 'error' });
+            context.log.warn('Bulk assign patient failed:', patient.id, e.message);
+        }
+    }
+
+    job.succeeded = succeeded;
+    job.skipped = skipped;
+    job.failed = failed;
+    job.errors = errors;
+    job.status = processed >= (job.patientIds || []).length ? 'completed' : 'running';
+    if (job.status === 'completed') job.completedAt = new Date().toISOString();
+    await jobsContainer.items.upsert(job);
+    return job;
 };
 
 const validateCrcsSchema = (data) => {
@@ -680,9 +1060,22 @@ const validateUsersSchema = (data) => {
     if (data.allowedSiteIds !== undefined && data.allowedSiteIds !== null && !Array.isArray(data.allowedSiteIds)) {
         errors.push('allowedSiteIds must be an array');
     }
+    if (data.allowedStudyIds !== undefined && data.allowedStudyIds !== null && !Array.isArray(data.allowedStudyIds)) {
+        errors.push('allowedStudyIds must be an array');
+    }
     if (errors.length > 0) {
         throw new Error(`VALIDATION_ERROR: Users validation failed: ${errors.join(', ')}`);
     }
+    return true;
+};
+
+const validateCohortRulesSchema = (data) => {
+    const errors = [];
+    if (!data.name || typeof data.name !== 'string') errors.push('name is required and must be a string');
+    if (!data.studyId || typeof data.studyId !== 'string') errors.push('studyId is required and must be a string');
+    if (!data.defaultSiteId || typeof data.defaultSiteId !== 'string') errors.push('defaultSiteId is required and must be a string');
+    if (data.criteria !== undefined && typeof data.criteria !== 'object') errors.push('criteria must be an object');
+    if (errors.length) throw new Error(`VALIDATION_ERROR: Cohort rule validation failed: ${errors.join(', ')}`);
     return true;
 };
 
@@ -797,7 +1190,10 @@ async function crudHandler(context, request, containerName) {
                     if (body.entraOid && !body.entraId) body.entraId = body.entraOid;
                 }
 
-                const newItem = { ...body, id: body.id || generateId() };
+                let newItem = { ...body, id: body.id || generateId() };
+                if (containerName === 'patients') {
+                    newItem = enrichPatientDocument(newItem);
+                }
                 const { resource: createdItem } = await container.items.create(newItem);
 
                 await writeAudit({
@@ -875,7 +1271,10 @@ async function crudHandler(context, request, containerName) {
                     if (requestBody.entraOid && !requestBody.entraId) requestBody.entraId = requestBody.entraOid;
                 }
                 
-                const updatedItem = { ...requestBody, id: updateId };
+                let updatedItem = { ...requestBody, id: updateId };
+                if (containerName === 'patients') {
+                    updatedItem = enrichPatientDocument(updatedItem);
+                }
                 const { resource: result } = await container.items.upsert(updatedItem);
 
                 await writeAudit({
@@ -1185,5 +1584,194 @@ app.http('accessRequests', {
             if (body) validateAccessRequestsSchema(body);
         }
         return crudHandler(context, request, 'access-requests');
+    },
+});
+
+app.http('patientsQuery', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patients/query',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            await requireUser(request);
+            const body = await safeJson(request) || {};
+            const result = await queryPatients(body);
+            return { jsonBody: result, headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Patient query failed');
+        }
+    },
+});
+
+app.http('cohortsPreview', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'cohorts/preview',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            await requireUser(request);
+            const body = await safeJson(request) || {};
+            const sampleLimit = Math.min(Math.max(parseInt(body.sampleLimit, 10) || 25, 1), 100);
+            const result = await queryPatients({
+                ...body,
+                limit: sampleLimit,
+                offset: 0,
+                includeTotal: true,
+            });
+            return {
+                jsonBody: {
+                    total: result.total,
+                    sample: result.items,
+                    limit: sampleLimit,
+                },
+                headers: jsonHeaders,
+            };
+        } catch (error) {
+            return handleError(context, error, 'Cohort preview failed');
+        }
+    },
+});
+
+app.http('cohortsAssign', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'cohorts/assign',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const user = await requireUser(request);
+            const actor = buildActor(user.claims);
+            const body = await safeJson(request) || {};
+            if (!body.studyId || !body.siteId) {
+                return { status: 400, jsonBody: { error: 'studyId and siteId are required' }, headers: jsonHeaders };
+            }
+            const jobsContainer = getContainer('bulk-jobs');
+            const job = {
+                id: body.jobId || generateId(),
+                type: 'cohort_assign',
+                status: 'running',
+                ruleId: body.ruleId || null,
+                cohortId: body.cohortId || null,
+                criteria: body.criteria || { logic: 'AND', conditions: [] },
+                scope: body.scope || null,
+                assign: {
+                    studyId: body.studyId,
+                    siteId: body.siteId,
+                    assignmentType: body.assignmentType === 'current' ? 'current' : 'candidate',
+                    pipelineStage: body.pipelineStage || null,
+                    assignedToUserId: body.assignedToUserId || null,
+                    ruleId: body.ruleId || null,
+                    cohortId: body.cohortId || null,
+                },
+                patientIds: null,
+                total: 0,
+                processed: 0,
+                succeeded: 0,
+                skipped: 0,
+                failed: 0,
+                errors: [],
+                actor,
+                startedAt: new Date().toISOString(),
+                completedAt: null,
+            };
+            await jobsContainer.items.create(job);
+            const updatedJob = await processBulkAssignBatch(job, context);
+            return { status: 201, jsonBody: updatedJob, headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Cohort assign failed');
+        }
+    },
+});
+
+app.http('bulkJobs', {
+    methods: ['GET', 'POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'bulk-jobs/{id?}',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            await requireUser(request);
+            const id = request.params.id;
+            const jobsContainer = getContainer('bulk-jobs');
+            if (request.method === 'GET') {
+                if (id) {
+                    const { resource } = await jobsContainer.item(id).read();
+                    if (!resource) return { status: 404, jsonBody: { error: 'Job not found' }, headers: jsonHeaders };
+                    return { jsonBody: resource, headers: jsonHeaders };
+                }
+                const { resources } = await jobsContainer.items.query({
+                    query: 'SELECT TOP 50 * FROM c ORDER BY c.startedAt DESC',
+                }).fetchAll();
+                return { jsonBody: resources || [], headers: jsonHeaders };
+            }
+            return { status: 405, jsonBody: { error: 'Method Not Allowed' }, headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Bulk jobs failed');
+        }
+    },
+});
+
+app.http('bulkJobsContinue', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'bulk-jobs/{id}/continue',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            await requireUser(request);
+            const id = request.params.id;
+            const jobsContainer = getContainer('bulk-jobs');
+            const { resource: job } = await jobsContainer.item(id).read();
+            if (!job) return { status: 404, jsonBody: { error: 'Job not found' }, headers: jsonHeaders };
+            if (job.status === 'completed') return { jsonBody: job, headers: jsonHeaders };
+            const updatedJob = await processBulkAssignBatch(job, context);
+            return { jsonBody: updatedJob, headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Bulk job continue failed');
+        }
+    },
+});
+
+app.http('cohortRules', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'cohort-rules/{id?}',
+    handler: async (request, context) => {
+        const method = request.method;
+        if (method === 'POST' || method === 'PUT') {
+            const body = method === 'PUT' ? await safeJson(request) : await request.json();
+            if (body) validateCohortRulesSchema(body);
+        }
+        return crudHandler(context, request, 'cohort-rules');
+    },
+});
+
+app.http('cohortMemberships', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'cohort-memberships',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            await requireUser(request);
+            const studyId = request.query.get('studyId');
+            const container = getContainer('cohort-memberships');
+            let resources = [];
+            if (studyId) {
+                const result = await container.items.query({
+                    query: 'SELECT TOP 500 * FROM c WHERE c.studyId = @studyId ORDER BY c.assignedAt DESC',
+                    parameters: [{ name: '@studyId', value: studyId }],
+                }).fetchAll();
+                resources = result.resources || [];
+            } else {
+                const result = await container.items.readAll().fetchAll();
+                resources = (result.resources || []).slice(0, 500);
+            }
+            return { jsonBody: resources, headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Cohort memberships failed');
+        }
     },
 });
