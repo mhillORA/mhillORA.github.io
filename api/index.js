@@ -334,145 +334,174 @@ const validateSitesSchema = (data) => {
     return true;
 };
 
+const normalizePatientInput = (data) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+    const normalized = { ...data };
+    const requiredStrings = ['firstName', 'lastName'];
+    const optionalStrings = [
+        'globalId', 'phoneNumber', 'email', 'dob', 'address', 'city', 'state', 'zipCode',
+        'condition', 'source', 'therapeuticArea', 'studyId', 'siteId', 'pipelineStage',
+        'eligibilityStatus', 'homeSiteId', 'claimedByUserId', 'primaryAppointmentDate',
+        'registryStatus', 'initials', 'screeningNumber', 'group', 'inClinicStatus',
+        'visitOutcome', 'nextVisitDate', 'sfReason', 'pcp', 'comments', 'assignedToUserId',
+    ];
+    requiredStrings.forEach((field) => {
+        if (normalized[field] == null) normalized[field] = '';
+        else normalized[field] = String(normalized[field]).trim();
+    });
+    optionalStrings.forEach((field) => {
+        if (normalized[field] == null) return;
+        normalized[field] = String(normalized[field]).trim();
+    });
+    return normalized;
+};
+
 const validatePatientsSchema = (data) => {
     const errors = [];
-    
-    if (!data.firstName || typeof data.firstName !== 'string') {
+    const patient = normalizePatientInput(data);
+
+    if (!patient.firstName) {
+        errors.push('firstName is required and must be a string');
+    } else if (typeof patient.firstName !== 'string') {
         errors.push('firstName is required and must be a string');
     }
-    
-    if (!data.lastName || typeof data.lastName !== 'string') {
+
+    if (!patient.lastName) {
+        errors.push('lastName is required and must be a string');
+    } else if (typeof patient.lastName !== 'string') {
         errors.push('lastName is required and must be a string');
     }
     
-    if (data.globalId && typeof data.globalId !== 'string') {
+    if (patient.globalId && typeof patient.globalId !== 'string') {
         errors.push('globalId must be a string');
     }
-    
-    if (data.phoneNumber && typeof data.phoneNumber !== 'string') {
+
+    if (patient.phoneNumber && typeof patient.phoneNumber !== 'string') {
         errors.push('phoneNumber must be a string');
     }
-    
-    if (data.email && typeof data.email !== 'string') {
+
+    if (patient.email && typeof patient.email !== 'string') {
         errors.push('email must be a string');
     }
-    
-    if (data.dob && typeof data.dob !== 'string') {
+
+    if (patient.dob && typeof patient.dob !== 'string') {
         errors.push('dob must be a string');
     }
-    
-    if (data.address && typeof data.address !== 'string') {
+
+    if (patient.address && typeof patient.address !== 'string') {
         errors.push('address must be a string');
     }
-    
-    if (data.city && typeof data.city !== 'string') {
+
+    if (patient.city && typeof patient.city !== 'string') {
         errors.push('city must be a string');
     }
-    
-    if (data.state && typeof data.state !== 'string') {
+
+    if (patient.state && typeof patient.state !== 'string') {
         errors.push('state must be a string');
     }
-    
-    if (data.zipCode && typeof data.zipCode !== 'string') {
+
+    if (patient.zipCode && typeof patient.zipCode !== 'string') {
         errors.push('zipCode must be a string');
     }
-    
-    if (data.age !== undefined && (typeof data.age !== 'number' || data.age < 0 || data.age > 150)) {
+
+    if (patient.age !== undefined && patient.age !== null && (typeof patient.age !== 'number' || patient.age < 0 || patient.age > 150)) {
         errors.push('age must be a number between 0 and 150');
     }
-    
-    if (data.condition && typeof data.condition !== 'string') {
+
+    if (patient.condition && typeof patient.condition !== 'string') {
         errors.push('condition must be a string');
     }
-    
-    if (data.status && !['Candidate', 'Pre-Screening', 'Enrolled', 'Screen Fail', 'Completed'].includes(data.status)) {
+
+    if (patient.status && !['Candidate', 'Pre-Screening', 'Enrolled', 'Screen Fail', 'Completed'].includes(patient.status)) {
         errors.push('status must be one of: Candidate, Pre-Screening, Enrolled, Screen Fail, Completed');
     }
-    
-    if (data.registryStatus && !['Active', 'Inactive'].includes(data.registryStatus)) {
-        errors.push('registryStatus must be one of: Active, Inactive');
+
+    if (patient.registryStatus && !['Active', 'Inactive', 'Do Not Call'].includes(patient.registryStatus)) {
+        errors.push('registryStatus must be one of: Active, Inactive, Do Not Call');
     }
-    
-    if (data.source && typeof data.source !== 'string') {
+
+    if (patient.source && typeof patient.source !== 'string') {
         errors.push('source must be a string');
     }
-    
-    if (data.therapeuticArea && typeof data.therapeuticArea !== 'string') {
+
+    if (patient.therapeuticArea && typeof patient.therapeuticArea !== 'string') {
         errors.push('therapeuticArea must be a string');
     }
-    
-    if (data.studyId && typeof data.studyId !== 'string') {
+
+    if (patient.studyId && typeof patient.studyId !== 'string') {
         errors.push('studyId must be a string');
     }
-    
-    if (data.siteId && typeof data.siteId !== 'string') {
+
+    if (patient.siteId && typeof patient.siteId !== 'string') {
         errors.push('siteId must be a string');
     }
-    
-    if (data.appointment && typeof data.appointment !== 'object') {
+
+    if (patient.appointment && typeof patient.appointment !== 'object') {
         errors.push('appointment must be an object');
     }
-    
-    if (data.surveyResults && !Array.isArray(data.surveyResults)) {
+
+    if (patient.surveyResults && !Array.isArray(patient.surveyResults)) {
         errors.push('surveyResults must be an array');
     }
-    
-    if (data.contactLogs && !Array.isArray(data.contactLogs)) {
+
+    if (patient.contactLogs && !Array.isArray(patient.contactLogs)) {
         errors.push('contactLogs must be an array');
     }
-    
-    if (data.studyHistory && !Array.isArray(data.studyHistory)) {
+
+    if (patient.studyHistory && !Array.isArray(patient.studyHistory)) {
         errors.push('studyHistory must be an array');
     }
 
-    if (data.inclusionCriteriaMet !== undefined && typeof data.inclusionCriteriaMet !== 'boolean') {
+    if (patient.inclusionCriteriaMet !== undefined && typeof patient.inclusionCriteriaMet !== 'boolean') {
         errors.push('inclusionCriteriaMet must be a boolean');
     }
-    
-    if (data.exclusionCriteriaMet !== undefined && typeof data.exclusionCriteriaMet !== 'boolean') {
+
+    if (patient.exclusionCriteriaMet !== undefined && typeof patient.exclusionCriteriaMet !== 'boolean') {
         errors.push('exclusionCriteriaMet must be a boolean');
     }
 
     ['appointments', 'tasks', 'consentRecords', 'communications', 'waitlist', 'auditTrail', 'visitLogs', 'completedVisits'].forEach((field) => {
-        if (data[field] !== undefined && !Array.isArray(data[field])) {
+        if (patient[field] !== undefined && !Array.isArray(patient[field])) {
             errors.push(`${field} must be an array`);
         }
     });
 
-    if (data.pipelineStage !== undefined && typeof data.pipelineStage !== 'string') {
+    if (patient.pipelineStage !== undefined && typeof patient.pipelineStage !== 'string') {
         errors.push('pipelineStage must be a string');
     }
-    if (data.eligibilityStatus !== undefined && typeof data.eligibilityStatus !== 'string') {
+    if (patient.eligibilityStatus !== undefined && typeof patient.eligibilityStatus !== 'string') {
         errors.push('eligibilityStatus must be a string');
     }
-    if (data.doNotContact !== undefined && typeof data.doNotContact !== 'boolean') {
+    if (patient.doNotContact !== undefined && typeof patient.doNotContact !== 'boolean') {
         errors.push('doNotContact must be a boolean');
     }
 
-    if (data.enrollments !== undefined && !Array.isArray(data.enrollments)) {
+    if (patient.enrollments !== undefined && !Array.isArray(patient.enrollments)) {
         errors.push('enrollments must be an array');
     }
-    if (data.enrolledStudyIds !== undefined && !Array.isArray(data.enrolledStudyIds)) {
+    if (patient.enrolledStudyIds !== undefined && !Array.isArray(patient.enrolledStudyIds)) {
         errors.push('enrolledStudyIds must be an array');
     }
-    if (data.candidateStudyIds !== undefined && !Array.isArray(data.candidateStudyIds)) {
+    if (patient.candidateStudyIds !== undefined && !Array.isArray(patient.candidateStudyIds)) {
         errors.push('candidateStudyIds must be an array');
     }
-    if (data.currentStudyId !== undefined && data.currentStudyId !== null && typeof data.currentStudyId !== 'string') {
+    if (patient.currentStudyId !== undefined && patient.currentStudyId !== null && typeof patient.currentStudyId !== 'string') {
         errors.push('currentStudyId must be a string or null');
     }
-    if (data.currentSiteId !== undefined && data.currentSiteId !== null && typeof data.currentSiteId !== 'string') {
+    if (patient.currentSiteId !== undefined && patient.currentSiteId !== null && typeof patient.currentSiteId !== 'string') {
         errors.push('currentSiteId must be a string or null');
     }
-    if (data.homeSiteId !== undefined && data.homeSiteId !== null && typeof data.homeSiteId !== 'string') {
+    if (patient.homeSiteId !== undefined && patient.homeSiteId !== null && typeof patient.homeSiteId !== 'string') {
         errors.push('homeSiteId must be a string or null');
     }
-    if (data.claimedByUserId !== undefined && data.claimedByUserId !== null && typeof data.claimedByUserId !== 'string') {
+    if (patient.claimedByUserId !== undefined && patient.claimedByUserId !== null && typeof patient.claimedByUserId !== 'string') {
         errors.push('claimedByUserId must be a string or null');
     }
-    if (data.primaryAppointmentDate !== undefined && data.primaryAppointmentDate !== null && typeof data.primaryAppointmentDate !== 'string') {
+    if (patient.primaryAppointmentDate !== undefined && patient.primaryAppointmentDate !== null && typeof patient.primaryAppointmentDate !== 'string') {
         errors.push('primaryAppointmentDate must be a string or null');
     }
+
+    Object.assign(data, patient);
     
     if (errors.length > 0) {
         throw new Error(`VALIDATION_ERROR: Patients validation failed: ${errors.join(', ')}`);
@@ -733,7 +762,7 @@ const buildPatientQuery = (body = {}) => {
         if (searchPart.clause) whereParts.push(searchPart.clause);
     }
 
-    const limit = Math.min(Math.max(parseInt(body.limit, 10) || 50, 1), 500);
+    const limit = Math.min(Math.max(parseInt(body.limit, 10) || 50, 1), 3000);
     const query = `SELECT * FROM c WHERE ${whereParts.join(' AND ')} ORDER BY c._ts DESC OFFSET ${parseInt(body.offset, 10) || 0} LIMIT ${limit}`;
     const countQuery = `SELECT VALUE COUNT(1) FROM c WHERE ${whereParts.join(' AND ')}`;
     return { query, countQuery, parameters, limit };
@@ -742,8 +771,7 @@ const buildPatientQuery = (body = {}) => {
 const queryPatients = async (body = {}) => {
     const container = getContainer('patients');
     const { query, countQuery, parameters, limit } = buildPatientQuery(body);
-    const iterator = container.items.query({ query, parameters });
-    const { resources } = await iterator.fetchNext();
+    const { resources } = await container.items.query({ query, parameters }).fetchAll();
     let total = null;
     if (body.includeTotal !== false) {
         const countIterator = container.items.query({ query: countQuery, parameters });
@@ -1253,13 +1281,23 @@ async function crudHandler(context, request, containerName) {
                         if (!patientAccessibleToScope(enriched, requestContext?.scope)) return scopeForbiddenResponse();
                         return { jsonBody: enriched };
                     }
-                    const result = await queryPatients({
-                        scope: requestContext?.scope || null,
-                        limit: Math.min(parseInt(request.query.get('limit'), 10) || 3000, 3000),
-                        offset: 0,
-                        includeTotal: false,
-                    });
-                    return { jsonBody: result.items };
+                    const scope = requestContext?.scope || null;
+                    const maxPatients = Math.min(parseInt(request.query.get('limit'), 10) || 10000, 10000);
+                    const pageSize = 500;
+                    const allItems = [];
+                    let offset = 0;
+                    while (allItems.length < maxPatients) {
+                        const batch = await queryPatients({
+                            scope,
+                            limit: pageSize,
+                            offset,
+                            includeTotal: false,
+                        });
+                        allItems.push(...(batch.items || []));
+                        if (!batch.items || batch.items.length < pageSize) break;
+                        offset += pageSize;
+                    }
+                    return { jsonBody: allItems };
                 }
                 if (id) {
                     const { resource } = await container.item(id).read(); 
@@ -1271,7 +1309,9 @@ async function crudHandler(context, request, containerName) {
                 }
             
             case 'POST':
-                const body = await request.json();
+                const body = containerName === 'patients'
+                    ? normalizePatientInput(await request.json())
+                    : await request.json();
                 
                 try {
                     switch (containerName) {
@@ -1341,8 +1381,8 @@ async function crudHandler(context, request, containerName) {
                 return { status: 201, jsonBody: createdItem };
             
             case 'PUT':
-                const requestBody = await request.json();
-                const updateId = id || requestBody.id;
+                const rawRequestBody = await request.json();
+                const updateId = id || rawRequestBody.id;
 
                 let before = null;
                 try {
@@ -1351,6 +1391,10 @@ async function crudHandler(context, request, containerName) {
                         before = readRes && readRes.resource ? readRes.resource : null;
                     }
                 } catch {}
+
+                const requestBody = containerName === 'patients'
+                    ? normalizePatientInput(before ? { ...before, ...rawRequestBody, id: updateId } : { ...rawRequestBody, id: updateId })
+                    : rawRequestBody;
 
                 if (containerName === 'patients') {
                     if (before && !patientAccessibleToScope(enrichPatientDocument(before), requestContext?.scope)) {

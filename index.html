@@ -489,7 +489,11 @@ const deleteDocument = async (collection, id) => {
 const getDocument = async (collection, id) => {
     try {
         const apiCollection = toApiCollectionName(collection);
-        return await apiCall(`${apiCollection}/${id}`);
+        const doc = await apiCall(`${apiCollection}/${id}`);
+        if (collection === 'patients') {
+            return normalizePatientRecord(convertPatientFromAzureFormat(doc));
+        }
+        return doc;
     } catch (error) {
         console.error(`Error getting ${collection}:`, error);
         throw error;
@@ -535,6 +539,7 @@ let state = {
     bulkJobs: [],
     activeBulkJobId: null,
     patientsServerTotal: null,
+    patientsPageItems: [],
     patientsUseServerQuery: true,
     patientsPageOffset: 0,
     patientsPageSize: 50,
@@ -967,8 +972,39 @@ const computePatientDenormalized = (patient) => {
     };
 };
 
+const PATIENT_FORM_STRING_FIELDS = new Set([
+    'firstName', 'lastName', 'initials', 'globalId', 'screeningNumber', 'group', 'phoneNumber', 'email',
+    'dob', 'address', 'city', 'state', 'zipCode', 'condition', 'source', 'therapeuticArea', 'registryStatus',
+    'inClinicStatus', 'visitOutcome', 'nextVisitDate', 'sfReason', 'pcp', 'comments', 'pipelineStage',
+    'eligibilityStatus', 'assignedToUserId', 'homeSiteId',
+]);
+
+const sanitizePatientForApi = (patient) => {
+    if (!patient || typeof patient !== 'object') return patient;
+    const sanitized = { ...patient };
+    PATIENT_FORM_STRING_FIELDS.forEach((field) => {
+        if (sanitized[field] == null) {
+            if (field === 'firstName' || field === 'lastName') sanitized[field] = '';
+            return;
+        }
+        sanitized[field] = String(sanitized[field]).trim();
+    });
+    return sanitized;
+};
+
+const applyPatientFormData = (target, data) => {
+    Object.keys(target).forEach((key) => {
+        if (data[key] === undefined || key === 'enrollments') return;
+        if (PATIENT_FORM_STRING_FIELDS.has(key)) {
+            target[key] = String(data[key] ?? '').trim();
+        } else {
+            target[key] = data[key] || null;
+        }
+    });
+};
+
 const convertPatientToAzureFormat = (patient) => {
-    const normalized = normalizePatientRecord(patient);
+    const normalized = normalizePatientRecord(sanitizePatientForApi(patient));
     const currentEnrollment = normalized.enrollments?.find(e => e.status === 'current');
     const pastEnrollments = normalized.enrollments?.filter(e => e.status === 'past') || [];
     const studyHistory = pastEnrollments.map(enrollment => ({
@@ -1239,6 +1275,7 @@ const getScopedPatients = () => filterPatientsForCurrentUser(state.patients || [
 
 const findPatientById = (id) =>
     state.patients.find(p => p.id === id)
+    || (state.patientsPageItems || []).find(p => p.id === id)
     || (state.registryResults || []).find(p => p.id === id);
 
 const getPatientAppointments = (patient) => {
@@ -1371,7 +1408,7 @@ const appendPatientAuditEntry = (patient, action, details = '') => ({
 });
 
 const updatePatientFields = async (patientId, fields, auditAction = null, auditDetails = '') => {
-    const patient = state.patients.find(p => p.id === patientId);
+    const patient = findPatientById(patientId);
     if (!patient) throw new Error('Patient not found');
     const updates = { ...fields, lastUpdated: new Date().toISOString() };
     if (auditAction) {
@@ -2684,19 +2721,24 @@ const loadPatientsPage = async (offset = 0) => {
             limit: state.patientsPageSize,
             includeTotal: true,
         });
-        state.patients = result.items;
+        state.patientsPageItems = result.items;
         state.patientsServerTotal = result.total;
         state.patientsPageOffset = offset;
         return result;
     } catch (err) {
         console.warn('Server patient query failed, using cached patients:', err.message);
         state.patientsUseServerQuery = false;
+        state.patientsPageItems = [];
         return null;
     }
 };
 
 const getPatientsHTML = () => {
-    const totalLabel = state.patientsServerTotal != null ? ` (${state.patientsServerTotal.toLocaleString()} total)` : '';
+    const totalLabel = state.patientsServerTotal != null
+        ? ` (${state.patientsServerTotal.toLocaleString()} in database)`
+        : state.patients.length
+            ? ` (${state.patients.length.toLocaleString()} loaded)`
+            : '';
     return `
         <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Patients${totalLabel}</h2>
         <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -2730,7 +2772,9 @@ const renderPatientTable = () => {
         return phone.replace(/\D/g, '');
     };
     
-    let filteredPatients = filterPatientsForCurrentUser(state.patients);
+    let filteredPatients = state.patientsUseServerQuery
+        ? (state.patientsPageItems || [])
+        : filterPatientsForCurrentUser(state.patients);
     if (!state.patientsUseServerQuery && searchTerm) {
         filteredPatients = filteredPatients.filter(p => {
             const nameMatch = `${p.firstName} ${p.lastName}`.toLowerCase().includes(searchTerm);
@@ -4015,7 +4059,8 @@ const getQuickAddPatientHTML = () => {
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 ${mappedFields.map(key => {
                     const label = key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
-                    return `<div><label class="block text-sm font-medium dark:text-gray-300">${label}</label><input type="${key === 'dob' ? 'date' : 'text'}" name="${key}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input"></div>`;
+                    const required = key === 'firstName' || key === 'lastName' ? 'required' : '';
+                    return `<div><label class="block text-sm font-medium dark:text-gray-300">${label}${required ? ' <span class="text-red-500">*</span>' : ''}</label><input type="${key === 'dob' ? 'date' : 'text'}" name="${key}" ${required} class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input"></div>`;
                 }).join('')}
                 <!-- Manually added and special fields -->
                 <div><label class="block text-sm font-medium dark:text-gray-300">Global ID</label><input type="text" name="globalId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="Optional (auto-generated if blank)"></div>
@@ -6118,7 +6163,7 @@ document.addEventListener('click', async (e) => {
                 }, 100);
                 break;
             }
-            case 'edit-patient': openModal(getEditPatientModalHTML(state.patients.find(p => p.id === id)), true); break;
+            case 'edit-patient': openModal(getEditPatientModalHTML(findPatientById(id)), true); break;
             case 'edit-study': openModal(getEditStudyModalHTML(state.studies.find(s => s.id === id)), true); break;
             case 'edit-site': openModal(getEditSiteModalHTML(state.sites.find(s => s.id === id))); break;
             case 'schedule-patient': 
@@ -6251,7 +6296,7 @@ document.addEventListener('click', async (e) => {
                         limit: state.patientsPageSize,
                         offset: 0,
                     });
-                    state.patients = result.items;
+                    state.patientsPageItems = result.items;
                     state.patientsServerTotal = result.total;
                     state.patientsPageOffset = 0;
                     renderPatientTable();
@@ -7447,11 +7492,10 @@ document.addEventListener('submit', async (e) => {
                             continue;
                         }
                         const finalPatient = patientTemplate();
-                        Object.keys(finalPatient).forEach(key => {
-                            if (patientData[key] !== undefined) {
-                                finalPatient[key] = patientData[key];
-                            }
-                        });
+                        applyPatientFormData(finalPatient, patientData);
+                        if (!finalPatient.firstName || !finalPatient.lastName) {
+                            continue;
+                        }
                         finalPatient.globalId = generateShortId();
                         finalPatient.age = calculateAge(finalPatient.dob);
                         if (patientData.studyId && patientData.siteId) {
@@ -7581,7 +7625,7 @@ document.addEventListener('submit', async (e) => {
                 submitBtn.innerHTML = '<span class="flex items-center justify-center"><svg class="animate-spin h-5 w-5 mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Saving...</span>';
                 
                 const patientId = form.dataset.id;
-                const patient = state.patients.find(p => p.id === patientId);
+                const patient = findPatientById(patientId);
                 
                 if (!patient) {
                     throw new Error("Patient not found");
@@ -7591,11 +7635,7 @@ document.addEventListener('submit', async (e) => {
                 const hasAppointment = patient.appointment && patient.appointment.time;
                 
                 const updatedPatient = { ...patient }; // Start with existing data
-                Object.keys(patientTemplate()).forEach(key => {
-                    if (data[key] !== undefined && key !== 'enrollments') {
-                        updatedPatient[key] = data[key] || null;
-                    }
-                });
+                applyPatientFormData(updatedPatient, data);
                 updatedPatient.age = data.age ? parseInt(data.age) : null;
                 updatedPatient.inclusionCriteriaMet = form.querySelector('input[name="inclusionCriteriaMet"]')?.checked === true;
                 updatedPatient.exclusionCriteriaMet = form.querySelector('input[name="exclusionCriteriaMet"]')?.checked === true;
@@ -7920,11 +7960,11 @@ document.addEventListener('submit', async (e) => {
                 return;
             }
             const newPatient = patientTemplate();
-            Object.keys(newPatient).forEach(key => {
-                if (data[key] !== undefined) {
-                    newPatient[key] = data[key] || null;
-                }
-            });
+            applyPatientFormData(newPatient, data);
+            if (!newPatient.firstName || !newPatient.lastName) {
+                showNotification('First name and last name are required.', 'error');
+                return;
+            }
             newPatient.inclusionCriteriaMet = form.querySelector('input[name="inclusionCriteriaMet"]')?.checked === true;
             newPatient.exclusionCriteriaMet = form.querySelector('input[name="exclusionCriteriaMet"]')?.checked === true;
             if (!newPatient.globalId) newPatient.globalId = generateShortId();
@@ -8731,9 +8771,26 @@ const exportSurveysToCSV = () => {
 };
 /// --- AZURE COSMOS DB DATA INTERACTIONS ---
 const loadOperationalPatients = async () => {
+    const pageSize = 500;
+    const maxPatients = 10000;
     try {
-        const result = await queryPatientsServer({ limit: 3000, offset: 0, includeTotal: true });
-        return { patients: result.items, total: result.total };
+        let offset = 0;
+        let all = [];
+        let total = null;
+        while (all.length < maxPatients) {
+            const result = await queryPatientsServer({
+                limit: pageSize,
+                offset,
+                includeTotal: offset === 0,
+            });
+            if (offset === 0) total = result.total;
+            const batch = result.items || [];
+            all = all.concat(batch);
+            if (!batch.length || batch.length < pageSize) break;
+            if (total != null && all.length >= total) break;
+            offset += pageSize;
+        }
+        return { patients: all, total: total ?? all.length };
     } catch (err) {
         console.warn('Operational patient query unavailable, falling back to full fetch:', err.message);
         const patients = await fetchData('patients');
