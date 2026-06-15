@@ -12,6 +12,8 @@ const requireUser = async () => ({ claims: null });
 
 const corsJsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
 
+const PATIENT_SUBROUTES = new Set(['query', 'today', 'actions', 'reindex']);
+
 const isCosmosNotFound = (error) => {
     if (!error) return false;
     const code = error.code ?? error.statusCode;
@@ -389,8 +391,16 @@ const validateSitesSchema = (data) => {
     return true;
 };
 
+const isPatientQueryBody = (body) => {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+    if (body.action !== undefined || body.patientId !== undefined) return false;
+    if (body.firstName !== undefined || body.lastName !== undefined) return false;
+    return body.criteria !== undefined || body.search !== undefined || body.includeTotal !== undefined;
+};
+
 const normalizePatientInput = (data) => {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+    if (isPatientQueryBody(data)) return data;
     const normalized = { ...data };
     const requiredStrings = ['firstName', 'lastName'];
     const optionalStrings = [
@@ -412,6 +422,7 @@ const normalizePatientInput = (data) => {
 };
 
 const validatePatientsSchema = (data) => {
+    if (isPatientQueryBody(data)) return true;
     const errors = [];
     const patient = normalizePatientInput(data);
 
@@ -1362,10 +1373,15 @@ async function crudHandler(context, request, containerName) {
                 const resources = await safeReadAll(container);
                 return { jsonBody: resources, headers: corsJsonHeaders };
             
-            case 'POST':
+            case 'POST': {
+                const bodyRaw = await request.json();
+                if (containerName === 'patients' && (isPatientQueryBody(bodyRaw) || id === 'query')) {
+                    const result = await queryPatients({ ...bodyRaw, scope: requestContext?.scope || null });
+                    return { jsonBody: result, headers: corsJsonHeaders };
+                }
                 const body = containerName === 'patients'
-                    ? normalizePatientInput(await request.json())
-                    : await request.json();
+                    ? normalizePatientInput(bodyRaw)
+                    : bodyRaw;
                 
                 try {
                     switch (containerName) {
@@ -1444,8 +1460,9 @@ async function crudHandler(context, request, containerName) {
                 }
                 
                 return { status: 201, jsonBody: createdItem, headers: corsJsonHeaders };
+            }
             
-            case 'PUT':
+            case 'PUT': {
                 const rawRequestBody = await request.json();
                 const updateId = id || rawRequestBody.id;
 
@@ -1541,6 +1558,7 @@ async function crudHandler(context, request, containerName) {
                 }
                 
                 return { jsonBody: result, headers: corsJsonHeaders };
+            }
 
             case 'DELETE':
                 let beforeDelete = null;
@@ -1595,7 +1613,6 @@ app.http('sites', {
 });
 
 // Sub-routes under /patients/* must not be handled as patient IDs by patients/{id?}.
-const PATIENT_SUBROUTES = new Set(['query', 'today', 'actions', 'reindex']);
 
 const runPatientsQuery = async (request, context) => {
     const requestContext = await resolveRequestContext(request);
@@ -1885,6 +1902,63 @@ app.http('patientsReindex', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'patients/reindex',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            return await runPatientsReindex(request, context);
+        } catch (error) {
+            return handleError(context, error, 'Patient reindex failed');
+        }
+    },
+});
+
+// Aliases avoid Azure SWA routing POST /patients/query into patients/{id?} CRUD create.
+app.http('patientQuery', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patient-query',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            return await runPatientsQuery(request, context);
+        } catch (error) {
+            return handleError(context, error, 'Patient query failed');
+        }
+    },
+});
+
+app.http('patientToday', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patient-today',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            return await runPatientsToday(request, context);
+        } catch (error) {
+            return handleError(context, error, 'Patients today query failed');
+        }
+    },
+});
+
+app.http('patientActions', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patient-actions',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            return await runPatientsActions(request, context);
+        } catch (error) {
+            return handleError(context, error, 'Patient action failed');
+        }
+    },
+});
+
+app.http('patientReindex', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'patient-reindex',
     handler: async (request, context) => {
         try {
             if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
