@@ -1075,8 +1075,19 @@ const convertPatientFromAzureFormat = (azurePatient) => {
         }
     }
     const { studyId, siteId, studyHistory, currentStudyId, currentSiteId, enrolledStudyIds, candidateStudyIds, ...rest } = azurePatient;
+    let firstName = rest.firstName || '';
+    let lastName = rest.lastName || '';
+    if ((!firstName || !lastName) && rest.name && typeof rest.name === 'string') {
+        const parts = rest.name.trim().split(/\s+/).filter(Boolean);
+        if (!firstName && parts.length) firstName = parts[0];
+        if (!lastName && parts.length > 1) lastName = parts.slice(1).join(' ');
+    }
+    if (rest.first_name && !firstName) firstName = String(rest.first_name).trim();
+    if (rest.last_name && !lastName) lastName = String(rest.last_name).trim();
     return normalizePatientRecord({
         ...rest,
+        firstName,
+        lastName,
         enrollments,
         inclusionCriteriaMet: azurePatient.inclusionCriteriaMet === true,
         exclusionCriteriaMet: azurePatient.exclusionCriteriaMet === true
@@ -1213,8 +1224,15 @@ const patientVisibleToCurrentUser = (patient) => {
     return false;
 };
 
-const patientActionServer = async (action, patientId, extra = {}) =>
-    apiCall('patient-actions', 'POST', { action, patientId, ...extra });
+const patientActionServer = async (action, patientId, extra = {}) => {
+    const body = { action, patientId, ...extra };
+    try {
+        return await apiCall('patient-actions', 'POST', body);
+    } catch (err) {
+        if (err.status === 404) throw err;
+        return apiCall('patients/actions', 'POST', body);
+    }
+};
 
 const loadCrcTodayPatients = async () => {
     try {
@@ -1241,9 +1259,38 @@ const queryPatientsServer = async (options = {}) => {
         offset: options.offset || 0,
         includeTotal: options.includeTotal !== false,
     };
-    const result = await apiCall('patient-query', 'POST', body);
-    const items = (result.items || []).map(p => normalizePatientRecord(convertPatientFromAzureFormat(p)));
-    return { ...result, items };
+    const mapItems = (result) => ({
+        ...result,
+        items: (result.items || []).map(p => normalizePatientRecord(convertPatientFromAzureFormat(p))),
+    });
+    const endpoints = ['patient-query', 'patients/query'];
+    let lastError = null;
+    for (const endpoint of endpoints) {
+        try {
+            return mapItems(await apiCall(endpoint, 'POST', body));
+        } catch (err) {
+            lastError = err;
+            if (err.status !== 404 && err.status !== 400) throw err;
+        }
+    }
+    return queryPatientsLocally(body, lastError);
+};
+
+const queryPatientsLocally = async (body, priorError = null) => {
+    let patients = state.patients?.length ? state.patients : await fetchData('patients');
+    patients = filterPatientsForCurrentUser(patients);
+    const search = String(body.search || '').trim().toLowerCase();
+    if (search) {
+        patients = patients.filter((p) => {
+            const hay = `${p.firstName || ''} ${p.lastName || ''} ${p.email || ''} ${p.globalId || ''} ${p.phoneNumber || ''}`.toLowerCase();
+            return hay.includes(search);
+        });
+    }
+    const offset = parseInt(body.offset, 10) || 0;
+    const limit = parseInt(body.limit, 10) || 50;
+    const items = patients.slice(offset, offset + limit);
+    if (!items.length && priorError) console.warn('Patient query API unavailable, using local cache:', priorError.message);
+    return { items, total: patients.length, limit, offset };
 };
 
 const previewCohortServer = async (criteria) =>
@@ -1289,6 +1336,21 @@ const findPatientById = (id) =>
     state.patients.find(p => p.id === id)
     || (state.patientsPageItems || []).find(p => p.id === id)
     || (state.registryResults || []).find(p => p.id === id);
+
+const resolvePatientById = async (id) => {
+    const cached = findPatientById(id);
+    if (cached) return cached;
+    try {
+        const doc = await getDocument('patients', id);
+        if (!doc) return null;
+        const normalized = normalizePatientRecord(doc);
+        const inPatients = state.patients.some(p => p.id === normalized.id);
+        if (!inPatients) state.patients = [...state.patients, normalized];
+        return normalized;
+    } catch {
+        return null;
+    }
+};
 
 const getPatientAppointments = (patient) => {
     if (!patient) return [];
@@ -1420,7 +1482,7 @@ const appendPatientAuditEntry = (patient, action, details = '') => ({
 });
 
 const updatePatientFields = async (patientId, fields, auditAction = null, auditDetails = '') => {
-    const patient = findPatientById(patientId);
+    const patient = await resolvePatientById(patientId);
     if (!patient) throw new Error('Patient not found');
     const updates = { ...fields, lastUpdated: new Date().toISOString() };
     if (auditAction) {
@@ -2739,9 +2801,17 @@ const loadPatientsPage = async (offset = 0) => {
         return result;
     } catch (err) {
         console.warn('Server patient query failed, using cached patients:', err.message);
+        const local = await queryPatientsLocally({
+            search: state.patientSearchTerm || '',
+            offset,
+            limit: state.patientsPageSize,
+            includeTotal: true,
+        }, err);
+        state.patientsPageItems = local.items;
+        state.patientsServerTotal = local.total;
+        state.patientsPageOffset = offset;
         state.patientsUseServerQuery = false;
-        state.patientsPageItems = [];
-        return null;
+        return local;
     }
 };
 
@@ -6129,8 +6199,9 @@ document.addEventListener('click', async (e) => {
             case 'next-day': state.calendarDate.setDate(state.calendarDate.getDate() + 1); render(); break;
             case 'view-patient': {
                 closeModal();
-                const viewPatient = findPatientById(id);
+                const viewPatient = await resolvePatientById(id);
                 if (viewPatient) openSidePanel(getPatientProfileHTML(viewPatient), true);
+                else showNotification('Patient not found.', 'error');
                 break;
             }
             case 'view-study-patients': {
@@ -6175,7 +6246,12 @@ document.addEventListener('click', async (e) => {
                 }, 100);
                 break;
             }
-            case 'edit-patient': openModal(getEditPatientModalHTML(findPatientById(id)), true); break;
+            case 'edit-patient': {
+                const editPatient = await resolvePatientById(id);
+                if (editPatient) openModal(getEditPatientModalHTML(editPatient), true);
+                else showNotification('Patient not found.', 'error');
+                break;
+            }
             case 'edit-study': openModal(getEditStudyModalHTML(state.studies.find(s => s.id === id)), true); break;
             case 'edit-site': openModal(getEditSiteModalHTML(state.sites.find(s => s.id === id))); break;
             case 'schedule-patient': 
@@ -7637,7 +7713,7 @@ document.addEventListener('submit', async (e) => {
                 submitBtn.innerHTML = '<span class="flex items-center justify-center"><svg class="animate-spin h-5 w-5 mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Saving...</span>';
                 
                 const patientId = form.dataset.id;
-                const patient = findPatientById(patientId);
+                const patient = await resolvePatientById(patientId);
                 
                 if (!patient) {
                     throw new Error("Patient not found");

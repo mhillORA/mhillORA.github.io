@@ -52,6 +52,17 @@ const safeItemRead = async (container, id) => {
     }
 };
 
+const findPatientRecord = async (container, id) => {
+    if (!id) return null;
+    const direct = await safeItemRead(container, id);
+    if (direct) return direct;
+    const matches = await safeQueryAll(container, {
+        query: 'SELECT * FROM c WHERE c.id = @id OR c.globalId = @id',
+        parameters: [{ name: '@id', value: String(id) }],
+    });
+    return matches[0] || null;
+};
+
 const wrapCosmosWrite = async (operation, containerName) => {
     try {
         return await operation();
@@ -608,14 +619,22 @@ const computePatientDenormalized = (patient) => {
 
 const enrichPatientDocument = (patient) => {
     if (!patient || typeof patient !== 'object') return patient;
-    const denorm = computePatientDenormalized(patient);
-    let primaryAppointmentDate = patient.primaryAppointmentDate || null;
-    const apptTime = patient.appointment?.time
-        || (Array.isArray(patient.appointments) && patient.appointments.find(a => a?.time)?.time);
+    const coerced = { ...patient };
+    if ((!coerced.firstName || !coerced.lastName) && coerced.name && typeof coerced.name === 'string') {
+        const parts = coerced.name.trim().split(/\s+/).filter(Boolean);
+        if (!coerced.firstName && parts.length) coerced.firstName = parts[0];
+        if (!coerced.lastName && parts.length > 1) coerced.lastName = parts.slice(1).join(' ');
+    }
+    if (coerced.first_name && !coerced.firstName) coerced.firstName = String(coerced.first_name).trim();
+    if (coerced.last_name && !coerced.lastName) coerced.lastName = String(coerced.last_name).trim();
+    const denorm = computePatientDenormalized(coerced);
+    let primaryAppointmentDate = coerced.primaryAppointmentDate || null;
+    const apptTime = coerced.appointment?.time
+        || (Array.isArray(coerced.appointments) && coerced.appointments.find(a => a?.time)?.time);
     if (apptTime) {
         try { primaryAppointmentDate = new Date(apptTime).toISOString().split('T')[0]; } catch { /* ignore */ }
     }
-    return { ...patient, ...denorm, primaryAppointmentDate };
+    return { ...coerced, ...denorm, primaryAppointmentDate };
 };
 
 const scopeFromUserRecord = (user) => ({
@@ -1341,11 +1360,11 @@ async function crudHandler(context, request, containerName) {
             case 'GET':
                 if (containerName === 'patients') {
                     if (id) {
-                        const { resource } = await container.item(id).read();
-                        if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` } };
+                        const resource = await findPatientRecord(container, id);
+                        if (!resource) return { status: 404, jsonBody: { error: 'Patient not found' }, headers: corsJsonHeaders };
                         const enriched = enrichPatientDocument(resource);
                         if (!patientAccessibleToScope(enriched, requestContext?.scope)) return scopeForbiddenResponse();
-                        return { jsonBody: enriched };
+                        return { jsonBody: enriched, headers: corsJsonHeaders };
                     }
                     const scope = requestContext?.scope || null;
                     const maxPatients = Math.min(parseInt(request.query.get('limit'), 10) || 10000, 10000);
@@ -1466,7 +1485,13 @@ async function crudHandler(context, request, containerName) {
                 const rawRequestBody = await request.json();
                 const updateId = id || rawRequestBody.id;
 
-                const before = updateId ? await safeItemRead(container, updateId) : null;
+                const before = updateId ? await (containerName === 'patients'
+                    ? findPatientRecord(container, updateId)
+                    : safeItemRead(container, updateId)) : null;
+
+                if (containerName === 'patients' && updateId && !before) {
+                    return { status: 404, jsonBody: { error: 'Patient not found' }, headers: corsJsonHeaders };
+                }
 
                 let requestBody = rawRequestBody;
                 if (containerName === 'patients') {
@@ -1645,7 +1670,7 @@ const runPatientsActions = async (request, context) => {
         return { status: 400, jsonBody: { error: 'action and patientId are required' }, headers: jsonHeaders };
     }
     const container = getContainer('patients');
-    const patient = await safeItemRead(container, patientId);
+    const patient = await findPatientRecord(container, patientId);
     if (!patient) return { status: 404, jsonBody: { error: 'Patient not found' }, headers: jsonHeaders };
     if (!patientAccessibleToScope(enrichPatientDocument(patient), requestContext.scope)) {
         return scopeForbiddenResponse();
