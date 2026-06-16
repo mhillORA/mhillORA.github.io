@@ -233,6 +233,13 @@ const validateSitesSchema = (data) => {
     if (data.country && typeof data.country !== 'string') {
         errors.push('country must be a string');
     }
+
+    const mailingFields = ['mailingAddress1', 'mailingAddress2', 'mailingCity', 'mailingState', 'mailingZipCode', 'mailingCountry'];
+    mailingFields.forEach((field) => {
+        if (data[field] !== undefined && data[field] !== null && typeof data[field] !== 'string') {
+            errors.push(`${field} must be a string`);
+        }
+    });
     
     // PI fields are optional (legacy string fields)
     if (data.pi !== undefined && data.pi !== null && typeof data.pi !== 'string') {
