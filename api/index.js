@@ -5037,20 +5037,106 @@ const isTravelDayLinkedToShift = (travelDay, shiftEvent) => {
 const cleanupTravelDaysForRemovedCrcs = async (eventsContainer, log, shiftEvent, removedCrcIds) => {
     const removed = [...new Set((removedCrcIds || []).map(normalizeAssignmentCrcId).filter(Boolean))];
     if (!shiftEvent || removed.length === 0) return;
-    const shiftDate = shiftEvent.date;
-    if (!shiftDate) return;
+
+    const groupId = shiftEvent.groupId || null;
+    const shiftId = shiftEvent.id || null;
+    const candidates = new Map();
+    const addCandidates = (list) => {
+        (list || []).forEach((td) => {
+            if (td?.id && td.type === 'Travel Day') candidates.set(td.id, td);
+        });
+    };
+
+    const adjacentDateSet = (dateStr) => {
+        const out = new Set();
+        if (!dateStr) return out;
+        const d = new Date(`${dateStr}T00:00:00`);
+        if (Number.isNaN(d.getTime())) return out;
+        const prev = new Date(d);
+        prev.setDate(prev.getDate() - 1);
+        const next = new Date(d);
+        next.setDate(next.getDate() + 1);
+        out.add(prev.toISOString().split('T')[0]);
+        out.add(next.toISOString().split('T')[0]);
+        return out;
+    };
+
+    const crcStillOnShiftGroup = async (crcId) => {
+        if (!groupId || !crcId) return false;
+        try {
+            const { resources } = await eventsContainer.items.query({
+                query: "SELECT * FROM c WHERE c.groupId = @gid AND c.type = 'Site Assignment'",
+                parameters: [{ name: '@gid', value: groupId }],
+            }).fetchAll();
+            for (const ev of (resources || [])) {
+                if (collectCrcIdsFromEvent(ev).has(crcId)) return true;
+            }
+        } catch (e) {
+            log.warn(`crcStillOnShiftGroup failed: ${e.message}`);
+        }
+        return false;
+    };
+
     try {
-        const { resources: travelDays } = await eventsContainer.items.query({
-            query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
-            parameters: [{ name: '@date', value: shiftDate }]
-        }).fetchAll();
-        for (const travelDay of (travelDays || [])) {
-            if (!travelDay?.id || travelDay.type !== 'Travel Day') continue;
-            if (!isTravelDayLinkedToShift(travelDay, shiftEvent)) continue;
+        if (groupId) {
+            const { resources } = await eventsContainer.items.query({
+                query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.parentShiftGroupId = @gid",
+                parameters: [{ name: '@gid', value: groupId }],
+            }).fetchAll();
+            addCandidates(resources);
+        }
+        if (shiftId) {
+            const { resources } = await eventsContainer.items.query({
+                query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND (c.parentShiftId = @sid OR c.linkedShiftId = @sid)",
+                parameters: [{ name: '@sid', value: shiftId }],
+            }).fetchAll();
+            addCandidates(resources);
+        }
+
+        const adjacentDates = adjacentDateSet(shiftEvent.date);
+        if (groupId) {
+            const { resources: siblings } = await eventsContainer.items.query({
+                query: "SELECT c.date FROM c WHERE c.groupId = @gid AND c.type = 'Site Assignment'",
+                parameters: [{ name: '@gid', value: groupId }],
+            }).fetchAll();
+            (siblings || []).forEach((s) => {
+                adjacentDateSet(s.date).forEach((d) => adjacentDates.add(d));
+            });
+        }
+
+        for (const adjDate of adjacentDates) {
+            const { resources } = await eventsContainer.items.query({
+                query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
+                parameters: [{ name: '@date', value: adjDate }],
+            }).fetchAll();
+            (resources || []).forEach((td) => {
+                const onTravel = getTravelDayCrcIds(td);
+                if (!removed.some((id) => onTravel.includes(id))) return;
+                if (isTravelDayLinkedToShift(td, shiftEvent)) addCandidates([td]);
+                else if (!td.parentShiftGroupId && !td.parentShiftId && !td.linkedShiftId) addCandidates([td]);
+            });
+        }
+
+        const narrowDates = adjacentDateSet(shiftEvent.date);
+        narrowDates.add(shiftEvent.date);
+
+        for (const travelDay of candidates.values()) {
             const onTravel = getTravelDayCrcIds(travelDay);
-            const removedOnThis = removed.filter(id => onTravel.includes(id));
-            if (removedOnThis.length === 0) continue;
-            const remaining = onTravel.filter(id => !removed.includes(id));
+            const removedOnThis = removed.filter((id) => onTravel.includes(id));
+            if (!removedOnThis.length) continue;
+
+            let skip = false;
+            for (const crcId of removedOnThis) {
+                if (groupId && travelDay.parentShiftGroupId === groupId && await crcStillOnShiftGroup(crcId)) {
+                    if (!narrowDates.has(travelDay.date)) {
+                        skip = true;
+                        break;
+                    }
+                }
+            }
+            if (skip) continue;
+
+            const remaining = onTravel.filter((id) => !removed.includes(id));
             try {
                 if (remaining.length === 0) {
                     await eventsContainer.item(travelDay.id, travelDay.id).delete();
@@ -5060,7 +5146,7 @@ const cleanupTravelDaysForRemovedCrcs = async (eventsContainer, log, shiftEvent,
                         ...travelDay,
                         id: travelDay.id,
                         crcIds: remaining,
-                        crcId: remaining[0]
+                        crcId: remaining[0],
                     });
                     log.info(`Updated travel day ${travelDay.id}; removed CRC(s): ${removedOnThis.join(', ')}`);
                 }
@@ -5069,7 +5155,7 @@ const cleanupTravelDaysForRemovedCrcs = async (eventsContainer, log, shiftEvent,
             }
         }
     } catch (e) {
-        log.warn(`cleanupTravelDaysForRemovedCrcs failed for date ${shiftDate}: ${e.message}`);
+        log.warn(`cleanupTravelDaysForRemovedCrcs failed: ${e.message}`);
     }
 };
 

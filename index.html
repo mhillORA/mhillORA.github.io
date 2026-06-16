@@ -5573,7 +5573,14 @@
                 return assignments.some(entry => normalizeCrcId(entry) === crcId);
             };
 
-            const isCrcSchedulable = (crc) => !!(crc && crc.id && crc.active !== false && crc.archived !== true);
+            const isCrcSchedulable = (crc) => {
+                if (!crc || !crc.id) return false;
+                if (crc.archived === true) return false;
+                if (crc.active === false) return false;
+                const status = String(crc.status || '').trim().toLowerCase();
+                if (status === 'inactive' || status === 'archived') return false;
+                return true;
+            };
             const getSchedulableCrcs = (list) => (list || state.crcs || []).filter(isCrcSchedulable);
             /** Active staff only; keep inactive/archived visible when already assigned on this slot (read-only). */
             const includeCrcInShiftRolePicker = (crc, assignedCrcId) => {
@@ -5928,7 +5935,35 @@
 
             const findTravelDaysForCrcOnShift = (shiftEvent, crcId) => {
                 if (!shiftEvent || !crcId) return [];
-                return findTravelDaysLinkedToShift(shiftEvent).filter(td => travelDayIncludesCrc(td, crcId));
+                const target = normalizeCrcId(crcId);
+                const linked = findTravelDaysLinkedToShift(shiftEvent);
+                let matches = linked.filter(td => travelDayIncludesCrc(td, target));
+                if (matches.length) return matches;
+                const groupId = shiftEvent.groupId || null;
+                const adjacentDates = new Set();
+                const addAdjacent = (dateStr) => {
+                    const d = parseDateOnly(dateStr);
+                    if (!d) return;
+                    const prev = new Date(d);
+                    prev.setDate(prev.getDate() - 1);
+                    const next = new Date(d);
+                    next.setDate(next.getDate() + 1);
+                    adjacentDates.add(toDateOnlyString(prev));
+                    adjacentDates.add(toDateOnlyString(next));
+                };
+                addAdjacent(shiftEvent.date);
+                if (groupId) {
+                    (state.crc_events || []).forEach((e) => {
+                        if (e?.groupId === groupId && e.type === 'Site Assignment') addAdjacent(e.date);
+                    });
+                }
+                matches = (state.crc_events || []).filter((e) => {
+                    if (!e || e.type !== 'Travel Day' || !travelDayIncludesCrc(e, target)) return false;
+                    if (isTravelDayLinkedToShift(e, shiftEvent)) return true;
+                    if (!e.parentShiftGroupId && !e.parentShiftId && !e.linkedShiftId && adjacentDates.has(e.date)) return true;
+                    return false;
+                });
+                return matches;
             };
 
             const deleteTravelDaysLinkedToShift = async (shiftEvent) => {
@@ -6112,6 +6147,53 @@
                     if (isTrainingRoleName(name) && trainingInfo[i]) return `Training, ${trainingInfo[i]}`;
                     return name;
                 });
+            };
+
+            const buildCrcToRolesForShiftGroup = (group, primaryEvent) => {
+                const crcToRoles = new Map();
+                const siteStaffRoles = [];
+                const event = primaryEvent || group?.primaryEvent;
+                const addRoleForCrc = (roleId, crcId) => {
+                    const role = state.roles.find(r => r.id === roleId);
+                    let roleDisplayName = role ? role.name : roleId;
+                    if (role && isTrainingRoleName(role.name)) {
+                        if (event?.trainingAssignments && event.trainingAssignments[roleId]) {
+                            const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
+                            roleDisplayName = trainingTypes.length > 0 ? `Training, ${trainingTypes.join(', ')}` : 'Training';
+                        } else {
+                            roleDisplayName = 'Training';
+                        }
+                    }
+                    if (crcId === 'SITE_STAFF') {
+                        if (!siteStaffRoles.includes(roleDisplayName)) siteStaffRoles.push(roleDisplayName);
+                        return;
+                    }
+                    if (!crcId || crcId === 'UNASSIGNED') return;
+                    if (!crcToRoles.has(crcId)) crcToRoles.set(crcId, []);
+                    if (!crcToRoles.get(crcId).includes(roleDisplayName)) crcToRoles.get(crcId).push(roleDisplayName);
+                };
+                if (group?.allRoles && group.allRoles.size > 0) {
+                    group.allRoles.forEach((crcSet, roleId) => {
+                        crcSet.forEach(crcId => addRoleForCrc(roleId, crcId));
+                    });
+                } else if (event?.roleAssignments && typeof event.roleAssignments === 'object') {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        if (Array.isArray(assignments)) assignments.forEach(crcId => addRoleForCrc(roleId, crcId));
+                    });
+                }
+                const crcIds = group?.allCrcIds
+                    ? Array.from(group.allCrcIds)
+                    : (event && typeof getEventCRCs === 'function' ? getEventCRCs(event).map(c => c.id) : []);
+                crcIds.forEach((crcId) => {
+                    if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') return;
+                    if (!crcToRoles.has(crcId)) crcToRoles.set(crcId, []);
+                    if (crcToRoles.get(crcId).length === 0 && event) {
+                        getRolesForCrcOnEvent(crcId, event).forEach((r) => {
+                            if (!crcToRoles.get(crcId).includes(r)) crcToRoles.get(crcId).push(r);
+                        });
+                    }
+                });
+                return { crcToRoles, siteStaffRoles };
             };
 
             // Site Assignment rows in a multi-day *group* share groupId but each row has its own `date`.
@@ -12855,9 +12937,30 @@
                 const studyNames = studies.map(s => s.title || s.name).join(', ') || 'No study';
 
                 const staffCrcs = typeof getEventCRCs === 'function' ? getEventCRCs(event) : [];
+                const sameDayEvents = (typeof getSameCalendarDayGroupSiteAssignments === 'function'
+                    ? getSameCalendarDayGroupSiteAssignments(event, state.crc_events || [])
+                    : [event]);
+                const roleGroup = { allRoles: new Map(), allCrcIds: new Set(), primaryEvent: event };
+                (sameDayEvents.length ? sameDayEvents : [event]).forEach((ev) => {
+                    if (ev?.roleAssignments && typeof ev.roleAssignments === 'object') {
+                        Object.entries(ev.roleAssignments).forEach(([roleId, assignments]) => {
+                            if (!roleGroup.allRoles.has(roleId)) roleGroup.allRoles.set(roleId, new Set());
+                            if (Array.isArray(assignments)) {
+                                assignments.forEach((crcId) => {
+                                    if (crcId && crcId !== 'UNASSIGNED') {
+                                        if (crcId !== 'SITE_STAFF') roleGroup.allCrcIds.add(crcId);
+                                        roleGroup.allRoles.get(roleId).add(crcId);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    if (ev?.crcId && ev.crcId !== 'SITE_STAFF' && ev.crcId !== 'UNASSIGNED') roleGroup.allCrcIds.add(ev.crcId);
+                });
+                const { crcToRoles } = buildCrcToRolesForShiftGroup(roleGroup, event);
                 const uniqueCrcs = staffCrcs.map(crc => ({
                     crc,
-                    roles: typeof getRolesForCrcOnEvent === 'function' ? getRolesForCrcOnEvent(crc.id, event) : []
+                    roles: crcToRoles.get(crc.id) || (typeof getRolesForCrcOnEvent === 'function' ? getRolesForCrcOnEvent(crc.id, event) : [])
                 }));
                 
                 
@@ -17992,56 +18095,7 @@
                                         ${travelDisplayContent} ${event.isOverridden ? overrideIcon : roleIcon}
                                     </div>`;
                                 } else if (group.allRoles.size > 0 || allCrcs.length > 0) {
-                                    // Group by CRC - each CRC gets their own block with ALL their roles combined
-                                    // First, build a map of CRC -> roles (using roleAssignments from the primary event)
-                                    const crcToRoles = new Map();
-                                    const siteStaffRoles = [];
-                                    
-                                    // Get roles from the event's roleAssignments
-                                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
-                                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                                            const role = state.roles.find(r => r.id === roleId);
-                                            let roleDisplayName = role ? role.name : roleId;
-                                            
-                                            // Handle training roles - get the training type from trainingAssignments
-                                            if (role && isTrainingRoleName(role.name)) {
-                                                if (event.trainingAssignments && event.trainingAssignments[roleId]) {
-                                                    const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
-                                                    if (trainingTypes.length > 0) {
-                                                        roleDisplayName = `Training, ${trainingTypes.join(', ')}`;
-                                                    } else {
-                                                        roleDisplayName = 'Training';
-                                                    }
-                                                } else {
-                                                    roleDisplayName = 'Training';
-                                                }
-                                            }
-                                            
-                                            if (Array.isArray(assignments)) {
-                                                assignments.forEach(crcId => {
-                                                    if (crcId === 'SITE_STAFF') {
-                                                        if (!siteStaffRoles.includes(roleDisplayName)) {
-                                                            siteStaffRoles.push(roleDisplayName);
-                                                        }
-                                                    } else if (crcId) {
-                                                        if (!crcToRoles.has(crcId)) {
-                                                            crcToRoles.set(crcId, []);
-                                                        }
-                                                        if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
-                                                            crcToRoles.get(crcId).push(roleDisplayName);
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        });
-                                    }
-                                    
-                                    // Also add CRCs from legacy crcId that might not have roles
-                                    allCrcs.forEach(crc => {
-                                        if (!crcToRoles.has(crc.id)) {
-                                            crcToRoles.set(crc.id, []);
-                                        }
-                                    });
+                                    const { crcToRoles, siteStaffRoles } = buildCrcToRolesForShiftGroup(group, event);
                                     
                                     // Build individual blocks for each CRC (each with their combined roles)
                                     // All blocks click to open the FULL shift (same event.id)
@@ -18475,50 +18529,7 @@
                                 // Build all blocks - one per CRC, showing all their roles
                                 let blocksHtml = '';
                                 if (allCrcs.length > 0) {
-                                    // Build a map of CRC -> roles with proper training type display
-                                    const crcToRoles = new Map();
-                                    
-                                    // Get roles from the event's roleAssignments
-                                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
-                                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                                            const role = state.roles.find(r => r.id === roleId);
-                                            let roleDisplayName = role ? role.name : roleId;
-                                            
-                                            // Handle training roles - get the training type from trainingAssignments
-                                            if (role && isTrainingRoleName(role.name)) {
-                                                if (event.trainingAssignments && event.trainingAssignments[roleId]) {
-                                                    const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
-                                                    if (trainingTypes.length > 0) {
-                                                        roleDisplayName = `Training, ${trainingTypes.join(', ')}`;
-                                                    } else {
-                                                        roleDisplayName = 'Training';
-                                                    }
-                                                } else {
-                                                    roleDisplayName = 'Training';
-                                                }
-                                            }
-                                            
-                                            if (Array.isArray(assignments)) {
-                                                assignments.forEach(crcId => {
-                                                    if (crcId && crcId !== 'SITE_STAFF') {
-                                                        if (!crcToRoles.has(crcId)) {
-                                                            crcToRoles.set(crcId, []);
-                                                        }
-                                                        if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
-                                                            crcToRoles.get(crcId).push(roleDisplayName);
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        });
-                                    }
-                                    
-                                    // Also add CRCs from legacy crcId that might not have roles
-                                    allCrcs.forEach(crc => {
-                                        if (!crcToRoles.has(crc.id)) {
-                                            crcToRoles.set(crc.id, []);
-                                        }
-                                    });
+                                    const { crcToRoles } = buildCrcToRolesForShiftGroup(group, event);
                                     
                                     let blockIndex = 0;
                                     const totalBlocks = crcToRoles.size;
@@ -19211,56 +19222,7 @@
                                         <strong>${displayText}</strong> ${event.isOverridden ? overrideIcon : roleIcon}
                                     </div>`;
                                 } else if (group.allRoles.size > 0 || allCrcs.length > 0) {
-                                    // Group by CRC - each CRC gets their own block with ALL their roles combined
-                                    // First, build a map of CRC -> roles (using roleAssignments from the primary event)
-                                    const crcToRoles = new Map();
-                                    const siteStaffRoles = [];
-                                    
-                                    // Get roles from the event's roleAssignments
-                                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
-                                        Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
-                                            const role = state.roles.find(r => r.id === roleId);
-                                            let roleDisplayName = role ? role.name : roleId;
-                                            
-                                            // Handle training roles
-                                            if (role && isTrainingRoleName(role.name)) {
-                                                if (event.trainingAssignments && event.trainingAssignments[roleId]) {
-                                                    const trainingTypes = [...new Set(event.trainingAssignments[roleId].filter(Boolean))];
-                                                    if (trainingTypes.length > 0) {
-                                                        roleDisplayName = `Training, ${trainingTypes.join(', ')}`;
-                                                    } else {
-                                                        roleDisplayName = 'Training';
-                                                    }
-                                                } else {
-                                                    roleDisplayName = 'Training';
-                                                }
-                                            }
-                                            
-                                            if (Array.isArray(assignments)) {
-                                                assignments.forEach(crcId => {
-                                                    if (crcId === 'SITE_STAFF') {
-                                                        if (!siteStaffRoles.includes(roleDisplayName)) {
-                                                            siteStaffRoles.push(roleDisplayName);
-                                                        }
-                                                    } else if (crcId) {
-                                                        if (!crcToRoles.has(crcId)) {
-                                                            crcToRoles.set(crcId, []);
-                                                        }
-                                                        if (!crcToRoles.get(crcId).includes(roleDisplayName)) {
-                                                            crcToRoles.get(crcId).push(roleDisplayName);
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        });
-                                    }
-                                    
-                                    // Also add CRCs from legacy crcId that might not have roles
-                                    allCrcs.forEach(crc => {
-                                        if (!crcToRoles.has(crc.id)) {
-                                            crcToRoles.set(crc.id, []);
-                                        }
-                                    });
+                                    const { crcToRoles, siteStaffRoles } = buildCrcToRolesForShiftGroup(group, event);
                                     
                                     // Build individual blocks for each CRC; click opens single-day modal for this cell's date
                                     let blocksHtml = '';
