@@ -594,6 +594,27 @@ const PATIENT_QUERY_FIELDS = new Set([
     'claimedByUserId', 'primaryAppointmentDate',
 ]);
 
+const patientHasRecruitmentStatus = (patient) => String(patient?.status || '').trim().length > 0;
+
+const inferPipelineStageFromPatient = (patient) => {
+    if (!patientHasRecruitmentStatus(patient)) return 'lead';
+    if (patient.status === 'Screen Fail') return 'screen_fail';
+    if (patient.status === 'Enrolled') return 'enrolled';
+    if (Array.isArray(patient.consentRecords) && patient.consentRecords.some((c) => c && c.status === 'signed')) return 'consented';
+    const apptTime = patient.appointment?.time
+        || (Array.isArray(patient.appointments) && patient.appointments.find((a) => a?.time)?.time);
+    if (apptTime) {
+        const appt = patient.appointment?.time === apptTime ? patient.appointment
+            : (patient.appointments || []).find((a) => a?.time === apptTime);
+        if (appt?.checkInStatus === 'checked-in') return 'showed';
+        if (new Date(apptTime) > new Date()) return 'scheduled';
+    }
+    if ((Array.isArray(patient.surveyResults) && patient.surveyResults.length) || patient.status === 'Pre-Screening') return 'pre_screened';
+    if (Array.isArray(patient.contactLogs) && patient.contactLogs.length) return 'contacted';
+    if (patient.registryStatus === 'Inactive') return 'inactive';
+    return 'lead';
+};
+
 const computePatientDenormalized = (patient) => {
     const enrollments = Array.isArray(patient.enrollments) ? patient.enrollments : [];
     let current = enrollments.find((e) => e && e.status === 'current');
@@ -634,6 +655,11 @@ const enrichPatientDocument = (patient) => {
     if (apptTime) {
         try { primaryAppointmentDate = new Date(apptTime).toISOString().split('T')[0]; } catch { /* ignore */ }
     }
+    if (!patientHasRecruitmentStatus(coerced)) {
+        coerced.pipelineStage = 'lead';
+    } else if (!coerced.pipelineStage) {
+        coerced.pipelineStage = inferPipelineStageFromPatient(coerced);
+    }
     return { ...coerced, ...denorm, primaryAppointmentDate };
 };
 
@@ -646,6 +672,15 @@ const scopeFromUserRecord = (user) => ({
 
 const patientAccessibleToScope = (patient, scope) => {
     if (!scope || scope.role === 'Internal') return true;
+
+    if (!patientHasRecruitmentStatus(patient)) {
+        const homeSiteId = patient.homeSiteId;
+        const allowedSites = scope.allowedSiteIds || [];
+        if (homeSiteId && allowedSites.length && !allowedSites.includes(homeSiteId)) return false;
+        if (scope.userId && (patient.claimedByUserId === scope.userId || patient.assignedToUserId === scope.userId)) return true;
+        return true;
+    }
+
     const denorm = computePatientDenormalized(patient);
     const siteId = denorm.currentSiteId;
     const studyId = denorm.currentStudyId;

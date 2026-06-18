@@ -1204,10 +1204,21 @@ const getUserScopeForApi = () => {
     };
 };
 
+const patientHasRecruitmentStatus = (patient) => String(patient?.status || '').trim().length > 0;
+
 const patientVisibleToCurrentUser = (patient) => {
     const allowedSites = getUserAllowedSiteIds();
     const allowedStudies = getUserAllowedStudyIds();
     if (allowedSites === null && allowedStudies === null) return true;
+
+    if (!patientHasRecruitmentStatus(patient)) {
+        const homeSiteId = patient.homeSiteId;
+        const userId = state.currentUser?.id;
+        if (homeSiteId && allowedSites !== null && !allowedSites.includes(homeSiteId)) return false;
+        if (userId && (patient.claimedByUserId === userId || patient.assignedToUserId === userId)) return true;
+        return true;
+    }
+
     const denorm = computePatientDenormalized(patient);
     const siteId = denorm.currentSiteId;
     const studyId = denorm.currentStudyId;
@@ -1382,7 +1393,11 @@ const normalizePatientRecord = (patient) => {
     if (!Array.isArray(normalized.auditTrail)) normalized.auditTrail = [];
     if (!Array.isArray(normalized.visitLogs)) normalized.visitLogs = [];
     if (!Array.isArray(normalized.completedVisits)) normalized.completedVisits = [];
-    if (!normalized.pipelineStage) normalized.pipelineStage = inferPipelineStage(normalized);
+    if (!patientHasRecruitmentStatus(normalized)) {
+        normalized.pipelineStage = 'lead';
+    } else if (!normalized.pipelineStage) {
+        normalized.pipelineStage = inferPipelineStage(normalized);
+    }
     if (!normalized.eligibilityStatus) normalized.eligibilityStatus = 'unknown';
     const appts = getPatientAppointments(normalized);
     normalized.appointments = appts;
@@ -1391,6 +1406,7 @@ const normalizePatientRecord = (patient) => {
 };
 
 const inferPipelineStage = (patient) => {
+    if (!patientHasRecruitmentStatus(patient)) return 'lead';
     if (patient.status === 'Screen Fail') return 'screen_fail';
     if (patient.status === 'Enrolled') return 'enrolled';
     if (patient.consentRecords?.some(c => c.status === 'signed')) return 'consented';
@@ -1401,6 +1417,13 @@ const inferPipelineStage = (patient) => {
     if (patient.contactLogs?.length) return 'contacted';
     if (patient.registryStatus === 'Inactive') return 'inactive';
     return 'lead';
+};
+
+const getEffectivePipelineStage = (patient) => {
+    if (!patient) return 'lead';
+    if (!patientHasRecruitmentStatus(patient)) return 'lead';
+    const stage = patient.pipelineStage || inferPipelineStage(patient);
+    return PIPELINE_STAGES.some(s => s.id === stage) ? stage : 'lead';
 };
 
 const getPipelineStageMeta = (stageId) =>
@@ -1533,7 +1556,7 @@ const computeRecruitmentFunnel = (patients, filters = {}) => {
     const stageIds = PIPELINE_STAGES.map(s => s.id);
     const counts = Object.fromEntries(stageIds.map(id => [id, 0]));
     list.forEach(p => {
-        const stage = p.pipelineStage || inferPipelineStage(p);
+        const stage = getEffectivePipelineStage(p);
         if (counts[stage] !== undefined) counts[stage]++;
     });
     const leads = list.length;
@@ -3038,7 +3061,7 @@ const renderPipelineBoard = () => {
         patients = patients.filter(p => p.assignedToUserId === assigneeFilter);
     }
     board.innerHTML = PIPELINE_STAGES.map(stage => {
-        const inStage = patients.filter(p => (p.pipelineStage || inferPipelineStage(p)) === stage.id);
+        const inStage = patients.filter(p => getEffectivePipelineStage(p) === stage.id);
         return `
             <div class="rounded-lg border dark:border-gray-700 ${stage.color} p-3 min-h-[200px]">
                 <div class="flex justify-between items-center mb-3">
@@ -3049,9 +3072,9 @@ const renderPipelineBoard = () => {
                     ${inStage.length ? inStage.map(p => `
                         <div class="bg-white dark:bg-gray-800 rounded-md p-2 shadow-sm border dark:border-gray-700">
                             <button data-action="view-patient" data-id="${p.id}" class="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline text-left">${phiName(p)}</button>
-                            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">${p.eligibilityStatus || 'unknown'} · ${p.status || 'Candidate'}</div>
+                            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">${p.eligibilityStatus || 'unknown'} · ${p.status || 'Lead'}</div>
                             <select data-action="set-pipeline-stage" data-patient-id="${p.id}" class="mt-2 w-full text-xs p-1 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                ${PIPELINE_STAGES.map(s => `<option value="${s.id}" ${(p.pipelineStage || inferPipelineStage(p)) === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}
+                                ${PIPELINE_STAGES.map(s => `<option value="${s.id}" ${getEffectivePipelineStage(p) === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}
                             </select>
                         </div>
                     `).join('') : '<p class="text-xs text-gray-500 dark:text-gray-400">No patients</p>'}
@@ -3828,7 +3851,7 @@ const getPatientProfileHTML = (patient) => {
     } else {
         visitDetailsHTML += '<p class="text-center text-gray-500 dark:text-gray-400 py-8">No visit logs have been recorded.</p>';
     }
-    const stageMeta = getPipelineStageMeta(patient.pipelineStage || inferPipelineStage(patient));
+    const stageMeta = getPipelineStageMeta(getEffectivePipelineStage(patient));
     const assignee = (state.managedUsers || []).find(u => u.id === patient.assignedToUserId);
     const appointmentsTabHTML = `
         <div class="space-y-3">
@@ -4265,7 +4288,7 @@ const getEditPatientModalHTML = (patient) => {
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.studies.map(s => `<option ${currentEnrollment?.studyId === s.id ? 'selected' : ''} value="${s.id}">${s.title}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Site</label><select name="siteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option ${currentEnrollment?.siteId === s.id ? 'selected' : ''} value="${s.id}">${s.name}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Home Site (lead pool)</label><select name="homeSiteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option value="${s.id}" ${patient.homeSiteId === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}</select></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Pipeline Stage</label><select name="pipelineStage" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${PIPELINE_STAGES.map(s => `<option value="${s.id}" ${(patient.pipelineStage || inferPipelineStage(patient)) === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Pipeline Stage</label><select name="pipelineStage" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${PIPELINE_STAGES.map(s => `<option value="${s.id}" ${getEffectivePipelineStage(patient) === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Eligibility Status</label><select name="eligibilityStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${['unknown','eligible','ineligible','pi_review'].map(s => `<option value="${s}" ${(patient.eligibilityStatus || 'unknown') === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assigned To</label><select name="assignedToUserId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Unassigned</option>${(state.managedUsers || []).map(u => `<option value="${u.id}" ${patient.assignedToUserId === u.id ? 'selected' : ''}>${u.username || u.email}</option>`).join('')}</select></div>
                 <div class="md:col-span-2">
