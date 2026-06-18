@@ -1223,6 +1223,8 @@ const patientVisibleToCurrentUser = (patient) => {
     const siteId = denorm.currentSiteId;
     const studyId = denorm.currentStudyId;
 
+    if (allowedStudies !== null && denorm.candidateStudyIds?.some((id) => allowedStudies.includes(id))) return true;
+
     if (siteId || studyId) {
         if (allowedSites !== null && siteId && !allowedSites.includes(siteId)) return false;
         if (allowedStudies !== null && studyId && !allowedStudies.includes(studyId)) return false;
@@ -1233,6 +1235,7 @@ const patientVisibleToCurrentUser = (patient) => {
     const userId = state.currentUser?.id;
     if (allowedSites !== null && homeSiteId && allowedSites.includes(homeSiteId)) return true;
     if (userId && (patient.claimedByUserId === userId || patient.assignedToUserId === userId)) return true;
+    if (!siteId && !studyId && !homeSiteId) return true;
     return false;
 };
 
@@ -1395,8 +1398,12 @@ const normalizePatientRecord = (patient) => {
     if (!Array.isArray(normalized.completedVisits)) normalized.completedVisits = [];
     if (!patientHasRecruitmentStatus(normalized)) {
         normalized.pipelineStage = 'lead';
+        if (!normalized.status) normalized.status = '';
     } else if (!normalized.pipelineStage) {
         normalized.pipelineStage = inferPipelineStage(normalized);
+    } else {
+        const canonical = normalizePipelineStageId(normalized.pipelineStage);
+        normalized.pipelineStage = canonical || inferPipelineStage(normalized);
     }
     if (!normalized.eligibilityStatus) normalized.eligibilityStatus = 'unknown';
     const appts = getPatientAppointments(normalized);
@@ -1419,11 +1426,34 @@ const inferPipelineStage = (patient) => {
     return 'lead';
 };
 
+const normalizePipelineStageId = (stage) => {
+    if (stage == null || stage === '') return null;
+    const raw = String(stage).trim().toLowerCase().replace(/-/g, '_').replace(/\s+/g, '_');
+    const aliases = {
+        lead: 'lead',
+        contacted: 'contacted',
+        prescreened: 'pre_screened',
+        pre_screen: 'pre_screened',
+        scheduled: 'scheduled',
+        showed: 'showed',
+        consented: 'consented',
+        enrolled: 'enrolled',
+        screenfail: 'screen_fail',
+        screen_failed: 'screen_fail',
+        inactive: 'inactive',
+        candidate: 'lead',
+    };
+    const id = aliases[raw] || raw;
+    return PIPELINE_STAGES.some(s => s.id === id) ? id : null;
+};
+
 const getEffectivePipelineStage = (patient) => {
     if (!patient) return 'lead';
     if (!patientHasRecruitmentStatus(patient)) return 'lead';
-    const stage = patient.pipelineStage || inferPipelineStage(patient);
-    return PIPELINE_STAGES.some(s => s.id === stage) ? stage : 'lead';
+    const normalized = normalizePipelineStageId(patient.pipelineStage);
+    if (normalized) return normalized;
+    const inferred = normalizePipelineStageId(inferPipelineStage(patient));
+    return inferred || 'lead';
 };
 
 const getPipelineStageMeta = (stageId) =>
@@ -3053,9 +3083,15 @@ const renderPipelineBoard = () => {
     if (!board) return;
     const studyFilter = document.getElementById('pipeline-study-filter')?.value || 'all';
     const assigneeFilter = document.getElementById('pipeline-assignee-filter')?.value || 'all';
-    let patients = filterPatientsForCurrentUser(state.patients);
+    let patients = filterPatientsForCurrentUser(state.patients || []);
     if (studyFilter !== 'all') {
-        patients = patients.filter(p => p.enrollments?.some(e => e.status === 'current' && e.studyId === studyFilter));
+        patients = patients.filter((p) => {
+            const denorm = computePatientDenormalized(p);
+            if (denorm.currentStudyId === studyFilter) return true;
+            if (denorm.candidateStudyIds?.includes(studyFilter)) return true;
+            if (denorm.enrolledStudyIds?.includes(studyFilter)) return true;
+            return p.enrollments?.some((e) => e.studyId === studyFilter) || false;
+        });
     }
     if (assigneeFilter !== 'all') {
         patients = patients.filter(p => p.assignedToUserId === assigneeFilter);

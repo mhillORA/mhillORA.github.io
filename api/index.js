@@ -672,20 +672,21 @@ const scopeFromUserRecord = (user) => ({
 
 const patientAccessibleToScope = (patient, scope) => {
     if (!scope || scope.role === 'Internal') return true;
+    const allowedSites = scope.allowedSiteIds || [];
+    const allowedStudies = scope.allowedStudyIds || [];
 
     if (!patientHasRecruitmentStatus(patient)) {
         const homeSiteId = patient.homeSiteId;
-        const allowedSites = scope.allowedSiteIds || [];
         if (homeSiteId && allowedSites.length && !allowedSites.includes(homeSiteId)) return false;
         if (scope.userId && (patient.claimedByUserId === scope.userId || patient.assignedToUserId === scope.userId)) return true;
         return true;
     }
 
     const denorm = computePatientDenormalized(patient);
+    if (allowedStudies.length && denorm.candidateStudyIds?.some((id) => allowedStudies.includes(id))) return true;
+
     const siteId = denorm.currentSiteId;
     const studyId = denorm.currentStudyId;
-    const allowedSites = scope.allowedSiteIds || [];
-    const allowedStudies = scope.allowedStudyIds || [];
 
     if (siteId || studyId) {
         if (allowedSites.length && siteId && !allowedSites.includes(siteId)) return false;
@@ -694,10 +695,9 @@ const patientAccessibleToScope = (patient, scope) => {
     }
 
     const homeSiteId = patient.homeSiteId;
-    const claimedBy = patient.claimedByUserId;
-    const assignedTo = patient.assignedToUserId;
     if (allowedSites.length && homeSiteId && allowedSites.includes(homeSiteId)) return true;
-    if (scope.userId && (claimedBy === scope.userId || assignedTo === scope.userId)) return true;
+    if (scope.userId && (patient.claimedByUserId === scope.userId || patient.assignedToUserId === scope.userId)) return true;
+    if (!homeSiteId) return true;
     return false;
 };
 
@@ -721,12 +721,15 @@ const scopeForbiddenResponse = () => ({
     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
 });
 
+const NO_CURRENT_STUDY_SQL = '(NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId = "")';
+
 const buildScopeClause = (scope, parameters, paramIndexRef) => {
     if (!scope || scope.role === 'Internal') return { clause: '', parameters };
     const allowedSites = Array.isArray(scope.allowedSiteIds) ? scope.allowedSiteIds.filter(Boolean) : [];
     const allowedStudies = Array.isArray(scope.allowedStudyIds) ? scope.allowedStudyIds.filter(Boolean) : [];
-    const enrolledParts = [];
+    const scopeParts = [];
 
+    const enrolledParts = [];
     if (allowedSites.length) {
         const siteKeys = allowedSites.map((siteId) => {
             const key = `@scopeSite${paramIndexRef.i++}`;
@@ -743,6 +746,16 @@ const buildScopeClause = (scope, parameters, paramIndexRef) => {
         });
         enrolledParts.push(`(IS_DEFINED(c.currentStudyId) AND c.currentStudyId != null AND c.currentStudyId IN (${studyKeys.join(', ')}))`);
     }
+    if (enrolledParts.length) scopeParts.push(`(${enrolledParts.join(' AND ')})`);
+
+    if (allowedStudies.length) {
+        const candidateKeys = allowedStudies.map((studyId) => {
+            const key = `@scopeCand${paramIndexRef.i++}`;
+            parameters.push({ name: key, value: studyId });
+            return `(IS_DEFINED(c.candidateStudyIds) AND ARRAY_CONTAINS(c.candidateStudyIds, ${key}))`;
+        });
+        scopeParts.push(`(${candidateKeys.join(' OR ')})`);
+    }
 
     const leadParts = [];
     if (allowedSites.length) {
@@ -758,14 +771,12 @@ const buildScopeClause = (scope, parameters, paramIndexRef) => {
         parameters.push({ name: uidKey, value: scope.userId });
         leadParts.push(`(c.claimedByUserId = ${uidKey} OR c.assignedToUserId = ${uidKey})`);
     }
+    // Unattributed recruitment leads (no current enrollment, no home site) belong in the shared pipeline pool.
+    leadParts.push('(NOT IS_DEFINED(c.homeSiteId) OR c.homeSiteId = null OR c.homeSiteId = "")');
+    scopeParts.push(`(${NO_CURRENT_STUDY_SQL} AND (${leadParts.join(' OR ')}))`);
 
-    const enrolledClause = enrolledParts.length ? `(${enrolledParts.join(' AND ')})` : '';
-    const leadClause = leadParts.length
-        ? `((NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId = "") AND (${leadParts.join(' OR ')}))`
-        : '';
-    const parts = [enrolledClause, leadClause].filter(Boolean);
-    if (!parts.length) return { clause: '', parameters };
-    return { clause: `(${parts.join(' OR ')})`, parameters };
+    if (!scopeParts.length) return { clause: '', parameters };
+    return { clause: `(${scopeParts.join(' OR ')})`, parameters };
 };
 
 const buildCriteriaClause = (criteria, parameters, paramIndexRef) => {
