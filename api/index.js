@@ -4049,17 +4049,28 @@ async function crudHandler(context, request, containerName) {
                                 });
                             }
                             
-                            const getTravelDaysForDate = async (travelDate) => {
+                            const shiftGroupId = result.groupId || null;
+                            const travelDayQueryCache = new Map();
+                            const getTravelDaysForDate = async (travelDate, crcId = null) => {
+                                const cacheKey = `${travelDate}|${shiftGroupId || ''}|${crcId || ''}`;
+                                if (travelDayQueryCache.has(cacheKey)) return travelDayQueryCache.get(cacheKey);
                                 try {
-                                    const queryResult = await eventsContainer.items.query({
-                                        query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date",
-                                        parameters: [
-                                            { name: "@date", value: travelDate }
-                                        ]
-                                    }).fetchAll();
-                                    return queryResult.resources || [];
+                                    let query = "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date";
+                                    const parameters = [{ name: "@date", value: travelDate }];
+                                    if (shiftGroupId) {
+                                        query += " AND c.parentShiftGroupId = @gid";
+                                        parameters.push({ name: "@gid", value: shiftGroupId });
+                                    } else if (crcId) {
+                                        query += " AND (c.crcId = @crcId OR (IS_DEFINED(c.crcIds) AND ARRAY_CONTAINS(c.crcIds, @crcId)))";
+                                        parameters.push({ name: "@crcId", value: crcId });
+                                    }
+                                    const queryResult = await eventsContainer.items.query({ query, parameters }).fetchAll();
+                                    const rows = queryResult.resources || [];
+                                    travelDayQueryCache.set(cacheKey, rows);
+                                    return rows;
                                 } catch (queryError) {
                                     context.log.error(`Error querying existing travel days for date ${travelDate}:`, queryError);
+                                    travelDayQueryCache.set(cacheKey, []);
                                     return [];
                                 }
                             };
@@ -4078,7 +4089,7 @@ async function crudHandler(context, request, containerName) {
                                         const datesToCheck = Array.from(new Set([startDate, endDate, defaultsRm.start, defaultsRm.end, shiftDate].filter(Boolean)));
                                         const shiftForTravel = { ...result, id: updateId };
                                         for (const travelDate of datesToCheck) {
-                                            const travelDaysOnDate = await getTravelDaysForDate(travelDate);
+                                            const travelDaysOnDate = await getTravelDaysForDate(travelDate, crcId);
                                             const travelDayToDelete = (travelDaysOnDate || []).find(td => {
                                                 if (!td || td.type !== 'Travel Day') return false;
                                                 if (!isTravelDayLinkedToShift(td, shiftForTravel)) return false;
@@ -4135,7 +4146,7 @@ async function crudHandler(context, request, containerName) {
                                         // Remove stale travel days: for this CRC, delete any travel day on range dates that is NOT in the new datesToCreate (edit changed travel dates)
                                         for (const travelDate of uniqueRangeDates) {
                                             if (datesToCreateSet.has(travelDate)) continue;
-                                            const travelDaysOnDate = await getTravelDaysForDate(travelDate);
+                                            const travelDaysOnDate = await getTravelDaysForDate(travelDate, crcId);
                                             const forThisCrc = (travelDaysOnDate || []).filter(td => {
                                                 if (!td || td.type !== 'Travel Day') return false;
                                                 if (td.crcId === crcId) return true;
@@ -4156,7 +4167,7 @@ async function crudHandler(context, request, containerName) {
                                         
                                         if (shouldHaveTravel && shiftCrcIds.has(crcId)) {
                                             for (const travelDate of datesToCreate) {
-                                                const travelDaysOnDate = await getTravelDaysForDate(travelDate);
+                                                const travelDaysOnDate = await getTravelDaysForDate(travelDate, crcId);
                                                 const forThisCrc = (travelDaysOnDate || []).filter(td => {
                                                     if (!td || td.type !== 'Travel Day') return false;
                                                     if (td.crcId === crcId) return true;
@@ -4222,7 +4233,7 @@ async function crudHandler(context, request, containerName) {
                                             const endDate = (typeof travelPrefs === 'object' && travelPrefs.endTravelDate) ? travelPrefs.endTravelDate : defaults.end;
                                             const datesToCheck = Array.from(new Set([startDate, endDate].filter(Boolean)));
                                             for (const travelDate of datesToCheck) {
-                                                const travelDaysOnDate = await getTravelDaysForDate(travelDate);
+                                                const travelDaysOnDate = await getTravelDaysForDate(travelDate, crcId);
                                                 const travelDayToDelete = (travelDaysOnDate || []).find(td => {
                                                     if (!td || td.type !== 'Travel Day') return false;
                                                     if (td.crcId === crcId) return true;

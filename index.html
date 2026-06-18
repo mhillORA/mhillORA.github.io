@@ -37990,9 +37990,10 @@
                                                 });
                                                 prevCrcs.forEach((id) => {
                                                     if (!assignedCrcsForTravelPrefs.has(id)) {
-                                                        scoped[id] = merged[id] || {
-                                                            includeStartTravel: true,
-                                                            includeEndTravel: true,
+                                                        scoped[id] = {
+                                                            includeStartTravel: false,
+                                                            includeEndTravel: false,
+                                                            travelNotNeeded: true,
                                                             startTravelDate: hintStart,
                                                             endTravelDate: hintEnd
                                                         };
@@ -38000,8 +38001,8 @@
                                                 });
                                                 return Object.keys(scoped).length > 0 ? scoped : undefined;
                                             })(),
-                                            // Legacy safety: skip travel-day processing only if no travel is selected
-                                            skipTravelDayProcessing: isLegacyShiftEdit && !hasSelectedTravel
+                                            // Legacy safety: skip API travel when client handles upserts (apply-to-all) or legacy shift with no travel selected.
+                                            skipTravelDayProcessing: applyToAllDays || (isLegacyShiftEdit && !hasSelectedTravel)
                                         };
                                         
                                         // CRITICAL: This UPDATE preserves the existing shift - it does NOT delete it
@@ -38013,31 +38014,36 @@
                                             const groupEventsToUpdate = state.crc_events.filter(e => 
                                                 e.groupId === existingGroupId && e.type !== 'Travel Day'
                                             );
-                                            for (const groupEvent of groupEventsToUpdate) {
+                                            const groupUpdateResults = await Promise.all(groupEventsToUpdate.map(async (groupEvent) => {
                                                 const payloadForDay = {
                                                     ...updatePayload,
                                                     id: groupEvent.id,
                                                     date: groupEvent.date,
                                                     startDate: groupEvent.date,
                                                     endDate: updatePayload.endDate || groupEvent.endDate || groupEvent.date,
-                                                    groupId: existingGroupId
+                                                    groupId: existingGroupId,
+                                                    skipTravelDayProcessing: true
                                                 };
                                                 try {
                                                     const updated = await apiService.updateEvent(groupEvent.id, payloadForDay);
-                                                    if (updated && updated.id) {
-                                                        const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(updated, payloadForDay) : updated;
-                                                        const idx = state.crc_events.findIndex(e => e.id === groupEvent.id);
-                                                        if (idx !== -1) {
-                                                            state.crc_events[idx] = merged;
-                                                        }
-                                                        if (!updatedEvent) {
-                                                            updatedEvent = merged;
-                                                        }
-                                                    }
+                                                    return { groupEvent, updated, payloadForDay };
                                                 } catch (groupUpdateError) {
                                                     console.error(`Error updating group event ${groupEvent.id}:`, groupUpdateError);
+                                                    return null;
                                                 }
-                                            }
+                                            }));
+                                            groupUpdateResults.filter(Boolean).forEach(({ groupEvent, updated, payloadForDay }) => {
+                                                if (updated && updated.id) {
+                                                    const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(updated, payloadForDay) : updated;
+                                                    const idx = state.crc_events.findIndex(e => e.id === groupEvent.id);
+                                                    if (idx !== -1) {
+                                                        state.crc_events[idx] = merged;
+                                                    }
+                                                    if (!updatedEvent) {
+                                                        updatedEvent = merged;
+                                                    }
+                                                }
+                                            });
                                         } else {
                                             updatedEvent = await apiService.updateEvent(eventId, updatePayload);
                                         }
@@ -38304,6 +38310,7 @@
                                             };
                                             
                                             // First pass: collect all travel preferences and group by date
+                                            const travelUpsertPromises = [];
                                             for (const crcId of assignedCrcsForTravel) {
                                                 const travelNotNeededEl = form.querySelector(`input[name="travel-not-needed-${crcId}"]`) || document.getElementById('travel-selection-container')?.querySelector(`input[name="travel-not-needed-${crcId}"]`);
                                                 if (travelNotNeededEl && travelNotNeededEl.checked) {
@@ -38379,12 +38386,15 @@
                                                 };
                                                 
                                                 if (includeStartTravelForCrc && startTravelDateStr) {
-                                                    await upsertTravelDay({ crcId, travelDateStr: startTravelDateStr, isBefore: true });
+                                                    travelUpsertPromises.push(upsertTravelDay({ crcId, travelDateStr: startTravelDateStr, isBefore: true }));
                                                 }
 
                                                 if (includeEndTravelForCrc && endTravelDateStr) {
-                                                    await upsertTravelDay({ crcId, travelDateStr: endTravelDateStr, isBefore: false });
+                                                    travelUpsertPromises.push(upsertTravelDay({ crcId, travelDateStr: endTravelDateStr, isBefore: false }));
                                                 }
+                                            }
+                                            if (travelUpsertPromises.length) {
+                                                await Promise.all(travelUpsertPromises);
                                             }
                                             }
                                             
