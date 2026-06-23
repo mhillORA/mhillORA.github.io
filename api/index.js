@@ -1,6 +1,31 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
-const { EmailClient } = require("@azure/communication-email");
+
+// Lazy-load email SDK so a missing/broken optional dependency does not prevent the API from starting.
+let EmailClientClass = null;
+const getEmailClientClass = () => {
+    if (!EmailClientClass) {
+        EmailClientClass = require('@azure/communication-email').EmailClient;
+    }
+    return EmailClientClass;
+};
+
+// Lightweight health probe — confirms the Functions worker started (no Cosmos required).
+app.http('health', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'health',
+    handler: async (request) => {
+        if (request.method === 'OPTIONS') {
+            return { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } };
+        }
+        return {
+            status: 200,
+            jsonBody: { ok: true, service: 'chaos-api', at: new Date().toISOString() },
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+        };
+    },
+});
 
 // Lazy initialization for the Email Client
 let emailClient = null;
@@ -8,7 +33,7 @@ const getEmailClient = () => {
     if (!emailClient) {
         const connectionString = process.env.COMMUNICATION_SERVICES_CONNECTION_STRING;
         if (!connectionString) throw new Error("Email connection string missing.");
-        emailClient = new EmailClient(connectionString);
+        emailClient = new (getEmailClientClass())(connectionString);
     }
     return emailClient;
 };

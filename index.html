@@ -23,6 +23,9 @@
         (async () => {
             try {
                 const response = await fetch('/api/azure-maps-config');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
                 const data = await response.json();
                 if (data && data.key) {
                     AZURE_MAPS_KEY = data.key;
@@ -53223,6 +53226,57 @@
 
             const ensureDeferredAppDataLoaded = () => loadDeferredAppData();
 
+            const clearStoredSession = () => {
+                try { localStorage.removeItem('ora_smo_session'); } catch { /* ignore */ }
+            };
+
+            const handleInitialLoadFailure = (error) => {
+                console.error('CHAOS: Error during initial data load:', error);
+                pendingInitialTabPaint = false;
+                stopLoadingPhraseRotation();
+                setState({
+                    crcs: state.crcs || [],
+                    crc_sites: state.crc_sites || [],
+                    studies: state.studies || [],
+                    crc_events: state.crc_events || [],
+                    roles: state.roles || [],
+                    training_types: state.training_types || [],
+                    initialLoadComplete: true,
+                }, { skipRender: false });
+                if (loadingMessage) loadingMessage.textContent = 'Server unavailable';
+                if (loadingError) {
+                    loadingError.innerHTML = `
+                        <strong>Could not reach the Azure API.</strong> The scheduler cannot load data right now.
+                        <br><small>${error?.message || 'Unknown error'}</small>
+                        <div class="mt-4 flex flex-wrap gap-2 justify-center">
+                            <button type="button" id="chaos-retry-load" class="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700 text-sm">Retry</button>
+                            <button type="button" id="chaos-return-login" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-600 text-sm">Return to Login</button>
+                        </div>`;
+                    document.getElementById('chaos-retry-load')?.addEventListener('click', () => {
+                        if (loadingError) loadingError.innerHTML = '';
+                        if (loadingMessage) loadingMessage.textContent = 'Retrying connection...';
+                        performInitialLoad();
+                    }, { once: true });
+                    document.getElementById('chaos-return-login')?.addEventListener('click', () => {
+                        clearStoredSession();
+                        setState({
+                            currentUser: null,
+                            isAuthenticated: false,
+                            authReady: true,
+                            initialLoadComplete: false,
+                        });
+                        pendingInitialTabPaint = false;
+                        if (loadingError) loadingError.innerHTML = '';
+                        forceRevealAppFromOverlay();
+                        renderNav();
+                        renderContent();
+                        showNotification('Signed out. Try logging in again when the server is back.', 'info');
+                    }, { once: true });
+                }
+                forceRevealAppFromOverlay();
+                showNotification('Server unavailable — scheduler data could not be loaded.', 'error');
+            };
+
             const performInitialLoad = async () => {
                 debugLog('CHAOS: performInitialLoad started');
                 if (state.isAuthenticated && !initialAppRevealed) {
@@ -53342,10 +53396,7 @@
                     debugLog('CHAOS: performInitialLoad completed successfully (deferred data loading in background)');
 
                 } catch (error) {
-                    console.error("CHAOS: Error during initial data load:", error);
-                    pendingInitialTabPaint = false;
-                    loadingMessage.textContent = 'Data Load Error';
-                    loadingError.innerHTML = `<strong>Error:</strong> Could not fetch initial data from the Azure API. Please check your connection and try again.<br><small>${error.message}</small>`;
+                    handleInitialLoadFailure(error);
                 }
             };
 
@@ -53369,18 +53420,19 @@
 
             // --- API Health Check ---
             const checkApiHealth = async () => {
-                try {
-                    const response = await fetch('/api/studies', {
-                        method: 'GET',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        }
-                    });
-                    return response.ok;
-                } catch (error) {
-                    console.warn('API health check failed:', error);
-                    return false;
+                const endpoints = ['/api/health', '/api/studies'];
+                for (const url of endpoints) {
+                    try {
+                        const response = await fetch(url, {
+                            method: 'GET',
+                            headers: { 'Content-Type': 'application/json' },
+                        });
+                        if (response.ok) return true;
+                    } catch (error) {
+                        console.warn(`API health check failed for ${url}:`, error);
+                    }
                 }
+                return false;
             };
 
             const init = async () => {
@@ -53404,16 +53456,29 @@
 						console.error('CHAOS: CSV input element not found');
 					}
 					
-					// Check API health
 					const apiHealthy = await checkApiHealth();
 					if (!apiHealthy) {
-						showNotification('API server is not responding. Data will be saved locally.', 'warning');
+						showNotification('API server is not responding. You can still try to sign in.', 'warning');
 					}
 					
+					const session = checkSession();
+					if (session && session.user && !apiHealthy) {
+						debugLog('CHAOS: Session found but API is down — showing login');
+						clearStoredSession();
+						state.authReady = true;
+						state.userId = 'chaos-user';
+						pendingInitialTabPaint = false;
+						initialAppRevealed = true;
+						setAppChromeVisible(true);
+						forceRevealAppFromOverlay();
+						renderNav();
+						renderContent();
+						return;
+					}
+
 					// Check for stored user in localStorage
 					// No localStorage - authentication must be done fresh each session
 					// Check for existing session
-					const session = checkSession();
 					if (session && session.user) {
 						debugLog('CHAOS: Restoring session for user:', session.user.username);
 						const email = (session.user.email || session.user.username || '').toLowerCase().trim();
@@ -53456,17 +53521,18 @@
 						pendingInitialTabPaint = false;
 						initialAppRevealed = true;
 						setAppChromeVisible(true);
-						// Hide loading overlay to show login page
-						if (loadingOverlay) {
-							loadingOverlay.style.display = 'none';
-						}
+						forceRevealAppFromOverlay();
 						renderNav();
 						renderContent();
 					}
 				} catch (error) {
 					console.error("CHAOS: Initialization failed:", error);
-					loadingMessage.textContent = 'Initialization Error';
-					loadingError.innerHTML = `<strong>Error:</strong> Application failed to initialize.<br><small>${error.message}</small>`;
+					if (loadingMessage) loadingMessage.textContent = 'Initialization Error';
+					if (loadingError) loadingError.innerHTML = `<strong>Error:</strong> Application failed to initialize.<br><small>${error.message}</small>`;
+					state.authReady = true;
+					pendingInitialTabPaint = false;
+					setAppChromeVisible(true);
+					forceRevealAppFromOverlay();
 				}
 			};
 
