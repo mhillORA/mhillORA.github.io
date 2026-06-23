@@ -9926,23 +9926,31 @@ app.http('navanImport', {
 });
 
 // =================================================================================
-// AUTOMATIC NAVAN IMPORT (Timer Trigger)
+// AUTOMATIC NAVAN IMPORT (HTTP — schedule externally)
 // =================================================================================
-// This timer automatically syncs Navan bookings on a schedule
-// Runs every 6 hours (at :00 minutes past the hour)
-// You can adjust the schedule by changing the CRON expression:
-// - "0 */6 * * *" = every 6 hours
-// - "0 0 * * *" = daily at midnight
-// - "0 */12 * * *" = every 12 hours
-// - "0 0 */1 * *" = daily at midnight
-app.timer('navanAutoImport', {
-    // Run daily at 7 AM EST (12:00 UTC)
-    // Note: During daylight saving time (EDT), this will run at 8 AM EDT (12:00 UTC)
-    // To run at exactly 7 AM EDT, use '0 11 * * *' (11:00 UTC), but that would be 6 AM EST
-    schedule: '0 12 * * *', // Daily at 12:00 UTC (7 AM EST / 8 AM EDT)
-    handler: async (myTimer, context) => {
+// Azure Static Web Apps managed APIs only support HTTP triggers (no app.timer).
+// Schedule via GitHub Actions, Azure Logic Apps, or cron-job.org:
+//   POST https://<your-app>/api/navan-auto-import
+// Previously ran daily at 7 AM EST via cron: 0 12 * * * (12:00 UTC)
+app.http('navanAutoImport', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'navan-auto-import',
+    handler: async (request, context) => {
         ensureContextLogger(context);
-        context.log.info('navanAutoImport: Timer triggered - Starting automatic Navan import (daily at 7 AM EST)');
+
+        if (request.method === 'OPTIONS') {
+            return {
+                status: 200,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                }
+            };
+        }
+
+        context.log.info('navanAutoImport: Scheduled import triggered - Starting automatic Navan import');
         
         const limitArray = (arr, limit = 50) => (arr.length > limit ? arr.slice(0, limit) : arr);
         
@@ -9978,7 +9986,11 @@ app.timer('navanAutoImport', {
                     type: 'Token fetch error'
                 });
                 context.log.error('navanAutoImport: Automatic import failed - authentication error');
-                return;
+                return {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                    jsonBody: { success: false, summary }
+                };
             }
             
             if (!tokenResult.success || !tokenResult.accessToken) {
@@ -9988,7 +10000,11 @@ app.timer('navanAutoImport', {
                     type: 'Authentication error'
                 });
                 context.log.error('navanAutoImport: Automatic import failed - authentication failed');
-                return;
+                return {
+                    status: 401,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                    jsonBody: { success: false, summary }
+                };
             }
             
             const accessToken = tokenResult.accessToken;
@@ -10043,7 +10059,11 @@ app.timer('navanAutoImport', {
                     type: 'Fetch error'
                 });
                 context.log.error('navanAutoImport: Automatic import failed - fetch error');
-                return;
+                return {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                    jsonBody: { success: false, summary }
+                };
             }
             
             summary.totals.fetched = bookings?.length || 0;
@@ -10054,7 +10074,7 @@ app.timer('navanAutoImport', {
             context.log.info(`navanAutoImport: Processing ${totalBookings} bookings in batches of ${BATCH_SIZE}`);
             
             const startTime = Date.now();
-            const MAX_EXECUTION_TIME_MS = 8 * 60 * 1000; // 8 minutes max for timer (Azure Functions timers can run longer)
+            const MAX_EXECUTION_TIME_MS = 8 * 60 * 1000; // 8 minutes max for long-running import
             
             const processedKeys = new Set();
             let processedCount = 0;
@@ -10131,7 +10151,11 @@ app.timer('navanAutoImport', {
                         
                         if (errorMsg.includes('container not found') || errorMsg.includes('DATABASE_ERROR')) {
                             context.log.error('navanAutoImport: Critical database error - aborting');
-                            return;
+                            return {
+                                status: 500,
+                                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                                jsonBody: { success: false, summary }
+                            };
                         }
                         
                         context.log.warn(`navanAutoImport: Failed to save booking ${booking.bookingId || booking.uuid}: ${errorMsg}. Continuing...`);
@@ -10165,6 +10189,12 @@ app.timer('navanAutoImport', {
             });
         }
         
-        context.log.info('navanAutoImport: Timer execution completed');
+        context.log.info('navanAutoImport: Scheduled import completed');
+
+        return {
+            status: 200,
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+            jsonBody: { success: true, summary }
+        };
     }
 });
