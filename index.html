@@ -13,6 +13,7 @@
     </script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
@@ -213,6 +214,85 @@
 const API_BASE_URL = '/api'; // Use relative path like other files
 const API_KEY = ''; // Optional. Prefer platform auth; leave empty for local/dev.
 const SCHEDULING_TEST_MODE = true; // QA: skip eligibility/enrollment gates so visits can be booked
+const NASA_SESSION_KEY = 'nasa_session';
+
+let msalInstance = null;
+let nasaEntraEnabled = false;
+const msalConfig = {
+    auth: {
+        clientId: '',
+        authority: 'https://login.microsoftonline.com/common',
+        redirectUri: typeof window !== 'undefined' ? window.location.origin : '',
+    },
+    cache: {
+        cacheLocation: 'sessionStorage',
+        storeAuthStateInCookie: false,
+    },
+};
+
+const initializeMSAL = () => {
+    if (typeof msal === 'undefined' || !msalConfig.auth.clientId) return;
+    try {
+        msalInstance = new msal.PublicClientApplication(msalConfig);
+        msalInstance.initialize().catch((error) => {
+            console.warn('MSAL initialization failed:', error);
+            msalInstance = null;
+        });
+    } catch (error) {
+        console.warn('MSAL initialization error:', error);
+        msalInstance = null;
+    }
+};
+
+const loadEntraConfig = async () => {
+    try {
+        const cfg = await apiCall('entra-config');
+        nasaEntraEnabled = !!cfg.enabled && !!cfg.clientId;
+        if (!nasaEntraEnabled) return false;
+        msalConfig.auth.clientId = cfg.clientId;
+        msalConfig.auth.authority = cfg.authority || msalConfig.auth.authority;
+        msalConfig.auth.redirectUri = window.location.origin;
+        initializeMSAL();
+        return true;
+    } catch (error) {
+        console.warn('NASA: Entra config unavailable.', error);
+        nasaEntraEnabled = false;
+        return false;
+    }
+};
+
+const clearStoredSession = () => {
+    try { localStorage.removeItem(NASA_SESSION_KEY); } catch { /* ignore */ }
+};
+
+const persistSession = (user) => {
+    try {
+        localStorage.setItem(NASA_SESSION_KEY, JSON.stringify({
+            user,
+            timestamp: Date.now(),
+        }));
+    } catch (error) {
+        console.warn('NASA: Could not persist session.', error);
+    }
+};
+
+const restoreStoredSession = () => {
+    try {
+        const raw = localStorage.getItem(NASA_SESSION_KEY);
+        if (!raw) return false;
+        const parsed = JSON.parse(raw);
+        const maxAgeMs = 7 * 24 * 60 * 60 * 1000;
+        if (!parsed?.user || Date.now() - (parsed.timestamp || 0) > maxAgeMs) {
+            clearStoredSession();
+            return false;
+        }
+        setSignedInUser(parsed.user, { persist: false });
+        return true;
+    } catch {
+        clearStoredSession();
+        return false;
+    }
+};
 
 const apiCall = async (endpoint, method = 'GET', data = null) => {
     try {
@@ -640,7 +720,7 @@ const toApiUserPayload = (user) => ({
     lastUpdated: new Date().toISOString(),
 });
 
-const setSignedInUser = (user) => {
+const setSignedInUser = (user, options = {}) => {
     const normalized = normalizeApiUser(user);
     if (!normalized) return;
     state.currentUser = {
@@ -650,9 +730,14 @@ const setSignedInUser = (user) => {
         role: normalized.role,
         allowedSiteIds: normalized.allowedSiteIds || [],
         allowedStudyIds: normalized.allowedStudyIds || [],
+        authType: normalized.authType || 'local',
+        userPartition: normalized.userPartition || (normalized.authType === 'entra' ? 'external' : 'internal'),
+        testModeAccess: normalized.testModeAccess === true,
+        entraId: normalized.entraId || '',
     };
     state.userId = normalized.id || normalized.username || 'nasa-user';
     state.showLoginGate = false;
+    if (options.persist !== false) persistSession(state.currentUser);
 };
 
 const loadManagedUsersFromApi = async () => {
@@ -1184,13 +1269,15 @@ const COMMUNICATION_TEMPLATES = {
 const getCurrentActor = () => state.currentUser?.email || state.currentUser?.username || state.userId || 'system';
 
 const getUserAllowedSiteIds = () => {
-    if (!state.currentUser || state.currentUser.role === 'Internal') return null;
+    if (!state.currentUser) return null;
+    if (state.currentUser.role === 'Internal' || state.currentUser.testModeAccess) return null;
     const ids = state.currentUser.allowedSiteIds;
     return Array.isArray(ids) ? ids : [];
 };
 
 const getUserAllowedStudyIds = () => {
-    if (!state.currentUser || state.currentUser.role === 'Internal') return null;
+    if (!state.currentUser) return null;
+    if (state.currentUser.role === 'Internal' || state.currentUser.testModeAccess) return null;
     const ids = state.currentUser.allowedStudyIds;
     return Array.isArray(ids) ? ids : [];
 };
@@ -4354,6 +4441,7 @@ const getEditPatientModalHTML = (patient) => {
 };
 
 const getLoginGateHTML = () => {
+    const showEntra = nasaEntraEnabled && msalConfig.auth.clientId;
     return `
         <div class="min-h-[70vh] flex items-center justify-center">
             <div class="max-w-xl w-full bg-white dark:bg-gray-800 p-8 rounded-lg shadow-xl">
@@ -4366,6 +4454,19 @@ const getLoginGateHTML = () => {
                         <p class="text-sm text-gray-600 dark:text-gray-400">Sign in to continue, or request access if you’re new.</p>
                     </div>
                 </div>
+
+                ${showEntra ? `
+                    <button type="button" data-action="login-gate-entra" class="w-full px-4 py-3 mb-4 bg-white dark:bg-gray-700 text-gray-900 dark:text-white border-2 border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-3">
+                        <svg class="w-5 h-5" viewBox="0 0 23 23" aria-hidden="true"><rect width="10" height="10" x="1" y="1" fill="#f25022"/><rect width="10" height="10" x="12" y="1" fill="#7fba00"/><rect width="10" height="10" x="1" y="12" fill="#00a4ef"/><rect width="10" height="10" x="12" y="12" fill="#ffb900"/></svg>
+                        <span>Sign in with Microsoft</span>
+                    </button>
+                    <div class="relative my-5">
+                        <div class="absolute inset-0 flex items-center"><div class="w-full border-t border-gray-200 dark:border-gray-700"></div></div>
+                        <div class="relative flex justify-center text-xs uppercase"><span class="bg-white dark:bg-gray-800 px-2 text-gray-500">Or use local account</span></div>
+                    </div>
+                ` : ''}
+
+                <div id="login-gate-error" class="hidden mb-3 text-sm text-red-600 dark:text-red-400"></div>
 
                 <form id="login-gate-form" class="space-y-4">
                     <div>
@@ -4389,11 +4490,49 @@ const getLoginGateHTML = () => {
                 </form>
 
                 <div class="mt-4 text-xs text-gray-500 dark:text-gray-400">
-                    Sign in with the username and password created in Manager → Users.
+                    ${showEntra
+                        ? 'Microsoft sign-in provisions <strong>external</strong> test users automatically. Internal staff can use Manager → Users passwords.'
+                        : 'Sign in with the username and password created in Manager → Users.'}
                 </div>
             </div>
         </div>
     `;
+};
+
+const handleEntraIdLogin = async () => {
+    const errorDiv = document.getElementById('login-gate-error');
+    const showLoginError = (message) => {
+        if (!errorDiv) return;
+        errorDiv.textContent = message;
+        errorDiv.classList.remove('hidden');
+    };
+    if (errorDiv) errorDiv.classList.add('hidden');
+
+    if (!msalInstance) {
+        showLoginError('Microsoft sign-in is not configured. Set ENTRA_CLIENT_ID on the NASA API and redeploy.');
+        return;
+    }
+
+    try {
+        const loginResponse = await msalInstance.loginPopup({
+            scopes: ['openid', 'profile', 'email'],
+            prompt: 'select_account',
+        });
+        const token = loginResponse?.idToken;
+        if (!token) throw new Error('No sign-in token returned from Microsoft.');
+
+        const apiUser = await apiCall('users/authenticate-entra', 'POST', { token });
+        setSignedInUser(apiUser);
+        showNotification(`Signed in as ${state.currentUser.email || state.currentUser.username}`, 'success');
+        render();
+    } catch (error) {
+        console.error('Entra ID login error:', error);
+        if (error?.errorCode === 'user_cancelled') {
+            showLoginError('Sign-in cancelled.');
+        } else {
+            showLoginError(error?.message || 'Microsoft sign-in failed. Try again or use a local account.');
+        }
+    }
 };
 
 const setupLoginGate = () => {
@@ -4610,6 +4749,7 @@ const getManageRHTML = () => {
                                     <option value="coordinator">coordinator</option>
                                     <option value="PI">PI</option>
                                     <option value="Site">Site</option>
+                                    <option value="External">External (Entra guest)</option>
                                     <option value="Internal">Internal</option>
                                 </select>
                             </div>
@@ -4652,6 +4792,7 @@ const getManageRHTML = () => {
                                     <th class="py-2 pr-3">Username</th>
                                     <th class="py-2 pr-3">Email</th>
                                     <th class="py-2 pr-3">Role</th>
+                                    <th class="py-2 pr-3">Auth</th>
                                     <th class="py-2 pr-3">Sites</th>
                                     <th class="py-2 pr-3">Studies</th>
                                     <th class="py-2 pr-3">Actions</th>
@@ -4666,6 +4807,11 @@ const getManageRHTML = () => {
                                             <td class="py-2 pr-3 font-medium">${u.username}</td>
                                             <td class="py-2 pr-3 text-xs break-all">${u.email ? escapeHtmlPhi(u.email) : '<span class="text-gray-400 dark:text-gray-500">—</span>'}</td>
                                             <td class="py-2 pr-3">${u.role || ''}</td>
+                                            <td class="py-2 pr-3 text-xs">
+                                                ${u.authType === 'entra'
+                                                    ? `<span class="px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200">Entra · ${u.userPartition || 'external'}</span>`
+                                                    : '<span class="text-gray-500">local</span>'}
+                                            </td>
                                             <td class="py-2 pr-3">${siteCount}</td>
                                             <td class="py-2 pr-3">${studyCount}</td>
                                             <td class="py-2 pr-3">
@@ -6239,10 +6385,21 @@ document.addEventListener('click', async (e) => {
                 state.selectedStudyId = null;
                 state.studiesExpanded = false;
                 state.showLoginGate = true;
+                clearStoredSession();
+                if (msalInstance) {
+                    const accounts = msalInstance.getAllAccounts();
+                    if (accounts.length) {
+                        msalInstance.logoutPopup({ account: accounts[0] }).catch(() => {});
+                    }
+                }
                 closeModal();
                 closeSidePanel();
                 showNotification('Signed out.', 'success');
                 render();
+                break;
+            }
+            case 'login-gate-entra': {
+                await handleEntraIdLogin();
                 break;
             }
             case 'login-gate-request-access': {
@@ -9104,6 +9261,7 @@ const init = async () => {
     // Initialize NASA with Azure Cosmos DB
     try {
         loadLocalState();
+        await loadEntraConfig();
         const loadedUsers = await loadManagedUsersFromApi();
         if (!loadedUsers && (state.managedUsers || []).length) {
             for (const user of state.managedUsers) {
@@ -9119,7 +9277,8 @@ const init = async () => {
         updatePrivacyMaskToggleUi();
         state.authReady = true;
         state.userId = 'nasa-user';
-        state.showLoginGate = true;
+        const restored = restoreStoredSession();
+        state.showLoginGate = !restored;
         
         await loadAllData();
         setupDataRefresh();

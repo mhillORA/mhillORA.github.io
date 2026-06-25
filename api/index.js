@@ -663,15 +663,28 @@ const enrichPatientDocument = (patient) => {
     return { ...coerced, ...denorm, primaryAppointmentDate };
 };
 
+const userHasFullAccess = (user) => {
+    if (!user) return false;
+    if (user.role === 'Internal') return true;
+    if (user.testModeAccess === true) return true;
+    if (
+        process.env.NASA_ENTRA_TEST_MODE === 'true'
+        && user.userPartition === 'external'
+        && user.authType === 'entra'
+    ) return true;
+    return false;
+};
+
 const scopeFromUserRecord = (user) => ({
     role: user?.role || '',
     allowedSiteIds: Array.isArray(user?.allowedSiteIds) ? user.allowedSiteIds : [],
     allowedStudyIds: Array.isArray(user?.allowedStudyIds) ? user.allowedStudyIds : [],
     userId: user?.id || null,
+    fullAccess: userHasFullAccess(user),
 });
 
 const patientAccessibleToScope = (patient, scope) => {
-    if (!scope || scope.role === 'Internal') return true;
+    if (!scope || scope.fullAccess || scope.role === 'Internal') return true;
     const allowedSites = scope.allowedSiteIds || [];
     const allowedStudies = scope.allowedStudyIds || [];
 
@@ -724,7 +737,7 @@ const scopeForbiddenResponse = () => ({
 const NO_CURRENT_STUDY_SQL = '(NOT IS_DEFINED(c.currentStudyId) OR c.currentStudyId = null OR c.currentStudyId = "")';
 
 const buildScopeClause = (scope, parameters, paramIndexRef) => {
-    if (!scope || scope.role === 'Internal') return { clause: '', parameters };
+    if (!scope || scope.fullAccess || scope.role === 'Internal') return { clause: '', parameters };
     const allowedSites = Array.isArray(scope.allowedSiteIds) ? scope.allowedSiteIds.filter(Boolean) : [];
     const allowedStudies = Array.isArray(scope.allowedStudyIds) ? scope.allowedStudyIds.filter(Boolean) : [];
     const scopeParts = [];
@@ -1750,7 +1763,7 @@ const runPatientsActions = async (request, context) => {
 
 const runPatientsReindex = async (request, context) => {
     const requestContext = await resolveRequestContext(request);
-    if (requestContext.scope && requestContext.scope.role !== 'Internal') {
+    if (requestContext.scope && !requestContext.scope.fullAccess && requestContext.scope.role !== 'Internal') {
         return { status: 403, jsonBody: { error: 'Internal role required' }, headers: jsonHeaders };
     }
     const body = await safeJson(request) || {};
@@ -1844,6 +1857,157 @@ const stripUserSecrets = (user) => {
     const { password, ...safe } = user;
     return safe;
 };
+
+const decodeJwtPayload = (token) => {
+    const tokenParts = String(token || '').split('.');
+    if (tokenParts.length !== 3) throw new Error('Invalid token format');
+    let base64 = tokenParts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) base64 += '=';
+    return JSON.parse(Buffer.from(base64, 'base64').toString());
+};
+
+const validateEntraTokenClaims = (payload) => {
+    const clientId = process.env.ENTRA_CLIENT_ID || '';
+    const tenantId = process.env.ENTRA_TENANT_ID || '';
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.exp && Number(payload.exp) < now - 60) {
+        throw new Error('Token expired');
+    }
+    if (clientId) {
+        const aud = payload.aud;
+        const audOk = aud === clientId
+            || (Array.isArray(aud) && aud.includes(clientId))
+            || aud === `api://${clientId}`;
+        if (!audOk) throw new Error('Token audience mismatch');
+    }
+    if (tenantId) {
+        const tid = payload.tid || '';
+        const iss = String(payload.iss || '');
+        if (tid && tid !== tenantId) throw new Error('Token tenant mismatch');
+        if (iss && !iss.includes(tenantId) && tenantId !== 'common' && tenantId !== 'organizations') {
+            throw new Error('Token issuer mismatch');
+        }
+    }
+};
+
+const getEntraAuthority = () => {
+    if (process.env.ENTRA_AUTHORITY) return process.env.ENTRA_AUTHORITY;
+    const tenantId = process.env.ENTRA_TENANT_ID || 'common';
+    return `https://login.microsoftonline.com/${tenantId}`;
+};
+
+const provisionEntraRecruitmentUser = async (container, { entraId, email, name }) => {
+    const testMode = process.env.NASA_ENTRA_TEST_MODE === 'true';
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    let existing = await safeQueryAll(container, {
+        query: 'SELECT * FROM c WHERE c.entraId = @entraId',
+        parameters: [{ name: '@entraId', value: entraId }],
+    });
+    if (!existing.length && normalizedEmail) {
+        existing = await safeQueryAll(container, {
+            query: 'SELECT * FROM c WHERE LOWER(c.email) = @email',
+            parameters: [{ name: '@email', value: normalizedEmail }],
+        });
+    }
+    if (existing.length) {
+        const user = existing[0];
+        const updates = {};
+        if (!user.entraId) updates.entraId = entraId;
+        if (!user.authType) updates.authType = 'entra';
+        if (!user.userPartition) updates.userPartition = 'external';
+        if (email && user.email !== email) updates.email = email;
+        if (name && (user.displayName || user.username) !== name) updates.displayName = name;
+        if (Object.keys(updates).length) {
+            const updated = { ...user, ...updates, lastUpdated: new Date().toISOString() };
+            const { resource } = await container.items.upsert(updated);
+            return resource;
+        }
+        return user;
+    }
+
+    const newUser = {
+        id: generateId(),
+        entraId,
+        authType: 'entra',
+        userPartition: 'external',
+        username: normalizedEmail || entraId,
+        email: normalizedEmail || '',
+        displayName: name || normalizedEmail || 'External User',
+        role: 'External',
+        allowedSiteIds: [],
+        allowedStudyIds: [],
+        testModeAccess: testMode,
+        active: true,
+        createdAt: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
+    };
+    const { resource } = await container.items.create(newUser);
+    return resource;
+};
+
+app.http('entraConfig', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'entra-config',
+    handler: async (request) => {
+        if (request.method === 'OPTIONS') return { status: 200, headers: corsJsonHeaders };
+        const clientId = process.env.ENTRA_CLIENT_ID || '';
+        return {
+            jsonBody: {
+                clientId,
+                authority: getEntraAuthority(),
+                enabled: !!clientId,
+                testMode: process.env.NASA_ENTRA_TEST_MODE === 'true',
+                partition: 'external',
+            },
+            headers: corsJsonHeaders,
+        };
+    },
+});
+
+app.http('usersAuthenticateEntra', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/authenticate-entra',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const body = await safeJson(request);
+            const token = body && body.token;
+            if (!token) {
+                return { status: 400, jsonBody: { error: 'Token is required' }, headers: jsonHeaders };
+            }
+            if (!process.env.ENTRA_CLIENT_ID) {
+                return { status: 503, jsonBody: { error: 'Entra ID is not configured on the server.' }, headers: jsonHeaders };
+            }
+
+            let payload;
+            try {
+                payload = decodeJwtPayload(token);
+                validateEntraTokenClaims(payload);
+            } catch (decodeError) {
+                context.log('Entra token validation failed:', decodeError.message);
+                return { status: 401, jsonBody: { error: 'Invalid or expired sign-in token' }, headers: jsonHeaders };
+            }
+
+            const entraId = payload.oid || payload.sub;
+            const email = payload.email || payload.preferred_username || payload.upn || '';
+            const name = payload.name || `${payload.given_name || ''} ${payload.family_name || ''}`.trim();
+            if (!entraId) {
+                return { status: 400, jsonBody: { error: 'Invalid token: missing user identifier' }, headers: jsonHeaders };
+            }
+
+            const container = getContainer(RECRUITMENT_USERS_CONTAINER);
+            let user = await provisionEntraRecruitmentUser(container, { entraId, email, name });
+            if (user.active === false) {
+                return { status: 403, jsonBody: { error: 'User account is deactivated.' }, headers: jsonHeaders };
+            }
+            return { jsonBody: stripUserSecrets(user), headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Entra authentication failed');
+        }
+    },
+});
 
 app.http('usersAuthenticate', {
     methods: ['POST', 'OPTIONS'],
