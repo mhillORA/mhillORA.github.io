@@ -1896,47 +1896,175 @@ const getEntraAuthority = () => {
     return `https://login.microsoftonline.com/${tenantId}`;
 };
 
-const provisionEntraRecruitmentUser = async (container, { entraId, email, name }) => {
-    const testMode = process.env.NASA_ENTRA_TEST_MODE === 'true';
+const getNasaAppUrl = () => {
+    const configured = String(process.env.NASA_APP_URL || '').trim().replace(/\/$/, '');
+    return configured || 'https://recruitment.oraclinical.com';
+};
+
+const findRecruitmentUserForEntra = async (container, { entraId, email }) => {
     const normalizedEmail = String(email || '').trim().toLowerCase();
-    let existing = await safeQueryAll(container, {
+    let users = await safeQueryAll(container, {
         query: 'SELECT * FROM c WHERE c.entraId = @entraId',
         parameters: [{ name: '@entraId', value: entraId }],
     });
-    if (!existing.length && normalizedEmail) {
-        existing = await safeQueryAll(container, {
+    if (!users.length && normalizedEmail) {
+        users = await safeQueryAll(container, {
             query: 'SELECT * FROM c WHERE LOWER(c.email) = @email',
             parameters: [{ name: '@email', value: normalizedEmail }],
         });
     }
-    if (existing.length) {
-        const user = existing[0];
-        const updates = {};
-        if (!user.entraId) updates.entraId = entraId;
-        if (!user.authType) updates.authType = 'entra';
-        if (!user.userPartition) updates.userPartition = 'external';
-        if (email && user.email !== email) updates.email = email;
-        if (name && (user.displayName || user.username) !== name) updates.displayName = name;
-        if (Object.keys(updates).length) {
-            const updated = { ...user, ...updates, lastUpdated: new Date().toISOString() };
-            const { resource } = await container.items.upsert(updated);
-            return resource;
-        }
-        return user;
-    }
+    return users[0] || null;
+};
 
+const findAccessRequestForIdentity = async (container, { entraId, email }, status) => {
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    if (entraId) {
+        const parameters = [{ name: '@entraId', value: entraId }];
+        let query = 'SELECT * FROM c WHERE c.entraId = @entraId';
+        if (status) {
+            query += ' AND c.status = @status';
+            parameters.push({ name: '@status', value: status });
+        }
+        const byEntra = await safeQueryAll(container, { query, parameters });
+        if (byEntra.length) return byEntra[0];
+    }
+    if (normalizedEmail) {
+        const parameters = [{ name: '@email', value: normalizedEmail }];
+        let query = 'SELECT * FROM c WHERE (LOWER(c.requestedLogin) = @email OR LOWER(c.email) = @email)';
+        if (status) {
+            query += ' AND c.status = @status';
+            parameters.push({ name: '@status', value: status });
+        }
+        const byEmail = await safeQueryAll(container, { query, parameters });
+        if (byEmail.length) return byEmail[0];
+    }
+    return null;
+};
+
+const createUserFromAccessRequest = async (usersContainer, request, approval, approverUserId) => {
+    const normalizedEmail = String(request.email || request.requestedLogin || '').trim().toLowerCase();
+    const entraId = request.entraId || '';
+    const existing = await findRecruitmentUserForEntra(usersContainer, { entraId, email: normalizedEmail });
+    const allowedSiteIds = Array.isArray(approval.allowedSiteIds) && approval.allowedSiteIds.length
+        ? approval.allowedSiteIds
+        : (request.siteId ? [request.siteId] : []);
+    const allowedStudyIds = Array.isArray(approval.allowedStudyIds) ? approval.allowedStudyIds : [];
+    const role = approval.role || (entraId ? 'External' : 'coordinator');
+    const partition = role === 'Internal' ? 'internal' : (entraId ? 'external' : 'internal');
+    const base = {
+        entraId: entraId || existing?.entraId || '',
+        authType: entraId ? 'entra' : (existing?.authType || 'local'),
+        userPartition: partition,
+        username: existing?.username || request.displayName || normalizedEmail.split('@')[0] || normalizedEmail || generateId(),
+        email: normalizedEmail || existing?.email || '',
+        displayName: request.displayName || existing?.displayName || normalizedEmail,
+        role,
+        allowedSiteIds,
+        allowedStudyIds,
+        active: true,
+        testModeAccess: process.env.NASA_ENTRA_TEST_MODE === 'true' && !!entraId,
+        accessRequestId: request.id,
+        approvedByUserId: approverUserId || null,
+        lastUpdated: new Date().toISOString(),
+    };
+    if (existing) {
+        const updated = { ...existing, ...base, id: existing.id };
+        const { resource } = await usersContainer.items.upsert(updated);
+        return resource;
+    }
+    const created = {
+        ...base,
+        id: generateId(),
+        password: entraId ? '' : randomPassword(),
+        createdAt: new Date().toISOString(),
+    };
+    const { resource } = await usersContainer.items.create(created);
+    return resource;
+};
+
+const randomPassword = () => {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%*?';
+    let out = '';
+    for (let i = 0; i < 14; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+    return out;
+};
+
+const getInternalEmailDomains = () => {
+    const raw = process.env.NASA_ENTRA_INTERNAL_EMAIL_DOMAINS || 'oraclinical.com';
+    return raw.split(',').map((part) => part.trim().toLowerCase()).filter(Boolean);
+};
+
+const isEntraGuestIdentity = (payload, email) => {
+    const upn = String(payload?.preferred_username || payload?.upn || email || '').toLowerCase();
+    if (upn.includes('#ext#')) return true;
+    if (String(payload?.acct || '').toLowerCase() === '1') return true;
+    return false;
+};
+
+const isInternalTenantEmail = (email) => {
+    const normalized = String(email || '').trim().toLowerCase();
+    const domain = normalized.split('@')[1];
+    if (!domain) return false;
+    return getInternalEmailDomains().includes(domain);
+};
+
+const classifyEntraIdentity = (payload, email) => {
+    if (isEntraGuestIdentity(payload, email)) {
+        return { partition: 'external', role: 'External' };
+    }
+    if (isInternalTenantEmail(email)) {
+        return { partition: 'internal', role: 'Internal' };
+    }
+    const tenantId = process.env.ENTRA_TENANT_ID || '';
+    if (
+        tenantId
+        && payload?.tid === tenantId
+        && process.env.NASA_ENTRA_AUTO_INTERNAL_MEMBERS === 'true'
+    ) {
+        return { partition: 'internal', role: 'Internal' };
+    }
+    return { partition: 'external', role: 'External' };
+};
+
+const applyEntraProfileUpdates = (user, { entraId, email, name }, classification) => {
+    const updates = {};
+    if (!user.entraId && entraId) updates.entraId = entraId;
+    if (!user.authType) updates.authType = 'entra';
+    if (!user.userPartition) {
+        updates.userPartition = user.role === 'Internal'
+            ? 'internal'
+            : (classification?.partition || 'external');
+    }
+    if (email && user.email !== email) updates.email = email;
+    if (name && (user.displayName || user.username) !== name) updates.displayName = name;
+    if (
+        classification?.partition === 'internal'
+        && user.role !== 'Internal'
+        && process.env.NASA_ENTRA_PROMOTE_INTERNAL_DOMAIN_USERS === 'true'
+    ) {
+        updates.role = 'Internal';
+        updates.userPartition = 'internal';
+    }
+    return updates;
+};
+
+const provisionEntraUser = async (container, { entraId, email, name }, classification) => {
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const partition = classification?.partition || 'external';
+    const role = classification?.role || (partition === 'internal' ? 'Internal' : 'External');
+    const testMode = process.env.NASA_ENTRA_TEST_MODE === 'true';
     const newUser = {
         id: generateId(),
         entraId,
         authType: 'entra',
-        userPartition: 'external',
+        userPartition: partition,
         username: normalizedEmail || entraId,
         email: normalizedEmail || '',
-        displayName: name || normalizedEmail || 'External User',
-        role: 'External',
+        displayName: name || normalizedEmail || (partition === 'internal' ? 'Internal User' : 'External User'),
+        role,
         allowedSiteIds: [],
         allowedStudyIds: [],
-        testModeAccess: testMode,
+        testModeAccess: partition === 'external' && testMode,
         active: true,
         createdAt: new Date().toISOString(),
         lastUpdated: new Date().toISOString(),
@@ -1944,6 +2072,25 @@ const provisionEntraRecruitmentUser = async (container, { entraId, email, name }
     const { resource } = await container.items.create(newUser);
     return resource;
 };
+
+app.http('health', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'health',
+    handler: async (request) => {
+        if (request.method === 'OPTIONS') return { status: 200, headers: corsJsonHeaders };
+        return {
+            jsonBody: {
+                ok: true,
+                app: 'NASA',
+                entraConfigured: !!process.env.ENTRA_CLIENT_ID,
+                appUrl: getNasaAppUrl(),
+                timestamp: new Date().toISOString(),
+            },
+            headers: corsJsonHeaders,
+        };
+    },
+});
 
 app.http('entraConfig', {
     methods: ['GET', 'OPTIONS'],
@@ -1956,8 +2103,10 @@ app.http('entraConfig', {
             jsonBody: {
                 clientId,
                 authority: getEntraAuthority(),
+                redirectUri: getNasaAppUrl(),
                 enabled: !!clientId,
                 testMode: process.env.NASA_ENTRA_TEST_MODE === 'true',
+                internalEmailDomains: getInternalEmailDomains(),
                 partition: 'external',
             },
             headers: corsJsonHeaders,
@@ -1997,8 +2146,55 @@ app.http('usersAuthenticateEntra', {
                 return { status: 400, jsonBody: { error: 'Invalid token: missing user identifier' }, headers: jsonHeaders };
             }
 
+            const classification = classifyEntraIdentity(payload, email);
             const container = getContainer(RECRUITMENT_USERS_CONTAINER);
-            let user = await provisionEntraRecruitmentUser(container, { entraId, email, name });
+            let user = await findRecruitmentUserForEntra(container, { entraId, email });
+            if (user) {
+                const updates = applyEntraProfileUpdates(user, { entraId, email, name }, classification);
+                if (Object.keys(updates).length) {
+                    const { resource } = await container.items.upsert({ ...user, ...updates, lastUpdated: new Date().toISOString() });
+                    user = resource;
+                }
+            } else if (classification.partition === 'internal') {
+                user = await provisionEntraUser(container, { entraId, email, name }, classification);
+            } else {
+                const requestsContainer = getContainer('access-requests');
+                const pending = await findAccessRequestForIdentity(requestsContainer, { entraId, email }, 'pending');
+                if (pending) {
+                    return {
+                        status: 403,
+                        jsonBody: {
+                            error: 'Access request pending manager approval.',
+                            code: 'ACCESS_PENDING',
+                        },
+                        headers: jsonHeaders,
+                    };
+                }
+                const denied = await findAccessRequestForIdentity(requestsContainer, { entraId, email }, 'denied');
+                if (denied) {
+                    return {
+                        status: 403,
+                        jsonBody: {
+                            error: 'Access request was denied.',
+                            code: 'ACCESS_DENIED',
+                        },
+                        headers: jsonHeaders,
+                    };
+                }
+                if (process.env.NASA_ENTRA_TEST_MODE === 'true') {
+                    user = await provisionEntraUser(container, { entraId, email, name }, classification);
+                } else {
+                    return {
+                        status: 403,
+                        jsonBody: {
+                            error: 'No NASA account found. Submit an access request for manager approval.',
+                            code: 'ACCESS_REQUIRED',
+                            entraProfile: { entraId, email, name, partition: classification.partition },
+                        },
+                        headers: jsonHeaders,
+                    };
+                }
+            }
             if (user.active === false) {
                 return { status: 403, jsonBody: { error: 'User account is deactivated.' }, headers: jsonHeaders };
             }
@@ -2062,6 +2258,11 @@ const normalizeAccessRequestInput = (data) => {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
     const normalized = { ...data };
     if (normalized.requestedLogin != null) normalized.requestedLogin = String(normalized.requestedLogin).trim();
+    if (normalized.email != null) normalized.email = String(normalized.email).trim();
+    if (normalized.displayName != null) normalized.displayName = String(normalized.displayName).trim();
+    if (normalized.entraId != null) normalized.entraId = String(normalized.entraId).trim();
+    if (normalized.authType != null) normalized.authType = String(normalized.authType).trim();
+    if (normalized.userPartition != null) normalized.userPartition = String(normalized.userPartition).trim();
     if (normalized.notes != null) normalized.notes = String(normalized.notes).trim();
     if (normalized.siteName != null) normalized.siteName = String(normalized.siteName).trim();
     if (normalized.siteId != null) normalized.siteId = String(normalized.siteId).trim();
@@ -2083,6 +2284,84 @@ const validateAccessRequestsSchema = (data) => {
     Object.assign(data, request);
     return true;
 };
+
+app.http('accessRequestsApprove', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'access-requests/{id}/approve',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const requestContext = await resolveRequestContext(request);
+            if (!requestContext.user || !userHasFullAccess(requestContext.user)) {
+                return { status: 403, jsonBody: { error: 'Manager access required' }, headers: jsonHeaders };
+            }
+            const id = request.params && request.params.id;
+            if (!id) return { status: 400, jsonBody: { error: 'Request id is required' }, headers: jsonHeaders };
+
+            const requestsContainer = getContainer('access-requests');
+            const accessRequest = await safeItemRead(requestsContainer, id);
+            if (!accessRequest) return { status: 404, jsonBody: { error: 'Access request not found' }, headers: jsonHeaders };
+            if ((accessRequest.status || 'pending') !== 'pending') {
+                return { status: 409, jsonBody: { error: 'Access request is not pending' }, headers: jsonHeaders };
+            }
+
+            const body = await safeJson(request) || {};
+            const usersContainer = getContainer(RECRUITMENT_USERS_CONTAINER);
+            const user = await createUserFromAccessRequest(usersContainer, accessRequest, body, requestContext.user.id);
+            const updatedRequest = {
+                ...accessRequest,
+                status: 'approved',
+                approvedAt: new Date().toISOString(),
+                approvedByUserId: requestContext.user.id,
+                provisionedUserId: user.id,
+                role: body.role || user.role,
+                allowedSiteIds: user.allowedSiteIds || [],
+                allowedStudyIds: user.allowedStudyIds || [],
+            };
+            const { resource: savedRequest } = await requestsContainer.items.upsert(updatedRequest);
+            return {
+                jsonBody: {
+                    request: savedRequest,
+                    user: stripUserSecrets(user),
+                },
+                headers: jsonHeaders,
+            };
+        } catch (error) {
+            return handleError(context, error, 'Approve access request failed');
+        }
+    },
+});
+
+app.http('accessRequestsDeny', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'access-requests/{id}/deny',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const requestContext = await resolveRequestContext(request);
+            if (!requestContext.user || !userHasFullAccess(requestContext.user)) {
+                return { status: 403, jsonBody: { error: 'Manager access required' }, headers: jsonHeaders };
+            }
+            const id = request.params && request.params.id;
+            if (!id) return { status: 400, jsonBody: { error: 'Request id is required' }, headers: jsonHeaders };
+            const requestsContainer = getContainer('access-requests');
+            const accessRequest = await safeItemRead(requestsContainer, id);
+            if (!accessRequest) return { status: 404, jsonBody: { error: 'Access request not found' }, headers: jsonHeaders };
+            const updatedRequest = {
+                ...accessRequest,
+                status: 'denied',
+                deniedAt: new Date().toISOString(),
+                deniedByUserId: requestContext.user.id,
+            };
+            const { resource } = await requestsContainer.items.upsert(updatedRequest);
+            return { jsonBody: { request: resource }, headers: jsonHeaders };
+        } catch (error) {
+            return handleError(context, error, 'Deny access request failed');
+        }
+    },
+});
 
 app.http('accessRequests', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],

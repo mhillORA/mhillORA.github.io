@@ -218,6 +218,7 @@ const NASA_SESSION_KEY = 'nasa_session';
 
 let msalInstance = null;
 let nasaEntraEnabled = false;
+let nasaInternalEmailDomains = ['oraclinical.com'];
 const msalConfig = {
     auth: {
         clientId: '',
@@ -249,9 +250,12 @@ const loadEntraConfig = async () => {
         const cfg = await apiCall('entra-config');
         nasaEntraEnabled = !!cfg.enabled && !!cfg.clientId;
         if (!nasaEntraEnabled) return false;
+        if (Array.isArray(cfg.internalEmailDomains) && cfg.internalEmailDomains.length) {
+            nasaInternalEmailDomains = cfg.internalEmailDomains;
+        }
         msalConfig.auth.clientId = cfg.clientId;
         msalConfig.auth.authority = cfg.authority || msalConfig.auth.authority;
-        msalConfig.auth.redirectUri = window.location.origin;
+        msalConfig.auth.redirectUri = cfg.redirectUri || window.location.origin;
         initializeMSAL();
         return true;
     } catch (error) {
@@ -319,16 +323,19 @@ const apiCall = async (endpoint, method = 'GET', data = null) => {
         
         if (!response.ok) {
             let details = '';
+            let parsed = null;
             try {
                 const text = await response.text();
                 details = text || '';
                 try {
-                    const parsed = JSON.parse(text);
+                    parsed = JSON.parse(text);
                     if (parsed && parsed.error) details = parsed.error;
+                    else if (parsed && parsed.message) details = parsed.message;
                 } catch { /* keep raw text */ }
             } catch {}
             const err = new Error(`API call failed: ${response.status} ${response.statusText}${details ? ' - ' + details : ''}`);
             err.status = response.status;
+            err.body = parsed;
             throw err;
         }
         
@@ -642,6 +649,7 @@ let state = {
     accessRequests: [],
     managedUsers: [],
     currentUser: null,
+    pendingEntraProfile: null,
     privacyMaskSensitive: false, // blur PHI/PII on screen (persisted in localStorage)
 };
 let chartInstances = {}; // To hold chart objects for destruction
@@ -731,7 +739,8 @@ const setSignedInUser = (user, options = {}) => {
         allowedSiteIds: normalized.allowedSiteIds || [],
         allowedStudyIds: normalized.allowedStudyIds || [],
         authType: normalized.authType || 'local',
-        userPartition: normalized.userPartition || (normalized.authType === 'entra' ? 'external' : 'internal'),
+        userPartition: normalized.userPartition
+            || (normalized.role === 'Internal' ? 'internal' : (normalized.authType === 'entra' ? 'external' : 'internal')),
         testModeAccess: normalized.testModeAccess === true,
         entraId: normalized.entraId || '',
     };
@@ -1760,7 +1769,7 @@ const render = () => {
 
         syncPrivacyMaskDom();
 
-        if (state.showLoginGate) {
+        if (state.showLoginGate || (!state.currentUser && state.activeTab !== 'requestAccess')) {
             mainContent.innerHTML = getLoginGateHTML();
             if (typeof lucide !== 'undefined') lucide.createIcons();
             setTimeout(() => setupLoginGate(), 50);
@@ -1768,8 +1777,12 @@ const render = () => {
             updatePrivacyMaskToggleUi();
             return;
         }
-        
-        renderNav();
+
+        if (!state.currentUser) {
+            renderNavPublic();
+        } else {
+            renderNav();
+        }
         renderContent();
         updateSessionControls();
         
@@ -1832,7 +1845,23 @@ const showErrorToUser = (message) => {
         lucide.createIcons();
     }
 };
+const getPendingAccessRequestCount = () => (state.accessRequests || []).filter(r => (r.status || 'pending') === 'pending').length;
+
+const renderNavPublic = () => {
+    navMenu.innerHTML = `
+        <button data-action="public-show-login" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700">
+            <i data-lucide="log-in" class="w-5 h-5"></i>
+            <span class="ml-3">Sign In</span>
+        </button>
+        <button data-tab="requestAccess" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors ${state.activeTab === 'requestAccess' ? 'bg-blue-600 text-white' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'}">
+            <i data-lucide="user-plus" class="w-5 h-5"></i>
+            <span class="ml-3">Request Access</span>
+        </button>
+    `;
+};
+
 const renderNav = () => {
+    const pendingCount = getPendingAccessRequestCount();
     const navItems = [
         { id: 'crcDashboard', label: 'CRC Dashboard', icon: 'calendar-check' },
         { id: 'recruiterDashboard', label: 'Recruiter Dashboard', icon: 'layout-dashboard' },
@@ -1844,12 +1873,12 @@ const renderNav = () => {
         { id: 'patients', label: 'Patients', icon: 'users' },
         { id: 'sites', label: 'Sites', icon: 'building' },
         { id: 'requestAccess', label: 'Request Access', icon: 'user-plus' },
-        { id: 'manageR', label: 'Manager', icon: 'shield-check' },
+        { id: 'manageR', label: 'Manager', icon: 'shield-check', internalOnly: true },
         { id: 'surveys', label: 'Surveys', icon: 'clipboard-list' },
         { id: 'scheduling', label: 'Scheduling', icon: 'calendar' },
         { id: 'reporting', label: 'Reporting', icon: 'trending-up' },
         { id: 'duplicates', label: 'Duplicates', icon: 'copy-x' },
-    ];
+    ].filter(item => !item.internalOnly || state.currentUser?.role === 'Internal');
     navMenu.innerHTML = navItems.map(item => {
         if (item.href) {
             return `
@@ -1885,9 +1914,11 @@ const renderNav = () => {
                 <button data-tab="${item.id}" class="nav-item w-full flex items-center px-4 py-2 text-sm font-medium rounded-md transition-colors ${state.activeTab === item.id ? 'bg-blue-600 text-white' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'}">
                     <i data-lucide="${item.icon}" class="w-5 h-5"></i>
                     <span class="ml-3">${item.label}</span>
+                    ${item.id === 'manageR' && pendingCount > 0 ? `<span class="ml-auto text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-500 text-white">${pendingCount}</span>` : ''}
                 </button>`;
     }).join('');
 };
+
 const renderContent = () => {
     const contentMap = {
         crcDashboard: getCRCDashboardHTML,
@@ -4440,8 +4471,15 @@ const getEditPatientModalHTML = (patient) => {
     `;
 };
 
+const isInternalWorkEmail = (email) => {
+    const domain = String(email || '').trim().toLowerCase().split('@')[1];
+    if (!domain) return false;
+    return nasaInternalEmailDomains.includes(domain);
+};
+
 const getLoginGateHTML = () => {
     const showEntra = nasaEntraEnabled && msalConfig.auth.clientId;
+    const internalDomainsLabel = nasaInternalEmailDomains.map((d) => `@${d}`).join(', ');
     return `
         <div class="min-h-[70vh] flex items-center justify-center">
             <div class="max-w-xl w-full bg-white dark:bg-gray-800 p-8 rounded-lg shadow-xl">
@@ -4451,19 +4489,25 @@ const getLoginGateHTML = () => {
                     </div>
                     <div>
                         <h2 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Welcome to N.A.S.A.</h2>
-                        <p class="text-sm text-gray-600 dark:text-gray-400">Sign in to continue, or request access if you’re new.</p>
+                        <p class="text-sm text-gray-600 dark:text-gray-400">ORA staff sign in with Microsoft. External partners request access first.</p>
                     </div>
                 </div>
 
                 ${showEntra ? `
-                    <button type="button" data-action="login-gate-entra" class="w-full px-4 py-3 mb-4 bg-white dark:bg-gray-700 text-gray-900 dark:text-white border-2 border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-3">
+                    <button type="button" data-action="login-gate-entra" class="w-full px-4 py-3 mb-3 bg-white dark:bg-gray-700 text-gray-900 dark:text-white border-2 border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-3">
                         <svg class="w-5 h-5" viewBox="0 0 23 23" aria-hidden="true"><rect width="10" height="10" x="1" y="1" fill="#f25022"/><rect width="10" height="10" x="12" y="1" fill="#7fba00"/><rect width="10" height="10" x="1" y="12" fill="#00a4ef"/><rect width="10" height="10" x="12" y="12" fill="#ffb900"/></svg>
                         <span>Sign in with Microsoft</span>
                     </button>
-                    <div class="relative my-5">
-                        <div class="absolute inset-0 flex items-center"><div class="w-full border-t border-gray-200 dark:border-gray-700"></div></div>
-                        <div class="relative flex justify-center text-xs uppercase"><span class="bg-white dark:bg-gray-800 px-2 text-gray-500">Or use local account</span></div>
-                    </div>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mb-4 text-center">
+                        Work accounts (${internalDomainsLabel}) are provisioned automatically on first sign-in.
+                    </p>
+                    <button type="button" data-action="login-gate-request-access" class="w-full px-4 py-3 mb-4 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
+                        <i data-lucide="user-plus" class="w-5 h-5"></i>
+                        <span>Request Access (external partners)</span>
+                    </button>
+                    <details class="mb-2">
+                        <summary class="text-xs text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300">Emergency local login (bootstrap only)</summary>
+                        <div class="mt-3 space-y-3">
                 ` : ''}
 
                 <div id="login-gate-error" class="hidden mb-3 text-sm text-red-600 dark:text-red-400"></div>
@@ -4471,32 +4515,68 @@ const getLoginGateHTML = () => {
                 <form id="login-gate-form" class="space-y-4">
                     <div>
                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email / Username</label>
-                        <input id="login-gate-identifier" name="identifier" type="text" autocomplete="username" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="mhill@oraclinical.com">
+                        <input id="login-gate-identifier" name="identifier" type="text" autocomplete="username" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="you@oraclinical.com">
                     </div>
                     <div>
                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Password</label>
-                        <input id="login-gate-password" name="password" type="password" autocomplete="current-password" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="Password1!">
+                        <input id="login-gate-password" name="password" type="password" autocomplete="current-password" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="Local bootstrap password">
                     </div>
 
-                    <button type="submit" data-action="login-gate-signin" class="w-full px-4 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 flex items-center justify-center gap-2">
+                    <button type="submit" data-action="login-gate-signin" class="w-full px-4 py-3 bg-gray-700 text-white rounded-md hover:bg-gray-800 flex items-center justify-center gap-2">
                         <i data-lucide="log-in" class="w-5 h-5"></i>
-                        <span>Sign in</span>
-                    </button>
-
-                    <button type="button" data-action="login-gate-request-access" class="w-full px-4 py-3 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
-                        <i data-lucide="user-plus" class="w-5 h-5"></i>
-                        <span>Request Access</span>
+                        <span>Sign in with local account</span>
                     </button>
                 </form>
 
+                ${showEntra ? `
+                        </div>
+                    </details>
+                ` : `
+                    <button type="button" data-action="login-gate-request-access" class="w-full mt-3 px-4 py-3 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
+                        <i data-lucide="user-plus" class="w-5 h-5"></i>
+                        <span>Request Access</span>
+                    </button>
+                `}
+
                 <div class="mt-4 text-xs text-gray-500 dark:text-gray-400">
                     ${showEntra
-                        ? 'Microsoft sign-in provisions <strong>external</strong> test users automatically. Internal staff can use Manager → Users passwords.'
+                        ? `<strong>ORA staff:</strong> use Microsoft with your ${internalDomainsLabel} account. <strong>External users:</strong> request access, then sign in with Microsoft after approval.`
                         : 'Sign in with the username and password created in Manager → Users.'}
                 </div>
             </div>
         </div>
     `;
+};
+
+const captureEntraProfileFromToken = (token) => {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) throw new Error('Invalid Microsoft token.');
+    let base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) base64 += '=';
+    const payload = JSON.parse(atob(base64));
+    const entraId = payload.oid || payload.sub;
+    const email = payload.email || payload.preferred_username || payload.upn || '';
+    const name = payload.name || `${payload.given_name || ''} ${payload.family_name || ''}`.trim();
+    const upn = String(payload.preferred_username || payload.upn || email || '').toLowerCase();
+    const isGuest = upn.includes('#ext#') || String(payload.acct || '').toLowerCase() === '1';
+    if (!entraId) throw new Error('Microsoft account is missing a user identifier.');
+    return { entraId, email, name, isGuest, isInternal: !isGuest && isInternalWorkEmail(email) };
+};
+
+const verifyEntraForAccessRequest = async () => {
+    if (!msalInstance) {
+        showNotification('Microsoft sign-in is not configured yet.', 'error');
+        return;
+    }
+    const loginResponse = await msalInstance.loginPopup({
+        scopes: ['openid', 'profile', 'email'],
+        prompt: 'select_account',
+    });
+    const token = loginResponse?.idToken;
+    if (!token) throw new Error('No sign-in token returned from Microsoft.');
+    state.pendingEntraProfile = captureEntraProfileFromToken(token);
+    showNotification(`Microsoft account linked: ${state.pendingEntraProfile.email || state.pendingEntraProfile.name}`, 'success');
+    render();
 };
 
 const handleEntraIdLogin = async () => {
@@ -4523,15 +4603,39 @@ const handleEntraIdLogin = async () => {
 
         const apiUser = await apiCall('users/authenticate-entra', 'POST', { token });
         setSignedInUser(apiUser);
+        state.pendingEntraProfile = null;
         showNotification(`Signed in as ${state.currentUser.email || state.currentUser.username}`, 'success');
         render();
     } catch (error) {
         console.error('Entra ID login error:', error);
         if (error?.errorCode === 'user_cancelled') {
             showLoginError('Sign-in cancelled.');
-        } else {
-            showLoginError(error?.message || 'Microsoft sign-in failed. Try again or use a local account.');
+            return;
         }
+        const code = error?.body?.code;
+        if (code === 'ACCESS_REQUIRED') {
+            state.pendingEntraProfile = error.body.entraProfile || null;
+            state.showLoginGate = false;
+            state.activeTab = 'requestAccess';
+            const isStaffDomain = isInternalWorkEmail(state.pendingEntraProfile?.email);
+            showNotification(
+                isStaffDomain
+                    ? 'Your work account was not recognized. Contact an administrator or use emergency local login.'
+                    : 'No NASA account yet. Submit an access request for manager approval.',
+                'info'
+            );
+            render();
+            return;
+        }
+        if (code === 'ACCESS_PENDING') {
+            showLoginError('Your access request is pending manager approval.');
+            return;
+        }
+        if (code === 'ACCESS_DENIED') {
+            showLoginError('Your access request was denied. Contact your manager.');
+            return;
+        }
+        showLoginError(error?.message || 'Microsoft sign-in failed. Try again or use a local account.');
     }
 };
 
@@ -4549,6 +4653,7 @@ const setupLoginGate = () => {
 
 const getRequestAccessHTML = () => {
     const activeSites = (state.sites || []).filter(s => (s.status || 'Active') === 'Active');
+    const profile = state.pendingEntraProfile;
     const siteOptions = (() => {
         if (!state.sites || state.sites.length === 0) {
             return `<option value="">Loading sites...</option>`;
@@ -4566,23 +4671,45 @@ const getRequestAccessHTML = () => {
         <div class="max-w-3xl">
             <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-2">Request Access</h2>
             <p class="text-gray-600 dark:text-gray-400 mb-6">
-                Use this page to request access to one or more clinical sites.
+                External partners: verify your Microsoft account, choose a site, and submit a request. ORA staff should use <strong>Sign in with Microsoft</strong> on the login screen instead.
             </p>
 
-            <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
+            <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md space-y-4">
+                ${nasaEntraEnabled ? `
+                    <div class="p-4 rounded-lg border ${profile ? 'border-green-300 bg-green-50 dark:bg-green-900/20 dark:border-green-800' : 'border-amber-300 bg-amber-50 dark:bg-amber-900/20 dark:border-amber-800'}">
+                        <div class="flex items-start justify-between gap-3">
+                            <div>
+                                <div class="font-semibold text-gray-800 dark:text-gray-200">Microsoft account</div>
+                                ${profile ? `
+                                    <p class="text-sm text-gray-700 dark:text-gray-300 mt-1">${escapeHtmlPhi(profile.name || profile.email || profile.entraId)}</p>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${escapeHtmlPhi(profile.email || '')}</p>
+                                    <p class="text-xs mt-2 ${profile.isInternal ? 'text-blue-700 dark:text-blue-300' : 'text-green-700 dark:text-green-300'}">
+                                        ${profile.isInternal
+                                            ? 'This looks like an ORA work account — use Sign in with Microsoft on the login page instead.'
+                                            : 'Entra ID captured — your manager will link this identity on approval.'}
+                                    </p>
+                                ` : `
+                                    <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Sign in with Microsoft so we can attach your Entra ID to the request.</p>
+                                `}
+                            </div>
+                            <button type="button" data-action="request-access-verify-entra" class="px-3 py-2 text-sm rounded-md ${profile ? 'bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500' : 'bg-blue-600 text-white hover:bg-blue-700'}">
+                                ${profile ? 'Change account' : 'Verify with Microsoft'}
+                            </button>
+                        </div>
+                    </div>
+                ` : ''}
+
                 <form id="request-access-form" class="space-y-4">
                     <div>
                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Requested Site</label>
                         <select id="request-site-id" name="siteId" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
                             ${siteOptions}
                         </select>
-                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Sites are sourced from the same Sites collection (Artemis/NASA) used elsewhere in the app.</p>
                     </div>
 
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email or Username</label>
-                        <input id="request-email-username" name="emailOrUsername" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="jane.doe@company.com or jdoe">
-                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Access dates are set by a manager during approval.</p>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Work Email</label>
+                        <input id="request-email-username" name="emailOrUsername" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="jane.doe@company.com" value="${profile?.email ? String(profile.email).replace(/"/g, '&quot;') : ''}">
                     </div>
 
                     <div>
@@ -4592,7 +4719,7 @@ const getRequestAccessHTML = () => {
 
                     <div class="flex items-center justify-between gap-3">
                         <div class="text-xs text-gray-500 dark:text-gray-400">
-                            Submitting will create a pending request for manager review.
+                            Pending requests appear in Manager for internal review.
                         </div>
                         <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">
                             Submit Request
@@ -4619,28 +4746,45 @@ const setupRequestAccessForm = () => {
         const emailOrUsername = String(document.getElementById('request-email-username')?.value || '').trim();
         const notes = document.getElementById('request-notes')?.value || '';
         if (!emailOrUsername) {
-            showNotification('Email or username is required.', 'error');
+            showNotification('Work email is required.', 'error');
+            return;
+        }
+        if (nasaEntraEnabled && !state.pendingEntraProfile?.entraId) {
+            showNotification('Verify your Microsoft account before submitting.', 'error');
+            return;
+        }
+        if (state.pendingEntraProfile?.isInternal) {
+            showNotification('ORA work accounts should sign in with Microsoft on the login page.', 'warning');
             return;
         }
 
+        const profile = state.pendingEntraProfile;
         const req = {
             id: ensureId('req'),
             createdAt: new Date().toISOString(),
             status: 'pending',
             siteId,
             siteName,
-            requestedLogin: emailOrUsername,
+            requestedLogin: profile?.email || emailOrUsername,
+            email: profile?.email || emailOrUsername,
+            displayName: profile?.name || '',
+            entraId: profile?.entraId || '',
+            authType: profile?.entraId ? 'entra' : 'local',
+            userPartition: profile?.entraId ? 'external' : 'internal',
             notes,
         };
         (async () => {
             try {
-                await createDocument('accessRequests', req);
-                state.accessRequests = [req, ...(state.accessRequests || [])];
-                showNotification(`Request submitted for: ${siteName}`, 'success');
+                const saved = await createDocument('accessRequests', req);
+                state.accessRequests = [saved, ...(state.accessRequests || [])];
+                state.pendingEntraProfile = null;
+                saveLocalState();
+                showNotification(`Request submitted for ${siteName}. A manager will review it shortly.`, 'success');
+                render();
             } catch (error) {
                 state.accessRequests = [req, ...(state.accessRequests || [])];
                 saveLocalState();
-                showNotification(`Request saved locally (API pending): ${siteName}`, 'warning');
+                showNotification(`Request saved locally (API error): ${siteName}`, 'warning');
             }
         })();
     });
@@ -4708,6 +4852,8 @@ const getManageRHTML = () => {
                                     <div class="flex items-start justify-between gap-3">
                                         <div>
                                             <div class="font-semibold text-gray-800 dark:text-gray-200">${r.requestedLogin || '(no login provided)'}</div>
+                                            ${r.entraId ? `<div class="text-xs mt-1"><span class="px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200">Microsoft · ${r.userPartition || 'external'}</span></div>` : ''}
+                                            ${r.displayName ? `<div class="text-sm text-gray-600 dark:text-gray-400 mt-1">${escapeHtmlPhi(r.displayName)}</div>` : ''}
                                             <div class="text-sm text-gray-600 dark:text-gray-400 mt-1">
                                                 <strong>Site:</strong> ${r.siteName || r.siteId || 'N/A'}
                                             </div>
@@ -4831,6 +4977,30 @@ const getManageRHTML = () => {
 };
 
 const getApproveAccessRequestModalHTML = (req) => {
+    const activeSites = (state.sites || []).filter(s => (s.status || 'Active') === 'Active');
+    const recruiting = (state.studies || []).filter(s => (s.status || 'Recruiting') === 'Recruiting' || !s.status);
+    const selectedSites = new Set(req.siteId ? [req.siteId] : []);
+    const sitesHTML = activeSites.length ? `
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-48 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
+            ${activeSites.map(s => `
+                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                    <input type="checkbox" name="allowedSiteIds" value="${s.id}" ${selectedSites.has(s.id) ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                    <span>${s.name}</span>
+                </label>
+            `).join('')}
+        </div>
+    ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No active sites loaded.</div>`;
+    const studiesHTML = recruiting.length ? `
+        <div class="grid grid-cols-1 gap-2 max-h-48 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
+            ${recruiting.map(s => `
+                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                    <input type="checkbox" name="allowedStudyIds" value="${s.id}" class="h-4 w-4 rounded border-gray-300 text-blue-600">
+                    <span>${s.title}</span>
+                </label>
+            `).join('')}
+        </div>
+    ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No studies loaded.</div>`;
+
     return `
         <div class="space-y-6">
             <div>
@@ -4838,12 +5008,30 @@ const getApproveAccessRequestModalHTML = (req) => {
                 <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">
                     <strong>${req?.requestedLogin || ''}</strong> • ${req?.siteName || req?.siteId || 'N/A'}
                 </p>
+                ${req?.entraId ? `<p class="text-xs text-purple-700 dark:text-purple-300 mt-2">Microsoft Entra ID will be linked on approval.</p>` : ''}
             </div>
 
             <form id="manageR-approve-request-form" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Role</label>
+                    <select name="role" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="External" ${req?.authType === 'entra' ? 'selected' : ''}>External (Entra guest)</option>
+                        <option value="coordinator">coordinator</option>
+                        <option value="PI">PI</option>
+                        <option value="Site">Site</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Site Access</label>
+                    ${sitesHTML}
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Study Access</label>
+                    ${studiesHTML}
+                </div>
                 <div class="flex justify-end gap-3">
                     <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 text-gray-800 dark:text-gray-100">Cancel</button>
-                    <button type="submit" class="px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-700">Approve</button>
+                    <button type="submit" class="px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-700">Approve &amp; create user</button>
                 </div>
             </form>
         </div>
@@ -4853,43 +5041,46 @@ const getApproveAccessRequestModalHTML = (req) => {
 const setupApproveAccessRequestForm = (requestId) => {
     const form = document.getElementById('manageR-approve-request-form');
     if (!form) return;
-    if (form.dataset.bound === 'true') return;
-    form.dataset.bound = 'true';
 
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('submit', async function onApproveSubmit(e) {
         e.preventDefault();
         const req = (state.accessRequests || []).find(r => r.id === requestId);
         if (!req) {
             showNotification('Request not found.', 'error');
             return;
         }
-        req.status = 'approved';
-        req.approvedAt = new Date().toISOString();
-        saveLocalState();
-
-        closeModal();
-        showNotification('Request approved. Create the user on the right.', 'success');
-        render();
-
-        // Prefill create-user form with request info
-        setTimeout(() => {
-            const emailEl = document.getElementById('manageR-email');
-            const userEl = document.getElementById('manageR-username');
-            const pwEl = document.getElementById('manageR-password');
-            const login = String(req.requestedLogin || '').trim();
-
-            if (login.includes('@')) {
-                if (emailEl && !emailEl.value) emailEl.value = login;
-                if (userEl && !userEl.value) userEl.value = login.split('@')[0];
-            } else {
-                if (userEl && !userEl.value) userEl.value = login;
+        const fd = new FormData(form);
+        const allowedSiteIds = fd.getAll('allowedSiteIds').map(String);
+        const allowedStudyIds = fd.getAll('allowedStudyIds').map(String);
+        const role = String(fd.get('role') || 'External').trim();
+        try {
+            const result = await apiCall(`access-requests/${requestId}/approve`, 'POST', {
+                role,
+                allowedSiteIds,
+                allowedStudyIds,
+            });
+            if (result?.user) {
+                const normalized = normalizeApiUser(result.user);
+                const existingIdx = (state.managedUsers || []).findIndex(u => u.id === normalized.id);
+                if (existingIdx >= 0) {
+                    state.managedUsers[existingIdx] = normalized;
+                } else {
+                    state.managedUsers = [normalized, ...(state.managedUsers || [])];
+                }
             }
-            if (pwEl && !pwEl.value) pwEl.value = randomPassword(14);
-
-            const cb = document.querySelector(`#manageR-create-user-form input[type="checkbox"][name="allowedSiteIds"][value="${req.siteId}"]`);
-            if (cb) cb.checked = true;
-        }, 50);
-    });
+            const updatedRequest = result?.request || { ...req, status: 'approved', approvedAt: new Date().toISOString() };
+            state.accessRequests = (state.accessRequests || []).map(r => r.id === requestId ? updatedRequest : r);
+            saveLocalState();
+            closeModal();
+            showNotification(result?.user
+                ? `Approved. ${result.user.email || result.user.username} can now sign in with Microsoft.`
+                : 'Request approved.', 'success');
+            render();
+        } catch (error) {
+            console.error('Approve access request failed:', error);
+            showNotification(error.message || 'Could not approve request.', 'error');
+        }
+    }, { once: true });
 };
 
 const setupManageR = () => {
@@ -6316,7 +6507,12 @@ const patientTemplate = () => ({
 document.addEventListener('click', async (e) => {
     const navButton = e.target.closest('.nav-item[data-tab]');
     if (navButton) {
-        setState({ activeTab: navButton.dataset.tab });
+        const tab = navButton.dataset.tab;
+        if (!state.currentUser && tab !== 'requestAccess') {
+            showNotification('Sign in or request access first.', 'warning');
+            return;
+        }
+        setState({ activeTab: tab });
         if (window.innerWidth < 768) { // Close sidebar on mobile after navigation
             sidebar.classList.add('-translate-x-full');
             overlay.classList.add('opacity-0', 'pointer-events-none');
@@ -6405,6 +6601,20 @@ document.addEventListener('click', async (e) => {
             case 'login-gate-request-access': {
                 state.showLoginGate = false;
                 setState({ activeTab: 'requestAccess' });
+                break;
+            }
+            case 'public-show-login': {
+                state.showLoginGate = true;
+                render();
+                break;
+            }
+            case 'request-access-verify-entra': {
+                try {
+                    await verifyEntraForAccessRequest();
+                } catch (error) {
+                    console.error('Verify Microsoft account failed:', error);
+                    showNotification(error?.message || 'Microsoft verification failed.', 'error');
+                }
                 break;
             }
             case 'login-gate-signin': {
@@ -7005,8 +7215,14 @@ document.addEventListener('click', async (e) => {
                     showNotification('Request not found.', 'error');
                     break;
                 }
-                req.status = 'denied';
-                req.deniedAt = new Date().toISOString();
+                try {
+                    const updated = await apiCall(`access-requests/${requestId}/deny`, 'POST', {});
+                    state.accessRequests = (state.accessRequests || []).map(r => r.id === requestId ? (updated.request || { ...req, status: 'denied', deniedAt: new Date().toISOString() }) : r);
+                } catch (error) {
+                    const denied = { ...req, status: 'denied', deniedAt: new Date().toISOString() };
+                    try { await updateDocument('accessRequests', requestId, denied); } catch { /* local only */ }
+                    state.accessRequests = (state.accessRequests || []).map(r => r.id === requestId ? denied : r);
+                }
                 saveLocalState();
                 showNotification('Request denied.', 'info');
                 render();
@@ -9166,6 +9382,13 @@ const loadAllData = async () => {
         state.schedules = schedules;
         state.surveys = surveys;
         if (accessRequests.length) state.accessRequests = accessRequests;
+        if (state.currentUser?.role === 'Internal') {
+            const pendingCount = getPendingAccessRequestCount();
+            if (pendingCount > 0 && state._lastSeenPendingRequests !== pendingCount) {
+                showNotification(`${pendingCount} access request${pendingCount === 1 ? '' : 's'} pending in Manager.`, 'info');
+            }
+            state._lastSeenPendingRequests = pendingCount;
+        }
         
         // Check if we're running in offline mode
         const isOfflineMode = state.studies.length === 0 && state.sites.length === 0 && state.patients.length === 0;
