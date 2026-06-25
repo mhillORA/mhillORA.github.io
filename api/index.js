@@ -1318,11 +1318,34 @@ const validateSurveysSchema = (data) => {
     return true;
 };
 
+const normalizeRecruitmentUserInput = (data) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+    const normalized = { ...data };
+    if (normalized.username != null) normalized.username = String(normalized.username).trim();
+    if (normalized.email != null) normalized.email = String(normalized.email).trim();
+    if (normalized.displayName != null) normalized.displayName = String(normalized.displayName).trim();
+    if (!normalized.displayName) {
+        normalized.displayName = normalized.username
+            || normalized.email
+            || (normalized.entraId ? String(normalized.entraId) : '')
+            || 'User';
+    }
+    if (!normalized.username) {
+        normalized.username = normalized.email
+            || normalized.displayName
+            || (normalized.entraId ? String(normalized.entraId) : '')
+            || `user_${generateId()}`;
+    }
+    if (!normalized.email && normalized.username.includes('@')) {
+        normalized.email = normalized.username.toLowerCase();
+    }
+    return normalized;
+};
+
 const validateUsersSchema = (data) => {
     const errors = [];
-    if ((!data.displayName || typeof data.displayName !== 'string') && data.username && typeof data.username === 'string') {
-        data.displayName = data.username;
-    }
+    const normalized = normalizeRecruitmentUserInput(data);
+    Object.assign(data, normalized);
     if (!data.displayName || typeof data.displayName !== 'string') {
         errors.push('displayName is required and must be a string');
     }
@@ -1951,13 +1974,13 @@ const createUserFromAccessRequest = async (usersContainer, request, approval, ap
     const allowedStudyIds = Array.isArray(approval.allowedStudyIds) ? approval.allowedStudyIds : [];
     const role = approval.role || (entraId ? 'External' : 'coordinator');
     const partition = role === 'Internal' ? 'internal' : (entraId ? 'external' : 'internal');
-    const base = {
+    const base = normalizeRecruitmentUserInput({
         entraId: entraId || existing?.entraId || '',
         authType: entraId ? 'entra' : (existing?.authType || 'local'),
         userPartition: partition,
-        username: existing?.username || request.displayName || normalizedEmail.split('@')[0] || normalizedEmail || generateId(),
+        username: existing?.username || request.displayName || normalizedEmail.split('@')[0] || normalizedEmail || '',
         email: normalizedEmail || existing?.email || '',
-        displayName: request.displayName || existing?.displayName || normalizedEmail,
+        displayName: request.displayName || existing?.displayName || normalizedEmail || request.requestedLogin || '',
         role,
         allowedSiteIds,
         allowedStudyIds,
@@ -1966,18 +1989,20 @@ const createUserFromAccessRequest = async (usersContainer, request, approval, ap
         accessRequestId: request.id,
         approvedByUserId: approverUserId || null,
         lastUpdated: new Date().toISOString(),
-    };
+    });
     if (existing) {
-        const updated = { ...existing, ...base, id: existing.id };
+        const updated = normalizeRecruitmentUserInput({ ...existing, ...base, id: existing.id });
+        validateUsersSchema(updated);
         const { resource } = await usersContainer.items.upsert(updated);
         return resource;
     }
-    const created = {
+    const created = normalizeRecruitmentUserInput({
         ...base,
         id: generateId(),
         password: entraId ? '' : randomPassword(),
         createdAt: new Date().toISOString(),
-    };
+    });
+    validateUsersSchema(created);
     const { resource } = await usersContainer.items.create(created);
     return resource;
 };
@@ -2053,7 +2078,7 @@ const provisionEntraUser = async (container, { entraId, email, name }, classific
     const partition = classification?.partition || 'external';
     const role = classification?.role || (partition === 'internal' ? 'Internal' : 'External');
     const testMode = process.env.NASA_ENTRA_TEST_MODE === 'true';
-    const newUser = {
+    const newUser = normalizeRecruitmentUserInput({
         id: generateId(),
         entraId,
         authType: 'entra',
@@ -2068,7 +2093,7 @@ const provisionEntraUser = async (container, { entraId, email, name }, classific
         active: true,
         createdAt: new Date().toISOString(),
         lastUpdated: new Date().toISOString(),
-    };
+    });
     const { resource } = await container.items.create(newUser);
     return resource;
 };
@@ -2266,6 +2291,13 @@ const normalizeAccessRequestInput = (data) => {
     if (normalized.notes != null) normalized.notes = String(normalized.notes).trim();
     if (normalized.siteName != null) normalized.siteName = String(normalized.siteName).trim();
     if (normalized.siteId != null) normalized.siteId = String(normalized.siteId).trim();
+    if (!normalized.displayName) {
+        const login = normalized.requestedLogin || normalized.email || '';
+        normalized.displayName = login.includes('@') ? login.split('@')[0] : login;
+    }
+    if (!normalized.email && normalized.requestedLogin && normalized.requestedLogin.includes('@')) {
+        normalized.email = normalized.requestedLogin;
+    }
     return normalized;
 };
 
