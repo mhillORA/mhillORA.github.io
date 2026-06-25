@@ -665,6 +665,33 @@ const safeJsonParse = (text, fallback) => {
     try { return JSON.parse(text); } catch { return fallback; }
 };
 
+const NASA_BOOTSTRAP_EMAIL = 'mhill@oraclinical.com';
+const NASA_BOOTSTRAP_PASSWORD = 'Password1!';
+
+const getBootstrapAdminUser = () => ({
+    id: 'nasa_bootstrap_admin',
+    createdAt: new Date().toISOString(),
+    username: NASA_BOOTSTRAP_EMAIL,
+    email: NASA_BOOTSTRAP_EMAIL,
+    displayName: 'Bootstrap Admin',
+    role: 'Internal',
+    userPartition: 'internal',
+    authType: 'local',
+    password: NASA_BOOTSTRAP_PASSWORD,
+    allowedSiteIds: [],
+    allowedStudyIds: [],
+    active: true,
+});
+
+const tryBootstrapLogin = (identifier, password) => {
+    const id = String(identifier || '').trim().toLowerCase();
+    const pw = String(password || '');
+    if (id === NASA_BOOTSTRAP_EMAIL && pw === NASA_BOOTSTRAP_PASSWORD) {
+        return getBootstrapAdminUser();
+    }
+    return null;
+};
+
 const loadLocalState = () => {
     const requests = safeJsonParse(localStorage.getItem(LS_KEYS.accessRequests) || '[]', []);
     const users = safeJsonParse(localStorage.getItem(LS_KEYS.managedUsers) || '[]', []);
@@ -676,21 +703,13 @@ const loadLocalState = () => {
         state.privacyMaskSensitive = false;
     }
 
-    // Seed a default local login user if missing (short-term bootstrap)
+    // Seed bootstrap admin in local cache for offline / API-down login
     const hasDefault = (state.managedUsers || []).some(u =>
-        String(u.email || '').toLowerCase() === 'mhill@oraclinical.com' ||
-        String(u.username || '').toLowerCase() === 'mhill@oraclinical.com'
+        String(u.email || '').toLowerCase() === NASA_BOOTSTRAP_EMAIL ||
+        String(u.username || '').toLowerCase() === NASA_BOOTSTRAP_EMAIL
     );
     if (!hasDefault) {
-        state.managedUsers = [{
-            id: ensureId('usr'),
-            createdAt: new Date().toISOString(),
-            username: 'mhill@oraclinical.com',
-            email: 'mhill@oraclinical.com',
-            role: 'Internal',
-            password: 'Password1!',
-            allowedSiteIds: [],
-        }, ...(state.managedUsers || [])];
+        state.managedUsers = [getBootstrapAdminUser(), ...(state.managedUsers || [])];
         saveLocalState();
     }
 };
@@ -699,6 +718,8 @@ const authenticateLocalUser = (identifier, password) => {
     const id = String(identifier || '').trim().toLowerCase();
     const pw = String(password || '');
     if (!id || !pw) return null;
+    const bootstrap = tryBootstrapLogin(identifier, password);
+    if (bootstrap) return bootstrap;
     return (state.managedUsers || []).find(u => {
         const email = String(u.email || '').trim().toLowerCase();
         const user = String(u.username || '').trim().toLowerCase();
@@ -761,7 +782,26 @@ const loadManagedUsersFromApi = async () => {
     try {
         const users = await apiCall('users');
         if (Array.isArray(users) && users.length) {
-            state.managedUsers = users.map(normalizeApiUser);
+            const localPasswords = new Map();
+            (state.managedUsers || []).forEach((u) => {
+                const key = String(u.id || u.email || u.username || '').toLowerCase();
+                if (key && u.password) localPasswords.set(key, u.password);
+            });
+            state.managedUsers = users.map((user) => {
+                const normalized = normalizeApiUser(user);
+                if (!normalized.password) {
+                    const key = String(normalized.id || normalized.email || normalized.username || '').toLowerCase();
+                    if (key && localPasswords.has(key)) normalized.password = localPasswords.get(key);
+                }
+                return normalized;
+            });
+            const hasBootstrap = state.managedUsers.some((u) =>
+                String(u.email || '').toLowerCase() === NASA_BOOTSTRAP_EMAIL
+                || String(u.username || '').toLowerCase() === NASA_BOOTSTRAP_EMAIL
+            );
+            if (!hasBootstrap) {
+                state.managedUsers = [getBootstrapAdminUser(), ...state.managedUsers];
+            }
             saveLocalState();
             return true;
         }
@@ -4497,7 +4537,7 @@ const getLoginGateHTML = () => {
                     </div>
                     <div>
                         <h2 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Welcome to N.A.S.A.</h2>
-                        <p class="text-sm text-gray-600 dark:text-gray-400">ORA staff sign in with Microsoft. External partners request access first.</p>
+                        <p class="text-sm text-gray-600 dark:text-gray-400">Sign in with Microsoft, or use the local admin login below.</p>
                     </div>
                 </div>
 
@@ -4507,15 +4547,12 @@ const getLoginGateHTML = () => {
                         <span>Sign in with Microsoft</span>
                     </button>
                     <p class="text-xs text-gray-500 dark:text-gray-400 mb-4 text-center">
-                        Work accounts (${internalDomainsLabel}) are provisioned automatically on first sign-in.
+                        ORA work accounts (${internalDomainsLabel}) · external partners use Request Access below
                     </p>
-                    <button type="button" data-action="login-gate-request-access" class="w-full px-4 py-3 mb-4 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
-                        <i data-lucide="user-plus" class="w-5 h-5"></i>
-                        <span>Request Access (external partners)</span>
-                    </button>
-                    <details class="mb-2">
-                        <summary class="text-xs text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300">Emergency local login (bootstrap only)</summary>
-                        <div class="mt-3 space-y-3">
+                    <div class="relative my-5">
+                        <div class="absolute inset-0 flex items-center"><div class="w-full border-t border-gray-200 dark:border-gray-700"></div></div>
+                        <div class="relative flex justify-center text-xs uppercase"><span class="bg-white dark:bg-gray-800 px-2 text-gray-500">Local admin login</span></div>
+                    </div>
                 ` : ''}
 
                 <div id="login-gate-error" class="hidden mb-3 text-sm text-red-600 dark:text-red-400"></div>
@@ -4523,32 +4560,27 @@ const getLoginGateHTML = () => {
                 <form id="login-gate-form" class="space-y-4">
                     <div>
                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email / Username</label>
-                        <input id="login-gate-identifier" name="identifier" type="text" autocomplete="username" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="you@oraclinical.com">
+                        <input id="login-gate-identifier" name="identifier" type="text" autocomplete="username" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="mhill@oraclinical.com" placeholder="you@oraclinical.com">
                     </div>
                     <div>
                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Password</label>
-                        <input id="login-gate-password" name="password" type="password" autocomplete="current-password" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="Local bootstrap password">
+                        <input id="login-gate-password" name="password" type="password" autocomplete="current-password" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" value="Password1!" placeholder="Password">
                     </div>
 
-                    <button type="submit" data-action="login-gate-signin" class="w-full px-4 py-3 bg-gray-700 text-white rounded-md hover:bg-gray-800 flex items-center justify-center gap-2">
+                    <button type="submit" data-action="login-gate-signin" class="w-full px-4 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 flex items-center justify-center gap-2">
                         <i data-lucide="log-in" class="w-5 h-5"></i>
-                        <span>Sign in with local account</span>
+                        <span>Sign in (local / backdoor)</span>
                     </button>
                 </form>
 
-                ${showEntra ? `
-                        </div>
-                    </details>
-                ` : `
-                    <button type="button" data-action="login-gate-request-access" class="w-full mt-3 px-4 py-3 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
-                        <i data-lucide="user-plus" class="w-5 h-5"></i>
-                        <span>Request Access</span>
-                    </button>
-                `}
+                <button type="button" data-action="login-gate-request-access" class="w-full mt-3 px-4 py-3 bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 flex items-center justify-center gap-2">
+                    <i data-lucide="user-plus" class="w-5 h-5"></i>
+                    <span>Request Access (external partners)</span>
+                </button>
 
                 <div class="mt-4 text-xs text-gray-500 dark:text-gray-400">
                     ${showEntra
-                        ? `<strong>ORA staff:</strong> use Microsoft with your ${internalDomainsLabel} account. <strong>External users:</strong> request access, then sign in with Microsoft after approval.`
+                        ? `<strong>Backdoor login</strong> works for Internal admins created in Manager → Users (password accounts). Microsoft sign-in is for Entra-linked users.`
                         : 'Sign in with the username and password created in Manager → Users.'}
                 </div>
             </div>
@@ -4661,7 +4693,6 @@ const setupLoginGate = () => {
 
 const getRequestAccessHTML = () => {
     const activeSites = (state.sites || []).filter(s => (s.status || 'Active') === 'Active');
-    const profile = state.pendingEntraProfile;
     const siteOptions = (() => {
         if (!state.sites || state.sites.length === 0) {
             return `<option value="">Loading sites...</option>`;
@@ -4679,49 +4710,30 @@ const getRequestAccessHTML = () => {
         <div class="max-w-3xl">
             <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-2">Request Access</h2>
             <p class="text-gray-600 dark:text-gray-400 mb-6">
-                External partners: verify your Microsoft account, choose a site, and submit a request. ORA staff should use <strong>Sign in with Microsoft</strong> on the login screen instead.
+                External partners: provide your <strong>name</strong>, <strong>work email</strong>, and <strong>site</strong>. After a manager approves your request, NASA will create your account and send a Microsoft invitation to that email.
             </p>
 
             <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md space-y-4">
-                ${nasaEntraEnabled ? `
-                    <div class="p-4 rounded-lg border ${profile ? 'border-green-300 bg-green-50 dark:bg-green-900/20 dark:border-green-800' : 'border-amber-300 bg-amber-50 dark:bg-amber-900/20 dark:border-amber-800'}">
-                        <div class="flex items-start justify-between gap-3">
-                            <div>
-                                <div class="font-semibold text-gray-800 dark:text-gray-200">Microsoft account</div>
-                                ${profile ? `
-                                    <p class="text-sm text-gray-700 dark:text-gray-300 mt-1">${escapeHtmlPhi(profile.name || profile.email || profile.entraId)}</p>
-                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">${escapeHtmlPhi(profile.email || '')}</p>
-                                    <p class="text-xs mt-2 ${profile.isInternal ? 'text-blue-700 dark:text-blue-300' : 'text-green-700 dark:text-green-300'}">
-                                        ${profile.isInternal
-                                            ? 'This looks like an ORA work account — use Sign in with Microsoft on the login page instead.'
-                                            : 'Entra ID captured — your manager will link this identity on approval.'}
-                                    </p>
-                                ` : `
-                                    <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Sign in with Microsoft so we can attach your Entra ID to the request.</p>
-                                `}
-                            </div>
-                            <button type="button" data-action="request-access-verify-entra" class="px-3 py-2 text-sm rounded-md ${profile ? 'bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500' : 'bg-blue-600 text-white hover:bg-blue-700'}">
-                                ${profile ? 'Change account' : 'Verify with Microsoft'}
-                            </button>
-                        </div>
-                    </div>
-                ` : ''}
-
                 <form id="request-access-form" class="space-y-4">
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Requested Site</label>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Your name</label>
+                        <input id="request-display-name" name="displayName" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="Jane Doe">
+                    </div>
+
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Work email</label>
+                        <input id="request-email-username" name="emailOrUsername" type="email" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="jane.doe@company.com">
+                    </div>
+
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Requested site</label>
                         <select id="request-site-id" name="siteId" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
                             ${siteOptions}
                         </select>
                     </div>
 
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Work Email</label>
-                        <input id="request-email-username" name="emailOrUsername" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="jane.doe@company.com" value="${profile?.email ? String(profile.email).replace(/"/g, '&quot;') : ''}">
-                    </div>
-
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Reason / Notes</label>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Reason / notes</label>
                         <textarea id="request-notes" name="notes" rows="4" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white" placeholder="Describe what you need access to and why."></textarea>
                     </div>
 
@@ -4730,7 +4742,7 @@ const getRequestAccessHTML = () => {
                             Pending requests appear in Manager for internal review.
                         </div>
                         <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">
-                            Submit Request
+                            Submit request
                         </button>
                     </div>
                 </form>
@@ -4752,23 +4764,27 @@ const setupRequestAccessForm = () => {
         const siteId = document.getElementById('request-site-id')?.value || '';
         const siteName = state.sites.find(s => s.id === siteId)?.name || siteId || 'Unknown site';
         const emailOrUsername = String(document.getElementById('request-email-username')?.value || '').trim();
+        const displayNameInput = String(document.getElementById('request-display-name')?.value || '').trim();
         const notes = document.getElementById('request-notes')?.value || '';
-        if (!emailOrUsername) {
-            showNotification('Work email is required.', 'error');
+        if (!displayNameInput) {
+            showNotification('Your name is required.', 'error');
             return;
         }
-        if (nasaEntraEnabled && !state.pendingEntraProfile?.entraId) {
-            showNotification('Verify your Microsoft account before submitting.', 'error');
+        if (!emailOrUsername || !emailOrUsername.includes('@')) {
+            showNotification('A valid work email is required.', 'error');
             return;
         }
-        if (state.pendingEntraProfile?.isInternal) {
-            showNotification('ORA work accounts should sign in with Microsoft on the login page.', 'warning');
+        if (!siteId) {
+            showNotification('Please select a site.', 'error');
+            return;
+        }
+        if (isInternalWorkEmail(emailOrUsername)) {
+            showNotification('ORA work accounts should use Sign in with Microsoft on the login page.', 'warning');
             return;
         }
 
-        const profile = state.pendingEntraProfile;
-        const resolvedEmail = String(profile?.email || emailOrUsername || '').trim();
-        const resolvedName = String(profile?.name || resolvedEmail.split('@')[0] || resolvedEmail || 'External User').trim();
+        const resolvedEmail = emailOrUsername;
+        const resolvedName = displayNameInput;
         const req = {
             id: ensureId('req'),
             createdAt: new Date().toISOString(),
@@ -4778,16 +4794,15 @@ const setupRequestAccessForm = () => {
             requestedLogin: resolvedEmail,
             email: resolvedEmail,
             displayName: resolvedName,
-            entraId: profile?.entraId || '',
-            authType: profile?.entraId ? 'entra' : 'local',
-            userPartition: profile?.entraId ? 'external' : 'internal',
+            entraId: '',
+            authType: 'entra',
+            userPartition: 'external',
             notes,
         };
         (async () => {
             try {
                 const saved = await createDocument('accessRequests', req);
                 state.accessRequests = [saved, ...(state.accessRequests || [])];
-                state.pendingEntraProfile = null;
                 saveLocalState();
                 showNotification(`Request submitted for ${siteName}. A manager will review it shortly.`, 'success');
                 render();
@@ -4861,11 +4876,10 @@ const getManageRHTML = () => {
                                 <div class="border border-gray-200 dark:border-gray-700 rounded-md p-4">
                                     <div class="flex items-start justify-between gap-3">
                                         <div>
-                                            <div class="font-semibold text-gray-800 dark:text-gray-200">${r.requestedLogin || '(no login provided)'}</div>
-                                            ${r.entraId ? `<div class="text-xs mt-1"><span class="px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200">Microsoft · ${r.userPartition || 'external'}</span></div>` : ''}
-                                            ${r.displayName ? `<div class="text-sm text-gray-600 dark:text-gray-400 mt-1">${escapeHtmlPhi(r.displayName)}</div>` : ''}
+                                            <div class="font-semibold text-gray-800 dark:text-gray-200">${escapeHtmlPhi(r.displayName || '(no name)')}</div>
+                                            <div class="text-sm text-gray-600 dark:text-gray-400 mt-1">${escapeHtmlPhi(r.email || r.requestedLogin || '(no email)')}</div>
                                             <div class="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                                                <strong>Site:</strong> ${r.siteName || r.siteId || 'N/A'}
+                                                <strong>Site:</strong> ${escapeHtmlPhi(r.siteName || r.siteId || 'N/A')}
                                             </div>
                                             ${r.notes ? `<div class="text-sm text-gray-600 dark:text-gray-300 mt-2 whitespace-pre-wrap">${r.notes}</div>` : ''}
                                             <div class="text-xs text-gray-500 dark:text-gray-500 mt-2">
@@ -5015,10 +5029,14 @@ const getApproveAccessRequestModalHTML = (req) => {
         <div class="space-y-6">
             <div>
                 <h2 class="text-2xl font-bold text-gray-800 dark:text-gray-100">Approve access request</h2>
-                <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                    <strong>${req?.requestedLogin || ''}</strong> • ${req?.siteName || req?.siteId || 'N/A'}
+                <div class="text-sm text-gray-600 dark:text-gray-400 mt-2 space-y-1">
+                    <p><strong>Name:</strong> ${escapeHtmlPhi(req?.displayName || 'N/A')}</p>
+                    <p><strong>Email:</strong> ${escapeHtmlPhi(req?.email || req?.requestedLogin || 'N/A')}</p>
+                    <p><strong>Site:</strong> ${escapeHtmlPhi(req?.siteName || req?.siteId || 'N/A')}</p>
+                </div>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-3">
+                    On approval, NASA creates the user and sends a Microsoft B2B invitation to this email with the Entra ID linked automatically.
                 </p>
-                ${req?.entraId ? `<p class="text-xs text-purple-700 dark:text-purple-300 mt-2">Microsoft Entra ID will be linked on approval.</p>` : ''}
             </div>
 
             <form id="manageR-approve-request-form" class="space-y-4">
@@ -5041,7 +5059,7 @@ const getApproveAccessRequestModalHTML = (req) => {
                 </div>
                 <div class="flex justify-end gap-3">
                     <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 text-gray-800 dark:text-gray-100">Cancel</button>
-                    <button type="submit" class="px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-700">Approve &amp; create user</button>
+                    <button type="submit" class="px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-700">Approve &amp; send invite</button>
                 </div>
             </form>
         </div>
@@ -5082,9 +5100,19 @@ const setupApproveAccessRequestForm = (requestId) => {
             state.accessRequests = (state.accessRequests || []).map(r => r.id === requestId ? updatedRequest : r);
             saveLocalState();
             closeModal();
-            showNotification(result?.user
-                ? `Approved. ${result.user.email || result.user.username} can now sign in with Microsoft.`
-                : 'Request approved.', 'success');
+            const inv = result?.invitation;
+            const email = result?.user?.email || result?.user?.username || req?.email || '';
+            if (inv?.sent) {
+                showNotification(`Approved. Microsoft invitation sent to ${email}.`, 'success');
+            } else if (inv?.error) {
+                showNotification(`User created, but Microsoft invitation failed: ${inv.error}`, 'warning');
+            } else if (inv?.skipped && inv?.reason === 'graph-not-configured') {
+                showNotification(`User created. Configure Graph API credentials to auto-send Microsoft invitations.`, 'warning');
+            } else {
+                showNotification(result?.user
+                    ? `Approved. ${email} can sign in after accepting their Microsoft invitation.`
+                    : 'Request approved.', 'success');
+            }
             render();
         } catch (error) {
             console.error('Approve access request failed:', error);
@@ -6630,20 +6658,45 @@ document.addEventListener('click', async (e) => {
             case 'login-gate-signin': {
                 const identifier = document.getElementById('login-gate-identifier')?.value || '';
                 const password = document.getElementById('login-gate-password')?.value || '';
+                const errorDiv = document.getElementById('login-gate-error');
+                const showLoginError = (message) => {
+                    if (!errorDiv) return;
+                    errorDiv.textContent = message;
+                    errorDiv.classList.remove('hidden');
+                };
+                if (errorDiv) errorDiv.classList.add('hidden');
+
                 let signedIn = false;
+                let apiError = null;
+                let localUser = null;
                 try {
                     const apiUser = await apiCall('users/authenticate', 'POST', { username: identifier, password });
                     setSignedInUser(apiUser);
                     signedIn = true;
-                } catch {
-                    const localUser = authenticateLocalUser(identifier, password);
+                } catch (error) {
+                    apiError = error;
+                    localUser = authenticateLocalUser(identifier, password);
                     if (localUser) {
                         setSignedInUser(localUser);
                         signedIn = true;
+                        try {
+                            const payload = toApiUserPayload(localUser);
+                            const existing = (state.managedUsers || []).find((u) => u.id === localUser.id);
+                            if (existing) {
+                                await updateDocument('users', localUser.id, payload);
+                            } else {
+                                await createDocument('users', payload);
+                            }
+                            await loadManagedUsersFromApi();
+                        } catch (syncError) {
+                            console.warn('NASA: Local login ok; API user sync pending.', syncError);
+                        }
                     }
                 }
                 if (!signedIn) {
-                    showNotification('Invalid username/email or password.', 'error');
+                    const msg = apiError?.body?.error || apiError?.message || 'Invalid username/email or password.';
+                    showLoginError(msg);
+                    showNotification(msg, 'error');
                     break;
                 }
                 showNotification(`Signed in as ${state.currentUser.email || state.currentUser.username}`, 'success');

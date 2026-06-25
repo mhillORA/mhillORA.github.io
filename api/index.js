@@ -1924,6 +1924,159 @@ const getNasaAppUrl = () => {
     return configured || 'https://recruitment.oraclinical.com';
 };
 
+const getInternalEmailDomains = () => {
+    const raw = process.env.NASA_ENTRA_INTERNAL_EMAIL_DOMAINS || 'oraclinical.com';
+    return raw.split(',').map((part) => part.trim().toLowerCase()).filter(Boolean);
+};
+
+const isInternalTenantEmail = (email) => {
+    const normalized = String(email || '').trim().toLowerCase();
+    const domain = normalized.split('@')[1];
+    if (!domain) return false;
+    return getInternalEmailDomains().includes(domain);
+};
+
+const isGraphInviteConfigured = () => {
+    const tenantId = process.env.ENTRA_TENANT_ID;
+    const clientId = process.env.NASA_GRAPH_CLIENT_ID || process.env.ENTRA_CLIENT_ID;
+    const clientSecret = process.env.NASA_GRAPH_CLIENT_SECRET || process.env.ENTRA_CLIENT_SECRET;
+    return !!(tenantId && clientId && clientSecret);
+};
+
+let graphTokenCache = { token: null, expiresAt: 0 };
+
+const getGraphAccessToken = async () => {
+    if (graphTokenCache.token && Date.now() < graphTokenCache.expiresAt - 60000) {
+        return graphTokenCache.token;
+    }
+    const tenantId = process.env.ENTRA_TENANT_ID;
+    const clientId = process.env.NASA_GRAPH_CLIENT_ID || process.env.ENTRA_CLIENT_ID;
+    const clientSecret = process.env.NASA_GRAPH_CLIENT_SECRET || process.env.ENTRA_CLIENT_SECRET;
+    if (!tenantId || !clientId || !clientSecret) {
+        throw new Error('Microsoft Graph is not configured. Set ENTRA_TENANT_ID, NASA_GRAPH_CLIENT_ID, and NASA_GRAPH_CLIENT_SECRET on the API.');
+    }
+    const body = new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        scope: 'https://graph.microsoft.com/.default',
+        grant_type: 'client_credentials',
+    });
+    const res = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        throw new Error(data.error_description || data.error || 'Failed to obtain Graph access token');
+    }
+    graphTokenCache = {
+        token: data.access_token,
+        expiresAt: Date.now() + (Number(data.expires_in) || 3600) * 1000,
+    };
+    return graphTokenCache.token;
+};
+
+const lookupEntraUserIdByEmail = async (email) => {
+    const normalized = String(email || '').trim().toLowerCase();
+    if (!normalized) return null;
+    const token = await getGraphAccessToken();
+    const escaped = normalized.replace(/'/g, "''");
+    const filters = [
+        `mail eq '${escaped}'`,
+        `otherMails/any(m:m eq '${escaped}')`,
+        `proxyAddresses/any(p:p eq 'SMTP:${escaped}')`,
+        `proxyAddresses/any(p:p eq 'smtp:${escaped}')`,
+    ];
+    for (const filter of filters) {
+        const url = `https://graph.microsoft.com/v1.0/users?$filter=${encodeURIComponent(filter)}&$select=id,mail,userPrincipalName,userType`;
+        const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        if (!res.ok) continue;
+        const payload = await res.json().catch(() => ({}));
+        const match = (payload.value || []).find((u) => u && u.id);
+        if (match) return { entraId: match.id, status: 'AlreadyExists' };
+    }
+    return null;
+};
+
+const sendEntraB2BInvitation = async ({ email, displayName }) => {
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const name = String(displayName || normalizedEmail.split('@')[0] || 'External User').trim();
+    if (!normalizedEmail || !normalizedEmail.includes('@')) {
+        throw new Error('A valid email address is required to send a Microsoft invitation.');
+    }
+    const token = await getGraphAccessToken();
+    const redirectUrl = getNasaAppUrl();
+    const inviteBody = {
+        invitedUserEmailAddress: normalizedEmail,
+        invitedUserDisplayName: name,
+        inviteRedirectUrl: redirectUrl,
+        sendInvitationMessage: true,
+    };
+    const customMessage = String(process.env.NASA_ENTRA_INVITE_MESSAGE || '').trim();
+    if (customMessage) {
+        inviteBody.invitedUserMessageInfo = {
+            customizedMessageBody: customMessage.replace(/\{appUrl\}/g, redirectUrl),
+        };
+    }
+    const res = await fetch('https://graph.microsoft.com/v1.0/invitations', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(inviteBody),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        const msg = payload?.error?.message || res.statusText || 'Invitation failed';
+        if (/already exists|duplicate|already been invited|already a member/i.test(msg)) {
+            const existing = await lookupEntraUserIdByEmail(normalizedEmail);
+            if (existing?.entraId) {
+                return {
+                    entraId: existing.entraId,
+                    status: existing.status || 'AlreadyExists',
+                    inviteRedeemUrl: '',
+                    alreadyExists: true,
+                };
+            }
+        }
+        throw new Error(msg);
+    }
+    return {
+        entraId: payload?.invitedUser?.id || '',
+        status: payload?.status || 'PendingAcceptance',
+        inviteRedeemUrl: payload?.inviteRedeemUrl || '',
+        alreadyExists: false,
+    };
+};
+
+const shouldSendEntraInviteOnApproval = (accessRequest, user) => {
+    const email = String(accessRequest.email || accessRequest.requestedLogin || '').trim().toLowerCase();
+    if (!email || isInternalTenantEmail(email)) return false;
+    if (user?.entraId || accessRequest.entraId) return false;
+    return user?.userPartition === 'external'
+        || user?.role === 'External'
+        || accessRequest.userPartition === 'external';
+};
+
+const provisionEntraGuestInvitation = async (accessRequest, user) => {
+    if (!shouldSendEntraInviteOnApproval(accessRequest, user)) {
+        return { skipped: true, reason: 'not-external-or-already-linked' };
+    }
+    if (!isGraphInviteConfigured()) {
+        return {
+            skipped: true,
+            reason: 'graph-not-configured',
+            error: 'Microsoft Graph credentials are not configured on the API.',
+        };
+    }
+    const email = String(accessRequest.email || accessRequest.requestedLogin || '').trim().toLowerCase();
+    const displayName = String(accessRequest.displayName || user.displayName || email.split('@')[0] || 'External User').trim();
+    const invitation = await sendEntraB2BInvitation({ email, displayName });
+    return { skipped: false, ...invitation };
+};
+
 const findRecruitmentUserForEntra = async (container, { entraId, email }) => {
     const normalizedEmail = String(email || '').trim().toLowerCase();
     let users = await safeQueryAll(container, {
@@ -1972,11 +2125,14 @@ const createUserFromAccessRequest = async (usersContainer, request, approval, ap
         ? approval.allowedSiteIds
         : (request.siteId ? [request.siteId] : []);
     const allowedStudyIds = Array.isArray(approval.allowedStudyIds) ? approval.allowedStudyIds : [];
-    const role = approval.role || (entraId ? 'External' : 'coordinator');
-    const partition = role === 'Internal' ? 'internal' : (entraId ? 'external' : 'internal');
+    const externalPartner = request.userPartition === 'external'
+        || (!isInternalTenantEmail(normalizedEmail) && request.userPartition !== 'internal');
+    const role = approval.role || (externalPartner || entraId ? 'External' : 'coordinator');
+    const partition = role === 'Internal' ? 'internal' : (externalPartner || entraId ? 'external' : 'internal');
+    const usesEntraSignIn = externalPartner || !!entraId || request.authType === 'entra';
     const base = normalizeRecruitmentUserInput({
         entraId: entraId || existing?.entraId || '',
-        authType: entraId ? 'entra' : (existing?.authType || 'local'),
+        authType: usesEntraSignIn ? 'entra' : (existing?.authType || 'local'),
         userPartition: partition,
         username: existing?.username || request.displayName || normalizedEmail.split('@')[0] || normalizedEmail || '',
         email: normalizedEmail || existing?.email || '',
@@ -1985,7 +2141,7 @@ const createUserFromAccessRequest = async (usersContainer, request, approval, ap
         allowedSiteIds,
         allowedStudyIds,
         active: true,
-        testModeAccess: process.env.NASA_ENTRA_TEST_MODE === 'true' && !!entraId,
+        testModeAccess: process.env.NASA_ENTRA_TEST_MODE === 'true' && externalPartner && !entraId,
         accessRequestId: request.id,
         approvedByUserId: approverUserId || null,
         lastUpdated: new Date().toISOString(),
@@ -1999,7 +2155,7 @@ const createUserFromAccessRequest = async (usersContainer, request, approval, ap
     const created = normalizeRecruitmentUserInput({
         ...base,
         id: generateId(),
-        password: entraId ? '' : randomPassword(),
+        password: usesEntraSignIn ? '' : randomPassword(),
         createdAt: new Date().toISOString(),
     });
     validateUsersSchema(created);
@@ -2014,23 +2170,11 @@ const randomPassword = () => {
     return out;
 };
 
-const getInternalEmailDomains = () => {
-    const raw = process.env.NASA_ENTRA_INTERNAL_EMAIL_DOMAINS || 'oraclinical.com';
-    return raw.split(',').map((part) => part.trim().toLowerCase()).filter(Boolean);
-};
-
 const isEntraGuestIdentity = (payload, email) => {
     const upn = String(payload?.preferred_username || payload?.upn || email || '').toLowerCase();
     if (upn.includes('#ext#')) return true;
     if (String(payload?.acct || '').toLowerCase() === '1') return true;
     return false;
-};
-
-const isInternalTenantEmail = (email) => {
-    const normalized = String(email || '').trim().toLowerCase();
-    const domain = normalized.split('@')[1];
-    if (!domain) return false;
-    return getInternalEmailDomains().includes(domain);
 };
 
 const classifyEntraIdentity = (payload, email) => {
@@ -2098,17 +2242,64 @@ const provisionEntraUser = async (container, { entraId, email, name }, classific
     return resource;
 };
 
+const ensureBootstrapAdminUser = async (container) => {
+    const email = String(process.env.NASA_BOOTSTRAP_ADMIN_EMAIL || 'mhill@oraclinical.com').trim().toLowerCase();
+    const password = String(process.env.NASA_BOOTSTRAP_ADMIN_PASSWORD || 'Password1!');
+    if (!email || !password) return null;
+    let existing = await findRecruitmentUserForEntra(container, { entraId: '', email });
+    if (existing) {
+        const needsPassword = String(existing.password || '') !== password;
+        const needsRole = existing.role !== 'Internal';
+        if (needsPassword || needsRole || !existing.displayName) {
+            const updated = normalizeRecruitmentUserInput({
+                ...existing,
+                password: needsPassword ? password : existing.password,
+                role: 'Internal',
+                userPartition: 'internal',
+                authType: existing.authType || 'local',
+                active: true,
+            });
+            const { resource } = await container.items.upsert(updated);
+            return resource;
+        }
+        return existing;
+    }
+    const created = normalizeRecruitmentUserInput({
+        id: generateId(),
+        email,
+        username: email,
+        displayName: 'Bootstrap Admin',
+        password,
+        role: 'Internal',
+        userPartition: 'internal',
+        authType: 'local',
+        allowedSiteIds: [],
+        allowedStudyIds: [],
+        active: true,
+        createdAt: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
+    });
+    validateUsersSchema(created);
+    const { resource } = await container.items.create(created);
+    return resource;
+};
+
 app.http('health', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'health',
     handler: async (request) => {
         if (request.method === 'OPTIONS') return { status: 200, headers: corsJsonHeaders };
+        try {
+            const container = getContainer(RECRUITMENT_USERS_CONTAINER);
+            await ensureBootstrapAdminUser(container);
+        } catch { /* non-fatal */ }
         return {
             jsonBody: {
                 ok: true,
                 app: 'NASA',
                 entraConfigured: !!process.env.ENTRA_CLIENT_ID,
+                graphInviteConfigured: isGraphInviteConfigured(),
                 appUrl: getNasaAppUrl(),
                 timestamp: new Date().toISOString(),
             },
@@ -2245,6 +2436,18 @@ app.http('usersAuthenticate', {
             }
 
             const container = getContainer(RECRUITMENT_USERS_CONTAINER);
+            const bootstrapEmail = String(process.env.NASA_BOOTSTRAP_ADMIN_EMAIL || 'mhill@oraclinical.com').trim().toLowerCase();
+            const bootstrapPassword = String(process.env.NASA_BOOTSTRAP_ADMIN_PASSWORD || 'Password1!');
+            if (identifier === bootstrapEmail && password === bootstrapPassword) {
+                const bootstrapUser = await ensureBootstrapAdminUser(container);
+                if (bootstrapUser) {
+                    if (bootstrapUser.active === false) {
+                        return { status: 403, jsonBody: { error: 'User account is deactivated.' }, headers: jsonHeaders };
+                    }
+                    return { jsonBody: stripUserSecrets(bootstrapUser), headers: jsonHeaders };
+                }
+            }
+
             const { resources } = await container.items.query({
                 query: 'SELECT * FROM c WHERE LOWER(c.email) = @id OR LOWER(c.username) = @id',
                 parameters: [{ name: '@id', value: identifier }],
@@ -2309,6 +2512,15 @@ const validateAccessRequestsSchema = (data) => {
     } else if (typeof request.requestedLogin !== 'string') {
         errors.push('requestedLogin is required and must be a string');
     }
+    if (!request.email || !String(request.email).includes('@')) {
+        errors.push('email is required and must be a valid email address');
+    }
+    if (!request.displayName) {
+        errors.push('displayName is required');
+    }
+    if (!request.siteId) {
+        errors.push('siteId is required');
+    }
     if (request.status && !['pending', 'approved', 'denied'].includes(request.status)) {
         errors.push('status must be one of: pending, approved, denied');
     }
@@ -2340,7 +2552,30 @@ app.http('accessRequestsApprove', {
 
             const body = await safeJson(request) || {};
             const usersContainer = getContainer(RECRUITMENT_USERS_CONTAINER);
-            const user = await createUserFromAccessRequest(usersContainer, accessRequest, body, requestContext.user.id);
+            let user = await createUserFromAccessRequest(usersContainer, accessRequest, body, requestContext.user.id);
+
+            let invitation = null;
+            try {
+                invitation = await provisionEntraGuestInvitation(accessRequest, user);
+                if (invitation?.entraId && !user.entraId) {
+                    const linked = normalizeRecruitmentUserInput({
+                        ...user,
+                        entraId: invitation.entraId,
+                        authType: 'entra',
+                        userPartition: user.userPartition || 'external',
+                        lastUpdated: new Date().toISOString(),
+                    });
+                    validateUsersSchema(linked);
+                    const { resource } = await usersContainer.items.upsert(linked);
+                    user = resource;
+                }
+            } catch (inviteError) {
+                invitation = {
+                    skipped: false,
+                    error: inviteError.message || 'Microsoft invitation failed',
+                };
+            }
+
             const updatedRequest = {
                 ...accessRequest,
                 status: 'approved',
@@ -2350,12 +2585,25 @@ app.http('accessRequestsApprove', {
                 role: body.role || user.role,
                 allowedSiteIds: user.allowedSiteIds || [],
                 allowedStudyIds: user.allowedStudyIds || [],
+                entraId: user.entraId || accessRequest.entraId || invitation?.entraId || '',
+                inviteStatus: invitation?.status || (invitation?.skipped ? invitation.reason : ''),
+                inviteRedeemUrl: invitation?.inviteRedeemUrl || '',
+                inviteError: invitation?.error || '',
             };
             const { resource: savedRequest } = await requestsContainer.items.upsert(updatedRequest);
             return {
                 jsonBody: {
                     request: savedRequest,
                     user: stripUserSecrets(user),
+                    invitation: invitation ? {
+                        sent: !invitation.skipped && !invitation.error && !!(invitation.entraId || invitation.status),
+                        skipped: !!invitation.skipped,
+                        status: invitation.status || '',
+                        entraId: user.entraId || invitation.entraId || '',
+                        inviteRedeemUrl: invitation.inviteRedeemUrl || '',
+                        error: invitation.error || '',
+                        reason: invitation.reason || '',
+                    } : null,
                 },
                 headers: jsonHeaders,
             };
