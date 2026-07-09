@@ -2845,6 +2845,11 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
                 
+                const skipTravelDayProcessingOnCreate = body.skipTravelDayProcessing === true;
+                if (body.skipTravelDayProcessing !== undefined) {
+                    delete body.skipTravelDayProcessing;
+                }
+
                 const newItem = { ...body, id: generateId() };
                 try {
                     const { resource: createdItem } = await container.items.create(newItem);
@@ -2889,7 +2894,7 @@ async function crudHandler(context, request, containerName) {
                     }
                     
                     // For Site Assignment shifts, create travel days from travelDayPreferences
-                    if (containerName === 'events' && createdItem && createdItem.type === 'Site Assignment' && createdItem.date && createdItem.travelDayPreferences) {
+                    if (!skipTravelDayProcessingOnCreate && containerName === 'events' && createdItem && createdItem.type === 'Site Assignment' && createdItem.date && createdItem.travelDayPreferences) {
                         context.log.info(`[TRAVEL PREFS DEBUG] Processing travelDayPreferences for Site Assignment: ${JSON.stringify(createdItem.travelDayPreferences)}`);
                         try {
                             const eventsContainer = getContainer('events');
@@ -3025,14 +3030,14 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
-                    // Triggered emails: new shift
+                    // Triggered emails: new shift (background — do not block HTTP response)
                     if (containerName === 'events' && createdItem && createdItem.type === 'Site Assignment') {
-                        try { await processEmailTriggers(context, { triggerType: 'new_shift', event: createdItem }); } catch (triggerErr) {
+                        processEmailTriggers(context, { triggerType: 'new_shift', event: createdItem }).catch((triggerErr) => {
                             context.log.warn('processEmailTriggers (new_shift) failed:', triggerErr.message);
-                        }
-                        try { await processEmailTriggers(context, { triggerType: 'shift_created_missing_role', event: createdItem }); } catch (triggerErr) {
+                        });
+                        processEmailTriggers(context, { triggerType: 'shift_created_missing_role', event: createdItem }).catch((triggerErr) => {
                             context.log.warn('processEmailTriggers (shift_created_missing_role) failed:', triggerErr.message);
-                        }
+                        });
                     }
                     
                     return { status: 201, jsonBody: createdItem };
@@ -4295,41 +4300,37 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
-                    // Triggered emails: shift edit / removed from shift / cancelled
+                    // Triggered emails: shift edit / removed from shift / cancelled (background)
                     if (containerName === 'events' && result && result.type === 'Site Assignment') {
                         const wasCancelledBefore = isEventCancelled(eventBeforeUpdate);
                         const isCancelledNow = isEventCancelled(result);
                         const justCancelled = !wasCancelledBefore && isCancelledNow;
                         if (!justCancelled) {
-                            try { await processEmailTriggers(context, { triggerType: 'shift_edit', event: result }); } catch (triggerErr) {
+                            processEmailTriggers(context, { triggerType: 'shift_edit', event: result }).catch((triggerErr) => {
                                 context.log.warn('processEmailTriggers (shift_edit) failed:', triggerErr.message);
-                            }
+                            });
                         }
                         const removedIds = eventBeforeUpdate
                             ? diffRemovedCrcIdsFromEvents(eventBeforeUpdate, result)
                             : removedFromShiftCrcIds;
                         if (removedIds.length > 0) {
                             context.log.info(`removed_from_shift: ${removedIds.length} CRC(s) removed from event ${result.id}`);
-                            try {
-                                await processEmailTriggers(context, {
-                                    triggerType: 'removed_from_shift',
-                                    event: result,
-                                    removedCrcIds: removedIds
-                                });
-                            } catch (triggerErr) {
+                            processEmailTriggers(context, {
+                                triggerType: 'removed_from_shift',
+                                event: result,
+                                removedCrcIds: removedIds
+                            }).catch((triggerErr) => {
                                 context.log.warn('processEmailTriggers (removed_from_shift) failed:', triggerErr.message);
-                            }
+                            });
                         }
                         if (justCancelled) {
-                            try {
-                                const shouldFire = await shouldFireShiftCancelledTrigger(container, result);
-                                if (shouldFire) {
-                                    context.log.info(`shift_cancelled: notifying staff for event ${result.id}`);
-                                    await processEmailTriggers(context, { triggerType: 'shift_cancelled', event: result });
-                                }
-                            } catch (triggerErr) {
+                            shouldFireShiftCancelledTrigger(container, result).then((shouldFire) => {
+                                if (!shouldFire) return null;
+                                context.log.info(`shift_cancelled: notifying staff for event ${result.id}`);
+                                return processEmailTriggers(context, { triggerType: 'shift_cancelled', event: result });
+                            }).catch((triggerErr) => {
                                 context.log.warn('processEmailTriggers (shift_cancelled) failed:', triggerErr.message);
-                            }
+                            });
                         }
                     }
                     // Triggered emails: schedule finalized
@@ -4440,15 +4441,13 @@ async function crudHandler(context, request, containerName) {
                         const removedCrcIds = Array.from(collectCrcIdsFromEvent(resource));
                         if (removedCrcIds.length > 0) {
                             context.log.info(`removed_from_shift (delete): shift ${id}, notifying ${removedCrcIds.length} CRC(s)`);
-                            try {
-                                await processEmailTriggers(context, {
-                                    triggerType: 'removed_from_shift',
-                                    event: resource,
-                                    removedCrcIds
-                                });
-                            } catch (triggerErr) {
+                            processEmailTriggers(context, {
+                                triggerType: 'removed_from_shift',
+                                event: resource,
+                                removedCrcIds
+                            }).catch((triggerErr) => {
                                 context.log.warn('processEmailTriggers (removed_from_shift on delete) failed:', triggerErr.message);
-                            }
+                            });
                         }
                     }
 
