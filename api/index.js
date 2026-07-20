@@ -8906,13 +8906,39 @@ app.http('navanTest', {
     },
 });
 
-// Azure Maps Geocoding Proxy
+// Azure Maps Geocoding Proxy — in-memory cache shared across requests in this instance
+const azureMapsGeocodeCache = new Map(); // key -> { expires, body }
+const azureMapsRouteCache = new Map();
+const AZURE_MAPS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const AZURE_MAPS_CACHE_MAX = 2000;
+
+const getAzureMapsCache = (map, key) => {
+    const hit = map.get(key);
+    if (!hit) return null;
+    if (Date.now() > hit.expires) {
+        map.delete(key);
+        return null;
+    }
+    return hit.body;
+};
+
+const setAzureMapsCache = (map, key, body) => {
+    if (map.size >= AZURE_MAPS_CACHE_MAX) {
+        const firstKey = map.keys().next().value;
+        if (firstKey !== undefined) map.delete(firstKey);
+    }
+    map.set(key, { expires: Date.now() + AZURE_MAPS_CACHE_TTL_MS, body });
+};
+
 app.http('geocode', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'geocode',
     handler: async (request, context) => {
         try {
+            if (request.method === 'OPTIONS') {
+                return { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } };
+            }
             const azureMapsKey = process.env.AZURE_MAPS_KEY || process.env.AZURE_MAPS_SUBSCRIPTION_KEY;
             if (!azureMapsKey) {
                 return {
@@ -8946,6 +8972,20 @@ app.http('geocode', {
                     }
                 }
             }
+
+            const cacheKey = (queryParams || '').toLowerCase();
+            const cached = cacheKey ? getAzureMapsCache(azureMapsGeocodeCache, cacheKey) : null;
+            if (cached) {
+                return {
+                    status: 200,
+                    jsonBody: cached,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'X-Cache': 'HIT'
+                    }
+                };
+            }
             
             // Build the Azure Maps API URL - pass all query params and add subscription-key
             const apiUrl = `https://atlas.microsoft.com/search/address/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
@@ -8954,10 +8994,17 @@ app.http('geocode', {
                 const fetchFn = await getFetch();
                 const response = await fetchFn(apiUrl);
                 const data = await response.json();
+                if (cacheKey && data && !data.error) {
+                    setAzureMapsCache(azureMapsGeocodeCache, cacheKey, data);
+                }
                 return {
                     status: 200,
                     jsonBody: data,
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'X-Cache': 'MISS'
+                    }
                 };
             } catch (error) {
                 context.log.error('Azure Maps geocoding error:', error.message);
@@ -8985,6 +9032,9 @@ app.http('routeDirections', {
     route: 'route/directions',
     handler: async (request, context) => {
         try {
+            if (request.method === 'OPTIONS') {
+                return { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } };
+            }
             const azureMapsKey = process.env.AZURE_MAPS_KEY || process.env.AZURE_MAPS_SUBSCRIPTION_KEY;
             if (!azureMapsKey) {
                 return {
@@ -9018,6 +9068,20 @@ app.http('routeDirections', {
                     }
                 }
             }
+
+            const cacheKey = (queryParams || '').toLowerCase();
+            const cached = cacheKey ? getAzureMapsCache(azureMapsRouteCache, cacheKey) : null;
+            if (cached) {
+                return {
+                    status: 200,
+                    jsonBody: cached,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'X-Cache': 'HIT'
+                    }
+                };
+            }
             
             // Build the Azure Maps API URL - pass all query params and add subscription-key
             const apiUrl = `https://atlas.microsoft.com/route/directions/json${queryParams ? queryParams + '&' : '?'}subscription-key=${azureMapsKey}`;
@@ -9026,10 +9090,17 @@ app.http('routeDirections', {
                 const fetchFn = await getFetch();
                 const response = await fetchFn(apiUrl);
                 const data = await response.json();
+                if (cacheKey && data && data.routes && !data.error) {
+                    setAzureMapsCache(azureMapsRouteCache, cacheKey, data);
+                }
                 return {
                     status: 200,
                     jsonBody: data,
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'X-Cache': 'MISS'
+                    }
                 };
             } catch (error) {
                 context.log.error('Azure Maps route directions error:', error.message);

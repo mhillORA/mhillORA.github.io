@@ -3259,9 +3259,100 @@
             // --- HELPER FUNCTIONS ---
             const geocodeCache = new Map();
             const siteGeocodeCache = new Map();
+            const crcGeocodeCache = new Map();
+            const routeDistanceCache = new Map();
             const GEOCODE_CACHE_MISS = '__miss__';
+            const GEOCODE_LS_KEY = 'chaos_geocode_cache_v1';
+            const GEOCODE_LS_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days — addresses rarely move
+            const ROUTE_LS_KEY = 'chaos_route_cache_v1';
+            const ROUTE_LS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+            const pendingCoordBackfills = new Set();
 
-            // Geocode location using Azure Maps Search API (in-memory cache per session)
+            const normalizeCoordPair = (obj) => {
+                if (!obj || typeof obj !== 'object') return null;
+                const lat = obj.lat ?? obj.latitude;
+                const lng = obj.lng ?? obj.longitude ?? obj.lon;
+                if (lat == null || lng == null) return null;
+                const latN = Number(lat);
+                const lngN = Number(lng);
+                if (!Number.isFinite(latN) || !Number.isFinite(lngN)) return null;
+                if (latN < -90 || latN > 90 || lngN < -180 || lngN > 180) return null;
+                return { lat: latN, lng: lngN };
+            };
+
+            const readPersistedCache = (storageKey, ttlMs) => {
+                try {
+                    const raw = localStorage.getItem(storageKey);
+                    if (!raw) return {};
+                    const parsed = JSON.parse(raw);
+                    const now = Date.now();
+                    const out = {};
+                    Object.entries(parsed || {}).forEach(([k, v]) => {
+                        if (v && typeof v === 'object' && v.ts && (now - v.ts) < ttlMs) {
+                            out[k] = v;
+                        }
+                    });
+                    return out;
+                } catch (_) {
+                    return {};
+                }
+            };
+
+            const writePersistedCacheEntry = (storageKey, ttlMs, key, value) => {
+                try {
+                    const store = readPersistedCache(storageKey, ttlMs);
+                    store[key] = { ...value, ts: Date.now() };
+                    // Cap size so localStorage doesn't grow forever
+                    const keys = Object.keys(store);
+                    if (keys.length > 2000) {
+                        keys.sort((a, b) => (store[a].ts || 0) - (store[b].ts || 0));
+                        keys.slice(0, keys.length - 1500).forEach(k => delete store[k]);
+                    }
+                    localStorage.setItem(storageKey, JSON.stringify(store));
+                } catch (_) { /* quota / private mode */ }
+            };
+
+            // Seed in-memory cache from localStorage once
+            (() => {
+                const persisted = readPersistedCache(GEOCODE_LS_KEY, GEOCODE_LS_TTL_MS);
+                Object.entries(persisted).forEach(([k, v]) => {
+                    if (v.miss) geocodeCache.set(k, GEOCODE_CACHE_MISS);
+                    else if (v.lat != null && v.lng != null) {
+                        geocodeCache.set(k, { lat: v.lat, lng: v.lng, displayName: v.displayName || k });
+                    }
+                });
+                const routes = readPersistedCache(ROUTE_LS_KEY, ROUTE_LS_TTL_MS);
+                Object.entries(routes).forEach(([k, v]) => {
+                    if (v && v.distance != null) routeDistanceCache.set(k, v);
+                });
+            })();
+
+            // Quietly persist coords on site/CRC so future sessions skip Azure geocode
+            const backfillEntityCoordinates = (kind, id, coords) => {
+                if (!id || !coords || pendingCoordBackfills.has(`${kind}:${id}`)) return;
+                pendingCoordBackfills.add(`${kind}:${id}`);
+                const payload = {
+                    coordinates: { latitude: coords.lat, longitude: coords.lng, lat: coords.lat, lng: coords.lng }
+                };
+                const run = async () => {
+                    try {
+                        if (kind === 'site') await apiService.updateSite(id, payload);
+                        else if (kind === 'crc') await apiService.updateCrc(id, payload);
+                        // Keep local state in sync so we don't geocode again this session
+                        if (kind === 'site') {
+                            const site = state.crc_sites?.find(s => s.id === id);
+                            if (site) site.coordinates = payload.coordinates;
+                        } else {
+                            const crc = state.crcs?.find(c => c.id === id);
+                            if (crc) crc.coordinates = payload.coordinates;
+                        }
+                    } catch (_) { /* non-blocking */ }
+                };
+                if (typeof requestIdleCallback === 'function') requestIdleCallback(() => run());
+                else setTimeout(run, 1500);
+            };
+
+            // Geocode via Azure Maps — memory + localStorage cache; prefer stored entity coords via resolve*
             const geocodeLocation = async (locationString) => {
                 try {
                     const key = (locationString || '').trim().toLowerCase();
@@ -3283,9 +3374,13 @@
                             displayName: result.address?.freeformAddress || locationString
                         };
                         geocodeCache.set(key, coords);
+                        writePersistedCacheEntry(GEOCODE_LS_KEY, GEOCODE_LS_TTL_MS, key, {
+                            lat: coords.lat, lng: coords.lng, displayName: coords.displayName
+                        });
                         return coords;
                     }
                     geocodeCache.set(key, GEOCODE_CACHE_MISS);
+                    writePersistedCacheEntry(GEOCODE_LS_KEY, GEOCODE_LS_TTL_MS, key, { miss: true });
                     return null;
                 } catch (error) {
                     console.error('Geocoding error:', error);
@@ -3295,14 +3390,26 @@
 
             const resolveCrcCoordinates = async (crc) => {
                 if (!crc) return null;
-                if (crc.coordinates && crc.coordinates.latitude != null && crc.coordinates.longitude != null) {
-                    return { lat: crc.coordinates.latitude, lng: crc.coordinates.longitude };
+                if (crc.id && crcGeocodeCache.has(crc.id)) {
+                    const cached = crcGeocodeCache.get(crc.id);
+                    return cached === GEOCODE_CACHE_MISS ? null : cached;
+                }
+                const stored = normalizeCoordPair(crc.coordinates);
+                if (stored) {
+                    if (crc.id) crcGeocodeCache.set(crc.id, stored);
+                    return stored;
                 }
                 const home = (crc.homeLocation || '').trim();
                 const crcLocation = home || getCrcAddress(crc);
-                if (!crcLocation) return null;
+                if (!crcLocation) {
+                    if (crc.id) crcGeocodeCache.set(crc.id, GEOCODE_CACHE_MISS);
+                    return null;
+                }
                 const geocode = await geocodeLocation(crcLocation);
-                return geocode ? { lat: geocode.lat, lng: geocode.lng } : null;
+                const coords = geocode ? { lat: geocode.lat, lng: geocode.lng } : null;
+                if (crc.id) crcGeocodeCache.set(crc.id, coords || GEOCODE_CACHE_MISS);
+                if (coords && crc.id) backfillEntityCoordinates('crc', crc.id, coords);
+                return coords;
             };
 
             const resolveSiteCoordinates = async (site) => {
@@ -3311,10 +3418,10 @@
                     const cached = siteGeocodeCache.get(site.id);
                     return cached === GEOCODE_CACHE_MISS ? null : cached;
                 }
-                if (site.coordinates && site.coordinates.latitude != null && site.coordinates.longitude != null) {
-                    const coords = { lat: site.coordinates.latitude, lng: site.coordinates.longitude };
-                    if (site.id) siteGeocodeCache.set(site.id, coords);
-                    return coords;
+                const stored = normalizeCoordPair(site.coordinates);
+                if (stored) {
+                    if (site.id) siteGeocodeCache.set(site.id, stored);
+                    return stored;
                 }
                 const siteAddress = getSiteAddress(site);
                 if (!siteAddress) {
@@ -3324,6 +3431,7 @@
                 const geocode = await geocodeLocation(siteAddress);
                 const coords = geocode ? { lat: geocode.lat, lng: geocode.lng } : null;
                 if (site.id) siteGeocodeCache.set(site.id, coords || GEOCODE_CACHE_MISS);
+                if (coords && site.id) backfillEntityCoordinates('site', site.id, coords);
                 return coords;
             };
             
@@ -3405,20 +3513,14 @@
                         console.error('calculateDistance: Missing addresses', { hotelAddress, siteAddress });
                         return null;
                     }
-                    
-                    console.log('calculateDistance: Calculating route from address to address');
-                    console.log('Hotel address:', hotelAddress);
-                    console.log('Site address:', siteAddress);
-                    
+
                     // First, geocode both addresses to get coordinates
-                    console.log('calculateDistance: Geocoding addresses...');
                     const hotelGeocode = await geocodeLocation(hotelAddress);
                     const siteGeocode = await geocodeLocation(siteAddress);
                     
                     if (!hotelGeocode || !siteGeocode) {
                         console.error('calculateDistance: Failed to geocode addresses', { hotelGeocode, siteGeocode });
                         // Fallback: try with addresses directly
-                        console.log('calculateDistance: Trying with addresses directly as fallback');
                         const queryParam = `${encodeURIComponent(hotelAddress)}:${encodeURIComponent(siteAddress)}`;
                         const url = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=shortest`;
                         const response = await fetch(url);
@@ -3428,14 +3530,20 @@
                         }
                         return null;
                     }
+
+                    const routeCacheKey = [
+                        hotelGeocode.lat.toFixed(5), hotelGeocode.lng.toFixed(5),
+                        siteGeocode.lat.toFixed(5), siteGeocode.lng.toFixed(5)
+                    ].join(':');
+                    if (routeDistanceCache.has(routeCacheKey)) {
+                        return routeDistanceCache.get(routeCacheKey);
+                    }
                     
                     // Use coordinates in route API (Azure Maps Route API expects latitude,longitude format)
                     const queryParam = `${hotelGeocode.lat},${hotelGeocode.lng}:${siteGeocode.lat},${siteGeocode.lng}`;
                     const url = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=shortest`;
-                    console.log('calculateDistance: Calling route API with coordinates');
                     
                     const response = await fetch(url);
-                    console.log('calculateDistance: Response status:', response.status);
                     
                     if (!response.ok) {
                         const errorText = await response.text();
@@ -3444,7 +3552,6 @@
                     }
                     
                     const data = await response.json();
-                    console.log('calculateDistance: Response data:', data);
                     
                     // Check for error in response (even if status is 200)
                     if (data && data.error) {
@@ -3461,7 +3568,12 @@
                             if (fallbackResponse.ok) {
                                 const fallbackData = await fallbackResponse.json();
                                 if (fallbackData && fallbackData.routes && fallbackData.routes.length > 0) {
-                                    return parseRouteResponse(fallbackData, hotelGeocode, siteGeocode);
+                                    const parsed = parseRouteResponse(fallbackData, hotelGeocode, siteGeocode);
+                                    if (parsed) {
+                                        routeDistanceCache.set(routeCacheKey, parsed);
+                                        writePersistedCacheEntry(ROUTE_LS_KEY, ROUTE_LS_TTL_MS, routeCacheKey, parsed);
+                                    }
+                                    return parsed;
                                 }
                             }
                         }
@@ -3469,7 +3581,12 @@
                     }
                     
                     if (data && data.routes && data.routes.length > 0) {
-                        return parseRouteResponse(data, hotelGeocode, siteGeocode);
+                        const parsed = parseRouteResponse(data, hotelGeocode, siteGeocode);
+                        if (parsed) {
+                            routeDistanceCache.set(routeCacheKey, parsed);
+                            writePersistedCacheEntry(ROUTE_LS_KEY, ROUTE_LS_TTL_MS, routeCacheKey, parsed);
+                        }
+                        return parsed;
                     }
                 } catch (error) {
                     console.error('Error calculating distance:', error);
@@ -12374,7 +12491,7 @@
                                                 const crcCityState = travelCrc.homeLocation || [crcCity, travelCrc.state].filter(Boolean).join(', ');
                                                 const siteCityState = [siteCity, site.state].filter(Boolean).join(', ');
                                                 if (crcCityState && siteCityState) {
-                                                    Promise.all([geocodeLocation(crcCityState), geocodeLocation(siteCityState)])
+                                                    Promise.all([resolveCrcCoordinates(travelCrc), resolveSiteCoordinates(site)])
                                                         .then(([crcGeo, siteGeo]) => {
                                                             if (crcGeo && siteGeo) {
                                                                 const mi = calculateHaversineDistance(crcGeo.lat, crcGeo.lng, siteGeo.lat, siteGeo.lng);
@@ -12861,7 +12978,7 @@
                                                 const crcCityState = travelCrc.homeLocation || [crcCity, travelCrc.state].filter(Boolean).join(', ');
                                                 const siteCityState = [siteCity, site.state].filter(Boolean).join(', ');
                                                 if (crcCityState && siteCityState) {
-                                                    Promise.all([geocodeLocation(crcCityState), geocodeLocation(siteCityState)])
+                                                    Promise.all([resolveCrcCoordinates(travelCrc), resolveSiteCoordinates(site)])
                                                         .then(([crcGeo, siteGeo]) => {
                                                             if (crcGeo && siteGeo) {
                                                                 const mi = calculateHaversineDistance(crcGeo.lat, crcGeo.lng, siteGeo.lat, siteGeo.lng);
@@ -20466,44 +20583,76 @@
             
             // Initialize scheduler map with site locations
             let schedulerMap = null;
+            let schedulerMapInitPromise = null;
             const initializeSchedulerMap = async () => {
                 const mapContainer = document.getElementById('chaos-scheduler-map');
                 if (!mapContainer) {
                     debugLog('Scheduler map container not found (expected when not on scheduler tab)');
                     return;
                 }
-                if (!AZURE_MAPS_KEY) {
-                    setTimeout(() => initializeSchedulerMap(), 500);
-                    return;
-                }
-                if (typeof atlas === 'undefined') {
-                    try { await window.loadAzureMaps(); } catch (e) { console.error('Azure Maps load failed:', e); return; }
-                }
-                // Dispose existing map if it exists
+                // Already live — just refresh markers (avoid re-billing for a new map tile session)
                 if (schedulerMap) {
-                    schedulerMap.dispose();
-                    schedulerMap = null;
-                }
-                
-                try {
-                    // Initialize Azure Maps
-                    schedulerMap = new atlas.Map('chaos-scheduler-map', {
-                        center: [-98.5795, 39.8283], // [longitude, latitude] - Center of USA
-                        zoom: 4,
-                        authOptions: {
-                            authType: 'subscriptionKey',
-                            subscriptionKey: AZURE_MAPS_KEY
-                        },
-                        style: document.documentElement.classList.contains('dark') ? 'dark' : 'road'
-                    });
-                    
-                    // Wait for map to be ready
-                    schedulerMap.events.add('ready', () => {
+                    const alive = mapContainer.querySelector('canvas') || mapContainer.childElementCount > 0;
+                    if (alive) {
                         loadSchedulerMapMarkers();
-                    });
-                } catch (error) {
-                    console.error('Error initializing scheduler map:', error);
+                        return;
+                    }
+                    try { schedulerMap.dispose(); } catch (_) {}
+                    schedulerMap = null;
+                    schedulerMapInitPromise = null;
                 }
+                if (schedulerMapInitPromise) return schedulerMapInitPromise;
+
+                const startInit = async () => {
+                    if (!AZURE_MAPS_KEY) {
+                        await new Promise(r => setTimeout(r, 500));
+                        if (!AZURE_MAPS_KEY) return;
+                    }
+                    if (typeof atlas === 'undefined') {
+                        try { await window.loadAzureMaps(); } catch (e) { console.error('Azure Maps load failed:', e); return; }
+                    }
+                    if (schedulerMap) {
+                        loadSchedulerMapMarkers();
+                        return;
+                    }
+                    try {
+                        schedulerMap = new atlas.Map('chaos-scheduler-map', {
+                            center: [-98.5795, 39.8283],
+                            zoom: 4,
+                            authOptions: {
+                                authType: 'subscriptionKey',
+                                subscriptionKey: AZURE_MAPS_KEY
+                            },
+                            style: document.documentElement.classList.contains('dark') ? 'dark' : 'road',
+                            // Fewer default services = less Azure Maps traffic
+                            showLogo: false,
+                            showFeedbackLink: false
+                        });
+                        schedulerMap.events.add('ready', () => {
+                            loadSchedulerMapMarkers();
+                        });
+                    } catch (error) {
+                        console.error('Error initializing scheduler map:', error);
+                        schedulerMap = null;
+                    }
+                };
+
+                // Only create the map (and pull tiles) once the section is on screen
+                schedulerMapInitPromise = new Promise((resolve) => {
+                    const run = () => startInit().finally(resolve);
+                    if (typeof IntersectionObserver === 'undefined') {
+                        run();
+                        return;
+                    }
+                    const obs = new IntersectionObserver((entries) => {
+                        if (entries.some(e => e.isIntersecting)) {
+                            obs.disconnect();
+                            run();
+                        }
+                    }, { rootMargin: '100px', threshold: 0.05 });
+                    obs.observe(mapContainer);
+                });
+                return schedulerMapInitPromise;
             };
             
             const loadSchedulerMapMarkers = async () => {
@@ -20545,31 +20694,18 @@
                 
                 // ============ SITE MARKERS ============
                 const sitesWithAddress = state.crc_sites.filter(site => 
-                    site && (site.address1 || site.city || site.state)
+                    site && (site.coordinates || site.address1 || site.city || site.state)
                 );
                 
                 for (const site of sitesWithAddress) {
                     try {
                         if (!schedulerMap || !schedulerMap.markers) break;
                         
-                        const siteAddressParts = [
-                            site.address1 || '', 
-                            site.city || '', 
-                            site.state || '', 
-                            site.zipCode || site.zip || ''
-                        ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
-                        
-                        if (siteAddressParts.length === 0) continue;
-                        
-                        const siteAddress = siteAddressParts.join(', ');
-                        const coords = await geocodeLocation(siteAddress);
-                        
+                        const coords = await resolveSiteCoordinates(site);
                         if (!coords) continue;
                         
-                        const lat = parseFloat(coords.lat);
-                        const lng = parseFloat(coords.lng);
-                        
-                        if (isNaN(lat) || isNaN(lng) || lat < -60 || lat > 90 || lng < -180 || lng > 180) continue;
+                        const lat = coords.lat;
+                        const lng = coords.lng;
                         
                         // Site marker (blue)
                         const markerHtml = `
@@ -20615,36 +20751,18 @@
                 
                 // ============ CRC HOME LOCATION MARKERS ============
                 const crcsWithAddress = state.crcs.filter(crc => 
-                    crc && (crc.homeLocation || crc.address || crc.city || crc.state || crc.homeAddress)
+                    crc && (crc.coordinates || crc.homeLocation || crc.address || crc.city || crc.state || crc.homeAddress)
                 );
                 
                 for (const crc of crcsWithAddress) {
                     try {
                         if (!schedulerMap || !schedulerMap.markers) break;
                         
-                        // Build CRC home address - prefer homeLocation field (e.g., "Memphis, TN")
-                        let crcAddress = '';
-                        if (crc.homeLocation && crc.homeLocation.trim()) {
-                            crcAddress = crc.homeLocation.trim();
-                        } else {
-                            const crcAddressParts = [
-                                crc.homeAddress || crc.address || '',
-                                crc.city || '',
-                                crc.state || '',
-                                crc.zipCode || crc.zip || ''
-                            ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
-                            crcAddress = crcAddressParts.join(', ');
-                        }
-                        
-                        if (!crcAddress) continue;
-                        const coords = await geocodeLocation(crcAddress);
-                        
+                        const coords = await resolveCrcCoordinates(crc);
                         if (!coords) continue;
                         
-                        const lat = parseFloat(coords.lat);
-                        const lng = parseFloat(coords.lng);
-                        
-                        if (isNaN(lat) || isNaN(lng) || lat < -60 || lat > 90 || lng < -180 || lng > 180) continue;
+                        const lat = coords.lat;
+                        const lng = coords.lng;
                         
                         // CRC home marker (green)
                         const markerHtml = `
@@ -20705,50 +20823,85 @@
             
             // ============ CRC DEPLOYMENT MAP ============
             let deploymentMap = null;
+            let deploymentMapInitPromise = null;
             
             const initializeDeploymentMap = async () => {
                 const mapContainer = document.getElementById('crc-deployment-map');
                 if (!mapContainer) return;
-                if (!AZURE_MAPS_KEY) {
-                    setTimeout(() => initializeDeploymentMap(), 500);
-                    return;
-                }
-                if (typeof atlas === 'undefined') {
-                    try { await window.loadAzureMaps(); } catch (e) { console.error('Azure Maps load failed:', e); return; }
-                }
+
                 if (deploymentMap) {
-                    deploymentMap.dispose();
-                    deploymentMap = null;
-                }
-                
-                try {
-                    deploymentMap = new atlas.Map('crc-deployment-map', {
-                        center: [-98.5795, 39.8283],
-                        zoom: 4,
-                        authOptions: {
-                            authType: 'subscriptionKey',
-                            subscriptionKey: AZURE_MAPS_KEY
-                        },
-                        style: document.documentElement.classList.contains('dark') ? 'dark' : 'road'
-                    });
-                    
-                    deploymentMap.events.add('ready', () => {
+                    const alive = mapContainer.querySelector('canvas') || mapContainer.childElementCount > 0;
+                    if (alive) {
                         loadDeploymentMapMarkers();
-                    });
-                    
-                    // Setup date change listener
-                    const dateInput = document.getElementById('crc-deployment-date');
-                    const refreshBtn = document.getElementById('refresh-deployment-map');
-                    
-                    if (dateInput) {
-                        dateInput.addEventListener('change', () => loadDeploymentMapMarkers());
+                        return;
                     }
-                    if (refreshBtn) {
-                        refreshBtn.addEventListener('click', () => loadDeploymentMapMarkers());
-                    }
-                } catch (error) {
-                    console.error('Error initializing deployment map:', error);
+                    try { deploymentMap.dispose(); } catch (_) {}
+                    deploymentMap = null;
+                    deploymentMapInitPromise = null;
                 }
+                if (deploymentMapInitPromise) return deploymentMapInitPromise;
+
+                const startInit = async () => {
+                    if (!AZURE_MAPS_KEY) {
+                        await new Promise(r => setTimeout(r, 500));
+                        if (!AZURE_MAPS_KEY) return;
+                    }
+                    if (typeof atlas === 'undefined') {
+                        try { await window.loadAzureMaps(); } catch (e) { console.error('Azure Maps load failed:', e); return; }
+                    }
+                    if (deploymentMap) {
+                        loadDeploymentMapMarkers();
+                        return;
+                    }
+                    try {
+                        deploymentMap = new atlas.Map('crc-deployment-map', {
+                            center: [-98.5795, 39.8283],
+                            zoom: 4,
+                            authOptions: {
+                                authType: 'subscriptionKey',
+                                subscriptionKey: AZURE_MAPS_KEY
+                            },
+                            style: document.documentElement.classList.contains('dark') ? 'dark' : 'road',
+                            showLogo: false,
+                            showFeedbackLink: false
+                        });
+                        
+                        deploymentMap.events.add('ready', () => {
+                            loadDeploymentMapMarkers();
+                        });
+                        
+                        const dateInput = document.getElementById('crc-deployment-date');
+                        const refreshBtn = document.getElementById('refresh-deployment-map');
+                        
+                        if (dateInput && !dateInput.dataset.mapsBound) {
+                            dateInput.dataset.mapsBound = '1';
+                            dateInput.addEventListener('change', () => loadDeploymentMapMarkers());
+                        }
+                        if (refreshBtn && !refreshBtn.dataset.mapsBound) {
+                            refreshBtn.dataset.mapsBound = '1';
+                            refreshBtn.addEventListener('click', () => loadDeploymentMapMarkers());
+                        }
+                    } catch (error) {
+                        console.error('Error initializing deployment map:', error);
+                        deploymentMap = null;
+                    }
+                };
+
+                deploymentMapInitPromise = new Promise((resolve) => {
+                    const run = () => startInit().finally(resolve);
+                    if (typeof IntersectionObserver === 'undefined') {
+                        run();
+                        return;
+                    }
+                    const obs = new IntersectionObserver((entries) => {
+                        if (entries.some(e => e.isIntersecting)) {
+                            obs.disconnect();
+                            run();
+                        }
+                    }, { rootMargin: '100px', threshold: 0.05 });
+                    obs.observe(mapContainer);
+                });
+                return deploymentMapInitPromise;
             };
             
             const loadDeploymentMapMarkers = async () => {
@@ -20862,17 +21015,13 @@
                             site.zipCode || site.zip || ''
                         ].filter(p => p && typeof p === 'string' && p.trim().length > 0);
                         
-                        if (siteAddressParts.length === 0) continue;
+                        if (siteAddressParts.length === 0 && !site.coordinates) continue;
                         
-                        const siteAddress = siteAddressParts.join(', ');
-                        const coords = await geocodeLocation(siteAddress);
-                        
+                        const coords = await resolveSiteCoordinates(site);
                         if (!coords) continue;
                         
-                        const baseLat = parseFloat(coords.lat);
-                        const baseLng = parseFloat(coords.lng);
-                        
-                        if (isNaN(baseLat) || isNaN(baseLng)) continue;
+                        const baseLat = coords.lat;
+                        const baseLng = coords.lng;
                         
                         allPositions.push([baseLng, baseLat]);
                         
@@ -44124,9 +44273,9 @@
                             }
                             
                             try {
-                                // Geocode city-to-city (simpler, more reliable)
-                                const crcGeocode = await geocodeLocation(crcCityState);
-                                const siteGeocode = await geocodeLocation(siteCityState);
+                                // Prefer stored coordinates (no Azure call); fall back to geocode once
+                                const crcGeocode = await resolveCrcCoordinates(crc);
+                                const siteGeocode = await resolveSiteCoordinates(site);
                                 
                                 if (crcGeocode && siteGeocode) {
                                     const mi = calculateHaversineDistance(
