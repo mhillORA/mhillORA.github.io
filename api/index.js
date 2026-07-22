@@ -2475,6 +2475,13 @@ app.http('surveys', {
     handler: (request, context) => crudHandler(context, request, 'surveys'),
 });
 
+app.http('recruitmentSettings', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'recruitment-settings/{id?}',
+    handler: (request, context) => crudHandler(context, request, 'recruitment-settings'),
+});
+
 app.http('users', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',

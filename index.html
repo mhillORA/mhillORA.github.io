@@ -371,10 +371,11 @@ const COLLECTION_API_NAME = {
     schedules: 'patient-schedules',
     accessRequests: 'access-requests',
     cohortRules: 'cohort-rules',
+    settings: 'recruitment-settings',
 };
 const toApiCollectionName = (logicalCollection) => COLLECTION_API_NAME[logicalCollection] || logicalCollection;
 
-const OPTIONAL_API_COLLECTIONS = new Set(['accessRequests', 'cohortRules', 'bulkJobs']);
+const OPTIONAL_API_COLLECTIONS = new Set(['accessRequests', 'cohortRules', 'bulkJobs', 'settings']);
 
 const fetchData = async (collection) => {
     try {
@@ -651,6 +652,7 @@ let state = {
     currentUser: null,
     pendingEntraProfile: null,
     privacyMaskSensitive: false, // blur PHI/PII on screen (persisted in localStorage)
+    referenceData: null,
 };
 let chartInstances = {}; // To hold chart objects for destruction
 
@@ -658,8 +660,354 @@ let chartInstances = {}; // To hold chart objects for destruction
 const LS_KEYS = {
     accessRequests: 'nasa_access_requests_v1',
     managedUsers: 'nasa_managed_users_v1',
+    referenceData: 'nasa_reference_data_v1',
 };
 const PHI_MASK_LS_KEY = 'nasa_privacy_mask_phi_pii_v1';
+
+// --- UAT: Manager-editable reference data + patient profile enhancements ---
+const DEFAULT_MEDICATION_NAMES = [
+    'Lisinopril', 'Metformin', 'Atorvastatin', 'Levothyroxine', 'Amlodipine',
+    'Losartan', 'Omeprazole', 'Albuterol', 'Sertraline', 'Ibuprofen'
+];
+const DEFAULT_UNIFORM_TAGS = [
+    'Do Not Call', 'Observational Studies Only', 'No English', 'Spanish Speaker'
+];
+const DEFAULT_NQ_REASONS = [
+    'Failed inclusion criteria', 'Met exclusion criteria', 'Age out of range',
+    'Medical history', 'Concomitant medication', 'Other'
+];
+const DEFAULT_NI_REASONS = [
+    'Not interested in study', 'Scheduling conflict', 'Travel / distance',
+    'Compensation', 'Other'
+];
+const PSQ_SECTION_HEADERS = [
+    'Voicemail Script', 'Live Patient Script', 'Study Overview',
+    'Personal Contact Details/Demographics', 'Medical History', 'Medication History',
+    'Medication Review', 'Medical and Study History', 'Scheduling', 'Waitlist'
+];
+const OVERALL_STATUS_OPTIONS = ['Not interested', 'Not qualified', 'Scheduled', 'Waitlist', 'Call Back'];
+const SEX_AT_BIRTH_OPTIONS = ['Male', 'Female', 'Unknown', 'Not Reported (Prefers not to disclose)'];
+const ETHNICITY_OPTIONS = [
+    'Hispanic or Latino', 'Not Hispanic or Latino', 'Unknown', 'Not Reported (Prefers not to disclose)'
+];
+const RACE_OPTIONS = [
+    'American Indian or Alaska Native', 'Asian', 'Black or African American',
+    'Native Hawaiian or Other Pacific Islander', 'White', 'Other (Specify)',
+    'Unknown', 'Not Reported (Prefers not to disclose)'
+];
+
+const getDefaultReferenceData = () => ({
+    id: 'nasa-reference-data',
+    medications: DEFAULT_MEDICATION_NAMES.map((name, i) => ({ id: 'med_' + (i + 1), name, active: true })),
+    tags: DEFAULT_UNIFORM_TAGS.map((name, i) => ({ id: 'tag_' + (i + 1), name, active: true })),
+    nqReasons: DEFAULT_NQ_REASONS.map((name, i) => ({ id: 'nq_' + (i + 1), name, active: true })),
+    niReasons: DEFAULT_NI_REASONS.map((name, i) => ({ id: 'ni_' + (i + 1), name, active: true })),
+    updatedAt: new Date().toISOString(),
+});
+
+const normalizeReferenceData = (rawData) => {
+    const defaults = getDefaultReferenceData();
+    const data = rawData && typeof rawData === 'object' ? rawData : {};
+    const normList = (list, fallback) => {
+        if (!Array.isArray(list) || !list.length) return fallback;
+        return list.map((item, i) => {
+            if (typeof item === 'string') return { id: 'item_' + (i + 1), name: item, active: true };
+            return {
+                id: item.id || ('item_' + (i + 1)),
+                name: String(item.name || '').trim(),
+                active: item.active !== false,
+            };
+        }).filter(x => x.name);
+    };
+    return {
+        id: 'nasa-reference-data',
+        medications: normList(data.medications, defaults.medications),
+        tags: normList(data.tags, defaults.tags),
+        nqReasons: normList(data.nqReasons, defaults.nqReasons),
+        niReasons: normList(data.niReasons, defaults.niReasons),
+        updatedAt: data.updatedAt || new Date().toISOString(),
+    };
+};
+
+const loadReferenceDataLocal = () => {
+    const parsed = safeJsonParse(localStorage.getItem(LS_KEYS.referenceData) || 'null', null);
+    state.referenceData = normalizeReferenceData(parsed || getDefaultReferenceData());
+};
+
+const saveReferenceDataLocal = () => {
+    try {
+        localStorage.setItem(LS_KEYS.referenceData, JSON.stringify(state.referenceData || getDefaultReferenceData()));
+    } catch (e) {
+        console.warn('NASA: Could not persist reference data locally.', e);
+    }
+};
+
+const persistReferenceData = async () => {
+    state.referenceData = normalizeReferenceData({
+        ...(state.referenceData || getDefaultReferenceData()),
+        updatedAt: new Date().toISOString(),
+    });
+    saveReferenceDataLocal();
+    try {
+        await updateDocument('settings', 'nasa-reference-data', state.referenceData);
+    } catch (e) {
+        try {
+            await createDocument('settings', { ...state.referenceData, id: 'nasa-reference-data' });
+        } catch (e2) {
+            console.warn('NASA: Reference data saved locally only (API unavailable).', e2 && e2.message ? e2.message : e2);
+        }
+    }
+};
+
+const loadReferenceDataFromApi = async () => {
+    try {
+        const doc = await apiCall('recruitment-settings/nasa-reference-data');
+        if (doc && (doc.medications || doc.tags)) {
+            state.referenceData = normalizeReferenceData(doc);
+            saveReferenceDataLocal();
+            return true;
+        }
+    } catch (e) { /* optional */ }
+    return false;
+};
+
+const isManagerUser = () => {
+    const role = String(state.currentUser && state.currentUser.role || '');
+    return role === 'Internal' || role === 'Manager' || role.toLowerCase() === 'admin';
+};
+
+const isPatientProfileLocked = (patient) => !!(patient && (patient.profileLocked || patient.deceased));
+
+const formatDobDisplay = (dob) => {
+    if (!dob) return '';
+    const s = String(dob);
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+        const parts = s.slice(0, 10).split('-');
+        return parts[1] + '/' + parts[2] + '/' + parts[0];
+    }
+    return s;
+};
+
+const formatPhoneFive9 = (phone) => {
+    const digits = String(phone || '').replace(/\D/g, '');
+    if (!digits) return '';
+    if (digits.length === 11 && digits.startsWith('1')) return digits;
+    if (digits.length === 10) return '1' + digits;
+    return digits.startsWith('1') ? digits : ('1' + digits);
+};
+
+const getPatientPrimarySite = (patient) => {
+    if (!patient) return null;
+    const current = (patient.enrollments || []).find(e => e.status === 'current');
+    const siteId = (current && current.siteId) || patient.homeSiteId || patient.siteId;
+    return (state.sites || []).find(s => s.id === siteId) || null;
+};
+
+const getScriptVariableMap = (patient) => {
+    const site = getPatientPrimarySite(patient);
+    const recruiter = (state.currentUser && (state.currentUser.displayName || state.currentUser.username || state.currentUser.email)) || getCurrentActor();
+    const address = site
+        ? [site.address, site.city, site.state, site.zipCode].filter(Boolean).join(', ') || site.location || ''
+        : '';
+    return {
+        '{{site_name}}': (site && site.name) || '',
+        '{{site_pi}}': (site && site.pi) || '',
+        '{{site_address}}': address,
+        '{{site_compensation}}': (site && site.compensation) || '',
+        '{{patient_name}}': [patient && patient.firstName, patient && patient.lastName].filter(Boolean).join(' '),
+        '{{patient_first_name}}': (patient && patient.firstName) || '',
+        '{{recruiter_name}}': recruiter || '',
+    };
+};
+
+const applyScriptVariables = (text, patient) => {
+    if (!text) return '';
+    const map = getScriptVariableMap(patient);
+    let out = String(text);
+    Object.keys(map).forEach((token) => {
+        out = out.split(token).join(map[token]);
+    });
+    return out;
+};
+
+const getActiveReferenceList = (key) =>
+    ((state.referenceData && state.referenceData[key]) || []).filter(x => x && x.active !== false);
+
+const buildFieldDiffDetails = (before, after, keys) => {
+    const changes = [];
+    keys.forEach((key) => {
+        const sa = JSON.stringify(before && before[key] != null ? before[key] : null);
+        const sb = JSON.stringify(after && after[key] != null ? after[key] : null);
+        if (sa !== sb) changes.push(key + ': ' + sa + ' → ' + sb);
+    });
+    return changes.join('; ').slice(0, 1800);
+};
+
+const inferOverallStatusFromSurvey = (outcome, answers) => {
+    const list = answers || [];
+    const blob = list.map(a => ((a.question || '') + ' ' + (a.answer || '')).toLowerCase()).join(' | ');
+    if (outcome === 'Fail' || /not qualified|disqualif|exclusion|screen fail|\bnq\b/.test(blob)) {
+        const hit = list.find(a => /fail|nq|not qualified|exclusion/i.test((a.question || '') + ' ' + (a.answer || '')));
+        return { overallStatus: 'Not qualified', nqReason: (hit && hit.answer) || 'Failed pre-screen survey' };
+    }
+    if (/not interested|decline|no thanks|\bni\b/.test(blob)) {
+        const hit = list.find(a => /not interested|decline|ni/i.test((a.question || '') + ' ' + (a.answer || '')));
+        return { overallStatus: 'Not interested', niReason: (hit && hit.answer) || 'Not interested' };
+    }
+    if (/waitlist|wait list/.test(blob)) return { overallStatus: 'Waitlist' };
+    if (/call back|callback|call-back/.test(blob)) return { overallStatus: 'Call Back' };
+    if (outcome === 'Pass' || /schedul/.test(blob)) return { overallStatus: 'Scheduled' };
+    return {};
+};
+
+const getLatestNqNiSummary = (patient) => {
+    const parts = [];
+    if (patient && patient.overallStatus) parts.push('Status: ' + patient.overallStatus);
+    if (patient && patient.nqReason) parts.push('NQ: ' + patient.nqReason);
+    if (patient && patient.niReason) parts.push('NI: ' + patient.niReason);
+    const logs = (patient && patient.contactLogs) || [];
+    const lastLog = [...logs].reverse().find(l => l.outcome || l.notes);
+    if (lastLog) {
+        parts.push('Last contact (' + new Date(lastLog.date).toLocaleString() + '): ' + (lastLog.outcome || '') + (lastLog.notes ? (' — ' + lastLog.notes) : ''));
+    }
+    return parts;
+};
+
+const getStudySchedulingRecordHTML = (patient) => {
+    const rows = [];
+    ((patient && patient.enrollments) || []).forEach(e => {
+        const study = state.studies.find(s => s.id === e.studyId);
+        const site = state.sites.find(s => s.id === e.siteId);
+        const appts = getPatientAppointments(patient).filter(a => !a.studyId || a.studyId === e.studyId);
+        const v1 = appts.find(a => /v1|visit 1|screening/i.test(String(a.visit || ''))) || appts[0];
+        let outcome = e.status === 'current' ? (patient.visitOutcome || patient.overallStatus || patient.status || 'Active') : (e.status || 'past');
+        if (patient.status === 'Screen Fail' && e.status === 'current') outcome = 'SF';
+        rows.push({
+            study: (study && study.title) || e.studyId || '—',
+            site: (site && site.name) || '—',
+            outcome,
+            v1: v1 && v1.time ? new Date(v1.time).toLocaleString() : '—',
+            enrolled: e.enrolledDate ? new Date(e.enrolledDate).toLocaleDateString() : '—',
+        });
+    });
+    if (!rows.length) return '<p class="text-gray-500 dark:text-gray-400 text-sm">No study scheduling history yet.</p>';
+    return '<div class="overflow-x-auto"><table class="min-w-full text-sm"><thead><tr class="text-left text-gray-500 dark:text-gray-400 border-b dark:border-gray-700">'
+        + '<th class="py-2 pr-3">Study</th><th class="py-2 pr-3">Site</th><th class="py-2 pr-3">Outcome</th><th class="py-2 pr-3">V1 / Visit</th><th class="py-2 pr-3">Enrolled</th>'
+        + '</tr></thead><tbody>'
+        + rows.map(r => '<tr class="border-b dark:border-gray-700"><td class="py-2 pr-3">' + r.study + '</td><td class="py-2 pr-3">' + r.site + '</td><td class="py-2 pr-3 font-medium">' + r.outcome + '</td><td class="py-2 pr-3">' + r.v1 + '</td><td class="py-2 pr-3">' + r.enrolled + '</td></tr>').join('')
+        + '</tbody></table></div>';
+};
+
+const getMedicationsEditorHTML = (patient, editable) => {
+    const canEditDefault = editable !== false;
+    const meds = Array.isArray(patient.medications) ? patient.medications : [];
+    const catalog = getActiveReferenceList('medications');
+    const locked = isPatientProfileLocked(patient) && !isManagerUser();
+    const canEdit = canEditDefault && !locked;
+    return '<div class="space-y-3" data-patient-meds="' + patient.id + '">'
+        + (meds.length ? meds.map(m => '<div class="p-3 border dark:border-gray-700 rounded-md"><div class="flex justify-between gap-2"><div>'
+            + '<p class="font-semibold dark:text-white">' + (m.name || 'Medication') + '</p>'
+            + '<p class="text-sm text-gray-600 dark:text-gray-400">Dose: ' + (m.dosage || '—') + ' · Freq: ' + (m.frequency || '—') + '</p>'
+            + '<p class="text-xs text-gray-500">Entered: ' + (m.enteredAt ? new Date(m.enteredAt).toLocaleString() : '—') + ' by ' + (m.enteredBy || '—') + '</p>'
+            + (m.notes ? ('<p class="text-sm mt-1 dark:text-gray-300">' + m.notes + '</p>') : '')
+            + '</div>'
+            + (canEdit ? ('<button type="button" data-action="remove-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-red-600 text-sm hover:underline">Remove</button>') : '')
+            + '</div></div>').join('') : '<p class="text-sm text-gray-500 dark:text-gray-400">No medications on file.</p>')
+        + (canEdit ? ('<form id="add-patient-medication-form" data-patient-id="' + patient.id + '" class="grid grid-cols-1 md:grid-cols-2 gap-2 p-3 border dark:border-gray-700 rounded-md bg-gray-50 dark:bg-gray-900">'
+            + '<div class="md:col-span-2"><label class="text-xs font-medium dark:text-gray-300">Medication</label>'
+            + '<input list="nasa-med-catalog" name="name" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Start typing…">'
+            + '<datalist id="nasa-med-catalog">' + catalog.map(m => '<option value="' + m.name + '"></option>').join('') + '</datalist></div>'
+            + '<div><label class="text-xs font-medium dark:text-gray-300">Dosage</label><input name="dosage" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 10mg"></div>'
+            + '<div><label class="text-xs font-medium dark:text-gray-300">Frequency</label><input name="frequency" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., once daily"></div>'
+            + '<div><label class="text-xs font-medium dark:text-gray-300">Start date</label><input type="date" name="startDate" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
+            + '<div><label class="text-xs font-medium dark:text-gray-300">Notes</label><input name="notes" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
+            + '<div class="md:col-span-2"><button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 text-sm">Add medication</button></div>'
+            + '</form>') : '')
+        + '</div>';
+};
+
+const getTagsChecklistHTML = (selected, name) => {
+    const field = name || 'tags';
+    const tags = getActiveReferenceList('tags');
+    const selectedSet = new Set(selected || []);
+    if (!tags.length) return '<p class="text-sm text-gray-500">No tags configured in Manager.</p>';
+    return '<div class="grid grid-cols-1 md:grid-cols-2 gap-2">'
+        + tags.map(t => '<label class="flex items-center gap-2 text-sm dark:text-gray-200"><input type="checkbox" name="' + field + '" value="' + t.name + '" '
+            + (selectedSet.has(t.name) ? 'checked' : '') + ' class="h-4 w-4 rounded border-gray-300 text-blue-600"><span>' + t.name + '</span></label>').join('')
+        + '</div>';
+};
+
+const getDemographicsFieldsHTML = (patient) => {
+    const p = patient || {};
+    const races = Array.isArray(p.race) ? p.race : (p.race ? [p.race] : []);
+    return ''
+        + '<div><label class="block text-sm font-medium dark:text-gray-300">Sex Assigned at Birth</label>'
+        + '<select name="sexAssignedAtBirth" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select</option>'
+        + SEX_AT_BIRTH_OPTIONS.map(o => '<option value="' + o + '" ' + (p.sexAssignedAtBirth === o ? 'selected' : '') + '>' + o + '</option>').join('')
+        + '</select></div>'
+        + '<div><label class="block text-sm font-medium dark:text-gray-300">Ethnicity</label>'
+        + '<select name="ethnicity" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select</option>'
+        + ETHNICITY_OPTIONS.map(o => '<option value="' + o + '" ' + (p.ethnicity === o ? 'selected' : '') + '>' + o + '</option>').join('')
+        + '</select></div>'
+        + '<div class="md:col-span-2"><label class="block text-sm font-medium dark:text-gray-300 mb-2">Race (check all that apply)</label>'
+        + '<div class="grid grid-cols-1 md:grid-cols-2 gap-2 p-3 border dark:border-gray-600 rounded bg-gray-50 dark:bg-gray-800">'
+        + RACE_OPTIONS.map(o => '<label class="flex items-center gap-2 text-sm dark:text-gray-300"><input type="checkbox" name="race" value="' + o + '" '
+            + (races.includes(o) ? 'checked' : '') + ' class="h-4 w-4 rounded border-gray-300 text-blue-600"><span>' + o + '</span></label>').join('')
+        + '</div><input type="text" name="raceOtherSpecify" value="' + (p.raceOtherSpecify || '') + '" placeholder="If Other, specify" class="mt-2 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>';
+};
+
+const getManagerReferenceListsHTML = () => {
+    const data = state.referenceData || getDefaultReferenceData();
+    const listEditor = (title, key, placeholder) => {
+        return '<div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">'
+            + '<div class="flex items-center justify-between mb-3"><h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200">' + title + '</h3>'
+            + '<span class="text-xs text-gray-500">' + ((data[key] || []).length) + ' items</span></div>'
+            + '<div class="space-y-2 max-h-56 overflow-y-auto mb-3">'
+            + ((data[key] || []).map(item => '<div class="flex items-center gap-2">'
+                + '<input type="text" data-ref-key="' + key + '" data-ref-id="' + item.id + '" value="' + String(item.name).replace(/"/g, '&quot;') + '" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm">'
+                + '<label class="text-xs flex items-center gap-1 dark:text-gray-300"><input type="checkbox" data-ref-active-key="' + key + '" data-ref-id="' + item.id + '" ' + (item.active !== false ? 'checked' : '') + '> Active</label>'
+                + '<button type="button" data-action="ref-remove-item" data-ref-key="' + key + '" data-ref-id="' + item.id + '" class="text-red-600 text-xs hover:underline">Remove</button>'
+                + '</div>').join('') || '<p class="text-sm text-gray-500">No items yet.</p>')
+            + '</div><div class="flex gap-2"><input type="text" id="ref-add-' + key + '" placeholder="' + placeholder + '" class="flex-1 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm">'
+            + '<button type="button" data-action="ref-add-item" data-ref-key="' + key + '" class="px-3 py-2 bg-blue-600 text-white rounded text-sm">Add</button></div></div>';
+    };
+    return '<div class="mt-8"><div class="flex items-center justify-between mb-4"><div>'
+        + '<h3 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Reference Lists</h3>'
+        + '<p class="text-sm text-gray-500 dark:text-gray-400">Editable catalogs for medications, tags, and NQ/NI reasons. More lists can be added later.</p></div>'
+        + '<button type="button" data-action="ref-save-lists" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">Save Lists</button></div>'
+        + '<div class="grid grid-cols-1 xl:grid-cols-2 gap-6">'
+        + listEditor('Medications', 'medications', 'e.g., Lisinopril')
+        + listEditor('Uniform Tags', 'tags', 'e.g., Do Not Call')
+        + listEditor('NQ Reasons', 'nqReasons', 'e.g., Age out of range')
+        + listEditor('NI Reasons', 'niReasons', 'e.g., Scheduling conflict')
+        + '</div></div>';
+};
+
+const getMergePatientsModalHTML = (patientIds) => {
+    const patients = patientIds.map(id => state.patients.find(p => p.id === id)).filter(Boolean);
+    if (patients.length < 2) return '<p>Need at least two patients to merge.</p>';
+    const fields = [
+        'firstName', 'lastName', 'phoneNumber', 'email', 'dob', 'address', 'city', 'state', 'zipCode',
+        'sexAssignedAtBirth', 'ethnicity', 'globalId', 'status', 'overallStatus', 'nqReason', 'niReason', 'homeSiteId'
+    ];
+    return '<h2 class="text-2xl font-bold dark:text-white mb-2">Merge Profiles</h2>'
+        + '<p class="text-sm text-gray-500 dark:text-gray-400 mb-4">Choose the keep profile, then pick which field values and history collections to keep. Other profiles are marked merged/inactive.</p>'
+        + '<form id="merge-patients-form" class="space-y-4">'
+        + '<div><label class="block text-sm font-medium dark:text-gray-300 mb-1">Keep profile</label>'
+        + '<select name="keepId" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">'
+        + patients.map(p => '<option value="' + p.id + '">' + (p.firstName || '') + ' ' + (p.lastName || '') + ' · ' + (p.dob || 'no DOB') + '</option>').join('')
+        + '</select></div><div class="max-h-72 overflow-y-auto border dark:border-gray-700 rounded p-3 space-y-3">'
+        + fields.map(field => '<div><label class="block text-xs font-semibold text-gray-500 mb-1">' + field + '</label><div class="space-y-1">'
+            + patients.map((p, idx) => '<label class="flex items-start gap-2 text-sm dark:text-gray-200"><input type="radio" name="field_' + field + '" value="' + p.id + '" ' + (idx === 0 ? 'checked' : '') + ' class="mt-1">'
+                + '<span><strong>' + (p.firstName || '') + ' ' + (p.lastName || '') + ':</strong> ' + (Array.isArray(p[field]) ? p[field].join(', ') : (p[field] != null && p[field] !== '' ? p[field] : '—')) + '</span></label>').join('')
+            + '</div></div>').join('')
+        + '</div><div class="grid grid-cols-1 md:grid-cols-2 gap-2">'
+        + ['surveyResults','contactLogs','appointments','medications','tasks','consentRecords','communications','visitLogs','enrollments','auditTrail','tags'].map(col =>
+            '<label class="flex items-center gap-2 text-sm dark:text-gray-200"><input type="checkbox" name="mergeCollections" value="' + col + '" checked class="h-4 w-4 rounded border-gray-300 text-blue-600"><span>Merge ' + col + '</span></label>').join('')
+        + '</div><input type="hidden" name="sourceIds" value="' + patientIds.join(',') + '">'
+        + '<div class="flex justify-end gap-2"><button type="button" data-action="close-modal" class="px-4 py-2 rounded bg-gray-200 dark:bg-gray-600">Cancel</button>'
+        + '<button type="submit" class="px-4 py-2 rounded bg-yellow-600 text-white hover:bg-yellow-700">Merge</button></div></form>';
+};
 
 const safeJsonParse = (text, fallback) => {
     try { return JSON.parse(text); } catch { return fallback; }
@@ -712,6 +1060,7 @@ const loadLocalState = () => {
         state.managedUsers = [getBootstrapAdminUser(), ...(state.managedUsers || [])];
         saveLocalState();
     }
+    loadReferenceDataLocal();
 };
 
 const authenticateLocalUser = (identifier, password) => {
@@ -1132,6 +1481,7 @@ const PATIENT_FORM_STRING_FIELDS = new Set([
     'dob', 'address', 'city', 'state', 'zipCode', 'condition', 'source', 'therapeuticArea', 'registryStatus',
     'inClinicStatus', 'visitOutcome', 'nextVisitDate', 'sfReason', 'pcp', 'comments', 'pipelineStage',
     'eligibilityStatus', 'assignedToUserId', 'homeSiteId',
+    'sexAssignedAtBirth', 'ethnicity', 'raceOtherSpecify', 'overallStatus', 'nqReason', 'niReason',
 ]);
 
 const sanitizePatientForApi = (patient) => {
@@ -1540,6 +1890,19 @@ const normalizePatientRecord = (patient) => {
     if (!Array.isArray(normalized.auditTrail)) normalized.auditTrail = [];
     if (!Array.isArray(normalized.visitLogs)) normalized.visitLogs = [];
     if (!Array.isArray(normalized.completedVisits)) normalized.completedVisits = [];
+    if (!Array.isArray(normalized.medications)) normalized.medications = [];
+    if (!Array.isArray(normalized.tags)) normalized.tags = [];
+    if (!Array.isArray(normalized.race)) normalized.race = normalized.race ? [normalized.race] : [];
+    if (!Array.isArray(normalized.surveyDrafts)) normalized.surveyDrafts = [];
+    if (normalized.deceased == null) normalized.deceased = false;
+    if (normalized.profileLocked == null) normalized.profileLocked = !!normalized.deceased;
+    if (normalized.emailInvalid == null) normalized.emailInvalid = false;
+    if (normalized.emailUnsubscribed == null) normalized.emailUnsubscribed = false;
+    if (!normalized.overallStatus) normalized.overallStatus = '';
+    if (!normalized.nqReason) normalized.nqReason = '';
+    if (!normalized.niReason) normalized.niReason = '';
+    if (!normalized.sexAssignedAtBirth) normalized.sexAssignedAtBirth = '';
+    if (!normalized.ethnicity) normalized.ethnicity = '';
     if (!patientHasRecruitmentStatus(normalized)) {
         normalized.pipelineStage = 'lead';
         if (!normalized.status) normalized.status = '';
@@ -1649,6 +2012,7 @@ const evaluateSurveyEligibility = (survey, answers) => {
 
 const getSchedulingBlockReason = (patient) => {
     if (!patient) return 'Patient not found';
+    if (patient.profileLocked || patient.deceased) return 'Profile is locked (deceased)';
     if (SCHEDULING_TEST_MODE) return null;
     if (patient.doNotContact) return 'Patient is marked do-not-contact';
     if (patient.eligibilityStatus === 'ineligible') return 'Patient is ineligible per survey/rules';
@@ -1700,9 +2064,18 @@ const appendPatientAuditEntry = (patient, action, details = '') => ({
 const updatePatientFields = async (patientId, fields, auditAction = null, auditDetails = '') => {
     const patient = await resolvePatientById(patientId);
     if (!patient) throw new Error('Patient not found');
+    const unlocking = fields.profileLocked === false || fields.deceased === false;
+    if (isPatientProfileLocked(patient) && !(unlocking && isManagerUser())) {
+        throw new Error('Profile is locked (deceased). A manager must unlock it before edits.');
+    }
     const updates = { ...fields, lastUpdated: new Date().toISOString() };
-    if (auditAction) {
-        updates.auditTrail = [...(patient.auditTrail || []), appendPatientAuditEntry(patient, auditAction, auditDetails)];
+    if (updates.deceased === true) updates.profileLocked = true;
+    const auditedKeys = Object.keys(fields).filter(k => k !== 'auditTrail' && k !== 'lastUpdated');
+    const autoDetails = buildFieldDiffDetails(patient, { ...patient, ...updates }, auditedKeys);
+    const action = auditAction || (auditedKeys.length ? 'profile_updated' : null);
+    const details = auditDetails || autoDetails;
+    if (action) {
+        updates.auditTrail = [...(patient.auditTrail || []), appendPatientAuditEntry(patient, action, details)];
     }
     await updateDocument('patients', patientId, updates);
 };
@@ -3771,6 +4144,9 @@ const getReportingHTML = () => {
                     <button id="export-surveys-btn" data-action="export-surveys-csv" class="bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 flex items-center disabled:bg-gray-400" disabled>
                         <i data-lucide="download" class="w-5 h-5 mr-2"></i> Export Survey Results
                     </button>
+                    <button id="export-five9-btn" data-action="export-five9-csv" class="bg-teal-600 text-white px-4 py-2 rounded-md hover:bg-teal-700 flex items-center disabled:bg-gray-400" disabled>
+                        <i data-lucide="phone" class="w-5 h-5 mr-2"></i> Export Five9 Phones
+                    </button>
                 </div>
             </div>
             <div class="overflow-x-auto">
@@ -4009,6 +4385,9 @@ const getPatientProfileHTML = (patient) => {
             <div class="mt-4 p-3 border dark:border-gray-700 rounded-lg">
                 <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Logged on: ${new Date(log.date).toLocaleString()}</p>
                 <p class="dark:text-gray-300"><strong>Outcome:</strong> ${phi(log.outcome)}</p>
+                ${log.overallStatus ? `<p class="dark:text-gray-300"><strong>Status:</strong> ${phi(log.overallStatus)}</p>` : ''}
+                ${log.nqReason ? `<p class="dark:text-gray-300"><strong>NQ:</strong> ${phi(log.nqReason)}</p>` : ''}
+                ${log.niReason ? `<p class="dark:text-gray-300"><strong>NI:</strong> ${phi(log.niReason)}</p>` : ''}
                 <p class="dark:text-gray-300 mt-1"><strong>Notes:</strong> ${phi(log.notes)}</p>
             </div>
         `).join('');
@@ -4120,16 +4499,22 @@ const getPatientProfileHTML = (patient) => {
                 <i data-lucide="x"></i>
             </button>
         </div>
-        <div class="flex items-center gap-2 mb-6">
-            <button data-action="survey-patient" data-id="${patient.id}" class="bg-green-600 text-white px-3 py-1.5 rounded-md hover:bg-green-700 flex items-center text-sm font-medium">
-                <i data-lucide="clipboard-list" class="w-4 h-4 mr-2"></i> Survey
-            </button>
-            <button data-action="schedule-patient" data-id="${patient.id}" class="bg-blue-600 text-white px-3 py-1.5 rounded-md hover:bg-blue-700 flex items-center text-sm font-medium">
-                <i data-lucide="calendar-plus" class="w-4 h-4 mr-2"></i> Schedule
-            </button>
-            <button data-action="edit-patient" data-id="${patient.id}" class="bg-gray-500 text-white px-3 py-1.5 rounded-md hover:bg-gray-600 flex items-center text-sm font-medium">
-                <i data-lucide="edit" class="w-4 h-4 mr-2"></i> Edit
-            </button>
+        <div class="flex items-center gap-2 mb-6 flex-wrap">
+            ${isPatientProfileLocked(patient) ? `
+                <span class="px-3 py-1.5 rounded-md bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200 text-sm font-semibold">Profile locked (deceased)</span>
+                ${isManagerUser() ? `<button data-action="unlock-patient-profile" data-id="${patient.id}" class="bg-amber-600 text-white px-3 py-1.5 rounded-md hover:bg-amber-700 text-sm font-medium">Manager Unlock</button>` : ''}
+            ` : `
+                <button data-action="survey-patient" data-id="${patient.id}" class="bg-green-600 text-white px-3 py-1.5 rounded-md hover:bg-green-700 flex items-center text-sm font-medium">
+                    <i data-lucide="clipboard-list" class="w-4 h-4 mr-2"></i> Survey
+                </button>
+                <button data-action="schedule-patient" data-id="${patient.id}" class="bg-blue-600 text-white px-3 py-1.5 rounded-md hover:bg-blue-700 flex items-center text-sm font-medium">
+                    <i data-lucide="calendar-plus" class="w-4 h-4 mr-2"></i> Schedule
+                </button>
+                <button data-action="edit-patient" data-id="${patient.id}" class="bg-gray-500 text-white px-3 py-1.5 rounded-md hover:bg-gray-600 flex items-center text-sm font-medium">
+                    <i data-lucide="edit" class="w-4 h-4 mr-2"></i> Edit
+                </button>
+                <button data-action="mark-patient-deceased" data-id="${patient.id}" class="bg-red-700 text-white px-3 py-1.5 rounded-md hover:bg-red-800 text-sm font-medium">Mark Deceased / Lock</button>
+            `}
         </div>
         <div class="mb-4 border-b border-gray-200 dark:border-gray-700">
             <ul class="flex flex-wrap -mb-px text-sm font-medium text-center" id="patient-profile-tabs" role="tablist">
@@ -4166,6 +4551,14 @@ const getPatientProfileHTML = (patient) => {
                         data-tab-name="communications" data-patient-id="${patient.id}" type="button" role="tab">Communications</button>
                 </li>
                 <li class="mr-2" role="presentation">
+                    <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'medications' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
+                        data-tab-name="medications" data-patient-id="${patient.id}" type="button" role="tab">Medications</button>
+                </li>
+                <li class="mr-2" role="presentation">
+                    <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'studyHistory' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
+                        data-tab-name="studyHistory" data-patient-id="${patient.id}" type="button" role="tab">Study Scheduling</button>
+                </li>
+                <li class="mr-2" role="presentation">
                     <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'audit' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
                         data-tab-name="audit" data-patient-id="${patient.id}" type="button" role="tab">Audit</button>
                 </li>
@@ -4173,44 +4566,83 @@ const getPatientProfileHTML = (patient) => {
         </div>
         <div id="patient-profile-tab-content-container">
             <div id="details-content" class="${state.currentPatientProfileTab === 'details' ? '' : 'hidden'}">
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 dark:text-gray-300">
-                    <div class="space-y-2">
-                        <p><strong>Global ID:</strong> ${phi(patient.globalId || 'N/A')}</p>
-                        <p><strong>Initials:</strong> ${phi(patient.initials || 'N/A')}</p>
-                        <p><strong>Phone:</strong> ${phi(patient.phoneNumber || 'N/A')}</p>
-                        <p><strong>Email:</strong> ${phi(patient.email || 'N/A')}</p>
-                        <p><strong>DOB:</strong> ${phi(patient.dob || 'N/A')}</p>
-                        <p><strong>Address:</strong> ${phi(patient.address || 'N/A')}</p>
-                        <p><strong>City:</strong> ${phi(patient.city || 'N/A')}</p>
-                        <p><strong>State:</strong> ${phi(patient.state || 'N/A')}</p>
-                        <p><strong>Zip:</strong> ${phi(patient.zipCode || 'N/A')}</p>
-                        <p><strong>Screening #:</strong> ${phi(patient.screeningNumber || 'N/A')}</p>
-                        <p><strong>Group:</strong> ${phi(patient.group || 'N/A')}</p>
-                        <p><strong>PCP?:</strong> ${phi(patient.pcp || 'N/A')}</p>
-                    </div>
-                    <div class="space-y-2">
-                        <p><strong>Age:</strong> ${phi(patient.age != null ? String(patient.age) : 'N/A')}</p>
-                        <p><strong>Status:</strong> ${patient.status || 'N/A'}</p>
-                        <p><strong>Pipeline:</strong> ${stageMeta.label}</p>
-                        <p><strong>Eligibility:</strong> ${patient.eligibilityStatus || 'unknown'}</p>
-                        <p><strong>Assigned To:</strong> ${assignee ? (assignee.username || assignee.email) : 'Unassigned'}</p>
-                        <p><strong>Registry Status:</strong> ${patient.registryStatus || 'N/A'}</p>
-                        ${patient.doNotContact ? '<p class="text-red-600 dark:text-red-400"><strong>Do Not Contact</strong></p>' : ''}
-                        <p><strong>Source:</strong> ${patient.source || 'N/A'}</p>
-                        <p><strong>Therapeutic Area:</strong> ${patient.therapeuticArea || 'N/A'}</p>
-                        <p><strong>Current Study:</strong> ${study?.title || 'N/A'}</p>
-                        <p><strong>Site:</strong> ${site?.name || 'N/A'}</p>
-                        <p><strong>Home Site:</strong> ${patient.homeSiteId ? (state.sites.find(s => s.id === patient.homeSiteId)?.name || patient.homeSiteId) : '—'}</p>
-                        ${patient.claimedByUserId ? `<p><strong>Claimed by:</strong> ${(state.managedUsers || []).find(u => u.id === patient.claimedByUserId)?.username || patient.claimedByUserId}</p>` : ''}
-                        ${!currentEnrollment && !patient.claimedByUserId ? `<button type="button" data-action="claim-lead" data-patient-id="${patient.id}" class="mt-2 text-sm bg-amber-600 text-white px-3 py-1 rounded hover:bg-amber-700">Claim Lead</button>` : ''}
-                        ${patient.claimedByUserId === state.currentUser?.id ? `<button type="button" data-action="release-claim" data-patient-id="${patient.id}" class="mt-2 ml-2 text-sm text-gray-600 dark:text-gray-300 hover:underline">Release claim</button>` : ''}
-                        <p><strong>In-Clinic Status:</strong> ${phi(patient.inClinicStatus || 'N/A')}</p>
-                        <p><strong>Visit Outcome:</strong> ${phi(patient.visitOutcome || 'N/A')}</p>
-                        <p><strong>Next Visit Date:</strong> ${phi(patient.nextVisitDate || 'N/A')}</p>
-                        <p><strong>SF Reason:</strong> ${phi(patient.sfReason || 'N/A')}</p>
-                        <p><strong>Comments:</strong> ${phi(patient.comments || 'N/A')}</p>
-                        ${appointmentHTML}
-                    </div>
+                ${getLatestNqNiSummary(patient).length ? `
+                <div class="mb-4 p-3 rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-700 text-sm dark:text-amber-100 space-y-1">
+                    ${getLatestNqNiSummary(patient).map(line => `<div><strong>${escapeHtmlPhi(line.split(':')[0])}:</strong> ${phi(line.includes(':') ? line.slice(line.indexOf(':') + 1).trim() : line)}</div>`).join('')}
+                </div>` : ''}
+                ${(patient.emailInvalid || patient.emailUnsubscribed) ? `
+                <div class="mb-4 p-3 rounded-md border border-red-300 bg-red-50 dark:bg-red-950/40 text-sm text-red-800 dark:text-red-200">
+                    ${patient.emailInvalid ? '<div>Email marked invalid / bounce.</div>' : ''}
+                    ${patient.emailUnsubscribed ? '<div>Patient unsubscribed from email.</div>' : ''}
+                </div>` : ''}
+                <div class="space-y-6 dark:text-gray-300">
+                    <section>
+                        <h3 class="font-semibold text-lg dark:text-white mb-2 border-b dark:border-gray-700 pb-1">Demographics</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                            <p><strong>Global ID:</strong> ${phi(patient.globalId || 'N/A')}</p>
+                            <p><strong>Initials:</strong> ${phi(patient.initials || 'N/A')}</p>
+                            <p><strong>DOB:</strong> ${phi(formatDobDisplay(patient.dob) || 'N/A')}</p>
+                            <p><strong>Age:</strong> ${phi(patient.age != null ? String(patient.age) : (calculateAge(patient.dob) || 'N/A'))}</p>
+                            <p><strong>Sex Assigned at Birth:</strong> ${phi(patient.sexAssignedAtBirth || 'N/A')}</p>
+                            <p><strong>Ethnicity:</strong> ${phi(patient.ethnicity || 'N/A')}</p>
+                            <p class="md:col-span-2"><strong>Race:</strong> ${phi((patient.race || []).join(', ') || 'N/A')}${patient.raceOtherSpecify ? phi(' (' + patient.raceOtherSpecify + ')') : ''}</p>
+                        </div>
+                    </section>
+                    <section>
+                        <h3 class="font-semibold text-lg dark:text-white mb-2 border-b dark:border-gray-700 pb-1">Contact Information</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                            <p><strong>Phone:</strong> ${phi(patient.phoneNumber || 'N/A')}</p>
+                            <p><strong>Email:</strong> ${phi(patient.email || 'N/A')}</p>
+                            <p><strong>Address:</strong> ${phi(patient.address || 'N/A')}</p>
+                            <p><strong>City:</strong> ${phi(patient.city || 'N/A')}</p>
+                            <p><strong>State:</strong> ${phi(patient.state || 'N/A')}</p>
+                            <p><strong>Zip:</strong> ${phi(patient.zipCode || 'N/A')}</p>
+                        </div>
+                    </section>
+                    <section>
+                        <h3 class="font-semibold text-lg dark:text-white mb-2 border-b dark:border-gray-700 pb-1">Medications</h3>
+                        <p class="text-sm text-gray-500 mb-2">${(patient.medications || []).length} on file — manage on the Medications tab.</p>
+                        ${(patient.medications || []).slice(0, 5).map(m => `<p class="text-sm">${m.name}${m.dosage ? ' — ' + m.dosage : ''}</p>`).join('') || '<p class="text-gray-500 text-sm">None</p>'}
+                    </section>
+                    <section>
+                        <h3 class="font-semibold text-lg dark:text-white mb-2 border-b dark:border-gray-700 pb-1">Tags</h3>
+                        <div class="flex flex-wrap gap-2">
+                            ${(patient.tags || []).length
+                                ? (patient.tags || []).map(t => `<span class="text-xs px-2 py-1 rounded-full bg-gray-200 dark:bg-gray-700">${t}</span>`).join('')
+                                : '<p class="text-gray-500 text-sm">No tags</p>'}
+                        </div>
+                    </section>
+                    <section>
+                        <h3 class="font-semibold text-lg dark:text-white mb-2 border-b dark:border-gray-700 pb-1">Study Information</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                            <p><strong>Status:</strong> ${patient.status || 'N/A'}</p>
+                            <p><strong>Overall Status:</strong> ${patient.overallStatus || 'N/A'}</p>
+                            <p><strong>NQ Reason:</strong> ${phi(patient.nqReason || 'N/A')}</p>
+                            <p><strong>NI Reason:</strong> ${phi(patient.niReason || 'N/A')}</p>
+                            <p><strong>Pipeline:</strong> ${stageMeta.label}</p>
+                            <p><strong>Eligibility:</strong> ${patient.eligibilityStatus || 'unknown'}</p>
+                            <p><strong>Assigned To:</strong> ${assignee ? (assignee.username || assignee.email) : 'Unassigned'}</p>
+                            <p><strong>Registry Status:</strong> ${patient.registryStatus || 'N/A'}</p>
+                            ${patient.doNotContact ? '<p class="text-red-600 dark:text-red-400"><strong>Do Not Contact</strong></p>' : ''}
+                            <p><strong>Source:</strong> ${patient.source || 'N/A'}</p>
+                            <p><strong>Therapeutic Area:</strong> ${patient.therapeuticArea || 'N/A'}</p>
+                            <p><strong>Current Study:</strong> ${study?.title || 'N/A'}</p>
+                            <p><strong>Site:</strong> ${site?.name || 'N/A'}</p>
+                            <p><strong>Home Site:</strong> ${patient.homeSiteId ? (state.sites.find(s => s.id === patient.homeSiteId)?.name || patient.homeSiteId) : '—'}</p>
+                            <p><strong>Screening #:</strong> ${phi(patient.screeningNumber || 'N/A')}</p>
+                            <p><strong>Group:</strong> ${phi(patient.group || 'N/A')}</p>
+                            <p><strong>PCP?:</strong> ${phi(patient.pcp || 'N/A')}</p>
+                            ${patient.claimedByUserId ? `<p><strong>Claimed by:</strong> ${(state.managedUsers || []).find(u => u.id === patient.claimedByUserId)?.username || patient.claimedByUserId}</p>` : ''}
+                            ${!currentEnrollment && !patient.claimedByUserId ? `<button type="button" data-action="claim-lead" data-patient-id="${patient.id}" class="mt-2 text-sm bg-amber-600 text-white px-3 py-1 rounded hover:bg-amber-700">Claim Lead</button>` : ''}
+                            ${patient.claimedByUserId === state.currentUser?.id ? `<button type="button" data-action="release-claim" data-patient-id="${patient.id}" class="mt-2 ml-2 text-sm text-gray-600 dark:text-gray-300 hover:underline">Release claim</button>` : ''}
+                            <p><strong>In-Clinic Status:</strong> ${phi(patient.inClinicStatus || 'N/A')}</p>
+                            <p><strong>Visit Outcome:</strong> ${phi(patient.visitOutcome || 'N/A')}</p>
+                            <p><strong>Next Visit Date:</strong> ${phi(patient.nextVisitDate || 'N/A')}</p>
+                            <p><strong>SF Reason:</strong> ${phi(patient.sfReason || 'N/A')}</p>
+                            <p class="md:col-span-2"><strong>Comments:</strong> ${phi(patient.comments || 'N/A')}</p>
+                            ${appointmentHTML}
+                        </div>
+                    </section>
                 </div>
                 ${candidateEnrollments.length ? `
                 <div class="mt-6">
@@ -4244,6 +4676,13 @@ const getPatientProfileHTML = (patient) => {
                         </div>
                     `).join('') : '<p class="text-gray-500 dark:text-gray-400">No past enrollments.</p>'}
                 </div>
+            </div>
+            <div id="medications-content" class="${state.currentPatientProfileTab === 'medications' ? '' : 'hidden'} dark:text-gray-300">
+                ${getMedicationsEditorHTML(patient, true)}
+            </div>
+            <div id="studyHistory-content" class="${state.currentPatientProfileTab === 'studyHistory' ? '' : 'hidden'} dark:text-gray-300">
+                <h3 class="font-semibold text-lg dark:text-white mb-3">Study Scheduling Record</h3>
+                ${getStudySchedulingRecordHTML(patient)}
             </div>
             <div id="contactLog-content" class="${state.currentPatientProfileTab === 'contactLog' ? '' : 'hidden'} dark:text-gray-300">
                 ${contactLogHTML}
@@ -4508,7 +4947,45 @@ const getEditPatientModalHTML = (patient) => {
                             <input type="checkbox" name="doNotContact" ${patient.doNotContact ? 'checked' : ''} class="mt-1 h-4 w-4 rounded border-gray-300 text-red-600 focus:ring-red-500">
                             <span class="text-sm">Do not contact</span>
                         </label>
+                        <label class="flex items-start gap-2 dark:text-gray-300">
+                            <input type="checkbox" name="emailInvalid" ${patient.emailInvalid ? 'checked' : ''} class="mt-1 h-4 w-4 rounded border-gray-300 text-red-600">
+                            <span class="text-sm">Email invalid / bounced</span>
+                        </label>
+                        <label class="flex items-start gap-2 dark:text-gray-300">
+                            <input type="checkbox" name="emailUnsubscribed" ${patient.emailUnsubscribed ? 'checked' : ''} class="mt-1 h-4 w-4 rounded border-gray-300 text-red-600">
+                            <span class="text-sm">Unsubscribed from email</span>
+                        </label>
+                        <label class="flex items-start gap-2 dark:text-gray-300">
+                            <input type="checkbox" name="deceased" ${patient.deceased ? 'checked' : ''} class="mt-1 h-4 w-4 rounded border-gray-300 text-red-600">
+                            <span class="text-sm">Deceased (locks profile)</span>
+                        </label>
                     </div>
+                </div>
+                ${getDemographicsFieldsHTML(patient)}
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-medium dark:text-gray-300 mb-2">Uniform Tags</label>
+                    ${getTagsChecklistHTML(patient.tags || [])}
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Overall Status</label>
+                    <select name="overallStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="">None</option>
+                        ${OVERALL_STATUS_OPTIONS.map(s => `<option value="${s}" ${patient.overallStatus === s ? 'selected' : ''}>${s}</option>`).join('')}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">NQ Reason</label>
+                    <select name="nqReason" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="">None</option>
+                        ${getActiveReferenceList('nqReasons').map(r => `<option value="${r.name}" ${patient.nqReason === r.name ? 'selected' : ''}>${r.name}</option>`).join('')}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">NI Reason</label>
+                    <select name="niReason" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="">None</option>
+                        ${getActiveReferenceList('niReasons').map(r => `<option value="${r.name}" ${patient.niReason === r.name ? 'selected' : ''}>${r.name}</option>`).join('')}
+                    </select>
                 </div>
             </div>
             <div class="flex justify-end gap-4">
@@ -4996,6 +5473,8 @@ const getManageRHTML = () => {
                     </div>
                 ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No users created yet.</div>`}
             </div>
+
+            ${getManagerReferenceListsHTML()}
         </div>
     `;
 };
@@ -5615,9 +6094,10 @@ const getSelectSurveyModalHTML = (patient) => {
 const getTakeSurveyModalHTML = () => {
     const { survey, patient, currentQuestionIndex, answers } = state.currentSurveyState;
     const question = survey.questions[currentQuestionIndex];
-    // Display question notes if available
-    let notesHTML = question.note ? `<div class="mt-2 p-2 bg-gray-100 dark:bg-gray-700 rounded text-sm italic break-words">${question.note}</div>` : '';
-    // Display question table if available
+    const section = question.section || question.header || '';
+    const questionText = applyScriptVariables(question.text || '', patient);
+    const noteText = applyScriptVariables(question.note || '', patient);
+    let notesHTML = noteText ? `<div class="mt-2 p-2 bg-gray-100 dark:bg-gray-700 rounded text-sm italic break-words">${noteText}</div>` : '';
     let tableHTML = '';
     if (question.table && question.table.headers && question.table.rows) {
         tableHTML = `
@@ -5625,13 +6105,13 @@ const getTakeSurveyModalHTML = () => {
                 <table class="min-w-full border dark:border-gray-600 text-sm">
                     <thead class="bg-gray-100 dark:bg-gray-700">
                         <tr>
-                            ${question.table.headers.map(h => `<th class="px-2 py-1 border dark:border-gray-600">${h}</th>`).join('')}
+                            ${question.table.headers.map(h => `<th class="px-2 py-1 border dark:border-gray-600">${applyScriptVariables(h, patient)}</th>`).join('')}
                         </tr>
                     </thead>
                     <tbody>
                         ${question.table.rows.map(row => `
                             <tr>
-                                ${row.map(cell => `<td class="px-2 py-1 border dark:border-gray-600">${cell}</td>`).join('')}
+                                ${row.map(cell => `<td class="px-2 py-1 border dark:border-gray-600">${applyScriptVariables(cell, patient)}</td>`).join('')}
                             </tr>
                         `).join('')}
                     </tbody>
@@ -5639,22 +6119,36 @@ const getTakeSurveyModalHTML = () => {
             </div>
         `;
     }
+    const medHint = /medication/i.test(section + ' ' + questionText)
+        ? `<div class="mb-4 p-3 border border-blue-200 dark:border-blue-800 rounded bg-blue-50 dark:bg-blue-950/40 text-sm dark:text-blue-100">
+                <p class="font-semibold mb-1">Patient medications on file</p>
+                ${(patient.medications || []).length
+                    ? (patient.medications || []).map(m => `<div>${m.name}${m.dosage ? ' — ' + m.dosage : ''}${m.frequency ? ' (' + m.frequency + ')' : ''}</div>`).join('')
+                    : '<p class="text-gray-600 dark:text-gray-400">None yet — add from the Medications tab on the profile.</p>'}
+           </div>` : '';
+    const vars = getScriptVariableMap(patient);
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-2 break-words">${survey.title}</h2>
-        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6">Question ${currentQuestionIndex + 1} of ${survey.questions.length}</p>
+        ${section ? `<p class="text-xs uppercase tracking-wide text-blue-600 dark:text-blue-400 font-semibold mb-2">${section}</p>` : ''}
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">Question ${currentQuestionIndex + 1} of ${survey.questions.length} · Recruiter: ${vars['{{recruiter_name}}'] || '—'} · Site: ${vars['{{site_name}}'] || '—'}</p>
+        <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">Script tokens auto-fill: {{site_name}}, {{site_pi}}, {{site_address}}, {{site_compensation}}, {{patient_name}}, {{recruiter_name}}</p>
+        ${medHint}
         <form id="take-survey-form">
-            <p class="text-lg font-semibold dark:text-white mb-4 break-words whitespace-normal">${question.text}</p>
+            <p class="text-lg font-semibold dark:text-white mb-4 break-words whitespace-normal">${questionText}</p>
             ${notesHTML}
             ${tableHTML}
             <div class="space-y-3 dark:text-gray-300">
-                ${question.options.map((opt, index) => `
+                ${(question.options || []).map((opt, index) => `
                     <div>
                         <input type="radio" id="option-${index}" name="answer" value="${opt.text}" data-next="${opt.next}" required class="mr-2">
-                        <label for="option-${index}" class="break-words whitespace-normal">${opt.text}</label>
+                        <label for="option-${index}" class="break-words whitespace-normal">${applyScriptVariables(opt.text, patient)}</label>
                     </div>
                 `).join('')}
             </div>
-            <button type="submit" class="mt-8 w-full bg-blue-600 text-white py-2 rounded-md">Next</button>
+            <div class="mt-6 flex gap-2">
+                <button type="button" data-action="save-survey-progress" class="flex-1 bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-white py-2 rounded-md hover:bg-gray-300 dark:hover:bg-gray-500">Save Progress</button>
+                <button type="submit" class="flex-1 bg-blue-600 text-white py-2 rounded-md">Next</button>
+            </div>
         </form>
     `;
 };
@@ -5986,12 +6480,36 @@ Jane,Smith,1990-07-22,jane@email.com,(555) 987-6543,Pre-Screening,study123,site4
     `;
 };
 const getAddContactLogModalHTML = (patientId) => {
+    const patient = state.patients.find(p => p.id === patientId) || {};
+    const nqOptions = getActiveReferenceList('nqReasons');
+    const niOptions = getActiveReferenceList('niReasons');
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-4">Add Contact Log</h2>
         <form id="add-contact-log-form" data-patient-id="${patientId}" class="space-y-4">
             <div>
-                <label class="block text-sm font-medium dark:text-gray-300">Outcome</label>
-                <input type="text" name="outcome" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input">
+                <label class="block text-sm font-medium dark:text-gray-300">Call / Contact Outcome</label>
+                <input type="text" name="outcome" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="e.g., Left voicemail, Spoke with patient">
+            </div>
+            <div>
+                <label class="block text-sm font-medium dark:text-gray-300">Overall Status (optional)</label>
+                <select name="overallStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    <option value="">No change (${patient.overallStatus || 'none'})</option>
+                    ${OVERALL_STATUS_OPTIONS.map(s => `<option value="${s}" ${patient.overallStatus === s ? 'selected' : ''}>${s}</option>`).join('')}
+                </select>
+            </div>
+            <div>
+                <label class="block text-sm font-medium dark:text-gray-300">NQ Reason</label>
+                <select name="nqReason" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    <option value="">None</option>
+                    ${nqOptions.map(r => `<option value="${r.name}" ${patient.nqReason === r.name ? 'selected' : ''}>${r.name}</option>`).join('')}
+                </select>
+            </div>
+            <div>
+                <label class="block text-sm font-medium dark:text-gray-300">NI Reason</label>
+                <select name="niReason" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    <option value="">None</option>
+                    ${niOptions.map(r => `<option value="${r.name}" ${patient.niReason === r.name ? 'selected' : ''}>${r.name}</option>`).join('')}
+                </select>
             </div>
             <div>
                 <label class="block text-sm font-medium dark:text-gray-300">Notes</label>
@@ -6538,6 +7056,10 @@ const patientTemplate = () => ({
     inClinicStatus: '', visitOutcome: '', nextVisitDate: '', sfReason: '', pcp: '', comments: '',
     pipelineStage: 'lead', assignedToUserId: '', eligibilityStatus: 'unknown', doNotContact: false,
     homeSiteId: '', claimedByUserId: '', claimedAt: null,
+    sexAssignedAtBirth: '', ethnicity: '', race: [], raceOtherSpecify: '',
+    tags: [], medications: [], overallStatus: '', nqReason: '', niReason: '',
+    deceased: false, profileLocked: false, emailInvalid: false, emailUnsubscribed: false,
+    surveyDrafts: [],
     enrollments: [], appointment: null, appointments: [], surveyResults: [], contactLogs: [],
     completedVisits: [], visitLogs: [], tasks: [], consentRecords: [], communications: [], waitlist: [], auditTrail: []
 });
@@ -7098,12 +7620,16 @@ document.addEventListener('click', async (e) => {
                 openModal(getBookingModalHTML(state.patients.find(p => p.id === patientId)));
                 break;
             case 'start-survey': {
+                const patientForSurvey = state.patients.find(p => p.id === patientId);
+                const surveyForStart = state.surveys.find(s => s.id === surveyId);
+                const draft = (patientForSurvey?.surveyDrafts || []).find(d => d.surveyId === surveyId);
                 state.currentSurveyState = {
-                    patient: state.patients.find(p => p.id === patientId),
-                    survey: state.surveys.find(s => s.id === surveyId),
-                    currentQuestionIndex: 0,
-                    answers: []
+                    patient: patientForSurvey,
+                    survey: surveyForStart,
+                    currentQuestionIndex: draft?.currentQuestionIndex || 0,
+                    answers: draft?.answers ? [...draft.answers] : []
                 };
+                if (draft) showNotification('Resuming saved PSQ progress.', 'info');
                 openModal(getTakeSurveyModalHTML());
                 break;
             }
@@ -7243,7 +7769,136 @@ document.addEventListener('click', async (e) => {
             case 'edit-survey': openModal(getEditSurveyModalHTML(state.surveys.find(s => s.id === id))); break;
             case 'export-csv': exportToCSV(); break;
             case 'export-surveys-csv': exportSurveysToCSV(); break;
+            case 'export-five9-csv': exportFive9CSV(); break;
             case 'export-participants': exportParticipants(); break;
+            case 'combine-duplicates': {
+                try {
+                    const ids = JSON.parse(actionButton.dataset.groupIds || '[]');
+                    if (!Array.isArray(ids) || ids.length < 2) {
+                        showNotification('Need at least two profiles to merge.', 'error');
+                        break;
+                    }
+                    openModal(getMergePatientsModalHTML(ids), true);
+                } catch (err) {
+                    showNotification('Could not open merge dialog.', 'error');
+                }
+                break;
+            }
+            case 'mark-patient-deceased': {
+                const pid = id || patientId;
+                openModal(`
+                    <h2 class="text-xl font-bold text-red-600 mb-3">Mark patient deceased?</h2>
+                    <p class="dark:text-gray-300 mb-4">This locks the profile. Recruiters cannot edit until a Manager unlocks it.</p>
+                    <div class="flex justify-end gap-2">
+                        <button data-action="close-modal" class="px-4 py-2 rounded bg-gray-200 dark:bg-gray-600">Cancel</button>
+                        <button data-action="confirm-mark-deceased" data-id="${pid}" class="px-4 py-2 rounded bg-red-700 text-white">Lock Profile</button>
+                    </div>
+                `);
+                break;
+            }
+            case 'confirm-mark-deceased': {
+                try {
+                    await updatePatientFields(id, { deceased: true, profileLocked: true }, 'profile_locked_deceased', 'Locked by recruiter');
+                    await loadAllData();
+                    closeModal();
+                    openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === id)), true);
+                    showNotification('Profile locked as deceased.', 'success');
+                } catch (err) {
+                    showNotification(err.message || 'Could not lock profile.', 'error');
+                }
+                break;
+            }
+            case 'unlock-patient-profile': {
+                if (!isManagerUser()) {
+                    showNotification('Manager unlock required.', 'error');
+                    break;
+                }
+                try {
+                    await updatePatientFields(id, { deceased: false, profileLocked: false }, 'profile_unlocked', 'Unlocked by manager');
+                    await loadAllData();
+                    openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === id)), true);
+                    showNotification('Profile unlocked.', 'success');
+                } catch (err) {
+                    showNotification(err.message || 'Unlock failed.', 'error');
+                }
+                break;
+            }
+            case 'save-survey-progress': {
+                const s = state.currentSurveyState;
+                if (!s?.patient || !s?.survey) break;
+                const drafts = [...(s.patient.surveyDrafts || []).filter(d => d.surveyId !== s.survey.id), {
+                    surveyId: s.survey.id,
+                    surveyTitle: s.survey.title,
+                    currentQuestionIndex: s.currentQuestionIndex,
+                    answers: s.answers || [],
+                    savedAt: new Date().toISOString(),
+                    savedBy: getCurrentActor()
+                }];
+                try {
+                    await updatePatientFields(s.patient.id, { surveyDrafts: drafts }, 'survey_progress_saved', s.survey.title);
+                    await loadAllData();
+                    state.currentSurveyState.patient = state.patients.find(p => p.id === s.patient.id) || s.patient;
+                    showNotification('PSQ progress saved. You can resume later.', 'success');
+                    closeModal();
+                } catch (err) {
+                    showNotification(err.message || 'Could not save progress.', 'error');
+                }
+                break;
+            }
+            case 'remove-patient-medication': {
+                const pid = actionButton.dataset.patientId;
+                const medId = actionButton.dataset.medId;
+                const p = state.patients.find(x => x.id === pid);
+                if (!p) break;
+                try {
+                    const medications = (p.medications || []).filter(m => m.id !== medId);
+                    await updatePatientFields(pid, { medications }, 'medication_removed', medId);
+                    await loadAllData();
+                    state.currentPatientProfileTab = 'medications';
+                    openSidePanel(getPatientProfileHTML(state.patients.find(x => x.id === pid)), true);
+                } catch (err) {
+                    showNotification(err.message || 'Could not remove medication.', 'error');
+                }
+                break;
+            }
+            case 'ref-add-item': {
+                const key = actionButton.dataset.refKey;
+                const input = document.getElementById('ref-add-' + key);
+                const name = String(input?.value || '').trim();
+                if (!name) break;
+                if (!state.referenceData) state.referenceData = getDefaultReferenceData();
+                state.referenceData[key] = [...(state.referenceData[key] || []), { id: ensureId(key), name, active: true }];
+                if (input) input.value = '';
+                setState({ activeTab: 'manageR' });
+                break;
+            }
+            case 'ref-remove-item': {
+                const key = actionButton.dataset.refKey;
+                const rid = actionButton.dataset.refId;
+                if (!state.referenceData) break;
+                state.referenceData[key] = (state.referenceData[key] || []).filter(i => i.id !== rid);
+                setState({ activeTab: 'manageR' });
+                break;
+            }
+            case 'ref-save-lists': {
+                const data = state.referenceData || getDefaultReferenceData();
+                ['medications', 'tags', 'nqReasons', 'niReasons'].forEach(key => {
+                    data[key] = (data[key] || []).map(item => {
+                        const nameInput = document.querySelector(`input[data-ref-key="${key}"][data-ref-id="${item.id}"]`);
+                        const activeInput = document.querySelector(`input[data-ref-active-key="${key}"][data-ref-id="${item.id}"]`);
+                        return {
+                            ...item,
+                            name: nameInput ? String(nameInput.value || '').trim() : item.name,
+                            active: activeInput ? activeInput.checked : item.active !== false,
+                        };
+                    }).filter(i => i.name);
+                });
+                state.referenceData = data;
+                await persistReferenceData();
+                showNotification('Reference lists saved.', 'success');
+                setState({ activeTab: 'manageR' });
+                break;
+            }
             case 'manageR-generate-password': {
                 const pw = randomPassword(14);
                 const pwInput = document.getElementById('manageR-password');
@@ -7714,20 +8369,132 @@ document.addEventListener('submit', async (e) => {
     const data = Object.fromEntries(formData.entries());
     // Removed Firebase collection reference - using Azure Cosmos DB API directly
     switch (form.id) {
+        case 'add-patient-medication-form': {
+            const pid = form.dataset.patientId;
+            const patient = state.patients.find(p => p.id === pid);
+            if (!patient) break;
+            try {
+                const med = {
+                    id: ensureId('med'),
+                    name: String(data.name || '').trim(),
+                    dosage: String(data.dosage || '').trim(),
+                    frequency: String(data.frequency || '').trim(),
+                    startDate: data.startDate || '',
+                    notes: String(data.notes || '').trim(),
+                    enteredAt: new Date().toISOString(),
+                    enteredBy: getCurrentActor()
+                };
+                const medications = [...(patient.medications || []), med];
+                await updatePatientFields(pid, { medications }, 'medication_added', med.name);
+                await loadAllData();
+                state.currentPatientProfileTab = 'medications';
+                openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === pid)), true);
+                showNotification('Medication added.', 'success');
+            } catch (err) {
+                showNotification(err.message || 'Could not add medication.', 'error');
+            }
+            break;
+        }
+        case 'merge-patients-form': {
+            try {
+                const keepId = data.keepId;
+                const sourceIds = String(data.sourceIds || '').split(',').filter(Boolean);
+                const mergeIds = sourceIds.filter(id => id !== keepId);
+                const keep = await resolvePatientById(keepId);
+                if (!keep) throw new Error('Keep profile not found');
+                const fieldNames = [
+                    'firstName', 'lastName', 'phoneNumber', 'email', 'dob', 'address', 'city', 'state', 'zipCode',
+                    'sexAssignedAtBirth', 'ethnicity', 'globalId', 'status', 'overallStatus', 'nqReason', 'niReason', 'homeSiteId'
+                ];
+                const updates = {};
+                fieldNames.forEach(field => {
+                    const donorId = data['field_' + field];
+                    if (!donorId) return;
+                    const donor = state.patients.find(p => p.id === donorId) || keep;
+                    updates[field] = donor[field];
+                });
+                if (updates.dob) updates.age = calculateAge(updates.dob) || null;
+                const collections = formData.getAll('mergeCollections').map(String);
+                for (const col of collections) {
+                    let merged = Array.isArray(keep[col]) ? [...keep[col]] : [];
+                    for (const mid of mergeIds) {
+                        const other = state.patients.find(p => p.id === mid);
+                        if (!other || !Array.isArray(other[col])) continue;
+                        if (col === 'medications' || col === 'tags') {
+                            const seen = new Set(merged.map(x => typeof x === 'string' ? x : x.id || x.name));
+                            other[col].forEach(item => {
+                                const key = typeof item === 'string' ? item : item.id || item.name;
+                                if (!seen.has(key)) { merged.push(item); seen.add(key); }
+                            });
+                        } else {
+                            merged = merged.concat(other[col]);
+                        }
+                    }
+                    updates[col] = merged;
+                }
+                updates.auditTrail = [
+                    ...(updates.auditTrail || keep.auditTrail || []),
+                    appendPatientAuditEntry(keep, 'profiles_merged', `Merged from ${mergeIds.join(', ')}`)
+                ];
+                await updatePatientFields(keepId, updates, 'profiles_merged', mergeIds.join(', '));
+                for (const mid of mergeIds) {
+                    await updatePatientFields(mid, {
+                        registryStatus: 'Inactive',
+                        status: 'Merged',
+                        mergedIntoId: keepId,
+                        profileLocked: true,
+                        doNotContact: true
+                    }, 'profile_merged_away', `Merged into ${keepId}`);
+                }
+                await loadAllData();
+                closeModal();
+                showNotification('Profiles merged. Duplicate(s) marked inactive.', 'success');
+                openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === keepId)), true);
+            } catch (err) {
+                console.error(err);
+                showNotification(err.message || 'Merge failed.', 'error');
+            }
+            break;
+        }
         case 'add-contact-log-form': {
             const patientId = form.dataset.patientId;
             const newLog = {
                 date: new Date().toISOString(),
                 outcome: data.outcome,
                 notes: data.notes,
+                overallStatus: data.overallStatus || '',
+                nqReason: data.nqReason || '',
+                niReason: data.niReason || '',
             };
             const patient = state.patients.find(p => p.id === patientId);
             if (patient) {
                 const pipelineStage = patient.pipelineStage === 'lead' ? 'contacted' : patient.pipelineStage;
-                await updatePatientFields(patientId, {
+                const updates = {
                     contactLogs: [...(patient.contactLogs || []), newLog],
                     pipelineStage
-                }, 'contact_log_added', data.outcome);
+                };
+                if (data.overallStatus) updates.overallStatus = data.overallStatus;
+                if (data.nqReason) updates.nqReason = data.nqReason;
+                if (data.niReason) updates.niReason = data.niReason;
+                if (data.overallStatus === 'Not qualified') {
+                    updates.status = 'Screen Fail';
+                    updates.pipelineStage = 'screen_fail';
+                    if (data.nqReason) updates.sfReason = data.nqReason;
+                } else if (data.overallStatus === 'Not interested') {
+                    updates.registryStatus = patient.registryStatus === 'Do Not Call' ? patient.registryStatus : patient.registryStatus;
+                } else if (data.overallStatus === 'Scheduled') {
+                    updates.pipelineStage = 'scheduled';
+                } else if (data.overallStatus === 'Call Back') {
+                    updates.tasks = [...(patient.tasks || []), {
+                        id: ensureId('task'),
+                        title: 'Call back',
+                        type: 'callback',
+                        dueDate: new Date().toISOString().split('T')[0],
+                        status: 'open',
+                        createdAt: new Date().toISOString()
+                    }];
+                }
+                await updatePatientFields(patientId, updates, 'contact_log_added', `${data.outcome}${data.overallStatus ? ' / ' + data.overallStatus : ''}`);
                 await loadAllData();
                 closeModal();
                 openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === patientId)), true);
@@ -8152,13 +8919,18 @@ document.addEventListener('submit', async (e) => {
                     outcome: outcome
                 };
                 const eligibility = evaluateSurveyEligibility(survey, answers);
+                const inferred = inferOverallStatusFromSurvey(outcome, answers);
                 const updates = {
-                    surveyResults: [...(patient.surveyResults || []), surveyResult]
+                    surveyResults: [...(patient.surveyResults || []), surveyResult],
+                    surveyDrafts: (patient.surveyDrafts || []).filter(d => d.surveyId !== survey.id),
+                    ...inferred
                 };
                 if (eligibility.status === 'ineligible' || outcome === 'Fail') {
                     updates.eligibilityStatus = 'ineligible';
                     updates.status = 'Screen Fail';
                     updates.pipelineStage = 'screen_fail';
+                    updates.overallStatus = updates.overallStatus || 'Not qualified';
+                    updates.nqReason = updates.nqReason || eligibility.reasons.join('; ') || 'Failed pre-screen survey';
                     updates.sfReason = eligibility.reasons.join('; ') || 'Failed pre-screen survey';
                 } else if (eligibility.status === 'pi_review') {
                     updates.eligibilityStatus = 'pi_review';
@@ -8176,6 +8948,7 @@ document.addEventListener('submit', async (e) => {
                     updates.exclusionCriteriaMet = false;
                     updates.status = 'Pre-Screening';
                     updates.pipelineStage = 'pre_screened';
+                    updates.overallStatus = updates.overallStatus || 'Scheduled';
                     updates.tasks = [...(patient.tasks || []), {
                         id: ensureId('task'),
                         title: 'Schedule screening visit',
@@ -8245,10 +9018,24 @@ document.addEventListener('submit', async (e) => {
                 
                 const updatedPatient = { ...patient }; // Start with existing data
                 applyPatientFormData(updatedPatient, data);
+                // age recalculated below from DOB
                 updatedPatient.age = data.age ? parseInt(data.age) : null;
                 updatedPatient.inclusionCriteriaMet = form.querySelector('input[name="inclusionCriteriaMet"]')?.checked === true;
                 updatedPatient.exclusionCriteriaMet = form.querySelector('input[name="exclusionCriteriaMet"]')?.checked === true;
                 updatedPatient.doNotContact = form.querySelector('input[name="doNotContact"]')?.checked === true;
+                updatedPatient.emailInvalid = form.querySelector('input[name="emailInvalid"]')?.checked === true;
+                updatedPatient.emailUnsubscribed = form.querySelector('input[name="emailUnsubscribed"]')?.checked === true;
+                updatedPatient.deceased = form.querySelector('input[name="deceased"]')?.checked === true;
+                if (updatedPatient.deceased) updatedPatient.profileLocked = true;
+                updatedPatient.race = formData.getAll('race').map(String);
+                updatedPatient.tags = formData.getAll('tags').map(String);
+                updatedPatient.raceOtherSpecify = data.raceOtherSpecify || '';
+                updatedPatient.sexAssignedAtBirth = data.sexAssignedAtBirth || '';
+                updatedPatient.ethnicity = data.ethnicity || '';
+                updatedPatient.overallStatus = data.overallStatus || '';
+                updatedPatient.nqReason = data.nqReason || '';
+                updatedPatient.niReason = data.niReason || '';
+                updatedPatient.age = data.dob ? (calculateAge(data.dob) || null) : (data.age ? parseInt(data.age) : null);
                 if (data.pipelineStage) updatedPatient.pipelineStage = data.pipelineStage;
                 if (data.eligibilityStatus) updatedPatient.eligibilityStatus = data.eligibilityStatus;
                 if (data.assignedToUserId !== undefined) updatedPatient.assignedToUserId = data.assignedToUserId || '';
@@ -8611,6 +9398,7 @@ document.addEventListener('submit', async (e) => {
                 const qId = qEl.id;
                 const text = form.querySelector(`input[name="${qId}-text"]`).value;
                 const type = form.querySelector(`select[name="${qId}-type"]`).value;
+                const section = form.querySelector(`select[name="${qId}-section"]`)?.value || '';
                 const note = form.querySelector(`textarea[name="${qId}-note"]`)?.value || '';
                 const tableData = form.querySelector(`textarea[name="${qId}-table"]`)?.value || '';
                 
@@ -8633,6 +9421,7 @@ document.addEventListener('submit', async (e) => {
                     });
                 });
                 const question = { id: index + 1, text, type, options };
+                if (section) question.section = section;
                 if (note) question.note = note;
                 if (table) question.table = table;
                 questions.push(question);
@@ -8747,6 +9536,7 @@ document.addEventListener('submit', async (e) => {
             state.lastReportData = filteredPatients;
             const exportBtn = document.getElementById('export-csv-btn');
             const exportSurveysBtn = document.getElementById('export-surveys-btn');
+            const exportFive9Btn = document.getElementById('export-five9-btn');
             const resultsBody = document.getElementById('report-results-body');
             if(filteredPatients.length > 0) {
                 resultsBody.innerHTML = filteredPatients.map(p => {
@@ -8768,10 +9558,12 @@ document.addEventListener('submit', async (e) => {
                 }).join('');
                 if (exportBtn) exportBtn.disabled = false;
                 if (exportSurveysBtn) exportSurveysBtn.disabled = false;
+                if (exportFive9Btn) exportFive9Btn.disabled = false;
             } else {
                 resultsBody.innerHTML = `<tr><td colspan="7" class="text-center text-gray-500 dark:text-gray-400 py-8">No patients match the selected criteria.</td></tr>`;
                 if (exportBtn) exportBtn.disabled = true;
                 if (exportSurveysBtn) exportSurveysBtn.disabled = true;
+                if (exportFive9Btn) exportFive9Btn.disabled = true;
             }
             // Calculate and display metrics
             const metricsContainer = document.getElementById('report-metrics');
@@ -8900,6 +9692,13 @@ const addQuestionToSurveyForm = () => {
             <button type="button" data-action="remove-question" data-q-id="${qId}" class="absolute top-2 right-2 p-1 text-red-500 hover:bg-red-100 dark:hover:bg-red-900 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
             <label class="font-medium dark:text-white" id="${qId}-label">Question ${questionIndex}</label>
             <input type="text" name="${qId}-text" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white mb-2" placeholder="Question Text" required oninput="updateQuestionLabel('${qId}')"/>
+            <div class="mb-2">
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">PSQ Section Header</label>
+                <select name="${qId}-section" class="mt-1 block w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    <option value="">None</option>
+                    ${PSQ_SECTION_HEADERS.map(h => `<option value="${h}">${h}</option>`).join('')}
+                </select>
+            </div>
             <div>
                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Question Type</label>
                 <select name="${qId}-type" class="mt-1 block w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
@@ -9265,6 +10064,43 @@ const renderDuplicateResults = (duplicateGroups) => {
     `).join('');
     lucide.createIcons();
 };
+const exportFive9CSV = () => {
+    try {
+        const patients = state.lastReportData;
+        if (!patients || patients.length === 0) {
+            showNotification('Please generate a report before exporting Five9 phones.', 'info');
+            return;
+        }
+        const headers = ['number', 'first_name', 'last_name', 'email', 'global_id', 'status', 'overall_status'];
+        const rows = [headers.join(',')];
+        patients.forEach(p => {
+            const num = formatPhoneFive9(p.phoneNumber);
+            if (!num) return;
+            rows.push([
+                num,
+                '"' + String(p.firstName || '').replace(/"/g, '""') + '"',
+                '"' + String(p.lastName || '').replace(/"/g, '""') + '"',
+                '"' + String(p.email || '').replace(/"/g, '""') + '"',
+                '"' + String(p.globalId || '').replace(/"/g, '""') + '"',
+                '"' + String(p.status || '').replace(/"/g, '""') + '"',
+                '"' + String(p.overallStatus || '').replace(/"/g, '""') + '"'
+            ].join(','));
+        });
+        const blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        const url = URL.createObjectURL(blob);
+        link.setAttribute('href', url);
+        link.setAttribute('download', 'five9_phones_' + new Date().toISOString().split('T')[0] + '.csv');
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        showNotification('Five9 phone export ready (numbers prefixed with 1).', 'success');
+    } catch (error) {
+        console.error(error);
+        showNotification('Five9 export failed.', 'error');
+    }
+};
 const exportToCSV = () => {
     try {
         const patients = state.lastReportData;
@@ -9548,6 +10384,8 @@ const init = async () => {
     try {
         loadLocalState();
         await loadEntraConfig();
+        await loadReferenceDataFromApi();
+        if (!state.referenceData) loadReferenceDataLocal();
         const loadedUsers = await loadManagedUsersFromApi();
         if (!loadedUsers && (state.managedUsers || []).length) {
             for (const user of state.managedUsers) {
