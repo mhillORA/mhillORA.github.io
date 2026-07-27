@@ -276,8 +276,24 @@
     if (!sites.length) {
       return `<div class="p-4 text-sm text-gray-500">No sites to roll up.</div>`;
     }
+    const studyEnroll = sites.reduce((a, s) => a + s.enrolled, 0) || 1;
+    const cards = sites
+      .map(
+        (s) => `<div class="rounded-lg border dark:border-gray-700 p-3">
+        <div class="font-medium text-gray-900 dark:text-white">${escapeHtml(s.siteName)}</div>
+        <div class="text-xs text-gray-500 mt-0.5">PI ${escapeHtml(s.piList || '—')} · Groups ${escapeHtml(s.groupList)}</div>
+        <div class="grid grid-cols-3 gap-1.5 mt-2">
+          ${metricChip('Sched', fmt(s.scheduled))}
+          ${metricChip('Screen', fmt(s.screened))}
+          ${metricChip('Enrolled', fmt(s.enrolled), true)}
+        </div>
+        <div class="text-xs text-gray-500 mt-2">E/S ${rate(s.enrolled, s.screened)} · ${rate(s.enrolled, studyEnroll)} of study</div>
+      </div>`
+      )
+      .join('');
     return `
-      <div class="overflow-x-auto">
+      <div class="md:hidden space-y-2">${cards}</div>
+      <div class="hidden md:block overflow-x-auto">
         <table class="min-w-full text-sm">
           <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
             <tr>
@@ -295,11 +311,9 @@
             </tr>
           </thead>
           <tbody>
-            ${(() => {
-              const studyEnroll = sites.reduce((a, s) => a + s.enrolled, 0) || 1;
-              return sites
-                .map(
-                  (s) => `<tr class="border-t dark:border-gray-700">
+            ${sites
+              .map(
+                (s) => `<tr class="border-t dark:border-gray-700">
                   <td class="px-2 py-1.5 font-medium">${escapeHtml(s.siteName)}</td>
                   <td class="px-2 py-1.5">${escapeHtml(s.groupList)}</td>
                   <td class="px-2 py-1.5">${escapeHtml(s.piList || '—')}</td>
@@ -316,9 +330,8 @@
                   <td class="px-2 py-1.5 text-right">${rate(s.enrolled, s.screened)}</td>
                   <td class="px-2 py-1.5 text-right">${rate(s.enrolled, studyEnroll)}</td>
                 </tr>`
-                )
-                .join('');
-            })()}
+              )
+              .join('')}
           </tbody>
         </table>
       </div>`;
@@ -326,62 +339,63 @@
 
   function getLegacyStudiesHTML() {
     return `
-      <div class="space-y-4" id="legacy-studies-root">
-        <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+      <div class="space-y-4 px-1 sm:px-0" id="legacy-studies-root">
+        <div class="flex flex-col gap-3">
           <div>
-            <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Legacy Studies</h2>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Legacy Studies</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
               Site–study outcomes from Anterior Segment Overview. Open a study for full site / PI / Visit1 / LPLV breakdown.
             </p>
           </div>
-          <div class="flex gap-2">
+          <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
             <input id="legacy-study-search" type="search" placeholder="Search studies…"
-              class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm w-56" />
-            <button id="legacy-studies-refresh" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Refresh</button>
+              class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-64 min-h-[44px]" />
+            <button id="legacy-studies-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 min-h-[44px] shrink-0">Refresh</button>
           </div>
         </div>
-        <div id="legacy-studies-summary" class="grid grid-cols-2 md:grid-cols-5 gap-3"></div>
+        <div id="legacy-studies-summary" class="grid grid-cols-2 md:grid-cols-5 gap-2 sm:gap-3"></div>
         <div id="legacy-load-status" class="text-xs text-gray-500"></div>
-        <div id="legacy-studies-table-wrap" class="overflow-x-auto rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800"></div>
+        <div id="legacy-studies-table-wrap" class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden"></div>
         <div id="legacy-study-detail" class="hidden"></div>
       </div>`;
   }
 
   function getLegacyReportingHTML() {
     return `
-      <div class="space-y-4" id="legacy-reporting-root">
-        <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+      <div class="space-y-4 px-1 sm:px-0" id="legacy-reporting-root">
+        <div class="flex flex-col gap-3">
           <div>
-            <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Legacy Reporting</h2>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Legacy Reporting</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              <strong>By Site</strong> = one row per unique site (~50), not ~700 study×site lines.
-              Drill into a site for its studies.
+              <strong>By Site</strong> = one row per unique site, not ~700 study×site lines.
             </p>
           </div>
-          <div class="flex flex-wrap gap-2 items-center">
-            <div class="inline-flex rounded-md border dark:border-gray-600 overflow-hidden text-sm">
-              <button type="button" id="legacy-mode-site" class="px-3 py-2 bg-indigo-600 text-white">By Site</button>
-              <button type="button" id="legacy-mode-study" class="px-3 py-2 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200">By Study</button>
+          <div class="flex flex-col gap-2">
+            <div class="inline-flex rounded-md border dark:border-gray-600 overflow-hidden text-sm w-full sm:w-auto">
+              <button type="button" id="legacy-mode-site" class="flex-1 sm:flex-none px-4 py-3 sm:py-2 bg-indigo-600 text-white min-h-[44px]">By Site</button>
+              <button type="button" id="legacy-mode-study" class="flex-1 sm:flex-none px-4 py-3 sm:py-2 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 min-h-[44px]">By Study</button>
             </div>
-            <select id="legacy-report-study" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm min-w-[12rem]">
-              <option value="">All studies</option>
-            </select>
-            <select id="legacy-report-site" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm min-w-[12rem]">
-              <option value="">All sites</option>
-            </select>
-            <button id="legacy-report-refresh" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Refresh</button>
-            <button id="legacy-report-export" class="px-3 py-2 text-sm rounded-md border dark:border-gray-600">Export CSV</button>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:flex lg:flex-wrap gap-2">
+              <select id="legacy-report-study" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full lg:min-w-[12rem] min-h-[44px]">
+                <option value="">All studies</option>
+              </select>
+              <select id="legacy-report-site" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full lg:min-w-[12rem] min-h-[44px]">
+                <option value="">All sites</option>
+              </select>
+              <button id="legacy-report-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 min-h-[44px]">Refresh</button>
+              <button id="legacy-report-export" class="px-4 py-3 sm:py-2 text-sm rounded-md border dark:border-gray-600 min-h-[44px]">Export CSV</button>
+            </div>
           </div>
         </div>
-        <div id="legacy-report-kpis" class="grid grid-cols-2 md:grid-cols-6 gap-3"></div>
+        <div id="legacy-report-kpis" class="grid grid-cols-2 md:grid-cols-6 gap-2 sm:gap-3"></div>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+          <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4">
             <h3 id="legacy-chart-title" class="font-semibold mb-2 text-gray-900 dark:text-white">Enrolled by site</h3>
-            <canvas id="legacy-chart-studies" height="220"></canvas>
+            <div class="relative h-56 sm:h-64"><canvas id="legacy-chart-studies"></canvas></div>
           </div>
-          <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+          <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4">
             <h3 class="font-semibold mb-2 text-gray-900 dark:text-white">Funnel totals</h3>
-            <canvas id="legacy-chart-funnel" height="220"></canvas>
+            <div class="relative h-56 sm:h-64"><canvas id="legacy-chart-funnel"></canvas></div>
           </div>
         </div>
         <div id="legacy-report-tables" class="space-y-4"></div>
@@ -390,16 +404,16 @@
 
   function getLegacySitesHTML() {
     return `
-      <div class="space-y-4" id="legacy-sites-root">
-        <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+      <div class="space-y-4 px-1 sm:px-0" id="legacy-sites-root">
+        <div class="flex flex-col gap-3">
           <div>
-            <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Legacy Sites</h2>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Legacy Sites</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              Overall site performance across all legacy studies, plus relationship notes (prefer / cautious / avoid, advantages & disadvantages).
+              Overall site performance plus relationship notes (prefer / cautious / avoid, advantages & disadvantages).
             </p>
           </div>
-          <div class="flex flex-wrap gap-2">
-            <select id="legacy-site-pref-filter" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm">
+          <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2 w-full">
+            <select id="legacy-site-pref-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]">
               <option value="">All preferences</option>
               <option value="prefer">Prefer</option>
               <option value="neutral">Neutral</option>
@@ -408,16 +422,30 @@
               <option value="unset">Not set</option>
             </select>
             <input id="legacy-site-search" type="search" placeholder="Search sites…"
-              class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm w-56" />
-            <button id="legacy-sites-refresh" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Refresh</button>
+              class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:flex-1 sm:min-w-[12rem] min-h-[44px]" />
+            <button id="legacy-sites-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 min-h-[44px] shrink-0">Refresh</button>
           </div>
         </div>
-        <div id="legacy-sites-summary" class="grid grid-cols-2 md:grid-cols-5 gap-3"></div>
+        <div id="legacy-sites-summary" class="grid grid-cols-2 md:grid-cols-5 gap-2 sm:gap-3"></div>
         <div id="legacy-sites-load-status" class="text-xs text-gray-500"></div>
-        <div id="legacy-sites-table-wrap" class="overflow-x-auto rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800"></div>
+        <div id="legacy-sites-table-wrap" class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden"></div>
         <div id="legacy-site-detail" class="hidden"></div>
       </div>`;
   }
+
+  function metricChip(label, value, emphasize = false) {
+    return `<div class="rounded-md bg-gray-50 dark:bg-gray-900/50 px-2 py-1.5 text-center min-w-0">
+      <div class="text-[10px] sm:text-xs text-gray-500 truncate">${label}</div>
+      <div class="text-sm font-semibold ${emphasize ? 'text-indigo-600 dark:text-indigo-300' : 'text-gray-900 dark:text-white'} truncate">${value}</div>
+    </div>`;
+  }
+
+  const TAP_BTN =
+    'inline-flex items-center justify-center px-4 py-2.5 min-h-[44px] text-sm font-medium rounded-md bg-indigo-600 text-white hover:bg-indigo-700';
+  const TAP_LINK =
+    'inline-flex items-center justify-center px-3 py-2.5 min-h-[44px] text-sm font-medium text-indigo-600 dark:text-indigo-300';
+  const TAP_BACK =
+    'inline-flex items-center px-3 py-2.5 min-h-[44px] text-sm font-medium text-indigo-600 dark:text-indigo-300 -ml-2';
 
   const RELATIONSHIP_OPTIONS = [
     { value: '', label: 'Not set' },
@@ -502,53 +530,88 @@
 
     siteSummaryCards(summary, sites);
 
+    const cardHtml = rows
+      .map((s) => {
+        const m = s.metrics || {};
+        const siteOutcomes = outcomesForSite(s.id);
+        const t = sumOutcomes(siteOutcomes);
+        const enrolled = t.enrolled || num(m.enrolled);
+        const screened = t.screened || num(m.screened);
+        const scheduled = t.scheduled || num(m.scheduled);
+        const nStudies = new Set(siteOutcomes.map((o) => o.studyId)).size || m.nStudies || 0;
+        return `<button type="button" data-legacy-open-site="${escapeHtml(s.id)}"
+          class="w-full text-left p-4 border-b dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-700/40 active:bg-indigo-50 dark:active:bg-indigo-900/20 transition-colors">
+          <div class="flex items-start justify-between gap-2 mb-2">
+            <div class="min-w-0">
+              <div class="font-semibold text-gray-900 dark:text-white truncate">${escapeHtml(s.name)}</div>
+              <div class="text-xs text-gray-500 font-mono truncate">${escapeHtml(s.siteCode || s.id)}</div>
+            </div>
+            ${preferenceBadge(s.relationshipPreference)}
+          </div>
+          <div class="grid grid-cols-4 gap-1.5 mb-3">
+            ${metricChip('Studies', nStudies)}
+            ${metricChip('Sched', fmt(scheduled))}
+            ${metricChip('Screen', fmt(screened))}
+            ${metricChip('Enrolled', fmt(enrolled), true)}
+          </div>
+          <div class="flex items-center justify-between text-xs text-gray-500">
+            <span>E/S ${rate(enrolled, screened)} · S/Sched ${rate(screened, scheduled)}</span>
+            <span class="text-indigo-600 dark:text-indigo-300 font-medium">Open →</span>
+          </div>
+        </button>`;
+      })
+      .join('');
+
+    const tableRows = rows
+      .map((s) => {
+        const m = s.metrics || {};
+        const siteOutcomes = outcomesForSite(s.id);
+        const t = sumOutcomes(siteOutcomes);
+        const enrolled = t.enrolled || num(m.enrolled);
+        const screened = t.screened || num(m.screened);
+        const scheduled = t.scheduled || num(m.scheduled);
+        const target = t.targetScheduled || num(m.targetScheduled);
+        const nStudies = new Set(siteOutcomes.map((o) => o.studyId)).size || m.nStudies || 0;
+        return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
+          <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(s.name)}</td>
+          <td class="px-3 py-2 text-xs font-mono text-gray-500">${escapeHtml(s.siteCode || '—')}</td>
+          <td class="px-3 py-2">${preferenceBadge(s.relationshipPreference)}</td>
+          <td class="px-3 py-2 text-right">${nStudies}</td>
+          <td class="px-3 py-2 text-right">${fmt(target)}</td>
+          <td class="px-3 py-2 text-right">${fmt(scheduled)}</td>
+          <td class="px-3 py-2 text-right">${fmt(screened)}</td>
+          <td class="px-3 py-2 text-right font-semibold">${fmt(enrolled)}</td>
+          <td class="px-3 py-2 text-right">${rate(enrolled, screened)}</td>
+          <td class="px-3 py-2 text-right">${rate(screened, scheduled)}</td>
+          <td class="px-3 py-2 text-right">
+            <button type="button" data-legacy-open-site="${escapeHtml(s.id)}" class="${TAP_BTN}">Open</button>
+          </td>
+        </tr>`;
+      })
+      .join('');
+
     wrap.innerHTML = `
-      <table class="min-w-full text-sm">
-        <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
-          <tr>
-            <th class="px-3 py-2">Site</th>
-            <th class="px-3 py-2">Code</th>
-            <th class="px-3 py-2">Relationship</th>
-            <th class="px-3 py-2 text-right">Studies</th>
-            <th class="px-3 py-2 text-right">Target</th>
-            <th class="px-3 py-2 text-right">Sched</th>
-            <th class="px-3 py-2 text-right">Screen</th>
-            <th class="px-3 py-2 text-right">Enrolled</th>
-            <th class="px-3 py-2 text-right">E/S</th>
-            <th class="px-3 py-2 text-right">S/Sched</th>
-            <th class="px-3 py-2"></th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows
-            .map((s) => {
-              const m = s.metrics || {};
-              const siteOutcomes = outcomesForSite(s.id);
-              const t = sumOutcomes(siteOutcomes);
-              const enrolled = t.enrolled || num(m.enrolled);
-              const screened = t.screened || num(m.screened);
-              const scheduled = t.scheduled || num(m.scheduled);
-              const target = t.targetScheduled || num(m.targetScheduled);
-              const nStudies = new Set(siteOutcomes.map((o) => o.studyId)).size || m.nStudies || 0;
-              return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
-                <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(s.name)}</td>
-                <td class="px-3 py-2 text-xs font-mono text-gray-500">${escapeHtml(s.siteCode || '—')}</td>
-                <td class="px-3 py-2">${preferenceBadge(s.relationshipPreference)}</td>
-                <td class="px-3 py-2 text-right">${nStudies}</td>
-                <td class="px-3 py-2 text-right">${fmt(target)}</td>
-                <td class="px-3 py-2 text-right">${fmt(scheduled)}</td>
-                <td class="px-3 py-2 text-right">${fmt(screened)}</td>
-                <td class="px-3 py-2 text-right font-semibold">${fmt(enrolled)}</td>
-                <td class="px-3 py-2 text-right">${rate(enrolled, screened)}</td>
-                <td class="px-3 py-2 text-right">${rate(screened, scheduled)}</td>
-                <td class="px-3 py-2 text-right">
-                  <button data-legacy-open-site="${escapeHtml(s.id)}" class="text-indigo-600 hover:underline">Open</button>
-                </td>
-              </tr>`;
-            })
-            .join('')}
-        </tbody>
-      </table>`;
+      <div class="md:hidden divide-y dark:divide-gray-700">${cardHtml || '<div class="p-4 text-sm text-gray-500">No sites match.</div>'}</div>
+      <div class="hidden md:block overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
+            <tr>
+              <th class="px-3 py-2">Site</th>
+              <th class="px-3 py-2">Code</th>
+              <th class="px-3 py-2">Relationship</th>
+              <th class="px-3 py-2 text-right">Studies</th>
+              <th class="px-3 py-2 text-right">Target</th>
+              <th class="px-3 py-2 text-right">Sched</th>
+              <th class="px-3 py-2 text-right">Screen</th>
+              <th class="px-3 py-2 text-right">Enrolled</th>
+              <th class="px-3 py-2 text-right">E/S</th>
+              <th class="px-3 py-2 text-right">S/Sched</th>
+              <th class="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </div>`;
 
     wrap.querySelectorAll('[data-legacy-open-site]').forEach((btn) => {
       btn.addEventListener('click', () => openSiteDetail(btn.getAttribute('data-legacy-open-site')));
@@ -617,62 +680,79 @@
     ).join('');
 
     detail.innerHTML = `
-      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-5">
-        <div class="flex items-start justify-between gap-3 flex-wrap">
+      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4 space-y-5">
+        <div class="flex flex-col gap-3">
           <div>
-            <button id="legacy-back-sites" class="text-sm text-indigo-600 hover:underline mb-1">← All legacy sites</button>
-            <h3 class="text-xl font-bold text-gray-900 dark:text-white">${escapeHtml(site.name)}</h3>
+            <button type="button" id="legacy-back-sites" class="${TAP_BACK}">← All legacy sites</button>
+            <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1">${escapeHtml(site.name)}</h3>
             <p class="text-sm text-gray-500 flex flex-wrap items-center gap-2 mt-1">
               <span class="font-mono text-xs">${escapeHtml(site.siteCode || site.id)}</span>
               ${preferenceBadge(site.relationshipPreference)}
-              <span>· ${studyIds.length} studies · ${outcomes.length} outcome rows · ${pis.length} PI(s)</span>
+              <span>· ${studyIds.length} studies · ${outcomes.length} rows · ${pis.length} PI(s)</span>
             </p>
           </div>
-          <button id="legacy-save-site" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white">Save relationship</button>
+          <button type="button" id="legacy-save-site" class="${TAP_BTN} w-full sm:w-auto">Save relationship</button>
         </div>
 
-        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 text-sm">
-          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Target sched</div><div class="font-semibold">${fmt(t.targetScheduled || m.targetScheduled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Scheduled</div><div class="font-semibold">${fmt(t.scheduled || m.scheduled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Screened</div><div class="font-semibold">${fmt(t.screened || m.screened)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Enrolled</div><div class="font-semibold">${fmt(t.enrolled || m.enrolled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Sched / Target</div><div class="font-semibold">${rate(t.scheduled || m.scheduled, t.targetScheduled || m.targetScheduled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Screen / Sched</div><div class="font-semibold">${rate(t.screened || m.screened, t.scheduled || m.scheduled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Enroll / Screen</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.screened || m.screened)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Enroll / Sched</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.scheduled || m.scheduled)}</div></div>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-sm">
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Target sched</div><div class="font-semibold">${fmt(t.targetScheduled || m.targetScheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Scheduled</div><div class="font-semibold">${fmt(t.scheduled || m.scheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Screened</div><div class="font-semibold">${fmt(t.screened || m.screened)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enrolled</div><div class="font-semibold text-indigo-600 dark:text-indigo-300">${fmt(t.enrolled || m.enrolled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Sched / Target</div><div class="font-semibold">${rate(t.scheduled || m.scheduled, t.targetScheduled || m.targetScheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Screen / Sched</div><div class="font-semibold">${rate(t.screened || m.screened, t.scheduled || m.scheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enroll / Screen</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.screened || m.screened)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enroll / Sched</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.scheduled || m.scheduled)}</div></div>
         </div>
 
-        <div class="rounded-lg border border-indigo-200 dark:border-indigo-800 bg-indigo-50/50 dark:bg-indigo-950/20 p-4 space-y-3">
+        <div class="rounded-lg border border-indigo-200 dark:border-indigo-800 bg-indigo-50/50 dark:bg-indigo-950/20 p-3 sm:p-4 space-y-3">
           <h4 class="font-semibold text-gray-900 dark:text-white">Site relationship</h4>
           <p class="text-xs text-gray-500">How we like working with this site — preserved across re-ingest.</p>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
             <label class="text-sm md:col-span-2">Working preference
-              <select id="legacy-site-pref" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">
+              <select id="legacy-site-pref" class="mt-1 w-full px-3 py-3 sm:py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]">
                 ${prefOptions}
               </select>
             </label>
             <label class="text-sm">Advantages
               <textarea id="legacy-site-advantages" rows="4" placeholder="What works well here…"
-                class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(site.advantages || '')}</textarea>
+                class="mt-1 w-full px-3 py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm">${escapeHtml(site.advantages || '')}</textarea>
             </label>
             <label class="text-sm">Disadvantages
               <textarea id="legacy-site-disadvantages" rows="4" placeholder="Friction, risk, or watch-outs…"
-                class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(site.disadvantages || '')}</textarea>
+                class="mt-1 w-full px-3 py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm">${escapeHtml(site.disadvantages || '')}</textarea>
             </label>
             <label class="text-sm md:col-span-2">Relationship notes
               <textarea id="legacy-site-rel-notes" rows="2" placeholder="Contacts, history, context…"
-                class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(site.relationshipNotes || '')}</textarea>
+                class="mt-1 w-full px-3 py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm">${escapeHtml(site.relationshipNotes || '')}</textarea>
             </label>
             <label class="text-sm md:col-span-2">General notes
               <textarea id="legacy-site-notes" rows="2"
-                class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(site.notes || '')}</textarea>
+                class="mt-1 w-full px-3 py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm">${escapeHtml(site.notes || '')}</textarea>
             </label>
           </div>
         </div>
 
         <div>
           <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Studies at this site (${studyParts.length})</h4>
-          <div class="overflow-x-auto rounded border dark:border-gray-700">
+          <div class="md:hidden space-y-2">
+            ${studyParts
+              .map((st) => {
+                const ta = st.meta?.therapeuticArea || st.meta?.indication || '—';
+                const stPis = [...new Set(st.rows.map((r) => r.pi).filter(Boolean))].join(', ') || '—';
+                return `<div class="rounded-lg border dark:border-gray-700 p-3">
+                  <div class="font-medium text-gray-900 dark:text-white">${escapeHtml(st.studyName || st.studyId)}</div>
+                  <div class="text-xs text-gray-500 mt-0.5">${escapeHtml(ta)} · PI ${escapeHtml(stPis)}</div>
+                  <div class="grid grid-cols-3 gap-1.5 mt-2">
+                    ${metricChip('Sched', fmt(st.t.scheduled))}
+                    ${metricChip('Screen', fmt(st.t.screened))}
+                    ${metricChip('Enrolled', fmt(st.t.enrolled), true)}
+                  </div>
+                </div>`;
+              })
+              .join('') || '<p class="text-sm text-gray-500">No studies.</p>'}
+          </div>
+          <div class="hidden md:block overflow-x-auto rounded border dark:border-gray-700">
             <table class="min-w-full text-sm">
               <thead class="bg-gray-50 dark:bg-gray-900/40 text-left">
                 <tr>
@@ -710,7 +790,7 @@
 
         <div>
           <h4 class="font-semibold text-gray-900 dark:text-white mb-2">PIs seen here</h4>
-          <p class="text-sm text-gray-700 dark:text-gray-300">${escapeHtml(pis.join(', ') || '—')}</p>
+          <p class="text-sm text-gray-700 dark:text-gray-300 break-words">${escapeHtml(pis.join(', ') || '—')}</p>
         </div>
 
         <div>
@@ -858,47 +938,72 @@
 
     if (summary) summaryCards(summary, state.studies);
 
+    const cardHtml = rows
+      .map((s) => {
+        const m = s.metrics || {};
+        const siteCount = m.nSites ?? state.outcomes.filter((o) => o.studyId === s.id).length;
+        return `<button type="button" data-legacy-open="${escapeHtml(s.id)}"
+          class="w-full text-left p-4 border-b dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-700/40 active:bg-indigo-50 dark:active:bg-indigo-900/20 transition-colors">
+          <div class="flex items-start justify-between gap-2 mb-1">
+            <div class="font-semibold text-gray-900 dark:text-white truncate">${escapeHtml(s.name || s.title)}</div>
+            <span class="text-indigo-600 dark:text-indigo-300 text-sm font-medium shrink-0">Open →</span>
+          </div>
+          <div class="text-xs text-gray-500 mb-3 truncate">${escapeHtml(s.therapeuticArea || s.indication || 'No TA/indication')}</div>
+          <div class="grid grid-cols-4 gap-1.5">
+            ${metricChip('Sites', fmt(siteCount))}
+            ${metricChip('Sched', fmt(m.scheduled))}
+            ${metricChip('Screen', fmt(m.screened))}
+            ${metricChip('Enrolled', fmt(m.enrolled), true)}
+          </div>
+          <div class="mt-2 text-xs text-gray-500">E/S ${rate(m.enrolled, m.screened)}</div>
+        </button>`;
+      })
+      .join('');
+
+    const tableRows = rows
+      .map((s) => {
+        const m = s.metrics || {};
+        const siteCount = state.outcomes.filter((o) => o.studyId === s.id).length;
+        return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
+          <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(s.name || s.title)}</td>
+          <td class="px-3 py-2">${escapeHtml(s.therapeuticArea || '—')}</td>
+          <td class="px-3 py-2">${escapeHtml(s.indication || '—')}</td>
+          <td class="px-3 py-2 text-right">${fmt(m.nSites ?? siteCount)}</td>
+          <td class="px-3 py-2 text-right">${fmt(m.scheduled)}</td>
+          <td class="px-3 py-2 text-right">${fmt(m.screened)}</td>
+          <td class="px-3 py-2 text-right font-semibold">${fmt(m.enrolled)}</td>
+          <td class="px-3 py-2 text-right">${rate(m.enrolled, m.screened)}</td>
+          <td class="px-3 py-2 text-xs text-gray-500">${escapeHtml(
+            [m.visit1StartMin, m.visit1StartMax].filter(Boolean).join(' → ') || '—'
+          )}</td>
+          <td class="px-3 py-2 text-right">
+            <button type="button" data-legacy-open="${escapeHtml(s.id)}" class="${TAP_BTN}">Open</button>
+          </td>
+        </tr>`;
+      })
+      .join('');
+
     wrap.innerHTML = `
-      <table class="min-w-full text-sm">
-        <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
-          <tr>
-            <th class="px-3 py-2">Study</th>
-            <th class="px-3 py-2">Therapeutic Area</th>
-            <th class="px-3 py-2">Indication</th>
-            <th class="px-3 py-2 text-right">Sites</th>
-            <th class="px-3 py-2 text-right">Scheduled</th>
-            <th class="px-3 py-2 text-right">Screened</th>
-            <th class="px-3 py-2 text-right">Enrolled</th>
-            <th class="px-3 py-2 text-right">E/S</th>
-            <th class="px-3 py-2">Visit1 range</th>
-            <th class="px-3 py-2"></th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows
-            .map((s) => {
-              const m = s.metrics || {};
-              const siteCount = state.outcomes.filter((o) => o.studyId === s.id).length;
-              return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
-                <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(s.name || s.title)}</td>
-                <td class="px-3 py-2">${escapeHtml(s.therapeuticArea || '—')}</td>
-                <td class="px-3 py-2">${escapeHtml(s.indication || '—')}</td>
-                <td class="px-3 py-2 text-right">${fmt(m.nSites ?? siteCount)}</td>
-                <td class="px-3 py-2 text-right">${fmt(m.scheduled)}</td>
-                <td class="px-3 py-2 text-right">${fmt(m.screened)}</td>
-                <td class="px-3 py-2 text-right font-semibold">${fmt(m.enrolled)}</td>
-                <td class="px-3 py-2 text-right">${rate(m.enrolled, m.screened)}</td>
-                <td class="px-3 py-2 text-xs text-gray-500">${escapeHtml(
-                  [m.visit1StartMin, m.visit1StartMax].filter(Boolean).join(' → ') || '—'
-                )}</td>
-                <td class="px-3 py-2 text-right">
-                  <button data-legacy-open="${escapeHtml(s.id)}" class="text-indigo-600 hover:underline">Open sites</button>
-                </td>
-              </tr>`;
-            })
-            .join('')}
-        </tbody>
-      </table>`;
+      <div class="md:hidden divide-y dark:divide-gray-700">${cardHtml || '<div class="p-4 text-sm text-gray-500">No studies match.</div>'}</div>
+      <div class="hidden md:block overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
+            <tr>
+              <th class="px-3 py-2">Study</th>
+              <th class="px-3 py-2">Therapeutic Area</th>
+              <th class="px-3 py-2">Indication</th>
+              <th class="px-3 py-2 text-right">Sites</th>
+              <th class="px-3 py-2 text-right">Scheduled</th>
+              <th class="px-3 py-2 text-right">Screened</th>
+              <th class="px-3 py-2 text-right">Enrolled</th>
+              <th class="px-3 py-2 text-right">E/S</th>
+              <th class="px-3 py-2">Visit1 range</th>
+              <th class="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </div>`;
 
     wrap.querySelectorAll('[data-legacy-open]').forEach((btn) => {
       btn.addEventListener('click', () => openStudyDetail(btn.getAttribute('data-legacy-open')));
@@ -923,11 +1028,11 @@
     const totals = sumOutcomes(outcomes);
 
     detail.innerHTML = `
-      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-4">
-        <div class="flex items-start justify-between gap-3">
+      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4 space-y-4">
+        <div class="flex flex-col gap-3">
           <div>
-            <button id="legacy-back-list" class="text-sm text-indigo-600 hover:underline mb-1">← All legacy studies</button>
-            <h3 class="text-xl font-bold text-gray-900 dark:text-white">${escapeHtml(study.name)}</h3>
+            <button type="button" id="legacy-back-list" class="${TAP_BACK}">← All legacy studies</button>
+            <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1">${escapeHtml(study.name)}</h3>
             <p class="text-sm text-gray-500">
               Visit 1 ${escapeHtml(m.visit1StartMin || totals.visitStarts.sort()[0] || '—')}
               → ${escapeHtml(m.visit1StartMax || totals.visitStarts.sort().slice(-1)[0] || '—')}
@@ -935,42 +1040,42 @@
               · ${outcomes.length} site row(s)
             </p>
           </div>
-          <button id="legacy-save-meta" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white">Save metadata</button>
+          <button type="button" id="legacy-save-meta" class="${TAP_BTN} w-full sm:w-auto">Save metadata</button>
         </div>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
           <label class="text-sm">Therapeutic Area
-            <input id="legacy-meta-ta" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600"
+            <input id="legacy-meta-ta" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
               value="${escapeHtml(study.therapeuticArea || study.indication || '')}" placeholder="Same as Indication" />
           </label>
           <label class="text-sm">Indication
-            <input id="legacy-meta-indication" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600"
+            <input id="legacy-meta-indication" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
               value="${escapeHtml(study.indication || '')}" />
           </label>
           <label class="text-sm">Sponsor
-            <input id="legacy-meta-sponsor" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600"
+            <input id="legacy-meta-sponsor" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
               value="${escapeHtml(study.sponsor || '')}" />
           </label>
           <label class="text-sm">Phase
-            <input id="legacy-meta-phase" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600"
+            <input id="legacy-meta-phase" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
               value="${escapeHtml(study.phase || '')}" />
           </label>
           <label class="text-sm">Status
-            <input id="legacy-meta-status" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600"
+            <input id="legacy-meta-status" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
               value="${escapeHtml(study.status || '')}" />
           </label>
-          <label class="text-sm md:col-span-3">Notes
-            <textarea id="legacy-meta-notes" rows="2" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(
+          <label class="text-sm sm:col-span-2 md:col-span-3">Notes
+            <textarea id="legacy-meta-notes" rows="2" class="mt-1 w-full px-3 py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm">${escapeHtml(
               study.notes || ''
             )}</textarea>
           </label>
         </div>
-        <div class="grid grid-cols-2 md:grid-cols-6 gap-3 text-sm">
-          <div><div class="text-gray-500">Target sched</div><div class="font-semibold">${fmt(totals.targetScheduled || m.targetScheduled)}</div></div>
-          <div><div class="text-gray-500">Scheduled</div><div class="font-semibold">${fmt(totals.scheduled || m.scheduled)}</div></div>
-          <div><div class="text-gray-500">Screened</div><div class="font-semibold">${fmt(totals.screened || m.screened)}</div></div>
-          <div><div class="text-gray-500">Enrolled</div><div class="font-semibold">${fmt(totals.enrolled || m.enrolled)}</div></div>
-          <div><div class="text-gray-500">Enroll / Screen</div><div class="font-semibold">${rate(totals.enrolled || m.enrolled, totals.screened || m.screened)}</div></div>
-          <div><div class="text-gray-500">Sites</div><div class="font-semibold">${totals.sites.size || m.nSites || '—'}</div></div>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2 text-sm">
+          ${metricChip('Target', fmt(totals.targetScheduled || m.targetScheduled))}
+          ${metricChip('Scheduled', fmt(totals.scheduled || m.scheduled))}
+          ${metricChip('Screened', fmt(totals.screened || m.screened))}
+          ${metricChip('Enrolled', fmt(totals.enrolled || m.enrolled), true)}
+          ${metricChip('E/S', rate(totals.enrolled || m.enrolled, totals.screened || m.screened))}
+          ${metricChip('Sites', totals.sites.size || m.nSites || '—')}
         </div>
 
         <div>
@@ -1220,8 +1325,9 @@
     const siteBtn = document.getElementById('legacy-mode-site');
     const studyBtn = document.getElementById('legacy-mode-study');
     if (siteBtn && studyBtn) {
-      const on = 'px-3 py-2 bg-indigo-600 text-white';
-      const off = 'px-3 py-2 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200';
+      const on = 'flex-1 sm:flex-none px-4 py-3 sm:py-2 bg-indigo-600 text-white min-h-[44px]';
+      const off =
+        'flex-1 sm:flex-none px-4 py-3 sm:py-2 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 min-h-[44px]';
       siteBtn.className = state.reportMode === 'bySite' ? on : off;
       studyBtn.className = state.reportMode === 'byStudy' ? on : off;
     }
@@ -1399,48 +1505,75 @@
         .sort((a, b) => b.t.enrolled - a.t.enrolled);
 
       tables.innerHTML = `
-        <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-x-auto">
-          <div class="px-3 py-2 font-semibold border-b dark:border-gray-700 flex justify-between gap-2">
-            <span>Sites (${siteRows.length} unique — not ${outcomes.length} outcome lines)</span>
-            <span class="text-xs font-normal text-gray-500">Each siteId appears once; expand for studies under that site</span>
+        <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden">
+          <div class="px-3 py-2 font-semibold border-b dark:border-gray-700">
+            <div>Sites (${siteRows.length} unique)</div>
+            <div class="text-xs font-normal text-gray-500">Tap a site for full metrics & relationship notes</div>
           </div>
-          <table class="min-w-full text-sm">
-            <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
-              <th class="px-3 py-2">Site</th>
-              <th class="px-3 py-2">Relationship</th>
-              <th class="px-3 py-2">Code</th>
-              <th class="px-3 py-2 text-right">Studies</th>
-              <th class="px-3 py-2 text-right">Rows</th>
-              <th class="px-3 py-2 text-right">Target</th>
-              <th class="px-3 py-2 text-right">Sched</th>
-              <th class="px-3 py-2 text-right">Screen</th>
-              <th class="px-3 py-2 text-right">Enrolled</th>
-              <th class="px-3 py-2 text-right">E/S</th>
-              <th class="px-3 py-2"></th>
-            </tr></thead>
-            <tbody>
-              ${siteRows
-                .map(({ site: s, rows, t, studyNames }) => {
-                  const m = s.metrics || {};
-                  return `<tr class="border-t dark:border-gray-700">
-                    <td class="px-3 py-1.5 font-medium">${escapeHtml(s.name)}</td>
-                    <td class="px-3 py-1.5">${preferenceBadge(s.relationshipPreference)}</td>
-                    <td class="px-3 py-1.5 text-xs">${escapeHtml(s.siteCode || '—')}</td>
-                    <td class="px-3 py-1.5 text-right">${studyNames.length || m.nStudies || '—'}</td>
-                    <td class="px-3 py-1.5 text-right">${rows.length}</td>
-                    <td class="px-3 py-1.5 text-right">${fmt(t.targetScheduled)}</td>
-                    <td class="px-3 py-1.5 text-right">${fmt(t.scheduled)}</td>
-                    <td class="px-3 py-1.5 text-right">${fmt(t.screened)}</td>
-                    <td class="px-3 py-1.5 text-right font-semibold">${fmt(t.enrolled)}</td>
-                    <td class="px-3 py-1.5 text-right">${rate(t.enrolled, t.screened)}</td>
-                    <td class="px-3 py-1.5 text-right">
-                      <button type="button" data-legacy-report-open-site="${escapeHtml(s.id)}" class="text-indigo-600 hover:underline text-xs">Open</button>
-                    </td>
-                  </tr>`;
-                })
-                .join('')}
-            </tbody>
-          </table>
+          <div class="md:hidden divide-y dark:divide-gray-700">
+            ${siteRows
+              .map(({ site: s, rows, t, studyNames }) => {
+                return `<button type="button" data-legacy-report-open-site="${escapeHtml(s.id)}"
+                  class="w-full text-left p-4 hover:bg-gray-50 dark:hover:bg-gray-700/40 active:bg-indigo-50 dark:active:bg-indigo-900/20">
+                  <div class="flex items-start justify-between gap-2 mb-2">
+                    <div class="min-w-0">
+                      <div class="font-semibold text-gray-900 dark:text-white truncate">${escapeHtml(s.name)}</div>
+                      <div class="text-xs text-gray-500">${studyNames.length} studies · ${rows.length} rows</div>
+                    </div>
+                    ${preferenceBadge(s.relationshipPreference)}
+                  </div>
+                  <div class="grid grid-cols-3 gap-1.5 mb-2">
+                    ${metricChip('Sched', fmt(t.scheduled))}
+                    ${metricChip('Screen', fmt(t.screened))}
+                    ${metricChip('Enrolled', fmt(t.enrolled), true)}
+                  </div>
+                  <div class="flex justify-between text-xs text-gray-500">
+                    <span>E/S ${rate(t.enrolled, t.screened)}</span>
+                    <span class="text-indigo-600 dark:text-indigo-300 font-medium">Open →</span>
+                  </div>
+                </button>`;
+              })
+              .join('')}
+          </div>
+          <div class="hidden md:block overflow-x-auto">
+            <table class="min-w-full text-sm">
+              <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
+                <th class="px-3 py-2">Site</th>
+                <th class="px-3 py-2">Relationship</th>
+                <th class="px-3 py-2">Code</th>
+                <th class="px-3 py-2 text-right">Studies</th>
+                <th class="px-3 py-2 text-right">Rows</th>
+                <th class="px-3 py-2 text-right">Target</th>
+                <th class="px-3 py-2 text-right">Sched</th>
+                <th class="px-3 py-2 text-right">Screen</th>
+                <th class="px-3 py-2 text-right">Enrolled</th>
+                <th class="px-3 py-2 text-right">E/S</th>
+                <th class="px-3 py-2"></th>
+              </tr></thead>
+              <tbody>
+                ${siteRows
+                  .map(({ site: s, rows, t, studyNames }) => {
+                    const m = s.metrics || {};
+                    return `<tr class="border-t dark:border-gray-700">
+                      <td class="px-3 py-1.5 font-medium">${escapeHtml(s.name)}</td>
+                      <td class="px-3 py-1.5">${preferenceBadge(s.relationshipPreference)}</td>
+                      <td class="px-3 py-1.5 text-xs">${escapeHtml(s.siteCode || '—')}</td>
+                      <td class="px-3 py-1.5 text-right">${studyNames.length || m.nStudies || '—'}</td>
+                      <td class="px-3 py-1.5 text-right">${rows.length}</td>
+                      <td class="px-3 py-1.5 text-right">${fmt(t.targetScheduled)}</td>
+                      <td class="px-3 py-1.5 text-right">${fmt(t.scheduled)}</td>
+                      <td class="px-3 py-1.5 text-right">${fmt(t.screened)}</td>
+                      <td class="px-3 py-1.5 text-right font-semibold">${fmt(t.enrolled)}</td>
+                      <td class="px-3 py-1.5 text-right">${rate(t.enrolled, t.screened)}</td>
+                      <td class="px-3 py-1.5 text-right">
+                        <button type="button" data-legacy-report-open-site="${escapeHtml(s.id)}" class="${TAP_BTN}">Open</button>
+                      </td>
+                    </tr>`;
+                  })
+                  .join('')}
+              </tbody>
+            </table>
+          </div>
         </div>
         <div class="space-y-2">
           <h3 class="font-semibold text-gray-900 dark:text-white">Site → studies (drill-down)</h3>
@@ -1472,12 +1605,13 @@
                 .join('');
               return `
               <details class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800" ${siteFilter ? 'open' : ''}>
-                <summary class="cursor-pointer px-3 py-2 font-semibold flex flex-wrap gap-x-4 gap-y-1">
+                <summary class="cursor-pointer px-3 py-3 min-h-[44px] font-semibold flex flex-wrap gap-x-4 gap-y-1 items-center">
                   <span>${escapeHtml(s.name)}</span>
-                  <span class="text-xs font-normal text-gray-500 font-mono">${escapeHtml(s.id)}</span>
+                  ${preferenceBadge(s.relationshipPreference)}
                   <span class="text-xs font-normal text-gray-500">${studyNames.length} studies · enrolled ${fmt(t.enrolled)}</span>
                 </summary>
                 <div class="px-3 pb-3 border-t dark:border-gray-700 space-y-3">
+                  <button type="button" data-legacy-report-open-site="${escapeHtml(s.id)}" class="${TAP_BTN} w-full sm:w-auto mt-2">Open site detail</button>
                   <div class="overflow-x-auto pt-2">
                     <table class="min-w-full text-sm">
                       <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
