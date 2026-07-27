@@ -7,7 +7,7 @@ Site–study outcomes from **Anterior Segment Overview.xlsx**, stored in the sam
 | Container | Partition key | Purpose |
 |-----------|---------------|---------|
 | `legacy-studies` | `/id` | One doc per study + rolled-up metrics + **editable** metadata (`therapeuticArea`, `indication`, `sponsor`, `phase`, `status`, `notes`). **TA = Indication** in this workbook. |
-| `legacy-sites` | `/id` | One doc per unique site (~80), with rolled metrics + optional `linkedArtemisSiteId` |
+| `legacy-sites` | `/id` | One doc per unique site (~80), with rolled metrics + optional `linkedArtemisSiteId` + **editable relationship** (`relationshipPreference`, `advantages`, `disadvantages`, `relationshipNotes`) |
 | `legacy-study-site-outcomes` | `/studyId` | One doc per study × site × group (scheduled / screened / enrolled / dates); includes `siteId` |
 
 **Never written:** `studies`, `sites`, `patients`, `crcs`, `events`, `schedules`, etc.
@@ -17,13 +17,16 @@ Site–study outcomes from **Anterior Segment Overview.xlsx**, stored in the sam
 ## API routes
 
 - `GET/POST/PATCH/DELETE /api/legacy-studies/{id?}`
+- `GET/POST/PATCH/DELETE /api/legacy-sites/{id?}`
 - `GET/POST /api/legacy-study-site-outcomes?studyId=`
 - `GET /api/legacy-reporting/summary`
 
 ## UI
 
 - **Legacy Studies** — list → open study → site table + edit TA/metadata  
+- **Legacy Sites** — list → open site → overall funnel metrics, studies at site, relationship preference / advantages / disadvantages  
 - **Legacy Reporting** — KPIs, charts, by-study / by-site tables, CSV export  
+- **Dashboard** — live ops charts + legacy overview panel at bottom  
 
 ## Re-ingest
 
@@ -35,4 +38,4 @@ python ingest/legacy_anterior_segment.py "C:\path\to\Anterior Segment Overview.x
 ```
 
 Uses `COSMOS_ENDPOINT` / `COSMOS_KEY` / `DATABASE_ID` from env, or falls back to `HoldAll\CHAOS\azure-api-fixed\local.settings.json`.  
-Re-ingest **preserves** manually edited `sponsor`, `phase`, `status`, `notes`. **`therapeuticArea` is kept in sync with `indication`** (TA = Indication).
+Re-ingest **preserves** manually edited study `sponsor`, `phase`, `status`, `notes`, and site `relationshipPreference`, `advantages`, `disadvantages`, `relationshipNotes`, `notes`. **`therapeuticArea` is kept in sync with `indication`** (TA = Indication).

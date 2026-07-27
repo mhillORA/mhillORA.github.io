@@ -214,6 +214,10 @@ function registerLegacyRoutes(app, deps) {
                         siteCode: body.siteCode || slugify(name).toUpperCase().replace(/-/g, '_').slice(0, 32),
                         status: body.status || 'Active',
                         notes: body.notes ?? null,
+                        relationshipPreference: body.relationshipPreference ?? null,
+                        advantages: body.advantages ?? null,
+                        disadvantages: body.disadvantages ?? null,
+                        relationshipNotes: body.relationshipNotes ?? null,
                         linkedArtemisSiteId: body.linkedArtemisSiteId ?? null,
                         source: body.source || 'manual',
                         metrics: body.metrics || {},
@@ -240,10 +244,33 @@ function registerLegacyRoutes(app, deps) {
                     if (!existing) {
                         return { status: 404, jsonBody: { error: 'Legacy site not found' }, headers: corsHeaders() };
                     }
-                    const editable = ['name', 'siteCode', 'status', 'notes', 'linkedArtemisSiteId'];
+                    const editable = [
+                        'name',
+                        'siteCode',
+                        'status',
+                        'notes',
+                        'linkedArtemisSiteId',
+                        'relationshipPreference',
+                        'advantages',
+                        'disadvantages',
+                        'relationshipNotes',
+                    ];
                     const updated = { ...existing };
                     for (const k of editable) {
                         if (body[k] !== undefined) updated[k] = body[k];
+                    }
+                    if (body.relationshipPreference !== undefined) {
+                        const allowed = new Set(['prefer', 'neutral', 'cautious', 'avoid', null, '']);
+                        if (!allowed.has(body.relationshipPreference)) {
+                            return {
+                                status: 400,
+                                jsonBody: {
+                                    error: 'relationshipPreference must be prefer|neutral|cautious|avoid (or empty)',
+                                },
+                                headers: corsHeaders(),
+                            };
+                        }
+                        updated.relationshipPreference = body.relationshipPreference || null;
                     }
                     if (body.metrics && typeof body.metrics === 'object') {
                         updated.metrics = { ...(existing.metrics || {}), ...body.metrics };

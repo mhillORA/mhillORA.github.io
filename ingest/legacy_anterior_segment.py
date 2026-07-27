@@ -373,6 +373,10 @@ def build_docs(records, indication_by_study, source_file: str):
                 "siteCode": slugify(agg["name"]).upper().replace("-", "_")[:32],
                 "status": "Active",
                 "notes": None,
+                "relationshipPreference": None,
+                "advantages": None,
+                "disadvantages": None,
+                "relationshipNotes": None,
                 "linkedArtemisSiteId": None,
                 "source": "anterior-segment-overview",
                 "sourceFile": source_file,
@@ -429,7 +433,10 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
     # Preserve site edits + linked Artemis id
     existing_sites = {}
     for item in sites_c.query_items(
-        query="SELECT c.id, c.status, c.notes, c.linkedArtemisSiteId, c.siteCode FROM c",
+        query=(
+            "SELECT c.id, c.status, c.notes, c.linkedArtemisSiteId, c.siteCode, "
+            "c.relationshipPreference, c.advantages, c.disadvantages, c.relationshipNotes, c.createdAt FROM c"
+        ),
         enable_cross_partition_query=True,
     ):
         existing_sites[item["id"]] = item
@@ -473,7 +480,15 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
     for doc in sites:
         prev = existing_sites.get(doc["id"])
         if prev:
-            for k in ("status", "notes", "siteCode"):
+            for k in (
+                "status",
+                "notes",
+                "siteCode",
+                "relationshipPreference",
+                "advantages",
+                "disadvantages",
+                "relationshipNotes",
+            ):
                 if prev.get(k) not in (None, ""):
                     doc[k] = prev[k]
             if prev.get("linkedArtemisSiteId"):

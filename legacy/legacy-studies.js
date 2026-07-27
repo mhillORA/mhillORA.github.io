@@ -9,6 +9,7 @@
     outcomes: [],
     loaded: false,
     selectedStudyId: null,
+    selectedSiteId: null,
     reportMode: 'bySite', // bySite | byStudy — bySite is ~50 rows, not ~700
   };
 
@@ -387,6 +388,372 @@
       </div>`;
   }
 
+  function getLegacySitesHTML() {
+    return `
+      <div class="space-y-4" id="legacy-sites-root">
+        <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+          <div>
+            <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Legacy Sites</h2>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+              Overall site performance across all legacy studies, plus relationship notes (prefer / cautious / avoid, advantages & disadvantages).
+            </p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <select id="legacy-site-pref-filter" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm">
+              <option value="">All preferences</option>
+              <option value="prefer">Prefer</option>
+              <option value="neutral">Neutral</option>
+              <option value="cautious">Cautious</option>
+              <option value="avoid">Avoid</option>
+              <option value="unset">Not set</option>
+            </select>
+            <input id="legacy-site-search" type="search" placeholder="Search sites…"
+              class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm w-56" />
+            <button id="legacy-sites-refresh" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Refresh</button>
+          </div>
+        </div>
+        <div id="legacy-sites-summary" class="grid grid-cols-2 md:grid-cols-5 gap-3"></div>
+        <div id="legacy-sites-load-status" class="text-xs text-gray-500"></div>
+        <div id="legacy-sites-table-wrap" class="overflow-x-auto rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800"></div>
+        <div id="legacy-site-detail" class="hidden"></div>
+      </div>`;
+  }
+
+  const RELATIONSHIP_OPTIONS = [
+    { value: '', label: 'Not set' },
+    { value: 'prefer', label: 'Prefer — good to work with' },
+    { value: 'neutral', label: 'Neutral' },
+    { value: 'cautious', label: 'Cautious — use carefully' },
+    { value: 'avoid', label: 'Avoid — prefer not to use' },
+  ];
+
+  function preferenceBadge(pref) {
+    const p = (pref || '').toLowerCase();
+    const map = {
+      prefer: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200',
+      neutral: 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-200',
+      cautious: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200',
+      avoid: 'bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200',
+    };
+    const label = p ? p.charAt(0).toUpperCase() + p.slice(1) : 'Not set';
+    const cls = map[p] || 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300';
+    return `<span class="inline-flex px-2 py-0.5 rounded text-xs font-medium ${cls}">${escapeHtml(label)}</span>`;
+  }
+
+  function siteSummaryCards(el, sites) {
+    if (!el) return;
+    const m = sites.reduce(
+      (a, s) => {
+        const x = s.metrics || {};
+        a.enrolled += num(x.enrolled);
+        a.screened += num(x.screened);
+        a.scheduled += num(x.scheduled);
+        a.prefer += (s.relationshipPreference || '') === 'prefer' ? 1 : 0;
+        return a;
+      },
+      { enrolled: 0, screened: 0, scheduled: 0, prefer: 0 }
+    );
+    el.innerHTML = [
+      ['Unique sites', sites.length],
+      ['Scheduled', fmt(m.scheduled)],
+      ['Screened', fmt(m.screened)],
+      ['Enrolled', fmt(m.enrolled)],
+      ['Prefer', m.prefer],
+    ]
+      .map(
+        ([label, val]) => `
+      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3">
+        <div class="text-xs text-gray-500 dark:text-gray-400">${label}</div>
+        <div class="text-xl font-semibold text-gray-900 dark:text-white">${val}</div>
+      </div>`
+      )
+      .join('');
+  }
+
+  function outcomesForSite(siteId) {
+    return state.outcomes.map(normOutcome).filter((o) => o.siteId === siteId);
+  }
+
+  function renderSitesTable(q = '', prefFilter = '') {
+    const wrap = document.getElementById('legacy-sites-table-wrap');
+    const summary = document.getElementById('legacy-sites-summary');
+    const status = document.getElementById('legacy-sites-load-status');
+    if (!wrap) return;
+
+    const sites = uniqueSitesFromState();
+    if (status) {
+      status.textContent = `Loaded ${sites.length} unique sites · ${state.outcomes.length} outcome rows · ${state.studies.length} studies`;
+    }
+
+    const qq = q.trim().toLowerCase();
+    const pf = (prefFilter || '').toLowerCase();
+    const rows = sites
+      .filter((s) => {
+        if (pf === 'unset') {
+          if (s.relationshipPreference) return false;
+        } else if (pf && (s.relationshipPreference || '') !== pf) {
+          return false;
+        }
+        if (!qq) return true;
+        const blob = `${s.name} ${s.siteCode || ''} ${s.advantages || ''} ${s.disadvantages || ''} ${s.relationshipNotes || ''}`.toLowerCase();
+        return blob.includes(qq);
+      })
+      .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled));
+
+    siteSummaryCards(summary, sites);
+
+    wrap.innerHTML = `
+      <table class="min-w-full text-sm">
+        <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
+          <tr>
+            <th class="px-3 py-2">Site</th>
+            <th class="px-3 py-2">Code</th>
+            <th class="px-3 py-2">Relationship</th>
+            <th class="px-3 py-2 text-right">Studies</th>
+            <th class="px-3 py-2 text-right">Target</th>
+            <th class="px-3 py-2 text-right">Sched</th>
+            <th class="px-3 py-2 text-right">Screen</th>
+            <th class="px-3 py-2 text-right">Enrolled</th>
+            <th class="px-3 py-2 text-right">E/S</th>
+            <th class="px-3 py-2 text-right">S/Sched</th>
+            <th class="px-3 py-2"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map((s) => {
+              const m = s.metrics || {};
+              const siteOutcomes = outcomesForSite(s.id);
+              const t = sumOutcomes(siteOutcomes);
+              const enrolled = t.enrolled || num(m.enrolled);
+              const screened = t.screened || num(m.screened);
+              const scheduled = t.scheduled || num(m.scheduled);
+              const target = t.targetScheduled || num(m.targetScheduled);
+              const nStudies = new Set(siteOutcomes.map((o) => o.studyId)).size || m.nStudies || 0;
+              return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
+                <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(s.name)}</td>
+                <td class="px-3 py-2 text-xs font-mono text-gray-500">${escapeHtml(s.siteCode || '—')}</td>
+                <td class="px-3 py-2">${preferenceBadge(s.relationshipPreference)}</td>
+                <td class="px-3 py-2 text-right">${nStudies}</td>
+                <td class="px-3 py-2 text-right">${fmt(target)}</td>
+                <td class="px-3 py-2 text-right">${fmt(scheduled)}</td>
+                <td class="px-3 py-2 text-right">${fmt(screened)}</td>
+                <td class="px-3 py-2 text-right font-semibold">${fmt(enrolled)}</td>
+                <td class="px-3 py-2 text-right">${rate(enrolled, screened)}</td>
+                <td class="px-3 py-2 text-right">${rate(screened, scheduled)}</td>
+                <td class="px-3 py-2 text-right">
+                  <button data-legacy-open-site="${escapeHtml(s.id)}" class="text-indigo-600 hover:underline">Open</button>
+                </td>
+              </tr>`;
+            })
+            .join('')}
+        </tbody>
+      </table>`;
+
+    wrap.querySelectorAll('[data-legacy-open-site]').forEach((btn) => {
+      btn.addEventListener('click', () => openSiteDetail(btn.getAttribute('data-legacy-open-site')));
+    });
+  }
+
+  async function openSiteDetail(siteId) {
+    state.selectedSiteId = siteId;
+    const sites = uniqueSitesFromState();
+    let site = sites.find((s) => s.id === siteId) || state.sites.find((s) => s.id === siteId);
+    if (!site) {
+      // try fetch single
+      try {
+        site = await req(`/legacy-sites/${encodeURIComponent(siteId)}`);
+      } catch (_) {
+        site = null;
+      }
+    }
+
+    // Prefer opening inside Legacy Sites tab if present; else navigate there
+    const detail = document.getElementById('legacy-site-detail');
+    const tableWrap = document.getElementById('legacy-sites-table-wrap');
+    const summary = document.getElementById('legacy-sites-summary');
+
+    if (!detail) {
+      // Switch to Legacy Sites tab via header button, then open
+      global.__legacyPendingSiteId = siteId;
+      document.getElementById('legacy-sites-tab-btn')?.click();
+      return;
+    }
+    if (!site) {
+      detail.classList.remove('hidden');
+      detail.innerHTML = `<div class="p-4 text-sm text-amber-700">Site not found: ${escapeHtml(siteId)}</div>`;
+      return;
+    }
+
+    if (tableWrap) tableWrap.classList.add('hidden');
+    if (summary) summary.classList.add('hidden');
+    detail.classList.remove('hidden');
+
+    const outcomes = outcomesForSite(site.id);
+    const t = sumOutcomes(outcomes);
+    const m = site.metrics || {};
+    const pis = [...new Set(outcomes.map((o) => o.pi).filter(Boolean))];
+    const studyIds = [...new Set(outcomes.map((o) => o.studyId).filter(Boolean))];
+
+    // Per-study rollup under this site
+    const byStudy = {};
+    for (const o of outcomes) {
+      if (!byStudy[o.studyId]) {
+        byStudy[o.studyId] = { studyId: o.studyId, studyName: o.studyName, rows: [] };
+      }
+      byStudy[o.studyId].rows.push(o);
+    }
+    const studyParts = Object.values(byStudy)
+      .map((st) => {
+        const stTotals = sumOutcomes(st.rows);
+        const meta = state.studies.find((x) => x.id === st.studyId);
+        return { ...st, t: stTotals, meta };
+      })
+      .sort((a, b) => b.t.enrolled - a.t.enrolled);
+
+    const pref = site.relationshipPreference || '';
+    const prefOptions = RELATIONSHIP_OPTIONS.map(
+      (o) => `<option value="${o.value}" ${pref === o.value ? 'selected' : ''}>${o.label}</option>`
+    ).join('');
+
+    detail.innerHTML = `
+      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-5">
+        <div class="flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <button id="legacy-back-sites" class="text-sm text-indigo-600 hover:underline mb-1">← All legacy sites</button>
+            <h3 class="text-xl font-bold text-gray-900 dark:text-white">${escapeHtml(site.name)}</h3>
+            <p class="text-sm text-gray-500 flex flex-wrap items-center gap-2 mt-1">
+              <span class="font-mono text-xs">${escapeHtml(site.siteCode || site.id)}</span>
+              ${preferenceBadge(site.relationshipPreference)}
+              <span>· ${studyIds.length} studies · ${outcomes.length} outcome rows · ${pis.length} PI(s)</span>
+            </p>
+          </div>
+          <button id="legacy-save-site" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white">Save relationship</button>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 text-sm">
+          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Target sched</div><div class="font-semibold">${fmt(t.targetScheduled || m.targetScheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Scheduled</div><div class="font-semibold">${fmt(t.scheduled || m.scheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Screened</div><div class="font-semibold">${fmt(t.screened || m.screened)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Enrolled</div><div class="font-semibold">${fmt(t.enrolled || m.enrolled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Sched / Target</div><div class="font-semibold">${rate(t.scheduled || m.scheduled, t.targetScheduled || m.targetScheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Screen / Sched</div><div class="font-semibold">${rate(t.screened || m.screened, t.scheduled || m.scheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Enroll / Screen</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.screened || m.screened)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2"><div class="text-gray-500 text-xs">Enroll / Sched</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.scheduled || m.scheduled)}</div></div>
+        </div>
+
+        <div class="rounded-lg border border-indigo-200 dark:border-indigo-800 bg-indigo-50/50 dark:bg-indigo-950/20 p-4 space-y-3">
+          <h4 class="font-semibold text-gray-900 dark:text-white">Site relationship</h4>
+          <p class="text-xs text-gray-500">How we like working with this site — preserved across re-ingest.</p>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label class="text-sm md:col-span-2">Working preference
+              <select id="legacy-site-pref" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">
+                ${prefOptions}
+              </select>
+            </label>
+            <label class="text-sm">Advantages
+              <textarea id="legacy-site-advantages" rows="4" placeholder="What works well here…"
+                class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(site.advantages || '')}</textarea>
+            </label>
+            <label class="text-sm">Disadvantages
+              <textarea id="legacy-site-disadvantages" rows="4" placeholder="Friction, risk, or watch-outs…"
+                class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(site.disadvantages || '')}</textarea>
+            </label>
+            <label class="text-sm md:col-span-2">Relationship notes
+              <textarea id="legacy-site-rel-notes" rows="2" placeholder="Contacts, history, context…"
+                class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(site.relationshipNotes || '')}</textarea>
+            </label>
+            <label class="text-sm md:col-span-2">General notes
+              <textarea id="legacy-site-notes" rows="2"
+                class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600">${escapeHtml(site.notes || '')}</textarea>
+            </label>
+          </div>
+        </div>
+
+        <div>
+          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Studies at this site (${studyParts.length})</h4>
+          <div class="overflow-x-auto rounded border dark:border-gray-700">
+            <table class="min-w-full text-sm">
+              <thead class="bg-gray-50 dark:bg-gray-900/40 text-left">
+                <tr>
+                  <th class="px-3 py-2">Study</th>
+                  <th class="px-3 py-2">TA / Indication</th>
+                  <th class="px-3 py-2">PI(s)</th>
+                  <th class="px-3 py-2 text-right">Rows</th>
+                  <th class="px-3 py-2 text-right">Sched</th>
+                  <th class="px-3 py-2 text-right">Screen</th>
+                  <th class="px-3 py-2 text-right">Enrolled</th>
+                  <th class="px-3 py-2 text-right">E/S</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${studyParts
+                  .map((st) => {
+                    const ta = st.meta?.therapeuticArea || st.meta?.indication || '—';
+                    const stPis = [...new Set(st.rows.map((r) => r.pi).filter(Boolean))].join(', ') || '—';
+                    return `<tr class="border-t dark:border-gray-700">
+                      <td class="px-3 py-1.5 font-medium">${escapeHtml(st.studyName || st.studyId)}</td>
+                      <td class="px-3 py-1.5">${escapeHtml(ta)}</td>
+                      <td class="px-3 py-1.5 text-xs">${escapeHtml(stPis)}</td>
+                      <td class="px-3 py-1.5 text-right">${st.rows.length}</td>
+                      <td class="px-3 py-1.5 text-right">${fmt(st.t.scheduled)}</td>
+                      <td class="px-3 py-1.5 text-right">${fmt(st.t.screened)}</td>
+                      <td class="px-3 py-1.5 text-right font-semibold">${fmt(st.t.enrolled)}</td>
+                      <td class="px-3 py-1.5 text-right">${rate(st.t.enrolled, st.t.screened)}</td>
+                    </tr>`;
+                  })
+                  .join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div>
+          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">PIs seen here</h4>
+          <p class="text-sm text-gray-700 dark:text-gray-300">${escapeHtml(pis.join(', ') || '—')}</p>
+        </div>
+
+        <div>
+          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Every study × group row</h4>
+          ${siteOutcomesTableHtml(outcomes, { showStudy: true })}
+        </div>
+      </div>`;
+
+    document.getElementById('legacy-back-sites')?.addEventListener('click', () => {
+      detail.classList.add('hidden');
+      detail.innerHTML = '';
+      tableWrap?.classList.remove('hidden');
+      summary?.classList.remove('hidden');
+      state.selectedSiteId = null;
+      renderSitesTable(
+        document.getElementById('legacy-site-search')?.value || '',
+        document.getElementById('legacy-site-pref-filter')?.value || ''
+      );
+    });
+
+    document.getElementById('legacy-save-site')?.addEventListener('click', async () => {
+      const payload = {
+        relationshipPreference: document.getElementById('legacy-site-pref').value || null,
+        advantages: document.getElementById('legacy-site-advantages').value.trim() || null,
+        disadvantages: document.getElementById('legacy-site-disadvantages').value.trim() || null,
+        relationshipNotes: document.getElementById('legacy-site-rel-notes').value.trim() || null,
+        notes: document.getElementById('legacy-site-notes').value.trim() || null,
+      };
+      try {
+        const updated = await req(`/legacy-sites/${encodeURIComponent(site.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
+        const idx = state.sites.findIndex((s) => s.id === site.id);
+        if (idx >= 0) state.sites[idx] = { ...state.sites[idx], ...updated };
+        else state.sites.push(updated);
+        openSiteDetail(site.id);
+      } catch (e) {
+        alert('Save failed: ' + e.message);
+      }
+    });
+  }
+
   function getLegacyDashboardHTML() {
     return `
       <section id="legacy-dashboard-root" class="border-t border-gray-200 dark:border-gray-700 pt-8 space-y-6">
@@ -401,6 +768,10 @@
             <button type="button" id="legacy-dash-refresh"
               class="px-3 py-2 text-sm rounded-md border dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700">
               Refresh
+            </button>
+            <button type="button" id="legacy-dash-view-sites"
+              class="px-3 py-2 text-sm rounded-md border dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700">
+              Legacy Sites →
             </button>
             <button type="button" id="legacy-dash-view-all"
               class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
@@ -792,6 +1163,7 @@
               <th class="px-3 py-2 text-right">Studies</th>
               <th class="px-3 py-2 text-right">Enrolled</th>
               <th class="px-3 py-2 text-right">E/S</th>
+              <th class="px-3 py-2"></th>
             </tr>
           </thead>
           <tbody>
@@ -803,11 +1175,17 @@
                   <td class="px-3 py-1.5 text-right">${studyCount}</td>
                   <td class="px-3 py-1.5 text-right font-semibold">${fmt(t.enrolled)}</td>
                   <td class="px-3 py-1.5 text-right">${rate(t.enrolled, t.screened)}</td>
+                  <td class="px-3 py-1.5 text-right">
+                    <button type="button" data-legacy-dash-site="${escapeHtml(s.id)}" class="text-indigo-600 hover:underline text-xs">Open</button>
+                  </td>
                 </tr>`;
               })
               .join('')}
           </tbody>
         </table>`;
+      tableWrap.querySelectorAll('[data-legacy-dash-site]').forEach((btn) => {
+        btn.addEventListener('click', () => openSiteDetail(btn.getAttribute('data-legacy-dash-site')));
+      });
     }
   }
 
@@ -828,6 +1206,9 @@
       state.loaded = false;
       await ensureLoaded(true);
       renderDashboard();
+    });
+    document.getElementById('legacy-dash-view-sites')?.addEventListener('click', () => {
+      document.getElementById('legacy-sites-tab-btn')?.click();
     });
     document.getElementById('legacy-dash-view-all')?.addEventListener('click', () => {
       document.getElementById('legacy-reporting-tab-btn')?.click();
@@ -1025,8 +1406,8 @@
           </div>
           <table class="min-w-full text-sm">
             <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
-              <th class="px-3 py-2">Site ID</th>
               <th class="px-3 py-2">Site</th>
+              <th class="px-3 py-2">Relationship</th>
               <th class="px-3 py-2">Code</th>
               <th class="px-3 py-2 text-right">Studies</th>
               <th class="px-3 py-2 text-right">Rows</th>
@@ -1035,14 +1416,15 @@
               <th class="px-3 py-2 text-right">Screen</th>
               <th class="px-3 py-2 text-right">Enrolled</th>
               <th class="px-3 py-2 text-right">E/S</th>
+              <th class="px-3 py-2"></th>
             </tr></thead>
             <tbody>
               ${siteRows
                 .map(({ site: s, rows, t, studyNames }) => {
                   const m = s.metrics || {};
                   return `<tr class="border-t dark:border-gray-700">
-                    <td class="px-3 py-1.5 text-xs font-mono text-gray-500">${escapeHtml(s.id)}</td>
                     <td class="px-3 py-1.5 font-medium">${escapeHtml(s.name)}</td>
+                    <td class="px-3 py-1.5">${preferenceBadge(s.relationshipPreference)}</td>
                     <td class="px-3 py-1.5 text-xs">${escapeHtml(s.siteCode || '—')}</td>
                     <td class="px-3 py-1.5 text-right">${studyNames.length || m.nStudies || '—'}</td>
                     <td class="px-3 py-1.5 text-right">${rows.length}</td>
@@ -1051,6 +1433,9 @@
                     <td class="px-3 py-1.5 text-right">${fmt(t.screened)}</td>
                     <td class="px-3 py-1.5 text-right font-semibold">${fmt(t.enrolled)}</td>
                     <td class="px-3 py-1.5 text-right">${rate(t.enrolled, t.screened)}</td>
+                    <td class="px-3 py-1.5 text-right">
+                      <button type="button" data-legacy-report-open-site="${escapeHtml(s.id)}" class="text-indigo-600 hover:underline text-xs">Open</button>
+                    </td>
                   </tr>`;
                 })
                 .join('')}
@@ -1113,6 +1498,9 @@
             })
             .join('') || '<p class="text-sm text-gray-500">No sites in filter.</p>'}
         </div>`;
+      tables.querySelectorAll('[data-legacy-report-open-site]').forEach((btn) => {
+        btn.addEventListener('click', () => openSiteDetail(btn.getAttribute('data-legacy-report-open-site')));
+      });
       return;
     }
 
@@ -1225,6 +1613,33 @@
     });
   }
 
+  async function mountSites() {
+    await ensureLoaded();
+    const rerender = () =>
+      renderSitesTable(
+        document.getElementById('legacy-site-search')?.value || '',
+        document.getElementById('legacy-site-pref-filter')?.value || ''
+      );
+    rerender();
+    document.getElementById('legacy-site-search')?.addEventListener('input', rerender);
+    document.getElementById('legacy-site-pref-filter')?.addEventListener('change', rerender);
+    document.getElementById('legacy-sites-refresh')?.addEventListener('click', async () => {
+      state.loaded = false;
+      await ensureLoaded(true);
+      const detail = document.getElementById('legacy-site-detail');
+      if (detail && !detail.classList.contains('hidden') && state.selectedSiteId) {
+        await openSiteDetail(state.selectedSiteId);
+      } else {
+        rerender();
+      }
+    });
+    if (global.__legacyPendingSiteId) {
+      const id = global.__legacyPendingSiteId;
+      global.__legacyPendingSiteId = null;
+      await openSiteDetail(id);
+    }
+  }
+
   async function mountReporting() {
     await ensureLoaded();
     const studySel = document.getElementById('legacy-report-study');
@@ -1257,6 +1672,8 @@
     if (!global.apiService) return;
     global.apiService.getLegacyStudies = () => global.apiService.request('/legacy-studies');
     global.apiService.getLegacySites = () => global.apiService.request('/legacy-sites');
+    global.apiService.updateLegacySite = (id, body) =>
+      global.apiService.request(`/legacy-sites/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
     global.apiService.updateLegacyStudy = (id, body) =>
       global.apiService.request(`/legacy-studies/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
     global.apiService.getLegacyOutcomes = (studyId) =>
@@ -1267,11 +1684,14 @@
 
   global.ArtemisLegacy = {
     getLegacyStudiesHTML,
+    getLegacySitesHTML,
     getLegacyReportingHTML,
     getLegacyDashboardHTML,
     mountStudies,
+    mountSites,
     mountReporting,
     mountDashboard,
+    openSiteDetail,
     ensureLoaded,
     attachApiMethods,
     state,
