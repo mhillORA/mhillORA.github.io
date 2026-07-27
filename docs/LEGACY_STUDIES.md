@@ -6,8 +6,9 @@ Site–study outcomes from **Anterior Segment Overview.xlsx**, stored in the sam
 
 | Container | Partition key | Purpose |
 |-----------|---------------|---------|
-| `legacy-studies` | `/id` | One doc per study + rolled-up metrics + **editable** metadata (`therapeuticArea`, `indication`, `sponsor`, `phase`, `status`, `notes`) |
-| `legacy-study-site-outcomes` | `/studyId` | One doc per study × site × group (scheduled / screened / enrolled / dates) |
+| `legacy-studies` | `/id` | One doc per study + rolled-up metrics + **editable** metadata (`therapeuticArea`, `indication`, `sponsor`, `phase`, `status`, `notes`). **TA = Indication** in this workbook. |
+| `legacy-sites` | `/id` | One doc per unique site (~80), with rolled metrics + optional `linkedArtemisSiteId` |
+| `legacy-study-site-outcomes` | `/studyId` | One doc per study × site × group (scheduled / screened / enrolled / dates); includes `siteId` |
 
 **Never written:** `studies`, `sites`, `patients`, `crcs`, `events`, `schedules`, etc.
 
@@ -34,4 +35,4 @@ python ingest/legacy_anterior_segment.py "C:\path\to\Anterior Segment Overview.x
 ```
 
 Uses `COSMOS_ENDPOINT` / `COSMOS_KEY` / `DATABASE_ID` from env, or falls back to `HoldAll\CHAOS\azure-api-fixed\local.settings.json`.  
-Re-ingest **preserves** manually edited `therapeuticArea`, `sponsor`, `phase`, `status`, `notes`.
+Re-ingest **preserves** manually edited `sponsor`, `phase`, `status`, `notes`. **`therapeuticArea` is kept in sync with `indication`** (TA = Indication).

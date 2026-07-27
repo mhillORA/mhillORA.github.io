@@ -5,9 +5,11 @@
 (function (global) {
   const state = {
     studies: [],
+    sites: [],
     outcomes: [],
     loaded: false,
     selectedStudyId: null,
+    reportMode: 'bySite', // bySite | byStudy — bySite is ~50 rows, not ~700
   };
 
   function apiBase() {
@@ -32,9 +34,13 @@
 
   async function ensureLoaded(force = false) {
     if (state.loaded && !force) return state;
-    const [studies, outcomes] = await Promise.all([
+    const [studies, sites, outcomes] = await Promise.all([
       req('/legacy-studies').catch((e) => {
         console.error('legacy-studies load failed', e);
+        return [];
+      }),
+      req('/legacy-sites').catch((e) => {
+        console.error('legacy-sites load failed', e);
         return [];
       }),
       req('/legacy-study-site-outcomes').catch((e) => {
@@ -43,9 +49,18 @@
       }),
     ]);
     state.studies = Array.isArray(studies) ? studies : [];
+    state.sites = Array.isArray(sites) ? sites : [];
     state.outcomes = Array.isArray(outcomes) ? outcomes : [];
     state.loaded = true;
-    console.log('Legacy loaded', state.studies.length, 'studies,', state.outcomes.length, 'site rows');
+    console.log(
+      'Legacy loaded',
+      state.studies.length,
+      'studies,',
+      state.sites.length,
+      'unique sites,',
+      state.outcomes.length,
+      'outcome rows'
+    );
     return state;
   }
 
@@ -90,6 +105,7 @@
       id: o.id,
       studyId: o.studyId,
       studyName: o.studyName || o.study || '',
+      siteId: o.siteId || (o.siteName ? `legacy-site-${String(o.siteName).trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}` : ''),
       siteName: o.siteName || o.site || '',
       group: o.group ?? o.groupNumber ?? o.Group ?? null,
       pi: o.pi || o.PI || '',
@@ -337,15 +353,20 @@
           <div>
             <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Legacy Reporting</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              Funnel metrics with study → site breakdowns (Group, PI, Visit 1, LPLV).
+              <strong>By Site</strong> = one row per unique site (~50), not ~700 study×site lines.
+              Drill into a site for its studies.
             </p>
           </div>
-          <div class="flex flex-wrap gap-2">
+          <div class="flex flex-wrap gap-2 items-center">
+            <div class="inline-flex rounded-md border dark:border-gray-600 overflow-hidden text-sm">
+              <button type="button" id="legacy-mode-site" class="px-3 py-2 bg-indigo-600 text-white">By Site</button>
+              <button type="button" id="legacy-mode-study" class="px-3 py-2 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200">By Study</button>
+            </div>
             <select id="legacy-report-study" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm min-w-[12rem]">
-              <option value="">All studies (summary)</option>
+              <option value="">All studies</option>
             </select>
-            <select id="legacy-report-ta" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm">
-              <option value="">All therapeutic areas</option>
+            <select id="legacy-report-site" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm min-w-[12rem]">
+              <option value="">All sites</option>
             </select>
             <button id="legacy-report-refresh" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Refresh</button>
             <button id="legacy-report-export" class="px-3 py-2 text-sm rounded-md border dark:border-gray-600">Export CSV</button>
@@ -354,7 +375,7 @@
         <div id="legacy-report-kpis" class="grid grid-cols-2 md:grid-cols-6 gap-3"></div>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
-            <h3 class="font-semibold mb-2 text-gray-900 dark:text-white">Enrolled by study</h3>
+            <h3 id="legacy-chart-title" class="font-semibold mb-2 text-gray-900 dark:text-white">Enrolled by site</h3>
             <canvas id="legacy-chart-studies" height="220"></canvas>
           </div>
           <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
@@ -364,6 +385,58 @@
         </div>
         <div id="legacy-report-tables" class="space-y-4"></div>
       </div>`;
+  }
+
+  function getLegacyDashboardHTML() {
+    return `
+      <section id="legacy-dashboard-root" class="border-t border-gray-200 dark:border-gray-700 pt-8 space-y-6">
+        <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+          <div>
+            <h3 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Legacy Studies Overview</h3>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+              Anterior Segment historical site–study outcomes (Completed Projects funnel).
+            </p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button type="button" id="legacy-dash-refresh"
+              class="px-3 py-2 text-sm rounded-md border dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700">
+              Refresh
+            </button>
+            <button type="button" id="legacy-dash-view-all"
+              class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
+              Full Legacy Reporting →
+            </button>
+          </div>
+        </div>
+        <div id="legacy-dash-status" class="text-xs text-gray-500 dark:text-gray-400">Loading legacy data…</div>
+        <div id="legacy-dash-kpis" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3"></div>
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div class="lg:col-span-2 bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
+            <h4 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Top sites by enrolled</h4>
+            <div class="relative h-72">
+              <canvas id="legacy-dash-chart-sites"></canvas>
+            </div>
+          </div>
+          <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
+            <h4 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Enrollment funnel</h4>
+            <div class="relative h-72">
+              <canvas id="legacy-dash-chart-funnel"></canvas>
+            </div>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
+            <h4 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Studies by therapeutic area</h4>
+            <div class="relative h-64">
+              <canvas id="legacy-dash-chart-ta"></canvas>
+            </div>
+          </div>
+          <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 overflow-hidden">
+            <h4 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4 px-1">Top sites</h4>
+            <div id="legacy-dash-table-wrap" class="overflow-x-auto"></div>
+          </div>
+        </div>
+      </section>`;
   }
 
   function summaryCards(el, studies) {
@@ -401,7 +474,7 @@
     const status = document.getElementById('legacy-load-status');
     if (!wrap) return;
     if (status) {
-      status.textContent = `Loaded ${state.studies.length} studies · ${state.outcomes.length} site–study rows from Cosmos`;
+      status.textContent = `Loaded ${state.studies.length} studies · ${state.sites.length || '—'} unique sites · ${state.outcomes.length} outcome rows (site×study lines)`;
     }
     const qq = q.trim().toLowerCase();
     const rows = state.studies
@@ -496,7 +569,7 @@
         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
           <label class="text-sm">Therapeutic Area
             <input id="legacy-meta-ta" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600"
-              value="${escapeHtml(study.therapeuticArea || '')}" placeholder="e.g. Dry Eye, Allergy" />
+              value="${escapeHtml(study.therapeuticArea || study.indication || '')}" placeholder="Same as Indication" />
           </label>
           <label class="text-sm">Indication
             <input id="legacy-meta-indication" class="mt-1 w-full px-2 py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600"
@@ -551,13 +624,18 @@
 
     document.getElementById('legacy-save-meta')?.addEventListener('click', async () => {
       const payload = {
-        therapeuticArea: document.getElementById('legacy-meta-ta').value.trim() || null,
+        therapeuticArea:
+          document.getElementById('legacy-meta-ta').value.trim() ||
+          document.getElementById('legacy-meta-indication').value.trim() ||
+          null,
         indication: document.getElementById('legacy-meta-indication').value.trim() || null,
         sponsor: document.getElementById('legacy-meta-sponsor').value.trim() || null,
         phase: document.getElementById('legacy-meta-phase').value.trim() || null,
         status: document.getElementById('legacy-meta-status').value.trim() || null,
         notes: document.getElementById('legacy-meta-notes').value.trim() || null,
       };
+      // Keep TA aligned with Indication when TA left blank
+      if (!payload.therapeuticArea && payload.indication) payload.therapeuticArea = payload.indication;
       try {
         const updated = await req(`/legacy-studies/${encodeURIComponent(studyId)}`, {
           method: 'PATCH',
@@ -575,6 +653,7 @@
   }
 
   let charts = { studies: null, funnel: null };
+  let dashCharts = { sites: null, funnel: null, ta: null };
 
   function destroyCharts() {
     if (charts.studies) {
@@ -587,14 +666,237 @@
     }
   }
 
+  function destroyDashCharts() {
+    Object.keys(dashCharts).forEach((k) => {
+      if (dashCharts[k]) {
+        dashCharts[k].destroy();
+        dashCharts[k] = null;
+      }
+    });
+  }
+
+  function renderDashboard() {
+    const kpis = document.getElementById('legacy-dash-kpis');
+    const tableWrap = document.getElementById('legacy-dash-table-wrap');
+    const status = document.getElementById('legacy-dash-status');
+    if (!kpis) return;
+
+    const outcomes = state.outcomes.map(normOutcome);
+    const totals = sumOutcomes(outcomes);
+    const sitesMaster = uniqueSitesFromState();
+    const siteRows = sitesMaster
+      .map((s) => {
+        const rows = outcomes.filter((o) => o.siteId === s.id);
+        return { site: s, rows, t: sumOutcomes(rows) };
+      })
+      .filter((x) => x.rows.length > 0)
+      .sort((a, b) => b.t.enrolled - a.t.enrolled);
+
+    if (status) {
+      status.textContent = `${state.studies.length} studies · ${sitesMaster.length} unique sites · ${outcomes.length} outcome rows · data from Anterior Segment Overview`;
+    }
+
+    kpis.innerHTML = [
+      ['Unique sites', sitesMaster.length],
+      ['Studies', state.studies.length],
+      ['Scheduled', fmt(totals.scheduled)],
+      ['Screened', fmt(totals.screened)],
+      ['Enrolled', fmt(totals.enrolled)],
+      ['Screen → Enroll', rate(totals.enrolled, totals.screened)],
+    ]
+      .map(
+        ([label, val]) => `
+      <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 text-center">
+        <div class="text-xs text-gray-500 dark:text-gray-400">${label}</div>
+        <div class="text-xl font-semibold text-gray-900 dark:text-white">${val}</div>
+      </div>`
+      )
+      .join('');
+
+    destroyDashCharts();
+    if (global.Chart) {
+      const topSites = siteRows.slice(0, 12);
+      const ctxSites = document.getElementById('legacy-dash-chart-sites');
+      if (ctxSites) {
+        dashCharts.sites = new global.Chart(ctxSites, {
+          type: 'bar',
+          data: {
+            labels: topSites.map((x) => x.site.name),
+            datasets: [{ label: 'Enrolled', data: topSites.map((x) => x.t.enrolled), backgroundColor: '#4f46e5' }],
+          },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+          },
+        });
+      }
+
+      const ctxFunnel = document.getElementById('legacy-dash-chart-funnel');
+      if (ctxFunnel) {
+        dashCharts.funnel = new global.Chart(ctxFunnel, {
+          type: 'bar',
+          data: {
+            labels: ['Target Sched', 'Scheduled', 'Screened', 'Enrolled'],
+            datasets: [
+              {
+                label: 'Count',
+                data: [totals.targetScheduled, totals.scheduled, totals.screened, totals.enrolled],
+                backgroundColor: ['#94a3b8', '#64748b', '#f59e0b', '#4f46e5'],
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+          },
+        });
+      }
+
+      const taData = state.studies.reduce((acc, s) => {
+        const ta = (s.therapeuticArea || s.indication || 'Unspecified').trim();
+        acc[ta] = (acc[ta] || 0) + 1;
+        return acc;
+      }, {});
+      const ctxTa = document.getElementById('legacy-dash-chart-ta');
+      if (ctxTa) {
+        dashCharts.ta = new global.Chart(ctxTa, {
+          type: 'doughnut',
+          data: {
+            labels: Object.keys(taData),
+            datasets: [
+              {
+                data: Object.values(taData),
+                backgroundColor: ['#4f46e5', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#64748b', '#ec4899'],
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'bottom' } },
+          },
+        });
+      }
+    }
+
+    if (tableWrap) {
+      const top = siteRows.slice(0, 10);
+      tableWrap.innerHTML = `
+        <table class="min-w-full text-sm">
+          <thead class="bg-gray-50 dark:bg-gray-900/40 text-left">
+            <tr>
+              <th class="px-3 py-2">Site</th>
+              <th class="px-3 py-2 text-right">Studies</th>
+              <th class="px-3 py-2 text-right">Enrolled</th>
+              <th class="px-3 py-2 text-right">E/S</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${top
+              .map(({ site: s, rows, t }) => {
+                const studyCount = new Set(rows.map((r) => r.studyId)).size;
+                return `<tr class="border-t dark:border-gray-700">
+                  <td class="px-3 py-1.5 font-medium">${escapeHtml(s.name)}</td>
+                  <td class="px-3 py-1.5 text-right">${studyCount}</td>
+                  <td class="px-3 py-1.5 text-right font-semibold">${fmt(t.enrolled)}</td>
+                  <td class="px-3 py-1.5 text-right">${rate(t.enrolled, t.screened)}</td>
+                </tr>`;
+              })
+              .join('')}
+          </tbody>
+        </table>`;
+    }
+  }
+
+  async function mountDashboard() {
+    const root = document.getElementById('legacy-dashboard-root');
+    if (!root) return;
+
+    const status = document.getElementById('legacy-dash-status');
+    try {
+      await ensureLoaded();
+      renderDashboard();
+    } catch (e) {
+      console.error('Legacy dashboard load failed', e);
+      if (status) status.textContent = 'Failed to load legacy data.';
+    }
+
+    document.getElementById('legacy-dash-refresh')?.addEventListener('click', async () => {
+      state.loaded = false;
+      await ensureLoaded(true);
+      renderDashboard();
+    });
+    document.getElementById('legacy-dash-view-all')?.addEventListener('click', () => {
+      document.getElementById('legacy-reporting-tab-btn')?.click();
+    });
+  }
+
+  function setReportMode(mode) {
+    state.reportMode = mode === 'byStudy' ? 'byStudy' : 'bySite';
+    const siteBtn = document.getElementById('legacy-mode-site');
+    const studyBtn = document.getElementById('legacy-mode-study');
+    if (siteBtn && studyBtn) {
+      const on = 'px-3 py-2 bg-indigo-600 text-white';
+      const off = 'px-3 py-2 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200';
+      siteBtn.className = state.reportMode === 'bySite' ? on : off;
+      studyBtn.className = state.reportMode === 'byStudy' ? on : off;
+    }
+    const title = document.getElementById('legacy-chart-title');
+    if (title) title.textContent = state.reportMode === 'bySite' ? 'Enrolled by site' : 'Enrolled by study';
+  }
+
+  function uniqueSitesFromState() {
+    // Prefer master legacy-sites (~50). Fallback: derive from outcomes by siteId.
+    if (state.sites.length) return state.sites;
+    const map = {};
+    for (const raw of state.outcomes) {
+      const o = normOutcome(raw);
+      if (!o.siteId) continue;
+      if (!map[o.siteId]) {
+        map[o.siteId] = {
+          id: o.siteId,
+          name: o.siteName,
+          siteCode: o.siteId.replace(/^legacy-site-/, '').toUpperCase().replace(/-/g, '_'),
+          metrics: {
+            enrolled: 0,
+            screened: 0,
+            scheduled: 0,
+            targetScheduled: 0,
+            nStudies: 0,
+            nOutcomeRows: 0,
+            studyNames: [],
+          },
+        };
+      }
+    }
+    // fill metrics
+    for (const raw of state.outcomes) {
+      const o = normOutcome(raw);
+      const s = map[o.siteId];
+      if (!s) continue;
+      s.metrics.enrolled += num(o.enrolled);
+      s.metrics.screened += num(o.screened);
+      s.metrics.scheduled += num(o.scheduled);
+      s.metrics.targetScheduled += num(o.targetScheduled);
+      s.metrics.nOutcomeRows += 1;
+      if (o.studyName && !s.metrics.studyNames.includes(o.studyName)) s.metrics.studyNames.push(o.studyName);
+    }
+    Object.values(map).forEach((s) => {
+      s.metrics.nStudies = s.metrics.studyNames.length;
+    });
+    return Object.values(map);
+  }
+
   function renderReporting() {
     const kpis = document.getElementById('legacy-report-kpis');
     const tables = document.getElementById('legacy-report-tables');
-    const taSel = document.getElementById('legacy-report-ta');
     const studySel = document.getElementById('legacy-report-study');
+    const siteSel = document.getElementById('legacy-report-site');
     if (!kpis || !tables) return;
 
-    // populate study dropdown once
     if (studySel && studySel.options.length <= 1) {
       [...state.studies]
         .sort((a, b) => String(a.name).localeCompare(String(b.name)))
@@ -606,33 +908,37 @@
         });
     }
 
-    const tas = [...new Set(state.studies.map((s) => s.therapeuticArea || 'Unspecified'))].sort();
-    if (taSel && taSel.options.length <= 1) {
-      tas.forEach((ta) => {
-        if (ta === 'Unspecified') return;
-        const opt = document.createElement('option');
-        opt.value = ta;
-        opt.textContent = ta;
-        taSel.appendChild(opt);
-      });
+    const sitesMaster = uniqueSitesFromState();
+    if (siteSel && siteSel.options.length <= 1) {
+      [...sitesMaster]
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+        .forEach((s) => {
+          const opt = document.createElement('option');
+          opt.value = s.id;
+          opt.textContent = `${s.name}${s.siteCode ? ` (${s.siteCode})` : ''}`;
+          siteSel.appendChild(opt);
+        });
     }
 
-    const taFilter = taSel?.value || '';
     const studyFilter = studySel?.value || '';
-    let studies = state.studies.filter((s) => !taFilter || s.therapeuticArea === taFilter);
-    if (studyFilter) studies = studies.filter((s) => s.id === studyFilter);
-    const studyIds = new Set(studies.map((s) => s.id));
-    const outcomes = state.outcomes.filter((o) => studyIds.has(o.studyId)).map(normOutcome);
+    const siteFilter = siteSel?.value || '';
+    let outcomes = state.outcomes.map(normOutcome);
+    if (studyFilter) outcomes = outcomes.filter((o) => o.studyId === studyFilter);
+    if (siteFilter) outcomes = outcomes.filter((o) => o.siteId === siteFilter);
 
+    const studyIds = new Set(outcomes.map((o) => o.studyId));
+    const studies = state.studies.filter((s) => studyIds.has(s.id) || (!studyFilter && !siteFilter));
+    const filteredStudies = studyFilter ? state.studies.filter((s) => s.id === studyFilter) : state.studies;
     const totals = sumOutcomes(outcomes);
+    const uniqueSiteCount = new Set(outcomes.map((o) => o.siteId).filter(Boolean)).size;
 
     kpis.innerHTML = [
-      ['Studies', studies.length],
-      ['Site rows', outcomes.length],
+      ['Unique sites', siteFilter ? 1 : state.sites.length || uniqueSiteCount],
+      ['Studies', studyFilter ? 1 : filteredStudies.length],
+      ['Outcome rows', outcomes.length],
       ['Scheduled', fmt(totals.scheduled)],
       ['Screened', fmt(totals.screened)],
       ['Enrolled', fmt(totals.enrolled)],
-      ['E/S', rate(totals.enrolled, totals.screened)],
     ]
       .map(
         ([label, val]) => `
@@ -645,21 +951,43 @@
 
     destroyCharts();
     if (global.Chart) {
-      const top = [...studies]
-        .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled))
-        .slice(0, 12);
       const ctx1 = document.getElementById('legacy-chart-studies');
-      if (ctx1) {
-        charts.studies = new global.Chart(ctx1, {
-          type: 'bar',
-          data: {
-            labels: top.map((s) => s.name),
-            datasets: [{ label: 'Enrolled', data: top.map((s) => num(s.metrics?.enrolled)), backgroundColor: '#4f46e5' }],
-          },
-          options: { indexAxis: 'y', plugins: { legend: { display: false } }, responsive: true },
-        });
-      }
       const ctx2 = document.getElementById('legacy-chart-funnel');
+      if (state.reportMode === 'bySite') {
+        let siteRows = sitesMaster
+          .map((s) => {
+            const rows = outcomes.filter((o) => o.siteId === s.id);
+            const t = sumOutcomes(rows);
+            return { ...s, _t: t, _rows: rows };
+          })
+          .filter((s) => s._rows.length > 0)
+          .sort((a, b) => b._t.enrolled - a._t.enrolled);
+        const top = siteRows.slice(0, 12);
+        if (ctx1) {
+          charts.studies = new global.Chart(ctx1, {
+            type: 'bar',
+            data: {
+              labels: top.map((s) => s.name),
+              datasets: [{ label: 'Enrolled', data: top.map((s) => s._t.enrolled), backgroundColor: '#4f46e5' }],
+            },
+            options: { indexAxis: 'y', plugins: { legend: { display: false } }, responsive: true },
+          });
+        }
+      } else {
+        const top = [...filteredStudies]
+          .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled))
+          .slice(0, 12);
+        if (ctx1) {
+          charts.studies = new global.Chart(ctx1, {
+            type: 'bar',
+            data: {
+              labels: top.map((s) => s.name),
+              datasets: [{ label: 'Enrolled', data: top.map((s) => num(s.metrics?.enrolled)), backgroundColor: '#4f46e5' }],
+            },
+            options: { indexAxis: 'y', plugins: { legend: { display: false } }, responsive: true },
+          });
+        }
+      }
       if (ctx2) {
         charts.funnel = new global.Chart(ctx2, {
           type: 'bar',
@@ -678,8 +1006,119 @@
       }
     }
 
-    // Study → site sections
-    const studyBlocks = studies
+    if (state.reportMode === 'bySite') {
+      const siteRows = sitesMaster
+        .map((s) => {
+          const rows = outcomes.filter((o) => o.siteId === s.id);
+          const t = sumOutcomes(rows);
+          const studyNames = [...new Set(rows.map((r) => r.studyName))];
+          return { site: s, rows, t, studyNames };
+        })
+        .filter((x) => x.rows.length > 0)
+        .sort((a, b) => b.t.enrolled - a.t.enrolled);
+
+      tables.innerHTML = `
+        <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-x-auto">
+          <div class="px-3 py-2 font-semibold border-b dark:border-gray-700 flex justify-between gap-2">
+            <span>Sites (${siteRows.length} unique — not ${outcomes.length} outcome lines)</span>
+            <span class="text-xs font-normal text-gray-500">Each siteId appears once; expand for studies under that site</span>
+          </div>
+          <table class="min-w-full text-sm">
+            <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
+              <th class="px-3 py-2">Site ID</th>
+              <th class="px-3 py-2">Site</th>
+              <th class="px-3 py-2">Code</th>
+              <th class="px-3 py-2 text-right">Studies</th>
+              <th class="px-3 py-2 text-right">Rows</th>
+              <th class="px-3 py-2 text-right">Target</th>
+              <th class="px-3 py-2 text-right">Sched</th>
+              <th class="px-3 py-2 text-right">Screen</th>
+              <th class="px-3 py-2 text-right">Enrolled</th>
+              <th class="px-3 py-2 text-right">E/S</th>
+            </tr></thead>
+            <tbody>
+              ${siteRows
+                .map(({ site: s, rows, t, studyNames }) => {
+                  const m = s.metrics || {};
+                  return `<tr class="border-t dark:border-gray-700">
+                    <td class="px-3 py-1.5 text-xs font-mono text-gray-500">${escapeHtml(s.id)}</td>
+                    <td class="px-3 py-1.5 font-medium">${escapeHtml(s.name)}</td>
+                    <td class="px-3 py-1.5 text-xs">${escapeHtml(s.siteCode || '—')}</td>
+                    <td class="px-3 py-1.5 text-right">${studyNames.length || m.nStudies || '—'}</td>
+                    <td class="px-3 py-1.5 text-right">${rows.length}</td>
+                    <td class="px-3 py-1.5 text-right">${fmt(t.targetScheduled)}</td>
+                    <td class="px-3 py-1.5 text-right">${fmt(t.scheduled)}</td>
+                    <td class="px-3 py-1.5 text-right">${fmt(t.screened)}</td>
+                    <td class="px-3 py-1.5 text-right font-semibold">${fmt(t.enrolled)}</td>
+                    <td class="px-3 py-1.5 text-right">${rate(t.enrolled, t.screened)}</td>
+                  </tr>`;
+                })
+                .join('')}
+            </tbody>
+          </table>
+        </div>
+        <div class="space-y-2">
+          <h3 class="font-semibold text-gray-900 dark:text-white">Site → studies (drill-down)</h3>
+          ${siteRows
+            .map(({ site: s, rows, t, studyNames }) => {
+              // roll up by study under this site
+              const byStudy = {};
+              for (const o of rows) {
+                if (!byStudy[o.studyId]) {
+                  byStudy[o.studyId] = { studyId: o.studyId, studyName: o.studyName, rows: [] };
+                }
+                byStudy[o.studyId].rows.push(o);
+              }
+              const studyParts = Object.values(byStudy)
+                .map((st) => {
+                  const stTot = sumOutcomes(st.rows);
+                  const meta = state.studies.find((x) => x.id === st.studyId);
+                  const ta = meta?.therapeuticArea || meta?.indication || '—';
+                  return `<tr class="border-t dark:border-gray-700">
+                    <td class="px-2 py-1.5">${escapeHtml(st.studyName)}</td>
+                    <td class="px-2 py-1.5">${escapeHtml(ta)}</td>
+                    <td class="px-2 py-1.5 text-right">${st.rows.length}</td>
+                    <td class="px-2 py-1.5 text-right">${fmt(stTot.scheduled)}</td>
+                    <td class="px-2 py-1.5 text-right">${fmt(stTot.screened)}</td>
+                    <td class="px-2 py-1.5 text-right">${fmt(stTot.enrolled)}</td>
+                    <td class="px-2 py-1.5 text-right">${rate(stTot.enrolled, stTot.screened)}</td>
+                  </tr>`;
+                })
+                .join('');
+              return `
+              <details class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800" ${siteFilter ? 'open' : ''}>
+                <summary class="cursor-pointer px-3 py-2 font-semibold flex flex-wrap gap-x-4 gap-y-1">
+                  <span>${escapeHtml(s.name)}</span>
+                  <span class="text-xs font-normal text-gray-500 font-mono">${escapeHtml(s.id)}</span>
+                  <span class="text-xs font-normal text-gray-500">${studyNames.length} studies · enrolled ${fmt(t.enrolled)}</span>
+                </summary>
+                <div class="px-3 pb-3 border-t dark:border-gray-700 space-y-3">
+                  <div class="overflow-x-auto pt-2">
+                    <table class="min-w-full text-sm">
+                      <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
+                        <th class="px-2 py-2">Study</th><th class="px-2 py-2">TA / Indication</th>
+                        <th class="px-2 py-2 text-right">Rows</th>
+                        <th class="px-2 py-2 text-right">Sched</th><th class="px-2 py-2 text-right">Screen</th>
+                        <th class="px-2 py-2 text-right">Enrolled</th><th class="px-2 py-2 text-right">E/S</th>
+                      </tr></thead>
+                      <tbody>${studyParts}</tbody>
+                    </table>
+                  </div>
+                  <div>
+                    <div class="text-sm font-medium mb-1">Site × group detail</div>
+                    ${siteOutcomesTableHtml(rows, { showStudy: true })}
+                  </div>
+                </div>
+              </details>`;
+            })
+            .join('') || '<p class="text-sm text-gray-500">No sites in filter.</p>'}
+        </div>`;
+      return;
+    }
+
+    // ---- By Study mode ----
+    const studyList = studyFilter ? filteredStudies : filteredStudies;
+    const studyBlocks = studyList
       .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled))
       .map((s) => {
         const rows = outcomes.filter((o) => o.studyId === s.id);
@@ -688,15 +1127,16 @@
           <details class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800" ${studyFilter ? 'open' : ''}>
             <summary class="cursor-pointer px-3 py-2 font-semibold flex flex-wrap gap-x-4 gap-y-1 items-center">
               <span>${escapeHtml(s.name)}</span>
-              <span class="text-xs font-normal text-gray-500">${rows.length} rows · ${t.sites.size} sites · enrolled ${fmt(t.enrolled)} · E/S ${rate(t.enrolled, t.screened)}</span>
+              <span class="text-xs font-normal text-gray-500">${escapeHtml(s.therapeuticArea || s.indication || '')}</span>
+              <span class="text-xs font-normal text-gray-500">${rows.length} rows · ${t.sites.size} sites · enrolled ${fmt(t.enrolled)}</span>
             </summary>
             <div class="px-3 pb-3 space-y-3 border-t dark:border-gray-700">
               <div class="pt-2">
-                <div class="text-sm font-medium mb-1">By site</div>
+                <div class="text-sm font-medium mb-1">By site (unique under this study)</div>
                 ${siteRollupTableHtml(rows)}
               </div>
               <div>
-                <div class="text-sm font-medium mb-1">Site × group detail (Visit 1 / LPLV / PI)</div>
+                <div class="text-sm font-medium mb-1">Site × group detail</div>
                 ${siteOutcomesTableHtml(rows)}
               </div>
             </div>
@@ -709,29 +1149,23 @@
         <div class="px-3 py-2 font-semibold border-b dark:border-gray-700">Study summary</div>
         <table class="min-w-full text-sm">
           <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
-            <th class="px-3 py-2">Study</th><th class="px-3 py-2">TA</th>
+            <th class="px-3 py-2">Study</th><th class="px-3 py-2">TA / Indication</th>
             <th class="px-3 py-2 text-right">Sites</th>
-            <th class="px-3 py-2 text-right">Target</th>
             <th class="px-3 py-2 text-right">Sched</th><th class="px-3 py-2 text-right">Screen</th>
             <th class="px-3 py-2 text-right">Enrolled</th><th class="px-3 py-2 text-right">E/S</th>
-            <th class="px-3 py-2">Visit1</th><th class="px-3 py-2">LPLV</th>
           </tr></thead>
           <tbody>
-            ${studies
+            ${studyList
               .map((s) => {
                 const m = s.metrics || {};
-                const rows = outcomes.filter((o) => o.studyId === s.id);
                 return `<tr class="border-t dark:border-gray-700">
                   <td class="px-3 py-1.5 font-medium">${escapeHtml(s.name)}</td>
-                  <td class="px-3 py-1.5">${escapeHtml(s.therapeuticArea || '—')}</td>
-                  <td class="px-3 py-1.5 text-right">${fmt(m.nSites ?? bySiteRollup(rows).length)}</td>
-                  <td class="px-3 py-1.5 text-right">${fmt(m.targetScheduled)}</td>
+                  <td class="px-3 py-1.5">${escapeHtml(s.therapeuticArea || s.indication || '—')}</td>
+                  <td class="px-3 py-1.5 text-right">${fmt(m.nSites)}</td>
                   <td class="px-3 py-1.5 text-right">${fmt(m.scheduled)}</td>
                   <td class="px-3 py-1.5 text-right">${fmt(m.screened)}</td>
                   <td class="px-3 py-1.5 text-right">${fmt(m.enrolled)}</td>
                   <td class="px-3 py-1.5 text-right">${rate(m.enrolled, m.screened)}</td>
-                  <td class="px-3 py-1.5 text-xs">${escapeHtml([m.visit1StartMin, m.visit1StartMax].filter(Boolean).join(' → ') || '—')}</td>
-                  <td class="px-3 py-1.5 text-xs">${escapeHtml([m.lplvMin, m.lplvMax].filter(Boolean).join(' → ') || '—')}</td>
                 </tr>`;
               })
               .join('')}
@@ -746,8 +1180,9 @@
 
   function exportCsv() {
     const headers = [
-      'studyName',
+      'siteId',
       'siteName',
+      'studyName',
       'group',
       'pi',
       'visit1Start',
@@ -792,19 +1227,27 @@
 
   async function mountReporting() {
     await ensureLoaded();
-    // reset selects so they repopulate
     const studySel = document.getElementById('legacy-report-study');
-    const taSel = document.getElementById('legacy-report-ta');
-    if (studySel) studySel.innerHTML = '<option value="">All studies (summary)</option>';
-    if (taSel) taSel.innerHTML = '<option value="">All therapeutic areas</option>';
+    const siteSel = document.getElementById('legacy-report-site');
+    if (studySel) studySel.innerHTML = '<option value="">All studies</option>';
+    if (siteSel) siteSel.innerHTML = '<option value="">All sites</option>';
+    setReportMode('bySite');
     renderReporting();
     studySel?.addEventListener('change', renderReporting);
-    taSel?.addEventListener('change', renderReporting);
+    siteSel?.addEventListener('change', renderReporting);
+    document.getElementById('legacy-mode-site')?.addEventListener('click', () => {
+      setReportMode('bySite');
+      renderReporting();
+    });
+    document.getElementById('legacy-mode-study')?.addEventListener('click', () => {
+      setReportMode('byStudy');
+      renderReporting();
+    });
     document.getElementById('legacy-report-refresh')?.addEventListener('click', async () => {
       state.loaded = false;
       await ensureLoaded(true);
-      if (studySel) studySel.innerHTML = '<option value="">All studies (summary)</option>';
-      if (taSel) taSel.innerHTML = '<option value="">All therapeutic areas</option>';
+      if (studySel) studySel.innerHTML = '<option value="">All studies</option>';
+      if (siteSel) siteSel.innerHTML = '<option value="">All sites</option>';
       renderReporting();
     });
     document.getElementById('legacy-report-export')?.addEventListener('click', exportCsv);
@@ -813,6 +1256,7 @@
   function attachApiMethods() {
     if (!global.apiService) return;
     global.apiService.getLegacyStudies = () => global.apiService.request('/legacy-studies');
+    global.apiService.getLegacySites = () => global.apiService.request('/legacy-sites');
     global.apiService.updateLegacyStudy = (id, body) =>
       global.apiService.request(`/legacy-studies/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
     global.apiService.getLegacyOutcomes = (studyId) =>
@@ -824,8 +1268,10 @@
   global.ArtemisLegacy = {
     getLegacyStudiesHTML,
     getLegacyReportingHTML,
+    getLegacyDashboardHTML,
     mountStudies,
     mountReporting,
+    mountDashboard,
     ensureLoaded,
     attachApiMethods,
     state,

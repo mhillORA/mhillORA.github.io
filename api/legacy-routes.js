@@ -4,6 +4,7 @@
  * Containers: legacy-studies (/id), legacy-study-site-outcomes (/studyId)
  */
 const LEGACY_STUDIES = 'legacy-studies';
+const LEGACY_SITES = 'legacy-sites';
 const LEGACY_OUTCOMES = 'legacy-study-site-outcomes';
 
 function corsHeaders() {
@@ -31,10 +32,14 @@ async function ensureLegacyContainers(getCosmosClient, context) {
         partitionKey: { paths: ['/id'] },
     });
     await database.containers.createIfNotExists({
+        id: LEGACY_SITES,
+        partitionKey: { paths: ['/id'] },
+    });
+    await database.containers.createIfNotExists({
         id: LEGACY_OUTCOMES,
         partitionKey: { paths: ['/studyId'] },
     });
-    if (context?.log) context.log(`Ensured containers ${LEGACY_STUDIES}, ${LEGACY_OUTCOMES}`);
+    if (context?.log) context.log(`Ensured containers ${LEGACY_STUDIES}, ${LEGACY_SITES}, ${LEGACY_OUTCOMES}`);
 }
 
 function registerLegacyRoutes(app, deps) {
@@ -158,6 +163,107 @@ function registerLegacyRoutes(app, deps) {
                 return { status: 405, jsonBody: { error: 'Method not allowed' }, headers: corsHeaders() };
             } catch (error) {
                 return handleError(context, error, 'legacy-studies');
+            }
+        },
+    });
+
+    // ---------- legacy-sites (one doc per unique dropdown site) ----------
+    app.http('legacySites', {
+        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'legacy-sites/{id?}',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                await ensureLegacyContainers(getCosmosClient, context);
+                const container = getContainer(LEGACY_SITES);
+                const id = request.params?.id || null;
+                const method = request.method;
+
+                if (method === 'GET') {
+                    if (id) {
+                        const { resource } = await container.item(id, id).read();
+                        if (!resource) {
+                            return { status: 404, jsonBody: { error: 'Legacy site not found' }, headers: corsHeaders() };
+                        }
+                        return { jsonBody: resource, headers: corsHeaders() };
+                    }
+                    const { resources } = await container.items
+                        .query({ query: 'SELECT * FROM c' }, { enableCrossPartitionQuery: true })
+                        .fetchAll();
+                    const rows = (resources || []).slice().sort((a, b) =>
+                        String(a.name || '').localeCompare(String(b.name || ''))
+                    );
+                    return { jsonBody: rows, headers: corsHeaders() };
+                }
+
+                if (method === 'POST') {
+                    const body = await getBody(request);
+                    const name = (body.name || '').trim();
+                    if (!name) {
+                        return { status: 400, jsonBody: { error: 'name is required' }, headers: corsHeaders() };
+                    }
+                    const now = new Date().toISOString();
+                    const newId = body.id || `legacy-site-${slugify(name)}`;
+                    const item = {
+                        id: newId,
+                        type: 'legacySite',
+                        name,
+                        siteCode: body.siteCode || slugify(name).toUpperCase().replace(/-/g, '_').slice(0, 32),
+                        status: body.status || 'Active',
+                        notes: body.notes ?? null,
+                        linkedArtemisSiteId: body.linkedArtemisSiteId ?? null,
+                        source: body.source || 'manual',
+                        metrics: body.metrics || {},
+                        editableFields: true,
+                        createdAt: now,
+                        updatedAt: now,
+                    };
+                    const { resource } = await container.items.upsert(item);
+                    return { status: 201, jsonBody: resource, headers: corsHeaders() };
+                }
+
+                if (method === 'PUT' || method === 'PATCH') {
+                    if (!id) {
+                        return { status: 400, jsonBody: { error: 'id required' }, headers: corsHeaders() };
+                    }
+                    const body = await getBody(request);
+                    let existing = null;
+                    try {
+                        const read = await container.item(id, id).read();
+                        existing = read.resource;
+                    } catch (_) {
+                        existing = null;
+                    }
+                    if (!existing) {
+                        return { status: 404, jsonBody: { error: 'Legacy site not found' }, headers: corsHeaders() };
+                    }
+                    const editable = ['name', 'siteCode', 'status', 'notes', 'linkedArtemisSiteId'];
+                    const updated = { ...existing };
+                    for (const k of editable) {
+                        if (body[k] !== undefined) updated[k] = body[k];
+                    }
+                    if (body.metrics && typeof body.metrics === 'object') {
+                        updated.metrics = { ...(existing.metrics || {}), ...body.metrics };
+                    }
+                    updated.updatedAt = new Date().toISOString();
+                    const { resource } = await container.items.upsert(updated);
+                    return { jsonBody: resource, headers: corsHeaders() };
+                }
+
+                if (method === 'DELETE') {
+                    if (!id) {
+                        return { status: 400, jsonBody: { error: 'id required' }, headers: corsHeaders() };
+                    }
+                    await container.item(id, id).delete();
+                    return { status: 204, headers: corsHeaders() };
+                }
+
+                return { status: 405, jsonBody: { error: 'Method not allowed' }, headers: corsHeaders() };
+            } catch (error) {
+                return handleError(context, error, 'legacy-sites');
             }
         },
     });
@@ -328,14 +434,17 @@ function registerLegacyRoutes(app, deps) {
             try {
                 await ensureLegacyContainers(getCosmosClient, context);
                 const studiesC = getContainer(LEGACY_STUDIES);
+                const sitesC = getContainer(LEGACY_SITES);
                 const outcomesC = getContainer(LEGACY_OUTCOMES);
-                const [{ resources: studies }, { resources: outcomes }] = await Promise.all([
+                const [{ resources: studies }, { resources: sites }, { resources: outcomes }] = await Promise.all([
                     studiesC.items.query({ query: 'SELECT * FROM c' }, { enableCrossPartitionQuery: true }).fetchAll(),
+                    sitesC.items.query({ query: 'SELECT * FROM c' }, { enableCrossPartitionQuery: true }).fetchAll(),
                     outcomesC.items.query({ query: 'SELECT * FROM c' }, { enableCrossPartitionQuery: true }).fetchAll(),
                 ]);
 
                 const totals = {
                     studies: (studies || []).length,
+                    uniqueSites: (sites || []).length,
                     siteRows: (outcomes || []).length,
                     targetScheduled: 0,
                     scheduled: 0,
@@ -366,6 +475,7 @@ function registerLegacyRoutes(app, deps) {
                         totals,
                         byTherapeuticArea,
                         studies: studies || [],
+                        sites: sites || [],
                     },
                     headers: corsHeaders(),
                 };
@@ -376,4 +486,4 @@ function registerLegacyRoutes(app, deps) {
     });
 }
 
-module.exports = { registerLegacyRoutes, ensureLegacyContainers, LEGACY_STUDIES, LEGACY_OUTCOMES };
+module.exports = { registerLegacyRoutes, ensureLegacyContainers, LEGACY_STUDIES, LEGACY_SITES, LEGACY_OUTCOMES };
