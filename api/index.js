@@ -2447,3 +2447,14 @@ app.http('routeDirections', {
         }
     }
 });
+
+// =================================================================================
+// LEGACY STUDIES (ARTEMIS only) — new Cosmos containers; does not touch live studies/sites/patients
+// =================================================================================
+const { registerLegacyRoutes } = require('./legacy-routes');
+registerLegacyRoutes(app, {
+    getContainer,
+    getCosmosClient,
+    handleError,
+    generateId,
+});

@@ -1,0 +1,352 @@
+/**
+ * Legacy Studies API — ARTEMIS only.
+ * Uses NEW Cosmos containers only. Never reads/writes studies|sites|patients|crcs|events.
+ * Containers: legacy-studies (/id), legacy-study-site-outcomes (/studyId)
+ */
+const LEGACY_STUDIES = 'legacy-studies';
+const LEGACY_OUTCOMES = 'legacy-study-site-outcomes';
+
+function corsHeaders() {
+    return {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+    };
+}
+
+function slugify(name) {
+    return String(name || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'unknown';
+}
+
+async function ensureLegacyContainers(getCosmosClient, context) {
+    const { database } = getCosmosClient();
+    await database.containers.createIfNotExists({
+        id: LEGACY_STUDIES,
+        partitionKey: { paths: ['/id'] },
+    });
+    await database.containers.createIfNotExists({
+        id: LEGACY_OUTCOMES,
+        partitionKey: { paths: ['/studyId'] },
+    });
+    if (context?.log) context.log(`Ensured containers ${LEGACY_STUDIES}, ${LEGACY_OUTCOMES}`);
+}
+
+function registerLegacyRoutes(app, deps) {
+    const { getContainer, getCosmosClient, handleError, generateId } = deps;
+
+    const getBody = async (request) => {
+        try {
+            return await request.json();
+        } catch {
+            return {};
+        }
+    };
+
+    const getId = (request) => {
+        try {
+            if (request.params?.id) return request.params.id;
+        } catch (_) { /* ignore */ }
+        const m = String(request.url || '').match(/\/([^\/\?]+)(?:\?|$)/);
+        // last path segment after route base is unreliable; prefer params
+        return request.params?.id || null;
+    };
+
+    // ---------- legacy-studies ----------
+    app.http('legacyStudies', {
+        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'legacy-studies/{id?}',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                await ensureLegacyContainers(getCosmosClient, context);
+                const container = getContainer(LEGACY_STUDIES);
+                const id = request.params?.id || null;
+                const method = request.method;
+
+                if (method === 'GET') {
+                    if (id) {
+                        const { resource } = await container.item(id, id).read();
+                        if (!resource) {
+                            return { status: 404, jsonBody: { error: 'Legacy study not found' }, headers: corsHeaders() };
+                        }
+                        return { jsonBody: resource, headers: corsHeaders() };
+                    }
+                    const { resources } = await container.items
+                        .query({ query: 'SELECT * FROM c ORDER BY c.name ASC' }, { enableCrossPartitionQuery: true })
+                        .fetchAll();
+                    return { jsonBody: resources || [], headers: corsHeaders() };
+                }
+
+                if (method === 'POST') {
+                    const body = await getBody(request);
+                    const name = (body.name || body.title || '').trim();
+                    if (!name) {
+                        return { status: 400, jsonBody: { error: 'name is required' }, headers: corsHeaders() };
+                    }
+                    const now = new Date().toISOString();
+                    const newId = body.id || `legacy-study-${slugify(name)}`;
+                    const item = {
+                        id: newId,
+                        type: 'legacyStudy',
+                        name,
+                        title: body.title || name,
+                        therapeuticArea: body.therapeuticArea ?? null,
+                        indication: body.indication ?? null,
+                        sponsor: body.sponsor ?? null,
+                        phase: body.phase ?? null,
+                        status: body.status || 'Completed',
+                        notes: body.notes ?? null,
+                        source: body.source || 'manual',
+                        metrics: body.metrics || {},
+                        editableFields: true,
+                        createdAt: now,
+                        updatedAt: now,
+                    };
+                    const { resource } = await container.items.upsert(item);
+                    return { status: 201, jsonBody: resource, headers: corsHeaders() };
+                }
+
+                if (method === 'PUT' || method === 'PATCH') {
+                    if (!id) {
+                        return { status: 400, jsonBody: { error: 'id required' }, headers: corsHeaders() };
+                    }
+                    const body = await getBody(request);
+                    let existing = null;
+                    try {
+                        const read = await container.item(id, id).read();
+                        existing = read.resource;
+                    } catch (_) {
+                        existing = null;
+                    }
+                    if (!existing) {
+                        return { status: 404, jsonBody: { error: 'Legacy study not found' }, headers: corsHeaders() };
+                    }
+                    // Allow editing metadata without clobbering metrics unless provided
+                    const editable = [
+                        'name', 'title', 'therapeuticArea', 'indication', 'sponsor',
+                        'phase', 'status', 'notes',
+                    ];
+                    const updated = { ...existing };
+                    for (const k of editable) {
+                        if (body[k] !== undefined) updated[k] = body[k];
+                    }
+                    if (body.metrics && typeof body.metrics === 'object') {
+                        updated.metrics = { ...(existing.metrics || {}), ...body.metrics };
+                    }
+                    updated.updatedAt = new Date().toISOString();
+                    const { resource } = await container.items.upsert(updated);
+                    return { jsonBody: resource, headers: corsHeaders() };
+                }
+
+                if (method === 'DELETE') {
+                    if (!id) {
+                        return { status: 400, jsonBody: { error: 'id required' }, headers: corsHeaders() };
+                    }
+                    await container.item(id, id).delete();
+                    return { status: 204, headers: corsHeaders() };
+                }
+
+                return { status: 405, jsonBody: { error: 'Method not allowed' }, headers: corsHeaders() };
+            } catch (error) {
+                return handleError(context, error, 'legacy-studies');
+            }
+        },
+    });
+
+    // ---------- legacy-study-site-outcomes ----------
+    app.http('legacyStudySiteOutcomes', {
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'legacy-study-site-outcomes/{id?}',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                await ensureLegacyContainers(getCosmosClient, context);
+                const container = getContainer(LEGACY_OUTCOMES);
+                const id = request.params?.id || null;
+                const method = request.method;
+
+                const q = request.query;
+                const studyId = typeof q?.get === 'function' ? q.get('studyId') : q?.studyId;
+                const siteName = typeof q?.get === 'function' ? q.get('siteName') : q?.siteName;
+
+                if (method === 'GET') {
+                    if (id && studyId) {
+                        const { resource } = await container.item(id, studyId).read();
+                        if (!resource) {
+                            return { status: 404, jsonBody: { error: 'Outcome not found' }, headers: corsHeaders() };
+                        }
+                        return { jsonBody: resource, headers: corsHeaders() };
+                    }
+                    const where = [];
+                    const parameters = [];
+                    if (studyId) {
+                        where.push('c.studyId = @studyId');
+                        parameters.push({ name: '@studyId', value: String(studyId) });
+                    }
+                    if (siteName) {
+                        where.push('c.siteName = @siteName');
+                        parameters.push({ name: '@siteName', value: String(siteName) });
+                    }
+                    const query = {
+                        query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.studyName ASC, c.siteName ASC`
+                            .replace(/\s+/g, ' ')
+                            .trim(),
+                        parameters,
+                    };
+                    const { resources } = await container.items
+                        .query(query, { enableCrossPartitionQuery: true })
+                        .fetchAll();
+                    return { jsonBody: resources || [], headers: corsHeaders() };
+                }
+
+                if (method === 'POST') {
+                    const body = await getBody(request);
+                    if (!body.studyId || !body.studyName || !body.siteName) {
+                        return {
+                            status: 400,
+                            jsonBody: { error: 'studyId, studyName, and siteName are required' },
+                            headers: corsHeaders(),
+                        };
+                    }
+                    const now = new Date().toISOString();
+                    const item = {
+                        id: body.id || `legacy-outcome-${generateId()}`,
+                        type: 'legacyStudySiteOutcome',
+                        studyId: body.studyId,
+                        studyName: body.studyName,
+                        siteName: body.siteName,
+                        group: body.group ?? null,
+                        pi: body.pi ?? null,
+                        visit1Start: body.visit1Start ?? null,
+                        lplv: body.lplv ?? null,
+                        targetScheduled: body.targetScheduled ?? null,
+                        scheduled: body.scheduled ?? null,
+                        screened: body.screened ?? body.screen ?? null,
+                        enrolled: body.enrolled ?? null,
+                        uniqueId: body.uniqueId ?? null,
+                        source: body.source || 'anterior-segment-overview',
+                        ingestedAt: body.ingestedAt || now,
+                        createdAt: now,
+                        updatedAt: now,
+                    };
+                    const { resource } = await container.items.upsert(item);
+                    return { status: 201, jsonBody: resource, headers: corsHeaders() };
+                }
+
+                if (method === 'PUT') {
+                    const body = await getBody(request);
+                    const pk = body.studyId || studyId;
+                    if (!id || !pk) {
+                        return { status: 400, jsonBody: { error: 'id and studyId required' }, headers: corsHeaders() };
+                    }
+                    let existing = null;
+                    try {
+                        const read = await container.item(id, pk).read();
+                        existing = read.resource;
+                    } catch (_) {
+                        existing = null;
+                    }
+                    if (!existing) {
+                        return { status: 404, jsonBody: { error: 'Outcome not found' }, headers: corsHeaders() };
+                    }
+                    const updated = {
+                        ...existing,
+                        ...body,
+                        id: existing.id,
+                        studyId: existing.studyId,
+                        type: 'legacyStudySiteOutcome',
+                        updatedAt: new Date().toISOString(),
+                    };
+                    const { resource } = await container.items.upsert(updated);
+                    return { jsonBody: resource, headers: corsHeaders() };
+                }
+
+                if (method === 'DELETE') {
+                    const pk = studyId;
+                    if (!id || !pk) {
+                        return { status: 400, jsonBody: { error: 'id and studyId query param required' }, headers: corsHeaders() };
+                    }
+                    await container.item(id, pk).delete();
+                    return { status: 204, headers: corsHeaders() };
+                }
+
+                return { status: 405, jsonBody: { error: 'Method not allowed' }, headers: corsHeaders() };
+            } catch (error) {
+                return handleError(context, error, 'legacy-study-site-outcomes');
+            }
+        },
+    });
+
+    // Aggregate report endpoint (read-only)
+    app.http('legacyReportingSummary', {
+        methods: ['GET', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'legacy-reporting/summary',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                await ensureLegacyContainers(getCosmosClient, context);
+                const studiesC = getContainer(LEGACY_STUDIES);
+                const outcomesC = getContainer(LEGACY_OUTCOMES);
+                const [{ resources: studies }, { resources: outcomes }] = await Promise.all([
+                    studiesC.items.query({ query: 'SELECT * FROM c' }, { enableCrossPartitionQuery: true }).fetchAll(),
+                    outcomesC.items.query({ query: 'SELECT * FROM c' }, { enableCrossPartitionQuery: true }).fetchAll(),
+                ]);
+
+                const totals = {
+                    studies: (studies || []).length,
+                    siteRows: (outcomes || []).length,
+                    targetScheduled: 0,
+                    scheduled: 0,
+                    screened: 0,
+                    enrolled: 0,
+                };
+                for (const o of outcomes || []) {
+                    totals.targetScheduled += Number(o.targetScheduled) || 0;
+                    totals.scheduled += Number(o.scheduled) || 0;
+                    totals.screened += Number(o.screened) || 0;
+                    totals.enrolled += Number(o.enrolled) || 0;
+                }
+                const byTherapeuticArea = {};
+                for (const s of studies || []) {
+                    const ta = s.therapeuticArea || 'Unspecified';
+                    if (!byTherapeuticArea[ta]) {
+                        byTherapeuticArea[ta] = { studies: 0, enrolled: 0, screened: 0, enrolled: 0 };
+                    }
+                    byTherapeuticArea[ta].studies += 1;
+                    const m = s.metrics || {};
+                    byTherapeuticArea[ta].enrolled += Number(m.enrolled) || 0;
+                    byTherapeuticArea[ta].screened += Number(m.screened) || 0;
+                    byTherapeuticArea[ta].scheduled += Number(m.scheduled) || 0;
+                }
+
+                return {
+                    jsonBody: {
+                        totals,
+                        byTherapeuticArea,
+                        studies: studies || [],
+                    },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'legacy-reporting/summary');
+            }
+        },
+    });
+}
+
+module.exports = { registerLegacyRoutes, ensureLegacyContainers, LEGACY_STUDIES, LEGACY_OUTCOMES };
