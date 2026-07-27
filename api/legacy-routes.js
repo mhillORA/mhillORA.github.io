@@ -177,9 +177,25 @@ function registerLegacyRoutes(app, deps) {
                 const id = request.params?.id || null;
                 const method = request.method;
 
-                const q = request.query;
-                const studyId = typeof q?.get === 'function' ? q.get('studyId') : q?.studyId;
-                const siteName = typeof q?.get === 'function' ? q.get('siteName') : q?.siteName;
+                const readQuery = (name) => {
+                    try {
+                        if (request.query && typeof request.query.get === 'function') {
+                            return request.query.get(name);
+                        }
+                        if (request.query && request.query[name] != null) return request.query[name];
+                    } catch (_) { /* ignore */ }
+                    try {
+                        const raw = String(request.url || '');
+                        const qIdx = raw.indexOf('?');
+                        if (qIdx >= 0) {
+                            const sp = new URLSearchParams(raw.slice(qIdx + 1));
+                            return sp.get(name);
+                        }
+                    } catch (_) { /* ignore */ }
+                    return null;
+                };
+                const studyId = readQuery('studyId');
+                const siteName = readQuery('siteName');
 
                 if (method === 'GET') {
                     if (id && studyId) {
@@ -189,6 +205,7 @@ function registerLegacyRoutes(app, deps) {
                         }
                         return { jsonBody: resource, headers: corsHeaders() };
                     }
+                    // Prefer partition-scoped read when studyId is present (faster + reliable)
                     const where = [];
                     const parameters = [];
                     if (studyId) {
@@ -199,16 +216,26 @@ function registerLegacyRoutes(app, deps) {
                         where.push('c.siteName = @siteName');
                         parameters.push({ name: '@siteName', value: String(siteName) });
                     }
+                    // Avoid ORDER BY on cross-partition (can fail / be slow). Sort in app.
+                    // Do not SELECT c.group — "group" is a reserved Cosmos SQL keyword; SELECT * is fine.
                     const query = {
-                        query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.studyName ASC, c.siteName ASC`
+                        query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`
                             .replace(/\s+/g, ' ')
                             .trim(),
                         parameters,
                     };
-                    const { resources } = await container.items
-                        .query(query, { enableCrossPartitionQuery: true })
-                        .fetchAll();
-                    return { jsonBody: resources || [], headers: corsHeaders() };
+                    const queryOpts = { enableCrossPartitionQuery: true };
+                    if (studyId) {
+                        // Partition key is /studyId — scope the query when filtering by study
+                        queryOpts.partitionKey = String(studyId);
+                    }
+                    const { resources } = await container.items.query(query, queryOpts).fetchAll();
+                    const rows = (resources || []).slice().sort((a, b) => {
+                        const sn = String(a.studyName || '').localeCompare(String(b.studyName || ''));
+                        if (sn !== 0) return sn;
+                        return String(a.siteName || '').localeCompare(String(b.siteName || ''));
+                    });
+                    return { jsonBody: rows, headers: corsHeaders() };
                 }
 
                 if (method === 'POST') {

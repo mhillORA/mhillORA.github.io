@@ -8,7 +8,6 @@
     outcomes: [],
     loaded: false,
     selectedStudyId: null,
-    reportFilter: { therapeuticArea: '', status: '', q: '' },
   };
 
   function apiBase() {
@@ -34,13 +33,36 @@
   async function ensureLoaded(force = false) {
     if (state.loaded && !force) return state;
     const [studies, outcomes] = await Promise.all([
-      req('/legacy-studies').catch(() => []),
-      req('/legacy-study-site-outcomes').catch(() => []),
+      req('/legacy-studies').catch((e) => {
+        console.error('legacy-studies load failed', e);
+        return [];
+      }),
+      req('/legacy-study-site-outcomes').catch((e) => {
+        console.error('legacy outcomes load failed', e);
+        return [];
+      }),
     ]);
     state.studies = Array.isArray(studies) ? studies : [];
     state.outcomes = Array.isArray(outcomes) ? outcomes : [];
     state.loaded = true;
+    console.log('Legacy loaded', state.studies.length, 'studies,', state.outcomes.length, 'site rows');
     return state;
+  }
+
+  async function fetchOutcomesForStudy(studyId) {
+    const cached = state.outcomes.filter((o) => o.studyId === studyId);
+    if (cached.length) return cached;
+    const rows = await req(
+      `/legacy-study-site-outcomes?studyId=${encodeURIComponent(studyId)}`
+    ).catch((e) => {
+      console.error('study outcomes fetch failed', e);
+      return [];
+    });
+    const list = Array.isArray(rows) ? rows : [];
+    // merge into cache
+    const others = state.outcomes.filter((o) => o.studyId !== studyId);
+    state.outcomes = others.concat(list);
+    return list;
   }
 
   function fmt(n) {
@@ -51,8 +73,238 @@
   }
 
   function rate(a, b) {
-    if (a == null || b == null || !b) return '—';
-    return `${((Number(a) / Number(b)) * 100).toFixed(1)}%`;
+    const x = Number(a);
+    const y = Number(b);
+    if (!y || Number.isNaN(x) || Number.isNaN(y)) return '—';
+    return `${((x / y) * 100).toFixed(1)}%`;
+  }
+
+  function num(v) {
+    const x = Number(v);
+    return Number.isFinite(x) ? x : 0;
+  }
+
+  /** Normalize outcome fields (tolerate older/alternate shapes). */
+  function normOutcome(o) {
+    return {
+      id: o.id,
+      studyId: o.studyId,
+      studyName: o.studyName || o.study || '',
+      siteName: o.siteName || o.site || '',
+      group: o.group ?? o.groupNumber ?? o.Group ?? null,
+      pi: o.pi || o.PI || '',
+      visit1Start: o.visit1Start || o.visit1_start || o.Visit1Start || '',
+      lplv: o.lplv || o.LPLV || '',
+      targetScheduled: o.targetScheduled ?? o.target_scheduled ?? null,
+      scheduled: o.scheduled ?? null,
+      screened: o.screened ?? o.screen ?? null,
+      enrolled: o.enrolled ?? null,
+      uniqueId: o.uniqueId || '',
+    };
+  }
+
+  function escapeHtml(str) {
+    return String(str ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function sumOutcomes(rows) {
+    return rows.reduce(
+      (a, raw) => {
+        const o = normOutcome(raw);
+        a.targetScheduled += num(o.targetScheduled);
+        a.scheduled += num(o.scheduled);
+        a.screened += num(o.screened);
+        a.enrolled += num(o.enrolled);
+        if (o.siteName) a.sites.add(o.siteName);
+        if (o.pi) a.pis.add(o.pi);
+        if (o.visit1Start) a.visitStarts.push(o.visit1Start);
+        if (o.lplv) a.lplvs.push(o.lplv);
+        return a;
+      },
+      {
+        targetScheduled: 0,
+        scheduled: 0,
+        screened: 0,
+        enrolled: 0,
+        sites: new Set(),
+        pis: new Set(),
+        visitStarts: [],
+        lplvs: [],
+      }
+    );
+  }
+
+  /** Roll site rows up to one row per site (sums groups). */
+  function bySiteRollup(rows) {
+    const map = {};
+    for (const raw of rows) {
+      const o = normOutcome(raw);
+      const key = o.siteName || '(unknown site)';
+      if (!map[key]) {
+        map[key] = {
+          siteName: key,
+          groups: [],
+          pis: new Set(),
+          targetScheduled: 0,
+          scheduled: 0,
+          screened: 0,
+          enrolled: 0,
+          visit1StartMin: null,
+          visit1StartMax: null,
+          lplvMin: null,
+          lplvMax: null,
+          rows: [],
+        };
+      }
+      const s = map[key];
+      s.rows.push(o);
+      if (o.group != null && o.group !== '') s.groups.push(o.group);
+      if (o.pi) s.pis.add(o.pi);
+      s.targetScheduled += num(o.targetScheduled);
+      s.scheduled += num(o.scheduled);
+      s.screened += num(o.screened);
+      s.enrolled += num(o.enrolled);
+      if (o.visit1Start) {
+        if (!s.visit1StartMin || o.visit1Start < s.visit1StartMin) s.visit1StartMin = o.visit1Start;
+        if (!s.visit1StartMax || o.visit1Start > s.visit1StartMax) s.visit1StartMax = o.visit1Start;
+      }
+      if (o.lplv) {
+        if (!s.lplvMin || o.lplv < s.lplvMin) s.lplvMin = o.lplv;
+        if (!s.lplvMax || o.lplv > s.lplvMax) s.lplvMax = o.lplv;
+      }
+    }
+    return Object.values(map)
+      .map((s) => ({
+        ...s,
+        piList: [...s.pis].join(', '),
+        groupList: s.groups.length ? [...new Set(s.groups)].join(', ') : '—',
+      }))
+      .sort((a, b) => b.enrolled - a.enrolled);
+  }
+
+  function siteOutcomesTableHtml(rows, { showStudy = false } = {}) {
+    const normalized = rows.map(normOutcome).sort((a, b) => {
+      const sn = String(a.siteName).localeCompare(String(b.siteName));
+      if (sn !== 0) return sn;
+      return num(b.enrolled) - num(a.enrolled);
+    });
+    if (!normalized.length) {
+      return `<div class="p-4 text-sm text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 rounded-md">
+        No site-level outcome rows loaded for this selection. Try Refresh. If this persists, re-run the legacy ingest.
+      </div>`;
+    }
+    const totals = sumOutcomes(normalized);
+    return `
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
+            <tr>
+              ${showStudy ? '<th class="px-2 py-2">Study</th>' : ''}
+              <th class="px-2 py-2">Site</th>
+              <th class="px-2 py-2">Group</th>
+              <th class="px-2 py-2">PI</th>
+              <th class="px-2 py-2">Visit 1</th>
+              <th class="px-2 py-2">LPLV</th>
+              <th class="px-2 py-2 text-right">Target Sched</th>
+              <th class="px-2 py-2 text-right">Scheduled</th>
+              <th class="px-2 py-2 text-right">Screened</th>
+              <th class="px-2 py-2 text-right">Enrolled</th>
+              <th class="px-2 py-2 text-right">Sched/Target</th>
+              <th class="px-2 py-2 text-right">Screen/Sched</th>
+              <th class="px-2 py-2 text-right">Enroll/Screen</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${normalized
+              .map(
+                (o) => `<tr class="border-t dark:border-gray-700">
+                ${showStudy ? `<td class="px-2 py-1.5">${escapeHtml(o.studyName)}</td>` : ''}
+                <td class="px-2 py-1.5 font-medium">${escapeHtml(o.siteName || '—')}</td>
+                <td class="px-2 py-1.5">${o.group == null || o.group === '' ? '—' : escapeHtml(o.group)}</td>
+                <td class="px-2 py-1.5">${escapeHtml(o.pi || '—')}</td>
+                <td class="px-2 py-1.5 whitespace-nowrap">${escapeHtml(o.visit1Start || '—')}</td>
+                <td class="px-2 py-1.5 whitespace-nowrap">${escapeHtml(o.lplv || '—')}</td>
+                <td class="px-2 py-1.5 text-right">${fmt(o.targetScheduled)}</td>
+                <td class="px-2 py-1.5 text-right">${fmt(o.scheduled)}</td>
+                <td class="px-2 py-1.5 text-right">${fmt(o.screened)}</td>
+                <td class="px-2 py-1.5 text-right font-semibold">${fmt(o.enrolled)}</td>
+                <td class="px-2 py-1.5 text-right">${rate(o.scheduled, o.targetScheduled)}</td>
+                <td class="px-2 py-1.5 text-right">${rate(o.screened, o.scheduled)}</td>
+                <td class="px-2 py-1.5 text-right">${rate(o.enrolled, o.screened)}</td>
+              </tr>`
+              )
+              .join('')}
+            <tr class="border-t-2 dark:border-gray-500 bg-gray-50 dark:bg-gray-900/40 font-semibold">
+              ${showStudy ? '<td class="px-2 py-2"></td>' : ''}
+              <td class="px-2 py-2" colspan="5">Total (${normalized.length} rows · ${totals.sites.size} sites)</td>
+              <td class="px-2 py-2 text-right">${fmt(totals.targetScheduled)}</td>
+              <td class="px-2 py-2 text-right">${fmt(totals.scheduled)}</td>
+              <td class="px-2 py-2 text-right">${fmt(totals.screened)}</td>
+              <td class="px-2 py-2 text-right">${fmt(totals.enrolled)}</td>
+              <td class="px-2 py-2 text-right">${rate(totals.scheduled, totals.targetScheduled)}</td>
+              <td class="px-2 py-2 text-right">${rate(totals.screened, totals.scheduled)}</td>
+              <td class="px-2 py-2 text-right">${rate(totals.enrolled, totals.screened)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>`;
+  }
+
+  function siteRollupTableHtml(rows) {
+    const sites = bySiteRollup(rows);
+    if (!sites.length) {
+      return `<div class="p-4 text-sm text-gray-500">No sites to roll up.</div>`;
+    }
+    return `
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
+            <tr>
+              <th class="px-2 py-2">Site</th>
+              <th class="px-2 py-2">Group(s)</th>
+              <th class="px-2 py-2">PI(s)</th>
+              <th class="px-2 py-2">Visit 1 range</th>
+              <th class="px-2 py-2">LPLV range</th>
+              <th class="px-2 py-2 text-right">Target</th>
+              <th class="px-2 py-2 text-right">Scheduled</th>
+              <th class="px-2 py-2 text-right">Screened</th>
+              <th class="px-2 py-2 text-right">Enrolled</th>
+              <th class="px-2 py-2 text-right">E/S</th>
+              <th class="px-2 py-2 text-right">% of study enroll</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${(() => {
+              const studyEnroll = sites.reduce((a, s) => a + s.enrolled, 0) || 1;
+              return sites
+                .map(
+                  (s) => `<tr class="border-t dark:border-gray-700">
+                  <td class="px-2 py-1.5 font-medium">${escapeHtml(s.siteName)}</td>
+                  <td class="px-2 py-1.5">${escapeHtml(s.groupList)}</td>
+                  <td class="px-2 py-1.5">${escapeHtml(s.piList || '—')}</td>
+                  <td class="px-2 py-1.5 text-xs whitespace-nowrap">${escapeHtml(
+                    [s.visit1StartMin, s.visit1StartMax].filter(Boolean).join(' → ') || '—'
+                  )}</td>
+                  <td class="px-2 py-1.5 text-xs whitespace-nowrap">${escapeHtml(
+                    [s.lplvMin, s.lplvMax].filter(Boolean).join(' → ') || '—'
+                  )}</td>
+                  <td class="px-2 py-1.5 text-right">${fmt(s.targetScheduled)}</td>
+                  <td class="px-2 py-1.5 text-right">${fmt(s.scheduled)}</td>
+                  <td class="px-2 py-1.5 text-right">${fmt(s.screened)}</td>
+                  <td class="px-2 py-1.5 text-right font-semibold">${fmt(s.enrolled)}</td>
+                  <td class="px-2 py-1.5 text-right">${rate(s.enrolled, s.screened)}</td>
+                  <td class="px-2 py-1.5 text-right">${rate(s.enrolled, studyEnroll)}</td>
+                </tr>`
+                )
+                .join('');
+            })()}
+          </tbody>
+        </table>
+      </div>`;
   }
 
   function getLegacyStudiesHTML() {
@@ -62,7 +314,7 @@
           <div>
             <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Legacy Studies</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              Site–study outcomes from Anterior Segment Overview. Not patient/subject data. Editable therapeutic area and metadata.
+              Site–study outcomes from Anterior Segment Overview. Open a study for full site / PI / Visit1 / LPLV breakdown.
             </p>
           </div>
           <div class="flex gap-2">
@@ -71,7 +323,8 @@
             <button id="legacy-studies-refresh" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Refresh</button>
           </div>
         </div>
-        <div id="legacy-studies-summary" class="grid grid-cols-2 md:grid-cols-4 gap-3"></div>
+        <div id="legacy-studies-summary" class="grid grid-cols-2 md:grid-cols-5 gap-3"></div>
+        <div id="legacy-load-status" class="text-xs text-gray-500"></div>
         <div id="legacy-studies-table-wrap" class="overflow-x-auto rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800"></div>
         <div id="legacy-study-detail" class="hidden"></div>
       </div>`;
@@ -84,10 +337,13 @@
           <div>
             <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Legacy Reporting</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              Standard suite over legacy site–study outcomes (funnel, by study, by site, by TA).
+              Funnel metrics with study → site breakdowns (Group, PI, Visit 1, LPLV).
             </p>
           </div>
           <div class="flex flex-wrap gap-2">
+            <select id="legacy-report-study" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm min-w-[12rem]">
+              <option value="">All studies (summary)</option>
+            </select>
             <select id="legacy-report-ta" class="px-3 py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-sm">
               <option value="">All therapeutic areas</option>
             </select>
@@ -95,7 +351,7 @@
             <button id="legacy-report-export" class="px-3 py-2 text-sm rounded-md border dark:border-gray-600">Export CSV</button>
           </div>
         </div>
-        <div id="legacy-report-kpis" class="grid grid-cols-2 md:grid-cols-5 gap-3"></div>
+        <div id="legacy-report-kpis" class="grid grid-cols-2 md:grid-cols-6 gap-3"></div>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
             <h3 class="font-semibold mb-2 text-gray-900 dark:text-white">Enrolled by study</h3>
@@ -114,19 +370,20 @@
     const m = studies.reduce(
       (a, s) => {
         const x = s.metrics || {};
-        a.enrolled += Number(x.enrolled) || 0;
-        a.screened += Number(x.screened) || 0;
-        a.scheduled += Number(x.scheduled) || 0;
-        a.sites += Number(x.nSites) || 0;
+        a.enrolled += num(x.enrolled);
+        a.screened += num(x.screened);
+        a.scheduled += num(x.scheduled);
+        a.target += num(x.targetScheduled);
         return a;
       },
-      { enrolled: 0, screened: 0, scheduled: 0, sites: 0 }
+      { enrolled: 0, screened: 0, scheduled: 0, target: 0 }
     );
     el.innerHTML = [
       ['Studies', studies.length],
-      ['Enrolled', fmt(m.enrolled)],
-      ['Screened', fmt(m.screened)],
+      ['Site outcome rows', state.outcomes.length],
       ['Scheduled', fmt(m.scheduled)],
+      ['Screened', fmt(m.screened)],
+      ['Enrolled', fmt(m.enrolled)],
     ]
       .map(
         ([label, val]) => `
@@ -141,7 +398,11 @@
   function renderStudiesTable(q = '') {
     const wrap = document.getElementById('legacy-studies-table-wrap');
     const summary = document.getElementById('legacy-studies-summary');
+    const status = document.getElementById('legacy-load-status');
     if (!wrap) return;
+    if (status) {
+      status.textContent = `Loaded ${state.studies.length} studies · ${state.outcomes.length} site–study rows from Cosmos`;
+    }
     const qq = q.trim().toLowerCase();
     const rows = state.studies
       .filter((s) => {
@@ -149,7 +410,7 @@
         const blob = `${s.name} ${s.title} ${s.therapeuticArea || ''} ${s.indication || ''}`.toLowerCase();
         return blob.includes(qq);
       })
-      .sort((a, b) => (Number(b.metrics?.enrolled) || 0) - (Number(a.metrics?.enrolled) || 0));
+      .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled));
 
     if (summary) summaryCards(summary, state.studies);
 
@@ -173,11 +434,12 @@
           ${rows
             .map((s) => {
               const m = s.metrics || {};
+              const siteCount = state.outcomes.filter((o) => o.studyId === s.id).length;
               return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
                 <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(s.name || s.title)}</td>
                 <td class="px-3 py-2">${escapeHtml(s.therapeuticArea || '—')}</td>
                 <td class="px-3 py-2">${escapeHtml(s.indication || '—')}</td>
-                <td class="px-3 py-2 text-right">${fmt(m.nSites)}</td>
+                <td class="px-3 py-2 text-right">${fmt(m.nSites ?? siteCount)}</td>
                 <td class="px-3 py-2 text-right">${fmt(m.scheduled)}</td>
                 <td class="px-3 py-2 text-right">${fmt(m.screened)}</td>
                 <td class="px-3 py-2 text-right font-semibold">${fmt(m.enrolled)}</td>
@@ -186,7 +448,7 @@
                   [m.visit1StartMin, m.visit1StartMax].filter(Boolean).join(' → ') || '—'
                 )}</td>
                 <td class="px-3 py-2 text-right">
-                  <button data-legacy-open="${s.id}" class="text-indigo-600 hover:underline">Open</button>
+                  <button data-legacy-open="${escapeHtml(s.id)}" class="text-indigo-600 hover:underline">Open sites</button>
                 </td>
               </tr>`;
             })
@@ -199,36 +461,35 @@
     });
   }
 
-  function escapeHtml(str) {
-    return String(str ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-
   async function openStudyDetail(studyId) {
     state.selectedStudyId = studyId;
     const study = state.studies.find((s) => s.id === studyId);
     const detail = document.getElementById('legacy-study-detail');
     const tableWrap = document.getElementById('legacy-studies-table-wrap');
+    const summary = document.getElementById('legacy-studies-summary');
     if (!detail || !study) return;
 
-    let outcomes = state.outcomes.filter((o) => o.studyId === studyId);
-    if (!outcomes.length) {
-      outcomes = await req(`/legacy-study-site-outcomes?studyId=${encodeURIComponent(studyId)}`).catch(() => []);
-    }
-
     if (tableWrap) tableWrap.classList.add('hidden');
+    if (summary) summary.classList.add('hidden');
     detail.classList.remove('hidden');
+    detail.innerHTML = `<div class="p-6 text-sm text-gray-500">Loading site outcomes for ${escapeHtml(study.name)}…</div>`;
+
+    const outcomes = await fetchOutcomesForStudy(studyId);
     const m = study.metrics || {};
+    const totals = sumOutcomes(outcomes);
+
     detail.innerHTML = `
       <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-4">
         <div class="flex items-start justify-between gap-3">
           <div>
             <button id="legacy-back-list" class="text-sm text-indigo-600 hover:underline mb-1">← All legacy studies</button>
             <h3 class="text-xl font-bold text-gray-900 dark:text-white">${escapeHtml(study.name)}</h3>
-            <p class="text-sm text-gray-500">LPLV ${escapeHtml(m.lplvMin || '—')} → ${escapeHtml(m.lplvMax || '—')}</p>
+            <p class="text-sm text-gray-500">
+              Visit 1 ${escapeHtml(m.visit1StartMin || totals.visitStarts.sort()[0] || '—')}
+              → ${escapeHtml(m.visit1StartMax || totals.visitStarts.sort().slice(-1)[0] || '—')}
+              · LPLV ${escapeHtml(m.lplvMin || '—')} → ${escapeHtml(m.lplvMax || '—')}
+              · ${outcomes.length} site row(s)
+            </p>
           </div>
           <button id="legacy-save-meta" class="px-3 py-2 text-sm rounded-md bg-indigo-600 text-white">Save metadata</button>
         </div>
@@ -259,46 +520,23 @@
             )}</textarea>
           </label>
         </div>
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-          <div><div class="text-gray-500">Scheduled</div><div class="font-semibold">${fmt(m.scheduled)}</div></div>
-          <div><div class="text-gray-500">Screened</div><div class="font-semibold">${fmt(m.screened)}</div></div>
-          <div><div class="text-gray-500">Enrolled</div><div class="font-semibold">${fmt(m.enrolled)}</div></div>
-          <div><div class="text-gray-500">Enroll / Screen</div><div class="font-semibold">${rate(m.enrolled, m.screened)}</div></div>
+        <div class="grid grid-cols-2 md:grid-cols-6 gap-3 text-sm">
+          <div><div class="text-gray-500">Target sched</div><div class="font-semibold">${fmt(totals.targetScheduled || m.targetScheduled)}</div></div>
+          <div><div class="text-gray-500">Scheduled</div><div class="font-semibold">${fmt(totals.scheduled || m.scheduled)}</div></div>
+          <div><div class="text-gray-500">Screened</div><div class="font-semibold">${fmt(totals.screened || m.screened)}</div></div>
+          <div><div class="text-gray-500">Enrolled</div><div class="font-semibold">${fmt(totals.enrolled || m.enrolled)}</div></div>
+          <div><div class="text-gray-500">Enroll / Screen</div><div class="font-semibold">${rate(totals.enrolled || m.enrolled, totals.screened || m.screened)}</div></div>
+          <div><div class="text-gray-500">Sites</div><div class="font-semibold">${totals.sites.size || m.nSites || '—'}</div></div>
         </div>
-        <div class="overflow-x-auto">
-          <table class="min-w-full text-sm">
-            <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
-              <tr>
-                <th class="px-2 py-2">Site</th>
-                <th class="px-2 py-2">Group</th>
-                <th class="px-2 py-2">PI</th>
-                <th class="px-2 py-2">Visit 1</th>
-                <th class="px-2 py-2">LPLV</th>
-                <th class="px-2 py-2 text-right">Target Sched</th>
-                <th class="px-2 py-2 text-right">Scheduled</th>
-                <th class="px-2 py-2 text-right">Screened</th>
-                <th class="px-2 py-2 text-right">Enrolled</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${outcomes
-                .sort((a, b) => (Number(b.enrolled) || 0) - (Number(a.enrolled) || 0))
-                .map(
-                  (o) => `<tr class="border-t dark:border-gray-700">
-                  <td class="px-2 py-1.5">${escapeHtml(o.siteName)}</td>
-                  <td class="px-2 py-1.5">${fmt(o.group)}</td>
-                  <td class="px-2 py-1.5">${escapeHtml(o.pi || '—')}</td>
-                  <td class="px-2 py-1.5">${escapeHtml(o.visit1Start || '—')}</td>
-                  <td class="px-2 py-1.5">${escapeHtml(o.lplv || '—')}</td>
-                  <td class="px-2 py-1.5 text-right">${fmt(o.targetScheduled)}</td>
-                  <td class="px-2 py-1.5 text-right">${fmt(o.scheduled)}</td>
-                  <td class="px-2 py-1.5 text-right">${fmt(o.screened)}</td>
-                  <td class="px-2 py-1.5 text-right font-medium">${fmt(o.enrolled)}</td>
-                </tr>`
-                )
-                .join('')}
-            </tbody>
-          </table>
+
+        <div>
+          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">By site (rolled up)</h4>
+          ${siteRollupTableHtml(outcomes)}
+        </div>
+
+        <div>
+          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Every site × group row</h4>
+          ${siteOutcomesTableHtml(outcomes)}
         </div>
       </div>`;
 
@@ -306,7 +544,9 @@
       detail.classList.add('hidden');
       detail.innerHTML = '';
       tableWrap?.classList.remove('hidden');
+      summary?.classList.remove('hidden');
       state.selectedStudyId = null;
+      renderStudiesTable(document.getElementById('legacy-study-search')?.value || '');
     });
 
     document.getElementById('legacy-save-meta')?.addEventListener('click', async () => {
@@ -351,33 +591,40 @@
     const kpis = document.getElementById('legacy-report-kpis');
     const tables = document.getElementById('legacy-report-tables');
     const taSel = document.getElementById('legacy-report-ta');
+    const studySel = document.getElementById('legacy-report-study');
     if (!kpis || !tables) return;
+
+    // populate study dropdown once
+    if (studySel && studySel.options.length <= 1) {
+      [...state.studies]
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+        .forEach((s) => {
+          const opt = document.createElement('option');
+          opt.value = s.id;
+          opt.textContent = s.name;
+          studySel.appendChild(opt);
+        });
+    }
 
     const tas = [...new Set(state.studies.map((s) => s.therapeuticArea || 'Unspecified'))].sort();
     if (taSel && taSel.options.length <= 1) {
       tas.forEach((ta) => {
+        if (ta === 'Unspecified') return;
         const opt = document.createElement('option');
-        opt.value = ta === 'Unspecified' ? '' : ta;
+        opt.value = ta;
         opt.textContent = ta;
-        if (ta !== 'Unspecified') taSel.appendChild(opt);
+        taSel.appendChild(opt);
       });
     }
 
     const taFilter = taSel?.value || '';
-    const studies = state.studies.filter((s) => !taFilter || s.therapeuticArea === taFilter);
+    const studyFilter = studySel?.value || '';
+    let studies = state.studies.filter((s) => !taFilter || s.therapeuticArea === taFilter);
+    if (studyFilter) studies = studies.filter((s) => s.id === studyFilter);
     const studyIds = new Set(studies.map((s) => s.id));
-    const outcomes = state.outcomes.filter((o) => studyIds.has(o.studyId));
+    const outcomes = state.outcomes.filter((o) => studyIds.has(o.studyId)).map(normOutcome);
 
-    const totals = outcomes.reduce(
-      (a, o) => {
-        a.targetScheduled += Number(o.targetScheduled) || 0;
-        a.scheduled += Number(o.scheduled) || 0;
-        a.screened += Number(o.screened) || 0;
-        a.enrolled += Number(o.enrolled) || 0;
-        return a;
-      },
-      { targetScheduled: 0, scheduled: 0, screened: 0, enrolled: 0 }
-    );
+    const totals = sumOutcomes(outcomes);
 
     kpis.innerHTML = [
       ['Studies', studies.length],
@@ -385,6 +632,7 @@
       ['Scheduled', fmt(totals.scheduled)],
       ['Screened', fmt(totals.screened)],
       ['Enrolled', fmt(totals.enrolled)],
+      ['E/S', rate(totals.enrolled, totals.screened)],
     ]
       .map(
         ([label, val]) => `
@@ -395,11 +643,10 @@
       )
       .join('');
 
-    // Charts
     destroyCharts();
     if (global.Chart) {
       const top = [...studies]
-        .sort((a, b) => (Number(b.metrics?.enrolled) || 0) - (Number(a.metrics?.enrolled) || 0))
+        .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled))
         .slice(0, 12);
       const ctx1 = document.getElementById('legacy-chart-studies');
       if (ctx1) {
@@ -407,7 +654,7 @@
           type: 'bar',
           data: {
             labels: top.map((s) => s.name),
-            datasets: [{ label: 'Enrolled', data: top.map((s) => Number(s.metrics?.enrolled) || 0), backgroundColor: '#4f46e5' }],
+            datasets: [{ label: 'Enrolled', data: top.map((s) => num(s.metrics?.enrolled)), backgroundColor: '#4f46e5' }],
           },
           options: { indexAxis: 'y', plugins: { legend: { display: false } }, responsive: true },
         });
@@ -431,69 +678,69 @@
       }
     }
 
-    // By site rollup
-    const bySite = {};
-    for (const o of outcomes) {
-      if (!bySite[o.siteName]) bySite[o.siteName] = { scheduled: 0, screened: 0, enrolled: 0, studies: new Set() };
-      bySite[o.siteName].scheduled += Number(o.scheduled) || 0;
-      bySite[o.siteName].screened += Number(o.screened) || 0;
-      bySite[o.siteName].enrolled += Number(o.enrolled) || 0;
-      bySite[o.siteName].studies.add(o.studyName);
-    }
-    const siteRows = Object.entries(bySite)
-      .map(([site, v]) => ({ site, ...v, nStudies: v.studies.size }))
-      .sort((a, b) => b.enrolled - a.enrolled)
-      .slice(0, 25);
+    // Study → site sections
+    const studyBlocks = studies
+      .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled))
+      .map((s) => {
+        const rows = outcomes.filter((o) => o.studyId === s.id);
+        const t = sumOutcomes(rows);
+        return `
+          <details class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800" ${studyFilter ? 'open' : ''}>
+            <summary class="cursor-pointer px-3 py-2 font-semibold flex flex-wrap gap-x-4 gap-y-1 items-center">
+              <span>${escapeHtml(s.name)}</span>
+              <span class="text-xs font-normal text-gray-500">${rows.length} rows · ${t.sites.size} sites · enrolled ${fmt(t.enrolled)} · E/S ${rate(t.enrolled, t.screened)}</span>
+            </summary>
+            <div class="px-3 pb-3 space-y-3 border-t dark:border-gray-700">
+              <div class="pt-2">
+                <div class="text-sm font-medium mb-1">By site</div>
+                ${siteRollupTableHtml(rows)}
+              </div>
+              <div>
+                <div class="text-sm font-medium mb-1">Site × group detail (Visit 1 / LPLV / PI)</div>
+                ${siteOutcomesTableHtml(rows)}
+              </div>
+            </div>
+          </details>`;
+      })
+      .join('');
 
     tables.innerHTML = `
       <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-x-auto">
-        <div class="px-3 py-2 font-semibold border-b dark:border-gray-700">Studies</div>
+        <div class="px-3 py-2 font-semibold border-b dark:border-gray-700">Study summary</div>
         <table class="min-w-full text-sm">
           <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
             <th class="px-3 py-2">Study</th><th class="px-3 py-2">TA</th>
+            <th class="px-3 py-2 text-right">Sites</th>
+            <th class="px-3 py-2 text-right">Target</th>
             <th class="px-3 py-2 text-right">Sched</th><th class="px-3 py-2 text-right">Screen</th>
             <th class="px-3 py-2 text-right">Enrolled</th><th class="px-3 py-2 text-right">E/S</th>
+            <th class="px-3 py-2">Visit1</th><th class="px-3 py-2">LPLV</th>
           </tr></thead>
           <tbody>
             ${studies
-              .sort((a, b) => (Number(b.metrics?.enrolled) || 0) - (Number(a.metrics?.enrolled) || 0))
               .map((s) => {
                 const m = s.metrics || {};
+                const rows = outcomes.filter((o) => o.studyId === s.id);
                 return `<tr class="border-t dark:border-gray-700">
-                  <td class="px-3 py-1.5">${escapeHtml(s.name)}</td>
+                  <td class="px-3 py-1.5 font-medium">${escapeHtml(s.name)}</td>
                   <td class="px-3 py-1.5">${escapeHtml(s.therapeuticArea || '—')}</td>
+                  <td class="px-3 py-1.5 text-right">${fmt(m.nSites ?? bySiteRollup(rows).length)}</td>
+                  <td class="px-3 py-1.5 text-right">${fmt(m.targetScheduled)}</td>
                   <td class="px-3 py-1.5 text-right">${fmt(m.scheduled)}</td>
                   <td class="px-3 py-1.5 text-right">${fmt(m.screened)}</td>
                   <td class="px-3 py-1.5 text-right">${fmt(m.enrolled)}</td>
                   <td class="px-3 py-1.5 text-right">${rate(m.enrolled, m.screened)}</td>
+                  <td class="px-3 py-1.5 text-xs">${escapeHtml([m.visit1StartMin, m.visit1StartMax].filter(Boolean).join(' → ') || '—')}</td>
+                  <td class="px-3 py-1.5 text-xs">${escapeHtml([m.lplvMin, m.lplvMax].filter(Boolean).join(' → ') || '—')}</td>
                 </tr>`;
               })
               .join('')}
           </tbody>
         </table>
       </div>
-      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-x-auto">
-        <div class="px-3 py-2 font-semibold border-b dark:border-gray-700">Top sites (by enrolled)</div>
-        <table class="min-w-full text-sm">
-          <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
-            <th class="px-3 py-2">Site</th><th class="px-3 py-2 text-right">Studies</th>
-            <th class="px-3 py-2 text-right">Sched</th><th class="px-3 py-2 text-right">Screen</th>
-            <th class="px-3 py-2 text-right">Enrolled</th>
-          </tr></thead>
-          <tbody>
-            ${siteRows
-              .map(
-                (r) => `<tr class="border-t dark:border-gray-700">
-              <td class="px-3 py-1.5">${escapeHtml(r.site)}</td>
-              <td class="px-3 py-1.5 text-right">${r.nStudies}</td>
-              <td class="px-3 py-1.5 text-right">${fmt(r.scheduled)}</td>
-              <td class="px-3 py-1.5 text-right">${fmt(r.screened)}</td>
-              <td class="px-3 py-1.5 text-right">${fmt(r.enrolled)}</td>
-            </tr>`
-              )
-              .join('')}
-          </tbody>
-        </table>
+      <div class="space-y-2">
+        <h3 class="font-semibold text-gray-900 dark:text-white">Breakdown by study → site</h3>
+        ${studyBlocks || '<p class="text-sm text-gray-500">No studies in filter.</p>'}
       </div>`;
   }
 
@@ -511,7 +758,8 @@
       'enrolled',
     ];
     const lines = [headers.join(',')];
-    for (const o of state.outcomes) {
+    for (const raw of state.outcomes) {
+      const o = normOutcome(raw);
       lines.push(
         headers
           .map((h) => {
@@ -536,6 +784,7 @@
       renderStudiesTable(e.target.value);
     });
     document.getElementById('legacy-studies-refresh')?.addEventListener('click', async () => {
+      state.loaded = false;
       await ensureLoaded(true);
       renderStudiesTable(document.getElementById('legacy-study-search')?.value || '');
     });
@@ -543,16 +792,24 @@
 
   async function mountReporting() {
     await ensureLoaded();
+    // reset selects so they repopulate
+    const studySel = document.getElementById('legacy-report-study');
+    const taSel = document.getElementById('legacy-report-ta');
+    if (studySel) studySel.innerHTML = '<option value="">All studies (summary)</option>';
+    if (taSel) taSel.innerHTML = '<option value="">All therapeutic areas</option>';
     renderReporting();
-    document.getElementById('legacy-report-ta')?.addEventListener('change', renderReporting);
+    studySel?.addEventListener('change', renderReporting);
+    taSel?.addEventListener('change', renderReporting);
     document.getElementById('legacy-report-refresh')?.addEventListener('click', async () => {
+      state.loaded = false;
       await ensureLoaded(true);
+      if (studySel) studySel.innerHTML = '<option value="">All studies (summary)</option>';
+      if (taSel) taSel.innerHTML = '<option value="">All therapeutic areas</option>';
       renderReporting();
     });
     document.getElementById('legacy-report-export')?.addEventListener('click', exportCsv);
   }
 
-  // Patch apiService when available
   function attachApiMethods() {
     if (!global.apiService) return;
     global.apiService.getLegacyStudies = () => global.apiService.request('/legacy-studies');
