@@ -4934,6 +4934,256 @@
                 }
                 return rolesArray;
             };
+
+            const normalizeRoleNameKey = (name) => (name || '').trim().toLowerCase();
+
+            /** Dedupe roles by name (case-insensitive) for display / pickers. Keeps first occurrence. */
+            const getUniqueRoles = (rolesArray = state.roles || []) => {
+                const seenNames = new Set();
+                const seenIds = new Set();
+                return (rolesArray || []).filter(role => {
+                    const name = (role?.name || '').trim();
+                    if (!name) return false;
+                    const key = normalizeRoleNameKey(name);
+                    if (seenNames.has(key)) return false;
+                    if (role.id && seenIds.has(role.id)) return false;
+                    seenNames.add(key);
+                    if (role.id) seenIds.add(role.id);
+                    return true;
+                });
+            };
+
+            const mergeRoleTrainingNames = (roleGroup) => {
+                const names = new Set();
+                (roleGroup || []).forEach(role => {
+                    (role.trainingNames || []).forEach(n => {
+                        const trimmed = (n || '').trim();
+                        if (trimmed) names.add(trimmed);
+                    });
+                });
+                return Array.from(names);
+            };
+
+            const pickCanonicalRole = (roleGroup) => {
+                return [...(roleGroup || [])].sort((a, b) => {
+                    const aTrain = (a.trainingNames || []).length;
+                    const bTrain = (b.trainingNames || []).length;
+                    if (bTrain !== aTrain) return bTrain - aTrain;
+                    const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+                    const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+                    if (aTime && bTime && aTime !== bTime) return aTime - bTime;
+                    return String(a.id || '').localeCompare(String(b.id || ''));
+                })[0];
+            };
+
+            const remapRoleIdList = (list, remap) => {
+                if (!Array.isArray(list)) return list;
+                const out = [];
+                const seen = new Set();
+                list.forEach(id => {
+                    const mapped = remap.get(id) || id;
+                    if (!mapped || seen.has(mapped)) return;
+                    seen.add(mapped);
+                    out.push(mapped);
+                });
+                return out;
+            };
+
+            const remapRoleKeyedObject = (obj, remap, mergeNumeric = false) => {
+                if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+                const out = {};
+                Object.entries(obj).forEach(([roleId, value]) => {
+                    const mapped = remap.get(roleId) || roleId;
+                    if (mergeNumeric && (typeof value === 'number' || (typeof value === 'string' && value !== '' && !Number.isNaN(Number(value))))) {
+                        const n = Number(value) || 0;
+                        out[mapped] = Math.max(Number(out[mapped]) || 0, n);
+                    } else if (out[mapped] === undefined) {
+                        out[mapped] = value;
+                    }
+                });
+                return out;
+            };
+
+            const remapVisitRoleRequirements = (vrr, remap) => {
+                if (!vrr || typeof vrr !== 'object') return vrr;
+                const out = {};
+                Object.entries(vrr).forEach(([visitKey, roleMap]) => {
+                    out[visitKey] = remapRoleKeyedObject(roleMap, remap, true);
+                });
+                return out;
+            };
+
+            const remapSiteRoleRequirements = (srr, remap) => {
+                if (!srr || typeof srr !== 'object') return srr;
+                const out = {};
+                Object.entries(srr).forEach(([siteId, roleMap]) => {
+                    out[siteId] = remapRoleKeyedObject(roleMap, remap, true);
+                });
+                return out;
+            };
+
+            const remapRoleAssignmentsObject = (roleAssignments, remap) => {
+                if (!roleAssignments || typeof roleAssignments !== 'object') return roleAssignments;
+                const out = {};
+                Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
+                    const mapped = remap.get(roleId) || roleId;
+                    if (!Array.isArray(assignments)) {
+                        if (out[mapped] === undefined) out[mapped] = assignments;
+                        return;
+                    }
+                    if (!Array.isArray(out[mapped])) {
+                        out[mapped] = [...assignments];
+                        return;
+                    }
+                    const maxLen = Math.max(out[mapped].length, assignments.length);
+                    const merged = [];
+                    for (let i = 0; i < maxLen; i++) {
+                        const a = out[mapped][i];
+                        const b = assignments[i];
+                        const isReal = (x) => x && x !== 'UNASSIGNED' && x !== 'SITE_STAFF';
+                        merged[i] = isReal(a) ? a : (isReal(b) ? b : (a || b || 'UNASSIGNED'));
+                    }
+                    out[mapped] = merged;
+                });
+                return out;
+            };
+
+            let roleMergePersistAttempted = false;
+            /**
+             * Collapse duplicate role records (same name, different ids) into one canonical role.
+             * Remaps study/event role references and optionally deletes extras via API (once per session).
+             */
+            const mergeDuplicateRolesInData = async (rolesInput, studiesInput, eventsInput, { persist = true } = {}) => {
+                const rolesList = Array.isArray(rolesInput) ? rolesInput : [];
+                const studiesList = Array.isArray(studiesInput) ? studiesInput : [];
+                const eventsList = Array.isArray(eventsInput) ? eventsInput : [];
+
+                const byName = new Map();
+                rolesList.forEach(role => {
+                    const key = normalizeRoleNameKey(role?.name);
+                    if (!key || !role?.id) return;
+                    if (!byName.has(key)) byName.set(key, []);
+                    byName.get(key).push(role);
+                });
+
+                const remap = new Map();
+                const keepers = [];
+                const toDelete = [];
+                const keepersNeedingTrainingsUpdate = [];
+
+                byName.forEach(group => {
+                    if (group.length === 1) {
+                        keepers.push(group[0]);
+                        return;
+                    }
+                    const keep = pickCanonicalRole(group);
+                    const mergedTrainings = mergeRoleTrainingNames(group);
+                    const keepUpdated = {
+                        ...keep,
+                        name: (keep.name || '').trim(),
+                        trainingNames: mergedTrainings
+                    };
+                    keepers.push(keepUpdated);
+                    const prevTrain = JSON.stringify([...(keep.trainingNames || [])].map(t => String(t).trim()).filter(Boolean).sort());
+                    const nextTrain = JSON.stringify([...mergedTrainings].sort());
+                    if (prevTrain !== nextTrain) {
+                        keepersNeedingTrainingsUpdate.push(keepUpdated);
+                    }
+                    group.forEach(role => {
+                        if (role.id !== keep.id) {
+                            remap.set(role.id, keep.id);
+                            toDelete.push(role);
+                        }
+                    });
+                });
+
+                // Preserve any nameless / id-less entries
+                rolesList.forEach(role => {
+                    if (!role?.id || !normalizeRoleNameKey(role?.name)) {
+                        if (!keepers.includes(role) && !toDelete.includes(role)) keepers.push(role);
+                    }
+                });
+
+                if (remap.size === 0) {
+                    return { roles: keepers.length ? keepers : rolesList, studies: studiesList, events: eventsList, merged: false };
+                }
+
+                const remappedStudies = studiesList.map(study => {
+                    if (!study) return study;
+                    let changed = false;
+                    const next = { ...study };
+                    if (Array.isArray(study.requiredRoles)) {
+                        const remapped = remapRoleIdList(study.requiredRoles, remap);
+                        if (JSON.stringify(remapped) !== JSON.stringify(study.requiredRoles)) {
+                            next.requiredRoles = remapped;
+                            changed = true;
+                        }
+                    }
+                    if (study.visitRoleRequirements) {
+                        const remapped = remapVisitRoleRequirements(study.visitRoleRequirements, remap);
+                        if (JSON.stringify(remapped) !== JSON.stringify(study.visitRoleRequirements)) {
+                            next.visitRoleRequirements = remapped;
+                            changed = true;
+                        }
+                    }
+                    if (study.siteRoleRequirements) {
+                        const remapped = remapSiteRoleRequirements(study.siteRoleRequirements, remap);
+                        if (JSON.stringify(remapped) !== JSON.stringify(study.siteRoleRequirements)) {
+                            next.siteRoleRequirements = remapped;
+                            changed = true;
+                        }
+                    }
+                    return changed ? next : study;
+                });
+
+                const remappedEvents = eventsList.map(event => {
+                    if (!event?.roleAssignments || typeof event.roleAssignments !== 'object') return event;
+                    const keys = Object.keys(event.roleAssignments);
+                    if (!keys.some(k => remap.has(k))) return event;
+                    return {
+                        ...event,
+                        roleAssignments: remapRoleAssignmentsObject(event.roleAssignments, remap)
+                    };
+                });
+
+                if (persist && !roleMergePersistAttempted) {
+                    roleMergePersistAttempted = true;
+                    try {
+                        for (const role of keepersNeedingTrainingsUpdate) {
+                            await apiService.updateRole(role.id, {
+                                name: role.name,
+                                trainingNames: role.trainingNames || []
+                            });
+                        }
+                        for (const study of remappedStudies) {
+                            const original = studiesList.find(s => s && s.id === study.id);
+                            if (!original || study === original) continue;
+                            await apiService.updateStudy(study.id, {
+                                requiredRoles: study.requiredRoles,
+                                visitRoleRequirements: study.visitRoleRequirements,
+                                siteRoleRequirements: study.siteRoleRequirements
+                            });
+                        }
+                        for (const event of remappedEvents) {
+                            const original = eventsList.find(e => e && e.id === event.id);
+                            if (!original || event === original || !event.id) continue;
+                            await apiService.updateEvent(event.id, { roleAssignments: event.roleAssignments });
+                        }
+                        for (const role of toDelete) {
+                            try {
+                                await apiService.deleteRole(role.id);
+                            } catch (delErr) {
+                                console.warn('CHAOS: Failed to delete duplicate role', role.id, role.name, delErr);
+                            }
+                        }
+                        console.log(`CHAOS: Merged ${toDelete.length} duplicate role(s) into canonical roles.`);
+                    } catch (mergeErr) {
+                        console.error('CHAOS: Role merge persistence failed (UI still deduped):', mergeErr);
+                    }
+                }
+
+                return { roles: keepers, studies: remappedStudies, events: remappedEvents, merged: true };
+            };
             
             const incrementSequentialLabel = (value, defaultPrefix = '') => {
                 if (!value || typeof value !== 'string') {
@@ -5693,12 +5943,17 @@
                 return assignments.some(entry => normalizeCrcId(entry) === crcId);
             };
 
+            const findUserByCrcId = (crcId) => (state.users || []).find(u => u && u.crcId === crcId);
+
             const isCrcSchedulable = (crc) => {
                 if (!crc || !crc.id) return false;
                 if (crc.archived === true) return false;
                 if (crc.active === false) return false;
                 const status = String(crc.status || '').trim().toLowerCase();
-                if (status === 'inactive' || status === 'archived') return false;
+                if (status === 'inactive' || status === 'archived' || status === 'deactivated') return false;
+                // Linked login deactivated → treat staff as not selectable for new assignments
+                const linkedUser = findUserByCrcId(crc.id);
+                if (linkedUser && linkedUser.active === false) return false;
                 return true;
             };
             const getSchedulableCrcs = (list) => (list || state.crcs || []).filter(isCrcSchedulable);
@@ -5712,8 +5967,6 @@
 
             /** CRC dashboard: show cancelled visits greyed out (still excluded from utilization via isCancelledShift). */
             const getCrcDashboardEvents = () => (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
-
-            const findUserByCrcId = (crcId) => (state.users || []).find(u => u && u.crcId === crcId);
 
             const staffWithoutLogin = () => (state.crcs || []).filter(c => c?.id && !findUserByCrcId(c.id));
 
@@ -5735,17 +5988,47 @@
 
             const syncLinkedUserFromStaff = async (crc, overrides = {}) => {
                 if (!crc?.id) return null;
-                const user = findUserByCrcId(crc.id);
+                const user = findUserByCrcId(crc.id) || (crc.userId ? (state.users || []).find(u => u && u.id === crc.userId) : null);
                 if (!user) return null;
+                const username = String(
+                    overrides.username || user.username || crc.username || crc.userEmail || crc.email || crc.oraEmail || user.email || ''
+                ).trim();
+                if (!username) {
+                    console.warn('syncLinkedUserFromStaff: skipping update — no username available for', crc.id);
+                    return null;
+                }
+                // Staff-profile sync must never rewrite login role (that demoted Managers to CRC).
+                const { permissionLevel: _ignorePerm, ...safeOverrides } = overrides || {};
                 const userUpdate = {
-                    email: crc.email || crc.oraEmail || user.email,
+                    username,
+                    email: String(crc.email || crc.oraEmail || crc.userEmail || user.email || username),
                     active: crc.active !== false,
                     crcId: crc.id,
-                    ...overrides
+                    ...safeOverrides,
+                    username: String(safeOverrides.username || username).trim()
                 };
                 const saved = await apiService.updateUser(user.id, userUpdate);
-                setState({ users: state.users.map(u => u.id === user.id ? saved : u) }, { skipRender: true });
-                return saved;
+                const mergedSaved = { ...user, ...saved, username: saved.username || username };
+                setState({ users: state.users.map(u => u.id === user.id ? mergedSaved : u) }, { skipRender: true });
+                // Keep the signed-in session in sync if this was the current user (without role demotion from this path)
+                if (state.currentUser && state.currentUser.id === user.id) {
+                    setState({
+                        currentUser: {
+                            ...state.currentUser,
+                            ...mergedSaved,
+                            permissionLevel: state.currentUser.permissionLevel || mergedSaved.permissionLevel
+                        }
+                    }, { skipRender: true });
+                    try {
+                        const sessionData = localStorage.getItem('ora_smo_session');
+                        if (sessionData) {
+                            const session = JSON.parse(sessionData);
+                            session.user = { ...session.user, ...state.currentUser };
+                            localStorage.setItem('ora_smo_session', JSON.stringify(session));
+                        }
+                    } catch (_) { /* ignore */ }
+                }
+                return mergedSaved;
             };
 
             const STAFF_DEPARTMENT_OPTIONS = `
@@ -26537,6 +26820,18 @@
                 const thirtyDaysFromNow = new Date();
                 thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
                 const today = new Date();
+                // Account fields live on the linked user — not the CRC staff record
+                const linkedLoginUser = findUserByCrcId(crc.id) || (crc.userId ? (state.users || []).find(u => u && u.id === crc.userId) : null);
+                const linkedUserEmail = (linkedLoginUser?.email || crc.userEmail || crc.email || crc.oraEmail || '').trim();
+                const linkedUsername = String(linkedLoginUser?.username || crc.username || linkedUserEmail || '').trim();
+                const linkedPermissionLevel = linkedLoginUser?.permissionLevel || crc.permissionLevel || 'CRC';
+                const linkedPermissionSetId = linkedLoginUser?.permissionSetId || crc.permissionSetId || '';
+                const linkedTabs = linkedLoginUser?.tabs || crc.tabs || [];
+                const linkedStudiesAccess = linkedLoginUser?.studiesAccess || crc.studiesAccess || 'all';
+                const linkedStudies = linkedLoginUser?.studies || crc.studies || [];
+                const linkedSitesAccess = linkedLoginUser?.sitesAccess || crc.sitesAccess || 'all';
+                const linkedSites = linkedLoginUser?.sites || crc.sites || [];
+                const canEditLoginSection = !!(state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'));
 
                 const weeklyHours = calculateWeeklyUtilization(new Date())[crc.id]?.totalHours || 0;
                 const summaryRange = state.timeOffSummaryRange || 'month';
@@ -27144,18 +27439,18 @@
                             <label class="block text-sm font-medium dark:text-gray-300">Phone Number (for contact when traveling)</label>
                             <input type="tel" name="phoneNumber" value="${crc.phoneNumber || ''}" placeholder="(555) 123-4567" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                         </div>
-                        ${state.currentUser && state.currentUser.permissionLevel === 'Manager' ? `
+                        ${canEditLoginSection ? `
                         <div class="border-t dark:border-gray-700 pt-4 mt-4">
                             <h3 class="text-lg font-semibold dark:text-white mb-4">User Account & Permissions</h3>
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300">Email</label>
-                                    <input type="email" name="userEmail" id="crc-user-email" value="${crc.userEmail || crc.email || ''}" placeholder="email@example.com" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                    <input type="email" name="userEmail" id="crc-user-email" value="${linkedUserEmail.replace(/"/g, '&quot;')}" placeholder="email@example.com" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Email address (will be used as username)</p>
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium dark:text-gray-300">Username</label>
-                                    <input type="text" name="username" id="crc-username" value="${crc.username || ''}" placeholder="Auto-filled from email" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                    <input type="text" name="username" id="crc-username" value="${linkedUsername.replace(/"/g, '&quot;')}" placeholder="Auto-filled from email" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Username for system login (auto-filled from email)</p>
                                 </div>
                             </div>
@@ -27168,18 +27463,18 @@
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Permission Set</label>
                                 <select name="permissionSetId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                     <option value="">None</option>
-                                    ${(state.permissionSets || []).map(ps => `<option value="${ps.id}" ${crc.permissionSetId === ps.id ? 'selected' : ''}>${ps.name}</option>`).join('')}
+                                    ${(state.permissionSets || []).map(ps => `<option value="${ps.id}" ${linkedPermissionSetId === ps.id ? 'selected' : ''}>${ps.name}</option>`).join('')}
                                 </select>
                                 <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Select a permission set to apply default permissions</p>
                             </div>
                             <div class="mb-4">
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Permission Level</label>
                                 <select name="permissionLevel" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                                    <option value="CRC" ${crc.permissionLevel === 'CRC' ? 'selected' : ''}>CRC</option>
-                                    <option value="Supervisor" ${crc.permissionLevel === 'Supervisor' ? 'selected' : ''}>Supervisor</option>
-                                    <option value="Manager" ${crc.permissionLevel === 'Manager' ? 'selected' : ''}>Manager</option>
+                                    <option value="CRC" ${linkedPermissionLevel === 'CRC' ? 'selected' : ''}>CRC</option>
+                                    <option value="Supervisor" ${linkedPermissionLevel === 'Supervisor' ? 'selected' : ''}>Supervisor</option>
+                                    <option value="Manager" ${linkedPermissionLevel === 'Manager' ? 'selected' : ''}>Manager</option>
                                 </select>
-                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Override permission level (overrides permission set)</p>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Override permission level (overrides permission set). Saving staff info will not demote an existing Manager.</p>
                             </div>
                             <div class="mb-4">
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Tabs Access</label>
@@ -27200,7 +27495,7 @@
                                         { id: 'sites', label: 'Sites' },
                                         { id: 'studies', label: 'Studies' }
                                     ].map(tab => {
-                                        const isChecked = (crc.tabs || []).includes(tab.id);
+                                        const isChecked = linkedTabs.includes(tab.id);
                                         return `
                                             <label class="flex items-center space-x-2 py-1 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-600 rounded px-2">
                                                 <input type="checkbox" name="tabs" value="${tab.id}" ${isChecked ? 'checked' : ''} class="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500">
@@ -27214,12 +27509,12 @@
                             <div class="mb-4">
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Studies Access</label>
                                 <select name="studiesAccess" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white mb-2">
-                                    <option value="all" ${(crc.studiesAccess || 'all') === 'all' ? 'selected' : ''}>All Studies</option>
-                                    <option value="selected" ${crc.studiesAccess === 'selected' ? 'selected' : ''}>Selected Studies Only</option>
+                                    <option value="all" ${linkedStudiesAccess === 'all' ? 'selected' : ''}>All Studies</option>
+                                    <option value="selected" ${linkedStudiesAccess === 'selected' ? 'selected' : ''}>Selected Studies Only</option>
                                 </select>
-                                <div id="crc-studies-selection" class="border dark:border-gray-600 rounded bg-white dark:bg-gray-700 p-3 max-h-48 overflow-y-auto" style="${(crc.studiesAccess || 'all') === 'all' ? 'display: none;' : ''}">
+                                <div id="crc-studies-selection" class="border dark:border-gray-600 rounded bg-white dark:bg-gray-700 p-3 max-h-48 overflow-y-auto" style="${linkedStudiesAccess === 'all' ? 'display: none;' : ''}">
                                     ${(state.studies || []).map(study => {
-                                        const isChecked = (crc.studies || []).includes(study.id);
+                                        const isChecked = linkedStudies.includes(study.id);
                                         return `
                                             <label class="flex items-center space-x-2 py-1 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-600 rounded px-2">
                                                 <input type="checkbox" name="studies" value="${study.id}" ${isChecked ? 'checked' : ''} class="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500">
@@ -27233,12 +27528,12 @@
                             <div class="mb-4">
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-2">Sites Access</label>
                                 <select name="sitesAccess" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white mb-2">
-                                    <option value="all" ${(crc.sitesAccess || 'all') === 'all' ? 'selected' : ''}>All Sites</option>
-                                    <option value="selected" ${crc.sitesAccess === 'selected' ? 'selected' : ''}>Selected Sites Only</option>
+                                    <option value="all" ${linkedSitesAccess === 'all' ? 'selected' : ''}>All Sites</option>
+                                    <option value="selected" ${linkedSitesAccess === 'selected' ? 'selected' : ''}>Selected Sites Only</option>
                                 </select>
-                                <div id="crc-sites-selection" class="border dark:border-gray-600 rounded bg-white dark:bg-gray-700 p-3 max-h-48 overflow-y-auto" style="${(crc.sitesAccess || 'all') === 'all' ? 'display: none;' : ''}">
+                                <div id="crc-sites-selection" class="border dark:border-gray-600 rounded bg-white dark:bg-gray-700 p-3 max-h-48 overflow-y-auto" style="${linkedSitesAccess === 'all' ? 'display: none;' : ''}">
                                     ${(state.crc_sites || []).map(site => {
-                                        const isChecked = (crc.sites || []).includes(site.id);
+                                        const isChecked = linkedSites.includes(site.id);
                                         return `
                                             <label class="flex items-center space-x-2 py-1 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-600 rounded px-2">
                                                 <input type="checkbox" name="sites" value="${site.id}" ${isChecked ? 'checked' : ''} class="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500">
@@ -39677,95 +39972,117 @@
                             
                             // Handle user account and permissions if Manager
                             if (state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager')) {
-                                // Email and username
+                                const username = String(data.username || data.userEmail || '').trim();
                                 if (data.userEmail) {
-                                    updateData.userEmail = data.userEmail;
-                                    updateData.email = data.userEmail; // Also store in email field for compatibility
+                                    updateData.userEmail = String(data.userEmail).trim();
+                                    updateData.email = updateData.userEmail;
                                 }
-                                
-                                // Use email as username if username is not explicitly set
-                                const username = data.username || data.userEmail || '';
                                 if (username) {
                                     updateData.username = username;
                                 }
-                                
-                                // Permission set
-                                if (data.permissionSetId !== undefined) {
-                                    updateData.permissionSetId = data.permissionSetId || null;
-                                }
-                                
-                                // Permission overrides
+
                                 const tabs = Array.from(form.querySelectorAll('input[name="tabs"]:checked')).map(cb => cb.value);
                                 const studies = Array.from(form.querySelectorAll('input[name="studies"]:checked')).map(cb => cb.value);
                                 const sites = Array.from(form.querySelectorAll('input[name="sites"]:checked')).map(cb => cb.value);
-                                
-                                if (data.permissionLevel) {
-                                    updateData.permissionLevel = data.permissionLevel;
+                                const permRank = (level) => ({ Manager: 3, Supervisor: 2, CRC: 1 }[level] || 0);
+
+                                // Do NOT copy permissionLevel onto the CRC staff document from this form —
+                                // that field belongs on the user login record only.
+                                if (data.permissionSetId !== undefined) {
+                                    updateData.permissionSetId = data.permissionSetId || null;
                                 }
-                                if (data.studiesAccess) {
-                                    updateData.studiesAccess = data.studiesAccess;
-                                    updateData.studies = data.studiesAccess === 'selected' ? studies : [];
-                                }
-                                if (data.sitesAccess) {
-                                    updateData.sitesAccess = data.sitesAccess;
-                                    updateData.sites = data.sitesAccess === 'selected' ? sites : [];
-                                }
-                                if (tabs.length > 0) {
-                                    updateData.tabs = tabs;
-                                }
-                                
-                                // Create or update user account if username or email is provided
+
                                 if (username) {
                                     try {
-                                        // Check if CRC already has a linked user
-                                        let userToUpdate = null;
-                                        if (crc.userId) {
-                                            userToUpdate = state.users.find(u => u.id === crc.userId);
+                                        let userToUpdate =
+                                            findUserByCrcId(crcId) ||
+                                            (crc.userId ? state.users.find(u => u.id === crc.userId) : null);
+
+                                        if (!userToUpdate && username) {
+                                            const unameLower = username.toLowerCase();
+                                            userToUpdate = state.users.find(u =>
+                                                (u.username && String(u.username).toLowerCase() === unameLower) ||
+                                                (u.email && String(u.email).toLowerCase() === unameLower)
+                                            );
                                         }
-                                        
-                                        // If no linked user, check if username already exists
-                                        if (!userToUpdate) {
-                                            userToUpdate = state.users.find(u => u.username === data.username);
+
+                                        // Never attach this staff save to a different person's Manager login
+                                        // unless that login is already linked to this CRC.
+                                        if (userToUpdate && userToUpdate.crcId && userToUpdate.crcId !== crcId) {
+                                            console.warn('edit-crc-form: refusing to overwrite unrelated linked user', userToUpdate.id);
+                                            userToUpdate = null;
                                         }
-                                        
+
                                         if (userToUpdate) {
-                                            // Update existing user
+                                            const existingPerm = userToUpdate.permissionLevel || 'CRC';
+                                            const formPerm = data.permissionLevel || existingPerm;
+                                            // Never demote Manager/Supervisor → CRC just because the staff form defaulted wrong.
+                                            // Allow upgrades, and allow same-level keep. Demotion only if explicitly Manager→Supervisor etc. from a real change —
+                                            // block any demotion of the signed-in user, and block Manager→CRC always from this form.
+                                            let nextPerm = formPerm;
+                                            if (permRank(formPerm) < permRank(existingPerm)) {
+                                                nextPerm = existingPerm;
+                                            }
+                                            if (state.currentUser && userToUpdate.id === state.currentUser.id && permRank(formPerm) < permRank(existingPerm)) {
+                                                nextPerm = existingPerm;
+                                            }
+                                            if (existingPerm === 'Manager' && formPerm === 'CRC') {
+                                                nextPerm = 'Manager';
+                                            }
+
                                             const userUpdateData = {
-                                                username: username, // Update username (from email or explicit username)
-                                                email: data.userEmail || userToUpdate.email || username, // Update email
-                                                permissionLevel: data.permissionLevel || userToUpdate.permissionLevel || 'CRC',
+                                                username: username,
+                                                email: String(data.userEmail || userToUpdate.email || username).trim(),
+                                                permissionLevel: nextPerm,
                                                 permissionSetId: data.permissionSetId !== undefined ? (data.permissionSetId || null) : userToUpdate.permissionSetId,
                                                 tabs: tabs.length > 0 ? tabs : (userToUpdate.tabs || undefined),
                                                 studiesAccess: data.studiesAccess || userToUpdate.studiesAccess || 'all',
                                                 studies: data.studiesAccess === 'selected' ? studies : (userToUpdate.studies || undefined),
                                                 sitesAccess: data.sitesAccess || userToUpdate.sitesAccess || 'all',
-                                                sites: data.sitesAccess === 'selected' ? sites : (userToUpdate.sites || undefined)
+                                                sites: data.sitesAccess === 'selected' ? sites : (userToUpdate.sites || undefined),
+                                                crcId
                                             };
                                             if (data.password) {
                                                 userUpdateData.password = data.password;
                                             }
-                                            await apiService.updateUser(userToUpdate.id, { ...userUpdateData, crcId });
+                                            const savedUser = await apiService.updateUser(userToUpdate.id, userUpdateData);
                                             updateData.userId = userToUpdate.id;
-                                            await syncLinkedCrcFromUser({ ...userToUpdate, ...userUpdateData, crcId }, { name: crc.name });
+                                            // Refresh staff contact fields only — do not push permission onto CRC via sync that could bounce back
+                                            await syncLinkedCrcFromUser({ ...userToUpdate, ...savedUser, crcId }, {
+                                                name: crc.name,
+                                                email: userUpdateData.email
+                                            });
                                             const users = await apiService.getUsers();
                                             setState({ users }, { skipRender: true });
+                                            if (state.currentUser && state.currentUser.id === userToUpdate.id) {
+                                                const refreshed = users.find(u => u.id === userToUpdate.id) || { ...userToUpdate, ...savedUser };
+                                                setState({ currentUser: { ...state.currentUser, ...refreshed, permissionLevel: refreshed.permissionLevel || nextPerm } }, { skipRender: true });
+                                                try {
+                                                    const sessionData = localStorage.getItem('ora_smo_session');
+                                                    if (sessionData) {
+                                                        const session = JSON.parse(sessionData);
+                                                        session.user = { ...session.user, ...state.currentUser };
+                                                        localStorage.setItem('ora_smo_session', JSON.stringify(session));
+                                                    }
+                                                } catch (_) { /* ignore */ }
+                                            }
                                         } else {
-                                            // Create new user
                                             const newUserData = {
                                                 username: username,
-                                                email: data.userEmail || username, // Use email if provided, otherwise use username
-                                                password: data.password || 'temp123', // Default password if not provided
+                                                email: String(data.userEmail || username).trim(),
+                                                password: data.password || 'temp123',
                                                 permissionLevel: data.permissionLevel || 'CRC',
                                                 permissionSetId: data.permissionSetId || null,
                                                 tabs: tabs.length > 0 ? tabs : undefined,
                                                 studiesAccess: data.studiesAccess || 'all',
                                                 studies: data.studiesAccess === 'selected' ? studies : undefined,
                                                 sitesAccess: data.sitesAccess || 'all',
-                                                sites: data.sitesAccess === 'selected' ? sites : undefined
+                                                sites: data.sitesAccess === 'selected' ? sites : undefined,
+                                                crcId
                                             };
-                                            const newUser = await apiService.createUser({ ...newUserData, crcId });
+                                            const newUser = await apiService.createUser(newUserData);
                                             updateData.userId = newUser.id;
-                                            await syncLinkedCrcFromUser(newUser, { name: crc.name, email: data.userEmail || username });
+                                            await syncLinkedCrcFromUser(newUser, { name: crc.name, email: newUserData.email });
                                             const users = await apiService.getUsers();
                                             setState({ users }, { skipRender: true });
                                         }
@@ -39773,11 +40090,16 @@
                                         console.error('Error creating/updating user account:', error);
                                         showNotification('Failed to create/update user account: ' + (error.message || 'Unknown error'), 'error');
                                     }
-                                } else if (crc.userId) {
-                                    // If username is removed, we might want to delete the user account
-                                    // For now, we'll just leave it as is
                                 }
                             }
+
+                            // Strip login-only fields so they are not persisted onto the CRC document as a fake role
+                            delete updateData.permissionLevel;
+                            delete updateData.tabs;
+                            delete updateData.studiesAccess;
+                            delete updateData.sitesAccess;
+                            delete updateData.studies;
+                            delete updateData.sites;
                             
                             // Geocode if home location changed
                             if (data.homeLocation !== crc.homeLocation) {

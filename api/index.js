@@ -1758,10 +1758,36 @@ const validateRolesSchema = (data) => {
     return true;
 };
 
+const coerceUserUsername = (data = {}, existing = null) => {
+    const candidates = [
+        data.username,
+        existing?.username,
+        data.email,
+        existing?.email,
+        existing?.id,
+        data.id
+    ];
+    for (const candidate of candidates) {
+        if (candidate == null || candidate === '') continue;
+        const asString = typeof candidate === 'string' ? candidate.trim() : String(candidate).trim();
+        if (asString) return asString;
+    }
+    return '';
+};
+
 const validateUsersSchema = (data) => {
     const errors = [];
+
+    // Coerce email-as-username and non-string usernames before validating
+    if (data && typeof data === 'object') {
+        const coerced = coerceUserUsername(data);
+        if (coerced) data.username = coerced;
+        if (data.email != null && typeof data.email !== 'string') {
+            data.email = String(data.email);
+        }
+    }
     
-    if (!data.username || typeof data.username !== 'string') {
+    if (!data.username || typeof data.username !== 'string' || !data.username.trim()) {
         errors.push('username is required and must be a string');
     }
     
@@ -6798,7 +6824,7 @@ app.http('usersAuthenticateEntra', {
                     };
                 }
 
-                // Look for existing user by Entra ID
+                // Look for existing user by Entra ID, then by email (so Manager accounts aren't recreated as CRC)
                 let users;
                 try {
                     const { resources } = await container.items
@@ -6831,7 +6857,38 @@ app.http('usersAuthenticateEntra', {
                         const { resource } = await container.items.upsert(updatedUser);
                         user = resource;
                     }
-                } else {
+                } else if (email) {
+                    // Fall back: match existing CHAOS user by email/username so Entra login
+                    // does not create a second CRC-level account for a Manager.
+                    try {
+                        const emailLower = String(email).toLowerCase().trim();
+                        const { resources: byEmail } = await container.items
+                            .query({
+                                query: "SELECT * FROM c WHERE LOWER(c.email) = @email OR LOWER(c.username) = @email",
+                                parameters: [{ name: "@email", value: emailLower }]
+                            })
+                            .fetchAll();
+                        if (byEmail && byEmail.length > 0) {
+                            user = byEmail[0];
+                            const linked = {
+                                ...user,
+                                entraId: entraId,
+                                email: email || user.email || '',
+                                name: name || user.name || email || 'User'
+                            };
+                            // Never downgrade an existing Manager/Supervisor on first Entra link
+                            if (!linked.permissionLevel || linked.permissionLevel === '') {
+                                linked.permissionLevel = 'CRC';
+                            }
+                            const { resource } = await container.items.upsert(linked);
+                            user = resource;
+                        }
+                    } catch (emailLookupErr) {
+                        context.log.warn('Entra email fallback lookup failed:', emailLookupErr.message || emailLookupErr);
+                    }
+                }
+
+                if (!user) {
                     // Create new user from Entra ID
                     // Default permission level - you may want to check group membership
                     const newUser = {
@@ -7304,20 +7361,63 @@ app.http('users', {
                     const { password: pwd, ...userWithoutPassword } = resource;
                     return { jsonBody: userWithoutPassword };
                 
-                case 'PUT':
+                case 'PUT': {
                     const requestBody = await request.json();
                     const updateId = id || requestBody.id;
-                    validateUsersSchema(requestBody);
-                    
-                    // If password is being updated, hash it
-                    if (requestBody.password) {
-                        requestBody.password = hashPassword(requestBody.password);
+                    if (!updateId) {
+                        return { status: 400, jsonBody: { error: 'User id is required' } };
                     }
-                    
-                    const updatedUser = { ...requestBody, id: updateId };
-                    const { resource: result } = await container.items.upsert(updatedUser);
+
+                    // Partial updates must merge with existing user (username/email/permissionLevel live here)
+                    let existingUser = null;
+                    try {
+                        const { resource } = await container.item(updateId, updateId).read();
+                        existingUser = resource || null;
+                    } catch (readErr) {
+                        context.log.warn(`Could not read user ${updateId} before update:`, readErr.message || readErr);
+                    }
+                    if (!existingUser) {
+                        return { status: 404, jsonBody: { error: 'User not found' } };
+                    }
+
+                    const { password: _existingPwd, ...existingWithoutPassword } = existingUser;
+                    const mergedUser = { ...existingWithoutPassword, ...requestBody, id: updateId };
+                    mergedUser.username = coerceUserUsername(mergedUser, existingUser);
+                    if (mergedUser.email != null && typeof mergedUser.email !== 'string') {
+                        mergedUser.email = String(mergedUser.email);
+                    }
+
+                    // Protect built-in admin account
+                    if (isAdminUser(mergedUser) || (existingUser.username || '').toLowerCase().trim() === 'admin') {
+                        mergedUser.permissionLevel = 'Manager';
+                        mergedUser.crcId = null;
+                        mergedUser.username = existingUser.username === 'admin' || (mergedUser.username || '').toLowerCase().trim() === 'admin'
+                            ? (existingUser.username || 'admin')
+                            : mergedUser.username;
+                        mergedUser.active = true;
+                        // Never change admin password via partial staff sync payloads
+                        if (!requestBody.password) {
+                            mergedUser.password = existingUser.password;
+                        }
+                    }
+
+                    validateUsersSchema(mergedUser);
+
+                    if (requestBody.password) {
+                        mergedUser.password = hashPassword(requestBody.password);
+                    } else {
+                        mergedUser.password = existingUser.password;
+                    }
+
+                    ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => {
+                        if (k in mergedUser) delete mergedUser[k];
+                    });
+
+                    let finalUser = await correctAdminUser(mergedUser, container, context);
+                    const { resource: result } = await container.items.upsert(finalUser);
                     const { password: pwd2, ...resultWithoutPassword } = result;
                     return { jsonBody: resultWithoutPassword };
+                }
 
                 case 'DELETE':
                     if (!id) return { status: 400, jsonBody: { error: 'id is required' } };
