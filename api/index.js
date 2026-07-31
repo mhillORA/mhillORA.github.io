@@ -1,8 +1,13 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
+const crypto = require('crypto');
 
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
+}
+
+function generateConsentToken() {
+    return crypto.randomBytes(24).toString('hex');
 }
 
 // NASA / recruitment logins are isolated from CHAOS (`users` container on chaos-scheduler deploy).
@@ -2930,6 +2935,280 @@ app.http('cohortMemberships', {
             return { jsonBody: resources, headers: jsonHeaders };
         } catch (error) {
             return handleError(context, error, 'Cohort memberships failed');
+        }
+    },
+});
+
+const CONSENT_LINKS_CONTAINER = 'consent-links';
+
+const publicConsentPayload = (link) => ({
+    token: link.id,
+    status: link.status,
+    version: link.version,
+    icfTitle: link.icfTitle,
+    icfText: link.icfText || '',
+    icfPdfUrl: link.icfPdfUrl || '',
+    patientDisplayName: link.patientDisplayName || 'Participant',
+    studyTitle: link.studyTitle || '',
+    expiresAt: link.expiresAt || null,
+    signedAt: link.signedAt || null,
+});
+
+const resolveConsentLinkStatus = (link) => {
+    if (!link) return 'missing';
+    if (link.status === 'signed') return 'signed';
+    if (link.status === 'void') return 'void';
+    if (link.expiresAt && new Date(link.expiresAt).getTime() < Date.now()) return 'expired';
+    return link.status || 'pending';
+};
+
+/** Staff: create a unique patient eConsent link (ICF + signature capture). */
+app.http('econsentCreateLink', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'econsent/links',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const body = await safeJson(request);
+            if (!body || !body.patientId) {
+                return { status: 400, jsonBody: { error: 'patientId is required' }, headers: jsonHeaders };
+            }
+            if (!body.version || typeof body.version !== 'string') {
+                return { status: 400, jsonBody: { error: 'version is required' }, headers: jsonHeaders };
+            }
+            const hasText = !!(body.icfText && String(body.icfText).trim());
+            const hasPdf = !!(body.icfPdfUrl && String(body.icfPdfUrl).trim());
+            if (!hasText && !hasPdf) {
+                return { status: 400, jsonBody: { error: 'Provide icfText and/or icfPdfUrl' }, headers: jsonHeaders };
+            }
+
+            const patients = getContainer('patients');
+            const patient = await findPatientRecord(patients, String(body.patientId));
+            if (!patient) {
+                return { status: 404, jsonBody: { error: 'Patient not found' }, headers: jsonHeaders };
+            }
+
+            let studyTitle = '';
+            if (body.studyId) {
+                const study = await safeItemRead(getContainer('studies'), String(body.studyId));
+                studyTitle = study?.title || study?.name || '';
+            }
+
+            const requestContext = await resolveRequestContext(request);
+            const actor = requestContext?.actor;
+            const first = String(patient.firstName || '').trim() || 'Participant';
+            const lastInitial = String(patient.lastName || '').trim().charAt(0);
+            const patientDisplayName = lastInitial ? `${first} ${lastInitial}.` : first;
+
+            const expiresDays = Math.min(Math.max(parseInt(body.expiresInDays, 10) || 14, 1), 90);
+            const token = generateConsentToken();
+            const now = new Date().toISOString();
+            const expiresAt = new Date(Date.now() + expiresDays * 24 * 60 * 60 * 1000).toISOString();
+            const link = {
+                id: token,
+                patientId: patient.id,
+                studyId: body.studyId || patient.currentStudyId || patient.studyId || null,
+                version: String(body.version).trim(),
+                icfTitle: String(body.icfTitle || `Informed Consent Form ${body.version}`).trim(),
+                icfText: hasText ? String(body.icfText) : '',
+                icfPdfUrl: hasPdf ? String(body.icfPdfUrl).trim() : '',
+                patientDisplayName,
+                studyTitle,
+                status: 'pending',
+                createdAt: now,
+                createdBy: (actor && (actor.name || actor.upn)) || body.createdBy || 'staff',
+                expiresAt,
+                channel: body.channel || 'unique_link',
+            };
+
+            await wrapCosmosWrite(
+                () => getContainer(CONSENT_LINKS_CONTAINER).items.create(link),
+                CONSENT_LINKS_CONTAINER
+            );
+
+            const appUrl = getNasaAppUrl();
+            const url = `${appUrl}/?econsent=${encodeURIComponent(token)}`;
+
+            // Soft-audit on patient that a link was issued
+            try {
+                const auditTrail = [...(Array.isArray(patient.auditTrail) ? patient.auditTrail : []), {
+                    id: generateId(),
+                    at: now,
+                    action: 'econsent_link_created',
+                    details: `version ${link.version}; expires ${expiresAt}`,
+                    user: link.createdBy,
+                }];
+                const pendingLinks = [...(Array.isArray(patient.pendingConsentLinks) ? patient.pendingConsentLinks : []), {
+                    token,
+                    version: link.version,
+                    url,
+                    createdAt: now,
+                    expiresAt,
+                    status: 'pending',
+                }].slice(-20);
+                await patients.items.upsert({
+                    ...patient,
+                    auditTrail,
+                    pendingConsentLinks: pendingLinks,
+                    lastUpdated: now,
+                });
+            } catch (auditErr) {
+                context.log.warn('eConsent patient audit failed:', auditErr.message || auditErr);
+            }
+
+            return {
+                jsonBody: { ...publicConsentPayload(link), url, patientId: patient.id, createdAt: now, expiresAt },
+                headers: jsonHeaders,
+            };
+        } catch (error) {
+            return handleError(context, error, 'eConsent link create failed');
+        }
+    },
+});
+
+/** Public: load ICF for a unique consent token (minimal PHI). */
+app.http('econsentGetByToken', {
+    methods: ['GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'econsent/{token}',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const token = String(request.params.token || '').trim();
+            if (!token || token.length < 16) {
+                return { status: 400, jsonBody: { error: 'Invalid token' }, headers: jsonHeaders };
+            }
+            const link = await safeItemRead(getContainer(CONSENT_LINKS_CONTAINER), token);
+            if (!link) {
+                return { status: 404, jsonBody: { error: 'Consent link not found' }, headers: jsonHeaders };
+            }
+            const status = resolveConsentLinkStatus(link);
+            if (status === 'expired' && link.status === 'pending') {
+                try {
+                    await getContainer(CONSENT_LINKS_CONTAINER).items.upsert({ ...link, status: 'expired' });
+                } catch { /* ignore */ }
+            }
+            return {
+                jsonBody: { ...publicConsentPayload({ ...link, status }), status },
+                headers: jsonHeaders,
+            };
+        } catch (error) {
+            return handleError(context, error, 'eConsent get failed');
+        }
+    },
+});
+
+/** Public: patient signs ICF; signature + record land on the patient profile. */
+app.http('econsentSignByToken', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'econsent/{token}/sign',
+    handler: async (request, context) => {
+        try {
+            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
+            const token = String(request.params.token || '').trim();
+            const body = await safeJson(request);
+            if (!token) {
+                return { status: 400, jsonBody: { error: 'Invalid token' }, headers: jsonHeaders };
+            }
+            if (!body || !body.signedBy || !String(body.signedBy).trim()) {
+                return { status: 400, jsonBody: { error: 'signedBy (printed name) is required' }, headers: jsonHeaders };
+            }
+            if (!body.signatureDataUrl || typeof body.signatureDataUrl !== 'string' || !body.signatureDataUrl.startsWith('data:image')) {
+                return { status: 400, jsonBody: { error: 'signatureDataUrl is required (draw signature on the pad)' }, headers: jsonHeaders };
+            }
+            if (body.signatureDataUrl.length > 900000) {
+                return { status: 400, jsonBody: { error: 'Signature image is too large' }, headers: jsonHeaders };
+            }
+            if (body.acknowledged !== true) {
+                return { status: 400, jsonBody: { error: 'Patient must acknowledge they read the ICF' }, headers: jsonHeaders };
+            }
+
+            const links = getContainer(CONSENT_LINKS_CONTAINER);
+            const link = await safeItemRead(links, token);
+            if (!link) {
+                return { status: 404, jsonBody: { error: 'Consent link not found' }, headers: jsonHeaders };
+            }
+            const status = resolveConsentLinkStatus(link);
+            if (status === 'signed') {
+                return { status: 409, jsonBody: { error: 'This consent link was already signed' }, headers: jsonHeaders };
+            }
+            if (status === 'expired' || status === 'void') {
+                return { status: 410, jsonBody: { error: `This consent link is ${status}` }, headers: jsonHeaders };
+            }
+
+            const patients = getContainer('patients');
+            const patient = await findPatientRecord(patients, link.patientId);
+            if (!patient) {
+                return { status: 404, jsonBody: { error: 'Patient record not found for this link' }, headers: jsonHeaders };
+            }
+
+            const now = new Date().toISOString();
+            const consentId = generateId();
+            const record = {
+                id: consentId,
+                version: link.version,
+                icfTitle: link.icfTitle,
+                studyId: link.studyId || null,
+                studyTitle: link.studyTitle || '',
+                signedAt: now,
+                signedBy: String(body.signedBy).trim(),
+                obtainedBy: 'Patient (unique link)',
+                status: 'signed',
+                method: 'econsent_unique_link',
+                channel: 'unique_link',
+                linkToken: token,
+                signatureDataUrl: body.signatureDataUrl,
+                icfPdfUrl: link.icfPdfUrl || '',
+                notes: body.notes ? String(body.notes).slice(0, 2000) : '',
+            };
+
+            const consentRecords = [...(Array.isArray(patient.consentRecords) ? patient.consentRecords : []), record];
+            const auditTrail = [...(Array.isArray(patient.auditTrail) ? patient.auditTrail : []), {
+                id: generateId(),
+                at: now,
+                action: 'econsent_signed',
+                details: `version ${link.version}; method unique_link`,
+                user: record.signedBy,
+            }];
+            const pendingConsentLinks = (Array.isArray(patient.pendingConsentLinks) ? patient.pendingConsentLinks : [])
+                .map((p) => (p.token === token ? { ...p, status: 'signed', signedAt: now } : p));
+
+            const enriched = enrichPatientDocument({
+                ...patient,
+                consentRecords,
+                auditTrail,
+                pendingConsentLinks,
+                pipelineStage: 'consented',
+                lastUpdated: now,
+            });
+
+            await wrapCosmosWrite(() => patients.items.upsert(enriched), 'patients');
+            await wrapCosmosWrite(
+                () => links.items.upsert({
+                    ...link,
+                    status: 'signed',
+                    signedAt: now,
+                    signedBy: record.signedBy,
+                    consentRecordId: consentId,
+                    // Keep a short marker; full signature lives on the patient record
+                    signatureStored: true,
+                }),
+                CONSENT_LINKS_CONTAINER
+            );
+
+            return {
+                jsonBody: {
+                    ok: true,
+                    signedAt: now,
+                    version: link.version,
+                    message: 'Thank you. Your consent has been recorded.',
+                },
+                headers: jsonHeaders,
+            };
+        } catch (error) {
+            return handleError(context, error, 'eConsent sign failed');
         }
     },
 });

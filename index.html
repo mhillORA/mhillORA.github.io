@@ -136,6 +136,19 @@
             filter: blur(6px);
             user-select: none;
         }
+        #econsent-root { display: none; }
+        body.econsent-mode #app-shell { display: none !important; }
+        body.econsent-mode #econsent-root { display: block; }
+        .econsent-sig-pad {
+            touch-action: none;
+            cursor: crosshair;
+            background: #fff;
+            border: 2px solid #cbd5e1;
+            border-radius: 0.5rem;
+            width: 100%;
+            max-width: 640px;
+            height: 180px;
+        }
     </style>
     <script>
         (function() {
@@ -158,6 +171,8 @@
     </script>
 </head>
 <body class="bg-gray-100 dark:bg-gray-900">
+<div id="econsent-root" class="min-h-screen bg-slate-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100"></div>
+<div id="app-shell">
 <div id="notification-container"></div>
 <div class="flex flex-col md:flex-row">
     <header class="md:hidden bg-white dark:bg-gray-800 p-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
@@ -206,6 +221,7 @@
     <main id="main-content" class="flex-1 p-4 md:p-8 bg-gray-50 dark:bg-gray-950">
     </main>
 </div>
+</div><!-- #app-shell -->
 <div id="overlay" class="fixed inset-0 bg-black bg-opacity-60 z-40 opacity-0 transition-opacity duration-300 pointer-events-none"></div>
 <div id="side-panel-container" class="fixed top-0 right-0 h-full w-full max-w-2xl bg-white dark:bg-gray-800 shadow-2xl transform translate-x-full transition-transform duration-300 ease-in-out z-50">
 </div>
@@ -1894,6 +1910,7 @@ const normalizePatientRecord = (patient) => {
     if (!Array.isArray(normalized.tags)) normalized.tags = [];
     if (!Array.isArray(normalized.race)) normalized.race = normalized.race ? [normalized.race] : [];
     if (!Array.isArray(normalized.surveyDrafts)) normalized.surveyDrafts = [];
+    if (!Array.isArray(normalized.pendingConsentLinks)) normalized.pendingConsentLinks = [];
     if (normalized.deceased == null) normalized.deceased = false;
     if (normalized.profileLocked == null) normalized.profileLocked = !!normalized.deceased;
     if (normalized.emailInvalid == null) normalized.emailInvalid = false;
@@ -2470,8 +2487,156 @@ const closeModal = () => {
         modalContainer.classList.add('hidden');
         modalContainer.innerHTML = '';
         state.currentSurveyState = null; // Clear survey state on modal close
+        state._officeSigPad = null;
     } catch (error) {
         console.error('Error closing modal:', error);
+    }
+};
+
+/** Canvas signature pad (trackpad / mouse / touch). Returns { clear, isEmpty, toDataURL }. */
+const attachSignaturePad = (canvas) => {
+    if (!canvas) return null;
+    const ctx = canvas.getContext('2d');
+    const ratio = Math.max(window.devicePixelRatio || 1, 1);
+    const cssW = canvas.clientWidth || 640;
+    const cssH = canvas.clientHeight || 180;
+    canvas.width = Math.floor(cssW * ratio);
+    canvas.height = Math.floor(cssH * ratio);
+    ctx.scale(ratio, ratio);
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#0f172a';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, cssW, cssH);
+    let drawing = false;
+    let empty = true;
+    const pos = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const src = e.touches && e.touches[0] ? e.touches[0] : e;
+        return { x: src.clientX - rect.left, y: src.clientY - rect.top };
+    };
+    const start = (e) => {
+        e.preventDefault();
+        drawing = true;
+        const p = pos(e);
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+    };
+    const move = (e) => {
+        if (!drawing) return;
+        e.preventDefault();
+        const p = pos(e);
+        ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+        empty = false;
+    };
+    const end = (e) => {
+        if (!drawing) return;
+        e.preventDefault();
+        drawing = false;
+    };
+    canvas.addEventListener('mousedown', start);
+    canvas.addEventListener('mousemove', move);
+    canvas.addEventListener('mouseup', end);
+    canvas.addEventListener('mouseleave', end);
+    canvas.addEventListener('touchstart', start, { passive: false });
+    canvas.addEventListener('touchmove', move, { passive: false });
+    canvas.addEventListener('touchend', end);
+    return {
+        clear: () => {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, cssW, cssH);
+            empty = true;
+        },
+        isEmpty: () => empty,
+        toDataURL: () => canvas.toDataURL('image/png'),
+    };
+};
+
+const escapeHtml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+const bootPublicEconsentPage = async () => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('econsent');
+    if (!token) return false;
+
+    document.body.classList.add('econsent-mode');
+    document.title = 'eConsent | N.A.S.A.';
+    const root = document.getElementById('econsent-root');
+    root.innerHTML = `<div class="max-w-3xl mx-auto p-6"><p class="text-gray-600">Loading consent form…</p></div>`;
+
+    try {
+        const link = await apiCall(`econsent/${encodeURIComponent(token)}`);
+        if (link.status === 'signed') {
+            root.innerHTML = `<div class="max-w-3xl mx-auto p-8 text-center"><h1 class="text-2xl font-bold mb-2">Already signed</h1><p class="text-gray-600">This consent link was completed${link.signedAt ? ' on ' + new Date(link.signedAt).toLocaleString() : ''}.</p></div>`;
+            return true;
+        }
+        if (link.status === 'expired' || link.status === 'void') {
+            root.innerHTML = `<div class="max-w-3xl mx-auto p-8 text-center"><h1 class="text-2xl font-bold mb-2">Link unavailable</h1><p class="text-gray-600">This consent link is ${escapeHtml(link.status)}.</p></div>`;
+            return true;
+        }
+
+        root.innerHTML = `
+            <div class="max-w-3xl mx-auto p-4 md:p-8">
+                <div class="mb-6">
+                    <p class="text-xs uppercase tracking-wide text-slate-500">N.A.S.A. eConsent</p>
+                    <h1 class="text-2xl md:text-3xl font-bold mt-1">${escapeHtml(link.icfTitle || 'Informed Consent Form')}</h1>
+                    <p class="text-sm text-slate-600 dark:text-slate-400 mt-2">Participant: <strong>${escapeHtml(link.patientDisplayName || 'Participant')}</strong>${link.studyTitle ? ' · Study: <strong>' + escapeHtml(link.studyTitle) + '</strong>' : ''} · Version <strong>${escapeHtml(link.version || '')}</strong></p>
+                </div>
+                ${link.icfPdfUrl ? `<div class="mb-4"><a class="text-indigo-700 underline font-medium" href="${escapeHtml(link.icfPdfUrl)}" target="_blank" rel="noopener">Open ICF PDF</a>
+                    <iframe src="${escapeHtml(link.icfPdfUrl)}" class="mt-3 w-full h-80 border rounded bg-white" title="ICF PDF"></iframe></div>` : ''}
+                ${link.icfText ? `<div class="mb-6 p-4 border rounded-lg bg-white dark:bg-gray-900 whitespace-pre-wrap text-sm leading-relaxed max-h-[50vh] overflow-y-auto">${escapeHtml(link.icfText)}</div>` : (!link.icfPdfUrl ? '<p class="text-red-600 mb-4">No ICF content was attached to this link.</p>' : '')}
+                <form id="public-econsent-form" class="space-y-4 bg-white dark:bg-gray-900 border rounded-xl p-4 md:p-6">
+                    <div><label class="block text-sm font-medium mb-1">Printed full name *</label>
+                        <input type="text" name="signedBy" required class="w-full p-3 border rounded-md" placeholder="Type your full legal name" autocomplete="name"></div>
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Signature (use trackpad or mouse) *</label>
+                        <canvas id="public-sig-pad" class="econsent-sig-pad" width="640" height="180"></canvas>
+                        <button type="button" id="public-clear-sig" class="mt-2 text-sm underline text-slate-600">Clear signature</button>
+                    </div>
+                    <label class="flex items-start gap-2 text-sm"><input type="checkbox" name="acknowledged" value="1" required class="mt-1"> I have read and understand this informed consent form, and I agree to participate as described.</label>
+                    <button type="submit" id="public-econsent-submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-md">Sign &amp; Submit</button>
+                    <p id="public-econsent-status" class="text-sm text-slate-500"></p>
+                </form>
+            </div>`;
+
+        const pad = attachSignaturePad(document.getElementById('public-sig-pad'));
+        document.getElementById('public-clear-sig')?.addEventListener('click', () => pad?.clear());
+        document.getElementById('public-econsent-form')?.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const statusEl = document.getElementById('public-econsent-status');
+            const submitBtn = document.getElementById('public-econsent-submit');
+            if (!pad || pad.isEmpty()) {
+                statusEl.textContent = 'Please draw your signature on the pad.';
+                statusEl.className = 'text-sm text-red-600';
+                return;
+            }
+            submitBtn.disabled = true;
+            statusEl.textContent = 'Submitting…';
+            statusEl.className = 'text-sm text-slate-500';
+            try {
+                await apiCall(`econsent/${encodeURIComponent(token)}/sign`, 'POST', {
+                    signedBy: form.signedBy.value.trim(),
+                    signatureDataUrl: pad.toDataURL(),
+                    acknowledged: true,
+                });
+                root.innerHTML = `<div class="max-w-xl mx-auto p-10 text-center"><h1 class="text-3xl font-bold mb-3">Thank you</h1><p class="text-slate-600">Your consent for version <strong>${escapeHtml(link.version || '')}</strong> has been recorded.</p></div>`;
+            } catch (err) {
+                submitBtn.disabled = false;
+                statusEl.textContent = err.message || 'Could not submit signature.';
+                statusEl.className = 'text-sm text-red-600';
+            }
+        });
+        return true;
+    } catch (err) {
+        root.innerHTML = `<div class="max-w-3xl mx-auto p-8"><h1 class="text-2xl font-bold mb-2">Unable to open consent</h1><p class="text-red-600">${escapeHtml(err.message || 'Unknown error')}</p></div>`;
+        return true;
     }
 };
 /**
@@ -4459,15 +4624,31 @@ const getPatientProfileHTML = (patient) => {
         `).join('') : '<p class="text-gray-500 dark:text-gray-400">No tasks.</p>'}
     `;
     const consentTabHTML = `
-        <div class="flex justify-end mb-4">
-            <button data-action="add-consent" data-patient-id="${patient.id}" class="text-sm bg-purple-600 text-white px-3 py-1 rounded hover:bg-purple-700">Record Consent</button>
+        <div class="flex flex-wrap justify-end gap-2 mb-4">
+            <button data-action="collect-econsent-office" data-patient-id="${patient.id}" class="text-sm bg-violet-600 text-white px-3 py-1 rounded hover:bg-violet-700">Collect Signature (in office)</button>
+            <button data-action="create-econsent-link" data-patient-id="${patient.id}" class="text-sm bg-indigo-600 text-white px-3 py-1 rounded hover:bg-indigo-700">Create Unique Link</button>
+            <button data-action="add-consent" data-patient-id="${patient.id}" class="text-sm bg-purple-600 text-white px-3 py-1 rounded hover:bg-purple-700">Record Consent (manual)</button>
         </div>
+        ${(patient.pendingConsentLinks || []).filter(l => (l.status || 'pending') === 'pending').length ? `
+            <div class="mb-4 p-3 border border-indigo-200 dark:border-indigo-800 rounded-lg bg-indigo-50 dark:bg-indigo-950/40">
+                <p class="text-sm font-semibold text-indigo-800 dark:text-indigo-200 mb-2">Open unique links</p>
+                ${(patient.pendingConsentLinks || []).filter(l => (l.status || 'pending') === 'pending').map(l => `
+                    <div class="text-xs dark:text-indigo-100 mb-2 break-all">
+                        <div><strong>${l.version || 'ICF'}</strong> · expires ${l.expiresAt ? new Date(l.expiresAt).toLocaleString() : '—'}</div>
+                        <a class="text-indigo-700 dark:text-indigo-300 underline" href="${l.url || ('/?econsent=' + l.token)}" target="_blank" rel="noopener">${l.url || (location.origin + '/?econsent=' + l.token)}</a>
+                        <button type="button" data-action="copy-econsent-link" data-url="${(l.url || (location.origin + '/?econsent=' + l.token)).replace(/"/g, '&quot;')}" class="ml-2 text-indigo-700 dark:text-indigo-300 underline">Copy</button>
+                    </div>
+                `).join('')}
+            </div>
+        ` : ''}
         ${(patient.consentRecords || []).length ? (patient.consentRecords || []).map(c => `
             <div class="p-3 border dark:border-gray-700 rounded-lg mb-2">
-                <p class="font-medium dark:text-white">Version ${c.version || '—'} — ${c.status || 'signed'}</p>
+                <p class="font-medium dark:text-white">${c.icfTitle || 'Consent'} · Version ${c.version || '—'} — ${c.status || 'signed'}</p>
                 <p class="text-sm text-gray-500">Signed: ${c.signedAt ? new Date(c.signedAt).toLocaleString() : '—'} by ${phi(c.signedBy || 'N/A')}</p>
-                <p class="text-sm dark:text-gray-300">Obtained by: ${phi(c.obtainedBy || 'N/A')}</p>
+                <p class="text-sm dark:text-gray-300">Method: ${c.method || c.channel || 'manual'} · Obtained by: ${phi(c.obtainedBy || 'N/A')}</p>
                 ${c.notes ? `<p class="text-sm dark:text-gray-300 mt-1">${c.notes}</p>` : ''}
+                ${c.signatureDataUrl ? `<img src="${c.signatureDataUrl}" alt="Signature" class="mt-2 max-h-24 border dark:border-gray-600 rounded bg-white p-1" />` : ''}
+                ${c.icfPdfUrl ? `<p class="text-sm mt-1"><a class="text-blue-600 underline" href="${c.icfPdfUrl}" target="_blank" rel="noopener">View ICF PDF</a></p>` : ''}
             </div>
         `).join('') : '<p class="text-gray-500 dark:text-gray-400">No consent records.</p>'}
     `;
@@ -6548,6 +6729,50 @@ const getAddConsentModalHTML = (patientId) => `
     </form>
 `;
 
+const getEconsentLinkModalHTML = (patientId) => {
+    const patient = state.patients.find(p => p.id === patientId);
+    const studyOptions = (state.studies || []).map(s => `<option value="${s.id}">${s.title || s.name || s.id}</option>`).join('');
+    const defaultName = patient ? `${patient.firstName || ''} ${patient.lastName || ''}`.trim() : '';
+    return `
+    <h2 class="text-2xl font-bold dark:text-white mb-2">Create Unique eConsent Link</h2>
+    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Patient opens the link, reviews the ICF, signs on trackpad/mouse, and the signature saves to their profile.</p>
+    <form id="create-econsent-link-form" data-patient-id="${patientId}" class="space-y-4 max-h-[70vh] overflow-y-auto">
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF Version *</label><input type="text" name="version" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="v1.0 / 31-Jul-2026"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF Title</label><input type="text" name="icfTitle" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Informed Consent Form"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Study (optional)</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">—</option>${studyOptions}</select></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF PDF URL (optional)</label><input type="url" name="icfPdfUrl" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="https://.../consent.pdf"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF Text (shown on the signing page)</label><textarea name="icfText" rows="8" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Paste informed consent text here..."></textarea></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Link expires in (days)</label><input type="number" name="expiresInDays" min="1" max="90" value="14" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
+        <p class="text-xs text-gray-500">Provide PDF URL and/or ICF text. Default participant name hint: ${defaultName || '—'}</p>
+        <button type="submit" class="w-full bg-indigo-600 text-white py-2 rounded-md hover:bg-indigo-700">Generate Link</button>
+    </form>`;
+};
+
+const getEconsentOfficeModalHTML = (patientId) => {
+    const patient = state.patients.find(p => p.id === patientId);
+    const studyOptions = (state.studies || []).map(s => `<option value="${s.id}">${s.title || s.name || s.id}</option>`).join('');
+    const fullName = patient ? `${patient.firstName || ''} ${patient.lastName || ''}`.trim() : '';
+    return `
+    <h2 class="text-2xl font-bold dark:text-white mb-2">In-Office eConsent</h2>
+    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Show the ICF on screen. Patient signs with trackpad or mouse. Patient signature only.</p>
+    <form id="office-econsent-form" data-patient-id="${patientId}" class="space-y-4 max-h-[75vh] overflow-y-auto">
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF Version *</label><input type="text" name="version" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF Title</label><input type="text" name="icfTitle" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" value="Informed Consent Form"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">—</option>${studyOptions}</select></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF PDF URL</label><input type="url" name="icfPdfUrl" id="office-icf-pdf" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">ICF Text</label><textarea name="icfText" id="office-icf-text" rows="6" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></textarea></div>
+        <div id="office-icf-preview" class="p-3 border dark:border-gray-600 rounded bg-gray-50 dark:bg-gray-900 text-sm whitespace-pre-wrap max-h-40 overflow-y-auto dark:text-gray-200">Paste ICF text above to preview for the patient.</div>
+        <div><label class="block text-sm font-medium dark:text-gray-300">Printed name *</label><input type="text" name="signedBy" required value="${fullName.replace(/"/g, '&quot;')}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input"></div>
+        <div>
+            <label class="block text-sm font-medium dark:text-gray-300 mb-1">Signature (trackpad / mouse) *</label>
+            <canvas id="office-sig-pad" class="econsent-sig-pad" width="640" height="180"></canvas>
+            <button type="button" data-action="clear-office-sig" class="mt-2 text-sm text-gray-600 dark:text-gray-300 underline">Clear signature</button>
+        </div>
+        <label class="flex items-start gap-2 text-sm dark:text-gray-300"><input type="checkbox" name="acknowledged" value="1" required class="mt-1"> Patient confirms they have read and understand this informed consent.</label>
+        <button type="submit" class="w-full bg-violet-600 text-white py-2 rounded-md hover:bg-violet-700">Save Signed Consent</button>
+    </form>`;
+};
+
 const getScheduleCommunicationModalHTML = (patientId) => `
     <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule Communication</h2>
     <form id="schedule-communication-form" data-patient-id="${patientId}" class="space-y-4">
@@ -7734,6 +7959,33 @@ document.addEventListener('click', async (e) => {
             case 'add-task': openModal(getAddTaskModalHTML(patientId)); break;
             case 'open-global-task-modal': openModal(getAddTaskModalHTML(null)); break;
             case 'add-consent': openModal(getAddConsentModalHTML(patientId)); break;
+            case 'create-econsent-link': openModal(getEconsentLinkModalHTML(patientId)); break;
+            case 'collect-econsent-office': {
+                openModal(getEconsentOfficeModalHTML(patientId));
+                setTimeout(() => {
+                    state._officeSigPad = attachSignaturePad(document.getElementById('office-sig-pad'));
+                    const textArea = document.getElementById('office-icf-text');
+                    const preview = document.getElementById('office-icf-preview');
+                    if (textArea && preview) {
+                        textArea.addEventListener('input', () => {
+                            preview.textContent = textArea.value.trim() || 'Paste ICF text above to preview for the patient.';
+                        });
+                    }
+                }, 50);
+                break;
+            }
+            case 'clear-office-sig':
+                state._officeSigPad?.clear();
+                break;
+            case 'copy-econsent-link': {
+                const url = actionButton.dataset.url || '';
+                if (url && navigator.clipboard?.writeText) {
+                    navigator.clipboard.writeText(url).then(() => showNotification('Consent link copied.', 'success')).catch(() => showNotification(url, 'info', 8000));
+                } else if (url) {
+                    showNotification(url, 'info', 8000);
+                }
+                break;
+            }
             case 'schedule-communication': openModal(getScheduleCommunicationModalHTML(patientId)); break;
             case 'set-task-view': setState({ taskView: view }); break;
             case 'complete-task': {
@@ -8532,6 +8784,7 @@ document.addEventListener('submit', async (e) => {
                 signedBy: data.signedBy,
                 obtainedBy: data.obtainedBy,
                 status: 'signed',
+                method: 'manual',
                 notes: data.notes || ''
             };
             await updatePatientFields(pid, {
@@ -8541,6 +8794,80 @@ document.addEventListener('submit', async (e) => {
             await loadAllData();
             closeModal();
             openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === pid)), true);
+            break;
+        }
+        case 'create-econsent-link-form': {
+            const pid = form.dataset.patientId;
+            try {
+                const payload = {
+                    patientId: pid,
+                    version: data.version,
+                    icfTitle: data.icfTitle || undefined,
+                    studyId: data.studyId || undefined,
+                    icfPdfUrl: data.icfPdfUrl || undefined,
+                    icfText: data.icfText || undefined,
+                    expiresInDays: data.expiresInDays ? parseInt(data.expiresInDays, 10) : 14,
+                    createdBy: getCurrentActor(),
+                };
+                const result = await apiCall('econsent/links', 'POST', payload);
+                await loadAllData();
+                closeModal();
+                openModal(`
+                    <h2 class="text-2xl font-bold dark:text-white mb-3">Unique link ready</h2>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">Share this link with the patient. When they sign, it saves to their Consent tab automatically.</p>
+                    <div class="p-3 bg-gray-100 dark:bg-gray-900 rounded break-all text-sm dark:text-gray-200 mb-4">${result.url}</div>
+                    <div class="flex gap-2">
+                        <button type="button" data-action="copy-econsent-link" data-url="${String(result.url || '').replace(/"/g, '&quot;')}" class="flex-1 bg-indigo-600 text-white py-2 rounded-md">Copy Link</button>
+                        <a href="${result.url}" target="_blank" rel="noopener" class="flex-1 text-center bg-gray-200 dark:bg-gray-700 dark:text-white py-2 rounded-md">Open</a>
+                        <button type="button" data-action="close-modal" class="px-4 py-2 rounded-md border dark:border-gray-600 dark:text-white">Done</button>
+                    </div>
+                `);
+                state.currentPatientProfileTab = 'consent';
+                openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === pid)), true);
+            } catch (err) {
+                showNotification(err.message || 'Could not create consent link.', 'error');
+            }
+            break;
+        }
+        case 'office-econsent-form': {
+            const pid = form.dataset.patientId;
+            const patient = state.patients.find(p => p.id === pid);
+            if (!patient) return;
+            const pad = state._officeSigPad;
+            if (!pad || pad.isEmpty()) {
+                showNotification('Patient must sign on the signature pad.', 'error');
+                return;
+            }
+            if (!data.acknowledged) {
+                showNotification('Patient must acknowledge they read the ICF.', 'error');
+                return;
+            }
+            const study = (state.studies || []).find(s => s.id === data.studyId);
+            const record = {
+                id: ensureId('consent'),
+                version: data.version,
+                icfTitle: data.icfTitle || 'Informed Consent Form',
+                studyId: data.studyId || null,
+                studyTitle: study?.title || study?.name || '',
+                signedAt: new Date().toISOString(),
+                signedBy: data.signedBy,
+                obtainedBy: getCurrentActor(),
+                status: 'signed',
+                method: 'econsent_in_office',
+                channel: 'in_office',
+                signatureDataUrl: pad.toDataURL(),
+                icfPdfUrl: data.icfPdfUrl || '',
+                notes: '',
+            };
+            await updatePatientFields(pid, {
+                consentRecords: [...(patient.consentRecords || []), record],
+                pipelineStage: 'consented'
+            }, 'econsent_signed_office', data.version);
+            await loadAllData();
+            closeModal();
+            state.currentPatientProfileTab = 'consent';
+            openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === pid)), true);
+            showNotification('In-office eConsent saved.', 'success');
             break;
         }
         case 'schedule-communication-form': {
@@ -10311,9 +10638,27 @@ const loadAllData = async () => {
     }
 };
 
-// Set up periodic data refresh (every 30 seconds)
+// Match CHAOS / SMO scheduler: silent background refresh every 10 minutes
+const DATA_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+let dataRefreshTimerId = null;
+let isRefreshingData = false;
+
 const setupDataRefresh = () => {
-    setInterval(loadAllData, 30000); // Refresh every 30 seconds
+    if (dataRefreshTimerId) clearTimeout(dataRefreshTimerId);
+    const loop = async () => {
+        if (!isRefreshingData) {
+            isRefreshingData = true;
+            try {
+                await loadAllData();
+            } catch (error) {
+                console.error('NASA: Background data refresh failed:', error);
+            } finally {
+                isRefreshingData = false;
+            }
+        }
+        dataRefreshTimerId = setTimeout(loop, DATA_REFRESH_INTERVAL_MS);
+    };
+    dataRefreshTimerId = setTimeout(loop, DATA_REFRESH_INTERVAL_MS);
 };
 // --- CTMS INTEGRATION ---
 /**
@@ -10382,6 +10727,9 @@ const init = async () => {
     
     // Initialize NASA with Azure Cosmos DB
     try {
+        if (await bootPublicEconsentPage()) {
+            return;
+        }
         loadLocalState();
         await loadEntraConfig();
         await loadReferenceDataFromApi();
