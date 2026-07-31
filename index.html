@@ -184,12 +184,12 @@
             <i data-lucide="menu" class="w-6 h-6"></i>
         </button>
     </header>
-    <aside id="sidebar" class="w-64 bg-white dark:bg-gray-800 p-4 border-r border-gray-200 dark:border-gray-700 h-screen sticky top-0 flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-300 ease-in-out md:flex z-50">
-        <div class="flex items-center mb-8">
+    <aside id="sidebar" class="w-64 bg-white dark:bg-gray-800 p-4 border-r border-gray-200 dark:border-gray-700 h-screen sticky top-0 flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-300 ease-in-out md:flex z-50 overflow-hidden">
+        <div class="flex items-center mb-4 shrink-0">
             <div id="logo-container" class="h-10 w-10 cursor-pointer hover:opacity-80 transition-opacity" title="Toggle dark mode"></div>
             <h1 class="text-xl font-bold ml-2 text-gray-800 dark:text-gray-200">N.A.S.A.</h1>
         </div>
-        <nav id="nav-menu" class="space-y-2 flex-grow">
+        <nav id="nav-menu" class="space-y-2 flex-grow overflow-y-auto min-h-0 pr-1">
         </nav>
         <div class="border-t dark:border-gray-700 pt-4">
             <div id="session-controls" class="hidden mb-3 px-1">
@@ -694,14 +694,14 @@ const DEFAULT_NQ_REASONS = [
 ];
 const DEFAULT_NI_REASONS = [
     'Not interested in study', 'Scheduling conflict', 'Travel / distance',
-    'Compensation', 'Other'
+    'Compensation', 'Do Not Call', 'Other'
 ];
 const PSQ_SECTION_HEADERS = [
     'Voicemail Script', 'Live Patient Script', 'Study Overview',
     'Personal Contact Details/Demographics', 'Medical History', 'Medication History',
     'Medication Review', 'Medical and Study History', 'Scheduling', 'Waitlist'
 ];
-const OVERALL_STATUS_OPTIONS = ['Not interested', 'Not qualified', 'Scheduled', 'Waitlist', 'Call Back'];
+const OVERALL_STATUS_OPTIONS = ['Not interested', 'Not qualified', 'Scheduled', 'Waitlist', 'Call Back', 'Attempted', 'Unreachable'];
 const SEX_AT_BIRTH_OPTIONS = ['Male', 'Female', 'Unknown', 'Not Reported (Prefers not to disclose)'];
 const ETHNICITY_OPTIONS = [
     'Hispanic or Latino', 'Not Hispanic or Latino', 'Unknown', 'Not Reported (Prefers not to disclose)'
@@ -792,6 +792,36 @@ const isManagerUser = () => {
     return role === 'Internal' || role === 'Manager' || role.toLowerCase() === 'admin';
 };
 
+const isCrcOrManagerUser = () => {
+    const u = state.currentUser || {};
+    const role = String(u.role || u.permissionLevel || '').toLowerCase();
+    if (isManagerUser()) return true;
+    if (role.includes('crc') || role === 'coordinator' || role === 'internal') return true;
+    if (u.userPartition === 'internal' && role !== 'external' && role !== 'recruiter') return true;
+    return false;
+};
+
+/** Recruiters edit V1 only; CRC / Manager / Internal can edit V2+. */
+const canEditAppointmentVisit = (visitLabel) => {
+    if (isCrcOrManagerUser()) return true;
+    const v = String(visitLabel || '').toLowerCase();
+    return !v || /\bv1\b|visit\s*1|screening|screen/.test(v);
+};
+
+const isAppointmentVisitV1 = (visitLabel) => {
+    const v = String(visitLabel || '').toLowerCase();
+    return !v || /\bv1\b|visit\s*1|screening|screen/.test(v);
+};
+
+const MED_STALE_MS = 365 * 24 * 60 * 60 * 1000; // 1 year — mark stale, keep forever
+const isMedicationStale = (med) => {
+    const t = med && (med.reviewedAt || med.enteredAt || med.startDate);
+    if (!t) return false;
+    const ms = new Date(t).getTime();
+    if (!Number.isFinite(ms)) return false;
+    return (Date.now() - ms) > MED_STALE_MS;
+};
+
 const isPatientProfileLocked = (patient) => !!(patient && (patient.profileLocked || patient.deceased));
 
 const formatDobDisplay = (dob) => {
@@ -821,20 +851,29 @@ const getPatientPrimarySite = (patient) => {
 
 const getScriptVariableMap = (patient) => {
     const site = getPatientPrimarySite(patient);
-    const recruiter = (state.currentUser && (state.currentUser.displayName || state.currentUser.username || state.currentUser.email)) || getCurrentActor();
+    const current = (patient && patient.enrollments || []).find(e => e.status === 'current');
+    const studyId = (current && current.studyId) || (patient && (patient.currentStudyId || patient.studyId));
+    const study = (state.studies || []).find(s => s.id === studyId);
+    const display = String((state.currentUser && (state.currentUser.displayName || state.currentUser.name || state.currentUser.username || state.currentUser.email)) || getCurrentActor() || '').trim();
+    const recruiterFirst = display.split(/[\s@]+/).filter(Boolean)[0] || display;
     const address = site
         ? [site.address, site.city, site.state, site.zipCode].filter(Boolean).join(', ') || site.location || ''
         : '';
     return {
         '{{site_name}}': (site && site.name) || '',
-        '{{site_pi}}': (site && site.pi) || '',
+        '{{site_pi}}': (site && (site.pi || site.principalInvestigator)) || '',
         '{{site_address}}': address,
         '{{site_compensation}}': (site && site.compensation) || '',
+        '{{study_name}}': (study && (study.title || study.name)) || '',
+        '{{study_protocol}}': (study && (study.protocolNumber || study.protocol)) || '',
         '{{patient_name}}': [patient && patient.firstName, patient && patient.lastName].filter(Boolean).join(' '),
         '{{patient_first_name}}': (patient && patient.firstName) || '',
-        '{{recruiter_name}}': recruiter || '',
+        '{{recruiter_name}}': recruiterFirst || '',
+        '{{recruiter_full_name}}': display || '',
     };
 };
+
+const SCRIPT_TOKEN_HELP = '{{site_name}} {{site_pi}} {{site_address}} {{site_compensation}} {{study_name}} {{study_protocol}} {{patient_name}} {{patient_first_name}} {{recruiter_name}}';
 
 const applyScriptVariables = (text, patient) => {
     if (!text) return '';
@@ -878,13 +917,23 @@ const inferOverallStatusFromSurvey = (outcome, answers) => {
 
 const getLatestNqNiSummary = (patient) => {
     const parts = [];
-    if (patient && patient.overallStatus) parts.push('Status: ' + patient.overallStatus);
-    if (patient && patient.nqReason) parts.push('NQ: ' + patient.nqReason);
-    if (patient && patient.niReason) parts.push('NI: ' + patient.niReason);
+    const current = (patient && patient.enrollments || []).find(e => e.status === 'current');
+    const study = current ? (state.studies || []).find(s => s.id === current.studyId) : null;
+    const studyLabel = (study && (study.title || study.name)) || (patient && patient.nqStudyTitle) || (patient && patient.niStudyTitle) || '';
+    if (patient && patient.overallStatus) {
+        parts.push('Status: ' + patient.overallStatus + (studyLabel ? (' (' + studyLabel + ')') : ''));
+    }
+    if (patient && patient.nqReason) {
+        parts.push('NQ' + ((patient.nqStudyTitle || studyLabel) ? (' [' + (patient.nqStudyTitle || studyLabel) + ']') : '') + ': ' + patient.nqReason);
+    }
+    if (patient && patient.niReason) {
+        parts.push('NI' + ((patient.niStudyTitle || studyLabel) ? (' [' + (patient.niStudyTitle || studyLabel) + ']') : '') + ': ' + patient.niReason);
+    }
     const logs = (patient && patient.contactLogs) || [];
-    const lastLog = [...logs].reverse().find(l => l.outcome || l.notes);
+    const lastLog = [...logs].reverse().find(l => l.outcome || l.notes || l.overallStatus);
     if (lastLog) {
-        parts.push('Last contact (' + new Date(lastLog.date).toLocaleString() + '): ' + (lastLog.outcome || '') + (lastLog.notes ? (' — ' + lastLog.notes) : ''));
+        parts.push('Last contact (' + new Date(lastLog.date).toLocaleString() + '): '
+            + [lastLog.overallStatus, lastLog.outcome, lastLog.notes].filter(Boolean).join(' — '));
     }
     return parts;
 };
@@ -920,23 +969,37 @@ const getMedicationsEditorHTML = (patient, editable) => {
     const catalog = getActiveReferenceList('medications');
     const locked = isPatientProfileLocked(patient) && !isManagerUser();
     const canEdit = canEditDefault && !locked;
+    const hasStale = meds.some(isMedicationStale);
     return '<div class="space-y-3" data-patient-meds="' + patient.id + '">'
-        + (meds.length ? meds.map(m => '<div class="p-3 border dark:border-gray-700 rounded-md"><div class="flex justify-between gap-2"><div>'
-            + '<p class="font-semibold dark:text-white">' + (m.name || 'Medication') + '</p>'
+        + (hasStale ? ('<div class="p-2 rounded border border-amber-300 bg-amber-50 dark:bg-amber-950/40 text-sm text-amber-900 dark:text-amber-100 flex flex-wrap items-center justify-between gap-2">'
+            + '<span>Some medications are older than 1 year (kept on file). Refresh review dates if still accurate.</span>'
+            + (canEdit ? ('<button type="button" data-action="refresh-patient-medications" data-patient-id="' + patient.id + '" class="px-3 py-1 bg-amber-600 text-white rounded text-xs">Refresh all review dates</button>') : '')
+            + '</div>') : '')
+        + (meds.length ? meds.map(m => {
+            const stale = isMedicationStale(m);
+            return '<div class="p-3 border dark:border-gray-700 rounded-md ' + (stale ? 'border-amber-400 dark:border-amber-600' : '') + '"><div class="flex justify-between gap-2"><div>'
+            + '<p class="font-semibold dark:text-white">' + (m.name || 'Medication')
+            + (stale ? ' <span class="text-xs font-normal text-amber-700 dark:text-amber-300">(1+ year old)</span>' : '')
+            + '</p>'
             + '<p class="text-sm text-gray-600 dark:text-gray-400">Dose: ' + (m.dosage || '—') + ' · Freq: ' + (m.frequency || '—') + '</p>'
-            + '<p class="text-xs text-gray-500">Entered: ' + (m.enteredAt ? new Date(m.enteredAt).toLocaleString() : '—') + ' by ' + (m.enteredBy || '—') + '</p>'
+            + '<p class="text-sm text-gray-600 dark:text-gray-400">Last taken: ' + (m.lastTaken || '—') + '</p>'
+            + '<p class="text-xs text-gray-500">Entered: ' + (m.enteredAt ? new Date(m.enteredAt).toLocaleString() : '—') + ' by ' + (m.enteredBy || '—')
+            + ' · Reviewed: ' + (m.reviewedAt ? new Date(m.reviewedAt).toLocaleDateString() : '—') + '</p>'
             + (m.notes ? ('<p class="text-sm mt-1 dark:text-gray-300">' + m.notes + '</p>') : '')
-            + '</div>'
+            + '</div><div class="flex flex-col items-end gap-1">'
+            + (canEdit && stale ? ('<button type="button" data-action="refresh-one-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-amber-700 dark:text-amber-300 text-xs hover:underline">Refresh</button>') : '')
             + (canEdit ? ('<button type="button" data-action="remove-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-red-600 text-sm hover:underline">Remove</button>') : '')
-            + '</div></div>').join('') : '<p class="text-sm text-gray-500 dark:text-gray-400">No medications on file.</p>')
+            + '</div></div></div>';
+        }).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400">No medications on file.</p>')
         + (canEdit ? ('<form id="add-patient-medication-form" data-patient-id="' + patient.id + '" class="grid grid-cols-1 md:grid-cols-2 gap-2 p-3 border dark:border-gray-700 rounded-md bg-gray-50 dark:bg-gray-900">'
             + '<div class="md:col-span-2"><label class="text-xs font-medium dark:text-gray-300">Medication</label>'
             + '<input list="nasa-med-catalog" name="name" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Start typing…">'
             + '<datalist id="nasa-med-catalog">' + catalog.map(m => '<option value="' + m.name + '"></option>').join('') + '</datalist></div>'
             + '<div><label class="text-xs font-medium dark:text-gray-300">Dosage</label><input name="dosage" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 10mg"></div>'
-            + '<div><label class="text-xs font-medium dark:text-gray-300">Frequency</label><input name="frequency" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., once daily"></div>'
+            + '<div><label class="text-xs font-medium dark:text-gray-300">Frequency</label><input name="frequency" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., once daily / PRN"></div>'
             + '<div><label class="text-xs font-medium dark:text-gray-300">Start date</label><input type="date" name="startDate" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
-            + '<div><label class="text-xs font-medium dark:text-gray-300">Notes</label><input name="notes" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
+            + '<div><label class="text-xs font-medium dark:text-gray-300">Last taken (optional)</label><input type="date" name="lastTaken" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
+            + '<div class="md:col-span-2"><label class="text-xs font-medium dark:text-gray-300">Notes</label><input name="notes" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
             + '<div class="md:col-span-2"><button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 text-sm">Add medication</button></div>'
             + '</form>') : '')
         + '</div>';
@@ -3744,14 +3807,20 @@ const renderSiteTable = () => {
 const getSurveysHTML = () => `
         <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Surveys with Branching Logic</h2>
         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
-            <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Create New Survey</h3>
+            <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-2">Create New Survey</h3>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">Insert script tokens in question text: ${typeof SCRIPT_TOKEN_HELP !== 'undefined' ? SCRIPT_TOKEN_HELP : '{{site_name}} {{patient_name}} {{recruiter_name}} {{study_name}}'}. Auto-filled when taking a PSQ.</p>
             <form id="survey-creator-form" class="space-y-6">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Survey Title</label><input type="text" name="title" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 rounded-md shadow-sm p-2 bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Patient Intake Survey" required /></div>
                     <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 rounded-md shadow-sm p-2 bg-white dark:bg-gray-700 dark:text-white" required><option value="" disabled selected>Select a study</option>${state.studies.map(study => `<option value="${study.id}">${study.title}</option>`).join('')}</select></div>
                 </div>
                 <div id="questions-container" class="space-y-4"></div>
-                <button type="button" data-action="add-question" class="text-sm font-medium text-blue-600 dark:text-blue-400 p-2 hover:bg-blue-50 dark:hover:bg-gray-700 rounded-md">+ Add Question</button>
+                <div class="flex flex-wrap gap-2">
+                    <button type="button" data-action="add-question" class="text-sm font-medium text-blue-600 dark:text-blue-400 p-2 hover:bg-blue-50 dark:hover:bg-gray-700 rounded-md">+ Add Question</button>
+                    <button type="button" data-action="add-script-block" data-block="voicemail" class="text-sm font-medium text-indigo-600 dark:text-indigo-400 p-2 hover:bg-indigo-50 dark:hover:bg-gray-700 rounded-md">+ Voicemail Script</button>
+                    <button type="button" data-action="add-script-block" data-block="live" class="text-sm font-medium text-indigo-600 dark:text-indigo-400 p-2 hover:bg-indigo-50 dark:hover:bg-gray-700 rounded-md">+ Live Patient Script</button>
+                    <button type="button" data-action="add-script-block" data-block="overview" class="text-sm font-medium text-indigo-600 dark:text-indigo-400 p-2 hover:bg-indigo-50 dark:hover:bg-gray-700 rounded-md">+ Study Overview</button>
+                </div>
                 <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md">Create Survey</button>
             </form>
         </div>
@@ -3759,7 +3828,7 @@ const getSurveysHTML = () => `
             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 p-6">Existing Surveys</h3>
             <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                 <thead class="bg-gray-50 dark:bg-gray-700"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Title</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th></tr></thead>
-                <tbody class="dark:text-gray-300">${state.surveys.map(s => `<tr><td class="px-6 py-4">${s.title}</td><td class="px-6 py-4">${state.studies.find(study => study.id == s.studyId)?.title || 'N/A'}</td><td class="px-6 py-4"><button data-action="view-survey" data-id="${s.id}" class="text-blue-600 dark:text-blue-400 hover:underline">View Survey</button></td></tr>`).join('')}${state.surveys.length === 0 ? `<tr><td colspan="3" class="text-center text-gray-500 dark:text-gray-400 py-8">No surveys created yet.</td></tr>` : ''}</tbody>
+                <tbody class="dark:text-gray-300">${state.surveys.map(s => `<tr><td class="px-6 py-4">${s.title}</td><td class="px-6 py-4">${state.studies.find(study => study.id == s.studyId)?.title || 'N/A'}</td><td class="px-6 py-4 space-x-3"><button data-action="view-survey" data-id="${s.id}" class="text-blue-600 dark:text-blue-400 hover:underline">View</button><button data-action="edit-survey" data-id="${s.id}" class="text-indigo-600 dark:text-indigo-400 hover:underline">Edit</button></td></tr>`).join('')}${state.surveys.length === 0 ? `<tr><td colspan="3" class="text-center text-gray-500 dark:text-gray-400 py-8">No surveys created yet.</td></tr>` : ''}</tbody>
             </table>
         </div>`;
 const getPipelineHTML = () => `
@@ -4548,12 +4617,12 @@ const getPatientProfileHTML = (patient) => {
     if (patient.contactLogs && patient.contactLogs.length > 0) {
         contactLogHTML += patient.contactLogs.map(log => `
             <div class="mt-4 p-3 border dark:border-gray-700 rounded-lg">
-                <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Logged on: ${new Date(log.date).toLocaleString()}</p>
-                <p class="dark:text-gray-300"><strong>Outcome:</strong> ${phi(log.outcome)}</p>
+                <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Logged on: ${new Date(log.date).toLocaleString()}${log.loggedBy ? ' · by ' + phi(log.loggedBy) : ''}</p>
                 ${log.overallStatus ? `<p class="dark:text-gray-300"><strong>Status:</strong> ${phi(log.overallStatus)}</p>` : ''}
+                ${log.studyTitle ? `<p class="dark:text-gray-300"><strong>Study:</strong> ${phi(log.studyTitle)}</p>` : ''}
                 ${log.nqReason ? `<p class="dark:text-gray-300"><strong>NQ:</strong> ${phi(log.nqReason)}</p>` : ''}
                 ${log.niReason ? `<p class="dark:text-gray-300"><strong>NI:</strong> ${phi(log.niReason)}</p>` : ''}
-                <p class="dark:text-gray-300 mt-1"><strong>Notes:</strong> ${phi(log.notes)}</p>
+                ${log.notes ? `<p class="dark:text-gray-300 mt-1"><strong>Notes:</strong> ${phi(log.notes)}</p>` : ''}
             </div>
         `).join('');
     } else {
@@ -4563,12 +4632,16 @@ const getPatientProfileHTML = (patient) => {
     let appointmentHTML = '<p><strong>Appointment:</strong> Not Scheduled</p>';
     if (patient.appointment) {
         const visitStatus = patient.appointment.visitStatus || 'Scheduled';
+        const visitLabel = patient.appointment.visit || 'General';
+        const canEditThis = canEditAppointmentVisit(visitLabel);
         appointmentHTML = `
-            <p><strong>Appointment:</strong> ${phi(new Date(patient.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }))} (${patient.appointment.visit || 'General'})</p>
+            <p><strong>Appointment:</strong> ${phi(new Date(patient.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }))} (${visitLabel})</p>
             <p><strong>Visit Status:</strong> ${phi(visitStatus)}</p>
             <div class="flex gap-2 mt-2">
-                <button data-action="change-appointment" data-patient-id="${patient.id}" class="text-sm bg-yellow-500 text-white px-3 py-1 rounded hover:bg-yellow-600">Change</button>
-                <button data-action="cancel-appointment" data-patient-id="${patient.id}" class="text-sm bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600">Cancel</button>
+                ${canEditThis
+                    ? `<button data-action="change-appointment" data-patient-id="${patient.id}" class="text-sm bg-yellow-500 text-white px-3 py-1 rounded hover:bg-yellow-600">Change</button>
+                       <button data-action="cancel-appointment" data-patient-id="${patient.id}" class="text-sm bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600">Cancel</button>`
+                    : `<p class="text-xs text-amber-700 dark:text-amber-300">Recruiters can edit V1/screening only. Ask a CRC or Manager to change V2+ visits.</p>`}
             </div>
         `;
     }
@@ -4601,12 +4674,18 @@ const getPatientProfileHTML = (patient) => {
     const assignee = (state.managedUsers || []).find(u => u.id === patient.assignedToUserId);
     const appointmentsTabHTML = `
         <div class="space-y-3">
-            ${getPatientAppointments(patient).length ? getPatientAppointments(patient).map(a => `
+            ${getPatientAppointments(patient).length ? getPatientAppointments(patient).map(a => {
+                const visitLabel = a.visit || 'Visit';
+                const canEdit = canEditAppointmentVisit(visitLabel);
+                return `
                 <div class="p-3 border dark:border-gray-700 rounded-lg">
-                    <p class="font-medium dark:text-white">${a.visit || 'Visit'} — ${a.time ? new Date(a.time).toLocaleString() : 'TBD'}</p>
+                    <p class="font-medium dark:text-white">${visitLabel} — ${a.time ? new Date(a.time).toLocaleString() : 'TBD'}</p>
                     <p class="text-sm text-gray-500 dark:text-gray-400">Status: ${a.visitStatus || a.status || 'scheduled'} · Check-in: ${a.checkInStatus || 'not-checked-in'}</p>
-                </div>
-            `).join('') : '<p class="text-gray-500 dark:text-gray-400">No appointments on record.</p>'}
+                    ${canEdit
+                        ? ''
+                        : '<p class="text-xs text-amber-700 dark:text-amber-300 mt-1">View only for recruiters (V2+). CRC/Manager can edit.</p>'}
+                </div>`;
+            }).join('') : '<p class="text-gray-500 dark:text-gray-400">No appointments on record.</p>'}
             ${(patient.waitlist || []).length ? `<div class="mt-4"><h4 class="font-semibold dark:text-white">Waitlist</h4>${patient.waitlist.map(w => `<p class="text-sm dark:text-gray-300">${w.visit} — requested ${new Date(w.requestedAt).toLocaleDateString()}</p>`).join('')}</div>` : ''}
         </div>
     `;
@@ -4694,7 +4773,6 @@ const getPatientProfileHTML = (patient) => {
                 <button data-action="edit-patient" data-id="${patient.id}" class="bg-gray-500 text-white px-3 py-1.5 rounded-md hover:bg-gray-600 flex items-center text-sm font-medium">
                     <i data-lucide="edit" class="w-4 h-4 mr-2"></i> Edit
                 </button>
-                <button data-action="mark-patient-deceased" data-id="${patient.id}" class="bg-red-700 text-white px-3 py-1.5 rounded-md hover:bg-red-800 text-sm font-medium">Mark Deceased / Lock</button>
             `}
         </div>
         <div class="mb-4 border-b border-gray-200 dark:border-gray-700">
@@ -4737,7 +4815,7 @@ const getPatientProfileHTML = (patient) => {
                 </li>
                 <li class="mr-2" role="presentation">
                     <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'studyHistory' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
-                        data-tab-name="studyHistory" data-patient-id="${patient.id}" type="button" role="tab">Study Scheduling</button>
+                        data-tab-name="studyHistory" data-patient-id="${patient.id}" type="button" role="tab">Enrollment History</button>
                 </li>
                 <li class="mr-2" role="presentation">
                     <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'audit' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
@@ -4862,7 +4940,7 @@ const getPatientProfileHTML = (patient) => {
                 ${getMedicationsEditorHTML(patient, true)}
             </div>
             <div id="studyHistory-content" class="${state.currentPatientProfileTab === 'studyHistory' ? '' : 'hidden'} dark:text-gray-300">
-                <h3 class="font-semibold text-lg dark:text-white mb-3">Study Scheduling Record</h3>
+                <h3 class="font-semibold text-lg dark:text-white mb-3">Enrollment History</h3>
                 ${getStudySchedulingRecordHTML(patient)}
             </div>
             <div id="contactLog-content" class="${state.currentPatientProfileTab === 'contactLog' ? '' : 'hidden'} dark:text-gray-300">
@@ -4880,6 +4958,10 @@ const getPatientProfileHTML = (patient) => {
             <div id="communications-content" class="${state.currentPatientProfileTab === 'communications' ? '' : 'hidden'} dark:text-gray-300">${communicationsTabHTML}</div>
             <div id="audit-content" class="${state.currentPatientProfileTab === 'audit' ? '' : 'hidden'} dark:text-gray-300 max-h-96 overflow-y-auto">${auditTabHTML}</div>
         </div>
+        ${!isPatientProfileLocked(patient) ? `
+        <div class="mt-8 pt-4 border-t border-gray-200 dark:border-gray-700">
+            <button data-action="mark-patient-deceased" data-id="${patient.id}" class="w-full bg-red-700 text-white px-3 py-2 rounded-md hover:bg-red-800 text-sm font-medium">Mark Deceased / Lock Profile</button>
+        </div>` : ''}
     `;
 };
 const getBookingModalHTML = (patient, visitFilter = 'all') => {
@@ -6215,7 +6297,14 @@ const getEditSurveyModalHTML = (survey) => {
                     <div id="edit-q-${index}" class="p-4 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-700 relative question-block">
                         <button type="button" data-action="remove-question" data-q-id="edit-q-${index}" class="absolute top-2 right-2 p-1 text-red-500 hover:bg-red-100 dark:hover:bg-red-900 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
                         <label class="font-medium dark:text-white" id="edit-q-${index}-label">${q.text.length > 50 ? q.text.substring(0, 50) + '...' : q.text}</label>
-                        <input type="text" name="edit-q-${index}-text" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white mb-2" value="${q.text}" required oninput="updateQuestionLabel('edit-q-${index}')"/>
+                        <input type="text" name="edit-q-${index}-text" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white mb-2" value="${String(q.text || '').replace(/"/g, '&quot;')}" required oninput="updateQuestionLabel('edit-q-${index}')"/>
+                        <div class="mb-2">
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">PSQ Section Header</label>
+                            <select name="edit-q-${index}-section" class="mt-1 block w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                                <option value="">None</option>
+                                ${PSQ_SECTION_HEADERS.map(h => `<option value="${h}" ${q.section === h ? 'selected' : ''}>${h}</option>`).join('')}
+                            </select>
+                        </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Question Type</label>
                             <select name="edit-q-${index}-type" class="mt-1 block w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
@@ -6237,8 +6326,8 @@ const getEditSurveyModalHTML = (survey) => {
                             <label class="text-sm font-medium text-gray-600 dark:text-gray-400">Options</label>
                             ${q.options.map((opt, optIndex) => `
                                 <div class="flex items-center gap-2">
-                                    <input type="text" name="edit-q-${index}-option-text" class="flex-grow p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white" value="${opt.text}" required/>
-                                    ${q.type === 'single-select' ? `<select name="edit-q-${index}-option-next" class="w-48 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white"></select>` : ''}
+                                    <input type="text" name="edit-q-${index}-option-text" class="flex-grow p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white" value="${String(opt.text || '').replace(/"/g, '&quot;')}" required/>
+                                    ${q.type === 'single-select' || q.type === 'dropdown' ? `<select name="edit-q-${index}-option-next" data-selected-next="${opt.next || 'submit'}" class="w-48 p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white"></select>` : ''}
                                     <button type="button" data-action="remove-option" class="p-1 text-red-500 hover:bg-red-100 dark:hover:bg-red-900 rounded-full"><i data-lucide="x" class="w-3.5 h-3.5"></i></button>
                                 </div>
                             `).join('')}
@@ -6265,10 +6354,17 @@ const getSelectSurveyModalHTML = (patient) => {
     if (availableSurveys.length === 0) {
         return `<h2 class="text-2xl font-bold dark:text-white mb-4">Survey ${phiName(patient)}</h2><p class="dark:text-gray-300">No surveys available for the patient's assigned study.</p>`;
     }
+    const drafts = patient.surveyDrafts || [];
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-4">Select Survey for ${phiName(patient)}</h2>
         <div class="space-y-2">
-            ${availableSurveys.map(s => `<button data-action="start-survey" data-patient-id="${patient.id}" data-survey-id="${s.id}" class="w-full text-left p-3 border dark:border-gray-600 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 dark:text-white">${s.title}</button>`).join('')}
+            ${availableSurveys.map(s => {
+                const draft = drafts.find(d => d.surveyId === s.id);
+                return `<button data-action="start-survey" data-patient-id="${patient.id}" data-survey-id="${s.id}" class="w-full text-left p-3 border dark:border-gray-600 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 dark:text-white">
+                    <span class="font-medium">${s.title}</span>
+                    ${draft ? `<span class="ml-2 text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">Resume Q${(draft.currentQuestionIndex || 0) + 1}</span>` : ''}
+                </button>`;
+            }).join('')}
         </div>
     `;
 };
@@ -6311,17 +6407,25 @@ const getTakeSurveyModalHTML = () => {
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-2 break-words">${survey.title}</h2>
         ${section ? `<p class="text-xs uppercase tracking-wide text-blue-600 dark:text-blue-400 font-semibold mb-2">${section}</p>` : ''}
-        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">Question ${currentQuestionIndex + 1} of ${survey.questions.length} · Recruiter: ${vars['{{recruiter_name}}'] || '—'} · Site: ${vars['{{site_name}}'] || '—'}</p>
-        <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">Script tokens auto-fill: {{site_name}}, {{site_pi}}, {{site_address}}, {{site_compensation}}, {{patient_name}}, {{recruiter_name}}</p>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">Question ${currentQuestionIndex + 1} of ${survey.questions.length} · Recruiter: ${vars['{{recruiter_name}}'] || '—'} · Site: ${vars['{{site_name}}'] || '—'} · Study: ${vars['{{study_name}}'] || '—'}</p>
+        <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">Tokens auto-fill from patient site/study and your first name.</p>
         ${medHint}
         <form id="take-survey-form">
             <p class="text-lg font-semibold dark:text-white mb-4 break-words whitespace-normal">${questionText}</p>
             ${notesHTML}
             ${tableHTML}
             <div class="space-y-3 dark:text-gray-300">
-                ${(question.options || []).map((opt, index) => `
+                ${question.type === 'open-text' ? `
+                    <textarea name="answer" rows="4" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter response / script notes…"></textarea>
+                    <input type="hidden" name="answerNext" value="submit">
+                ` : question.type === 'dropdown' ? `
+                    <select name="answer" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="">Select…</option>
+                        ${(question.options || []).map(opt => `<option value="${String(opt.text).replace(/"/g, '&quot;')}" data-next="${opt.next || 'submit'}">${applyScriptVariables(opt.text, patient)}</option>`).join('')}
+                    </select>
+                ` : (question.options || []).map((opt, index) => `
                     <div>
-                        <input type="radio" id="option-${index}" name="answer" value="${opt.text}" data-next="${opt.next}" required class="mr-2">
+                        <input type="radio" id="option-${index}" name="answer" value="${String(opt.text).replace(/"/g, '&quot;')}" data-next="${opt.next || 'submit'}" required class="mr-2">
                         <label for="option-${index}" class="break-words whitespace-normal">${applyScriptVariables(opt.text, patient)}</label>
                     </div>
                 `).join('')}
@@ -6664,17 +6768,22 @@ const getAddContactLogModalHTML = (patientId) => {
     const patient = state.patients.find(p => p.id === patientId) || {};
     const nqOptions = getActiveReferenceList('nqReasons');
     const niOptions = getActiveReferenceList('niReasons');
+    const current = (patient.enrollments || []).find(e => e.status === 'current');
+    const study = current ? state.studies.find(s => s.id === current.studyId) : null;
+    const site = current ? state.sites.find(s => s.id === current.siteId) : null;
     return `
-        <h2 class="text-2xl font-bold dark:text-white mb-4">Add Contact Log</h2>
+        <h2 class="text-2xl font-bold dark:text-white mb-2">Add Contact Log</h2>
+        <div class="mb-4 p-3 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/40 text-sm dark:text-blue-100">
+            <p class="font-semibold text-base dark:text-white">${phiName(patient)}</p>
+            <p>DOB: ${formatDobDisplay(patient.dob) || '—'} · Phone: ${phi(patient.phoneNumber || '—')} · Email: ${phi(patient.email || '—')}</p>
+            <p>Study: ${study ? (study.title || study.name) : '—'} · Site: ${site ? site.name : '—'}</p>
+            <p class="text-xs text-gray-600 dark:text-gray-400 mt-1">Profile stays open behind this window.</p>
+        </div>
         <form id="add-contact-log-form" data-patient-id="${patientId}" class="space-y-4">
             <div>
-                <label class="block text-sm font-medium dark:text-gray-300">Call / Contact Outcome</label>
-                <input type="text" name="outcome" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="e.g., Left voicemail, Spoke with patient">
-            </div>
-            <div>
-                <label class="block text-sm font-medium dark:text-gray-300">Overall Status (optional)</label>
-                <select name="overallStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                    <option value="">No change (${patient.overallStatus || 'none'})</option>
+                <label class="block text-sm font-medium dark:text-gray-300">Overall Status *</label>
+                <select name="overallStatus" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    <option value="">Select status…</option>
                     ${OVERALL_STATUS_OPTIONS.map(s => `<option value="${s}" ${patient.overallStatus === s ? 'selected' : ''}>${s}</option>`).join('')}
                 </select>
             </div>
@@ -6694,7 +6803,7 @@ const getAddContactLogModalHTML = (patientId) => {
             </div>
             <div>
                 <label class="block text-sm font-medium dark:text-gray-300">Notes</label>
-                <textarea name="notes" rows="4" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input"></textarea>
+                <textarea name="notes" rows="4" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="Call details, voicemail, etc."></textarea>
             </div>
             <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700">Save Log</button>
         </form>
@@ -7835,26 +7944,48 @@ document.addEventListener('click', async (e) => {
                 openModal(getEnrollPatientFormModalHTML(patientId, studyId));
                 break;
             }
-            case 'cancel-appointment': 
+            case 'change-appointment': {
+                const patientForChange = state.patients.find(p => p.id === patientId);
+                const visitLabel = patientForChange?.appointment?.visit || '';
+                if (!canEditAppointmentVisit(visitLabel)) {
+                    showNotification('Recruiters can only edit V1/screening appointments. Ask a CRC or Manager for V2+.', 'error');
+                    break;
+                }
+                await cancelAppointment(patientId);
+                state.bookingCalendarDate = new Date();
+                openModal(getBookingModalHTML(patientForChange));
+                break;
+            }
+            case 'cancel-appointment': {
+                const patientForCancel = state.patients.find(p => p.id === patientId);
+                const visitCancel = patientForCancel?.appointment?.visit || '';
+                if (!canEditAppointmentVisit(visitCancel)) {
+                    showNotification('Recruiters can only cancel V1/screening appointments. Ask a CRC or Manager for V2+.', 'error');
+                    break;
+                }
                 await cancelAppointment(patientId);
                 closeModal();
                 break;
-            case 'change-appointment':
-                await cancelAppointment(patientId);
-                state.bookingCalendarDate = new Date();
-                openModal(getBookingModalHTML(state.patients.find(p => p.id === patientId)));
-                break;
+            }
             case 'start-survey': {
                 const patientForSurvey = state.patients.find(p => p.id === patientId);
                 const surveyForStart = state.surveys.find(s => s.id === surveyId);
-                const draft = (patientForSurvey?.surveyDrafts || []).find(d => d.surveyId === surveyId);
+                if (!patientForSurvey || !surveyForStart) {
+                    showNotification('Patient or survey not found.', 'error');
+                    break;
+                }
+                const draft = (patientForSurvey.surveyDrafts || []).find(d => d.surveyId === surveyId);
+                const maxIdx = Math.max((surveyForStart.questions || []).length - 1, 0);
+                let startIdx = draft ? (parseInt(draft.currentQuestionIndex, 10) || 0) : 0;
+                if (startIdx < 0) startIdx = 0;
+                if (startIdx > maxIdx) startIdx = maxIdx;
                 state.currentSurveyState = {
                     patient: patientForSurvey,
                     survey: surveyForStart,
-                    currentQuestionIndex: draft?.currentQuestionIndex || 0,
+                    currentQuestionIndex: startIdx,
                     answers: draft?.answers ? [...draft.answers] : []
                 };
-                if (draft) showNotification('Resuming saved PSQ progress.', 'info');
+                if (draft) showNotification('Resuming PSQ at question ' + (startIdx + 1) + '.', 'info');
                 openModal(getTakeSurveyModalHTML());
                 break;
             }
@@ -8009,6 +8140,30 @@ document.addEventListener('click', async (e) => {
             }
             case 'quick-add-patient-modal': openModal(getQuickAddPatientHTML(), true); break;
             case 'add-question': addQuestionToSurveyForm(); break;
+            case 'add-script-block': {
+                const block = actionButton.dataset.block;
+                const sectionMap = {
+                    voicemail: 'Voicemail Script',
+                    live: 'Live Patient Script',
+                    overview: 'Study Overview',
+                };
+                const section = sectionMap[block] || 'Study Overview';
+                addQuestionToSurveyForm();
+                const container = getActiveSurveyQuestionsContainer();
+                const last = container && container.querySelector('.question-block:last-child');
+                if (last) {
+                    const sectionSelect = last.querySelector('select[name$="-section"]');
+                    if (sectionSelect) sectionSelect.value = section;
+                    const textInput = last.querySelector('input[name$="-text"]');
+                    if (textInput && !textInput.value) {
+                        textInput.value = section + ' — Hello {{patient_first_name}}, this is {{recruiter_name}} calling from {{site_name}} about {{study_name}}.';
+                        textInput.dispatchEvent(new Event('input'));
+                    }
+                    const typeSelect = last.querySelector('select[name$="-type"]');
+                    if (typeSelect) typeSelect.value = 'open-text';
+                }
+                break;
+            }
             case 'add-option': addOptionToQuestion(actionButton.dataset.qId, actionButton.dataset.type); break; // Pass type
             case 'remove-question': 
                 document.getElementById(qId).remove();
@@ -8018,7 +8173,15 @@ document.addEventListener('click', async (e) => {
                 actionButton.parentElement.remove();
                 break;
             case 'view-survey': openModal(getViewSurveyModalHTML(state.surveys.find(s => s.id === id))); break;
-            case 'edit-survey': openModal(getEditSurveyModalHTML(state.surveys.find(s => s.id === id))); break;
+            case 'edit-survey': {
+                openModal(getEditSurveyModalHTML(state.surveys.find(s => s.id === id)));
+                setTimeout(() => {
+                    updateBranchingLogicDropdowns();
+                    setupDragAndDrop();
+                    if (typeof lucide !== 'undefined') lucide.createIcons();
+                }, 50);
+                break;
+            }
             case 'export-csv': exportToCSV(); break;
             case 'export-surveys-csv': exportSurveysToCSV(); break;
             case 'export-five9-csv': exportFive9CSV(); break;
@@ -8078,19 +8241,40 @@ document.addEventListener('click', async (e) => {
             case 'save-survey-progress': {
                 const s = state.currentSurveyState;
                 if (!s?.patient || !s?.survey) break;
+                // Capture current unanswered question selection if present
+                const formEl = document.getElementById('take-survey-form');
+                let answers = [...(s.answers || [])];
+                let qIndex = s.currentQuestionIndex || 0;
+                if (formEl) {
+                    const selected = formEl.querySelector('input[name="answer"]:checked');
+                    const question = s.survey.questions[qIndex];
+                    if (selected && question) {
+                        const already = answers[answers.length - 1];
+                        if (!already || already.question !== question.text) {
+                            answers.push({ question: question.text, answer: selected.value, next: selected.dataset.next || '' });
+                        }
+                    }
+                }
+                s.answers = answers;
                 const drafts = [...(s.patient.surveyDrafts || []).filter(d => d.surveyId !== s.survey.id), {
                     surveyId: s.survey.id,
                     surveyTitle: s.survey.title,
-                    currentQuestionIndex: s.currentQuestionIndex,
-                    answers: s.answers || [],
+                    currentQuestionIndex: qIndex,
+                    answers,
                     savedAt: new Date().toISOString(),
                     savedBy: getCurrentActor()
                 }];
                 try {
                     await updatePatientFields(s.patient.id, { surveyDrafts: drafts }, 'survey_progress_saved', s.survey.title);
-                    await loadAllData();
-                    state.currentSurveyState.patient = state.patients.find(p => p.id === s.patient.id) || s.patient;
-                    showNotification('PSQ progress saved. You can resume later.', 'success');
+                    // Soft refresh patient only — do not wipe modal / reset to Q1
+                    const refreshed = await getDocument('patients', s.patient.id).catch(() => null);
+                    if (refreshed) {
+                        const normalized = normalizePatientRecord(convertPatientFromAzureFormat(refreshed));
+                        const idx = state.patients.findIndex(p => p.id === s.patient.id);
+                        if (idx >= 0) state.patients[idx] = normalized;
+                        s.patient = normalized;
+                    }
+                    showNotification('PSQ progress saved at question ' + (qIndex + 1) + '. Resume anytime.', 'success');
                     closeModal();
                 } catch (err) {
                     showNotification(err.message || 'Could not save progress.', 'error');
@@ -8110,6 +8294,39 @@ document.addEventListener('click', async (e) => {
                     openSidePanel(getPatientProfileHTML(state.patients.find(x => x.id === pid)), true);
                 } catch (err) {
                     showNotification(err.message || 'Could not remove medication.', 'error');
+                }
+                break;
+            }
+            case 'refresh-patient-medications': {
+                const pid = actionButton.dataset.patientId;
+                const p = state.patients.find(x => x.id === pid);
+                if (!p) break;
+                try {
+                    const now = new Date().toISOString();
+                    const medications = (p.medications || []).map(m => ({ ...m, reviewedAt: now }));
+                    await updatePatientFields(pid, { medications }, 'medications_review_refreshed', 'all');
+                    await loadAllData();
+                    state.currentPatientProfileTab = 'medications';
+                    openSidePanel(getPatientProfileHTML(state.patients.find(x => x.id === pid)), true);
+                    showNotification('Medication review dates refreshed.', 'success');
+                } catch (err) {
+                    showNotification(err.message || 'Could not refresh medications.', 'error');
+                }
+                break;
+            }
+            case 'refresh-one-medication': {
+                const pid = actionButton.dataset.patientId;
+                const medId = actionButton.dataset.medId;
+                const p = state.patients.find(x => x.id === pid);
+                if (!p) break;
+                try {
+                    const medications = (p.medications || []).map(m => m.id === medId ? { ...m, reviewedAt: new Date().toISOString() } : m);
+                    await updatePatientFields(pid, { medications }, 'medication_review_refreshed', medId);
+                    await loadAllData();
+                    state.currentPatientProfileTab = 'medications';
+                    openSidePanel(getPatientProfileHTML(state.patients.find(x => x.id === pid)), true);
+                } catch (err) {
+                    showNotification(err.message || 'Could not refresh medication.', 'error');
                 }
                 break;
             }
@@ -8632,8 +8849,10 @@ document.addEventListener('submit', async (e) => {
                     dosage: String(data.dosage || '').trim(),
                     frequency: String(data.frequency || '').trim(),
                     startDate: data.startDate || '',
+                    lastTaken: data.lastTaken || '',
                     notes: String(data.notes || '').trim(),
                     enteredAt: new Date().toISOString(),
+                    reviewedAt: new Date().toISOString(),
                     enteredBy: getCurrentActor()
                 };
                 const medications = [...(patient.medications || []), med];
@@ -8710,30 +8929,49 @@ document.addEventListener('submit', async (e) => {
         }
         case 'add-contact-log-form': {
             const patientId = form.dataset.patientId;
+            if (!data.overallStatus) {
+                showNotification('Overall Status is required.', 'error');
+                return;
+            }
+            const patient = state.patients.find(p => p.id === patientId);
+            const current = (patient?.enrollments || []).find(e => e.status === 'current');
+            const study = current ? state.studies.find(s => s.id === current.studyId) : null;
+            const studyTitle = study?.title || study?.name || '';
             const newLog = {
                 date: new Date().toISOString(),
-                outcome: data.outcome,
-                notes: data.notes,
+                outcome: data.overallStatus,
+                notes: data.notes || '',
                 overallStatus: data.overallStatus || '',
                 nqReason: data.nqReason || '',
                 niReason: data.niReason || '',
+                studyId: current?.studyId || null,
+                studyTitle,
+                loggedBy: getCurrentActor(),
             };
-            const patient = state.patients.find(p => p.id === patientId);
             if (patient) {
                 const pipelineStage = patient.pipelineStage === 'lead' ? 'contacted' : patient.pipelineStage;
                 const updates = {
                     contactLogs: [...(patient.contactLogs || []), newLog],
                     pipelineStage
                 };
-                if (data.overallStatus) updates.overallStatus = data.overallStatus;
-                if (data.nqReason) updates.nqReason = data.nqReason;
-                if (data.niReason) updates.niReason = data.niReason;
+                updates.overallStatus = data.overallStatus;
+                if (data.nqReason) {
+                    updates.nqReason = data.nqReason;
+                    updates.nqStudyTitle = studyTitle;
+                }
+                if (data.niReason) {
+                    updates.niReason = data.niReason;
+                    updates.niStudyTitle = studyTitle;
+                }
                 if (data.overallStatus === 'Not qualified') {
                     updates.status = 'Screen Fail';
                     updates.pipelineStage = 'screen_fail';
                     if (data.nqReason) updates.sfReason = data.nqReason;
                 } else if (data.overallStatus === 'Not interested') {
-                    updates.registryStatus = patient.registryStatus === 'Do Not Call' ? patient.registryStatus : patient.registryStatus;
+                    if (data.niReason === 'Do Not Call') {
+                        updates.registryStatus = 'Do Not Call';
+                        updates.doNotContact = true;
+                    }
                 } else if (data.overallStatus === 'Scheduled') {
                     updates.pipelineStage = 'scheduled';
                 } else if (data.overallStatus === 'Call Back') {
@@ -9229,14 +9467,34 @@ document.addEventListener('submit', async (e) => {
         case 'take-survey-form': {
             const { survey, patient, currentQuestionIndex, answers } = state.currentSurveyState;
             const question = survey.questions[currentQuestionIndex];
-            const selectedOption = form.querySelector('input[name="answer"]:checked');
-            if (!selectedOption) {
-                console.error('Please select an option.');
-                return;
+            let answer = '';
+            let nextQuestionTarget = 'submit';
+            if (question.type === 'open-text') {
+                answer = String(form.querySelector('[name="answer"]')?.value || '').trim();
+                if (!answer) {
+                    showNotification('Please enter a response.', 'error');
+                    return;
+                }
+                nextQuestionTarget = form.querySelector('[name="answerNext"]')?.value || 'submit';
+            } else if (question.type === 'dropdown') {
+                const sel = form.querySelector('select[name="answer"]');
+                answer = String(sel?.value || '').trim();
+                if (!answer) {
+                    showNotification('Please select an option.', 'error');
+                    return;
+                }
+                const opt = sel.options[sel.selectedIndex];
+                nextQuestionTarget = opt?.dataset?.next || 'submit';
+            } else {
+                const selectedOption = form.querySelector('input[name="answer"]:checked');
+                if (!selectedOption) {
+                    showNotification('Please select an option.', 'error');
+                    return;
+                }
+                answer = selectedOption.value;
+                nextQuestionTarget = selectedOption.dataset.next;
             }
-            const answer = selectedOption.value;
             answers.push({ question: question.text, answer });
-            const nextQuestionTarget = selectedOption.dataset.next;
             const endSurvey = async (outcome) => {
                 const surveyResult = {
                     surveyId: survey.id,
@@ -9247,17 +9505,22 @@ document.addEventListener('submit', async (e) => {
                 };
                 const eligibility = evaluateSurveyEligibility(survey, answers);
                 const inferred = inferOverallStatusFromSurvey(outcome, answers);
+                const study = state.studies.find(s => s.id === survey.studyId);
+                const studyTitle = study?.title || study?.name || '';
                 const updates = {
                     surveyResults: [...(patient.surveyResults || []), surveyResult],
                     surveyDrafts: (patient.surveyDrafts || []).filter(d => d.surveyId !== survey.id),
                     ...inferred
                 };
+                if (updates.nqReason) updates.nqStudyTitle = studyTitle;
+                if (updates.niReason) updates.niStudyTitle = studyTitle;
                 if (eligibility.status === 'ineligible' || outcome === 'Fail') {
                     updates.eligibilityStatus = 'ineligible';
                     updates.status = 'Screen Fail';
                     updates.pipelineStage = 'screen_fail';
                     updates.overallStatus = updates.overallStatus || 'Not qualified';
                     updates.nqReason = updates.nqReason || eligibility.reasons.join('; ') || 'Failed pre-screen survey';
+                    updates.nqStudyTitle = studyTitle;
                     updates.sfReason = eligibility.reasons.join('; ') || 'Failed pre-screen survey';
                 } else if (eligibility.status === 'pi_review') {
                     updates.eligibilityStatus = 'pi_review';
@@ -9791,6 +10054,7 @@ document.addEventListener('submit', async (e) => {
                 const text = form.querySelector(`input[name="${qId}-text"]`).value;
                 const type = form.querySelector(`select[name="${qId}-type"]`).value;
                 const note = form.querySelector(`textarea[name="${qId}-note"]`)?.value || '';
+                const section = form.querySelector(`select[name="${qId}-section"]`)?.value || '';
                 const tableData = form.querySelector(`textarea[name="${qId}-table"]`)?.value || '';
                 
                 // Parse table data from CSV format
@@ -9812,6 +10076,10 @@ document.addEventListener('submit', async (e) => {
                     });
                 });
                 const question = { id: index + 1, text, type, options };
+                if (section) question.section = section;
+                if (note) question.note = note;
+                if (table) question.table = table;
+                questions.push(question);
                 if (note) question.note = note;
                 if (table) question.table = table;
                 questions.push(question);
@@ -9988,8 +10256,11 @@ document.addEventListener('submit', async (e) => {
     }
 });
 // --- SURVEY LOGIC ---
+const getActiveSurveyQuestionsContainer = () =>
+    document.getElementById('edit-questions-container') || document.getElementById('questions-container');
+
 const updateBranchingLogicDropdowns = () => {
-    const questionsContainer = document.getElementById('questions-container');
+    const questionsContainer = getActiveSurveyQuestionsContainer();
     if (!questionsContainer) return;
     const questionElements = questionsContainer.querySelectorAll('.question-block');
     const questionOptions = Array.from(questionElements).map((el, index) => {
@@ -9997,7 +10268,7 @@ const updateBranchingLogicDropdowns = () => {
     });
     const allDropdowns = questionsContainer.querySelectorAll('select[name$="-option-next"]');
     allDropdowns.forEach(dropdown => {
-        const currentValue = dropdown.value;
+        const currentValue = dropdown.dataset.selectedNext || dropdown.value;
         dropdown.innerHTML = `
             <option value="submit">End - Completed</option>
             <option value="pass">End - Pass</option>
@@ -10006,11 +10277,14 @@ const updateBranchingLogicDropdowns = () => {
         questionOptions.forEach(opt => {
             dropdown.innerHTML += `<option value="${opt.value}">${opt.text}</option>`;
         });
-        dropdown.value = currentValue;
+        if (currentValue) {
+            dropdown.value = currentValue;
+            dropdown.dataset.selectedNext = currentValue;
+        }
     });
 };
 const addQuestionToSurveyForm = () => {
-    const container = document.getElementById('questions-container');
+    const container = getActiveSurveyQuestionsContainer();
     if (!container) return;
     const qId = `q-${Date.now()}`;
     const questionIndex = container.children.length + 1;
@@ -10077,7 +10351,7 @@ const updateQuestionLabel = (qId) => {
 
 // Drag and drop functionality for question reordering
 const setupDragAndDrop = () => {
-    const container = document.getElementById('questions-container');
+    const container = getActiveSurveyQuestionsContainer();
     if (!container) return;
     
     const questions = container.querySelectorAll('.question-block');
@@ -10104,7 +10378,7 @@ const handleDragOver = (e) => {
 const handleDrop = (e) => {
     e.preventDefault();
     if (draggedElement && e.target !== draggedElement) {
-        const container = document.getElementById('questions-container');
+        const container = getActiveSurveyQuestionsContainer();
         const afterElement = getDragAfterElement(container, e.clientY);
         if (afterElement == null) {
             container.appendChild(draggedElement);
@@ -10570,10 +10844,15 @@ const loadOperationalPatients = async () => {
     }
 };
 
-const loadAllData = async () => {
+const loadAllData = async (options = {}) => {
+    const silent = options.silent === true;
     try {
         const onRegistry = state.activeTab === 'registry';
         if (onRegistry) preserveRegistryFormState();
+
+        const preserveUi = silent || !!state.currentSurveyState
+            || (modalContainer && !modalContainer.classList.contains('hidden'))
+            || state.activeTab === 'surveys';
 
         const [studies, sites, schedules, surveys, patientLoad] = await Promise.all([
             fetchData('studies'),
@@ -10618,8 +10897,17 @@ const loadAllData = async () => {
         
         // Check if we're running in offline mode
         const isOfflineMode = state.studies.length === 0 && state.sites.length === 0 && state.patients.length === 0;
-        if (isOfflineMode) {
+        if (isOfflineMode && !silent) {
             showNotification('Running in offline mode - data will be saved locally', 'info');
+        }
+
+        // Do not remount Surveys tab / open modals / in-progress PSQ (UAT-032/033)
+        if (preserveUi) {
+            if (state.currentSurveyState?.patient?.id) {
+                const refreshedPatient = state.patients.find(p => p.id === state.currentSurveyState.patient.id);
+                if (refreshedPatient) state.currentSurveyState.patient = refreshedPatient;
+            }
+            return;
         }
 
         if (onRegistry && state.activeTab === 'registry' && document.getElementById('registry-conditions-container')) {
@@ -10634,7 +10922,7 @@ const loadAllData = async () => {
         render();
     } catch (error) {
         console.error('Error loading data:', error);
-        showNotification('Failed to load data from server', 'error');
+        if (!silent) showNotification('Failed to load data from server', 'error');
     }
 };
 
@@ -10649,7 +10937,7 @@ const setupDataRefresh = () => {
         if (!isRefreshingData) {
             isRefreshingData = true;
             try {
-                await loadAllData();
+                await loadAllData({ silent: true });
             } catch (error) {
                 console.error('NASA: Background data refresh failed:', error);
             } finally {

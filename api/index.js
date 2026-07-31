@@ -542,7 +542,7 @@ const validatePatientsSchema = (data) => {
         errors.push('exclusionCriteriaMet must be a boolean');
     }
 
-    ['appointments', 'tasks', 'consentRecords', 'communications', 'waitlist', 'auditTrail', 'visitLogs', 'completedVisits'].forEach((field) => {
+    ['appointments', 'tasks', 'consentRecords', 'communications', 'waitlist', 'auditTrail', 'visitLogs', 'completedVisits', 'surveyDrafts', 'medications', 'tags', 'pendingConsentLinks'].forEach((field) => {
         if (patient[field] !== undefined && !Array.isArray(patient[field])) {
             errors.push(`${field} must be an array`);
         }
