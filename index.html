@@ -835,11 +835,16 @@ const formatDobDisplay = (dob) => {
 };
 
 const formatPhoneFive9 = (phone) => {
-    const digits = String(phone || '').replace(/\D/g, '');
+    // Strip to digits only; US numbers -> 1 + 10 digits (e.g. 17153074271)
+    let digits = String(phone || '').replace(/\D/g, '');
     if (!digits) return '';
+    // Drop a leading +1 / 1 country code duplicates if someone pasted 11+ digits oddly
+    if (digits.length > 11 && digits.startsWith('1')) digits = digits.slice(-11);
+    if (digits.length > 11) digits = digits.slice(-10);
     if (digits.length === 11 && digits.startsWith('1')) return digits;
     if (digits.length === 10) return '1' + digits;
-    return digits.startsWith('1') ? digits : ('1' + digits);
+    // Already has country code or incomplete — return digits only (no punctuation)
+    return digits;
 };
 
 const getPatientPrimarySite = (patient) => {
@@ -3605,7 +3610,7 @@ const exportParticipants = () => {
                 `"${siteName}"`,
                 `"${appointmentInfo}"`,
                 `"${p.email || 'N/A'}"`,
-                `"${p.phoneNumber || 'N/A'}"`,
+                `${formatPhoneFive9(p.phoneNumber) || ''}`,
                 `"${p.dob || 'N/A'}"`
             ];
             csvRows.push(row.join(','));
@@ -6393,10 +6398,21 @@ const getSelectSurveyModalHTML = (patient) => {
         <div class="space-y-2">
             ${availableSurveys.map(s => {
                 const draft = drafts.find(d => d.surveyId === s.id);
-                return `<button data-action="start-survey" data-patient-id="${patient.id}" data-survey-id="${s.id}" class="w-full text-left p-3 border dark:border-gray-600 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 dark:text-white">
-                    <span class="font-medium">${s.title}</span>
-                    ${draft ? `<span class="ml-2 text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">Resume Q${(draft.currentQuestionIndex || 0) + 1}</span>` : ''}
-                </button>`;
+                return `<div class="border dark:border-gray-600 rounded-md p-3 dark:text-white">
+                    <div class="flex items-center justify-between gap-2 flex-wrap">
+                        <div>
+                            <span class="font-medium">${s.title}</span>
+                            ${draft ? `<span class="ml-2 text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">Saved at Q${(draft.currentQuestionIndex || 0) + 1} · ${(draft.answers || []).length} answers</span>` : ''}
+                        </div>
+                        <div class="flex gap-2">
+                            ${draft
+                                ? `<button type="button" data-action="start-survey" data-patient-id="${patient.id}" data-survey-id="${s.id}" class="text-sm bg-amber-600 text-white px-3 py-1.5 rounded hover:bg-amber-700">Resume</button>
+                            <button type="button" data-action="start-survey" data-patient-id="${patient.id}" data-survey-id="${s.id}" data-restart="1" class="text-sm bg-gray-500 text-white px-3 py-1.5 rounded hover:bg-gray-600">Start Over</button>`
+                                : `<button type="button" data-action="start-survey" data-patient-id="${patient.id}" data-survey-id="${s.id}" class="text-sm bg-green-600 text-white px-3 py-1.5 rounded hover:bg-green-700">Start</button>`}
+                        </div>
+                    </div>
+                    ${draft?.savedAt ? `<p class="text-xs text-gray-500 mt-1">Last saved ${new Date(draft.savedAt).toLocaleString()}${draft.savedBy ? ' by ' + draft.savedBy : ''}</p>` : ''}
+                </div>`;
             }).join('')}
         </div>
     `;
@@ -6404,6 +6420,7 @@ const getSelectSurveyModalHTML = (patient) => {
 const getTakeSurveyModalHTML = () => {
     const { survey, patient, currentQuestionIndex, answers } = state.currentSurveyState;
     const question = survey.questions[currentQuestionIndex];
+    const priorAnswer = (answers || []).find(a => a.question === question.text)?.answer || '';
     const section = question.section || question.header || '';
     const questionText = applyScriptVariables(question.text || '', patient);
     const noteText = applyScriptVariables(question.note || '', patient);
@@ -6456,16 +6473,16 @@ const getTakeSurveyModalHTML = () => {
             ${tableHTML}
             <div class="space-y-3 dark:text-gray-300">
                 ${question.type === 'open-text' ? `
-                    <textarea name="answer" rows="4" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter response / script notes…"></textarea>
+                    <textarea name="answer" rows="4" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Enter response / script notes…">${priorAnswer.replace(/</g, '&lt;')}</textarea>
                     <input type="hidden" name="answerNext" value="${(question.options && question.options[0] && question.options[0].next) || (currentQuestionIndex + 2 <= survey.questions.length ? String(currentQuestionIndex + 2) : 'submit')}">
                 ` : question.type === 'dropdown' ? `
                     <select name="answer" required class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                         <option value="">Select…</option>
-                        ${(question.options || []).map(opt => `<option value="${String(opt.text).replace(/"/g, '&quot;')}" data-next="${opt.next || 'submit'}">${applyScriptVariables(opt.text, patient)}</option>`).join('')}
+                        ${(question.options || []).map(opt => `<option value="${String(opt.text).replace(/"/g, '&quot;')}" data-next="${opt.next || 'submit'}" ${priorAnswer === opt.text ? 'selected' : ''}>${applyScriptVariables(opt.text, patient)}</option>`).join('')}
                     </select>
                 ` : (question.options || []).map((opt, index) => `
                     <div>
-                        <input type="radio" id="option-${index}" name="answer" value="${String(opt.text).replace(/"/g, '&quot;')}" data-next="${opt.next || 'submit'}" required class="mr-2">
+                        <input type="radio" id="option-${index}" name="answer" value="${String(opt.text).replace(/"/g, '&quot;')}" data-next="${opt.next || 'submit'}" ${priorAnswer === opt.text ? 'checked' : ''} required class="mr-2">
                         <label for="option-${index}" class="break-words whitespace-normal">${applyScriptVariables(opt.text, patient)}</label>
                     </div>
                 `).join('')}
@@ -8016,17 +8033,18 @@ document.addEventListener('click', async (e) => {
                     break;
                 }
                 const draft = (patientForSurvey.surveyDrafts || []).find(d => d.surveyId === surveyId);
+                const forceRestart = actionButton.dataset.restart === '1';
                 const maxIdx = Math.max((surveyForStart.questions || []).length - 1, 0);
-                let startIdx = draft ? (parseInt(draft.currentQuestionIndex, 10) || 0) : 0;
+                let startIdx = (!forceRestart && draft) ? (parseInt(draft.currentQuestionIndex, 10) || 0) : 0;
                 if (startIdx < 0) startIdx = 0;
                 if (startIdx > maxIdx) startIdx = maxIdx;
                 state.currentSurveyState = {
                     patient: patientForSurvey,
                     survey: surveyForStart,
                     currentQuestionIndex: startIdx,
-                    answers: draft?.answers ? [...draft.answers] : []
+                    answers: (!forceRestart && draft?.answers) ? [...draft.answers] : []
                 };
-                if (draft) showNotification('Resuming PSQ at question ' + (startIdx + 1) + '.', 'info');
+                if (!forceRestart && draft) showNotification('Resuming PSQ at question ' + (startIdx + 1) + ' with ' + (draft.answers?.length || 0) + ' saved answer(s).', 'info');
                 openModal(getTakeSurveyModalHTML());
                 break;
             }
@@ -8290,41 +8308,66 @@ document.addEventListener('click', async (e) => {
             case 'save-survey-progress': {
                 const s = state.currentSurveyState;
                 if (!s?.patient || !s?.survey) break;
-                // Capture current unanswered question selection if present
                 const formEl = document.getElementById('take-survey-form');
                 let answers = [...(s.answers || [])];
                 let qIndex = s.currentQuestionIndex || 0;
-                if (formEl) {
+                const question = s.survey.questions[qIndex];
+                // Capture whatever is currently on screen (radio, dropdown, open-text, script)
+                if (formEl && question) {
+                    let currentAnswer = '';
+                    let currentNext = '';
                     const selected = formEl.querySelector('input[name="answer"]:checked');
-                    const question = s.survey.questions[qIndex];
-                    if (selected && question) {
-                        const already = answers[answers.length - 1];
-                        if (!already || already.question !== question.text) {
-                            answers.push({ question: question.text, answer: selected.value, next: selected.dataset.next || '' });
-                        }
+                    const dropdown = formEl.querySelector('select[name="answer"]');
+                    const textArea = formEl.querySelector('textarea[name="answer"]');
+                    const hiddenAnswer = formEl.querySelector('input[name="answer"][type="hidden"]');
+                    if (selected) {
+                        currentAnswer = selected.value;
+                        currentNext = selected.dataset.next || '';
+                    } else if (dropdown && dropdown.value) {
+                        currentAnswer = dropdown.value;
+                        currentNext = dropdown.options[dropdown.selectedIndex]?.dataset?.next || '';
+                    } else if (textArea && String(textArea.value || '').trim()) {
+                        currentAnswer = String(textArea.value).trim();
+                        currentNext = formEl.querySelector('[name="answerNext"]')?.value || '';
+                    } else if (hiddenAnswer && String(hiddenAnswer.value || '').trim()) {
+                        currentAnswer = String(hiddenAnswer.value).trim();
+                        currentNext = formEl.querySelector('[name="answerNext"]')?.value || '';
+                    }
+                    if (currentAnswer) {
+                        const existingIdx = answers.findIndex(a => a.question === question.text);
+                        const entry = { question: question.text, answer: currentAnswer, next: currentNext };
+                        if (existingIdx >= 0) answers[existingIdx] = entry;
+                        else answers.push(entry);
                     }
                 }
                 s.answers = answers;
-                const drafts = [...(s.patient.surveyDrafts || []).filter(d => d.surveyId !== s.survey.id), {
+                const draftRecord = {
                     surveyId: s.survey.id,
                     surveyTitle: s.survey.title,
                     currentQuestionIndex: qIndex,
                     answers,
                     savedAt: new Date().toISOString(),
                     savedBy: getCurrentActor()
-                }];
+                };
+                const drafts = [...(s.patient.surveyDrafts || []).filter(d => d.surveyId !== s.survey.id), draftRecord];
                 try {
-                    await updatePatientFields(s.patient.id, { surveyDrafts: drafts }, 'survey_progress_saved', s.survey.title);
-                    // Soft refresh patient only — do not wipe modal / reset to Q1
+                    await updatePatientFields(s.patient.id, { surveyDrafts: drafts }, 'survey_progress_saved', s.survey.title + ' @ Q' + (qIndex + 1));
+                    // Keep local patient + survey state in sync so Resume works immediately
+                    const idx = state.patients.findIndex(p => p.id === s.patient.id);
+                    if (idx >= 0) {
+                        state.patients[idx] = { ...state.patients[idx], surveyDrafts: drafts };
+                        s.patient = state.patients[idx];
+                    }
                     const refreshed = await getDocument('patients', s.patient.id).catch(() => null);
                     if (refreshed) {
                         const normalized = normalizePatientRecord(convertPatientFromAzureFormat(refreshed));
-                        const idx = state.patients.findIndex(p => p.id === s.patient.id);
                         if (idx >= 0) state.patients[idx] = normalized;
                         s.patient = normalized;
                     }
-                    showNotification('PSQ progress saved at question ' + (qIndex + 1) + '. Resume anytime.', 'success');
                     closeModal();
+                    openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === s.patient.id) || s.patient), true);
+                    openModal(getSelectSurveyModalHTML(state.patients.find(p => p.id === s.patient.id) || s.patient));
+                    showNotification('Progress saved at question ' + (qIndex + 1) + '. Click the survey again to Resume.', 'success');
                 } catch (err) {
                     showNotification(err.message || 'Could not save progress.', 'error');
                 }
@@ -10899,6 +10942,7 @@ const exportFive9CSV = () => {
         patients.forEach(p => {
             const num = formatPhoneFive9(p.phoneNumber);
             if (!num) return;
+            // number column: plain digits only (17153074271) — no quotes/punctuation
             rows.push([
                 num,
                 '"' + String(p.firstName || '').replace(/"/g, '""') + '"',
@@ -10918,7 +10962,7 @@ const exportFive9CSV = () => {
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        showNotification('Five9 phone export ready (numbers prefixed with 1).', 'success');
+        showNotification('Five9 export ready — phones as plain digits (e.g. 17153074271).', 'success');
     } catch (error) {
         console.error(error);
         showNotification('Five9 export failed.', 'error');
@@ -10947,9 +10991,14 @@ const exportToCSV = () => {
                     value = currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A';
                 } else if (header === 'currentSite') {
                     value = currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A';
+                } else if (header === 'phoneNumber') {
+                    // Export as plain digits with country code (17153074271); UI can stay formatted
+                    value = formatPhoneFive9(p.phoneNumber) || '';
                 } else {
                     value = p[header];
                 }
+                // Phone: bare digits, no quotes — Five9 / dialer friendly
+                if (header === 'phoneNumber') return String(value || '');
                 return `"${(value || '').toString().replace(/"/g, '""')}"`;
             });
             csvRows.push(row.join(','));
