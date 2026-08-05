@@ -3064,6 +3064,16 @@ async function crudHandler(context, request, containerName) {
                         processEmailTriggers(context, { triggerType: 'shift_created_missing_role', event: createdItem }).catch((triggerErr) => {
                             context.log.warn('processEmailTriggers (shift_created_missing_role) failed:', triggerErr.message);
                         });
+                        const createdCrcIds = Array.from(collectCrcIdsFromEvent(createdItem));
+                        if (createdCrcIds.length > 0 && getEventStudyIds(createdItem).length > 0) {
+                            processEmailTriggers(context, {
+                                triggerType: 'added_to_study',
+                                event: createdItem,
+                                addedCrcIds: createdCrcIds
+                            }).catch((triggerErr) => {
+                                context.log.warn('processEmailTriggers (added_to_study) failed:', triggerErr.message);
+                            });
+                        }
                     }
                     
                     return { status: 201, jsonBody: createdItem };
@@ -3426,6 +3436,14 @@ async function crudHandler(context, request, containerName) {
                 // For users, fetch existing user data to merge with update data for validation
                 let mergedRequestBody = requestBody;
                 if (containerName === 'users' && updateId) {
+                    // Coerce active from checkbox/FormData strings ("true"/"false") to boolean
+                    if (requestBody.active !== undefined && typeof requestBody.active !== 'boolean') {
+                        if (requestBody.active === 'true' || requestBody.active === '1' || requestBody.active === 1) {
+                            requestBody.active = true;
+                        } else if (requestBody.active === 'false' || requestBody.active === '0' || requestBody.active === 0 || requestBody.active === '') {
+                            requestBody.active = false;
+                        }
+                    }
                     try {
                         const { resource: existingUser } = await container.item(updateId, updateId).read();
                         if (existingUser) {
@@ -4326,7 +4344,7 @@ async function crudHandler(context, request, containerName) {
                         }
                     }
                     
-                    // Triggered emails: shift edit / removed from shift / cancelled (background)
+                    // Triggered emails: shift edit / removed from shift / cancelled / added to study (background)
                     if (containerName === 'events' && result && result.type === 'Site Assignment') {
                         const wasCancelledBefore = isEventCancelled(eventBeforeUpdate);
                         const isCancelledNow = isEventCancelled(result);
@@ -4347,6 +4365,19 @@ async function crudHandler(context, request, containerName) {
                                 removedCrcIds: removedIds
                             }).catch((triggerErr) => {
                                 context.log.warn('processEmailTriggers (removed_from_shift) failed:', triggerErr.message);
+                            });
+                        }
+                        const addedIds = eventBeforeUpdate
+                            ? diffAddedCrcIdsFromEvents(eventBeforeUpdate, result)
+                            : [];
+                        if (addedIds.length > 0 && getEventStudyIds(result).length > 0 && !justCancelled) {
+                            context.log.info(`added_to_study: ${addedIds.length} CRC(s) added to event ${result.id}`);
+                            processEmailTriggers(context, {
+                                triggerType: 'added_to_study',
+                                event: result,
+                                addedCrcIds: addedIds
+                            }).catch((triggerErr) => {
+                                context.log.warn('processEmailTriggers (added_to_study) failed:', triggerErr.message);
                             });
                         }
                         if (justCancelled) {
@@ -5012,6 +5043,7 @@ const TRIGGER_DEFAULTS = {
     shift_cancelled: { subject: 'Shift cancelled', body: 'A shift on {{eventDate}} at {{siteName}} ({{siteLocation}}) has been cancelled. Staff remain listed on the shift but it no longer counts toward scheduled hours.' },
     removed_from_shift: { subject: 'Removed from shift', body: 'You have been removed from a shift on {{eventDate}} at {{siteName}} ({{siteLocation}}).' },
     shift_created_missing_role: { subject: 'Shift created without required role', body: 'A shift was created that is missing the required role: {{missingRoleName}}. Date: {{eventDate}}, Site/Study: {{siteId}} / {{studyIds}}.' },
+    added_to_study: { subject: 'Added to study', body: 'You have been added to a shift for {{studyNames}} on {{eventDate}} at {{siteName}}.' },
     finalized_schedule: { subject: 'Schedule finalized', body: 'The schedule has been finalized for the month.' },
     pto_request: { subject: 'Time off request submitted', body: 'A time off request has been submitted for approval.' },
     pto_approved: { subject: 'Time off approved', body: 'Your time off request has been approved.' }
@@ -5243,6 +5275,42 @@ const diffRemovedCrcIdsFromEvents = (before, after) => {
     return Array.from(beforeIds).filter(id => !afterIds.has(id));
 };
 
+const diffAddedCrcIdsFromEvents = (before, after) => {
+    const beforeIds = collectCrcIdsFromEvent(before);
+    const afterIds = collectCrcIdsFromEvent(after);
+    return Array.from(afterIds).filter(id => !beforeIds.has(id));
+};
+
+const getEventStudyIds = (ev) => {
+    if (!ev) return [];
+    if (Array.isArray(ev.studyIds) && ev.studyIds.length) {
+        return ev.studyIds.map(id => String(id)).filter(Boolean);
+    }
+    if (ev.studyId) return [String(ev.studyId)];
+    return [];
+};
+
+/** Blank studyIds on a rule = any study. Otherwise event must include at least one selected study. */
+const ruleMatchesEventStudy = (rule, event) => {
+    const ruleStudies = Array.isArray(rule?.studyIds)
+        ? rule.studyIds.map(id => String(id)).filter(Boolean)
+        : [];
+    if (ruleStudies.length === 0) return true;
+    const eventStudies = getEventStudyIds(event);
+    if (eventStudies.length === 0) return false;
+    const eventSet = new Set(eventStudies);
+    return ruleStudies.some(id => eventSet.has(id));
+};
+
+const SHIFT_STUDY_FILTER_TRIGGERS = new Set([
+    'new_shift',
+    'shift_edit',
+    'shift_cancelled',
+    'removed_from_shift',
+    'shift_created_missing_role',
+    'added_to_study'
+]);
+
 const buildTriggerRecipientLookups = async (log, { crcIds = [], specificIds = [], needManagers = false } = {}) => {
     const usersContainer = getContainer('users');
     const crcsContainer = getContainer('crcs');
@@ -5451,7 +5519,7 @@ function eventIsMissingRole(event, roleId) {
 }
 
 async function processEmailTriggers(context, payload) {
-    const { triggerType, event, timeOffRequest, scheduleMonthKey, eventsSnapshot, removedCrcIds } = payload || {};
+    const { triggerType, event, timeOffRequest, scheduleMonthKey, eventsSnapshot, removedCrcIds, addedCrcIds } = payload || {};
     if (!triggerType || !context) return;
     const log = context.log || console;
     try {
@@ -5480,6 +5548,10 @@ async function processEmailTriggers(context, payload) {
         if (triggerType === 'shift_created_missing_role' && event) {
             filteredRules = rules.filter(rule => rule.missingRoleId && eventIsMissingRole(event, rule.missingRoleId));
         }
+        // Study criteria: blank studyIds = any study; otherwise event must include a selected study
+        if (SHIFT_STUDY_FILTER_TRIGGERS.has(triggerType) && event) {
+            filteredRules = filteredRules.filter(rule => ruleMatchesEventStudy(rule, event));
+        }
         if (filteredRules.length === 0) {
             log.info(`processEmailTriggers: no matching rules after filters for triggerType=${triggerType}`);
             return;
@@ -5493,6 +5565,7 @@ async function processEmailTriggers(context, payload) {
 
         const crcIdsNeeded = new Set();
         if (Array.isArray(removedCrcIds)) removedCrcIds.forEach(id => { if (id) crcIdsNeeded.add(id); });
+        if (Array.isArray(addedCrcIds)) addedCrcIds.forEach(id => { if (id) crcIdsNeeded.add(id); });
         if (timeOffRequest && timeOffRequest.crcId) crcIdsNeeded.add(timeOffRequest.crcId);
         if (event) collectCrcIdsFromEvent(event).forEach(id => crcIdsNeeded.add(id));
         if (triggerType === 'finalized_schedule' && Array.isArray(eventsSnapshot)) {
@@ -5519,7 +5592,7 @@ async function processEmailTriggers(context, payload) {
         }
 
         const emailLookups = await loadEmailTemplateLookups(log);
-        const { siteNameById, siteLocationById } = emailLookups;
+        const { siteNameById, siteLocationById, studyNameById } = emailLookups;
 
         const resolveToEmails = (crcIds, userIdsOrEmails) => {
             const out = [];
@@ -5611,12 +5684,18 @@ async function processEmailTriggers(context, payload) {
                     requestedBy: timeOffRequest.requestedBy || ''
                 };
             }
-            if ((triggerType === 'new_shift' || triggerType === 'shift_edit' || triggerType === 'removed_from_shift' || triggerType === 'shift_cancelled') && event) {
+            if ((triggerType === 'new_shift' || triggerType === 'shift_edit' || triggerType === 'removed_from_shift' || triggerType === 'shift_cancelled' || triggerType === 'added_to_study') && event) {
                 const perRecipientCrcId = rule._recipientCrcId || '';
+                const eventStudyIds = getEventStudyIds(event);
+                const studyNames = eventStudyIds
+                    .map(id => (studyNameById && studyNameById.get(id)) || id)
+                    .filter(Boolean)
+                    .join(', ');
                 return {
                     ...base,
                     ...buildShiftTriggerContext(event, siteNameById, siteLocationById, getCrcDisplayName, {
-                        crcName: perRecipientCrcId ? getCrcDisplayName(perRecipientCrcId) : ''
+                        crcName: perRecipientCrcId ? getCrcDisplayName(perRecipientCrcId) : '',
+                        studyNames: studyNames || ''
                     })
                 };
             }
@@ -5670,6 +5749,8 @@ async function processEmailTriggers(context, payload) {
                     recipients = resolveToEmails([timeOffRequest.crcId], []);
                 } else if (triggerType === 'removed_from_shift' && Array.isArray(removedCrcIds) && removedCrcIds.length > 0) {
                     recipients = resolveToEmails(removedCrcIds, []);
+                } else if (triggerType === 'added_to_study' && Array.isArray(addedCrcIds) && addedCrcIds.length > 0) {
+                    recipients = resolveToEmails(addedCrcIds, []);
                 } else if (event) {
                     recipients = resolveToEmails(Array.from(collectCrcIdsFromEvent(event)), []);
                 } else if (triggerType === 'finalized_schedule' && Array.isArray(eventsSnapshot)) {
