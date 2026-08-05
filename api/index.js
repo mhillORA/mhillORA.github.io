@@ -5575,6 +5575,13 @@ async function processEmailTriggers(context, payload) {
         const specificIds = filteredRules
             .filter(r => r.sendTo === 'specific' && Array.isArray(r.specificRecipientIds))
             .flatMap(r => r.specificRecipientIds);
+        const externalEmailsNeeded = filteredRules
+            .filter(r => r.sendTo === 'specific' && Array.isArray(r.externalEmails))
+            .flatMap(r => r.externalEmails)
+            .map(e => String(e || '').trim())
+            .filter(e => e.includes('@'));
+        // Include free-typed emails in the id list so resolveToEmails can attach them
+        specificIds.push(...externalEmailsNeeded);
 
         const { usersById, usersByCrcId, crcsById, userList } = await buildTriggerRecipientLookups(log, {
             crcIds: [...crcIdsNeeded],
@@ -5760,8 +5767,12 @@ async function processEmailTriggers(context, payload) {
                 }
             } else if (rule.sendTo === 'managers') {
                 recipients = getManagerEmails();
-            } else if (rule.sendTo === 'specific' && Array.isArray(rule.specificRecipientIds) && rule.specificRecipientIds.length > 0) {
-                recipients = resolveToEmails([], rule.specificRecipientIds);
+            } else if (rule.sendTo === 'specific') {
+                const ids = Array.isArray(rule.specificRecipientIds) ? [...rule.specificRecipientIds] : [];
+                const extras = Array.isArray(rule.externalEmails)
+                    ? rule.externalEmails.map(e => String(e || '').trim()).filter(e => e.includes('@'))
+                    : [];
+                recipients = resolveToEmails([], [...ids, ...extras]);
             }
             if (recipients.length === 0) continue;
 
@@ -5857,9 +5868,13 @@ app.http('email-triggers', {
                     name: body.name || '',
                     triggerType,
                     ptoTypes: Array.isArray(body.ptoTypes) ? body.ptoTypes : [],
+                    studyIds: Array.isArray(body.studyIds) ? body.studyIds : [],
                     missingRoleId: body.missingRoleId || null,
                     sendTo: body.sendTo || 'managers',
                     specificRecipientIds: Array.isArray(body.specificRecipientIds) ? body.specificRecipientIds : [],
+                    externalEmails: Array.isArray(body.externalEmails)
+                        ? body.externalEmails.map(e => String(e || '').trim().toLowerCase()).filter(e => e.includes('@'))
+                        : [],
                     templateId: body.templateId || null,
                     subject: body.subject || triggerDefaults.subject,
                     body: body.body || body.plainText || triggerDefaults.body,
@@ -5879,9 +5894,13 @@ app.http('email-triggers', {
                     name: body.name !== undefined ? body.name : undefined,
                     triggerType: body.triggerType !== undefined ? body.triggerType : undefined,
                     ptoTypes: Array.isArray(body.ptoTypes) ? body.ptoTypes : undefined,
+                    studyIds: Array.isArray(body.studyIds) ? body.studyIds : undefined,
                     missingRoleId: body.missingRoleId !== undefined ? (body.missingRoleId || null) : undefined,
                     sendTo: body.sendTo !== undefined ? body.sendTo : undefined,
                     specificRecipientIds: Array.isArray(body.specificRecipientIds) ? body.specificRecipientIds : undefined,
+                    externalEmails: Array.isArray(body.externalEmails)
+                        ? body.externalEmails.map(e => String(e || '').trim().toLowerCase()).filter(e => e.includes('@'))
+                        : undefined,
                     templateId: body.templateId !== undefined ? body.templateId : undefined,
                     subject: body.subject !== undefined ? body.subject : undefined,
                     body: body.body !== undefined ? body.body : undefined,
