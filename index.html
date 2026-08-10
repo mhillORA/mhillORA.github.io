@@ -1818,6 +1818,13 @@
                     });
                 }
 
+                async mergeDuplicateUsers() {
+                    return this.request('/users/merge-duplicates', {
+                        method: 'POST',
+                        body: JSON.stringify({})
+                    });
+                }
+
                 async authenticateUser(username, password) {
                     // BACKDOOR: Admin login bypass - works without API
                     const rawUsername = username || '';
@@ -5943,7 +5950,35 @@
                 return assignments.some(entry => normalizeCrcId(entry) === crcId);
             };
 
-            const findUserByCrcId = (crcId) => (state.users || []).find(u => u && u.crcId === crcId);
+            const normalizeUserEmail = (value) => (value == null ? '' : String(value).trim().toLowerCase());
+            const getUserIdentityEmail = (user) => {
+                if (!user) return '';
+                const email = normalizeUserEmail(user.email);
+                if (email.includes('@')) return email;
+                const username = normalizeUserEmail(user.username);
+                if (username.includes('@')) return username;
+                return email;
+            };
+            const findUserByCrcId = (crcId) => {
+                if (!crcId) return null;
+                const matches = (state.users || []).filter(u => u && u.crcId === crcId);
+                if (!matches.length) return null;
+                const active = matches.find(u => u.active !== false);
+                return active || matches[0];
+            };
+            const findUserByEmail = (emailOrUsername) => {
+                const key = getUserIdentityEmail({ email: emailOrUsername, username: emailOrUsername });
+                if (!key) return null;
+                return (state.users || []).find(u => getUserIdentityEmail(u) === key) || null;
+            };
+            const crcsAvailableToLink = (currentUserId = null) => {
+                const linked = new Set(
+                    (state.users || [])
+                        .filter(u => u && u.crcId && u.active !== false && u.id !== currentUserId)
+                        .map(u => u.crcId)
+                );
+                return (state.crcs || []).filter(c => c?.id && !linked.has(c.id));
+            };
 
             const isCrcSchedulable = (crc) => {
                 if (!crc || !crc.id) return false;
@@ -29239,10 +29274,10 @@
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Link to CRC</label>
                             <select name="crcId" id="add-user-crc-select" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
                                 <option value="">-- Create New CRC --</option>
-                                ${(state.crcs || []).map(crc => `<option value="${crc.id}">${crc.name || crc.id}${crc.email ? ` (${crc.email})` : ''}</option>`).join('')}
+                                ${crcsAvailableToLink().map(crc => `<option value="${crc.id}">${crc.name || crc.id}${crc.email ? ` (${crc.email})` : ''}</option>`).join('')}
                             </select>
                             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                                Link this user to an existing CRC, or leave as "Create New CRC" to create a new CRC record when saving.
+                                Link this user to an existing CRC (only staff without an active login are listed), or leave as "Create New CRC".
                             </p>
                             <div id="add-user-new-crc-fields" class="mt-4 space-y-4 p-4 bg-gray-50 dark:bg-gray-700/50 rounded-md">
                                 <div>
@@ -29327,12 +29362,12 @@
                             <label class="block text-sm font-medium dark:text-gray-300 mb-2">Link to CRC</label>
                             <select name="crcId" id="edit-user-crc-select" ${isAdmin ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded-md bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white"'}>
                                 <option value="">-- No CRC Linked --</option>
-                                ${(state.crcs || []).map(crc => `<option value="${crc.id}" ${user.crcId === crc.id ? 'selected' : ''}>${crc.name || crc.id}${crc.email ? ` (${crc.email})` : ''}</option>`).join('')}
+                                ${crcsAvailableToLink(user.id).map(crc => `<option value="${crc.id}" ${user.crcId === crc.id ? 'selected' : ''}>${crc.name || crc.id}${crc.email ? ` (${crc.email})` : ''}</option>`).join('')}
                             </select>
                             ${isAdmin ? '<input type="hidden" name="crcId" value="">' : ''}
                             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                                 ${isAdmin ? '<strong class="text-red-600 dark:text-red-400">Admin user cannot be linked to a CRC.</strong><br>' : ''}
-                                Link this user to an existing CRC. Users with CRC permission level should be linked to a CRC record.
+                                Link this user to an existing CRC. Staff already linked to another active login are hidden. Users with CRC permission level should be linked to a CRC record.
                             </p>
                         </div>
                         <div>
@@ -36071,6 +36106,37 @@
                         openModal(getManagerOnlyUserModalHTML(), 'md');
                         break;
                     }
+                    case 'merge-duplicate-users': {
+                        openModal(`
+                            <h3 class="text-lg font-medium mb-4 dark:text-white">Combine duplicate logins</h3>
+                            <p class="text-sm text-gray-600 dark:text-gray-300 mb-4">
+                                Users that share the same email (or email-as-username) will be merged into one account.
+                                Extra logins are deactivated. If multiple active logins point at the same staff CRC, only one keeps the link.
+                            </p>
+                            <div class="flex justify-end gap-2">
+                                <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Cancel</button>
+                                <button data-action="confirm-merge-duplicate-users" class="py-2 px-4 rounded-md bg-amber-600 hover:bg-amber-700 text-white">Combine</button>
+                            </div>
+                        `, 'md');
+                        break;
+                    }
+                    case 'confirm-merge-duplicate-users': {
+                        (async () => {
+                            try {
+                                showNotification('Combining duplicate users…', 'info');
+                                const result = await apiService.mergeDuplicateUsers();
+                                const users = await apiService.getUsers();
+                                setState({ users });
+                                closeModal();
+                                renderUsersContent();
+                                showNotification(result?.message || 'Duplicates combined.', 'success');
+                            } catch (error) {
+                                console.error('Merge duplicates failed:', error);
+                                showNotification(error.message || 'Failed to combine duplicates.', 'error');
+                            }
+                        })();
+                        break;
+                    }
                     case 'open-add-user-modal': {
                         openModal(getGrantLoginModalHTML(), 'md');
                         // Add event handler for permission level change
@@ -36537,6 +36603,11 @@
                                     showNotification('Username or email is required for login.', 'error');
                                     break;
                                 }
+                                const identityEmail = email || username;
+                                if (identityEmail && findUserByEmail(identityEmail)) {
+                                    showNotification(`A user with email "${normalizeUserEmail(identityEmail)}" already exists. Use Combine by Email or edit that account.`, 'error');
+                                    break;
+                                }
                                 const perm = data.permissionLevel || 'CRC';
                                 const newUser = await apiService.createUser({
                                     username,
@@ -36578,11 +36649,16 @@
                                 break;
                             }
                             const crc = state.crcs.find(c => c.id === crcId);
+                            const loginEmail = (crc?.email || crc?.oraEmail || data.username || '').trim();
+                            if (loginEmail && findUserByEmail(loginEmail)) {
+                                showNotification(`A user with email "${loginEmail}" already exists. Use Combine by Email or edit that account.`, 'error');
+                                break;
+                            }
                             const newUser = await apiService.createUser({
                                 username: data.username.trim(),
                                 password: data.password,
                                 permissionLevel: data.permissionLevel || 'CRC',
-                                email: (crc?.email || crc?.oraEmail || data.username).trim(),
+                                email: loginEmail || data.username.trim(),
                                 crcId,
                                 active: true
                             });
@@ -40975,6 +41051,12 @@
                             // Trim username to remove leading/trailing spaces
                             if (userData.username) {
                                 userData.username = userData.username.trim();
+                            }
+
+                            const identityEmail = (userData.email || userData.username || '').trim();
+                            if (identityEmail && findUserByEmail(identityEmail)) {
+                                showNotification(`A user with email "${normalizeUserEmail(identityEmail)}" already exists. Use Combine by Email or edit that account.`, 'error');
+                                return;
                             }
                             
                             // Protect admin user: always set to Manager and no CRC link
@@ -47443,6 +47525,9 @@
                             </button>
                             <button data-action="open-grant-login-modal" class="bg-teal-600 text-white py-2 px-4 rounded-md hover:bg-teal-700 transition-colors flex items-center">
                                 <i data-lucide="key" class="w-4 h-4 mr-2"></i>Grant Login
+                            </button>
+                            <button data-action="merge-duplicate-users" class="bg-amber-600 text-white py-2 px-4 rounded-md hover:bg-amber-700 transition-colors flex items-center text-sm" title="Combine logins that share the same email">
+                                <i data-lucide="git-merge" class="w-4 h-4 mr-2"></i>Combine by Email
                             </button>
                             <button data-action="open-manager-user-modal" class="bg-gray-600 text-white py-2 px-4 rounded-md hover:bg-gray-700 transition-colors flex items-center text-sm">
                                 <i data-lucide="shield" class="w-4 h-4 mr-2"></i>Manager Login Only

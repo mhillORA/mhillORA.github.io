@@ -1819,6 +1819,211 @@ const validateUsersSchema = (data) => {
     return true;
 };
 
+/** Normalize email for uniqueness (trim + lowercase). Empty string if missing. */
+const normalizeUserEmail = (value) => {
+    if (value == null) return '';
+    return String(value).trim().toLowerCase();
+};
+
+/**
+ * Identity email for a user: prefer email, else username when it looks like an email.
+ * Used for unique-email enforcement and merge-by-email.
+ */
+const getUserIdentityEmail = (user) => {
+    if (!user) return '';
+    const email = normalizeUserEmail(user.email);
+    if (email.includes('@')) return email;
+    const username = normalizeUserEmail(user.username);
+    if (username.includes('@')) return username;
+    return email;
+};
+
+const USER_PERM_RANK = { Manager: 3, Supervisor: 2, CRC: 1 };
+
+const scoreUserForMergeKeeper = (user) => {
+    if (!user) return -Infinity;
+    let score = 0;
+    if (user.active !== false) score += 100;
+    score += (USER_PERM_RANK[user.permissionLevel] || 0) * 10;
+    if (user.password) score += 5;
+    if (user.crcId) score += 3;
+    if (user.entraId) score += 2;
+    if (getUserIdentityEmail(user)) score += 1;
+    const created = Date.parse(user.createdAt || '') || Number.MAX_SAFE_INTEGER;
+    // Prefer older account as the stable keeper when scores tie
+    score -= created / 1e15;
+    return score;
+};
+
+const unionStringArrays = (...lists) => {
+    const out = new Set();
+    lists.forEach(list => {
+        if (!Array.isArray(list)) return;
+        list.forEach(item => {
+            if (item == null || item === '') return;
+            out.add(String(item));
+        });
+    });
+    return [...out];
+};
+
+const mergeUserRecordFields = (keeper, duplicates) => {
+    const merged = { ...keeper };
+    for (const other of duplicates) {
+        if (!other) continue;
+        if (!merged.crcId && other.crcId) merged.crcId = other.crcId;
+        if (!normalizeUserEmail(merged.email) && other.email) merged.email = other.email;
+        if (!merged.firstName && other.firstName) merged.firstName = other.firstName;
+        if (!merged.lastName && other.lastName) merged.lastName = other.lastName;
+        if (!merged.title && other.title) merged.title = other.title;
+        if (!merged.entraId && other.entraId) merged.entraId = other.entraId;
+        if (!merged.permissionSetId && other.permissionSetId) merged.permissionSetId = other.permissionSetId;
+        if ((USER_PERM_RANK[other.permissionLevel] || 0) > (USER_PERM_RANK[merged.permissionLevel] || 0)) {
+            merged.permissionLevel = other.permissionLevel;
+        }
+        merged.tabs = unionStringArrays(merged.tabs, other.tabs);
+        merged.studies = unionStringArrays(merged.studies, other.studies);
+        merged.sites = unionStringArrays(merged.sites, other.sites);
+        if (merged.studiesAccess !== 'all' && other.studiesAccess === 'all') merged.studiesAccess = 'all';
+        if (merged.sitesAccess !== 'all' && other.sitesAccess === 'all') merged.sitesAccess = 'all';
+        if (merged.active === false && other.active !== false) merged.active = true;
+        if (!merged.password && other.password) merged.password = other.password;
+    }
+    if (Array.isArray(merged.tabs) && merged.tabs.length === 0) delete merged.tabs;
+    if (Array.isArray(merged.studies) && merged.studies.length === 0) delete merged.studies;
+    if (Array.isArray(merged.sites) && merged.sites.length === 0) delete merged.sites;
+    return merged;
+};
+
+/**
+ * Enforce unique identity email and unique CRC link among users.
+ * Throws Error with VALIDATION_ERROR prefix on conflict.
+ */
+const assertUserUniqueness = async (container, { email, username, crcId, excludeId = null, active = true } = {}) => {
+    const identityEmail = getUserIdentityEmail({ email, username });
+    const normalizedUsername = normalizeUserEmail(username);
+    const { resources: allUsers } = await container.items.readAll().fetchAll();
+    const others = (allUsers || []).filter(u => u && u.id && u.id !== excludeId);
+
+    if (identityEmail) {
+        const emailClash = others.find(u => getUserIdentityEmail(u) === identityEmail);
+        if (emailClash) {
+            throw new Error(
+                `VALIDATION_ERROR: A user with email "${identityEmail}" already exists (username: ${emailClash.username || emailClash.id}). Combine duplicates or edit that account instead.`
+            );
+        }
+    }
+
+    if (normalizedUsername) {
+        const usernameClash = others.find(u => normalizeUserEmail(u.username) === normalizedUsername);
+        if (usernameClash) {
+            throw new Error(
+                `VALIDATION_ERROR: Username "${username}" already exists`
+            );
+        }
+    }
+
+    // One active login per CRC staff record
+    if (crcId && active !== false) {
+        const crcClash = others.find(u => u.crcId === crcId && u.active !== false);
+        if (crcClash) {
+            throw new Error(
+                `VALIDATION_ERROR: Staff member is already linked to login "${crcClash.username || crcClash.email || crcClash.id}". Combine duplicates or unlink the other account first.`
+            );
+        }
+    }
+};
+
+const stripCosmosMeta = (doc) => {
+    if (!doc || typeof doc !== 'object') return doc;
+    ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => {
+        if (k in doc) delete doc[k];
+    });
+    return doc;
+};
+
+/**
+ * Merge duplicate users that share the same identity email.
+ * Keeps the best account, merges fields, deactivates losers and clears their crcId.
+ * Also resolves multiple active logins on the same crcId (different emails) by keeping one link.
+ */
+const mergeDuplicateUsersByEmail = async (container, context) => {
+    const { resources } = await container.items.readAll().fetchAll();
+    const users = resources || [];
+    const summary = { mergedGroups: 0, deactivated: 0, crcLinksCleared: 0, keepers: [] };
+
+    const byEmail = new Map();
+    users.forEach(u => {
+        const key = getUserIdentityEmail(u);
+        if (!key) return;
+        if (!byEmail.has(key)) byEmail.set(key, []);
+        byEmail.get(key).push(u);
+    });
+
+    for (const [email, group] of byEmail.entries()) {
+        if (!group || group.length < 2) continue;
+        group.sort((a, b) => scoreUserForMergeKeeper(b) - scoreUserForMergeKeeper(a));
+        const keeper = group[0];
+        const losers = group.slice(1);
+        const merged = stripCosmosMeta(mergeUserRecordFields(keeper, losers));
+        merged.id = keeper.id;
+        merged.email = merged.email || email;
+        merged.active = merged.active !== false;
+        merged.updatedAt = new Date().toISOString();
+        merged.mergedFromUserIds = unionStringArrays(keeper.mergedFromUserIds, losers.map(l => l.id));
+
+        await container.items.upsert(merged);
+        for (const loser of losers) {
+            const shortId = String(loser.id || '').slice(0, 8) || 'x';
+            const baseUsername = String(loser.username || 'user').trim() || 'user';
+            const deactivated = stripCosmosMeta({
+                ...loser,
+                active: false,
+                crcId: null,
+                // Clear identity so uniqueness checks apply only to the keeper
+                email: '',
+                username: `${baseUsername}__merged_${shortId}`.slice(0, 100),
+                mergedIntoUserId: keeper.id,
+                deactivatedReason: 'merged_duplicate_email',
+                priorEmail: loser.email || loser.username || email,
+                updatedAt: new Date().toISOString()
+            });
+            await container.items.upsert(deactivated);
+            summary.deactivated += 1;
+        }
+        summary.mergedGroups += 1;
+        summary.keepers.push({ id: keeper.id, email, username: merged.username, deactivatedIds: losers.map(l => l.id) });
+        context?.log?.info?.(`Merged ${losers.length} duplicate user(s) into ${keeper.id} for email ${email}`);
+    }
+
+    // Re-read after email merges, then ensure at most one active crcId link
+    const { resources: afterEmailMerge } = await container.items.readAll().fetchAll();
+    const byCrc = new Map();
+    (afterEmailMerge || []).forEach(u => {
+        if (!u?.crcId || u.active === false) return;
+        if (!byCrc.has(u.crcId)) byCrc.set(u.crcId, []);
+        byCrc.get(u.crcId).push(u);
+    });
+    for (const [crcId, group] of byCrc.entries()) {
+        if (!group || group.length < 2) continue;
+        group.sort((a, b) => scoreUserForMergeKeeper(b) - scoreUserForMergeKeeper(a));
+        const keeper = group[0];
+        for (const loser of group.slice(1)) {
+            const cleared = stripCosmosMeta({
+                ...loser,
+                crcId: null,
+                updatedAt: new Date().toISOString(),
+                crcLinkClearedReason: `duplicate_crc_link_kept_${keeper.id}`
+            });
+            await container.items.upsert(cleared);
+            summary.crcLinksCleared += 1;
+            context?.log?.info?.(`Cleared duplicate crcId ${crcId} from user ${loser.id}; kept on ${keeper.id}`);
+        }
+    }
+
+    return summary;
+};
+
 // Simple password hashing (in production, use bcrypt or similar)
 const hashPassword = (password) => {
     // Simple hash for now - in production use proper bcrypt
@@ -7369,6 +7574,35 @@ app.http('usersAuthenticateArtemis', {
     },
 });
 
+// Merge duplicate users that share the same identity email (and fix multi-login CRC links)
+app.http('usersMergeDuplicates', {
+    methods: ['POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/merge-duplicates',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return { status: 200 };
+        }
+        try {
+            const container = getContainer('users');
+            const summary = await mergeDuplicateUsersByEmail(container, context);
+            return {
+                status: 200,
+                jsonBody: {
+                    success: true,
+                    message: summary.mergedGroups === 0 && summary.crcLinksCleared === 0
+                        ? 'No duplicate users found.'
+                        : `Combined ${summary.mergedGroups} email group(s); deactivated ${summary.deactivated}; cleared ${summary.crcLinksCleared} extra CRC link(s).`,
+                    ...summary
+                },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        } catch (error) {
+            return handleError(context, error, 'Merge duplicate users failed');
+        }
+    },
+});
+
 // Register users list endpoint (no id parameter)
 app.http('usersList', {
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -7388,19 +7622,23 @@ app.http('usersList', {
             if (method === 'POST') {
                 const body = await request.json();
                 validateUsersSchema(body);
-                
-                // Check if username already exists
-                const { resources: existingUsers } = await container.items
-                    .query({
-                        query: "SELECT * FROM c WHERE c.username = @username",
-                        parameters: [{ name: "@username", value: body.username }]
-                    })
-                    .fetchAll();
-                
-                if (existingUsers.length > 0) {
+
+                // Prefer a real email; if username is an email, treat it as identity
+                if (!body.email && getUserIdentityEmail(body)) {
+                    body.email = getUserIdentityEmail(body);
+                }
+
+                try {
+                    await assertUserUniqueness(container, {
+                        email: body.email,
+                        username: body.username,
+                        crcId: body.crcId || null,
+                        active: body.active !== undefined ? body.active : true
+                    });
+                } catch (uniqueErr) {
                     return {
                         status: 400,
-                        jsonBody: { error: 'Username already exists' },
+                        jsonBody: { error: uniqueErr.message.replace(/^VALIDATION_ERROR:\s*/, '') },
                         headers: { 'Content-Type': 'application/json' }
                     };
                 }
@@ -7437,12 +7675,19 @@ app.http('users', {
         const { method } = request;
         const id = getIdFromRequest(request);
         
-        // Explicitly exclude 'authenticate' from being handled by this route
+        // Explicitly exclude dedicated sub-routes from being handled by this route
         if (id === 'authenticate') {
             context.log.warn('Authenticate request matched users/{id} route - should use users/authenticate');
             return {
                 status: 404,
                 jsonBody: { error: 'Route not found. Use POST /api/users/authenticate for authentication.' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+        if (id === 'merge-duplicates') {
+            return {
+                status: 404,
+                jsonBody: { error: 'Route not found. Use POST /api/users/merge-duplicates.' },
                 headers: { 'Content-Type': 'application/json' }
             };
         }
@@ -7502,6 +7747,26 @@ app.http('users', {
                     }
 
                     validateUsersSchema(mergedUser);
+
+                    if (!mergedUser.email && getUserIdentityEmail(mergedUser)) {
+                        mergedUser.email = getUserIdentityEmail(mergedUser);
+                    }
+
+                    try {
+                        await assertUserUniqueness(container, {
+                            email: mergedUser.email,
+                            username: mergedUser.username,
+                            crcId: mergedUser.crcId || null,
+                            excludeId: updateId,
+                            active: mergedUser.active !== undefined ? mergedUser.active : true
+                        });
+                    } catch (uniqueErr) {
+                        return {
+                            status: 400,
+                            jsonBody: { error: uniqueErr.message.replace(/^VALIDATION_ERROR:\s*/, '') },
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
 
                     if (requestBody.password) {
                         mergedUser.password = hashPassword(requestBody.password);
