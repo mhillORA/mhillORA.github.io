@@ -71,6 +71,10 @@ The Cursor laptop can stay blocked. The Function App is inside Azure.
 2. First time it asks for a shell storage account. OK.
 3. Paste this **whole block**. Change `RG` if your resource group name is not obvious — it must be the group from step A.
 
+Flex / 512 MB **does not support** `SCM_DO_BUILD_DURING_DEPLOYMENT`. CI/CD in Deployment Center can stay **not set up**. Do not connect Git.
+
+If a previous deploy failed, delete these app settings if they exist: `SCM_DO_BUILD_DURING_DEPLOYMENT`, `ENABLE_ORYX_BUILD`. Then paste this instead (builds in Cloud Shell, zip includes `node_modules`):
+
 ```bash
 set -euo pipefail
 FUNC=ora-lens-ns-ingest
@@ -85,19 +89,20 @@ if [ -z "$RG" ]; then
 fi
 echo "RG=$RG"
 
+az functionapp config appsettings delete -g "$RG" -n "$FUNC" --setting-names SCM_DO_BUILD_DURING_DEPLOYMENT ENABLE_ORYX_BUILD || true
+
 cd $HOME
 rm -rf mhillORA.github.io
 git clone --branch ora-data-lens --single-branch https://github.com/mhillORA/mhillORA.github.io.git
 cd mhillORA.github.io/ingest/azure-func
+npm install --omit=dev
 
-az functionapp config appsettings set -g "$RG" -n "$FUNC" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-
+rm -f /tmp/ns-ingest.zip
 zip -r /tmp/ns-ingest.zip . -x "*.git*" -x "local.settings.json"
 az functionapp deployment source config-zip \
   -g "$RG" \
   -n "$FUNC" \
-  --src /tmp/ns-ingest.zip \
-  --build-remote true
+  --src /tmp/ns-ingest.zip
 
 echo "Deployed. Next landing *project_profitability*.csv will load Cosmos."
 ```
