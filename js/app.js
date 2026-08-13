@@ -14,8 +14,9 @@
     },
     draft: "",
     phase: "idle",
-    key: "enrollment",
+    key: "live",
     askedText: "",
+    error: "",
     traceOpen: false,
     chart: null,
     history: load("odl.history", []),
@@ -79,46 +80,43 @@
     if (el) el.value = "";
   }
 
-  async function run(key, text) {
+  async function run(_key, text) {
+    const question = (text || state.draft || "").trim();
+    if (!question) return;
     state.nav = "ask";
     state.phase = "thinking";
-    state.key = key;
-    state.askedText = text || ANSWERS[key].q;
+    state.key = "live";
+    state.askedText = question;
     state.draft = "";
+    state.error = "";
     state.traceOpen = false;
+    state.answer = null;
     render();
 
-    const live = await tryLiveAsk(state.askedText, key);
-    const answer = live || ANSWERS[key];
-    state.liveAnswer = live || null;
-    state.history.unshift({ at: new Date().toISOString(), text: state.askedText, key });
-    state.history = state.history.slice(0, 40);
-    save("odl.history", state.history);
-
-    window.setTimeout(() => {
-      state.phase = "answered";
-      state.answer = answer;
-      render();
-    }, live ? 200 : 900);
-  }
-
-  async function tryLiveAsk(question, fallbackKey) {
     try {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
-          sources: enabledList().map((s) => s.id),
-          fallbackKey
+          sources: enabledList().map((s) => s.id)
         })
       });
-      if (!res.ok) return null;
-      const body = await res.json();
-      return body && body.answer ? body.answer : null;
-    } catch (_) {
-      return null;
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(body.error || `Ask failed (${res.status})`);
+      }
+      if (!body.answer) throw new Error("API returned no answer");
+      state.answer = body.answer;
+      state.phase = "answered";
+      state.history.unshift({ at: new Date().toISOString(), text: question, key: "live" });
+      state.history = state.history.slice(0, 40);
+      save("odl.history", state.history);
+    } catch (err) {
+      state.phase = "error";
+      state.error = String(err.message || err);
     }
+    render();
   }
 
   function missingFor(answer) {
@@ -186,18 +184,14 @@
     if (state.phase !== "idle") return;
     panel.innerHTML =
       `<div class="suggest-head">Start from</div>` +
-      Object.keys(ANSWERS)
-        .map((k) => {
-          const a = ANSWERS[k];
-          const needs = "Needs " + a.needs.map((id) => sourceById(id).name).join(", ");
-          return `<button type="button" class="suggest" data-ask="${k}">
-            <span class="suggest-icon">${ICONS[a.icon]}</span>
-            <span><span class="suggest-text">${a.q}</span><span class="suggest-needs">${needs}</span></span>
-          </button>`;
-        })
-        .join("");
-    panel.querySelectorAll("[data-ask]").forEach((btn) => {
-      btn.onclick = () => run(btn.dataset.ask, ANSWERS[btn.dataset.ask].q);
+      EXAMPLE_QUESTIONS.map(
+        (q) => `<button type="button" class="suggest">
+            <span class="suggest-icon">${ICONS[q.icon]}</span>
+            <span><span class="suggest-text">${q.text}</span><span class="suggest-needs">${q.needs}</span></span>
+          </button>`
+      ).join("");
+    panel.querySelectorAll(".suggest").forEach((btn, i) => {
+      btn.onclick = () => run("live", EXAMPLE_QUESTIONS[i].text);
     });
   }
 
@@ -214,7 +208,16 @@
 
   function renderAnswer() {
     const panel = document.getElementById("answerPanel");
-    const show = state.phase === "answered";
+    if (state.phase === "error") {
+      panel.classList.remove("hidden");
+      panel.innerHTML = `<div class="you"><span class="you-badge">You</span><p>${escapeHtml(state.askedText)}</p></div>
+        <div class="gap"><div style="flex:1">
+          <div class="gap-title">Could not answer from Cosmos</div>
+          <div class="gap-body">${escapeHtml(state.error)}</div>
+        </div></div>`;
+      return;
+    }
+    const show = state.phase === "answered" && state.answer;
     panel.classList.toggle("hidden", !show);
     if (!show) {
       if (state.chart) {
@@ -224,7 +227,7 @@
       return;
     }
 
-    const a = state.answer || ANSWERS[state.key];
+    const a = state.answer;
     const missing = missingFor(a);
     const missingNames = missing.map((id) => sourceById(id).name);
     const confKey = missing.length ? "partial" : a.confidence;
@@ -343,7 +346,7 @@
       state.chart = null;
     }
     const canvas = document.getElementById("odlChart");
-    if (!canvas || typeof Chart === "undefined") return;
+    if (!canvas || typeof Chart === "undefined" || !a.bars || !a.bars.length) return;
     state.chart = new Chart(canvas, {
       type: "bar",
       data: {
@@ -430,7 +433,7 @@
 
     help.innerHTML = `<div class="answer">
       <p class="summary">Same Cosmos as Study Bid Workbench: database <code>bd-budgets</code>. Ask reads existing <code>ora_fact_study</code> / TrialHub / CT.gov. Daily gold sync writes only <code>lens_*</code> containers — never the bid <code>studies</code> docs.</p>
-      <p class="caveat">Local demo uses canned mock answers. With Functions + the bid-workbench Cosmos keys, <code>/api/ask</code> hits the shared account.</p>
+      <p class="caveat">Ask hits <code>/api/ask</code> → Cosmos <code>bd-budgets</code> read-only. No canned answers.</p>
     </div>`;
   }
 
@@ -457,7 +460,7 @@
     };
     document.getElementById("btnAsk").onclick = () => {
       const t = state.draft.trim();
-      run(t ? guessKey(t) : "enrollment", t);
+      if (t) run("live", t);
     };
     document.getElementById("btnNew").onclick = resetAsk;
     document.getElementById("btnSave").onclick = () => {

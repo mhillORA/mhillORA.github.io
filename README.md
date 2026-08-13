@@ -21,7 +21,9 @@ Account:  bd-budgets.documents.azure.com
 Database: bd-budgets
 ```
 
-Copy `COSMOS_ENDPOINT` / `COSMOS_KEY` / `COSMOS_DATABASE` from the bid-workbench SWA. Data Lens **does not write** `studies` or `ora_fact_*`. Gold snapshots go to `lens_studies`, `lens_visits`, `lens_metrics`, `lens_sources`, `lens_syncRuns`.
+Copy `COSMOS_ENDPOINT` / `COSMOS_KEY` / `COSMOS_DATABASE` from the bid-workbench SWA.
+
+**This app only reads Cosmos.** No create / upsert / delete from the SWA. Gold ETL is a separate writer later. Do not give the website the account primary key if you can avoid it — prefer Cosmos **Data Reader** on the SWA identity. The bid-workbench primary key is full access; using it still means the *app* will not write, but the key itself could.
 
 Ask already reads `ora_fact_study`, `ora_trialhub_trials`, and `ora_ctgov_trials` so you can demo against data that is already in the account.
 

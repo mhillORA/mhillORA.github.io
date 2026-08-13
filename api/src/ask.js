@@ -1,4 +1,4 @@
-const { safeQuery, LENS, SHARED_READ } = require("./cosmos");
+const { getDb, safeQuery, LENS, SHARED_READ } = require("./cosmos");
 
 function guessKey(text) {
   const t = String(text || "").toLowerCase();
@@ -209,7 +209,34 @@ async function fromRegistry(question) {
   };
 }
 
+function emptyAnswer(question) {
+  return {
+    q: question,
+    needs: [],
+    icon: "chart",
+    summary: "Cosmos answered, but no documents matched this question in ora_fact_study, TrialHub, CT.gov, or lens_* marts.",
+    chartTitle: "No matching rows",
+    chartNote: "bd-budgets · read-only",
+    chartType: "bar",
+    bars: [],
+    tableTitle: "Result",
+    grid: "1fr",
+    cols: ["Note"],
+    rows: [["No matching documents"]],
+    caveat: "Gold visit/study marts are empty until the warehouse ETL runs. Intelligence containers are queried first.",
+    trace: ["Connected to bd-budgets.", "Queried lens_* then ora_fact_study / TrialHub / CT.gov. Zero matches."],
+    query: "-- no matching documents",
+    confidence: "medium",
+    followUps: [
+      "Which Ora dry eye studies enrolled the most subjects?",
+      "Show competing dry eye trials",
+      "List Ora glaucoma studies"
+    ]
+  };
+}
+
 async function answerFromCosmos(question, sources) {
+  getDb();
   const key = guessKey(question);
   let answer = null;
   if (key === "visits") answer = await fromLensVisits(question);
@@ -217,7 +244,7 @@ async function answerFromCosmos(question, sources) {
   if (!answer) answer = await fromLensStudies(question);
   if (!answer && key !== "competitive") answer = await fromOraFactStudy(question);
   if (!answer) answer = await fromRegistry(question);
-  if (!answer) return null;
+  if (!answer) answer = emptyAnswer(question);
   answer.sourcesUsed = sources;
   return answer;
 }

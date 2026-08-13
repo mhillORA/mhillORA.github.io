@@ -57,17 +57,8 @@ async function ensureContainers() {
   return database;
 }
 
-async function upsertMany(containerId, docs) {
-  if (!Object.values(LENS).includes(containerId)) {
-    throw new Error(`Refusing to write non-lens container: ${containerId}`);
-  }
-  const container = getDb().container(containerId);
-  let upserted = 0;
-  for (const doc of docs) {
-    await container.items.upsert(doc);
-    upserted += 1;
-  }
-  return upserted;
+async function upsertMany() {
+  throw new Error("Data Lens API is read-only. Gold ETL must use a separate writer, not this SWA.");
 }
 
 async function queryContainer(containerId, query, parameters = []) {
