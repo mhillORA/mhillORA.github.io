@@ -1,5 +1,6 @@
 const { app } = require("@azure/functions");
 const { CosmosClient } = require("@azure/cosmos");
+const { BlobServiceClient } = require("@azure/storage-blob");
 const { parseCsv, toDoc } = require("./map");
 
 const COSMOS_CONTAINER = "lens_ns_projects";
@@ -50,6 +51,34 @@ async function loadCsvToCosmos(csvText, blobPath, log) {
   }
   return { upserted: docs.length, deleted, blob: blobPath };
 }
+
+async function latestProfitabilityCsv() {
+  const conn = env("NETSUITE_STORAGE");
+  if (!conn) throw new Error("NETSUITE_STORAGE is empty on this Function App");
+  const container = BlobServiceClient.fromConnectionString(conn).getContainerClient("netsuite");
+  const hits = [];
+  for await (const blob of container.listBlobsFlat({ prefix: "landing/" })) {
+    const name = blob.name || "";
+    if (!/landing\/\d{4}\/\d{2}\/\d{2}\/\d+\/.*project_profitability.*\.csv$/i.test(name)) continue;
+    hits.push(name);
+  }
+  hits.sort();
+  if (!hits.length) {
+    throw new Error("No landing/**/*project_profitability*.csv in container netsuite");
+  }
+  const blobPath = hits[hits.length - 1];
+  const buf = await container.getBlobClient(blobPath).downloadToBuffer();
+  return { blobPath, text: buf.toString("utf8") };
+}
+
+app.timer("nsProfitabilityTimer", {
+  schedule: "0 */5 * * * *",
+  handler: async (_timer, context) => {
+    const { blobPath, text } = await latestProfitabilityCsv();
+    const result = await loadCsvToCosmos(text, blobPath, (m) => context.log(m));
+    context.log(JSON.stringify(result));
+  }
+});
 
 app.storageBlob("nsProfitabilityToCosmos", {
   path: "netsuite/landing/{year}/{month}/{day}/{run}/{name}",
