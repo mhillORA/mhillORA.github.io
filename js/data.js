@@ -17,6 +17,30 @@ const WORKSPACES = [
   { id: "all", label: "Loaded sources", ids: SOURCES.filter((s) => s.loaded).map((s) => s.id) }
 ];
 
+const PURPOSES = [
+  {
+    id: "clinops",
+    label: "ClinOps",
+    hint: "Enrollment, sites, studies",
+    workspace: "clinops",
+    ids: ["ora", "ctgov", "trialhub"]
+  },
+  {
+    id: "finance",
+    label: "Finance",
+    hint: "GM, delivery, project list",
+    workspace: "finance",
+    ids: ["ora", "netsuite", "salesforce"]
+  },
+  {
+    id: "bd",
+    label: "Business development",
+    hint: "Registry and sponsors",
+    workspace: "bd",
+    ids: ["salesforce", "ctgov", "trialhub"]
+  }
+];
+
 const DETAIL = {
   ora: "ora_fact_study + ora_fact_site",
   veeva: "not loaded",
@@ -57,4 +81,17 @@ const EXAMPLE_QUESTIONS = [
   { text: "Which Ora sites enrolled the most in dry eye?", icon: "users", needs: "Certified · ora_fact_site" },
   { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
   { text: "Which projects are under budgeted GM?", icon: "chart", needs: "Certified · NetSuite profitability" }
+];
+
+const FINANCE_QUESTIONS = [
+  { text: "Which projects are under budgeted GM?", icon: "chart", needs: "Certified · NetSuite" },
+  { text: "Which NetSuite projects have no GM%?", icon: "chart", needs: "Missing ≠ zero" },
+  { text: "Show change order status for posterior projects", icon: "file", needs: "NetSuite · posterior" },
+  { text: "Which projects have the highest cost per billable hour vs budget?", icon: "chart", needs: "NetSuite cost/hr" }
+];
+
+const BD_QUESTIONS = [
+  { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
+  { text: "Show competing glaucoma trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
+  { text: "Which Ora studies match this indication?", icon: "chart", needs: "ora_fact_study" }
 ];

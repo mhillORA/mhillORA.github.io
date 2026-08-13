@@ -1,5 +1,6 @@
 const { getDb, safeQuery, LENS, SHARED_READ } = require("./cosmos");
 const { narrateWithFoundry } = require("./foundry");
+const { getProjectBundle, studyMatchesProject } = require("./projectJoin");
 
 function guessKey(text) {
   const t = String(text || "").toLowerCase();
@@ -114,12 +115,19 @@ async function fromNsProjects(question) {
   if (!used.length) used = rows;
 
   const wantMissing = /(no gm|missing gm|blank gm|without gm)/.test(t);
+  const wantCost = /(billable|cost per)/.test(t);
   const known = used.filter((r) => gmOf(r, "gm_pct_variance") != null);
   const missing = used.filter((r) => gmOf(r, "gm_pct_variance") == null);
   const under = known.filter((r) => gmOf(r, "gm_pct_variance") < 0).sort((a, b) => gmOf(a, "gm_pct_variance") - gmOf(b, "gm_pct_variance"));
+  const costKnown = used
+    .filter((r) => gmOf(r, "cost_per_billable_hr_actual") != null)
+    .slice()
+    .sort((a, b) => (gmOf(b, "cost_per_billable_hr_actual") || 0) - (gmOf(a, "cost_per_billable_hr_actual") || 0));
   const chartSource = wantMissing
     ? []
-    : (/(under|behind|below|short)/.test(t) && under.length ? under : known.slice().sort((a, b) => gmOf(a, "gm_pct_variance") - gmOf(b, "gm_pct_variance"))).slice(0, 8);
+    : wantCost && costKnown.length
+      ? costKnown.slice(0, 8)
+      : (/(under|behind|below|short)/.test(t) && under.length ? under : known.slice().sort((a, b) => gmOf(a, "gm_pct_variance") - gmOf(b, "gm_pct_variance"))).slice(0, 8);
   const maxAbs = Math.max(0.01, ...chartSource.map((r) => Math.abs(gmOf(r, "gm_pct_variance") || 0)));
   const tableRows = wantMissing ? missing : used;
 
@@ -130,30 +138,63 @@ async function fromNsProjects(question) {
       icon: "chart",
       summary: wantMissing
         ? `${missing.length} of ${used.length} NetSuite projects have no GM% in the profitability snapshot.`
-        : `${known.length} projects have GM%. ${under.length} are under budgeted GM. ${missing.length} have GM missing (not zero).`,
-      chartTitle: wantMissing ? "No GM chart — values are missing" : "GM% variance vs budget (known values only)",
+        : wantCost
+          ? `${costKnown.length} projects have actual cost per billable hour. Blank cost is missing, not zero.`
+          : `${known.length} projects have GM%. ${under.length} are under budgeted GM. ${missing.length} have GM missing (not zero).`,
+      chartTitle: wantMissing
+        ? "No GM chart — values are missing"
+        : wantCost
+          ? "Actual cost per billable hour (known values only)"
+          : "GM% variance vs budget (known values only)",
       chartNote: "NetSuite Project Profitability · lens_ns_projects · read-only",
       chartType: "bar",
-      bars: chartSource.map((r) => {
-        const v = gmOf(r, "gm_pct_variance");
-        return {
-          label: `${r.project_number} ${r.project_name || ""}`.slice(0, 42),
-          pct: Math.round((Math.abs(v) / maxAbs) * 100),
-          value: pctLabel(v),
-          color: v < 0 ? "#ed1c24" : "#3ebdac"
-        };
-      }),
-      tableTitle: wantMissing ? "Projects with GM missing" : "Project profitability",
-      grid: "0.8fr 1.4fr 0.6fr 0.6fr 0.6fr 1fr",
-      cols: ["Number", "Project", "Budget GM", "Actual GM", "Variance", "Change order"],
-      rows: tableRows.slice(0, 12).map((r) => [
-        r.project_number || "—",
-        r.project_name || "—",
-        pctLabel(gmOf(r, "budgeted_gm_pct")),
-        pctLabel(gmOf(r, "actual_gm_pct_prior_month")),
-        pctLabel(gmOf(r, "gm_pct_variance")),
-        r.change_order_status || "—"
-      ]),
+      bars: (wantCost
+        ? (() => {
+            const maxCost = Math.max(1, ...chartSource.map((r) => gmOf(r, "cost_per_billable_hr_actual") || 0));
+            return chartSource.map((r) => {
+              const v = gmOf(r, "cost_per_billable_hr_actual");
+              return {
+                label: `${r.project_number} ${r.project_name || ""}`.slice(0, 42),
+                pct: Math.round((v / maxCost) * 100),
+                value: v == null ? "—" : `$${Math.round(v)}`,
+                color: "#052c49"
+              };
+            });
+          })()
+        : chartSource.map((r) => {
+            const v = gmOf(r, "gm_pct_variance");
+            return {
+              label: `${r.project_number} ${r.project_name || ""}`.slice(0, 42),
+              pct: Math.round((Math.abs(v) / maxAbs) * 100),
+              value: pctLabel(v),
+              color: v < 0 ? "#ed1c24" : "#3ebdac"
+            };
+          })),
+      tableTitle: wantMissing ? "Projects with GM missing" : wantCost ? "Cost per billable hour" : "Project profitability",
+      grid: wantCost ? "0.8fr 1.4fr 0.7fr 0.7fr 0.6fr" : "0.8fr 1.4fr 0.6fr 0.6fr 0.6fr 1fr",
+      cols: wantCost
+        ? ["Number", "Project", "Actual $/hr", "Budget $/hr", "Variance GM"]
+        : ["Number", "Project", "Budget GM", "Actual GM", "Variance", "Change order"],
+      rows: (wantCost ? costKnown : tableRows).slice(0, 12).map((r) =>
+        wantCost
+          ? [
+              r.project_number || "—",
+              r.project_name || "—",
+              gmOf(r, "cost_per_billable_hr_actual") == null ? "—" : `$${Math.round(gmOf(r, "cost_per_billable_hr_actual"))}`,
+              gmOf(r, "cost_per_billable_hr_budgeted") == null ? "—" : `$${Math.round(gmOf(r, "cost_per_billable_hr_budgeted"))}`,
+              pctLabel(gmOf(r, "gm_pct_variance"))
+            ]
+          : [
+              r.project_number || "—",
+              r.project_name || "—",
+              pctLabel(gmOf(r, "budgeted_gm_pct")),
+              pctLabel(gmOf(r, "actual_gm_pct_prior_month")),
+              pctLabel(gmOf(r, "gm_pct_variance")),
+              r.change_order_status || "—"
+            ]
+      ),
+      projectKeys: (wantCost ? costKnown : tableRows).slice(0, 12).map((r) => r.project_number || ""),
+      projectKeys: tableRows.slice(0, 12).map((r) => r.project_number || ""),
       missingCount: missing.length,
       missingNote: wantMissing ? "" : missingNote(missing.length, known.length).replace(/enrolled value/g, "GM%").replace(/enrolled/g, "GM%"),
       caveat: "Snapshot from NetSuite Project Profitability (blob → lens_ns_projects). Blank GM is missing, not 0%. Grain is job (US/AU can share a project number).",
@@ -383,9 +424,12 @@ async function fromOraFactStudy(question, opts = {}) {
     [{ name: "@t", value: "ora_fact_study" }]
   );
   if (!rows.length) return null;
-  const filtered = needle
-    ? rows.filter((r) => String(r.indication || "").toLowerCase().includes(needle))
-    : rows;
+  const filtered = rows.filter((r) => {
+    if (needle && !String(r.indication || "").toLowerCase().includes(needle)) return false;
+    if (opts.projectNumber && !studyMatchesProject(r.study_number, opts.projectNumber)) return false;
+    return true;
+  });
+  if (opts.projectNumber && !filtered.length) return null;
   const used = filtered.length ? filtered : rows;
   const known = used.filter((r) => enrolledOf(r) != null);
   const missing = used.filter((r) => enrolledOf(r) == null);
@@ -561,21 +605,184 @@ async function getBriefing() {
   };
 }
 
-async function answerFromCosmos(question, sources) {
+async function fromProjectContext(question, projectNumber) {
+  const bundle = await getProjectBundle(projectNumber);
+  const jobs = bundle.jobs || [];
+  const studies = bundle.studies || [];
+  const sites = bundle.sites || [];
+  if (!jobs.length && !studies.length) return null;
+
+  const t = String(question || "").toLowerCase();
+  const wantSites = /(site|investigator)/.test(t) && sites.length;
+  const wantClinical = /(enroll|study|psm|screen fail|indication|lifecycle)/.test(t) && studies.length;
+
+  if (wantSites) {
+    const known = sites.filter((s) => s.enrolled != null);
+    const maxEnroll = Math.max(1, ...known.map((s) => s.enrolled));
+    return stamp(
+      {
+        q: question,
+        needs: ["ora", "netsuite"],
+        icon: "users",
+        summary: `${sites.length} ora_fact_site row${sites.length === 1 ? "" : "s"} for studies joined to ${projectNumber}. ${bundle.join.note}`,
+        chartTitle: `Sites · ${projectNumber}`,
+        chartNote: "Join computed at read time · no mapping table",
+        chartType: "bar",
+        bars: known.slice(0, 8).map((s) => ({
+          label: String(s.site || "—").slice(0, 36),
+          pct: Math.round((s.enrolled / maxEnroll) * 100),
+          value: String(s.enrolled),
+          color: "#052c49"
+        })),
+        tableTitle: "Sites on joined studies",
+        grid: "1.2fr 0.8fr 0.6fr 0.6fr 0.8fr",
+        cols: ["Site", "Study", "Country", "Enrolled", "Site PSM"],
+        rows: sites.slice(0, 12).map((s) => [
+          s.site || "—",
+          s.study_name || "—",
+          s.country || "—",
+          s.enrolled == null ? "—" : String(s.enrolled),
+          s.site_psm == null ? "—" : String(s.site_psm)
+        ]),
+        caveat: bundle.join.note,
+        trace: [
+          `Computed join project_number ${projectNumber} → ora_fact_study.study_number.`,
+          `Read ${SHARED_READ.oraFactSite} for those study names. Did not write.`
+        ],
+        query: `computed join ${projectNumber} → ora_fact_site`,
+        confidence: studies.length ? "high" : "medium",
+        followUps: [
+          `What is GM on ${projectNumber}?`,
+          `Enrollment for ${projectNumber}`,
+          "Which projects are under budgeted GM?"
+        ]
+      },
+      sites
+    );
+  }
+
+  if (wantClinical) {
+    const known = studies.filter((s) => s.total_enrolled != null);
+    const maxEnroll = Math.max(1, ...known.map((s) => s.total_enrolled));
+    return stamp(
+      {
+        q: question,
+        needs: ["ora", "netsuite"],
+        icon: "chart",
+        summary: `${studies.length} ora_fact_study row${studies.length === 1 ? "" : "s"} joined to ${projectNumber}. ${jobs.length} NetSuite job${jobs.length === 1 ? "" : "s"} share that number. ${bundle.join.note}`,
+        chartTitle: `Enrollment · studies joined to ${projectNumber}`,
+        chartNote: "Join computed at read time · no mapping table",
+        chartType: "bar",
+        bars: known.slice(0, 8).map((s) => ({
+          label: s.study_number || "—",
+          pct: Math.round((s.total_enrolled / maxEnroll) * 100),
+          value: String(s.total_enrolled),
+          color: "#052c49"
+        })),
+        tableTitle: "ora_fact_study rows for this project number",
+        grid: "1fr 0.7fr 0.7fr 0.8fr 1fr",
+        cols: ["Study", "Enrolled", "PSM", "Match", "Indication"],
+        rows: studies.slice(0, 12).map((s) => [
+          s.study_number || "—",
+          s.total_enrolled == null ? "—" : String(s.total_enrolled),
+          s.psm == null ? "—" : String(s.psm),
+          s.match || "—",
+          s.indication || "—"
+        ]),
+        caveat: bundle.join.note,
+        trace: [
+          `Computed join: ${bundle.join.matchedOn}.`,
+          "Did not write Cosmos. No mapping container."
+        ],
+        query: `computed join ${projectNumber} → ora_fact_study.study_number`,
+        confidence: "high",
+        followUps: [
+          `Sites for ${projectNumber}`,
+          `What is GM on ${projectNumber}?`,
+          "Which projects are under budgeted GM?"
+        ]
+      },
+      studies
+    );
+  }
+
+  if (jobs.length) {
+    const known = jobs.filter((r) => gmOf(r, "gm_pct_variance") != null);
+    const missing = jobs.filter((r) => gmOf(r, "gm_pct_variance") == null);
+    const maxAbs = Math.max(0.01, ...known.map((r) => Math.abs(gmOf(r, "gm_pct_variance") || 0)));
+    return stamp(
+      {
+        q: question,
+        needs: ["netsuite", "ora"],
+        icon: "chart",
+        summary: `${jobs.length} NetSuite job${jobs.length === 1 ? "" : "s"} for ${projectNumber}. ${studies.length} ora_fact_study match${studies.length === 1 ? "" : "es"} on study_number. ${bundle.join.note}`,
+        chartTitle: `GM% variance · ${projectNumber}`,
+        chartNote: "NetSuite + computed study join · read-only",
+        chartType: "bar",
+        bars: known.map((r) => {
+          const v = gmOf(r, "gm_pct_variance");
+          return {
+            label: String(r.project_name || r.project_number).slice(0, 42),
+            pct: Math.round((Math.abs(v) / maxAbs) * 100),
+            value: pctLabel(v),
+            color: v < 0 ? "#ed1c24" : "#3ebdac"
+          };
+        }),
+        tableTitle: "NetSuite jobs for this project number",
+        grid: "0.8fr 1.4fr 0.6fr 0.6fr 0.6fr 1fr",
+        cols: ["Number", "Project", "Budget GM", "Actual GM", "Variance", "Change order"],
+        rows: jobs.map((r) => [
+          r.project_number || "—",
+          r.project_name || "—",
+          pctLabel(gmOf(r, "budgeted_gm_pct")),
+          pctLabel(gmOf(r, "actual_gm_pct_prior_month")),
+          pctLabel(gmOf(r, "gm_pct_variance")),
+          r.change_order_status || "—"
+        ]),
+        projectKeys: jobs.map((r) => r.project_number || ""),
+        missingCount: missing.length,
+        missingNote: missing.length
+          ? `${missing.length} job${missing.length === 1 ? " has" : "s have"} GM% missing (not zero).`
+          : "",
+        caveat: bundle.join.note,
+        trace: [
+          `Read ${LENS.nsProjects} for project_number = ${projectNumber}.`,
+          `Joined in-memory to ${SHARED_READ.oraFactStudy}.study_number. Did not write.`
+        ],
+        query: `lens_ns_projects + computed join to ora_fact_study (${projectNumber})`,
+        confidence: "high",
+        followUps: [
+          `Enrollment for ${projectNumber}`,
+          `Sites for ${projectNumber}`,
+          "Which projects are under budgeted GM?"
+        ]
+      },
+      jobs
+    );
+  }
+
+  return fromOraFactStudy(question, { projectNumber });
+}
+
+async function answerFromCosmos(question, sources, opts) {
   getDb();
+  const fromQ = String(question).match(/\b\d{2}-\d{3}-\d{4}\b/);
+  const projectNumber = String((opts && opts.projectNumber) || (fromQ && fromQ[0]) || "").trim();
   const key = guessKey(question);
   let answer = null;
-  if (key === "missing_enrolled") answer = await fromOraFactStudy(question, { missingOnly: true });
+  if (projectNumber) answer = await fromProjectContext(question, projectNumber);
+  if (!answer && key === "missing_enrolled") answer = await fromOraFactStudy(question, { missingOnly: true });
   if (!answer && key === "netsuite") answer = await fromNsProjects(question);
   if (!answer && key === "sites") answer = await fromOraFactSite(question);
   if (!answer && key === "visits") answer = await fromLensVisits(question);
   if (!answer && key === "visits") answer = await fromOraFactSite(question);
   if (!answer && key === "competitive") answer = await fromRegistry(question);
   if (!answer) answer = await fromLensStudies(question);
-  if (!answer && key !== "competitive") answer = await fromOraFactStudy(question);
+  if (!answer && key !== "competitive") answer = await fromOraFactStudy(question, projectNumber ? { projectNumber } : {});
   if (!answer) answer = await fromRegistry(question);
   if (!answer) answer = emptyAnswer(question);
   answer.sourcesUsed = sources;
+  if (projectNumber) answer.projectNumber = projectNumber;
 
   try {
     const llm = await narrateWithFoundry(question, answer);

@@ -1,6 +1,7 @@
 (function () {
   const state = {
     nav: "ask",
+    purpose: load("odl.purpose", "clinops") || "clinops",
     workspace: "clinops",
     enabled: {
       ora: true,
@@ -14,6 +15,11 @@
       netsuite: true
     },
     briefing: null,
+    finance: null,
+    project: null,
+    projectNumber: "",
+    projectFilter: "",
+    projectError: "",
     draft: "",
     phase: "idle",
     key: "live",
@@ -73,6 +79,50 @@
     return "enrollment";
   }
 
+  function fmtPct(n) {
+    if (n == null || n === "") return "—";
+    return `${Math.round(Number(n) * 1000) / 10}%`;
+  }
+
+  function fmtMoney(n) {
+    if (n == null || n === "") return "—";
+    return `$${Math.round(Number(n))}`;
+  }
+
+  function gmClass(n) {
+    if (n == null) return "missing";
+    return n < 0 ? "under" : "over";
+  }
+
+  function purposeOf(id) {
+    return (typeof PURPOSES !== "undefined" ? PURPOSES : []).find((p) => p.id === id);
+  }
+
+  function applyPurposeSources(id) {
+    const p = purposeOf(id);
+    if (!p) return;
+    SOURCES.forEach((s) => {
+      state.enabled[s.id] = s.loaded && p.ids.includes(s.id);
+    });
+    state.workspace = p.workspace;
+    state.purpose = p.id;
+  }
+
+  function setPurpose(id, opts) {
+    const keepIdle = !(opts && opts.keepView);
+    applyPurposeSources(id);
+    save("odl.purpose", id);
+    if (keepIdle) {
+      state.phase = "idle";
+      state.project = null;
+      state.projectNumber = "";
+      state.projectError = "";
+      state.nav = "ask";
+    }
+    render();
+    if (id === "finance") loadFinance();
+  }
+
   function setNav(key) {
     state.nav = key;
     render();
@@ -83,6 +133,9 @@
     state.draft = "";
     state.traceOpen = false;
     state.nav = "ask";
+    state.project = null;
+    state.projectNumber = "";
+    state.projectError = "";
     render();
     const el = document.getElementById("draft");
     if (el) el.value = "";
@@ -107,7 +160,8 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
-          sources: enabledList().map((s) => s.id)
+          sources: enabledList().map((s) => s.id),
+          projectNumber: state.projectNumber || ""
         })
       });
       const body = await res.json().catch(() => ({}));
@@ -163,7 +217,12 @@
           state.enabled[s.id] = s.loaded && w.ids.includes(s.id);
         });
         state.workspace = w.id;
+        if (w.id === "finance" || w.id === "clinops" || w.id === "bd") {
+          state.purpose = w.id;
+          save("odl.purpose", w.id);
+        }
         render();
+        if (w.id === "finance") loadFinance();
       };
     });
 
@@ -190,10 +249,142 @@
     });
   }
 
+  function suggestButtons(questions) {
+    return (
+      questions
+        .map(
+          (q) => `<button type="button" class="suggest">
+            <span class="suggest-icon">${ICONS[q.icon] || ICONS.chart}</span>
+            <span><span class="suggest-text">${q.text}</span><span class="suggest-needs">${q.needs}</span></span>
+          </button>`
+        )
+        .join("")
+    );
+  }
+
+  function bindSuggests(panel, questions) {
+    panel.querySelectorAll(".suggest").forEach((btn, i) => {
+      btn.onclick = () => run("live", questions[i].text);
+    });
+  }
+
+  function renderPurpose() {
+    const root = document.getElementById("purpose");
+    if (!root || typeof PURPOSES === "undefined") return;
+    root.innerHTML = PURPOSES.map(
+      (p) =>
+        `<button type="button" class="purpose-btn${state.purpose === p.id ? " active" : ""}" data-purpose="${p.id}" title="${p.hint}">${p.label}</button>`
+    ).join("");
+    root.querySelectorAll("[data-purpose]").forEach((btn) => {
+      btn.onclick = () => setPurpose(btn.dataset.purpose);
+    });
+  }
+
+  function renderFinanceIdle(panel) {
+    const f = state.finance;
+    if (!f) {
+      panel.innerHTML = `<div class="briefing"><div class="suggest-head">Finance</div><div class="briefing-note">Loading NetSuite profitability…</div></div>`;
+      return;
+    }
+    const kpis = f.loaded
+      ? `<div class="kpi-row">
+          <div class="kpi"><div class="kpi-value">${f.projects}</div><div class="kpi-label">Jobs in snapshot</div></div>
+          <div class="kpi"><div class="kpi-value">${f.underGm}</div><div class="kpi-label">Under budgeted GM</div></div>
+          <div class="kpi"><div class="kpi-value">${f.missingGm}</div><div class="kpi-label">GM missing</div></div>
+          <div class="kpi"><div class="kpi-value">${f.linked}</div><div class="kpi-label">Linked to a study</div></div>
+          <div class="kpi"><div class="kpi-value">${f.unlinked}</div><div class="kpi-label">No study match</div></div>
+        </div>`
+      : `<div class="briefing-note">${escapeHtml(f.note || "No NetSuite snapshot in Cosmos yet.")}</div>`;
+    const q = typeof FINANCE_QUESTIONS !== "undefined" ? FINANCE_QUESTIONS : EXAMPLE_QUESTIONS;
+    const needle = (state.projectFilter || "").trim().toLowerCase();
+    const rows = (f.rows || []).filter((r) => {
+      if (!needle) return true;
+      return [r.project_number, r.project_name, r.customer_name, r.service_line, r.project_manager]
+        .join(" ")
+        .toLowerCase()
+        .includes(needle);
+    });
+    const list = f.loaded
+      ? `<div class="project-toolbar">
+          <input class="project-filter" id="projectFilter" type="search" placeholder="Filter by number, name, customer, PM…" value="${escapeHtml(state.projectFilter)}" />
+          <span class="project-count">${rows.length} shown</span>
+        </div>` +
+        (rows.length
+          ? rows
+              .map((r) => {
+                const gm = r.gm_pct_variance;
+                return `<button type="button" class="project-card" data-pn="${escapeHtml(r.project_number)}">
+                  <span class="project-num">${escapeHtml(r.project_number)}</span>
+                  <span>
+                    <span class="project-name">${escapeHtml(r.project_name || "—")}</span>
+                    <div class="project-sub">${escapeHtml([r.customer_name, r.service_line, r.project_status].filter(Boolean).join(" · ") || "—")}</div>
+                    <span class="link-badge${r.linkedStudyCount ? "" : " off"}">${
+                      r.linkedStudyCount
+                        ? `${r.linkedStudyCount} study match`
+                        : "no study match"
+                    }</span>
+                  </span>
+                  <span class="project-gm ${gmClass(gm)}">${fmtPct(gm)}</span>
+                </button>`;
+              })
+              .join("")
+          : `<p class="empty">No projects match that filter.</p>`)
+      : "";
+
+    panel.innerHTML =
+      `<div class="briefing">
+        <div class="suggest-head">Finance briefing</div>
+        ${kpis}
+        <div class="briefing-note">${escapeHtml(f.asOfLabel || "")}${f.note ? ` · ${escapeHtml(f.note)}` : ""}</div>
+      </div>
+      <div class="suggest-head">Ask these, or click a project</div>` +
+      suggestButtons(q) +
+      `<div class="suggest-head" style="margin-top:8px">Projects</div>` +
+      list;
+
+    bindSuggests(panel, q);
+    const filter = document.getElementById("projectFilter");
+    if (filter) {
+      filter.oninput = (e) => {
+        state.projectFilter = e.target.value;
+        const pos = e.target.selectionStart;
+        renderFinanceIdle(panel);
+        const again = document.getElementById("projectFilter");
+        if (again) {
+          again.focus();
+          try {
+            again.setSelectionRange(pos, pos);
+          } catch (_) {}
+        }
+      };
+    }
+    panel.querySelectorAll("[data-pn]").forEach((btn) => {
+      btn.onclick = () => openProject(btn.dataset.pn);
+    });
+  }
+
   function renderIdle() {
     const panel = document.getElementById("idlePanel");
     panel.classList.toggle("hidden", state.phase !== "idle");
     if (state.phase !== "idle") return;
+
+    if (state.purpose === "finance") {
+      renderFinanceIdle(panel);
+      return;
+    }
+
+    if (state.purpose === "bd") {
+      const q = typeof BD_QUESTIONS !== "undefined" ? BD_QUESTIONS : EXAMPLE_QUESTIONS;
+      panel.innerHTML =
+        `<div class="briefing">
+          <div class="suggest-head">Business development</div>
+          <div class="briefing-note">Registry and sponsor questions. Salesforce is a crosswalk, not pipeline revenue.</div>
+        </div>
+        <div class="suggest-head">Suggested prompts</div>` + suggestButtons(q);
+      bindSuggests(panel, q);
+      return;
+    }
+
     const b = state.briefing;
     const kpis = b
       ? `<div class="briefing">
@@ -210,16 +401,9 @@
       : `<div class="briefing"><div class="suggest-head">ClinOps briefing</div><div class="briefing-note">Loading Cosmos rollup…</div></div>`;
     panel.innerHTML =
       kpis +
-      `<div class="suggest-head">Five questions that always work</div>` +
-      EXAMPLE_QUESTIONS.map(
-        (q) => `<button type="button" class="suggest">
-            <span class="suggest-icon">${ICONS[q.icon]}</span>
-            <span><span class="suggest-text">${q.text}</span><span class="suggest-needs">${q.needs}</span></span>
-          </button>`
-      ).join("");
-    panel.querySelectorAll(".suggest").forEach((btn, i) => {
-      btn.onclick = () => run("live", EXAMPLE_QUESTIONS[i].text);
-    });
+      `<div class="suggest-head">Suggested prompts</div>` +
+      suggestButtons(EXAMPLE_QUESTIONS);
+    bindSuggests(panel, EXAMPLE_QUESTIONS);
   }
 
   function renderThinking() {
@@ -235,6 +419,13 @@
 
   function renderAnswer() {
     const panel = document.getElementById("answerPanel");
+    if (state.phase === "project") {
+      if (state.chart) {
+        state.chart.destroy();
+        state.chart = null;
+      }
+      return;
+    }
     if (state.phase === "error") {
       panel.classList.remove("hidden");
       panel.innerHTML = `<div class="you"><span class="you-badge">You</span><p>${escapeHtml(state.askedText)}</p></div>
@@ -294,13 +485,14 @@
     const cols = a.cols
       .map((c) => `<span>${c}</span>`)
       .join("");
+    const keys = a.projectKeys || [];
     const rows = a.rows
-      .map(
-        (r) =>
-          `<div class="table-row" style="grid-template-columns:${a.grid}">${r
-            .map((cell, i) => `<span class="${i === 0 ? "cell-strong" : i < 3 ? "cell-mono" : ""}">${cell}</span>`)
-            .join("")}</div>`
-      )
+      .map((r, ri) => {
+        const pn = keys[ri] || "";
+        return `<div class="table-row${pn ? " clickable" : ""}"${pn ? ` data-pn="${escapeHtml(pn)}"` : ""} style="grid-template-columns:${a.grid}">${r
+          .map((cell, i) => `<span class="${i === 0 ? "cell-strong" : i < 3 ? "cell-mono" : ""}">${cell}</span>`)
+          .join("")}</div>`;
+      })
       .join("");
 
     const cites = a.needs
@@ -374,8 +566,148 @@
     panel.querySelectorAll(".follow").forEach((btn) => {
       btn.onclick = () => run(guessKey(btn.textContent), btn.textContent);
     });
+    panel.querySelectorAll("[data-pn]").forEach((row) => {
+      row.onclick = () => openProject(row.dataset.pn);
+    });
 
     drawChart(a);
+  }
+
+  function renderProject() {
+    const panel = document.getElementById("answerPanel");
+    if (state.phase !== "project") return;
+    panel.classList.remove("hidden");
+    if (state.projectError && !state.project) {
+      panel.innerHTML = `<button type="button" class="btn btn-ghost project-back" id="projBack">← All projects</button>
+        <div class="gap"><div style="flex:1">
+          <div class="gap-title">Could not load project</div>
+          <div class="gap-body">${escapeHtml(state.projectError)}</div>
+        </div></div>`;
+      const back = document.getElementById("projBack");
+      if (back) back.onclick = resetAsk;
+      return;
+    }
+    if (!state.project) {
+      panel.innerHTML = `<div class="thinking">
+        <div class="thinking-row"><span class="dot"></span><span>Joining NetSuite to ora_fact_study…</span></div>
+        <div class="skel" style="width:72%"></div>
+        <div class="skel" style="width:48%"></div>
+      </div>`;
+      return;
+    }
+
+    const p = state.project;
+    const job = p.jobs && p.jobs[0];
+    const title = job ? job.project_name : p.project_number;
+    const jobs = p.jobs || [];
+    const studies = p.studies || [];
+    const sites = p.sites || [];
+
+    const jobRows = jobs
+      .map(
+        (r) => `<div class="table-row" style="grid-template-columns:1.4fr 0.8fr 0.7fr 0.7fr 0.7fr 1fr">
+          <span class="cell-strong">${escapeHtml(r.project_name || "—")}</span>
+          <span class="cell-mono">${escapeHtml(r.service_line || "—")}</span>
+          <span class="cell-mono">${fmtPct(r.budgeted_gm_pct)}</span>
+          <span class="cell-mono">${fmtPct(r.actual_gm_pct_prior_month)}</span>
+          <span class="cell-mono">${fmtPct(r.gm_pct_variance)}</span>
+          <span>${escapeHtml(r.change_order_status || "—")}</span>
+        </div>`
+      )
+      .join("");
+
+    const studyRows = studies.length
+      ? studies
+          .map(
+            (s) => `<div class="table-row" style="grid-template-columns:1fr 0.7fr 0.6fr 0.7fr 1fr">
+              <span class="cell-strong">${escapeHtml(s.study_number || "—")}</span>
+              <span class="cell-mono">${s.total_enrolled == null ? "—" : s.total_enrolled}</span>
+              <span class="cell-mono">${s.psm == null ? "—" : s.psm}</span>
+              <span>${escapeHtml(s.match || "—")}</span>
+              <span>${escapeHtml(s.indication || "—")}</span>
+            </div>`
+          )
+          .join("")
+      : `<p class="empty">No ora_fact_study.study_number matched ${escapeHtml(p.project_number)}.</p>`;
+
+    const siteRows = sites.length
+      ? sites
+          .map(
+            (s) => `<div class="table-row" style="grid-template-columns:1.2fr 0.8fr 0.7fr 0.6fr 0.6fr">
+              <span class="cell-strong">${escapeHtml(s.site || "—")}</span>
+              <span class="cell-mono">${escapeHtml(s.study_name || "—")}</span>
+              <span>${escapeHtml(s.country || "—")}</span>
+              <span class="cell-mono">${s.enrolled == null ? "—" : s.enrolled}</span>
+              <span class="cell-mono">${s.site_psm == null ? "—" : s.site_psm}</span>
+            </div>`
+          )
+          .join("")
+      : "";
+
+    const prompts = [
+      `What is GM on ${p.project_number}?`,
+      `Enrollment for ${p.project_number}`,
+      `Sites for ${p.project_number}`
+    ];
+
+    panel.innerHTML = `
+      <button type="button" class="btn btn-ghost project-back" id="projBack">← All projects</button>
+      <div class="answer">
+        <div class="answer-head">
+          <span class="conf" style="background:var(--status-info-bg);color:var(--ora-blue-600)"><span class="conf-dot" style="background:var(--ora-blue-600)"></span>${escapeHtml(p.project_number)}</span>
+          <span class="chart-note">${escapeHtml(p.asOfLabel || "computed join · no mapping table")}</span>
+        </div>
+        <p class="summary">${escapeHtml(title || p.project_number)}</p>
+        <div class="detail-grid">
+          <div class="detail-card"><div class="detail-label">Customer</div><div class="detail-value">${escapeHtml((job && job.customer_name) || "—")}</div></div>
+          <div class="detail-card"><div class="detail-label">PM</div><div class="detail-value">${escapeHtml((job && job.project_manager) || "—")}</div></div>
+          <div class="detail-card"><div class="detail-label">Status</div><div class="detail-value">${escapeHtml((job && job.project_status) || "—")}</div></div>
+          <div class="detail-card"><div class="detail-label">Budget GM</div><div class="detail-value">${fmtPct(job && job.budgeted_gm_pct)}</div></div>
+          <div class="detail-card"><div class="detail-label">Actual GM</div><div class="detail-value">${fmtPct(job && job.actual_gm_pct_prior_month)}</div></div>
+          <div class="detail-card"><div class="detail-label">Variance</div><div class="detail-value">${fmtPct(job && job.gm_pct_variance)}</div></div>
+          <div class="detail-card"><div class="detail-label">EOS GM</div><div class="detail-value">${fmtPct(job && job.projected_eos_gm_pct_prior_month)}</div></div>
+          <div class="detail-card"><div class="detail-label">Cost / billable hr</div><div class="detail-value">${fmtMoney(job && job.cost_per_billable_hr_actual)} / ${fmtMoney(job && job.cost_per_billable_hr_budgeted)}</div></div>
+        </div>
+        <div class="join-note">${escapeHtml((p.join && p.join.note) || "")}</div>
+        <div class="block">
+          <span class="block-title">NetSuite jobs (${jobs.length})</span>
+          <div class="table-wrap">
+            <div class="table-head" style="grid-template-columns:1.4fr 0.8fr 0.7fr 0.7fr 0.7fr 1fr"><span>Job</span><span>Service line</span><span>Budget GM</span><span>Actual GM</span><span>Variance</span><span>Change order</span></div>
+            ${jobRows || `<p class="empty">No lens_ns_projects row for this number.</p>`}
+          </div>
+        </div>
+        <div class="block">
+          <span class="block-title">ora_fact_study (${studies.length}) · joined on study_number</span>
+          <div class="table-wrap">
+            ${
+              studies.length
+                ? `<div class="table-head" style="grid-template-columns:1fr 0.7fr 0.6fr 0.7fr 1fr"><span>Study</span><span>Enrolled</span><span>PSM</span><span>Match</span><span>Indication</span></div>${studyRows}`
+                : studyRows
+            }
+          </div>
+        </div>
+        ${
+          sites.length
+            ? `<div class="block">
+          <span class="block-title">ora_fact_site (${sites.length})</span>
+          <div class="table-wrap">
+            <div class="table-head" style="grid-template-columns:1.2fr 0.8fr 0.7fr 0.6fr 0.6fr"><span>Site</span><span>Study</span><span>Country</span><span>Enrolled</span><span>Site PSM</span></div>
+            ${siteRows}
+          </div>
+        </div>`
+            : ""
+        }
+      </div>
+      <div>
+        <div class="suggest-head" style="margin-bottom:10px">Ask about this project</div>
+        <div class="follows">${prompts.map((t) => `<button type="button" class="follow">${escapeHtml(t)}</button>`).join("")}</div>
+      </div>`;
+
+    const back = document.getElementById("projBack");
+    if (back) back.onclick = resetAsk;
+    panel.querySelectorAll(".follow").forEach((btn) => {
+      btn.onclick = () => run("live", btn.textContent);
+    });
   }
 
   function drawChart(a) {
@@ -429,8 +761,15 @@
     hist.classList.toggle("hidden", state.nav !== "history");
     help.classList.toggle("hidden", state.nav !== "sources");
 
+    const idleTitle =
+      state.purpose === "finance" ? "Finance" : state.purpose === "bd" ? "Business development" : "ClinOps briefing";
     const titles = {
-      ask: state.phase === "idle" ? "ClinOps briefing" : "Ask your data",
+      ask:
+        state.phase === "project"
+          ? state.projectNumber || "Project"
+          : state.phase === "idle"
+            ? idleTitle
+            : "Ask your data",
       saved: "Saved answers",
       history: "History",
       sources: "Sources"
@@ -470,8 +809,8 @@
     });
 
     help.innerHTML = `<div class="answer">
-      <p class="summary">Loaded sources are in Cosmos today: Ora clinical rollup, TrialHub, CT.gov, Salesforce crosswalk. Veeva, live iMedNet/Medidata, InsightsRM, and NetSuite stay locked until gold ETL lands. Ask never writes.</p>
-      <p class="caveat">Blank enrolled is missing, not zero. Chart bars use known values only. As-of is the newest document timestamp in the pack.</p>
+      <p class="summary">Loaded sources: Ora clinical rollup, TrialHub, CT.gov, Salesforce crosswalk, NetSuite profitability. Veeva / live EDC / InsightsRM stay locked until gold ETL. Ask never writes. Project number joins to ora_fact_study.study_number in the app — there is no mapping table.</p>
+      <p class="caveat">Blank enrolled or GM is missing, not zero. Chart bars use known values only. As-of is the newest document timestamp in the pack.</p>
     </div>`;
   }
 
@@ -485,6 +824,12 @@
 
   function bindChrome() {
     const draft = document.getElementById("draft");
+    draft.placeholder =
+      state.projectNumber
+        ? `Ask about ${state.projectNumber} — GM, enrollment, sites…`
+        : state.purpose === "finance"
+          ? "Ask about GM, change orders, or a project number…"
+          : "Ask from the loaded Cosmos sources — or pick a purpose above.";
     draft.value = state.draft;
     draft.oninput = (e) => {
       state.draft = e.target.value;
@@ -512,10 +857,12 @@
 
   function render() {
     renderNav();
+    renderPurpose();
     renderSources();
     renderIdle();
     renderThinking();
     renderAnswer();
+    renderProject();
     renderLists();
     bindChrome();
   }
@@ -531,6 +878,55 @@
     if (state.phase === "idle") render();
   }
 
+  async function loadFinance() {
+    try {
+      const res = await fetch("/api/finance");
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Finance failed (${res.status})`);
+      state.finance = body.finance || null;
+    } catch (err) {
+      state.finance = {
+        loaded: false,
+        projects: 0,
+        uniqueNumbers: 0,
+        withGm: 0,
+        missingGm: 0,
+        underGm: 0,
+        linked: 0,
+        unlinked: 0,
+        rows: [],
+        note: String(err.message || err)
+      };
+    }
+    if (state.phase === "idle" && state.purpose === "finance") render();
+  }
+
+  async function openProject(number) {
+    const pn = String(number || "").trim();
+    if (!pn) return;
+    state.nav = "ask";
+    state.phase = "project";
+    state.projectNumber = pn;
+    state.project = null;
+    state.projectError = "";
+    if (state.purpose !== "finance") {
+      applyPurposeSources("finance");
+      save("odl.purpose", "finance");
+    }
+    render();
+    try {
+      const res = await fetch(`/api/project?number=${encodeURIComponent(pn)}`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Project failed (${res.status})`);
+      state.project = body.project;
+    } catch (err) {
+      state.projectError = String(err.message || err);
+    }
+    render();
+  }
+
+  applyPurposeSources(state.purpose);
   render();
   loadBriefing();
+  loadFinance();
 })();

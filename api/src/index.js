@@ -1,5 +1,6 @@
 const { app } = require("@azure/functions");
 const { answerFromCosmos, getBriefing } = require("./ask");
+const { getFinanceBriefing, getProjectBundle } = require("./projectJoin");
 const { foundryStatus } = require("./foundry");
 
 function json(status, body) {
@@ -62,8 +63,40 @@ app.http("ask", {
     const question = String(body.question || "").trim();
     if (!question) return json(400, { error: "question required" });
     try {
-      const answer = await answerFromCosmos(question, body.sources || []);
+      const answer = await answerFromCosmos(question, body.sources || [], {
+        projectNumber: String(body.projectNumber || "").trim()
+      });
       return json(200, { answer });
+    } catch (err) {
+      return json(503, { error: String(err.message || err) });
+    }
+  }
+});
+
+app.http("finance", {
+  methods: ["GET"],
+  authLevel: "anonymous",
+  route: "finance",
+  handler: async () => {
+    try {
+      const finance = await getFinanceBriefing();
+      return json(200, { finance });
+    } catch (err) {
+      return json(503, { error: String(err.message || err) });
+    }
+  }
+});
+
+app.http("project", {
+  methods: ["GET"],
+  authLevel: "anonymous",
+  route: "project",
+  handler: async (request) => {
+    const number = String(request.query.get("number") || request.query.get("id") || "").trim();
+    if (!number) return json(400, { error: "number required" });
+    try {
+      const project = await getProjectBundle(number);
+      return json(200, { project });
     } catch (err) {
       return json(503, { error: String(err.message || err) });
     }
