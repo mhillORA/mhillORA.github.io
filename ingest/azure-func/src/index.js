@@ -71,14 +71,16 @@ async function latestProfitabilityCsv() {
   return { blobPath, text: buf.toString("utf8") };
 }
 
-app.timer("nsProfitabilityTimer", {
-  schedule: "0 */5 * * * *",
-  handler: async (_timer, context) => {
-    const { blobPath, text } = await latestProfitabilityCsv();
-    const result = await loadCsvToCosmos(text, blobPath, (m) => context.log(m));
-    context.log(JSON.stringify(result));
-  }
-});
+async function runLatest(_timer, context) {
+  const { blobPath, text } = await latestProfitabilityCsv();
+  const result = await loadCsvToCosmos(text, blobPath, (m) => context.log(m));
+  context.log(JSON.stringify(result));
+}
+
+// Eastern local time. Set Function App setting TZ=America/New_York (Linux).
+app.timer("nsLoad_0605ET", { schedule: "0 5 6 * * *", handler: runLatest });
+app.timer("nsLoad_1015ET", { schedule: "0 15 10 * * *", handler: runLatest });
+app.timer("nsLoad_1205ET", { schedule: "0 5 12 * * *", handler: runLatest });
 
 app.storageBlob("nsProfitabilityToCosmos", {
   path: "netsuite/landing/{year}/{month}/{day}/{run}/{name}",
