@@ -1,4 +1,5 @@
 const { getDb, safeQuery, LENS, SHARED_READ } = require("./cosmos");
+const { narrateWithFoundry } = require("./foundry");
 
 function guessKey(text) {
   const t = String(text || "").toLowerCase();
@@ -246,6 +247,23 @@ async function answerFromCosmos(question, sources) {
   if (!answer) answer = await fromRegistry(question);
   if (!answer) answer = emptyAnswer(question);
   answer.sourcesUsed = sources;
+
+  try {
+    const llm = await narrateWithFoundry(question, answer);
+    answer.summary = llm.summary || answer.summary;
+    answer.chartTitle = llm.chartTitle || answer.chartTitle;
+    answer.caveat = llm.caveat || answer.caveat;
+    answer.followUps = llm.followUps || answer.followUps;
+    answer.chartNote = `${answer.chartNote} · ${llm.agentName} (${llm.model})`;
+    answer.trace = [
+      ...(answer.trace || []),
+      `Foundry ${llm.via} wrote the narrative. Bars and table are Cosmos rows, not model-invented.`
+    ];
+  } catch (err) {
+    answer.foundryError = String(err.message || err);
+    answer.caveat = `${answer.caveat} Foundry did not run: ${answer.foundryError}`;
+    answer.trace = [...(answer.trace || []), `Foundry skipped: ${answer.foundryError}`];
+  }
   return answer;
 }
 

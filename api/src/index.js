@@ -1,5 +1,6 @@
 const { app } = require("@azure/functions");
 const { answerFromCosmos } = require("./ask");
+const { foundryStatus } = require("./foundry");
 
 function json(status, body) {
   return {
@@ -26,7 +27,8 @@ app.http("health", {
       ok: true,
       app: "ora-data-lens",
       access: "read-only",
-      cosmos
+      cosmos,
+      foundry: foundryStatus()
     });
   }
 });

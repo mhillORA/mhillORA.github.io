@@ -199,7 +199,7 @@
     const panel = document.getElementById("thinkingPanel");
     panel.classList.toggle("hidden", state.phase !== "thinking");
     panel.innerHTML = `<div class="thinking">
-      <div class="thinking-row"><span class="dot"></span><span>Reading ${enabledList().length} sources</span></div>
+      <div class="thinking-row"><span class="dot"></span><span>Reading Cosmos · asking Foundry</span></div>
       <div class="skel" style="width:72%"></div>
       <div class="skel" style="width:94%"></div>
       <div class="skel" style="width:48%"></div>
@@ -233,15 +233,20 @@
     const confKey = missing.length ? "partial" : a.confidence;
     const conf = CONF[confKey];
 
-    const gap = missing.length
-      ? `<div class="gap">
+    const gap = a.foundryError
+      ? `<div class="gap"><div style="flex:1">
+          <div class="gap-title">Foundry did not answer</div>
+          <div class="gap-body">${escapeHtml(a.foundryError)} Numbers below are still from Cosmos.</div>
+        </div></div>`
+      : missing.length
+        ? `<div class="gap">
           <div style="flex:1">
             <div class="gap-title">${missingNames.join(" and ")} ${missing.length > 1 ? "are" : "is"} switched off</div>
             <div class="gap-body">This answer leaves out ${missingNames.join(" and ")}, so anything sourced from ${missing.length > 1 ? "them" : "it"} is missing rather than zero.</div>
           </div>
           <button type="button" class="gap-btn" id="fixGap">Add and re-run</button>
         </div>`
-      : "";
+        : "";
 
     const bars = (a.bars || [])
       .map(
