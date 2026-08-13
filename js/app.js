@@ -410,7 +410,7 @@
     const panel = document.getElementById("thinkingPanel");
     panel.classList.toggle("hidden", state.phase !== "thinking");
     panel.innerHTML = `<div class="thinking">
-      <div class="thinking-row"><span class="dot"></span><span>Reading Cosmos · asking Foundry</span></div>
+      <div class="thinking-row"><span class="lens-mark" aria-hidden="true"></span><span>Reading Cosmos · asking Foundry</span></div>
       <div class="skel" style="width:72%"></div>
       <div class="skel" style="width:94%"></div>
       <div class="skel" style="width:48%"></div>
@@ -589,7 +589,7 @@
     }
     if (!state.project) {
       panel.innerHTML = `<div class="thinking">
-        <div class="thinking-row"><span class="dot"></span><span>Joining NetSuite to ora_fact_study…</span></div>
+        <div class="thinking-row"><span class="lens-mark" aria-hidden="true"></span><span>Joining NetSuite to ora_fact_study…</span></div>
         <div class="skel" style="width:72%"></div>
         <div class="skel" style="width:48%"></div>
       </div>`;
@@ -845,6 +845,13 @@
       const t = state.draft.trim();
       if (t) run("live", t);
     };
+    const brand = document.getElementById("brandHome");
+    if (brand) {
+      brand.onclick = (e) => {
+        e.preventDefault();
+        resetAsk();
+      };
+    }
     document.getElementById("btnNew").onclick = resetAsk;
     document.getElementById("btnSave").onclick = () => {
       if (state.phase !== "answered") return;
