@@ -22,13 +22,17 @@ the function overwrites Cosmos `bd-budgets` / `lens_ns_projects`. Other JSON/CSV
 | Function App name | `ora-lens-ns-ingest` (must be globally unique; add your initials if taken) |
 | Publish | **Code** |
 | Runtime stack | **Node.js** |
-| Version | **20 LTS** |
+| Version | **22 LTS** (not 20 — Node 20 EOL was 30 Apr 2026) |
 | Region | Same region as the `netsuite` storage account |
 | Operating system | **Linux** |
 | Hosting plan | **Consumption (Serverless)** |
 
+Node 22 is the last Node version on Linux Consumption (Azure support through Apr 2027). Node 24 needs **Flex Consumption** — skip that unless you already use Flex.
+
 4. On **Storage**: it will create or pick a storage account for the **function host**. That can be a new small account. It does **not** have to be the netsuite account.
 5. Review + create → Create. Wait until **Go to resource**.
+
+If you already created it on Node 20: Function App → **Settings** → **Configuration** → **General settings** → Stack version → **Node.js 22** → Save. Then continue from B.
 
 ---
 
