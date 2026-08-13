@@ -3,15 +3,17 @@
     nav: "ask",
     workspace: "clinops",
     enabled: {
-      veeva: true,
-      imednet: true,
-      medidata: true,
+      ora: true,
       ctgov: true,
-      insightsrm: true,
-      netsuite: true,
-      trialhub: false,
-      salesforce: false
+      trialhub: true,
+      salesforce: false,
+      veeva: false,
+      imednet: false,
+      medidata: false,
+      insightsrm: false,
+      netsuite: true
     },
+    briefing: null,
     draft: "",
     phase: "idle",
     key: "live",
@@ -52,12 +54,18 @@
     return SOURCES.find((s) => s.id === id);
   }
 
+  function loadedSources() {
+    return SOURCES.filter((s) => s.loaded);
+  }
+
   function enabledList() {
-    return SOURCES.filter((s) => state.enabled[s.id]);
+    return SOURCES.filter((s) => s.loaded && state.enabled[s.id]);
   }
 
   function guessKey(text) {
     const t = (text || "").toLowerCase();
+    if (/\b(netsuite|profitability|gross margin|\bgm\b|change order|billable)\b/.test(t)) return "netsuite";
+    if (/\b(sites?|investigator|scorecard|site psm)\b/.test(t) && !/\bvisits?\b/.test(t)) return "sites";
     const competitive = ["competitor", "sponsor", "registry", "market", "poland", "cac", "pipeline", "bid"];
     if (competitive.some((w) => t.includes(w))) return "competitive";
     const staffing = ["staff", "resource", "cra", "fte", "capacity", "assign", "backfill", "rolls off", "headcount"];
@@ -139,9 +147,10 @@
   function renderSources() {
     document.getElementById("enabledSummary").textContent = enabledList().length
       ? enabledList().map((s) => s.name).join(" · ")
-      : "No sources selected — pick at least one to ask a question.";
-    document.getElementById("enabledCount").textContent = `${enabledList().length} of ${SOURCES.length} sources in scope`;
-    document.getElementById("scopeLine").textContent = `${enabledList().length} sources · synced within the hour`;
+      : "No loaded sources selected — pick at least one to ask a question.";
+    document.getElementById("enabledCount").textContent = `${enabledList().length} of ${loadedSources().length} loaded sources in scope`;
+    const asOf = state.briefing && state.briefing.asOfLabel ? state.briefing.asOfLabel : "as-of pending";
+    document.getElementById("scopeLine").textContent = `${enabledList().length} loaded sources · ${asOf}`;
 
     document.getElementById("workspaces").innerHTML = WORKSPACES.map(
       (w) =>
@@ -151,7 +160,7 @@
       btn.onclick = () => {
         const w = WORKSPACES.find((x) => x.id === btn.dataset.ws);
         SOURCES.forEach((s) => {
-          state.enabled[s.id] = w.ids.includes(s.id);
+          state.enabled[s.id] = s.loaded && w.ids.includes(s.id);
         });
         state.workspace = w.id;
         render();
@@ -159,11 +168,12 @@
     });
 
     document.getElementById("sourceList").innerHTML = SOURCES.map((s) => {
-      const on = state.enabled[s.id];
-      return `<button type="button" class="source-card${on ? " on" : ""}" data-src="${s.id}">
-        <span class="check">${on ? "✓" : ""}</span>
+      const on = s.loaded && state.enabled[s.id];
+      const locked = !s.loaded;
+      return `<button type="button" class="source-card${on ? " on" : ""}${locked ? " locked" : ""}" data-src="${s.id}" ${locked ? "disabled" : ""}>
+        <span class="check">${on ? "✓" : locked ? "–" : ""}</span>
         <span style="min-width:0;flex:1">
-          <span class="source-top"><span class="source-name">${s.name}</span><span class="source-sync${s.fresh ? "" : " stale"}">${s.sync}</span></span>
+          <span class="source-top"><span class="source-name">${s.name}</span><span class="source-sync${s.fresh ? "" : " stale"}">${locked ? "not loaded" : s.sync}</span></span>
           <span class="source-cat">${s.cat}</span>
           <span class="source-scope">${s.scope}</span>
         </span>
@@ -171,6 +181,8 @@
     }).join("");
     document.querySelectorAll("[data-src]").forEach((btn) => {
       btn.onclick = () => {
+        const src = sourceById(btn.dataset.src);
+        if (!src || !src.loaded) return;
         state.enabled[btn.dataset.src] = !state.enabled[btn.dataset.src];
         state.workspace = null;
         render();
@@ -182,8 +194,23 @@
     const panel = document.getElementById("idlePanel");
     panel.classList.toggle("hidden", state.phase !== "idle");
     if (state.phase !== "idle") return;
+    const b = state.briefing;
+    const kpis = b
+      ? `<div class="briefing">
+          <div class="suggest-head">ClinOps briefing</div>
+          <div class="kpi-row">
+            <div class="kpi"><div class="kpi-value">${b.studies}</div><div class="kpi-label">Studies in rollup</div></div>
+            <div class="kpi"><div class="kpi-value">${b.withEnrolled}</div><div class="kpi-label">Have enrolled</div></div>
+            <div class="kpi"><div class="kpi-value">${b.missingEnrolled}</div><div class="kpi-label">Enrolled missing</div></div>
+            <div class="kpi"><div class="kpi-value">${b.dryEye}</div><div class="kpi-label">Dry eye</div></div>
+            <div class="kpi"><div class="kpi-value">${b.glaucoma}</div><div class="kpi-label">Glaucoma</div></div>
+          </div>
+          <div class="briefing-note">${escapeHtml(b.asOfLabel)}${b.topStudy ? ` · top enrolled ${escapeHtml(b.topStudy.study)} (${b.topStudy.enrolled})` : ""}. Missing enrolled is not zero.</div>
+        </div>`
+      : `<div class="briefing"><div class="suggest-head">ClinOps briefing</div><div class="briefing-note">Loading Cosmos rollup…</div></div>`;
     panel.innerHTML =
-      `<div class="suggest-head">Start from</div>` +
+      kpis +
+      `<div class="suggest-head">Five questions that always work</div>` +
       EXAMPLE_QUESTIONS.map(
         (q) => `<button type="button" class="suggest">
             <span class="suggest-icon">${ICONS[q.icon]}</span>
@@ -233,6 +260,12 @@
     const confKey = missing.length ? "partial" : a.confidence;
     const conf = CONF[confKey];
 
+    const missingBanner = a.missingNote
+      ? `<div class="gap gap-info"><div style="flex:1">
+          <div class="gap-title">Missing is not zero</div>
+          <div class="gap-body">${escapeHtml(a.missingNote)}</div>
+        </div></div>`
+      : "";
     const gap = a.foundryError
       ? `<div class="gap"><div style="flex:1">
           <div class="gap-title">Foundry did not answer</div>
@@ -290,16 +323,16 @@
     panel.innerHTML = `
       <div class="you"><span class="you-badge">You</span><p>${escapeHtml(state.askedText)}</p></div>
       ${gap}
+      ${missingBanner}
       <div class="answer">
         <div class="answer-head">
           <span class="conf" style="background:${conf.bg};color:${conf.color}"><span class="conf-dot" style="background:${conf.color}"></span>${conf.label}</span>
-          <span class="chart-note">${a.chartNote}</span>
+          <span class="chart-note">${escapeHtml(a.asOfLabel || a.chartNote)}</span>
         </div>
         <p class="summary">${a.summary}</p>
         <div class="block">
           <span class="block-title">${a.chartTitle}</span>
-          <div class="chart-wrap"><canvas id="odlChart"></canvas></div>
-          <div class="bars">${bars}</div>
+          ${a.bars && a.bars.length ? `<div class="chart-wrap"><canvas id="odlChart"></canvas></div><div class="bars">${bars}</div>` : `<p class="caveat">No chart — there are no known values to plot. Table still lists rows, including missing enrolled.</p>`}
         </div>
         <div class="block">
           <span class="block-title">${a.tableTitle}</span>
@@ -397,7 +430,7 @@
     help.classList.toggle("hidden", state.nav !== "sources");
 
     const titles = {
-      ask: "Ask your data",
+      ask: state.phase === "idle" ? "ClinOps briefing" : "Ask your data",
       saved: "Saved answers",
       history: "History",
       sources: "Sources"
@@ -437,8 +470,8 @@
     });
 
     help.innerHTML = `<div class="answer">
-      <p class="summary">Same Cosmos as Study Bid Workbench: database <code>bd-budgets</code>. Ask reads existing <code>ora_fact_study</code> / TrialHub / CT.gov. Daily gold sync writes only <code>lens_*</code> containers — never the bid <code>studies</code> docs.</p>
-      <p class="caveat">Ask hits <code>/api/ask</code> → Cosmos <code>bd-budgets</code> read-only. No canned answers.</p>
+      <p class="summary">Loaded sources are in Cosmos today: Ora clinical rollup, TrialHub, CT.gov, Salesforce crosswalk. Veeva, live iMedNet/Medidata, InsightsRM, and NetSuite stay locked until gold ETL lands. Ask never writes.</p>
+      <p class="caveat">Blank enrolled is missing, not zero. Chart bars use known values only. As-of is the newest document timestamp in the pack.</p>
     </div>`;
   }
 
@@ -487,5 +520,17 @@
     bindChrome();
   }
 
+  async function loadBriefing() {
+    try {
+      const res = await fetch("/api/briefing");
+      const body = await res.json().catch(() => ({}));
+      if (res.ok && body.briefing) state.briefing = body.briefing;
+    } catch (_) {
+      state.briefing = null;
+    }
+    if (state.phase === "idle") render();
+  }
+
   render();
+  loadBriefing();
 })();

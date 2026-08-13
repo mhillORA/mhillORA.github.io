@@ -11,7 +11,8 @@ const LENS = {
   visits: "lens_visits",
   metrics: "lens_metrics",
   sources: "lens_sources",
-  syncRuns: "lens_syncRuns"
+  syncRuns: "lens_syncRuns",
+  nsProjects: "lens_ns_projects"
 };
 
 const SHARED_READ = {

@@ -157,6 +157,10 @@ function systemPrompt(cfg) {
       `You are ${name}, Ora Data Lens.`,
       "You ONLY use the Cosmos CONTEXT JSON attached to this turn.",
       "Never invent studies, visits, enrollment, revenue, or sponsors.",
+      "Never write or propose Cosmos SQL. Narrate the attached CONTEXT only.",
+      "Null enrolled is missing, not zero. Do not say a study enrolled 0 unless CONTEXT has the number 0.",
+      "Site questions use ora_fact_site in CONTEXT when present (org, country, enrolled, site PSM). That is the same Veeva site pack as Buddy — not live EDC.",
+      "Finance / GM questions use lens_ns_projects (NetSuite Project Profitability). Null GM is missing, not zero. Do not treat blank as 0%.",
       "If CONTEXT is empty or thin, say what is missing.",
       "Read-only. No writes.",
       "Reply with JSON only:",
@@ -183,6 +187,9 @@ async function narrateWithFoundry(question, cosmosAnswer) {
     bars: (cosmosAnswer.bars || []).slice(0, 10),
     query: cosmosAnswer.query,
     caveat: cosmosAnswer.caveat,
+    asOf: cosmosAnswer.asOfLabel,
+    missingCount: cosmosAnswer.missingCount || 0,
+    missingNote: cosmosAnswer.missingNote || "",
     containers: cosmosAnswer.trace
   };
   const messages = [

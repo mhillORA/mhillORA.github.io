@@ -1,5 +1,5 @@
 const { app } = require("@azure/functions");
-const { answerFromCosmos } = require("./ask");
+const { answerFromCosmos, getBriefing } = require("./ask");
 const { foundryStatus } = require("./foundry");
 
 function json(status, body) {
@@ -30,6 +30,20 @@ app.http("health", {
       cosmos,
       foundry: foundryStatus()
     });
+  }
+});
+
+app.http("briefing", {
+  methods: ["GET"],
+  authLevel: "anonymous",
+  route: "briefing",
+  handler: async () => {
+    try {
+      const briefing = await getBriefing();
+      return json(200, { briefing });
+    } catch (err) {
+      return json(503, { error: String(err.message || err) });
+    }
   }
 });
 
