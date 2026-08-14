@@ -41,7 +41,7 @@
   const CONF = {
     high: { label: "High confidence — all required sources in scope", bg: "var(--status-success-bg)", color: "var(--ora-teal-600)" },
     medium: { label: "Medium confidence — registry data lags by up to 2 weeks", bg: "var(--status-info-bg)", color: "var(--ora-blue-600)" },
-    partial: { label: "Partial answer — a required source is switched off", bg: "var(--status-warning-bg)", color: "var(--ora-amber-500)" }
+    partial: { label: "Partial answer — a needed source is out of scope", bg: "var(--status-warning-bg)", color: "var(--ora-amber-500)" }
   };
 
   function load(key, fallback) {
@@ -198,55 +198,72 @@
     });
   }
 
-  function renderSources() {
-    document.getElementById("enabledSummary").textContent = enabledList().length
-      ? enabledList().map((s) => s.name).join(" · ")
-      : "No loaded sources selected — pick at least one to ask a question.";
-    document.getElementById("enabledCount").textContent = `${enabledList().length} of ${loadedSources().length} loaded sources in scope`;
-    const asOf = state.briefing && state.briefing.asOfLabel ? state.briefing.asOfLabel : "as-of pending";
-    document.getElementById("scopeLine").textContent = `${enabledList().length} loaded sources · ${asOf}`;
+  function referencedIds() {
+    if (state.phase === "answered" && state.answer && Array.isArray(state.answer.needs)) {
+      return state.answer.needs.filter((id) => {
+        const s = sourceById(id);
+        return s && s.loaded;
+      });
+    }
+    if (state.phase === "project" && state.project) {
+      const ids = [];
+      if (state.project.jobs && state.project.jobs.length) ids.push("netsuite");
+      if ((state.project.studies && state.project.studies.length) || (state.project.sites && state.project.sites.length)) {
+        ids.push("ora");
+      }
+      return ids;
+    }
+    return enabledList().map((s) => s.id);
+  }
 
-    document.getElementById("workspaces").innerHTML = WORKSPACES.map(
-      (w) =>
-        `<button type="button" class="chip${state.workspace === w.id ? " active" : ""}" data-ws="${w.id}">${w.label}</button>`
-    ).join("");
-    document.querySelectorAll("[data-ws]").forEach((btn) => {
-      btn.onclick = () => {
-        const w = WORKSPACES.find((x) => x.id === btn.dataset.ws);
-        SOURCES.forEach((s) => {
-          state.enabled[s.id] = s.loaded && w.ids.includes(s.id);
-        });
-        state.workspace = w.id;
-        if (w.id === "finance" || w.id === "clinops" || w.id === "bd") {
-          state.purpose = w.id;
-          save("odl.purpose", w.id);
-        }
-        render();
-        if (w.id === "finance") loadFinance();
-      };
-    });
+  function sourceStatus(s) {
+    if (!s.loaded) return { key: "locked", label: "Not loaded" };
+    const refs = referencedIds();
+    const answering = state.phase === "answered" || state.phase === "project";
+    if (answering) {
+      if (refs.includes(s.id)) return { key: "ref", label: "Referenced" };
+      return { key: "dim", label: "Not used" };
+    }
+    if (state.enabled[s.id]) return { key: "scope", label: "In scope" };
+    return { key: "dim", label: "Out of scope" };
+  }
+
+  function renderSources() {
+    const refs = referencedIds();
+    const answering = state.phase === "answered" || state.phase === "project";
+    const asOf = state.briefing && state.briefing.asOfLabel ? state.briefing.asOfLabel : "as-of pending";
+    const refNames = refs.map((id) => sourceById(id)).filter(Boolean).map((s) => s.name);
+
+    document.getElementById("enabledSummary").textContent = answering
+      ? refNames.length
+        ? `This answer used ${refNames.join(" · ")}`
+        : "No Cosmos sources cited for this answer."
+      : enabledList().length
+        ? `${(purposeOf(state.purpose) && purposeOf(state.purpose).label) || "Ask"} can pull from ${enabledList().map((s) => s.name).join(" · ")}`
+        : "Pick a purpose above to set which loaded sources are in scope.";
+
+    document.getElementById("enabledCount").textContent = answering
+      ? `${refs.length} source${refs.length === 1 ? "" : "s"} referenced`
+      : `${enabledList().length} of ${loadedSources().length} loaded sources in scope`;
+
+    document.getElementById("scopeLine").textContent = answering
+      ? `${refs.length} referenced · ${asOf}`
+      : `${enabledList().length} in scope · ${asOf}`;
 
     document.getElementById("sourceList").innerHTML = SOURCES.map((s) => {
-      const on = s.loaded && state.enabled[s.id];
-      const locked = !s.loaded;
-      return `<button type="button" class="source-card${on ? " on" : ""}${locked ? " locked" : ""}" data-src="${s.id}" ${locked ? "disabled" : ""}>
-        <span class="check">${on ? "✓" : locked ? "–" : ""}</span>
+      const st = sourceStatus(s);
+      return `<div class="source-card ${st.key}" data-src="${s.id}">
+        <span class="source-dot" style="background:${DOT[s.id] || "var(--ora-gray-400)"}"></span>
         <span style="min-width:0;flex:1">
-          <span class="source-top"><span class="source-name">${s.name}</span><span class="source-sync${s.fresh ? "" : " stale"}">${locked ? "not loaded" : s.sync}</span></span>
+          <span class="source-top">
+            <span class="source-name">${s.name}</span>
+            <span class="source-status">${st.label}</span>
+          </span>
           <span class="source-cat">${s.cat}</span>
           <span class="source-scope">${s.scope}</span>
         </span>
-      </button>`;
+      </div>`;
     }).join("");
-    document.querySelectorAll("[data-src]").forEach((btn) => {
-      btn.onclick = () => {
-        const src = sourceById(btn.dataset.src);
-        if (!src || !src.loaded) return;
-        state.enabled[btn.dataset.src] = !state.enabled[btn.dataset.src];
-        state.workspace = null;
-        render();
-      };
-    });
   }
 
   function suggestButtons(questions) {
@@ -447,7 +464,10 @@
 
     const a = state.answer;
     const missing = missingFor(a);
-    const missingNames = missing.map((id) => sourceById(id).name);
+    const missingNames = missing.map((id) => {
+      const s = sourceById(id);
+      return s ? s.name : id;
+    });
     const confKey = missing.length ? "partial" : a.confidence;
     const conf = CONF[confKey];
 
@@ -465,10 +485,9 @@
       : missing.length
         ? `<div class="gap">
           <div style="flex:1">
-            <div class="gap-title">${missingNames.join(" and ")} ${missing.length > 1 ? "are" : "is"} switched off</div>
-            <div class="gap-body">This answer leaves out ${missingNames.join(" and ")}, so anything sourced from ${missing.length > 1 ? "them" : "it"} is missing rather than zero.</div>
+            <div class="gap-title">${escapeHtml(missingNames.join(" and "))} ${missing.length > 1 ? "are" : "is"} out of scope</div>
+            <div class="gap-body">This answer needs ${escapeHtml(missingNames.join(" and "))}, which the current purpose leaves greyed. Switch purpose above and ask again — those sources stay dim until they are referenced.</div>
           </div>
-          <button type="button" class="gap-btn" id="fixGap">Add and re-run</button>
         </div>`
         : "";
 
@@ -495,10 +514,11 @@
       })
       .join("");
 
-    const cites = a.needs
-      .filter((id) => state.enabled[id])
+    const cites = (a.needs || [])
+      .map((id) => sourceById(id))
+      .filter(Boolean)
       .map(
-        (id) => `<span class="cite"><span class="cite-dot" style="background:${DOT[id]}"></span><span class="cite-name">${sourceById(id).name}</span><span class="cite-detail">${DETAIL[id]}</span></span>`
+        (s) => `<span class="cite"><span class="cite-dot" style="background:${DOT[s.id]}"></span><span class="cite-name">${s.name}</span><span class="cite-detail">${DETAIL[s.id]}</span></span>`
       )
       .join("");
 
@@ -548,16 +568,6 @@
         <div class="follows">${follows}</div>
       </div>`;
 
-    const fix = document.getElementById("fixGap");
-    if (fix) {
-      fix.onclick = () => {
-        missing.forEach((id) => {
-          state.enabled[id] = true;
-        });
-        state.workspace = null;
-        run(state.key, state.askedText);
-      };
-    }
     const tog = document.getElementById("toggleTrace");
     if (tog) tog.onclick = () => {
       state.traceOpen = !state.traceOpen;
@@ -809,8 +819,8 @@
     });
 
     help.innerHTML = `<div class="answer">
-      <p class="summary">Loaded sources: Ora clinical rollup, TrialHub, CT.gov, Salesforce crosswalk, NetSuite profitability. Veeva / live EDC / InsightsRM stay locked until gold ETL. Ask never writes. Project number joins to ora_fact_study.study_number in the app — there is no mapping table.</p>
-      <p class="caveat">Blank enrolled or GM is missing, not zero. Chart bars use known values only. As-of is the newest document timestamp in the pack.</p>
+      <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey — including anything not used for that question. Veeva / live EDC / InsightsRM stay not loaded until gold ETL.</p>
+      <p class="caveat">Blank enrolled or GM is missing, not zero. Project number joins to ora_fact_study.study_number in the app — no mapping table. Ask never writes.</p>
     </div>`;
   }
 
