@@ -850,7 +850,10 @@ const isActualStudy = (study) => {
     const source = String(study.sourceSystem || study.integrationSource || study.source || '').trim().toLowerCase();
     if (source && !['artemis', 'manual', 'nasa'].includes(source)) return false;
     const text = `${study.title || ''} ${study.name || ''} ${study.type || ''} ${study.category || ''} ${study.recordType || ''}`.toLowerCase();
-    return !/\b(training|department|orientation|onboarding|education|course)\b/.test(text);
+    if (/\b(training|department|orientation|onboarding|education|course)\b/.test(text)) return false;
+    if (source) return true;
+    // Legacy Artemis rows predate sourceSystem; a protocol/integration identifier distinguishes studies from training records.
+    return !!(study.protocolNumber || study.protocol || study.artemisId || study.ctmsId || study.externalId);
 };
 
 const isCrcOrManagerUser = () => {
@@ -1377,8 +1380,10 @@ const mobileMenuButton = document.getElementById('mobile-menu-button');
 const sessionControls = document.getElementById('session-controls');
 const sessionUserLabel = document.getElementById('session-user-label');
 try {
-    if (localStorage.getItem('nasa-sidebar-collapsed') === '1' && window.innerWidth >= 768) {
+    const savedSidebarPreference = localStorage.getItem('nasa-sidebar-collapsed');
+    if (window.innerWidth >= 768 && (savedSidebarPreference === '1' || (savedSidebarPreference == null && window.innerWidth < 1180))) {
         sidebar.classList.add('sidebar-collapsed');
+        if (savedSidebarPreference == null) sidebar.dataset.autoCollapsedForViewport = '1';
     }
 } catch { /* optional */ }
 
@@ -2043,8 +2048,8 @@ const getPatientAppointments = (patient) => {
 
 const getPrimaryAppointment = (patient) => {
     const now = Date.now();
-    const appts = getPatientAppointments(patient);
-    const upcoming = appts.filter(a => a.time && new Date(a.time).getTime() >= now && (a.status || 'scheduled') !== 'cancelled');
+    const appts = getPatientAppointments(patient).filter(a => (a.status || 'scheduled') !== 'cancelled');
+    const upcoming = appts.filter(a => a.time && new Date(a.time).getTime() >= now);
     if (upcoming.length) return upcoming[0];
     return appts.length ? appts[appts.length - 1] : null;
 };
@@ -4715,7 +4720,10 @@ const getDayAppointmentsModalHTML = (dateString) => {
         slotsForDay.forEach(({ schedule, slot }) => {
             const study = state.studies.find(s => s.id === schedule.studyId);
             const site = state.sites.find(s => s.id === schedule.siteId);
-            const patientsInSlot = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id);
+            const patientsInSlot = state.patients.flatMap(patient =>
+                getPatientAppointments(patient)
+                    .filter(appointment => appointment.slotId === slot.id && (appointment.status || 'scheduled') !== 'cancelled')
+                    .map(appointment => ({ patient, appointment })));
             const bookedCount = patientsInSlot.length;
             const isFull = bookedCount >= (slot.capacity || 0);
             contentHTML += `
@@ -4900,6 +4908,7 @@ const getPatientProfileHTML = (patient) => {
                 <div class="p-3 border dark:border-gray-700 rounded-lg">
                     <p class="font-medium dark:text-white">${visitLabel} — ${a.time ? new Date(a.time).toLocaleString() : 'TBD'}</p>
                     <p class="text-sm text-gray-500 dark:text-gray-400">Status: ${a.visitStatus || a.status || 'scheduled'} · Check-in: ${a.checkInStatus || 'not-checked-in'}</p>
+                    <p class="text-sm text-gray-500 dark:text-gray-400">In-clinic: ${phi(a.inClinicStatus || '—')} · Outcome: ${phi(a.visitOutcome || '—')}</p>
                     ${canEdit
                         ? ''
                         : '<p class="text-xs text-amber-700 dark:text-amber-300 mt-1">View only for recruiters (V2+). CRC/Admin can edit.</p>'}
@@ -5289,8 +5298,6 @@ const getQuickAddPatientHTML = () => {
                 <div><label class="block text-sm font-medium dark:text-gray-300">Initials</label><input type="text" name="initials" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed phi-sensitive-input" readonly></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Age</label><input type="text" name="age" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed phi-sensitive-input" readonly></div>
                 ${!isRecruiterUser() ? `<div><label class="block text-sm font-medium dark:text-gray-300">PCP?</label><select name="pcp" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Unknown</option><option value="Yes">Yes</option><option value="No">No</option></select></div>` : ''}
-                <div><label class="block text-sm font-medium dark:text-gray-300">In-Clinic Status</label><input type="text" name="inClinicStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="Open text"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Visit Outcome</label><select name="visitOutcome" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select</option>${VISIT_OUTCOME_OPTIONS.map(o => `<option value="${o}">${o}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Next Visit Date</label><input type="date" name="nextVisitDate" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input"></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">SF Reason</label><input type="text" name="sfReason" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" placeholder="Reason (if Screen Fail)"></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Status</label><select name="status" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail'].map(s => `<option>${s}</option>`).join('')}</select></div>
@@ -5366,8 +5373,6 @@ const getEditPatientModalHTML = (patient) => {
                 <div><label class="block text-sm font-medium dark:text-gray-300">Screening #</label><input type="text" name="screeningNumber" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.screeningNumber || ''}"></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Group</label><input type="text" name="group" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.group || ''}"></div>
                 ${!isRecruiterUser() ? `<div><label class="block text-sm font-medium dark:text-gray-300">PCP?</label><select name="pcp" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="" ${!patient.pcp ? 'selected' : ''}>Unknown</option><option value="Yes" ${patient.pcp === 'Yes' ? 'selected' : ''}>Yes</option><option value="No" ${patient.pcp === 'No' ? 'selected' : ''}>No</option></select></div>` : ''}
-                <div><label class="block text-sm font-medium dark:text-gray-300">In-Clinic Status</label><input type="text" name="inClinicStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.inClinicStatus || ''}"></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Visit Outcome</label><select name="visitOutcome" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="" ${!patient.visitOutcome ? 'selected' : ''}>Select</option>${VISIT_OUTCOME_OPTIONS.map(o => `<option value="${o}" ${patient.visitOutcome === o ? 'selected' : ''}>${o}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Next Visit Date</label><input type="date" name="nextVisitDate" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.nextVisitDate || ''}"></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">SF Reason</label><input type="text" name="sfReason" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white phi-sensitive-input" value="${patient.sfReason || ''}"></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Status</label><select name="status" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail'].map(s => `<option ${patient.status === s ? 'selected' : ''} ${(washoutStatus && s === 'Pre-Screening') ? 'disabled' : ''}>${s}</option>`).join('')}</select></div>
@@ -7580,26 +7585,37 @@ const getEditSiteModalHTML = (site) => {
 // --- APPOINTMENT UTILITIES ---
 const cancelAppointment = async (patientId) => {
     const patient = state.patients.find(p => p.id === patientId);
-    if (!patient || !patient.appointment) return;
+    if (!patient || !patient.appointment) return patient || null;
     const { scheduleId, slotId, visit } = patient.appointment;
     const schedule = state.schedules.find(s => s.id === scheduleId);
-    if (!schedule) return;
-    const slotIndex = schedule.slots.findIndex(s => s.id === slotId);
-    if (slotIndex > -1 && schedule.slots[slotIndex].booked > 0) {
-        schedule.slots[slotIndex].booked -= 1;
-        await updateDocument('schedules', scheduleId, { slots: schedule.slots });
+    if (schedule) {
+        const slotIndex = schedule.slots.findIndex(s => s.id === slotId);
+        if (slotIndex > -1 && schedule.slots[slotIndex].booked > 0) {
+            schedule.slots[slotIndex].booked -= 1;
+            await updateDocument('schedules', scheduleId, { slots: schedule.slots });
+        }
     }
     // NOTE: We no longer decrement the study enrollment here,
     // as the CTMS is now the source of truth for enrollment numbers.
     // This prevents a double-decrement if the CTMS sends an update.
     const patientToUpdate = state.patients.find(p => p.id === patientId);
     if (patientToUpdate) {
-        const updates = { appointment: null };
+        const cancelledAt = new Date().toISOString();
+        const appointments = getPatientAppointments(patientToUpdate).map(appointment =>
+            (appointment.id && appointment.id === patientToUpdate.appointment.id) || appointment.slotId === slotId
+                ? { ...appointment, status: 'cancelled', visitStatus: 'Cancelled', cancelledAt }
+                : appointment);
+        const nextPrimary = getPrimaryAppointment({ ...patientToUpdate, appointment: null, appointments });
+        const updates = { appointment: nextPrimary, appointments };
         if (visit && patientToUpdate.completedVisits) {
             updates.completedVisits = patientToUpdate.completedVisits.filter(v => v !== visit);
         }
-        await updateDocument('patients', patientId, updates);
+        await updatePatientFields(patientId, updates, 'appointment_cancelled', `${visit || 'Visit'} ${slotId || ''}`.trim());
+        const idx = state.patients.findIndex(p => p.id === patientId);
+        if (idx >= 0) state.patients[idx] = normalizePatientRecord({ ...state.patients[idx], ...updates });
+        return state.patients[idx] || { ...patientToUpdate, ...updates };
     }
+    return null;
 };
 const deletePatient = async (patientId) => {
     const patient = state.patients.find(p => p.id === patientId);
@@ -7781,6 +7797,7 @@ document.addEventListener('click', async (e) => {
             case 'close-side-panel': closeSidePanel(); break;
             case 'toggle-sidebar-collapse': {
                 delete sidebar.dataset.autoCollapsedForPanel;
+                delete sidebar.dataset.autoCollapsedForViewport;
                 sidebar.classList.toggle('sidebar-collapsed');
                 const collapsed = sidebar.classList.contains('sidebar-collapsed');
                 try { localStorage.setItem('nasa-sidebar-collapsed', collapsed ? '1' : '0'); } catch { /* optional */ }
@@ -8235,7 +8252,11 @@ document.addEventListener('click', async (e) => {
                             checkInTime: null,
                             checkInNotes: null
                         };
-                        await updateDocument('patients', patientId, { appointment: updatedAppointment });
+                        const appointments = getPatientAppointments(patient).map(appointment =>
+                            String(appointment.id || appointment.slotId) === String(updatedAppointment.id || updatedAppointment.slotId)
+                                ? { ...appointment, ...updatedAppointment }
+                                : appointment);
+                        await updatePatientFields(patientId, { appointment: updatedAppointment, appointments }, 'check_in_undone', updatedAppointment.visit || 'Visit');
                         showNotification("Check-in status reset.", "success");
                     }
                 } catch (error) {
@@ -8308,9 +8329,9 @@ document.addEventListener('click', async (e) => {
                     showNotification('Recruiters can only edit V1/screening appointments. Ask a CRC or Admin for V2+.', 'error');
                     break;
                 }
-                await cancelAppointment(patientId);
+                const refreshedPatient = await cancelAppointment(patientId);
                 state.bookingCalendarDate = new Date();
-                openModal(getBookingModalHTML(patientForChange));
+                openModal(getBookingModalHTML(refreshedPatient || patientForChange));
                 break;
             }
             case 'cancel-appointment': {
@@ -8373,12 +8394,17 @@ document.addEventListener('click', async (e) => {
                         slotId,
                         time: slot.startTime,
                         visit: schedule.visit || null,
+                        studyId: schedule.studyId || null,
+                        siteId: schedule.siteId || null,
+                        group: schedule.group || '',
                         status: 'scheduled',
                         visitStatus: 'Scheduled',
+                        inClinicStatus: '',
+                        visitOutcome: '',
                         checkInStatus: 'not-checked-in',
                         createdAt: new Date().toISOString()
                     };
-                    const appointments = [...getPatientAppointments(patient).filter(a => a.status !== 'cancelled'), newAppt];
+                    const appointments = [...getPatientAppointments(patient), newAppt];
                     const updatedSlots = schedule.slots.map(s => s.id === slotId ? { ...s, booked: countPatientsInSlot(slot.id) + 1 } : s);
                     const updatedSchedule = { ...schedule, slots: updatedSlots, name: schedule.name || `${schedule.visit || 'Appointment'} - ${schedule.siteId || ''}`.trim(), lastUpdated: new Date().toISOString() };
                     delete updatedSchedule._rid; delete updatedSchedule._self; delete updatedSchedule._etag; delete updatedSchedule._attachments; delete updatedSchedule._ts;
@@ -9060,9 +9086,15 @@ document.addEventListener('click', async (e) => {
                         closeModal();
                         break;
                     }
-                    const patientsWithAppointments = state.patients.filter(p => p.appointment && p.appointment.scheduleId === id);
+                    const patientsWithAppointments = state.patients.filter(p => getPatientAppointments(p).some(appointment => appointment.scheduleId === id && (appointment.status || 'scheduled') !== 'cancelled'));
                     for (const patient of patientsWithAppointments) {
-                        await updateDocument('patients', patient.id, { appointment: null });
+                        const cancelledAt = new Date().toISOString();
+                        const appointments = getPatientAppointments(patient).map(appointment =>
+                            appointment.scheduleId === id
+                                ? { ...appointment, status: 'cancelled', visitStatus: 'Cancelled', cancelledAt }
+                                : appointment);
+                        const appointment = getPrimaryAppointment({ ...patient, appointment: null, appointments });
+                        await updatePatientFields(patient.id, { appointment, appointments }, 'schedule_deleted_appointments_cancelled', id);
                     }
                     await deleteDocument('schedules', id);
                     closeModal();
@@ -9093,19 +9125,52 @@ document.addEventListener('change', async (e) => {
     if (e.target.closest('.booked-inline-form')) {
         const formEl = e.target.closest('.booked-inline-form');
         const pid = formEl.dataset.patientId;
+        const appointmentId = formEl.dataset.appointmentId;
         const field = formEl.dataset.field;
         const value = e.target.value;
-        if (!pid || !field) return;
+        if (!pid || !appointmentId || !field) return;
         if (field === 'visitOutcome' && !isAdminUser()) {
             showNotification('Only admins can change visit outcomes.', 'error');
             renderBookedAppointmentsView();
             return;
         }
         try {
-            await updatePatientFields(pid, { [field]: value }, 'booked_view_update', field + '=' + value);
+            const patient = state.patients.find(p => p.id === pid);
+            if (!patient) throw new Error('Patient not found.');
+            const appointments = getPatientAppointments(patient).map(appointment =>
+                String(appointment.id || appointment.slotId) === appointmentId
+                    ? { ...appointment, [field]: value, updatedAt: new Date().toISOString() }
+                    : appointment);
+            const currentPrimary = patient.appointment;
+            const appointment = currentPrimary && String(currentPrimary.id || currentPrimary.slotId) === appointmentId
+                ? { ...currentPrimary, [field]: value, updatedAt: new Date().toISOString() }
+                : currentPrimary;
+            const updatedVisit = appointments.find(item => String(item.id || item.slotId) === appointmentId);
+            let visitLogs = patient.visitLogs || [];
+            if (field === 'visitOutcome') {
+                const existingLogIndex = visitLogs.findIndex(log => String(log.appointmentId || '') === appointmentId);
+                const visitLog = {
+                    ...(existingLogIndex >= 0 ? visitLogs[existingLogIndex] : {}),
+                    appointmentId,
+                    date: new Date().toISOString(),
+                    visit: updatedVisit?.visit || 'Visit',
+                    outcome: value,
+                    completedBy: getCurrentActor(),
+                    signature: getCurrentActor(),
+                };
+                visitLogs = existingLogIndex >= 0
+                    ? visitLogs.map((log, index) => index === existingLogIndex ? visitLog : log)
+                    : [...visitLogs, visitLog];
+            }
+            await updatePatientFields(pid, {
+                appointments,
+                appointment,
+                visitLogs,
+                [field]: value, // legacy mirror for reports that have not migrated yet
+            }, 'booked_visit_update', appointmentId + ' ' + field + '=' + value);
             const idx = state.patients.findIndex(p => p.id === pid);
-            if (idx >= 0) state.patients[idx] = { ...state.patients[idx], [field]: value };
-            showNotification('Updated ' + field + '.', 'success');
+            if (idx >= 0) state.patients[idx] = normalizePatientRecord({ ...state.patients[idx], appointments, appointment, visitLogs, [field]: value });
+            showNotification('Updated this visit’s ' + (field === 'visitOutcome' ? 'outcome' : 'in-clinic status') + '.', 'success');
         } catch (err) {
             showNotification(err.message || 'Update failed.', 'error');
         }
@@ -9175,8 +9240,12 @@ document.addEventListener('change', async (e) => {
         const patient = state.patients.find(p => p.id === patientId);
         if (patient && patient.appointment) {
             const updatedAppointment = { ...patient.appointment, visitStatus: newStatus };
+            const appointments = getPatientAppointments(patient).map(appointment =>
+                String(appointment.id || appointment.slotId) === String(updatedAppointment.id || updatedAppointment.slotId)
+                    ? { ...appointment, ...updatedAppointment }
+                    : appointment);
             try {
-                await updateDocument('patients', patientId, { appointment: updatedAppointment });
+                await updatePatientFields(patientId, { appointment: updatedAppointment, appointments }, 'visit_status_updated', newStatus);
                 showNotification(`Status for ${patient.firstName} updated to "${newStatus}".`, 'success');
             } catch (error) {
                 console.error("Error updating visit status:", error);
@@ -9797,13 +9866,22 @@ document.addEventListener('submit', async (e) => {
                     ...patient.appointment,
                     checkInStatus: checkInStatus,
                     checkInTime: new Date().toISOString(),
-                    checkInNotes: checkInNotes
+                    checkInNotes: checkInNotes,
+                    visitOutcome: checkInStatus === 'no-show' ? 'No Show' : (patient.appointment.visitOutcome || '')
                 };
                 const appointments = getPatientAppointments(patient).map(a =>
                     a.slotId === updatedAppointment.slotId ? { ...a, ...updatedAppointment } : a
                 );
                 const pipelineStage = checkInStatus === 'checked-in' ? 'showed' : patient.pipelineStage;
                 const extra = checkInStatus === 'no-show' ? {
+                    visitLogs: [...(patient.visitLogs || []), {
+                        appointmentId: String(updatedAppointment.id || updatedAppointment.slotId),
+                        date: new Date().toISOString(),
+                        visit: updatedAppointment.visit || 'Visit',
+                        outcome: 'No Show',
+                        completedBy: getCurrentActor(),
+                        signature: getCurrentActor(),
+                    }],
                     communications: [...(patient.communications || []), {
                         id: ensureId('comm'),
                         templateKey: 'no_show_followup',
@@ -9825,6 +9903,7 @@ document.addEventListener('submit', async (e) => {
                 await updatePatientFields(patientId, {
                     appointment: updatedAppointment,
                     appointments,
+                    ...(checkInStatus === 'no-show' ? { visitOutcome: 'No Show' } : {}),
                     pipelineStage,
                     ...extra
                 }, 'check_in', checkInStatus);
@@ -10177,7 +10256,7 @@ document.addEventListener('submit', async (e) => {
                         status: 'open',
                         createdAt: new Date().toISOString()
                     }];
-                } else if (outcome === 'Pass') {
+                } else if (outcome === 'Pass' || eligibility.status === 'eligible') {
                     updates.eligibilityStatus = 'eligible';
                     updates.inclusionCriteriaMet = true;
                     updates.exclusionCriteriaMet = false;
@@ -10516,6 +10595,7 @@ document.addEventListener('submit', async (e) => {
             const studyId = form.dataset.id;
             const formData = new FormData(form);
             const selectedSiteIds = formData.getAll('siteIds');
+            const existingStudy = state.studies.find(study => study.id === studyId);
             
             const updatedStudy = {
                 title: data.title,
@@ -10524,6 +10604,7 @@ document.addEventListener('submit', async (e) => {
                 target: parseInt(data.target),
                 washoutDays: data.washoutDays ? parseInt(data.washoutDays) : 30,
                 siteIds: selectedSiteIds,
+                sourceSystem: existingStudy?.sourceSystem || existingStudy?.integrationSource || existingStudy?.source || 'manual',
                 lastUpdated: new Date().toISOString()
             };
             await updateDocument('studies', studyId, updatedStudy);
@@ -11394,7 +11475,7 @@ const renderDayView = () => {
                     <p class="font-bold dark:text-white">${new Date(slot.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} <span class="text-xs font-normal text-gray-500">(${patientsInSlot.length}/${slot.capacity || 0})</span></p>
                     <p class="text-sm text-gray-600 dark:text-gray-400">${schedule.visit || 'General'}: ${study?.title || 'N/A'}${schedule.group ? ' · Group ' + schedule.group : ''}</p>
                     <div class="mt-2 text-sm">
-                        ${patientsInSlot.length > 0 ? patientsInSlot.map(p => `<p class="dark:text-gray-300">${phiName(p)}</p>`).join('') : '<p class="text-gray-500 dark:text-gray-500">Open Slot — click to edit capacity</p>'}
+                        ${patientsInSlot.length > 0 ? patientsInSlot.map(({ patient, appointment }) => `<p class="dark:text-gray-300">${phiName(patient)}${appointment.inClinicStatus ? ` · ${phi(appointment.inClinicStatus)}` : ''}${appointment.visitOutcome ? ` · ${phi(appointment.visitOutcome)}` : ''}</p>`).join('') : '<p class="text-gray-500 dark:text-gray-500">Open Slot — click to edit capacity</p>'}
                     </div>
                 </div>
             `;
@@ -11411,26 +11492,28 @@ const renderBookedAppointmentsView = () => {
     if(!container) return;
     let bookedAppointments = [];
     state.patients.forEach(p => {
-        if(p.appointment) {
-            const schedule = state.schedules.find(s => s.id === p.appointment.scheduleId);
+        getPatientAppointments(p)
+            .filter(appointment => (appointment.status || 'scheduled') !== 'cancelled')
+            .forEach(appointment => {
+            const schedule = state.schedules.find(s => s.id === appointment.scheduleId);
             if (schedule) {
-                const slot = schedule.slots.find(s => s.id === p.appointment.slotId);
+                const slot = schedule.slots.find(s => s.id === appointment.slotId);
                 if(slot) {
-                    bookedAppointments.push({patient: p, schedule, slot});
+                    bookedAppointments.push({ patient: p, appointment, schedule, slot });
                 }
             }
-        }
+        });
     });
     if (state.schedulingSiteFilter !== 'all') {
-        bookedAppointments = bookedAppointments.filter(({ patient }) => {
+        bookedAppointments = bookedAppointments.filter(({ patient, appointment, schedule }) => {
             const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
-            return currentEnrollment?.siteId === state.schedulingSiteFilter;
+            return (appointment.siteId || schedule.siteId || currentEnrollment?.siteId) === state.schedulingSiteFilter;
         });
     }
     if (state.schedulingStudyFilter !== 'all') {
-        bookedAppointments = bookedAppointments.filter(({ patient }) => {
+        bookedAppointments = bookedAppointments.filter(({ patient, appointment, schedule }) => {
             const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
-            return currentEnrollment?.studyId === state.schedulingStudyFilter;
+            return (appointment.studyId || schedule.studyId || currentEnrollment?.studyId) === state.schedulingStudyFilter;
         });
     }
     bookedAppointments.sort((a,b) => new Date(a.slot.startTime) - new Date(b.slot.startTime));
@@ -11454,32 +11537,36 @@ const renderBookedAppointmentsView = () => {
                     <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Visit Outcome</th>
                 </tr></thead>
                 <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                ${bookedAppointments.map(({patient, schedule, slot}) => `
+                ${bookedAppointments.map(({patient, appointment, schedule, slot}) => {
+                    const appointmentKey = String(appointment.id || appointment.slotId);
+                    const inClinicStatus = appointment.inClinicStatus ?? patient.inClinicStatus ?? '';
+                    const visitOutcome = appointment.visitOutcome ?? patient.visitOutcome ?? '';
+                    return `
                     <tr class="dark:text-gray-300 align-top">
                         <td class="px-3 py-3 whitespace-nowrap">${phi(new Date(slot.startTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }))}</td>
                         <td class="px-3 py-3"><button data-action="view-patient" data-id="${patient.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${phiName(patient)}</button></td>
                         <td class="px-3 py-3">${phi(patient.initials || '—')}</td>
                         <td class="px-3 py-3">${phi(patient.globalId || '—')}</td>
                         <td class="px-3 py-3">${phi(patient.screeningNumber || '—')}</td>
-                        <td class="px-3 py-3">${phi(patient.group || schedule.group || '—')}</td>
+                        <td class="px-3 py-3">${phi(appointment.group || patient.group || schedule.group || '—')}</td>
                         <td class="px-3 py-3 whitespace-nowrap">${phi(patient.phoneNumber || '—')}</td>
                         <td class="px-3 py-3">${state.studies.find(s => s.id === schedule.studyId)?.title || 'N/A'}</td>
-                        <td class="px-3 py-3">${schedule.visit || 'General'}</td>
+                        <td class="px-3 py-3">${appointment.visit || schedule.visit || 'General'}</td>
                         <td class="px-3 py-3 min-w-[140px]">
-                            <form class="booked-inline-form" data-patient-id="${patient.id}" data-field="inClinicStatus">
-                                <input type="text" name="inClinicStatus" value="${(patient.inClinicStatus || '').replace(/"/g, '&quot;')}" class="w-full p-1 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-xs" placeholder="Status">
+                            <form class="booked-inline-form" data-patient-id="${patient.id}" data-appointment-id="${appointmentKey}" data-field="inClinicStatus">
+                                <input type="text" name="inClinicStatus" value="${String(inClinicStatus).replace(/"/g, '&quot;')}" class="w-full p-1 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-xs" placeholder="Status">
                             </form>
                         </td>
                         <td class="px-3 py-3 min-w-[160px]">
-                            <form class="booked-inline-form" data-patient-id="${patient.id}" data-field="visitOutcome">
+                            <form class="booked-inline-form" data-patient-id="${patient.id}" data-appointment-id="${appointmentKey}" data-field="visitOutcome">
                                 <select name="visitOutcome" ${canEditOutcome ? '' : 'disabled'} class="w-full p-1 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-xs">
                                     <option value="">Select</option>
-                                    ${VISIT_OUTCOME_OPTIONS.map(o => `<option value="${o}" ${patient.visitOutcome === o ? 'selected' : ''}>${o}</option>`).join('')}
+                                    ${VISIT_OUTCOME_OPTIONS.map(o => `<option value="${o}" ${visitOutcome === o ? 'selected' : ''}>${o}</option>`).join('')}
                                 </select>
                             </form>
                         </td>
                     </tr>
-                `).join('')}
+                `}).join('')}
                 </tbody>
             </table>
             </div>
@@ -11951,6 +12038,9 @@ const init = async () => {
     }
 };
 window.addEventListener('resize', () => {
+    if (sidebar.dataset.autoCollapsedForViewport === '1') {
+        sidebar.classList.toggle('sidebar-collapsed', window.innerWidth >= 768 && window.innerWidth < 1180);
+    }
     if (!sidePanelContainer.classList.contains('translate-x-full') && document.body.classList.contains('patient-panel-open')) {
         syncSidebarForPatientPanel(true);
     }
