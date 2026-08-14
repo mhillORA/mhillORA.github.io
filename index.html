@@ -78,6 +78,7 @@
         #sidebar.sidebar-collapsed .nav-item button,
         #sidebar.sidebar-collapsed .nav-item { justify-content: center; }
         #sidebar.sidebar-collapsed [data-action="toggle-sidebar-collapse"] { margin-left: 0; }
+        body.patient-panel-open #sidebar { z-index: 40; }
         .logo-bg { fill: #3B82F6; }
         .logo-swoosh { stroke: #EF4444; }
         .logo-inner-circle { fill: #1F2937; }
@@ -845,20 +846,23 @@ const isNumberedSurveyQuestion = (q) => {
 
 const isActualStudy = (study) => {
     if (!study || study.archived || String(study.status || '').toLowerCase() === 'archived') return false;
-    const text = `${study.title || ''} ${study.name || ''} ${study.type || ''}`.toLowerCase();
-    return !/\b(training|department|orientation|onboarding)\b/.test(text);
+    if (study.isTraining === true || study.isDepartment === true) return false;
+    const source = String(study.sourceSystem || study.integrationSource || study.source || '').trim().toLowerCase();
+    if (source && !['artemis', 'manual', 'nasa'].includes(source)) return false;
+    const text = `${study.title || ''} ${study.name || ''} ${study.type || ''} ${study.category || ''} ${study.recordType || ''}`.toLowerCase();
+    return !/\b(training|department|orientation|onboarding|education|course)\b/.test(text);
 };
 
 const isCrcOrManagerUser = () => {
     const u = state.currentUser || {};
     const role = String(u.role || u.permissionLevel || '').toLowerCase();
-    if (isManagerUser()) return true;
+    if (isAdminUser()) return true;
     if (role.includes('crc') || role === 'coordinator' || role === 'internal') return true;
     if (u.userPartition === 'internal' && role !== 'external' && role !== 'recruiter') return true;
     return false;
 };
 
-/** Recruiters edit V1 only; CRC / Manager / Internal can edit V2+. */
+/** Recruiters edit V1 only; CRC / Admin / Internal can edit V2+. */
 const canEditAppointmentVisit = (visitLabel) => {
     if (isCrcOrManagerUser()) return true;
     const v = String(visitLabel || '').toLowerCase();
@@ -871,6 +875,8 @@ const isAppointmentVisitV1 = (visitLabel) => {
 };
 
 const MED_STALE_MS = 365 * 24 * 60 * 60 * 1000; // 1 year — mark stale, keep forever
+const getActivePatientMedications = (patient) =>
+    ((patient && patient.medications) || []).filter(m => m && m.active !== false);
 const isMedicationStale = (med) => {
     const t = med && (med.reviewedAt || med.enteredAt || med.startDate);
     if (!t) return false;
@@ -973,6 +979,8 @@ const inferOverallStatusFromSurvey = (outcome, answers) => {
     }
     if (/waitlist|wait list/.test(blob)) return { overallStatus: 'Waitlist' };
     if (/call back|callback|call-back/.test(blob)) return { overallStatus: 'Call Back' };
+    if (/unreachable|wrong number|disconnected|no answer/.test(blob)) return { overallStatus: 'Unreachable' };
+    if (/attempted|left voicemail|voicemail left/.test(blob)) return { overallStatus: 'Attempted' };
     if (outcome === 'Pass' || /schedul/.test(blob)) return { overallStatus: 'Scheduled' };
     return {};
 };
@@ -1042,6 +1050,7 @@ const getMedicationsEditorHTML = (patient, editable) => {
             return '<div class="p-3 border dark:border-gray-700 rounded-md ' + (stale ? 'border-amber-400 dark:border-amber-600' : '') + '"><div class="flex justify-between gap-2"><div>'
             + '<p class="font-semibold dark:text-white">' + (m.name || 'Medication')
             + (stale ? ' <span class="text-xs font-normal text-amber-700 dark:text-amber-300">(1+ year old)</span>' : '')
+            + (m.active === false ? ' <span class="text-xs font-normal text-gray-500">(discontinued — retained for history)</span>' : '')
             + '</p>'
             + '<p class="text-sm text-gray-600 dark:text-gray-400">Dose: ' + (m.dosage || '—') + ' · Freq: ' + (m.frequency || '—') + '</p>'
             + '<p class="text-sm text-gray-600 dark:text-gray-400">Last taken: ' + (m.lastTaken || '—') + '</p>'
@@ -1051,7 +1060,8 @@ const getMedicationsEditorHTML = (patient, editable) => {
             + '</div><div class="flex flex-col items-end gap-1">'
             + (canEdit ? ('<button type="button" data-action="edit-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-indigo-600 dark:text-indigo-300 text-xs hover:underline">Edit</button>') : '')
             + (canEdit && stale ? ('<button type="button" data-action="refresh-one-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-amber-700 dark:text-amber-300 text-xs hover:underline">Refresh</button>') : '')
-            + (canEdit ? ('<button type="button" data-action="remove-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-red-600 text-sm hover:underline">Remove</button>') : '')
+            + (canEdit && m.active !== false ? ('<button type="button" data-action="remove-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-red-600 text-sm hover:underline">Discontinue</button>') : '')
+            + (canEdit && m.active === false ? ('<button type="button" data-action="restore-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-green-600 text-sm hover:underline">Restore</button>') : '')
             + '</div></div></div>';
         }).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400">No medications on file.</p>')
         + (canEdit ? ('<form id="add-patient-medication-form" data-patient-id="' + patient.id + '" class="grid grid-cols-1 md:grid-cols-2 gap-2 p-3 border dark:border-gray-700 rounded-md bg-gray-50 dark:bg-gray-900">'
@@ -1072,7 +1082,7 @@ const getTagsChecklistHTML = (selected, name) => {
     const field = name || 'tags';
     const tags = getActiveReferenceList('tags');
     const selectedSet = new Set(selected || []);
-    if (!tags.length) return '<p class="text-sm text-gray-500">No tags configured in Manager.</p>';
+    if (!tags.length) return '<p class="text-sm text-gray-500">No tags configured in Admin.</p>';
     return '<div class="grid grid-cols-1 md:grid-cols-2 gap-2">'
         + tags.map(t => '<label class="flex items-center gap-2 text-sm dark:text-gray-200"><input type="checkbox" name="' + field + '" value="' + t.name + '" '
             + (selectedSet.has(t.name) ? 'checked' : '') + ' class="h-4 w-4 rounded border-gray-300 text-blue-600"><span>' + t.name + '</span></label>').join('')
@@ -1371,6 +1381,17 @@ try {
         sidebar.classList.add('sidebar-collapsed');
     }
 } catch { /* optional */ }
+
+const syncSidebarForPatientPanel = (opening) => {
+    if (!sidebar || window.innerWidth < 768) return;
+    if (opening && window.innerWidth < 1280 && !sidebar.classList.contains('sidebar-collapsed')) {
+        sidebar.classList.add('sidebar-collapsed');
+        sidebar.dataset.autoCollapsedForPanel = '1';
+    } else if (!opening && sidebar.dataset.autoCollapsedForPanel === '1') {
+        sidebar.classList.remove('sidebar-collapsed');
+        delete sidebar.dataset.autoCollapsedForPanel;
+    }
+};
 // --- NOTIFICATION UTILITY ---
 /**
  * Show notification to user with enhanced styling and error handling
@@ -2811,6 +2832,8 @@ const openSidePanel = (content, isPatientProfile = false) => {
         sidePanelContainer.classList.remove('translate-x-full');
         
         if (isPatientProfile) {
+            document.body.classList.add('patient-panel-open');
+            syncSidebarForPatientPanel(true);
             setTimeout(() => { 
                 document.addEventListener('click', handleOutsideClick, true);
             }, 100);
@@ -2836,6 +2859,8 @@ const closeSidePanel = () => {
         sidePanelContainer.classList.add('translate-x-full');
         overlay.classList.add('opacity-0', 'pointer-events-none');
         sidePanelContainer.innerHTML = '';
+        document.body.classList.remove('patient-panel-open');
+        syncSidebarForPatientPanel(false);
         state.currentPatientProfileTab = 'details';
         document.removeEventListener('click', handleOutsideClick, true);
     } catch (error) {
@@ -3955,7 +3980,7 @@ const getPipelineHTML = () => `
         <div class="flex gap-2 flex-wrap">
             <select id="pipeline-study-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                 <option value="all">All Studies</option>
-                ${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
+                ${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
             </select>
             <select id="pipeline-assignee-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                 <option value="all">All Assignees</option>
@@ -4073,7 +4098,7 @@ const getFunnelHTML = () => `
     <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md mb-6 grid grid-cols-1 md:grid-cols-2 gap-4">
         <select id="funnel-study-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
             <option value="all">All Studies</option>
-            ${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
+            ${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}">${s.title}</option>`).join('')}
         </select>
         <select id="funnel-site-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
             <option value="all">All Sites</option>
@@ -4136,7 +4161,7 @@ const buildRegistryValueInputHTML = (field, op, value = '') => {
         return `<div class="flex gap-2"><input type="number" data-registry-value="0" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" placeholder="Min" value="${arr[0] ?? ''}"><input type="number" data-registry-value="1" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" placeholder="Max" value="${arr[1] ?? ''}"></div>`;
     }
     if (op === 'not_enrolled_in') {
-        return `<select class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full">${state.studies.map(s => `<option value="${s.id}" ${value === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select>`;
+        return `<select class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full">${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}" ${value === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select>`;
     }
     if (op === 'appointment_on_date') {
         return `<input type="date" class="registry-cond-value p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white w-full" value="${value || ''}">`;
@@ -4238,7 +4263,7 @@ const refreshRegistryAssignSelects = () => {
     const typeEl = document.getElementById('registry-assign-type');
     if (studyEl) {
         const selected = studyEl.value || state.registryAssignStudyId;
-        studyEl.innerHTML = `<option value="">Select study</option>${state.studies.map(s => `<option value="${s.id}" ${selected === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}`;
+        studyEl.innerHTML = `<option value="">Select study</option>${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}" ${selected === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}`;
     }
     if (siteEl) {
         const selected = siteEl.value || state.registryAssignSiteId;
@@ -4330,7 +4355,7 @@ const getRegistryHTML = () => {
                     <label class="block text-sm dark:text-gray-300 mb-1">Study</label>
                     <select id="registry-assign-study" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                         <option value="">Select study</option>
-                        ${state.studies.map(s => `<option value="${s.id}" ${state.registryAssignStudyId === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}
+                        ${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}" ${state.registryAssignStudyId === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}
                     </select>
                 </div>
                 <div>
@@ -4462,7 +4487,7 @@ const getReportingHTML = () => {
         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Report Filters</h3>
             <form id="report-filter-form" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 items-center">
-                <select name="studyId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Studies</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
+                <select name="studyId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Studies</option>${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
                 <select name="siteId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Sites</option>${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select>
                 <select name="status" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Statuses</option>${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail'].map(s => `<option value="${s}">${s}</option>`).join('')}</select>
                 <select name="source" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Sources</option>${sources.map(s => `<option value="${s}">${s}</option>`).join('')}</select>
@@ -4531,7 +4556,7 @@ const getDuplicatesHTML = () => `
 const getSchedulingHTML = () => {
     // Filter studies to only show active ones (case-insensitive for API variance)
     const activeStatuses = new Set(['recruiting', 'enrolling', 'active']);
-    const activeStudies = state.studies.filter(s => activeStatuses.has(String(s.status || '').toLowerCase()));
+    const activeStudies = state.studies.filter(isActualStudy).filter(s => activeStatuses.has(String(s.status || '').toLowerCase()));
     
     const creatorView = `
         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
@@ -4645,7 +4670,7 @@ const getSchedulingHTML = () => {
        </select>
        <select id="scheduling-study-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
            <option value="all">All Studies</option>
-           ${state.studies.map(s => `<option value="${s.id}" ${state.schedulingStudyFilter === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}
+           ${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}" ${state.schedulingStudyFilter === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}
        </select>`
         : '';
     const visitFilterHTML = (state.schedulingView === 'calendar' || state.schedulingView === 'day') 
@@ -4835,7 +4860,7 @@ const getPatientProfileHTML = (patient) => {
                 ${canEditThis
                     ? `<button data-action="change-appointment" data-patient-id="${patient.id}" class="text-sm bg-yellow-500 text-white px-3 py-1 rounded hover:bg-yellow-600">Change</button>
                        <button data-action="cancel-appointment" data-patient-id="${patient.id}" class="text-sm bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600">Cancel</button>`
-                    : `<p class="text-xs text-amber-700 dark:text-amber-300">Recruiters can edit V1/screening only. Ask a CRC or Manager to change V2+ visits.</p>`}
+                    : `<p class="text-xs text-amber-700 dark:text-amber-300">Recruiters can edit V1/screening only. Ask a CRC or Admin to change V2+ visits.</p>`}
             </div>
         `;
     }
@@ -4877,7 +4902,7 @@ const getPatientProfileHTML = (patient) => {
                     <p class="text-sm text-gray-500 dark:text-gray-400">Status: ${a.visitStatus || a.status || 'scheduled'} · Check-in: ${a.checkInStatus || 'not-checked-in'}</p>
                     ${canEdit
                         ? ''
-                        : '<p class="text-xs text-amber-700 dark:text-amber-300 mt-1">View only for recruiters (V2+). CRC/Manager can edit.</p>'}
+                        : '<p class="text-xs text-amber-700 dark:text-amber-300 mt-1">View only for recruiters (V2+). CRC/Admin can edit.</p>'}
                 </div>`;
             }).join('') : '<p class="text-gray-500 dark:text-gray-400">No appointments on record.</p>'}
             ${(patient.waitlist || []).length ? `<div class="mt-4"><h4 class="font-semibold dark:text-white">Waitlist</h4>${patient.waitlist.map(w => `<p class="text-sm dark:text-gray-300">${w.visit} — requested ${new Date(w.requestedAt).toLocaleDateString()}</p>`).join('')}</div>` : ''}
@@ -5009,7 +5034,7 @@ const getPatientProfileHTML = (patient) => {
                 </li>
                 <li class="mr-2" role="presentation">
                     <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'medications' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
-                        data-tab-name="medications" data-patient-id="${patient.id}" type="button" role="tab">Medications</button>
+                        data-tab-name="medications" data-patient-id="${patient.id}" type="button" role="tab">Medication Review</button>
                 </li>
                 <li class="mr-2" role="presentation">
                     <button class="inline-block p-4 border-b-2 rounded-t-lg ${state.currentPatientProfileTab === 'surveyHistory' ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent hover:text-gray-600 hover:border-gray-300 dark:hover:text-gray-300 dark:hover:border-gray-600 text-gray-500 dark:text-gray-400'}"
@@ -5083,9 +5108,9 @@ const getPatientProfileHTML = (patient) => {
                         </div>
                     </section>
                     <section>
-                        <div class="flex items-center border-b dark:border-gray-700 mb-2"><h3 class="font-semibold text-lg dark:text-white pb-1">Medications</h3><button type="button" data-action="show-profile-section" data-patient-id="${patient.id}" data-tab="medications" class="ml-2 p-1 text-blue-600 dark:text-blue-400 rounded"><i data-lucide="pencil" class="w-4 h-4"></i></button></div>
-                        <p class="text-sm text-gray-500 mb-2">${(patient.medications || []).length} on file — manage on the Medications tab.</p>
-                        ${(patient.medications || []).slice(0, 5).map(m => `<p class="text-sm">${m.name}${m.dosage ? ' — ' + m.dosage : ''}</p>`).join('') || '<p class="text-gray-500 text-sm">None</p>'}
+                        <div class="flex items-center border-b dark:border-gray-700 mb-2"><h3 class="font-semibold text-lg dark:text-white pb-1">Medication Review</h3><button type="button" data-action="show-profile-section" data-patient-id="${patient.id}" data-tab="medications" class="ml-2 p-1 text-blue-600 dark:text-blue-400 rounded"><i data-lucide="pencil" class="w-4 h-4"></i></button></div>
+                        <p class="text-sm text-gray-500 mb-2">${getActivePatientMedications(patient).length} active on file — manage review dates and retained history on the Medication Review tab.</p>
+                        ${getActivePatientMedications(patient).slice(0, 5).map(m => `<p class="text-sm">${m.name}${m.dosage ? ' — ' + m.dosage : ''}</p>`).join('') || '<p class="text-gray-500 text-sm">None</p>'}
                     </section>
                     <section>
                         <div class="flex items-center border-b dark:border-gray-700 mb-2"><h3 class="font-semibold text-lg dark:text-white pb-1">Tags</h3>${profileEditButtonHTML(patient.id, 'tags')}</div>
@@ -5272,7 +5297,7 @@ const getQuickAddPatientHTML = () => {
                 <div><label class="block text-sm font-medium dark:text-gray-300">Registry Status</label><select name="registryStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${registryStatuses.map(s => `<option>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Therapeutic Area</label><select name="therapeuticArea" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Area</option>${therapeuticAreas.map(s => `<option>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Source</label><select name="source" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Source</option>${sources.map(s => `<option>${s}</option>`).join('')}</select></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.studies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Site</label><select name="siteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Home Site (lead pool)</label><select name="homeSiteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>
                 <div class="md:col-span-2">
@@ -5349,7 +5374,7 @@ const getEditPatientModalHTML = (patient) => {
                 <div><label class="block text-sm font-medium dark:text-gray-300">Registry Status</label><select name="registryStatus" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${registryStatuses.map(s => `<option ${patient.registryStatus === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Therapeutic Area</label><select name="therapeuticArea" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Area</option>${therapeuticAreas.map(s => `<option ${patient.therapeuticArea === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Source</label><select name="source" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">Select Source</option>${sources.map(s => `<option ${patient.source === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
-                <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.studies.map(s => `<option ${currentEnrollment?.studyId === s.id ? 'selected' : ''} value="${s.id}">${s.title}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.studies.filter(isActualStudy).map(s => `<option ${currentEnrollment?.studyId === s.id ? 'selected' : ''} value="${s.id}">${s.title}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Assign to Site</label><select name="siteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" ${hasAppointment || washoutStatus ? 'disabled' : ''}><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option ${currentEnrollment?.siteId === s.id ? 'selected' : ''} value="${s.id}">${s.name}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Home Site (lead pool)</label><select name="homeSiteId" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="">None</option>${state.sites.filter(s => s.status === 'Active').map(s => `<option value="${s.id}" ${patient.homeSiteId === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}</select></div>
                 <div><label class="block text-sm font-medium dark:text-gray-300">Pipeline Stage</label><select name="pipelineStage" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">${PIPELINE_STAGES.map(s => `<option value="${s.id}" ${getEffectivePipelineStage(patient) === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}</select></div>
@@ -5488,8 +5513,8 @@ const getLoginGateHTML = () => {
 
                 <div class="mt-4 text-xs text-gray-500 dark:text-gray-400">
                     ${showEntra
-                        ? `<strong>Backdoor login</strong> works for Internal admins created in Manager → Users (password accounts). Microsoft sign-in is for Entra-linked users.`
-                        : 'Sign in with the username and password created in Manager → Users.'}
+                        ? `<strong>Backdoor login</strong> works for Internal admins created in Admin → Users (password accounts). Microsoft sign-in is for Entra-linked users.`
+                        : 'Sign in with the username and password created in Admin → Users.'}
                 </div>
             </div>
         </div>
@@ -5647,7 +5672,7 @@ const getRequestAccessHTML = () => {
 
                     <div class="flex items-center justify-between gap-3">
                         <div class="text-xs text-gray-500 dark:text-gray-400">
-                            Pending requests appear in Manager for internal review.
+                            Pending requests appear in Admin for internal review.
                         </div>
                         <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">
                             Submit request
@@ -5744,7 +5769,7 @@ const getManageRHTML = () => {
     };
 
     const studiesChecklistHTML = (selectedIds = [], name = 'allowedStudyIds') => {
-        const recruiting = (state.studies || []).filter(s => (s.status || 'Recruiting') === 'Recruiting' || !s.status);
+        const recruiting = (state.studies || []).filter(isActualStudy).filter(s => (s.status || 'Recruiting') === 'Recruiting' || !s.status);
         if (!recruiting.length) return `<div class="text-sm text-gray-500 dark:text-gray-400">No studies loaded yet.</div>`;
         const selected = new Set(selectedIds || []);
         return `
@@ -5913,7 +5938,7 @@ const getManageRHTML = () => {
 
 const getApproveAccessRequestModalHTML = (req) => {
     const activeSites = (state.sites || []).filter(s => (s.status || 'Active') === 'Active');
-    const recruiting = (state.studies || []).filter(s => (s.status || 'Recruiting') === 'Recruiting' || !s.status);
+    const recruiting = (state.studies || []).filter(isActualStudy).filter(s => (s.status || 'Recruiting') === 'Recruiting' || !s.status);
     const selectedSites = new Set(req.siteId ? [req.siteId] : []);
     const sitesHTML = activeSites.length ? `
         <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-48 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
@@ -5954,6 +5979,7 @@ const getApproveAccessRequestModalHTML = (req) => {
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Role</label>
                     <select name="role" class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="Recruiter">Recruiter</option>
                         <option value="External" ${req?.authType === 'entra' ? 'selected' : ''}>External (Entra guest)</option>
                         <option value="coordinator">coordinator</option>
                         <option value="PI">PI</option>
@@ -6084,9 +6110,9 @@ const getEditManagedUserModalHTML = (user) => {
             `).join('')}
         </div>
     ` : `<div class="text-sm text-gray-500 dark:text-gray-400">No active sites loaded yet.</div>`;
-    const studiesHTML = (state.studies || []).length ? `
+    const studiesHTML = (state.studies || []).filter(isActualStudy).length ? `
         <div class="grid grid-cols-1 gap-2 max-h-72 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
-            ${state.studies.map(s => `
+            ${state.studies.filter(isActualStudy).map(s => `
                 <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
                     <input type="checkbox" name="allowedStudyIds" value="${s.id}" ${selectedStudies.has(s.id) ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-blue-600">
                     <span>${s.title}</span>
@@ -6390,15 +6416,33 @@ const getAppointmentDetailsModalHTML = (schedule, slot) => {
         </div>
     `;
 };
+const formatSurveyBranchTarget = (survey, target) => {
+    if (target === 'pass') return 'End — Pass';
+    if (target === 'fail') return 'End — Fail';
+    if (target === 'submit') return 'End — Completed';
+    if (target === 'next-section') return 'Next section';
+    if (String(target || '').startsWith('section:')) return `Section — ${String(target).slice(8)}`;
+    if (!Number.isNaN(Number(target)) && Number(target) > 0) {
+        const rawIndex = Number(target) - 1;
+        const item = survey?.questions?.[rawIndex];
+        if (!item) return `Item ${target}`;
+        if (!isNumberedSurveyQuestion(item)) return `Section/item — ${item.section || item.text || target}`;
+        const displayNumber = (survey.questions || []).slice(0, rawIndex + 1).filter(isNumberedSurveyQuestion).length;
+        return `Question ${displayNumber}`;
+    }
+    return String(target || 'End — Completed');
+};
+
 const getViewSurveyModalHTML = (survey) => {
     if (!survey) return `<h2>Survey not found</h2>`;
     const study = state.studies.find(s => s.id === survey.studyId);
     let questionsHTML = survey.questions.map((q, index) => {
+        const displayNumber = isNumberedSurveyQuestion(q)
+            ? survey.questions.slice(0, index + 1).filter(isNumberedSurveyQuestion).length
+            : null;
+        const displayLabel = displayNumber ? `Question ${displayNumber}` : (q.section || (q.isScript ? 'Script' : 'Unnumbered item'));
         let optionsHTML = q.options.map(opt => {
-            let nextText = `Question ${opt.next}`;
-            if (opt.next === 'pass') nextText = 'End - Pass';
-            if (opt.next === 'fail') nextText = 'End - Fail';
-            if (opt.next === 'submit') nextText = 'End - Completed';
+            const nextText = formatSurveyBranchTarget(survey, opt.next);
             return `
                 <li class="ml-4 list-disc break-words">
                     <span class="break-words whitespace-normal">${opt.text}</span> &rarr; (Next: ${nextText})
@@ -6430,6 +6474,7 @@ const getViewSurveyModalHTML = (survey) => {
         }
         return `
             <div class="mt-4 p-2 border-t dark:border-gray-700" data-question-id="${q.id || index}" draggable="true">
+                <p class="text-xs uppercase tracking-wide text-blue-600 dark:text-blue-400 mb-1">${displayLabel}</p>
                 <p class="font-semibold break-words whitespace-normal">${q.text}</p>
                 ${notesHTML}
                 ${tableHTML}
@@ -6459,14 +6504,17 @@ const getEditSurveyModalHTML = (survey) => {
         <form id="edit-survey-form" data-id="${survey.id}" class="space-y-6">
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Survey Title</label><input type="text" name="title" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 rounded-md shadow-sm p-2 bg-white dark:bg-gray-700 dark:text-white" value="${survey.title}" required /></div>
-                <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 rounded-md shadow-sm p-2 bg-white dark:bg-gray-700 dark:text-white" required><option value="">Select a study</option>${state.studies.map(s => `<option value="${s.id}" ${s.id === survey.studyId ? 'selected' : ''}>${s.title}</option>`).join('')}</select></div>
+                <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 rounded-md shadow-sm p-2 bg-white dark:bg-gray-700 dark:text-white" required><option value="">Select a study</option>${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}" ${s.id === survey.studyId ? 'selected' : ''}>${s.title}</option>`).join('')}</select></div>
             </div>
             <div id="edit-questions-container" class="space-y-4">
                 ${survey.questions.map((q, index) => `
                     <div id="edit-q-${index}" class="p-4 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-700 relative question-block" ${q.isScript ? 'data-script-block="1"' : ''}>
                         <button type="button" data-action="remove-question" data-q-id="edit-q-${index}" class="absolute top-2 right-2 p-1 text-red-500 hover:bg-red-100 dark:hover:bg-red-900 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
                         <label class="font-medium dark:text-white" id="edit-q-${index}-label">${q.text.length > 50 ? q.text.substring(0, 50) + '...' : q.text}</label>
-                        <input type="text" name="edit-q-${index}-text" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white mb-2" value="${String(q.text || '').replace(/"/g, '&quot;')}" required oninput="updateQuestionLabel('edit-q-${index}')"/>
+                        ${q.isScript
+                            ? `<textarea name="edit-q-${index}-script" rows="5" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white mb-2" required>${escapeHtml(q.text || '')}</textarea>
+                               <input type="hidden" name="edit-q-${index}-type" value="open-text">`
+                            : `<input type="text" name="edit-q-${index}-text" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white mb-2" value="${String(q.text || '').replace(/"/g, '&quot;')}" required oninput="updateQuestionLabel('edit-q-${index}')"/>`}
                         <div class="mb-2">
                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">PSQ Section Header</label>
                             <select name="edit-q-${index}-section" class="mt-1 block w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
@@ -6474,7 +6522,7 @@ const getEditSurveyModalHTML = (survey) => {
                                 ${PSQ_SECTION_HEADERS.map(h => `<option value="${h}" ${q.section === h ? 'selected' : ''}>${h}</option>`).join('')}
                             </select>
                         </div>
-                        <div>
+                        ${q.isScript ? '' : `<div>
                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Question Type</label>
                             <select name="edit-q-${index}-type" class="mt-1 block w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                 <option value="single-select" ${q.type === 'single-select' ? 'selected' : ''}>Single Select (with branching)</option>
@@ -6482,8 +6530,8 @@ const getEditSurveyModalHTML = (survey) => {
                                 <option value="dropdown" ${q.type === 'dropdown' ? 'selected' : ''}>Dropdown</option>
                                 <option value="open-text" ${q.type === 'open-text' ? 'selected' : ''}>Open Text</option>
                             </select>
-                        </div>
-                        <label class="mt-2 flex items-center gap-2 text-sm dark:text-gray-300"><input type="checkbox" name="edit-q-${index}-numbered" ${q.numbered === false ? '' : 'checked'}> Include in PSQ question numbering</label>
+                        </div>`}
+                        ${q.isScript ? '' : `<label class="mt-2 flex items-center gap-2 text-sm dark:text-gray-300"><input type="checkbox" name="edit-q-${index}-numbered" ${q.numbered === false ? '' : 'checked'}> Include in PSQ question numbering</label>`}
                         <details class="mt-2 border dark:border-gray-600 rounded p-2" ${q.note ? 'open' : ''}>
                             <summary class="cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-300">Question Note (Optional)</summary>
                             <textarea name="edit-q-${index}-note" class="mt-2 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white" rows="2" placeholder="Add a note for this question...">${q.note || ''}</textarea>
@@ -6492,7 +6540,13 @@ const getEditSurveyModalHTML = (survey) => {
                             <summary class="cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-300">Table Data (Optional)</summary>
                             <textarea name="edit-q-${index}-table" class="mt-2 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white font-mono text-xs" rows="3" placeholder="Paste CSV data here">${q.table ? q.table.headers.join(',') + '\r\n' + q.table.rows.map(row => row.join(',')).join('\r\n') : ''}</textarea>
                         </details>
-                        <div class="mt-2 space-y-2 pl-4" data-options-for="edit-q-${index}">
+                        ${q.isScript ? `
+                            <div class="mt-2">
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">After script, go to</label>
+                                <select name="edit-q-${index}-option-next" data-selected-next="${q.options?.[0]?.next || 'submit'}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white"></select>
+                            </div>
+                            <div class="hidden" data-options-for="edit-q-${index}"></div>
+                        ` : `<div class="mt-2 space-y-2 pl-4" data-options-for="edit-q-${index}">
                             <label class="text-sm font-medium text-gray-600 dark:text-gray-400">Options</label>
                             ${q.options.map((opt, optIndex) => `
                                 <div class="flex items-center gap-2">
@@ -6502,7 +6556,7 @@ const getEditSurveyModalHTML = (survey) => {
                                 </div>
                             `).join('')}
                         </div>
-                        <button type="button" data-action="add-option" data-q-id="edit-q-${index}" data-type="${q.type}" class="text-sm text-blue-600 dark:text-blue-400 hover:underline mt-2">+ Add Option</button>
+                        <button type="button" data-action="add-option" data-q-id="edit-q-${index}" data-type="${q.type}" class="text-sm text-blue-600 dark:text-blue-400 hover:underline mt-2">+ Add Option</button>`}
                     </div>
                 `).join('')}
             </div>
@@ -6585,13 +6639,14 @@ const getTakeSurveyModalHTML = () => {
             </div>
         `;
     }
-    const medListText = (patient.medications || []).map(m => `${m.name}${m.dosage ? ' — ' + m.dosage : ''}${m.frequency ? ' (' + m.frequency + ')' : ''}`).join('\n');
+    const activePatientMeds = getActivePatientMedications(patient);
+    const medListText = activePatientMeds.map(m => `${m.name}${m.dosage ? ' — ' + m.dosage : ''}${m.frequency ? ' (' + m.frequency + ')' : ''}`).join('\n');
     const medPrefill = (!priorAnswer && /medication/i.test(section + ' ' + questionText) && question.type === 'open-text' && medListText) ? medListText : priorAnswer;
     const medHint = /medication/i.test(section + ' ' + questionText)
         ? `<div class="mb-4 p-3 border border-blue-200 dark:border-blue-800 rounded bg-blue-50 dark:bg-blue-950/40 text-sm dark:text-blue-100">
                 <p class="font-semibold mb-1">Patient medications on file</p>
-                ${(patient.medications || []).length
-                    ? (patient.medications || []).map(m => `<div>${m.name}${m.dosage ? ' — ' + m.dosage : ''}${m.frequency ? ' (' + m.frequency + ')' : ''}</div>`).join('')
+                ${activePatientMeds.length
+                    ? activePatientMeds.map(m => `<div>${m.name}${m.dosage ? ' — ' + m.dosage : ''}${m.frequency ? ' (' + m.frequency + ')' : ''}</div>`).join('')
                     : '<p class="text-gray-600 dark:text-gray-400">None yet — add from the Medications tab on the profile.</p>'}
            </div>` : '';
     const vars = getScriptVariableMap(patient);
@@ -7725,6 +7780,7 @@ document.addEventListener('click', async (e) => {
             case 'close-modal': closeModal(); break;
             case 'close-side-panel': closeSidePanel(); break;
             case 'toggle-sidebar-collapse': {
+                delete sidebar.dataset.autoCollapsedForPanel;
                 sidebar.classList.toggle('sidebar-collapsed');
                 const collapsed = sidebar.classList.contains('sidebar-collapsed');
                 try { localStorage.setItem('nasa-sidebar-collapsed', collapsed ? '1' : '0'); } catch { /* optional */ }
@@ -8249,7 +8305,7 @@ document.addEventListener('click', async (e) => {
                 const patientForChange = state.patients.find(p => p.id === patientId);
                 const visitLabel = patientForChange?.appointment?.visit || '';
                 if (!canEditAppointmentVisit(visitLabel)) {
-                    showNotification('Recruiters can only edit V1/screening appointments. Ask a CRC or Manager for V2+.', 'error');
+                    showNotification('Recruiters can only edit V1/screening appointments. Ask a CRC or Admin for V2+.', 'error');
                     break;
                 }
                 await cancelAppointment(patientId);
@@ -8261,7 +8317,7 @@ document.addEventListener('click', async (e) => {
                 const patientForCancel = state.patients.find(p => p.id === patientId);
                 const visitCancel = patientForCancel?.appointment?.visit || '';
                 if (!canEditAppointmentVisit(visitCancel)) {
-                    showNotification('Recruiters can only cancel V1/screening appointments. Ask a CRC or Manager for V2+.', 'error');
+                    showNotification('Recruiters can only cancel V1/screening appointments. Ask a CRC or Admin for V2+.', 'error');
                     break;
                 }
                 await cancelAppointment(patientId);
@@ -8501,6 +8557,7 @@ document.addEventListener('click', async (e) => {
             case 'add-option': addOptionToQuestion(actionButton.dataset.qId, actionButton.dataset.type); break; // Pass type
             case 'remove-question': 
                 document.getElementById(qId).remove();
+                renumberSurveyQuestions();
                 updateBranchingLogicDropdowns();
                 break;
             case 'remove-option': 
@@ -8538,7 +8595,7 @@ document.addEventListener('click', async (e) => {
                 const pid = id || patientId;
                 openModal(`
                     <h2 class="text-xl font-bold text-red-600 mb-3">Mark patient deceased?</h2>
-                    <p class="dark:text-gray-300 mb-4">This locks the profile. Recruiters cannot edit until a Manager unlocks it.</p>
+                    <p class="dark:text-gray-300 mb-4">This locks the profile. Recruiters cannot edit until an Admin unlocks it.</p>
                     <div class="flex justify-end gap-2">
                         <button data-action="close-modal" class="px-4 py-2 rounded bg-gray-200 dark:bg-gray-600">Cancel</button>
                         <button data-action="confirm-mark-deceased" data-id="${pid}" class="px-4 py-2 rounded bg-red-700 text-white">Lock Profile</button>
@@ -8650,13 +8707,36 @@ document.addEventListener('click', async (e) => {
                 const p = state.patients.find(x => x.id === pid);
                 if (!p) break;
                 try {
-                    const medications = (p.medications || []).filter(m => m.id !== medId);
-                    await updatePatientFields(pid, { medications }, 'medication_removed', medId);
+                    const now = new Date().toISOString();
+                    const medications = (p.medications || []).map(m => m.id === medId
+                        ? { ...m, active: false, discontinuedAt: now, reviewedAt: now }
+                        : m);
+                    await updatePatientFields(pid, { medications }, 'medication_discontinued', medId);
                     await loadAllData();
                     state.currentPatientProfileTab = 'medications';
                     openSidePanel(getPatientProfileHTML(state.patients.find(x => x.id === pid)), true);
+                    showNotification('Medication discontinued and retained in history.', 'success');
                 } catch (err) {
-                    showNotification(err.message || 'Could not remove medication.', 'error');
+                    showNotification(err.message || 'Could not discontinue medication.', 'error');
+                }
+                break;
+            }
+            case 'restore-patient-medication': {
+                const pid = actionButton.dataset.patientId;
+                const medId = actionButton.dataset.medId;
+                const p = state.patients.find(x => x.id === pid);
+                if (!p) break;
+                try {
+                    const medications = (p.medications || []).map(m => m.id === medId
+                        ? { ...m, active: true, discontinuedAt: null, reviewedAt: new Date().toISOString() }
+                        : m);
+                    await updatePatientFields(pid, { medications }, 'medication_restored', medId);
+                    await loadAllData();
+                    state.currentPatientProfileTab = 'medications';
+                    openSidePanel(getPatientProfileHTML(state.patients.find(x => x.id === pid)), true);
+                    showNotification('Medication restored.', 'success');
+                } catch (err) {
+                    showNotification(err.message || 'Could not restore medication.', 'error');
                 }
                 break;
             }
@@ -9289,6 +9369,7 @@ document.addEventListener('submit', async (e) => {
                     startDate: data.startDate || '',
                     lastTaken: data.lastTaken || '',
                     notes: String(data.notes || '').trim(),
+                    active: true,
                     enteredAt: new Date().toISOString(),
                     reviewedAt: new Date().toISOString(),
                     enteredBy: getCurrentActor()
@@ -9338,9 +9419,21 @@ document.addEventListener('submit', async (e) => {
             try {
                 const keepId = data.keepId;
                 const sourceIds = String(data.sourceIds || '').split(',').filter(Boolean);
-                const mergeIds = sourceIds.filter(id => id !== keepId);
                 const keep = await resolvePatientById(keepId);
                 if (!keep) throw new Error('Keep profile not found');
+                const resolvedProfiles = await Promise.all(sourceIds.map(id => resolvePatientById(id)));
+                const profilesById = new Map(resolvedProfiles.filter(Boolean).map(profile => [profile.id, profile]));
+                profilesById.set(keep.id, keep);
+                const mergeIds = sourceIds.filter(id => {
+                    if (id === keepId) return false;
+                    const profile = profilesById.get(id);
+                    if (!profile) throw new Error(`Duplicate profile not found: ${id}`);
+                    if (profile.mergedIntoId && profile.mergedIntoId !== keepId) {
+                        throw new Error(`Profile ${id} was already merged into another patient.`);
+                    }
+                    return profile.mergedIntoId !== keepId;
+                });
+                if (!mergeIds.length) throw new Error('No unmerged duplicate profiles selected.');
                 const fieldNames = [
                     'firstName', 'lastName', 'phoneNumber', 'email', 'dob', 'address', 'city', 'state', 'zipCode',
                     'sexAssignedAtBirth', 'ethnicity', 'globalId', 'status', 'overallStatus', 'nqReason', 'niReason', 'homeSiteId'
@@ -9349,7 +9442,7 @@ document.addEventListener('submit', async (e) => {
                 fieldNames.forEach(field => {
                     const donorId = data['field_' + field];
                     if (!donorId) return;
-                    const donor = state.patients.find(p => p.id === donorId) || keep;
+                    const donor = profilesById.get(donorId) || keep;
                     updates[field] = donor[field];
                 });
                 if (updates.dob) updates.age = calculateAge(updates.dob) || null;
@@ -9357,7 +9450,7 @@ document.addEventListener('submit', async (e) => {
                 for (const col of collections) {
                     let merged = Array.isArray(keep[col]) ? [...keep[col]] : [];
                     for (const mid of mergeIds) {
-                        const other = state.patients.find(p => p.id === mid);
+                        const other = profilesById.get(mid);
                         if (!other || !Array.isArray(other[col])) continue;
                         if (col === 'medications' || col === 'tags') {
                             const seen = new Set(merged.map(x => typeof x === 'string' ? x : x.id || x.name));
@@ -10100,6 +10193,24 @@ document.addEventListener('submit', async (e) => {
                         createdAt: new Date().toISOString()
                     }];
                 }
+                const studyOutcome = {
+                    overallStatus: updates.overallStatus || patient.overallStatus || '',
+                    eligibilityStatus: updates.eligibilityStatus || patient.eligibilityStatus || 'unknown',
+                    pipelineStage: updates.pipelineStage || patient.pipelineStage || '',
+                    sfReason: updates.sfReason || '',
+                    nqReason: updates.nqReason || '',
+                    niReason: updates.niReason || '',
+                    lastSurveyId: survey.id,
+                    lastSurveyOutcome: outcome,
+                    lastSurveyCompletedAt: surveyResult.completedAt,
+                };
+                const enrollments = (patient.enrollments || []).map(enrollment =>
+                    enrollment.studyId === survey.studyId
+                        ? { ...enrollment, ...studyOutcome }
+                        : enrollment);
+                if (enrollments.some(enrollment => enrollment.studyId === survey.studyId)) {
+                    updates.enrollments = enrollments;
+                }
                 await updatePatientFields(patient.id, updates, 'survey_completed', survey.title);
                 await loadAllData();
                 closeModal();
@@ -10449,6 +10560,7 @@ document.addEventListener('submit', async (e) => {
                 enrolled: 0,
                 screenFails: 0,
                 siteIds: selectedSiteIds,
+                sourceSystem: 'manual',
                 lastUpdated: new Date().toISOString()
             };
             await createDocument('studies', newStudy);
@@ -10878,23 +10990,6 @@ document.addEventListener('submit', async (e) => {
             }
             break;
         }
-        case 'create-study-form': {
-            const studyData = {
-                title: data.title,
-                protocolNumber: data.protocolNumber || '',
-                status: data.status || 'Recruiting',
-                target: parseInt(data.target, 10) || 0,
-                startDate: data.startDate || '',
-                endDate: data.endDate || '',
-                washoutDays: parseInt(data.washoutDays, 10) || 30,
-                enrolled: 0,
-                screenFails: 0,
-                siteIds: []
-            };
-            await createDocument('studies', studyData);
-            closeModal();
-            break;
-        }
         case 'create-site-form': {
             const selectedIndications = Array.from(form.querySelectorAll('input[name="indication"]:checked')).map(cb => cb.value);
             const siteData = {
@@ -10950,8 +11045,21 @@ const updateBranchingLogicDropdowns = () => {
     const questionsContainer = getActiveSurveyQuestionsContainer();
     if (!questionsContainer) return;
     const questionElements = questionsContainer.querySelectorAll('.question-block');
+    let displayQuestionNumber = 0;
     const questionOptions = Array.from(questionElements).map((el, index) => {
-        return { value: String(index + 1), text: `Go to Q${index + 1}` };
+        const section = el.querySelector('select[name$="-section"]')?.value || '';
+        const isScript = el.dataset.scriptBlock === '1';
+        const numberedControl = el.querySelector('input[name$="-numbered"]');
+        const isNumbered = !isScript && !NON_NUMBERED_PSQ_SECTIONS.has(section) && numberedControl?.checked !== false;
+        if (isNumbered) displayQuestionNumber += 1;
+        const textControl = el.querySelector('input[name$="-text"], textarea[name$="-script"]');
+        const snippet = String(textControl?.value || '').trim().slice(0, 42);
+        const label = isScript
+            ? `Go to section: ${section || 'Script'}`
+            : isNumbered
+                ? `Go to Question ${displayQuestionNumber}${snippet ? ` — ${snippet}` : ''}`
+                : `Go to unnumbered item${section ? `: ${section}` : ''}${snippet ? ` — ${snippet}` : ''}`;
+        return { value: String(index + 1), text: label };
     });
     const sectionOptions = [...new Set(Array.from(questionElements)
         .map(el => el.querySelector('select[name$="-section"]')?.value || '')
@@ -11075,21 +11183,9 @@ const addQuestionToSurveyForm = () => {
 
 // Function to update question labels with actual question text
 const updateQuestionLabel = (qId) => {
-    const input = document.querySelector(`input[name="${qId}-text"]`);
-    const label = document.getElementById(`${qId}-label`);
-    if (input && label) {
-        const text = input.value.trim();
-        if (text) {
-            // Truncate long text for display
-            const displayText = text.length > 50 ? text.substring(0, 50) + '...' : text;
-            label.textContent = displayText;
-        } else {
-            // Reset to question number if empty
-            const container = document.getElementById('questions-container');
-            const questionIndex = Array.from(container.children).indexOf(document.getElementById(qId)) + 1;
-            label.textContent = `Question ${questionIndex}`;
-        }
-    }
+    if (!document.getElementById(qId)) return;
+    renumberSurveyQuestions();
+    updateBranchingLogicDropdowns();
 };
 
 // Drag and drop functionality for question reordering
@@ -11693,7 +11789,7 @@ const loadAllData = async (options = {}) => {
         if (state.currentUser) {
             const pendingCount = getPendingAccessRequestCount();
             if (pendingCount > 0 && state._lastSeenPendingRequests !== pendingCount) {
-                showNotification(`${pendingCount} access request${pendingCount === 1 ? '' : 's'} pending in Manager.`, 'info');
+                showNotification(`${pendingCount} access request${pendingCount === 1 ? '' : 's'} pending in Admin.`, 'info');
             }
             state._lastSeenPendingRequests = pendingCount;
         }
@@ -11769,7 +11865,8 @@ const handleCtmsMessage = async (event) => {
         try {
             await updateDocument('studies', studyId, {
                 enrolled: parseInt(enrolled, 10),
-                screenFails: parseInt(screenFails, 10)
+                screenFails: parseInt(screenFails, 10),
+                sourceSystem: 'artemis'
             });
             const studyTitle = state.studies.find(s => s.id === studyId)?.title || 'a study';
             showNotification(`Data for ${studyTitle} updated from CTMS.`, 'success');
@@ -11853,6 +11950,11 @@ const init = async () => {
         mainContent.innerHTML = `<div class="p-4 bg-red-100 rounded-md text-red-700">${errorMessage}</div>`;
     }
 };
+window.addEventListener('resize', () => {
+    if (!sidePanelContainer.classList.contains('translate-x-full') && document.body.classList.contains('patient-panel-open')) {
+        syncSidebarForPatientPanel(true);
+    }
+});
 window.onload = init;
 </script>
 </body>
