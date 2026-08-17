@@ -2536,10 +2536,17 @@
                     return out;
                 }
 
+                async getEvent(eventId) {
+                    return this.request(`/events/${eventId}`);
+                }
+
                 // PUT must persist full event including roleAssignments, crcId, crcIds and return them in the response.
                 async updateEvent(eventId, data) {
+                    const current = (state.crc_events || []).find(event => event && event.id === eventId);
+                    const headers = current && current._etag ? { 'If-Match': current._etag } : undefined;
                     const out = await this.request(`/events/${eventId}`, {
                         method: 'PUT',
+                        headers,
                         body: JSON.stringify(data)
                     });
                     this.invalidateEventsHttpCache();
@@ -7176,8 +7183,17 @@
             };
             
             // Helper function to safely add an event to state without duplicates
+            const requireCreatedEvent = (created, label = 'event') => {
+                if (created && created.id) return created;
+                throw new Error(`Server did not save this ${label}. Nothing was stored — please try again.`);
+            };
+
             const addEventToState = (newEvent, options = {}) => {
     if (!newEvent) return;
+    if (!newEvent.id) {
+        debugWarn('CHAOS: Refused to add event without server id');
+        return;
+    }
     if (newEvent.id && state.crc_events.some(e => e.id === newEvent.id)) {
         debugWarn('CHAOS: Prevented adding duplicate event:', newEvent.id);
         return;
@@ -7333,17 +7349,19 @@
                         return;
                     }
                     let deleted = 0;
+                    const successfullyDeletedIds = new Set();
                     for (const id of toDelete) {
                         try {
                             await apiService.deleteEvent(id);
                             deleted++;
+                            successfullyDeletedIds.add(id);
                         } catch (err) {
                             console.error('Error deleting duplicate travel day:', id, err);
                         }
                     }
-                    // Always clean local state, even if some API deletes failed.
-                    const remainingIds = new Set(toDelete);
-                    const localUpdated = (state.crc_events || []).filter(e => !(e && e.id && remainingIds.has(e.id)));
+                    // Only remove rows the API confirmed deleted. Hiding failed
+                    // deletes locally made them appear gone until the next refresh.
+                    const localUpdated = (state.crc_events || []).filter(e => !(e && e.id && successfullyDeletedIds.has(e.id)));
                     setState({ crc_events: localUpdated });
                     if (deleted === toDelete.length) {
                         showNotification(`Removed ${deleted} duplicate travel day(s). One per person per date kept.`, 'success');
@@ -7378,19 +7396,26 @@
                     showNotification('No duplicate PTO/time off events found.', 'success');
                     return;
                 }
+                const deletedIds = new Set();
                 for (const id of toDelete) {
                     try {
                         await apiService.deleteEvent(id);
+                        deletedIds.add(id);
                     } catch (err) {
                         console.error('Error deleting duplicate PTO event:', id, err);
-                        showNotification(`Failed to delete some PTO duplicates. See console.`, 'error');
                     }
                 }
                 const updated = await apiService.getEvents({ full: true });
-                const merged = mergeEventsById(state.crc_events, Array.isArray(updated) ? updated : []);
+                const localWithoutDeleted = (state.crc_events || []).filter(e => !deletedIds.has(e?.id));
+                const merged = mergeEventsById(localWithoutDeleted, Array.isArray(updated) ? updated : []);
                 const evRange = widenEventsQueryRange(state.eventsQueryRange, getDefaultEventsDateRange());
                 setState({ crc_events: merged, eventsQueryRange: evRange });
-                showNotification(`Removed ${toDelete.length} duplicate PTO/time off event(s). One per person per date kept.`, 'success');
+                showNotification(
+                    deletedIds.size === toDelete.length
+                        ? `Removed ${deletedIds.size} duplicate PTO/time off event(s). One per person per date kept.`
+                        : `Removed ${deletedIds.size}/${toDelete.length} duplicate PTO/time off event(s). Some API deletes failed.`,
+                    deletedIds.size === toDelete.length ? 'success' : 'warning'
+                );
             };
             
             // Remove duplicate time off REQUESTS (same person, date, and period). AM/PM on same day are kept.
@@ -7417,17 +7442,23 @@
                     showNotification('No duplicate time off requests found.', 'success');
                     return;
                 }
+                let deletedCount = 0;
                 for (const id of toDelete) {
                     try {
                         await apiService.deleteTimeOffRequest(id);
+                        deletedCount++;
                     } catch (err) {
                         console.error('Error deleting duplicate time off request:', id, err);
-                        showNotification(`Failed to delete some request duplicates. See console.`, 'error');
                     }
                 }
                 const updated = await apiService.getTimeOffRequests();
                 setState({ timeOffRequests: Array.isArray(updated) ? updated : [] });
-                showNotification(`Removed ${toDelete.length} duplicate time off request(s). One per person per date per period kept.`, 'success');
+                showNotification(
+                    deletedCount === toDelete.length
+                        ? `Removed ${deletedCount} duplicate time off request(s). One per person per date per period kept.`
+                        : `Removed ${deletedCount}/${toDelete.length} duplicate time off request(s). Some API deletes failed.`,
+                    deletedCount === toDelete.length ? 'success' : 'warning'
+                );
             };
             
             // Find and report duplicates in the data - returns detailed info for cleanup
@@ -7590,7 +7621,7 @@
                         <div class="p-3 bg-blue-50 dark:bg-blue-900/30 rounded-lg text-sm text-blue-800 dark:text-blue-200 mt-4 mb-3">
                             <strong>Safe Mode:</strong> Auto-clean will only delete:
                             <ul class="list-disc ml-5 mt-1">
-                                <li>Events with identical IDs (true database duplicates)</li>
+                                <li>Repeated in-memory references with identical event IDs (database record is kept)</li>
                                 <li>PTO entries with identical type, period, AND hours</li>
                             </ul>
                             <p class="mt-1">It will <strong>NOT</strong> delete AM/PM splits or different PTO types on the same day.</p>
@@ -7622,19 +7653,19 @@
                 
                 showNotification('Cleaning up duplicates... Please wait.', 'info');
                 
-                // SAFE: Only delete events with IDENTICAL IDs (true database duplicates)
-                // These are definitely duplicates - same ID should only exist once
+                // Cosmos cannot contain two documents with the same id/partition key.
+                // Repeated IDs here are duplicate in-memory references to ONE canonical
+                // document. Calling DELETE for the "extra" would delete the real shift.
                 for (const dupe of dupes.events) {
-                    // Keep the first one, delete the rest (they have the same ID)
-                    for (let i = 1; i < dupe.events.length; i++) {
-                        try {
-                            await apiService.deleteEvent(dupe.events[i].id);
-                            deletedCount++;
-                        } catch (err) {
-                            console.error('Error deleting duplicate event:', err);
-                            errorCount++;
-                        }
-                    }
+                    const before = state.crc_events.length;
+                    const seen = new Set();
+                    state.crc_events = state.crc_events.filter(event => {
+                        if (!event?.id) return true;
+                        if (seen.has(event.id)) return false;
+                        seen.add(event.id);
+                        return true;
+                    });
+                    deletedCount += Math.max(0, before - state.crc_events.length);
                 }
                 
                 // SAFE: For PTO duplicates by date, only delete if they have IDENTICAL properties
@@ -9825,8 +9856,6 @@
                     // Re-enable PTO cleanup to handle any legacy duplicates
                     events = await cleanupDuplicatePTOEvents(events || []);
                     
-                    const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
-                    
                     // DEDUPLICATION: Track seen event IDs to prevent duplicate events in state
                     const seenEventIds = new Set();
                     
@@ -9838,20 +9867,9 @@
                         }
                         if (event.id) seenEventIds.add(event.id);
                         
-                        if (Array.isArray(event.studyIds) && event.studyIds.length > 0) {
-                            const filteredIds = event.studyIds.filter(studyId => artemisStudyIdsSet.has(studyId));
-                            if (filteredIds.length === 0) {
-                                if (event.type === 'Site Assignment') {
-                                    return acc;
-                                }
-                                acc.push({ ...event, studyIds: [] });
-                                return acc;
-                            }
-                            if (filteredIds.length !== event.studyIds.length) {
-                                acc.push({ ...event, studyIds: filteredIds });
-                                return acc;
-                            }
-                        }
+                        // Never discard a saved event just because its study is closed,
+                        // temporarily absent from ARTEMIS, or outside the current study
+                        // filter. That made valid schedule rows disappear after refresh.
                         acc.push(event);
                         return acc;
                     }, []) : events;
@@ -9860,7 +9878,21 @@
                         crcs,
                         crc_sites: sites,
                         studies: sanitizedStudies,
-                        crc_events: sanitizedEvents,
+                        // Keep local events outside the fetched date window so out-of-month
+                        // schedule work is not wiped by the 10-minute silent refresh.
+                        crc_events: (() => {
+                            const range = state.eventsQueryRange || (typeof getDefaultEventsDateRange === 'function' ? getDefaultEventsDateRange() : null);
+                            const outside = (range && range.startDate && range.endDate)
+                                ? (state.crc_events || []).filter(e => {
+                                    const d = (e && (e.date || e.startDate)) ? String(e.date || e.startDate).slice(0, 10) : '';
+                                    if (!d) return false;
+                                    return d < range.startDate || d > range.endDate;
+                                })
+                                : [];
+                            return typeof mergeEventsById === 'function'
+                                ? mergeEventsById(outside, sanitizedEvents)
+                                : [...outside, ...(sanitizedEvents || [])];
+                        })(),
                         roles,
                         training_types,
                         timeOffRequests,
@@ -11511,8 +11543,7 @@
                     }
 
                     if (!hasError) {
-                        const newEventRef = null;
-                        await apiService.createEvent(newEventRef, eventData);
+                        await apiService.createEvent(eventData);
                         successCount++;
                     }
                 }
@@ -34700,7 +34731,7 @@
                                 
                                 try {
                                     const createdEvent = await apiService.createEvent(eventData);
-                                    const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                                    const newEvent = requireCreatedEvent(createdEvent, 'shift');
                                     addEventToState(newEvent);
                                 } catch (eventError) {
                                     console.error('Error creating unavailability event:', eventError);
@@ -35052,7 +35083,7 @@
                                                 
                                                 try {
                                                     const createdEvent = await apiService.createEvent(eventData);
-                                                    const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                                                    const newEvent = requireCreatedEvent(createdEvent, 'shift');
                                                     addEventToState(newEvent);
                                                 } catch (eventError) {
                                                     console.error('Error creating associated event:', eventError);
@@ -35176,7 +35207,7 @@
                                                 
                                                 try {
                                                     const createdEvent = await apiService.createEvent(eventData);
-                                                    const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                                                    const newEvent = requireCreatedEvent(createdEvent, 'shift');
                                                     addEventToState(newEvent);
                                                 } catch (eventError) {
                                                     console.error('Error creating unavailability event:', eventError);
@@ -37319,7 +37350,7 @@
                                 }
                                 
                                 const created = await apiService.createEvent(payload);
-                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...payload };
+                                const createdEvent = requireCreatedEvent(created, 'shift');
                                 addEventToState(createdEvent);
                             };
                             
@@ -37513,6 +37544,13 @@
                         };
 
                         const processSubmit = async (confirmedOverride = false) => {
+                            if (form.dataset.submitting === 'true') {
+                                showNotification('Save already in progress — please wait.', 'warning');
+                                return;
+                            }
+                            form.dataset.submitting = 'true';
+                            const submitButtons = form.querySelectorAll('button[type="submit"], button[data-action="submit-crc-event"]');
+                            submitButtons.forEach(btn => { btn.disabled = true; });
                             try {
                                 // Shared helper to get next business day (excluding weekends)
                                 const getNextBusinessDay = (date, days) => {
@@ -37994,17 +38032,6 @@
                                             e.parentShiftGroupId === existingGroupId && e.type === 'Travel Day'
                                         );
                                         
-                                        // Delete all events in the old group
-                                        for (const groupEvent of groupEvents) {
-                                            try {
-                                                await apiService.deleteEvent(groupEvent.id);
-                                                // Remove from state
-                                                state.crc_events = state.crc_events.filter(e => e.id !== groupEvent.id);
-                                            } catch (error) {
-                                                console.error(`Error deleting group event ${groupEvent.id}:`, error);
-                                            }
-                                        }
-                                        
                                         // For group events, we need to handle role assignments properly
                                         // Preserve shift type when editing so we never recreate a shift as travel
                                         const typeForDateRange = isEditing && existingEvent ? existingEvent.type : data.eventType;
@@ -38038,6 +38065,7 @@
                                         const newGroupId = crypto.randomUUID();
                                         const dayCursor = new Date(startDateObj);
                                         const createdEvents = [];
+                                        const failedDates = [];
                                         
                                         while (dayCursor <= endDateObj) {
                                             const dateStr = toDateOnlyString(dayCursor);
@@ -38056,21 +38084,74 @@
                                                 date: dateStr,
                                                 startDate: dateStr,
                                                 endDate: toDateOnlyString(endDateObj),
-                                                groupId: newGroupId
+                                                groupId: newGroupId,
+                                                skipTravelDayProcessing: true
                                             };
                                             
                                             try {
                                                 const created = await apiService.createEvent(eventPayload);
-                                                if (created && created.id) {
-                                                    const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(created, eventPayload) : created;
-                                                    createdEvents.push(merged);
-                                                    state.crc_events.push(merged);
-                                                }
+                                                const merged = typeof mergeEventAssignmentFields === 'function'
+                                                    ? mergeEventAssignmentFields(requireCreatedEvent(created, 'shift'), eventPayload)
+                                                    : requireCreatedEvent(created, 'shift');
+                                                createdEvents.push(merged);
+                                                state.crc_events.push(merged);
                                             } catch (error) {
                                                 console.error(`Error creating event for date ${dateStr}:`, error);
+                                                failedDates.push(dateStr);
                                             }
                                             
                                             dayCursor.setDate(dayCursor.getDate() + 1);
+                                        }
+
+                                        if (failedDates.length > 0 || createdEvents.length === 0) {
+                                            const rollbackFailures = [];
+                                            for (const createdEvent of createdEvents) {
+                                                try {
+                                                    await apiService.deleteEvent(createdEvent.id);
+                                                    state.crc_events = state.crc_events.filter(e => e.id !== createdEvent.id);
+                                                } catch (rollbackError) {
+                                                    rollbackFailures.push(createdEvent.id);
+                                                    console.error(`Failed to roll back replacement event ${createdEvent.id}:`, rollbackError);
+                                                }
+                                            }
+                                            setState({ crc_events: [...state.crc_events] });
+                                            showNotification(
+                                                rollbackFailures.length
+                                                    ? `The old schedule was preserved, but ${rollbackFailures.length} partial replacement row(s) could not be rolled back. Do not submit again; refresh and remove those rows first.`
+                                                    : `The old schedule was preserved. Replacement failed for: ${failedDates.join(', ') || 'all'}; partial replacement rows were rolled back safely.`,
+                                                'error'
+                                            );
+                                            return;
+                                        }
+
+                                        // Only remove the old series after every replacement day is
+                                        // confirmed saved. Retry each delete once; never claim success
+                                        // while old rows remain (which would look like duplicates).
+                                        const failedOldDeletes = [];
+                                        for (const groupEvent of groupEvents) {
+                                            let deleted = false;
+                                            for (let attempt = 0; attempt < 2 && !deleted; attempt++) {
+                                                try {
+                                                    await apiService.deleteEvent(groupEvent.id);
+                                                    deleted = true;
+                                                    state.crc_events = state.crc_events.filter(e => e.id !== groupEvent.id);
+                                                } catch (error) {
+                                                    console.error(`Error deleting old group event ${groupEvent.id} (attempt ${attempt + 1}):`, error);
+                                                    if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 500));
+                                                }
+                                            }
+                                            if (!deleted) failedOldDeletes.push(groupEvent.id);
+                                        }
+                                        if (failedOldDeletes.length > 0) {
+                                            const refreshed = await apiService.getEvents(state.eventsQueryRange || undefined).catch(() => null);
+                                            if (Array.isArray(refreshed)) {
+                                                setState({ crc_events: mergeEventsById(state.crc_events, refreshed) });
+                                            }
+                                            showNotification(
+                                                `Replacement days saved, but ${failedOldDeletes.length} old row(s) could not be removed. The modal will stay open; do not submit again.`,
+                                                'error'
+                                            );
+                                            return;
                                         }
 
                                         // Preserved travel days keep their OWN unique groupId (NOT the parent shift's groupId)
@@ -38247,6 +38328,7 @@
                                         const dayCursor = new Date(startDateObj);
                                         dayCursor.setDate(dayCursor.getDate() + 1); // Start from the second day
                                         const createdEvents = [];
+                                        const failedDates = [];
                                         
                                         while (dayCursor <= endDateObj) {
                                             const dateStr = toDateOnlyString(dayCursor);
@@ -38265,21 +38347,32 @@
                                                 date: dateStr,
                                                 startDate: newStartDateStr,
                                                 endDate: newEndDateStr,
-                                                groupId: newGroupId
+                                                groupId: newGroupId,
+                                                skipTravelDayProcessing: true
                                             };
                                             
                                             try {
                                                 const created = await apiService.createEvent(eventPayload);
-                                                if (created && created.id) {
-                                                    const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(created, eventPayload) : created;
-                                                    createdEvents.push(merged);
-                                                    state.crc_events.push(merged);
-                                                }
+                                                const saved = requireCreatedEvent(created, 'shift');
+                                                const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(saved, eventPayload) : saved;
+                                                createdEvents.push(merged);
+                                                state.crc_events.push(merged);
                                             } catch (error) {
                                                 console.error(`Error creating event for date ${dateStr}:`, error);
+                                                failedDates.push(dateStr);
                                             }
                                             
                                             dayCursor.setDate(dayCursor.getDate() + 1);
+                                        }
+
+                                        if (failedDates.length > 0) {
+                                            setState({ crc_events: [...state.crc_events] });
+                                            renderContentPreservingScroll();
+                                            showNotification(
+                                                `The first day and ${createdEvents.length} additional day(s) saved, but these dates failed: ${failedDates.join(', ')}. Modal stays open so you can retry.`,
+                                                'error'
+                                            );
+                                            return;
                                         }
                                         
                                         setState({ crc_events: [...state.crc_events] });
@@ -38294,16 +38387,6 @@
                                             e.id !== eventId &&
                                             e.type !== 'Travel Day'
                                         );
-                                        
-                                        // Delete all other events in the group
-                                        for (const groupEvent of groupEvents) {
-                                            try {
-                                                await apiService.deleteEvent(groupEvent.id);
-                                                state.crc_events = state.crc_events.filter(e => e.id !== groupEvent.id);
-                                            } catch (error) {
-                                                console.error(`Error deleting group event ${groupEvent.id}:`, error);
-                                            }
-                                        }
                                         
                                         // Update the remaining event to remove groupId and set endDate to same as date
                                         // Preserve shift type when editing so we never turn a shift into travel
@@ -38355,6 +38438,10 @@
                                         };
                                         
                                         const updatedEvent = await apiService.updateEvent(eventId, updatePayload);
+                                        if (!updatedEvent || !updatedEvent.id) {
+                                            showNotification('The remaining day did not save. No other days were deleted.', 'error');
+                                            return;
+                                        }
                                         if (updatedEvent && updatePayload.travelDayPreferences && !updatedEvent.travelDayPreferences) {
                                             updatedEvent.travelDayPreferences = updatePayload.travelDayPreferences;
                                         }
@@ -38365,6 +38452,27 @@
                                                 // Fully replace the event with server response
                                                 state.crc_events[eventIndex] = updatedEvent;
                                             }
+                                        }
+
+                                        // The keeper is safely updated; now remove the other days.
+                                        const failedDeletes = [];
+                                        for (const groupEvent of groupEvents) {
+                                            try {
+                                                await apiService.deleteEvent(groupEvent.id);
+                                                state.crc_events = state.crc_events.filter(e => e.id !== groupEvent.id);
+                                            } catch (error) {
+                                                failedDeletes.push(groupEvent.id);
+                                                console.error(`Error deleting group event ${groupEvent.id}:`, error);
+                                            }
+                                        }
+                                        if (failedDeletes.length > 0) {
+                                            setState({ crc_events: [...state.crc_events] }, { skipRender: false });
+                                            renderContentPreservingScroll();
+                                            showNotification(
+                                                `The selected day saved, but ${failedDeletes.length} other day(s) could not be removed. The modal will stay open; do not submit again.`,
+                                                'error'
+                                            );
+                                            return;
                                         }
                                         
                                         setState({ crc_events: [...state.crc_events] }, { skipRender: false });
@@ -38388,9 +38496,37 @@
                                             setTimeout(() => {
                                                 document.getElementById('vol-travel-confirm2')?.addEventListener('click', async () => {
                                                     const startCb = document.getElementById('vol-travel-start2'); const endCb = document.getElementById('vol-travel-end2'); const startDateInput = document.getElementById('vol-travel-start-date2'); const endDateInput = document.getElementById('vol-travel-end-date2');
-                                                    if (startCb?.checked && startDateInput?.value) { const t = { name: 'Travel Day', type: 'Travel Day', crcId: acceptedVolunteerId2, crcIds: [acceptedVolunteerId2], date: startDateInput.value, startDate: startDateInput.value, endDate: startDateInput.value, groupId: `travel-${acceptedVolunteerId2}-${startDateInput.value}`, hours: 5, notes: '', period: null, studyIds: updatedEvent.studyIds || [], siteId: updatedEvent.siteId || null, roleAssignments: {} }; try { const c = await apiService.createEvent(t); addEventToState(c && c.id ? c : { id: crypto.randomUUID(), ...t }); } catch (e) { console.error(e); } }
-                                                    if (endCb?.checked && endDateInput?.value) { const t = { name: 'Travel Day', type: 'Travel Day', crcId: acceptedVolunteerId2, crcIds: [acceptedVolunteerId2], date: endDateInput.value, startDate: endDateInput.value, endDate: endDateInput.value, groupId: `travel-${acceptedVolunteerId2}-${endDateInput.value}`, hours: 5, notes: '', period: null, studyIds: updatedEvent.studyIds || [], siteId: updatedEvent.siteId || null, roleAssignments: {} }; try { const c = await apiService.createEvent(t); addEventToState(c && c.id ? c : { id: crypto.randomUUID(), ...t }); } catch (e) { console.error(e); } }
-                                                    closeModal(); setState({ crc_events: [...state.crc_events] }); renderContentPreservingScroll(); showNotification('Travel day(s) added.', 'success');
+                                                    let saved = 0;
+                                                    let failed = 0;
+                                                    if (startCb?.checked && startDateInput?.value) {
+                                                        const t = { name: 'Travel Day', type: 'Travel Day', crcId: acceptedVolunteerId2, crcIds: [acceptedVolunteerId2], date: startDateInput.value, startDate: startDateInput.value, endDate: startDateInput.value, groupId: `travel-${acceptedVolunteerId2}-${startDateInput.value}`, hours: 5, notes: '', period: null, studyIds: updatedEvent.studyIds || [], siteId: updatedEvent.siteId || null, roleAssignments: {} };
+                                                        try {
+                                                            const c = await apiService.createEvent(t);
+                                                            addEventToState(requireCreatedEvent(c, 'travel day'));
+                                                            saved++;
+                                                        } catch (e) {
+                                                            failed++;
+                                                            console.error(e);
+                                                        }
+                                                    }
+                                                    if (endCb?.checked && endDateInput?.value) {
+                                                        const t = { name: 'Travel Day', type: 'Travel Day', crcId: acceptedVolunteerId2, crcIds: [acceptedVolunteerId2], date: endDateInput.value, startDate: endDateInput.value, endDate: endDateInput.value, groupId: `travel-${acceptedVolunteerId2}-${endDateInput.value}`, hours: 5, notes: '', period: null, studyIds: updatedEvent.studyIds || [], siteId: updatedEvent.siteId || null, roleAssignments: {} };
+                                                        try {
+                                                            const c = await apiService.createEvent(t);
+                                                            addEventToState(requireCreatedEvent(c, 'travel day'));
+                                                            saved++;
+                                                        } catch (e) {
+                                                            failed++;
+                                                            console.error(e);
+                                                        }
+                                                    }
+                                                    closeModal();
+                                                    setState({ crc_events: [...state.crc_events] });
+                                                    renderContentPreservingScroll();
+                                                    showNotification(
+                                                        failed ? `${saved} travel day(s) saved; ${failed} failed.` : `${saved} travel day(s) added.`,
+                                                        failed ? 'error' : 'success'
+                                                    );
                                                 });
                                                 document.getElementById('vol-travel-skip2')?.addEventListener('click', () => closeModal());
                                             }, 100);
@@ -38635,18 +38771,22 @@
                                                     return null;
                                                 }
                                             }));
-                                            groupUpdateResults.filter(Boolean).forEach(({ groupEvent, updated, payloadForDay }) => {
-                                                if (updated && updated.id) {
-                                                    const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(updated, payloadForDay) : updated;
-                                                    const idx = state.crc_events.findIndex(e => e.id === groupEvent.id);
-                                                    if (idx !== -1) {
-                                                        state.crc_events[idx] = merged;
-                                                    }
-                                                    if (!updatedEvent) {
-                                                        updatedEvent = merged;
-                                                    }
+                                            const groupOk = groupUpdateResults.filter(r => r && r.updated && r.updated.id);
+                                            const groupFailCount = groupEventsToUpdate.length - groupOk.length;
+                                            groupOk.forEach(({ groupEvent, updated, payloadForDay }) => {
+                                                const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(updated, payloadForDay) : updated;
+                                                const idx = state.crc_events.findIndex(e => e.id === groupEvent.id);
+                                                if (idx !== -1) {
+                                                    state.crc_events[idx] = merged;
+                                                }
+                                                if (!updatedEvent) {
+                                                    updatedEvent = merged;
                                                 }
                                             });
+                                            if (groupFailCount > 0) {
+                                                setState({ crc_events: [...state.crc_events] }, { skipRender: false });
+                                                throw new Error(`Updated ${groupOk.length} of ${groupEventsToUpdate.length} days; ${groupFailCount} failed. Refresh before retrying the failed days.`);
+                                            }
                                         } else {
                                             updatedEvent = await apiService.updateEvent(eventId, updatePayload);
                                         }
@@ -38850,14 +38990,10 @@
                                                         if (matchingFlight.bookingId) travelEventData.travelBookingId = matchingFlight.bookingId;
                                                     }
 
-                                                    try {
-                                                        const created = await apiService.createEvent(travelEventData);
-                                                        const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
-                                                        registerTravelDayCreated(crcId, travelDateStr);
-                                                        addEventToState(createdEvent);
-                                                    } catch (createError) {
-                                                        console.error('Error creating travel day (edit mode):', createError);
-                                                    }
+                                                    const created = await apiService.createEvent(travelEventData);
+                                                    const createdEvent = requireCreatedEvent(created, 'travel day');
+                                                    registerTravelDayCreated(crcId, travelDateStr);
+                                                    addEventToState(createdEvent);
                                                     return;
                                                 }
 
@@ -38892,22 +39028,16 @@
                                                     if (matchingFlight.bookingId) updateData.travelBookingId = matchingFlight.bookingId;
                                                 }
 
-                                                try {
-                                                    const updated = await apiService.updateEvent(existingTravelDay.id, updateData);
-                                                    if (updated && updated.id) {
-                                                        const index = state.crc_events.findIndex(e => e.id === existingTravelDay.id);
-                                                        if (index !== -1) {
-                                                            state.crc_events[index] = updated;
-                                                        } else {
-                                                            state.crc_events.push(updated);
-                                                        }
+                                                const updated = await apiService.updateEvent(existingTravelDay.id, updateData);
+                                                if (updated && updated.id) {
+                                                    const index = state.crc_events.findIndex(e => e.id === existingTravelDay.id);
+                                                    if (index !== -1) {
+                                                        state.crc_events[index] = updated;
                                                     } else {
-                                                        console.error('ERROR: Travel day update failed - no ID returned:', updated);
-                                                        showNotification('Error updating travel day. Please check the console for details.', 'error');
+                                                        state.crc_events.push(updated);
                                                     }
-                                                } catch (error) {
-                                                    console.error('Error updating shared travel day:', error);
-                                                    showNotification(`Error updating travel day: ${error.message || 'Unknown error'}`, 'error');
+                                                } else {
+                                                    throw new Error('Travel day update failed: server returned no saved id.');
                                                 }
                                             };
                                             
@@ -39135,6 +39265,10 @@
                                         }
                                         
                                         // Single render after all updates (shift + travel days) are complete.
+                                        if (!updatedEvent || !updatedEvent.id) {
+                                            showNotification('Shift update did not save. The modal will stay open so you can retry.', 'error');
+                                            return;
+                                        }
                                         setState({ crc_events: [...state.crc_events] }, { skipRender: false });
                                         renderContentPreservingScroll();
                                         showNotification('Shift updated successfully!', 'success');
@@ -39177,16 +39311,41 @@
                                                 const endDateInput = document.getElementById('vol-travel-end-date');
                                                 const addStart = startCb && startCb.checked && startDateInput && startDateInput.value;
                                                 const addEnd = endCb && endCb.checked && endDateInput && endDateInput.value;
+                                                let savedTravelDays = 0;
+                                                let failedTravelDays = 0;
                                                 if (addStart) {
                                                     const travelEventData = { name: 'Travel Day', type: 'Travel Day', crcId: acceptedVolunteerId, crcIds: [acceptedVolunteerId], date: startDateInput.value, startDate: startDateInput.value, endDate: startDateInput.value, groupId: `travel-${acceptedVolunteerId}-${startDateInput.value}`, hours: 5, notes: '', period: null, studyIds: updatedEvent.studyIds || [], siteId: updatedEvent.siteId || null, roleAssignments: {} };
-                                                    try { const created = await apiService.createEvent(travelEventData); addEventToState(created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData }); } catch (e) { console.error(e); showNotification('Failed to create start travel day.', 'error'); }
+                                                    try {
+                                                        const created = await apiService.createEvent(travelEventData);
+                                                        addEventToState(requireCreatedEvent(created, 'travel day'));
+                                                        savedTravelDays++;
+                                                    } catch (e) {
+                                                        failedTravelDays++;
+                                                        console.error(e);
+                                                    }
                                                 }
                                                 if (addEnd) {
                                                     const travelEventData = { name: 'Travel Day', type: 'Travel Day', crcId: acceptedVolunteerId, crcIds: [acceptedVolunteerId], date: endDateInput.value, startDate: endDateInput.value, endDate: endDateInput.value, groupId: `travel-${acceptedVolunteerId}-${endDateInput.value}`, hours: 5, notes: '', period: null, studyIds: updatedEvent.studyIds || [], siteId: updatedEvent.siteId || null, roleAssignments: {} };
-                                                    try { const created = await apiService.createEvent(travelEventData); addEventToState(created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData }); } catch (e) { console.error(e); showNotification('Failed to create end travel day.', 'error'); }
+                                                    try {
+                                                        const created = await apiService.createEvent(travelEventData);
+                                                        addEventToState(requireCreatedEvent(created, 'travel day'));
+                                                        savedTravelDays++;
+                                                    } catch (e) {
+                                                        failedTravelDays++;
+                                                        console.error(e);
+                                                    }
                                                 }
                                                 closeModal();
-                                                if (addStart || addEnd) { setState({ crc_events: [...state.crc_events] }); renderContentPreservingScroll(); showNotification('Travel day(s) added.', 'success'); }
+                                                if (addStart || addEnd) {
+                                                    setState({ crc_events: [...state.crc_events] });
+                                                    renderContentPreservingScroll();
+                                                    showNotification(
+                                                        failedTravelDays
+                                                            ? `${savedTravelDays} travel day(s) saved; ${failedTravelDays} failed.`
+                                                            : `${savedTravelDays} travel day(s) added.`,
+                                                        failedTravelDays ? 'error' : 'success'
+                                                    );
+                                                }
                                             };
                                             setTimeout(() => {
                                                 document.getElementById('vol-travel-confirm')?.addEventListener('click', () => { onConfirm(); });
@@ -39321,7 +39480,7 @@
                                                     }
                                                     console.log('Creating Travel Day event (new path) for:', dateStr, 'CRC:', travelCrcId);
                                                     const created = await apiService.createEvent(travelEventData);
-                                                    const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
+                                                    const createdEvent = requireCreatedEvent(created, 'travel day');
                                                     registerTravelDayCreated(travelCrcId, dateStr);
                                                     addEventToState(createdEvent);
                                                 }
@@ -39432,7 +39591,7 @@
 
                                                     registerTravelDayCreated(crcId, travelDateStr);
                                                     const created = await apiService.createEvent(travelEventData);
-                                                    const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
+                                                    const createdEvent = requireCreatedEvent(created, 'travel day');
                                                     debugLog(`[TRAVEL DEBUG] Travel day created for CRC ${crcId}:`, createdEvent.id);
                                                     addEventToState(createdEvent);
                                                     return;
@@ -39572,97 +39731,35 @@
                                                 }
                                             }
                                             
-                                            // Create main assignment events for each CRC
-                                            // Use allAssignedCrcs to include CRCs from both role assignments and travel checkboxes
-                                            // This ensures shifts are created even if travel was selected before roles were assigned
-                                            // Reduced logging for performance
-                                            for (const crcId of allAssignedCrcs) {
-                                                // Ensure startDate and endDate are Date objects (they should already be from parseDateOnly)
-                                                const startDateObjLoop = startDate instanceof Date ? startDate : parseDateOnly(startDate);
-                                                const endDateObjLoop = endDate instanceof Date ? endDate : parseDateOnly(endDate);
-                                                if (!startDateObjLoop || !endDateObjLoop) {
-                                                    continue;
-                                                }
-                                                
+                                            // Create ONE Site Assignment per calendar day with full roleAssignments
+                                            // (all CRCs on the same event). Do NOT create a separate event per CRC —
+                                            // that multiplied weeks of schedule entries and looked like "duplicates".
+                                            const startDateObjLoop = startDate instanceof Date ? startDate : parseDateOnly(startDate);
+                                            const endDateObjLoop = endDate instanceof Date ? endDate : parseDateOnly(endDate);
+                                            if (startDateObjLoop && endDateObjLoop) {
+                                                const allCrcIdsList = [...allAssignedCrcs].filter(id => id && String(id).trim() !== '' && id !== 'UNASSIGNED' && id !== 'SITE_STAFF');
+                                                const primaryCrcId = allCrcIdsList[0] || null;
                                                 for (let d = new Date(startDateObjLoop); d <= endDateObjLoop; d.setDate(d.getDate() + 1)) {
-                                                const dateStr = toDateOnlyString(d);
-                                                const newEventRef = null;
-                                                // Get role assignments for this specific CRC
-                                                const crcRoleAssignments = {};
-                                                Object.entries(roleAssignments).forEach(([roleId, assignments]) => {
-                                                    if (assignments.includes(crcId)) {
-                                                        crcRoleAssignments[roleId] = [crcId];
-                                                    }
-                                                });
-                                                
-                                                // Get training assignments and modes for this CRC
-                                                const crcTrainingAssignments = {};
-                                                const crcTrainingModes = {};
-                                                if (finalTrainingAssignments) {
-                                                    Object.entries(finalTrainingAssignments).forEach(([roleId, assignments]) => {
-                                                        const roleAssignmentsForRole = roleAssignments[roleId] || [];
-                                                        const crcIndex = roleAssignmentsForRole.indexOf(crcId);
-                                                        if (crcIndex >= 0 && assignments[crcIndex]) {
-                                                            if (!crcTrainingAssignments[roleId]) {
-                                                                crcTrainingAssignments[roleId] = [];
-                                                            }
-                                                            crcTrainingAssignments[roleId][0] = assignments[crcIndex];
-                                                            
-                                                            // Get training modes for this CRC
-                                                            if (finalTrainingModes) {
-                                                                const modeKey = `${roleId}-${crcIndex}`;
-                                                                const newModeKey = `${roleId}-0`;
-                                                                if (finalTrainingModes[modeKey]) {
-                                                                    crcTrainingModes[newModeKey] = finalTrainingModes[modeKey];
-                                                                }
-                                                            }
-                                                        }
-                                                    });
+                                                    const dateStr = toDateOnlyString(d);
+                                                    const currentEventData = {
+                                                        ...baseEventData,
+                                                        name: 'Site Assignment',
+                                                        crcId: primaryCrcId,
+                                                        crcIds: allCrcIdsList.length ? allCrcIdsList : undefined,
+                                                        roles: [],
+                                                        roleAssignments: baseEventData.roleAssignments || finalRoleAssignments || {},
+                                                        trainingAssignments: baseEventData.trainingAssignments || finalTrainingAssignments || undefined,
+                                                        trainingModes: baseEventData.trainingModes || finalTrainingModes || undefined,
+                                                        roleQuantityOverrides: baseEventData.roleQuantityOverrides || undefined,
+                                                        date: dateStr,
+                                                        groupId,
+                                                        type: 'Site Assignment',
+                                                        travelDayPreferences: Object.keys(travelDayPreferences).length > 0 ? travelDayPreferences : undefined,
+                                                        skipTravelDayProcessing: true
+                                                    };
+                                                    const created = await apiService.createEvent(currentEventData);
+                                                    addEventToState(requireCreatedEvent(created, 'Site Assignment'));
                                                 }
-                                                
-                                                // Validate that this event won't be an N/A entry
-                                                const hasValidCrc = crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED';
-                                                const hasValidRoleAssignments = Object.keys(crcRoleAssignments).length > 0;
-                                                
-                                                // CRITICAL: If CRC is valid but no role assignments, use finalRoleAssignments instead
-                                                // This ensures shifts are created even if crcRoleAssignments is empty (CRC might be in a different role)
-                                                const roleAssignmentsToUse = hasValidRoleAssignments ? crcRoleAssignments : (finalRoleAssignments || {});
-                                                
-                                                // Skip creating this event only if both CRC and role assignments are invalid
-                                                // CRITICAL: If CRC is valid, always create the shift (even with empty roleAssignments)
-                                                // This ensures shifts are created for CRCs selected for travel, even if not assigned to roles yet
-                                                if (!hasValidCrc && Object.keys(roleAssignmentsToUse).length === 0) {
-                                                    continue;
-                                                }
-                                                // Reduced logging for performance
-                                                
-                                                // CRITICAL: Use finalRoleAssignments (the full structure) instead of crcRoleAssignments
-                                                // The per-CRC filtering was causing roleAssignments to be lost
-                                                // We should create ONE event with ALL role assignments, not separate events per CRC
-                                                // But for now, preserve the per-CRC structure but ensure roleAssignments are always included
-                                                let currentEventData = { 
-                                                    ...baseEventData, 
-                                                    name: 'Site Assignment', 
-                                                    crcId, 
-                                                    roles: [], // Legacy field - use roleAssignments instead
-                                                    // CRITICAL: Always include roleAssignments from baseEventData or finalRoleAssignments
-                                                    // Use roleAssignmentsToUse (which falls back to finalRoleAssignments if crcRoleAssignments is empty)
-                                                    roleAssignments: baseEventData.roleAssignments || roleAssignmentsToUse || finalRoleAssignments || {},
-                                                    trainingAssignments: Object.keys(crcTrainingAssignments).length > 0 ? crcTrainingAssignments : (baseEventData.trainingAssignments || undefined),
-                                                    trainingModes: Object.keys(crcTrainingModes).length > 0 ? crcTrainingModes : (baseEventData.trainingModes || undefined),
-                                                    roleQuantityOverrides: baseEventData.roleQuantityOverrides || undefined,
-                                                    date: dateStr, 
-                                                    groupId, 
-                                                    type: 'Site Assignment',
-                                                    travelDayPreferences: Object.keys(travelDayPreferences).length > 0 ? travelDayPreferences : undefined,
-                                                    // Travel days already upserted above; skip duplicate API travel processing.
-                                                    skipTravelDayProcessing: true
-                                                };
-                                                // Reduced logging for performance
-                                                const created = await apiService.createEvent(currentEventData);
-                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...currentEventData };
-                                                addEventToState(createdEvent);
-                                            }
                                             }
                                         } else {
                                             // No CRCs assigned, but we have role requirements - create a shift with role requirements only
@@ -39707,7 +39804,7 @@
                                                     console.log('shiftEventData.roleAssignments:', shiftEventData.roleAssignments);
                                                     
                                                     const created = await apiService.createEvent(shiftEventData);
-                                                    const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...shiftEventData };
+                                                    const createdEvent = requireCreatedEvent(created, 'shift');
                                                     addEventToState(createdEvent);
                                                 }
                                                 
@@ -39802,7 +39899,7 @@
                                                         }
                                                         console.log('Creating start travel day (legacy) for:', startTravelDateStr, 'CRC:', crcId);
                                                         const created = await apiService.createEvent(startTravelEventData);
-                                                        const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...startTravelEventData };
+                                                        const createdEvent = requireCreatedEvent(created, 'travel day');
                                                         registerTravelDayCreated(crcId, startTravelDateStr);
                                                         addEventToState(createdEvent);
                                                     }
@@ -39825,7 +39922,8 @@
                                                     trainingAssignments: Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (baseEventData.trainingAssignments || undefined),
                                                     trainingModes: baseEventData.trainingModes || undefined,
                                                     roleQuantityOverrides: baseEventData.roleQuantityOverrides || undefined,
-                                                    travelDayPreferences: travelDayPreferencesLegacy
+                                                    travelDayPreferences: travelDayPreferencesLegacy,
+                                                    skipTravelDayProcessing: true
                                                 };
                                                 if (eventType === 'Site Assignment') {
                                                     currentEventData.type = 'Site Assignment';
@@ -39864,7 +39962,7 @@
                                                 console.log('currentEventData keys:', Object.keys(currentEventData));
                                                 
                                                 const created = await apiService.createEvent(currentEventData);
-                                                const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...currentEventData };
+                                                const createdEvent = requireCreatedEvent(created, 'shift');
                                                 console.log('Created event roleAssignments:', createdEvent.roleAssignments);
                                                 addEventToState(createdEvent);
                                             }
@@ -39919,7 +40017,7 @@
                                                         }
                                                         console.log('Creating end travel day (legacy) for:', endTravelDateStr, 'CRC:', crcId);
                                                         const created = await apiService.createEvent(endTravelEventData);
-                                                        const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...endTravelEventData };
+                                                        const createdEvent = requireCreatedEvent(created, 'travel day');
                                                         registerTravelDayCreated(crcId, endTravelDateStr);
                                                         addEventToState(createdEvent);
                                                     }
@@ -39964,7 +40062,7 @@
                                                         }
                                                         console.log('Creating Travel Day event for:', dateStr, 'CRC:', crcId);
                                                         const created = await apiService.createEvent(travelEventData);
-                                                        const createdEvent = created && created.id ? created : { id: crypto.randomUUID(), ...travelEventData };
+                                                        const createdEvent = requireCreatedEvent(created, 'travel day');
                                                         registerTravelDayCreated(crcId, dateStr);
                                                         addEventToState(createdEvent);
                                                     }
@@ -40035,7 +40133,10 @@
                                 }, 1500);
                             } catch (err) {
                                 console.error("Error submitting form:", err);
-                                showNotification('An error occurred.', 'error');
+                                showNotification(err?.message || 'An error occurred while saving. Nothing may have been stored — please try again.', 'error');
+                            } finally {
+                                form.dataset.submitting = 'false';
+                                submitButtons.forEach(btn => { btn.disabled = false; });
                             }
                         };
                         
@@ -53786,7 +53887,7 @@
                     await runPromisesInChunks(createPayloads, async (eventData) => {
                         try {
                             const createdEvent = await apiService.createEvent(eventData);
-                            const newEvent = createdEvent && createdEvent.id ? createdEvent : { id: crypto.randomUUID(), ...eventData };
+                            const newEvent = requireCreatedEvent(createdEvent, 'shift');
                             addEventToState(newEvent, { silent });
                             eventsChanged = true;
                             debugLog(`Created event for approved time off request: ${eventData.timeOffRequestId}`);

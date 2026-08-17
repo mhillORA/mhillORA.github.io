@@ -112,6 +112,15 @@ function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
+// Travel days are logically unique by person + calendar day. A deterministic
+// document id makes repeated/double-clicked POSTs idempotent even when two
+// requests race before either one can query the other.
+const getTravelDayDocumentId = (crcId, date) => {
+    const safeCrcId = String(crcId || '').trim().replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120);
+    const safeDate = String(date || '').trim().slice(0, 10).replace(/[^0-9-]/g, '');
+    return safeCrcId && safeDate ? `travel-${safeCrcId}-${safeDate}` : generateId();
+};
+
 // Helper function to get Cosmos DB client (lazy initialization)
 let cosmosClient = null;
 let database = null;
@@ -2756,13 +2765,9 @@ async function crudHandler(context, request, containerName) {
             
             case 'POST':
                 const body = await request.json();
-                let extraTravelEvents = [];
                 
                 // For events, validate that we're not creating N/A entries and prevent overriding training
                 if (containerName === 'events') {
-                    // Variable to hold extra events if we need to split Group/Range Travel Days
-                    extraTravelEvents = [];
-                    
                     // Prevent creating overridden training events
                     // Check if this is a training event and prevent isOverridden from being set
                     if (body.studyId) {
@@ -2907,41 +2912,21 @@ async function crudHandler(context, request, containerName) {
                         
                         context.log.info(`[TRAVEL DEBUG] Final dates array: ${JSON.stringify(dates)} (count: ${dates.length})`);
 
-                        // If we have >1 person OR >1 day, we need to split
+                        // The API accepts one person + one day per Travel Day write.
+                        // Older behavior exploded ranges into many documents and swallowed
+                        // partial failures, which produced both duplicates and missing days.
                         const needsSplit = (validCrcIds.length > 0 && dates.length > 0) && (validCrcIds.length > 1 || dates.length > 1);
-                        context.log.info(`[TRAVEL DEBUG] Needs split? ${needsSplit} (${validCrcIds.length} people x ${dates.length} days)`);
+                        context.log.info(`[TRAVEL DEBUG] Invalid bulk travel payload? ${needsSplit} (${validCrcIds.length} people x ${dates.length} days)`);
                         
                         if (needsSplit) {
-                            // Generate ALL combinations [Person + Day]
-                            const allCombinations = [];
-                            for (const dateStr of dates) {
-                                for (const crcId of validCrcIds) {
-                                    allCombinations.push({ date: dateStr, crcId });
-                                }
-                            }
-
-                            context.log.info(`[TRAVEL DEBUG] Generated ${allCombinations.length} combinations`);
-
-                            if (allCombinations.length > 0) {
-                                // Take the FIRST combination for the Main Event
-                                const mainParams = allCombinations[0];
-                                
-                                // Update the main 'body' to match this single day/person
-                                body.date = mainParams.date;
-                                body.crcId = mainParams.crcId;
-                                body.crcIds = [mainParams.crcId];
-                                body.startDate = mainParams.date; 
-                                body.endDate = mainParams.date;   
-                                
-                                // Save the REST for the "extras" loop
-                                const remaining = allCombinations.slice(1);
-                                extraTravelEvents = remaining.map(params => ({
-                                    date: params.date,
-                                    crcId: params.crcId
-                                }));
-                                
-                                context.log.info(`[TRAVEL DEBUG] EXPLODING Travel Day: Main event for ${mainParams.crcId} on ${mainParams.date}, plus ${extraTravelEvents.length} extra events`);
-                            }
+                            return {
+                                status: 400,
+                                jsonBody: {
+                                    error: 'Travel Day writes must contain exactly one CRC and one calendar day.',
+                                    details: 'Submit each person/day separately so every save can succeed or fail independently.'
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
                         } else if (validCrcIds.length === 1 && dates.length === 1) {
                             // Single person, single day - no split needed but ensure fields are set
                             context.log.info(`[TRAVEL DEBUG] Single person/day - no split needed`);
@@ -3081,38 +3066,34 @@ async function crudHandler(context, request, containerName) {
                     delete body.skipTravelDayProcessing;
                 }
 
-                const newItem = { ...body, id: generateId() };
+                // Idempotent Travel Day create: return the existing row for the
+                // same CRC/date, otherwise use a deterministic id to close races.
+                if (containerName === 'events' && body.type === 'Travel Day' && body.crcId && body.date) {
+                    const { resources: existingTravelDays } = await container.items.query({
+                        query: "SELECT * FROM c WHERE c.type = 'Travel Day' AND c.date = @date AND (c.crcId = @crcId OR (IS_DEFINED(c.crcIds) AND ARRAY_CONTAINS(c.crcIds, @crcId)))",
+                        parameters: [
+                            { name: '@date', value: body.date },
+                            { name: '@crcId', value: body.crcId }
+                        ]
+                    }).fetchAll();
+                    if (Array.isArray(existingTravelDays) && existingTravelDays.length > 0) {
+                        context.log.info(`[TRAVEL IDEMPOTENCY] Reused ${existingTravelDays[0].id} for ${body.crcId} on ${body.date}`);
+                        return {
+                            status: 200,
+                            jsonBody: existingTravelDays[0],
+                            headers: { 'Content-Type': 'application/json' }
+                        };
+                    }
+                }
+
+                const newItem = {
+                    ...body,
+                    id: containerName === 'events' && body.type === 'Travel Day'
+                        ? getTravelDayDocumentId(body.crcId, body.date)
+                        : generateId()
+                };
                 try {
                     const { resource: createdItem } = await container.items.create(newItem);
-
-                    // FIX: Create the extra individual events (Dates x People)
-                    context.log.info(`[TRAVEL DEBUG] After main create - extraTravelEvents.length = ${extraTravelEvents ? extraTravelEvents.length : 'undefined'}, createdItem.type = ${createdItem ? createdItem.type : 'none'}`);
-                    
-                    if (containerName === 'events' && extraTravelEvents && extraTravelEvents.length > 0) {
-                        context.log.info(`[TRAVEL DEBUG] Creating ${extraTravelEvents.length} extra Travel Day events...`);
-                        for (const params of extraTravelEvents) {
-                            const extraEvent = {
-                                ...createdItem, // Copy base props from main event
-                                id: generateId(),
-                                type: 'Travel Day', // Ensure type is Travel Day
-                                date: params.date,
-                                startDate: params.date, // Ensure it's a single day
-                                endDate: params.date,   // Ensure it's a single day
-                                crcId: params.crcId,
-                                crcIds: [params.crcId]
-                            };
-                            // Clean up system fields
-                            ['_rid', '_self', '_etag', '_attachments', '_ts'].forEach(k => delete extraEvent[k]);
-
-                            try {
-                                await container.items.create(extraEvent);
-                                context.log.info(`[TRAVEL DEBUG] Created extra Travel Day: ${params.date} for ${params.crcId}`);
-                            } catch (extraError) {
-                                context.log.error(`[TRAVEL DEBUG] Failed to create extra Travel Day:`, extraError);
-                            }
-                        }
-                        context.log.info(`[TRAVEL DEBUG] Finished creating ${extraTravelEvents.length} extra events`);
-                    }
                     
                     // Calculate enrollment for studies (non-fatal)
                     if (containerName === 'studies') {
@@ -3225,7 +3206,7 @@ async function crudHandler(context, request, containerName) {
                                         
                                         if (!existingTravelDay) {
                                             const travelDayEvent = {
-                                                id: generateId(),
+                                                id: getTravelDayDocumentId(crcId, travelDate),
                                                 type: 'Travel Day',
                                                 date: travelDate,
                                                 startDate: travelDate,  // SINGLE DAY - not a range!
@@ -3286,6 +3267,24 @@ async function crudHandler(context, request, containerName) {
                     // Handle case where container doesn't exist
                     const errorCode = createError.code || createError.statusCode;
                     const errorMessage = (createError.message || '').toLowerCase();
+
+                    // A concurrent request may have created the same deterministic
+                    // Travel Day after our preflight query. Treat that conflict as
+                    // success and return the canonical document.
+                    if (errorCode === 409 && containerName === 'events' && newItem.type === 'Travel Day') {
+                        try {
+                            const { resource: existingTravelDay } = await container.item(newItem.id, newItem.id).read();
+                            if (existingTravelDay) {
+                                return {
+                                    status: 200,
+                                    jsonBody: existingTravelDay,
+                                    headers: { 'Content-Type': 'application/json' }
+                                };
+                            }
+                        } catch (readConflictError) {
+                            context.log.warn(`Could not read Travel Day after create conflict: ${readConflictError.message}`);
+                        }
+                    }
                     
                     if (errorCode === 404 || 
                         errorMessage.includes('notfound') || 
@@ -4245,7 +4244,14 @@ async function crudHandler(context, request, containerName) {
                             }
                         }
                         
-                        const upsertResult = await container.items.upsert(updatedItem);
+                        const ifMatchEtag = containerName === 'events'
+                            ? request.headers.get('if-match')
+                            : null;
+                        const upsertResult = ifMatchEtag
+                            ? await container.item(updateId, updateId).replace(updatedItem, {
+                                accessCondition: { type: 'IfMatch', condition: ifMatchEtag }
+                            })
+                            : await container.items.upsert(updatedItem);
                         result = upsertResult.resource;
                     } catch (upsertError) {
                         context.log.error(`Error upserting ${containerName} ${updateId}:`, upsertError);
@@ -4259,6 +4265,16 @@ async function crudHandler(context, request, containerName) {
                         context.log.error(`UpdatedItem type:`, updatedItem?.type);
                         context.log.error(`UpdatedItem studyIds:`, updatedItem?.studyIds);
                         context.log.error(`UpdatedItem crcIds:`, updatedItem?.crcIds);
+                        if ((upsertError.code || upsertError.statusCode) === 412) {
+                            return {
+                                status: 409,
+                                jsonBody: {
+                                    error: 'This shift was changed by someone else while you were editing it.',
+                                    detail: 'Refresh the schedule, reopen the shift, and apply your changes again.'
+                                },
+                                headers: { 'Content-Type': 'application/json' }
+                            };
+                        }
                         // Re-throw to be caught by outer catch
                         throw upsertError;
                     }
@@ -4471,7 +4487,7 @@ async function crudHandler(context, request, containerName) {
                                                 
                                                 if (!existingTravelDay) {
                                                     const travelDayEvent = {
-                                                        id: generateId(),
+                                                        id: getTravelDayDocumentId(crcId, travelDate),
                                                         type: 'Travel Day',
                                                         date: travelDate,
                                                         startDate: travelDate,  // SINGLE DAY - not a range!
