@@ -21,6 +21,7 @@
     projectNumber: "",
     projectFilter: "",
     projectError: "",
+    mobileDrawer: null,
     draft: "",
     phase: "idle",
     key: "live",
@@ -132,10 +133,37 @@
 
   function setNav(key) {
     state.nav = key;
+    closeMobileDrawers();
     render();
   }
 
+  function setMobileDrawer(which) {
+    const root = document.getElementById("appRoot");
+    const backdrop = document.getElementById("drawerBackdrop");
+    const navBtn = document.getElementById("btnMobileNav");
+    const srcBtn = document.getElementById("btnMobileSources");
+    const next = state.mobileDrawer === which ? null : which || null;
+    state.mobileDrawer = next;
+    if (root) {
+      root.classList.toggle("drawer-nav-open", next === "nav");
+      root.classList.toggle("drawer-sources-open", next === "sources");
+    }
+    if (backdrop) {
+      backdrop.hidden = !next;
+      backdrop.setAttribute("aria-hidden", next ? "false" : "true");
+    }
+    document.body.style.overflow = next ? "hidden" : "";
+    if (navBtn) navBtn.setAttribute("aria-expanded", next === "nav" ? "true" : "false");
+    if (srcBtn) srcBtn.setAttribute("aria-expanded", next === "sources" ? "true" : "false");
+  }
+
+  function closeMobileDrawers() {
+    if (!state.mobileDrawer) return;
+    setMobileDrawer(null);
+  }
+
   function resetAsk() {
+    closeMobileDrawers();
     state.phase = "idle";
     state.draft = "";
     state.traceOpen = false;
@@ -151,6 +179,7 @@
   async function run(_key, text) {
     const question = (text || state.draft || "").trim();
     if (!question) return;
+    closeMobileDrawers();
     state.nav = "ask";
     state.phase = "thinking";
     state.key = "live";
@@ -201,7 +230,10 @@
           `<button type="button" class="nav-btn${state.nav === n.key ? " active" : ""}" data-nav="${n.key}">${ICONS[n.icon]}<span>${n.label}</span></button>`
       ).join("");
     root.querySelectorAll("[data-nav]").forEach((btn) => {
-      btn.onclick = () => setNav(btn.dataset.nav);
+      btn.onclick = () => {
+        setNav(btn.dataset.nav);
+        closeMobileDrawers();
+      };
     });
   }
 
@@ -1149,8 +1181,38 @@
     if (brand) {
       brand.onclick = (e) => {
         e.preventDefault();
+        closeMobileDrawers();
         resetAsk();
       };
+    }
+    const mobileBrand = document.getElementById("mobileBrandHome");
+    if (mobileBrand) {
+      mobileBrand.onclick = (e) => {
+        e.preventDefault();
+        closeMobileDrawers();
+        resetAsk();
+      };
+    }
+    const navToggle = document.getElementById("btnMobileNav");
+    if (navToggle) {
+      navToggle.onclick = () => setMobileDrawer("nav");
+    }
+    const sourcesToggle = document.getElementById("btnMobileSources");
+    if (sourcesToggle) {
+      sourcesToggle.onclick = () => setMobileDrawer("sources");
+    }
+    const backdrop = document.getElementById("drawerBackdrop");
+    if (backdrop) {
+      backdrop.onclick = () => closeMobileDrawers();
+    }
+    if (!window.__odlMobileBound) {
+      window.__odlMobileBound = true;
+      window.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeMobileDrawers();
+      });
+      window.matchMedia("(min-width: 981px)").addEventListener("change", (ev) => {
+        if (ev.matches) closeMobileDrawers();
+      });
     }
     document.getElementById("btnNew").onclick = resetAsk;
     document.getElementById("btnSave").onclick = () => {
