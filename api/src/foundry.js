@@ -162,6 +162,8 @@ function systemPrompt(cfg) {
       "Site questions use ora_fact_site in CONTEXT when present (org, country, enrolled, site PSM). That is the same Veeva site pack as Buddy — not live EDC.",
       "Finance / GM questions use lens_ns_projects (NetSuite Project Profitability). Null GM is missing, not zero. Do not treat blank as 0%.",
       "If CONTEXT is empty or thin, say what is missing.",
+      "VIEWER is secondary context (Entra preference). Frame the narrative for that role. Do not change Cosmos numbers. Do not invent people, reports, or projects that are not in CONTEXT or VIEWER extras.",
+      "If VIEWER says the project is primary, lead with the project then people. If VIEWER is a director, stay high-level. If VIEWER is a manager, lead with direct reports when CONTEXT has them.",
       "Read-only. No writes.",
       "Reply with JSON only:",
       '{"summary":"2-4 plain sentences","chartTitle":"short title","caveat":"one limitation","followUps":["q1","q2","q3"]}'
@@ -169,7 +171,7 @@ function systemPrompt(cfg) {
   );
 }
 
-async function narrateWithFoundry(question, cosmosAnswer) {
+async function narrateWithFoundry(question, cosmosAnswer, viewerSlice) {
   if (!foundryConfigured()) {
     throw new Error(
       "Foundry is not configured. Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT on this SWA."
@@ -192,11 +194,14 @@ async function narrateWithFoundry(question, cosmosAnswer) {
     missingNote: cosmosAnswer.missingNote || "",
     containers: cosmosAnswer.trace
   };
+  const viewer = viewerSlice || null;
   const messages = [
     { role: "system", content: systemPrompt(cfg) },
     {
       role: "user",
-      content: `Question:\n${question}\n\nCONTEXT (JSON, Cosmos read-only):\n${JSON.stringify(context).slice(0, 80000)}`
+      content:
+        `Question:\n${question}\n\nCONTEXT (JSON, Cosmos read-only):\n${JSON.stringify(context).slice(0, 70000)}` +
+        (viewer ? `\n\nVIEWER (secondary, Entra preference — do not invent numbers):\n${JSON.stringify(viewer).slice(0, 8000)}` : "")
     }
   ];
   const attempts = buildChatAttempts(cfg.endpoint, cfg.deployment, apiVersion);

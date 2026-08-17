@@ -1,6 +1,7 @@
 const { getDb, safeQuery, LENS, SHARED_READ } = require("./cosmos");
 const { narrateWithFoundry } = require("./foundry");
 const { getProjectBundle, studyMatchesProject } = require("./projectJoin");
+const { getViewerContext, foundryViewerSlice } = require("./userPrefs");
 
 function guessKey(text) {
   const t = String(text || "").toLowerCase();
@@ -784,8 +785,25 @@ async function answerFromCosmos(question, sources, opts) {
   answer.sourcesUsed = sources;
   if (projectNumber) answer.projectNumber = projectNumber;
 
+  let viewerSlice = null;
+  if (opts && opts.principal) {
+    try {
+      const viewer = await getViewerContext(opts.principal);
+      viewerSlice = foundryViewerSlice(viewer);
+      if (viewerSlice) {
+        answer.viewer = {
+          role: viewerSlice.role,
+          primary: viewerSlice.primary,
+          then: viewerSlice.then
+        };
+      }
+    } catch (_) {
+      viewerSlice = null;
+    }
+  }
+
   try {
-    const llm = await narrateWithFoundry(question, answer);
+    const llm = await narrateWithFoundry(question, answer, viewerSlice);
     answer.summary = llm.summary || answer.summary;
     answer.chartTitle = llm.chartTitle || answer.chartTitle;
     answer.caveat = llm.caveat || answer.caveat;
@@ -793,7 +811,10 @@ async function answerFromCosmos(question, sources, opts) {
     answer.chartNote = `${answer.chartNote} · ${llm.agentName} (${llm.model})`;
     answer.trace = [
       ...(answer.trace || []),
-      `Foundry ${llm.via} wrote the narrative. Bars and table are Cosmos rows, not model-invented.`
+      `Foundry ${llm.via} wrote the narrative. Bars and table are Cosmos rows, not model-invented.`,
+      viewerSlice
+        ? `VIEWER frame: ${viewerSlice.role || "custom"} (primary ${viewerSlice.primary || "—"}; secondary reference, not a data source).`
+        : "No Entra viewer preference on this turn."
     ];
   } catch (err) {
     answer.foundryError = String(err.message || err);

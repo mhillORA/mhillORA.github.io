@@ -72,6 +72,7 @@ const ICONS = {
   clipboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>',
   chart: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 16l4-6 3 3 5-7"/></svg>',
   users: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3"/><path d="M3 19a6 6 0 0 1 12 0"/><circle cx="17" cy="9" r="2.5"/><path d="M21 19a5 5 0 0 0-6-4.7"/></svg>',
+  user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="3"/><path d="M4 20a8 8 0 0 1 16 0"/></svg>',
   globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>'
 };
 
@@ -94,4 +95,42 @@ const BD_QUESTIONS = [
   { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
   { text: "Show competing glaucoma trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
   { text: "Which Ora studies match this indication?", icon: "chart", needs: "ora_fact_study" }
+];
+
+const ROLE_PLAYBOOKS = [
+  {
+    key: "director",
+    label: "Director",
+    primary: "portfolio",
+    then: ["exceptions", "projects"],
+    instruction: "Give a higher-level overview. Lead with portfolio and exceptions."
+  },
+  {
+    key: "manager",
+    label: "Manager",
+    primary: "direct_reports",
+    then: ["their_projects"],
+    instruction: "Show their direct reports first, then the projects those people sit on."
+  },
+  {
+    key: "pm",
+    label: "Project manager",
+    primary: "project",
+    then: ["employees"],
+    instruction: "The project is the main point, then the employees on it."
+  },
+  {
+    key: "exec",
+    label: "Executive",
+    primary: "org",
+    then: ["exceptions"],
+    instruction: "Org-level KPIs and exceptions only."
+  },
+  {
+    key: "analyst",
+    label: "Analyst",
+    primary: "grain",
+    then: ["missing"],
+    instruction: "Keep full grain. Call out missing vs known."
+  }
 ];

@@ -2,6 +2,9 @@ const { app } = require("@azure/functions");
 const { answerFromCosmos, getBriefing } = require("./ask");
 const { getFinanceBriefing, getProjectBundle } = require("./projectJoin");
 const { foundryStatus } = require("./foundry");
+const { principalFromRequest } = require("./principal");
+const { getViewerContext, upsertPref, deletePref } = require("./userPrefs");
+const { graphStatus } = require("./graph");
 
 function json(status, body) {
   return {
@@ -27,9 +30,10 @@ app.http("health", {
     return json(200, {
       ok: true,
       app: "ora-data-lens",
-      access: "read-only",
+      access: "read-only except lens_user_prefs (own Entra doc)",
       cosmos,
-      foundry: foundryStatus()
+      foundry: foundryStatus(),
+      graph: graphStatus()
     });
   }
 });
@@ -63,8 +67,10 @@ app.http("ask", {
     const question = String(body.question || "").trim();
     if (!question) return json(400, { error: "question required" });
     try {
+      const principal = principalFromRequest(request);
       const answer = await answerFromCosmos(question, body.sources || [], {
-        projectNumber: String(body.projectNumber || "").trim()
+        projectNumber: String(body.projectNumber || "").trim(),
+        principal
       });
       return json(200, { answer });
     } catch (err) {
@@ -83,6 +89,44 @@ app.http("finance", {
       return json(200, { finance });
     } catch (err) {
       return json(503, { error: String(err.message || err) });
+    }
+  }
+});
+
+app.http("meContext", {
+  methods: ["GET", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  authLevel: "anonymous",
+  route: "me/context",
+  handler: async (request) => {
+    if (request.method === "OPTIONS") return json(204, {});
+    const principal = principalFromRequest(request);
+    if (!principal) return json(401, { error: "sign in with Entra to load or save context" });
+    try {
+      if (request.method === "GET") {
+        const context = await getViewerContext(principal);
+        return json(200, { context });
+      }
+      if (request.method === "DELETE") {
+        const context = await deletePref(principal);
+        return json(200, { context, deleted: true });
+      }
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (_) {
+        body = {};
+      }
+      const context = await upsertPref(principal, {
+        roleKey: body.roleKey,
+        notes: body.notes,
+        extras: body.extras,
+        useEntra: body.useEntra === true
+      });
+      return json(200, { context });
+    } catch (err) {
+      const msg = String(err.message || err);
+      const code = /unknown roleKey|signed-in/.test(msg) ? 400 : 503;
+      return json(code, { error: msg });
     }
   }
 });

@@ -12,7 +12,8 @@ const LENS = {
   metrics: "lens_metrics",
   sources: "lens_sources",
   syncRuns: "lens_syncRuns",
-  nsProjects: "lens_ns_projects"
+  nsProjects: "lens_ns_projects",
+  userPrefs: "lens_user_prefs"
 };
 
 const SHARED_READ = {
@@ -29,7 +30,8 @@ const CONTAINERS = [
   { id: LENS.visits, partitionKey: { paths: ["/studyCode"] } },
   { id: LENS.metrics, partitionKey: { paths: ["/metricType"] } },
   { id: LENS.sources, partitionKey: { paths: ["/sourceId"] } },
-  { id: LENS.syncRuns, partitionKey: { paths: ["/runDate"] } }
+  { id: LENS.syncRuns, partitionKey: { paths: ["/runDate"] } },
+  { id: LENS.userPrefs, partitionKey: { paths: ["/entraId"] } }
 ];
 
 function getDb() {

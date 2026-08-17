@@ -28,11 +28,17 @@
     traceOpen: false,
     chart: null,
     history: load("odl.history", []),
-    saved: load("odl.saved", [])
+    saved: load("odl.saved", []),
+    viewer: null,
+    viewerError: "",
+    extraDraft: "",
+    notesDraft: "",
+    savingContext: false
   };
 
   const NAV = [
     { key: "ask", label: "Ask", icon: "search" },
+    { key: "context", label: "My context", icon: "user" },
     { key: "saved", label: "Saved answers", icon: "file" },
     { key: "sources", label: "Sources", icon: "database" },
     { key: "history", label: "History", icon: "clipboard" }
@@ -539,6 +545,11 @@
       <div class="answer">
         <div class="answer-head">
           <span class="conf" style="background:${conf.bg};color:${conf.color}"><span class="conf-dot" style="background:${conf.color}"></span>${conf.label}</span>
+          ${
+            a.viewer && a.viewer.role
+              ? `<span class="viewer-chip">Framed for ${escapeHtml(a.viewer.role)}</span>`
+              : ""
+          }
           <span class="chart-note">${escapeHtml(a.asOfLabel || a.chartNote)}</span>
         </div>
         <p class="summary">${a.summary}</p>
@@ -760,16 +771,246 @@
     });
   }
 
+  function playbooks() {
+    if (state.viewer && Array.isArray(state.viewer.playbooks) && state.viewer.playbooks.length) {
+      return state.viewer.playbooks;
+    }
+    return typeof ROLE_PLAYBOOKS !== "undefined" ? ROLE_PLAYBOOKS : [];
+  }
+
+  function renderContext() {
+    const panel = document.getElementById("viewContext");
+    if (!panel) return;
+    panel.classList.toggle("hidden", state.nav !== "context");
+    if (state.nav !== "context") return;
+
+    if (state.viewerError && !state.viewer) {
+      panel.innerHTML = `<div class="answer">
+        <p class="summary">Sign in with Entra to save your lens. ${escapeHtml(state.viewerError)}</p>
+        <p class="caveat">Role playbooks live in the app. Cosmos only stores which one is yours, plus extras you add.</p>
+      </div>`;
+      return;
+    }
+
+    const v = state.viewer;
+    if (!v) {
+      panel.innerHTML = `<div class="briefing"><div class="suggest-head">My context</div><div class="briefing-note">Loading Entra preference…</div></div>`;
+      return;
+    }
+
+    const books = playbooks();
+    const extras = v.extras || [];
+
+    const roles = books
+      .map((p) => {
+        const on = v.roleKey === p.key;
+        const then = (p.then || []).join(" → ");
+        return `<button type="button" class="role-card${on ? " active" : ""}" data-role="${p.key}">
+          <span class="role-label">${escapeHtml(p.label)}</span>
+          <span class="role-order">Lead with ${escapeHtml(p.primary || "—")}${then ? ` → ${escapeHtml(then)}` : ""}</span>
+          <span class="role-inst">${escapeHtml(p.instruction)}</span>
+        </button>`;
+      })
+      .join("");
+
+    const extraRows = extras.length
+      ? extras
+          .map(
+            (e) => `<div class="extra-row">
+              <span>${escapeHtml(e.text)}</span>
+              <button type="button" class="btn btn-ghost extra-del" data-xid="${escapeHtml(e.id)}">Remove</button>
+            </div>`
+          )
+          .join("")
+      : `<p class="empty">No extras yet. Add a named project, a direct-report team, or a standing note.</p>`;
+
+    const entra = v.entra || {};
+    const entraNote = entra.ok
+      ? `Entra job title: ${entra.jobTitle || "(blank in Entra)"}${entra.department ? ` · ${entra.department}` : ""}${
+          entra.suggestedRoleKey ? ` · maps to ${entra.suggestedRoleKey}` : " · no playbook match — pick one below"
+        }`
+      : entra.error
+        ? `Graph: ${entra.error}`
+        : "Graph profile not loaded.";
+    const sourceNote =
+      v.roleSource === "override"
+        ? "Using your override, not the Entra title."
+        : v.roleSource === "entra"
+          ? "Using Entra job title."
+          : v.roleLabel
+            ? `Active: ${v.roleLabel}`
+            : "No role yet.";
+
+    panel.innerHTML = `<div class="answer">
+      <p class="summary">Entra job title is the default playbook. Cosmos extras stay secondary. Warehouse numbers never come from Graph.</p>
+      <div class="join-note">${escapeHtml(entraNote)} ${escapeHtml(sourceNote)}${state.savingContext ? " · saving…" : ""}</div>
+      ${
+        entra.manager || (entra.reports && entra.reports.length)
+          ? `<div class="briefing-note" style="margin:8px 0 12px">${
+              entra.manager ? `Manager: ${escapeHtml(entra.manager.displayName)}` : ""
+            }${
+              entra.reports && entra.reports.length
+                ? `${entra.manager ? " · " : ""}Reports: ${escapeHtml(entra.reports.map((r) => r.displayName).join(", "))}`
+                : ""
+            }</div>`
+          : ""
+      }
+      <div class="suggest-head">Position</div>
+      <div class="role-grid">${roles}</div>
+      ${
+        v.roleOverride
+          ? `<button type="button" class="btn btn-ghost" id="btnUseEntra" style="margin:8px 0 16px">Use Entra job title</button>`
+          : ""
+      }
+      <div class="block">
+        <span class="block-title">Extras (optional)</span>
+        ${extraRows}
+        <div class="extra-add">
+          <input id="extraDraft" class="project-filter" type="text" maxlength="400" placeholder="e.g. I PM 02-123-4567 · reports: Jane, Luis" value="${escapeHtml(state.extraDraft)}" />
+          <button type="button" class="btn btn-secondary" id="btnAddExtra">Add</button>
+        </div>
+      </div>
+      <div class="block">
+        <span class="block-title">Standing note</span>
+        <textarea id="notesDraft" rows="3" class="notes-box" placeholder="Anything Ask should remember about how you work — still secondary to Cosmos facts.">${escapeHtml(v.notes || "")}</textarea>
+        <div class="project-toolbar" style="margin-top:10px">
+          <button type="button" class="btn btn-secondary" id="btnSaveNotes">Save note</button>
+          <button type="button" class="btn btn-ghost" id="btnClearContext">Remove my context</button>
+        </div>
+      </div>
+      <p class="caveat">Ask uses this as VIEWER framing only. Foundry cannot invent employees or GM from a note.</p>
+    </div>`;
+
+    panel.querySelectorAll("[data-role]").forEach((btn) => {
+      btn.onclick = () => saveContext({ roleKey: btn.dataset.role });
+    });
+    const useEntra = document.getElementById("btnUseEntra");
+    if (useEntra) useEntra.onclick = () => saveContext({ useEntra: true });
+    const extraIn = document.getElementById("extraDraft");
+    if (extraIn) {
+      extraIn.oninput = (e) => {
+        state.extraDraft = e.target.value;
+      };
+      extraIn.onkeydown = (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          addExtra();
+        }
+      };
+    }
+    const addBtn = document.getElementById("btnAddExtra");
+    if (addBtn) addBtn.onclick = addExtra;
+    panel.querySelectorAll(".extra-del").forEach((btn) => {
+      btn.onclick = () => {
+        const next = extras.filter((e) => e.id !== btn.dataset.xid);
+        saveContext({ extras: next });
+      };
+    });
+    const notesEl = document.getElementById("notesDraft");
+    if (notesEl) {
+      notesEl.oninput = (e) => {
+        state.notesDraft = e.target.value;
+      };
+    }
+    const saveNotes = document.getElementById("btnSaveNotes");
+    if (saveNotes) {
+      saveNotes.onclick = () => {
+        const el = document.getElementById("notesDraft");
+        saveContext({ notes: el ? el.value : "" });
+      };
+    }
+    const clearBtn = document.getElementById("btnClearContext");
+    if (clearBtn) clearBtn.onclick = clearContext;
+  }
+
+  async function saveContext(patch) {
+    state.savingContext = true;
+    renderContext();
+    try {
+      const payload = {
+        notes: patch.notes != null ? patch.notes : (state.viewer && state.viewer.notes) || "",
+        extras: patch.extras != null ? patch.extras : (state.viewer && state.viewer.extras) || []
+      };
+      if (patch.roleKey != null) payload.roleKey = patch.roleKey;
+      if (patch.useEntra) payload.useEntra = true;
+      const res = await fetch("/api/me/context", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Save failed (${res.status})`);
+      state.viewer = body.context;
+      state.viewerError = "";
+      state.extraDraft = "";
+      state.notesDraft = (body.context && body.context.notes) || "";
+    } catch (err) {
+      state.viewerError = String(err.message || err);
+    }
+    state.savingContext = false;
+    render();
+  }
+
+  function addExtra() {
+    const text = String(state.extraDraft || "").trim();
+    if (!text) return;
+    const extras = [...((state.viewer && state.viewer.extras) || [])];
+    extras.push({ id: `x${Date.now()}`, text });
+    state.extraDraft = "";
+    saveContext({ extras });
+  }
+
+  async function clearContext() {
+    if (!window.confirm("Remove your saved role and extras from Cosmos?")) return;
+    state.savingContext = true;
+    renderContext();
+    try {
+      const res = await fetch("/api/me/context", { method: "DELETE" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Delete failed (${res.status})`);
+      state.viewer = body.context;
+      state.notesDraft = "";
+      state.extraDraft = "";
+      state.viewerError = "";
+    } catch (err) {
+      state.viewerError = String(err.message || err);
+    }
+    state.savingContext = false;
+    render();
+  }
+
+  async function loadViewer() {
+    try {
+      const res = await fetch("/api/me/context");
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        state.viewer = null;
+        state.viewerError = body.error || "Sign in with Entra.";
+        return;
+      }
+      if (!res.ok) throw new Error(body.error || `Context failed (${res.status})`);
+      state.viewer = body.context;
+      state.notesDraft = (body.context && body.context.notes) || "";
+      state.viewerError = "";
+    } catch (err) {
+      state.viewer = null;
+      state.viewerError = String(err.message || err);
+    }
+    if (state.nav === "context") render();
+  }
+
   function renderLists() {
     const saved = document.getElementById("viewSaved");
     const hist = document.getElementById("viewHistory");
     const help = document.getElementById("viewSourcesHelp");
+    const ctx = document.getElementById("viewContext");
     const ask = document.getElementById("viewAsk");
 
     ask.classList.toggle("hidden", state.nav !== "ask");
     saved.classList.toggle("hidden", state.nav !== "saved");
     hist.classList.toggle("hidden", state.nav !== "history");
     help.classList.toggle("hidden", state.nav !== "sources");
+    if (ctx) ctx.classList.toggle("hidden", state.nav !== "context");
 
     const idleTitle =
       state.purpose === "finance" ? "Finance" : state.purpose === "bd" ? "Business development" : "ClinOps briefing";
@@ -782,7 +1023,8 @@
             : "Ask your data",
       saved: "Saved answers",
       history: "History",
-      sources: "Sources"
+      sources: "Sources",
+      context: "My context"
     };
     document.getElementById("pageTitle").textContent = titles[state.nav];
 
@@ -820,7 +1062,7 @@
 
     help.innerHTML = `<div class="answer">
       <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey — including anything not used for that question. Veeva / live EDC / InsightsRM stay not loaded until gold ETL.</p>
-      <p class="caveat">Blank enrolled or GM is missing, not zero. Project number joins to ora_fact_study.study_number in the app — no mapping table. Ask never writes.</p>
+      <p class="caveat">Blank enrolled or GM is missing, not zero. Project number joins to ora_fact_study.study_number in the app — no mapping table. Ask never writes warehouse containers. Your Entra preference lives in lens_user_prefs and only frames the narrative.</p>
     </div>`;
   }
 
@@ -881,6 +1123,7 @@
     renderAnswer();
     renderProject();
     renderLists();
+    renderContext();
     bindChrome();
   }
 
@@ -946,4 +1189,5 @@
   render();
   loadBriefing();
   loadFinance();
+  loadViewer();
 })();
