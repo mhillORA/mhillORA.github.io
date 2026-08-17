@@ -6,7 +6,7 @@ const SOURCES = [
   { id: "veeva", name: "Veeva Vault", cat: "eTMF, regulatory, safety", sync: "not in Cosmos yet", scope: "gold ETL later", fresh: false, loaded: false },
   { id: "imednet", name: "iMedNet", cat: "Live EDC — not a separate feed", sync: "use Ora clinical rollup", scope: "not split out yet", fresh: false, loaded: false },
   { id: "medidata", name: "Medidata", cat: "Live EDC — not a separate feed", sync: "use Ora clinical rollup", scope: "not split out yet", fresh: false, loaded: false },
-  { id: "insightsrm", name: "InsightsRM", cat: "Resource management", sync: "not in Cosmos yet", scope: "gold ETL later", fresh: false, loaded: false },
+  { id: "insightsrm", name: "InsightsRM", cat: "Resource management", sync: "temporary Cosmos until DW", scope: "lens_rm_* actual FTE", fresh: true, loaded: true },
   { id: "netsuite", name: "NetSuite", cat: "Project profitability", sync: "from Cosmos", scope: "lens_ns_projects", fresh: true, loaded: true }
 ];
 
@@ -14,6 +14,7 @@ const WORKSPACES = [
   { id: "clinops", label: "Clinical operations", ids: ["ora", "ctgov", "trialhub"] },
   { id: "bd", label: "Business development", ids: ["salesforce", "ctgov", "trialhub"] },
   { id: "finance", label: "Finance and delivery", ids: ["ora", "netsuite", "salesforce"] },
+  { id: "staffing", label: "Resource management", ids: ["insightsrm"] },
   { id: "all", label: "Loaded sources", ids: SOURCES.filter((s) => s.loaded).map((s) => s.id) }
 ];
 
@@ -33,6 +34,13 @@ const PURPOSES = [
     ids: ["ora", "netsuite", "salesforce"]
   },
   {
+    id: "staffing",
+    label: "RM",
+    hint: "FTE, assignments, capacity",
+    workspace: "staffing",
+    ids: ["insightsrm"]
+  },
+  {
     id: "bd",
     label: "Business development",
     hint: "Registry and sponsors",
@@ -48,7 +56,7 @@ const DETAIL = {
   medidata: "not a separate feed",
   ctgov: "ora_ctgov_trials",
   trialhub: "ora_trialhub_trials",
-  insightsrm: "not loaded",
+  insightsrm: "lens_rm_* actual RM (until DW)",
   netsuite: "lens_ns_projects",
   salesforce: "ora_sponsor_crosswalk"
 };
@@ -95,6 +103,13 @@ const BD_QUESTIONS = [
   { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
   { text: "Show competing glaucoma trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
   { text: "Which Ora studies match this indication?", icon: "chart", needs: "ora_fact_study" }
+];
+
+const STAFFING_QUESTIONS = [
+  { text: "Who is over-allocated?", icon: "users", needs: "Actual RM · until DW" },
+  { text: "Which roles are short on capacity?", icon: "users", needs: "Actual RM headcount" },
+  { text: "Show CRA assignments", icon: "users", needs: "Actual RM assignments" },
+  { text: "Show assignments for 19-120-0012", icon: "users", needs: "Actual RM study key" }
 ];
 
 const ROLE_PLAYBOOKS = [

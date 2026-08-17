@@ -408,6 +408,18 @@
       return;
     }
 
+    if (state.purpose === "staffing") {
+      const q = typeof STAFFING_QUESTIONS !== "undefined" ? STAFFING_QUESTIONS : EXAMPLE_QUESTIONS;
+      panel.innerHTML =
+        `<div class="briefing">
+          <div class="suggest-head">RM</div>
+          <div class="briefing-note">Actual Ora resource-management data in Cosmos (assignments, timesheet FTE, role capacity). Queryable now. The warehouse feed will replace this landing later. Not NetSuite and not a demo pack.</div>
+        </div>
+        <div class="suggest-head">Suggested prompts</div>` + suggestButtons(q);
+      bindSuggests(panel, q);
+      return;
+    }
+
     const b = state.briefing;
     const kpis = b
       ? `<div class="briefing">
@@ -1013,7 +1025,13 @@
     if (ctx) ctx.classList.toggle("hidden", state.nav !== "context");
 
     const idleTitle =
-      state.purpose === "finance" ? "Finance" : state.purpose === "bd" ? "Business development" : "ClinOps briefing";
+      state.purpose === "finance"
+        ? "Finance"
+        : state.purpose === "bd"
+          ? "Business development"
+          : state.purpose === "staffing"
+            ? "RM"
+            : "ClinOps briefing";
     const titles = {
       ask:
         state.phase === "project"
@@ -1061,7 +1079,7 @@
     });
 
     help.innerHTML = `<div class="answer">
-      <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey — including anything not used for that question. Veeva / live EDC / InsightsRM stay not loaded until gold ETL.</p>
+      <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / RM / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey — including anything not used for that question. Veeva / live EDC stay not loaded until gold ETL. InsightsRM is actual RM data in lens_rm_* until the DW feed exists — not NetSuite, not a mock.</p>
       <p class="caveat">Blank enrolled or GM is missing, not zero. Project number joins to ora_fact_study.study_number in the app — no mapping table. Ask never writes warehouse containers. Your Entra preference lives in lens_user_prefs and only frames the narrative.</p>
     </div>`;
   }
@@ -1081,7 +1099,9 @@
         ? `Ask about ${state.projectNumber} — GM, enrollment, sites…`
         : state.purpose === "finance"
           ? "Ask about GM, change orders, or a project number…"
-          : "Ask from the loaded Cosmos sources — or pick a purpose above.";
+          : state.purpose === "staffing"
+            ? "Ask about FTE, assignments, CRA capacity, or a study key…"
+            : "Ask from the loaded Cosmos sources — or pick a purpose above.";
     draft.value = state.draft;
     draft.oninput = (e) => {
       state.draft = e.target.value;

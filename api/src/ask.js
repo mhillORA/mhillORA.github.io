@@ -216,6 +216,347 @@ async function fromNsProjects(question) {
   );
 }
 
+function rmCaveat() {
+  return "Actual InsightsRM data in Cosmos (xlsx landing until the warehouse feed). Not NetSuite. Blank FTE is missing, not zero.";
+}
+
+function fteLabel(n) {
+  if (n == null || n === "") return "—";
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  return v.toFixed(2);
+}
+
+function studyKeyFromQuestion(question) {
+  const a = String(question).match(/\b\d{2}-\d{3}-\d{4}\b/);
+  if (a) return a[0];
+  const b = String(question).match(/\bO-\d{4,}\b/i);
+  if (b) return b[0];
+  return "";
+}
+
+async function fromRmStaffing(question) {
+  const t = String(question || "").toLowerCase();
+  const studyKey = studyKeyFromQuestion(question);
+  const wantOver = /(over.?allocat|overbook|too many hours)/.test(t);
+  const wantGap = /(capacity|headcount|gap|shortfall|demand)/.test(t);
+  const wantAssign = /(assign|booked|staffed|who is on|who.?s on)/.test(t) || Boolean(studyKey);
+  const craOnly = /\bcra\b/.test(t);
+
+  const [over, gaps, headcount, studies] = await Promise.all([
+    safeQuery(
+      LENS.rmDq,
+      "SELECT * FROM c WHERE c.docType = @t AND c.sheet = @s",
+      [
+        { name: "@t", value: "lens_rm_dq" },
+        { name: "@s", value: "DQ_04_OverAllocatedPersonnel" }
+      ]
+    ),
+    safeQuery(
+      LENS.rmDq,
+      "SELECT * FROM c WHERE c.docType = @t AND c.sheet = @s",
+      [
+        { name: "@t", value: "lens_rm_dq" },
+        { name: "@s", value: "DQ_07_CapacityGaps" }
+      ]
+    ),
+    safeQuery(LENS.rmHeadcount, "SELECT * FROM c WHERE c.docType = @t", [
+      { name: "@t", value: "lens_rm_headcount" }
+    ]),
+    studyKey
+      ? safeQuery(
+          LENS.rmStudies,
+          "SELECT * FROM c WHERE c.docType = @t AND c.studyKey = @k",
+          [
+            { name: "@t", value: "lens_rm_study" },
+            { name: "@k", value: studyKey }
+          ]
+        )
+      : Promise.resolve([])
+  ]);
+
+  let assignments = [];
+  if (wantAssign || studyKey) {
+    assignments = studyKey
+      ? await safeQuery(
+          LENS.rmExportAssignments,
+          "SELECT TOP 200 * FROM c WHERE c.docType = @t AND c.studyKey = @k",
+          [
+            { name: "@t", value: "lens_rm_export_assignment" },
+            { name: "@k", value: studyKey }
+          ]
+        )
+      : await safeQuery(LENS.rmExportAssignments, "SELECT TOP 80 * FROM c WHERE c.docType = @t", [
+          { name: "@t", value: "lens_rm_export_assignment" }
+        ]);
+    if (!assignments.length) {
+      assignments = studyKey
+        ? await safeQuery(
+            LENS.rmAssignments,
+            "SELECT TOP 200 * FROM c WHERE c.docType = @t AND c.studyKey = @k",
+            [
+              { name: "@t", value: "lens_rm_assignment" },
+              { name: "@k", value: studyKey }
+            ]
+          )
+        : await safeQuery(LENS.rmAssignments, "SELECT TOP 80 * FROM c WHERE c.docType = @t", [
+            { name: "@t", value: "lens_rm_assignment" }
+          ]);
+    }
+    if (craOnly) {
+      const craRoster = await safeQuery(
+        LENS.rmRoster,
+        "SELECT c.fullName, c.nameKey, c.roleCode FROM c WHERE c.docType = @t AND CONTAINS(c.roleCode, 'CRA', true)",
+        [{ name: "@t", value: "lens_rm_roster" }]
+      );
+      const craNames = new Set(craRoster.map((r) => String(r.fullName || "").toLowerCase()));
+      const craKeys = new Set(craRoster.map((r) => r.nameKey));
+      assignments = assignments.filter((r) => {
+        const name = String(r.employeeName || "").toLowerCase();
+        return craNames.has(name) || craKeys.has(r.nameKey) || /cra/i.test(String(r.roleCodeRaw || r.roleCode || r.roleId || ""));
+      });
+    }
+  }
+
+  const schedule = studyKey
+    ? await safeQuery(
+        LENS.rmSchedule,
+        "SELECT * FROM c WHERE c.docType = @t AND c.studyKey = @k",
+        [
+          { name: "@t", value: "lens_rm_schedule" },
+          { name: "@k", value: studyKey }
+        ]
+      )
+    : [];
+
+  const hasAny = over.length || gaps.length || headcount.length || assignments.length || studies.length || schedule.length;
+  if (!hasAny) return null;
+
+  const studyLabel = studies[0]
+    ? studies[0].studyLabel || `${studies[0].studyKey} ${studies[0].studyName || ""}`.trim()
+    : studyKey;
+
+  if (studyKey && (assignments.length || studies.length || schedule.length)) {
+    const byPerson = {};
+    for (const a of assignments) {
+      const role = a.employeeName || a.roleCode || a.roleCodeRaw || String(a.roleId || a.activity || "row");
+      byPerson[role] = (byPerson[role] || 0) + (numOrNull(a.valueFte) || 0);
+    }
+    const roleRows = Object.entries(byPerson).sort((a, b) => b[1] - a[1]);
+    const maxFte = Math.max(0.01, ...roleRows.map(([, n]) => n));
+    const stampRows = assignments.length ? assignments : schedule.length ? schedule : studies;
+    const label = studies[0]
+      ? studies[0].studyLabel || `${studies[0].studyKey} ${studies[0].studyName || ""}`.trim()
+      : (schedule[0] && schedule[0].studyLabel) || studyKey;
+    return stamp(
+      {
+        q: question,
+        needs: ["insightsrm"],
+        icon: "users",
+        summary: assignments.length
+          ? `${assignments.length} InsightsRM assignment row${assignments.length === 1 ? "" : "s"} on ${label}. Booked FTE from the live RM extract, not NetSuite GM.`
+          : `${schedule.length} InsightsRM schedule row${schedule.length === 1 ? "" : "s"} on ${label}.`,
+        chartTitle: assignments.length ? `Booked FTE · ${studyKey}` : `Schedule · ${studyKey}`,
+        chartNote: "InsightsRM · not NetSuite",
+        chartType: "bar",
+        bars: (assignments.length
+          ? roleRows.slice(0, 8).map(([lbl, n]) => ({
+              label: String(lbl).slice(0, 36),
+              pct: Math.round((n / maxFte) * 100),
+              value: fteLabel(n),
+              color: "#273b8a"
+            }))
+          : schedule.slice(0, 8).map((s) => ({
+              label: String(s.activity || "All").slice(0, 36),
+              pct: 100,
+              value: (s.beginDate || "").slice(0, 10) || "—",
+              color: "#273b8a"
+            }))),
+        tableTitle: assignments.length ? "Assignments" : "Schedule",
+        grid: "1.1fr 1fr 0.7fr 0.5fr 0.7fr 0.7fr",
+        cols: assignments.length
+          ? ["Study", "Person", "Activity", "FTE", "Begin", "Status"]
+          : ["Study", "Activity", "Status", "Begin", "End", "Sponsor"],
+        rows: (assignments.length ? assignments : schedule).slice(0, 12).map((r) =>
+          assignments.length
+            ? [
+                r.studyKey || "—",
+                r.employeeName || "—",
+                r.activity || r.activityNameRaw || "—",
+                fteLabel(r.valueFte),
+                (r.beginDate || "").slice(0, 10) || "—",
+                r.status || "—"
+              ]
+            : [
+                r.studyKey || "—",
+                r.activity || "—",
+                r.status || r.currentProjectStatus || "—",
+                (r.beginDate || "").slice(0, 10) || "—",
+                (r.endDate || "").slice(0, 10) || "—",
+                r.sponsor || "—"
+              ]
+        ),
+        caveat: rmCaveat() + " StudyKey can match a project number at read time; no mapping table.",
+        trace: [
+          assignments.length
+            ? `Read ${LENS.rmExportAssignments} where studyKey = ${studyKey}.`
+            : `Read ${LENS.rmSchedule} where studyKey = ${studyKey}.`,
+          "Did not read lens_ns_projects."
+        ],
+        query: assignments.length
+          ? `lens_rm_export_assignments where studyKey = '${studyKey}'`
+          : `lens_rm_schedule where studyKey = '${studyKey}'`,
+        confidence: "high",
+        followUps: [
+          "Who is over-allocated?",
+          "Which roles are short on capacity?",
+          `Enrollment for ${studyKey}`
+        ]
+      },
+      stampRows
+    );
+  }
+
+  if (assignments.length && (wantAssign || craOnly) && !studyKey) {
+    const byRole = {};
+    for (const a of assignments) {
+      const role = a.employeeName || a.roleCode || a.roleCodeRaw || String(a.roleId || a.activity || "row");
+      byRole[role] = (byRole[role] || 0) + (numOrNull(a.valueFte) || 0);
+    }
+    const roleRows = Object.entries(byRole).sort((a, b) => b[1] - a[1]);
+    const maxFte = Math.max(0.01, ...roleRows.map(([, n]) => n));
+    return stamp(
+      {
+        q: question,
+        needs: ["insightsrm"],
+        icon: "users",
+        summary: craOnly
+          ? `${assignments.length} InsightsRM CRA assignment row${assignments.length === 1 ? "" : "s"} (first page). Actual booked FTE, not NetSuite.`
+          : `${assignments.length} InsightsRM assignment rows (first page). Actual booked FTE, not NetSuite.`,
+        chartTitle: craOnly ? "CRA booked FTE by role code" : "Booked FTE by role",
+        chartNote: "InsightsRM · lens_rm_assignments · not NetSuite",
+        chartType: "bar",
+        bars: roleRows.slice(0, 8).map(([label, n]) => ({
+          label,
+          pct: Math.round((n / maxFte) * 100),
+          value: fteLabel(n),
+          color: "#273b8a"
+        })),
+        tableTitle: "Assignments",
+        grid: "1.2fr 0.7fr 0.6fr 0.5fr 0.7fr 0.7fr",
+        cols: ["Study", "Person", "Activity", "FTE", "Begin", "Status"],
+        rows: assignments.slice(0, 12).map((r) => [
+          r.studyKey || "—",
+          r.employeeName || "—",
+          r.activity || r.activityNameRaw || "—",
+          fteLabel(r.valueFte),
+          (r.beginDate || "").slice(0, 10) || "—",
+          r.status || "—"
+        ]),
+        caveat: rmCaveat() + " Table is the first page of assignment rows. Name a study key (NN-NNN-NNNN) to filter.",
+        trace: [`Read ${LENS.rmAssignments} (TOP ${assignments.length}).`, "Did not read lens_ns_projects."],
+        query: `lens_rm_assignments TOP ${assignments.length}`,
+        confidence: "medium",
+        followUps: ["Who is over-allocated?", "Which roles are short on capacity?", "Show assignments for 19-120-0012"]
+      },
+      assignments
+    );
+  }
+
+  if (wantOver || (!wantGap && over.length && !wantAssign)) {
+    const ranked = over
+      .slice()
+      .sort((a, b) => (numOrNull(b.overAllocationFte) || 0) - (numOrNull(a.overAllocationFte) || 0));
+    const maxOver = Math.max(0.01, ...ranked.map((r) => Math.abs(numOrNull(r.overAllocationFte) || 0)));
+    return stamp(
+      {
+        q: question,
+        needs: ["insightsrm"],
+        icon: "users",
+        summary: `${over.length} people in InsightsRM are over-allocated vs their time allocation. This is resource management, not NetSuite hours.`,
+        chartTitle: "Over-allocation (FTE)",
+        chartNote: "InsightsRM DQ_04 · lens_rm_dq · not NetSuite",
+        chartType: "bar",
+        bars: ranked.slice(0, 8).map((r) => {
+          const v = numOrNull(r.overAllocationFte) || 0;
+          return {
+            label: String(r.fullName || r.employeeKey || "—").slice(0, 36),
+            pct: Math.round((Math.abs(v) / maxOver) * 100),
+            value: fteLabel(v),
+            color: "#ed1c24"
+          };
+        }),
+        tableTitle: "Over-allocated personnel",
+        grid: "1.3fr 1.1fr 0.6fr 0.6fr 0.6fr",
+        cols: ["Name", "Title", "Assigned", "Over by", "Active"],
+        rows: ranked.slice(0, 12).map((r) => [
+          r.fullName || "—",
+          r.jobTitle || "—",
+          fteLabel(r.currentAssignedFte),
+          fteLabel(r.overAllocationFte),
+          r.active == null ? "—" : r.active ? "Yes" : "No"
+        ]),
+        caveat: rmCaveat() + " Over-allocation is from InsightsRM DQ_04 (assigned FTE vs time allocation).",
+        trace: [`Read ${LENS.rmDq} sheet DQ_04_OverAllocatedPersonnel.`, "Did not read lens_ns_projects."],
+        query: "lens_rm_dq where sheet = 'DQ_04_OverAllocatedPersonnel'",
+        confidence: "high",
+        followUps: ["Which roles are short on capacity?", "Show CRA assignments", "Who is on 25-100-0001?"]
+      },
+      over
+    );
+  }
+
+  const short = gaps.filter((g) => (numOrNull(g.gapFte) || 0) < 0).sort((a, b) => (numOrNull(a.gapFte) || 0) - (numOrNull(b.gapFte) || 0));
+  const surplus = gaps.filter((g) => (numOrNull(g.gapFte) || 0) > 0).sort((a, b) => (numOrNull(b.gapFte) || 0) - (numOrNull(a.gapFte) || 0));
+  const chartSource = (short.length ? short : surplus).slice(0, 8);
+  const maxAbs = Math.max(0.01, ...chartSource.map((r) => Math.abs(numOrNull(r.gapFte) || 0)));
+  const tableSource = (short.length ? short : gaps).slice(0, 12);
+  const stampRows = gaps.length ? gaps : headcount;
+
+  return stamp(
+    {
+      q: question,
+      needs: ["insightsrm"],
+      icon: "users",
+      summary: gaps.length
+        ? `${short.length} InsightsRM role${short.length === 1 ? "" : "s"} are short vs headcount (gap FTE < 0). ${surplus.length} have spare capacity. Not NetSuite.`
+        : `${headcount.length} InsightsRM headcount rows (role capacity).`,
+      chartTitle: short.length ? "Role capacity shortfall (FTE)" : "Role capacity vs demand (FTE)",
+      chartNote: "InsightsRM DQ_07 + lens_rm_headcount · not NetSuite",
+      chartType: "bar",
+      bars: chartSource.map((r) => {
+        const v = numOrNull(r.gapFte) || 0;
+        return {
+          label: String(r.roleCode || r.roleGroup || "—").slice(0, 36),
+          pct: Math.round((Math.abs(v) / maxAbs) * 100),
+          value: fteLabel(v),
+          color: v < 0 ? "#ed1c24" : "#3ebdac"
+        };
+      }),
+      tableTitle: short.length ? "Roles short on capacity" : "Role capacity gaps",
+      grid: "0.9fr 0.7fr 0.7fr 0.7fr 0.7fr",
+      cols: ["Role", "Capacity", "Demand", "Gap FTE", "Note"],
+      rows: tableSource.map((r) => [
+        r.roleCode || "—",
+        fteLabel(r.capacityFte),
+        fteLabel(r.currentDemandFte),
+        fteLabel(r.gapFte),
+        r.note || "—"
+      ]),
+      caveat: rmCaveat() + " Headcount is role capacity, not a person list. Projections are role-level (no employee).",
+      trace: [
+        `Read ${LENS.rmDq} sheet DQ_07_CapacityGaps (${gaps.length} rows).`,
+        `Read ${LENS.rmHeadcount} (${headcount.length} rows).`,
+        "Did not read lens_ns_projects."
+      ],
+      query: "lens_rm_dq DQ_07_CapacityGaps + lens_rm_headcount",
+      confidence: "high",
+      followUps: ["Who is over-allocated?", "Show assignments for 19-120-0012", "Which CRA roles have spare capacity?"]
+    },
+    stampRows
+  );
+}
+
 function missingNote(missingCount, knownCount) {
   if (!missingCount) return "";
   return `${missingCount} ${missingCount === 1 ? "study has" : "studies have"} no enrolled value. They are listed in the table and omitted from the chart — not plotted as zero. ${knownCount} ${knownCount === 1 ? "study has" : "studies have"} a number.`;
@@ -771,7 +1112,8 @@ async function answerFromCosmos(question, sources, opts) {
   const projectNumber = String((opts && opts.projectNumber) || (fromQ && fromQ[0]) || "").trim();
   const key = guessKey(question);
   let answer = null;
-  if (projectNumber) answer = await fromProjectContext(question, projectNumber);
+  if (projectNumber && key !== "staffing") answer = await fromProjectContext(question, projectNumber);
+  if (!answer && key === "staffing") answer = await fromRmStaffing(question);
   if (!answer && key === "missing_enrolled") answer = await fromOraFactStudy(question, { missingOnly: true });
   if (!answer && key === "netsuite") answer = await fromNsProjects(question);
   if (!answer && key === "sites") answer = await fromOraFactSite(question);

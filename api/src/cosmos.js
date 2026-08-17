@@ -13,7 +13,26 @@ const LENS = {
   sources: "lens_sources",
   syncRuns: "lens_syncRuns",
   nsProjects: "lens_ns_projects",
-  userPrefs: "lens_user_prefs"
+  userPrefs: "lens_user_prefs",
+  rmStudies: "lens_rm_studies",
+  rmRoles: "lens_rm_roles",
+  rmEmployees: "lens_rm_employees",
+  rmActivities: "lens_rm_activities",
+  rmDepartments: "lens_rm_departments",
+  rmOrganizations: "lens_rm_organizations",
+  rmDomains: "lens_rm_domains",
+  rmUsers: "lens_rm_users",
+  rmActuals: "lens_rm_actuals",
+  rmAssignments: "lens_rm_assignments",
+  rmProjections: "lens_rm_projections",
+  rmHeadcount: "lens_rm_headcount",
+  rmDq: "lens_rm_dq",
+  rmRuns: "lens_rm_runs",
+  rmStaffingEmployee: "lens_rm_staffing_employee",
+  rmStaffingWorkitem: "lens_rm_staffing_workitem",
+  rmRoster: "lens_rm_roster",
+  rmExportAssignments: "lens_rm_export_assignments",
+  rmSchedule: "lens_rm_schedule"
 };
 
 const SHARED_READ = {
