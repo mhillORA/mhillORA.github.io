@@ -1421,8 +1421,9 @@
                     if (Array.isArray(event.studyIds) && event.studyIds.length > 0) {
                         const filteredIds = event.studyIds.filter(studyId => artemisStudyIdsSet.has(studyId));
                         if (filteredIds.length === 0) {
-                            if (event.type === 'Site Assignment') return acc;
-                            acc.push({ ...event, studyIds: [] });
+                            // Keep saved Site Assignments even if the study is closed/missing
+                            // from ARTEMIS — dropping them made weeks of schedule vanish.
+                            acc.push(event);
                             return acc;
                         }
                         if (filteredIds.length !== event.studyIds.length) {
@@ -9856,23 +9857,10 @@
                     // Re-enable PTO cleanup to handle any legacy duplicates
                     events = await cleanupDuplicatePTOEvents(events || []);
                     
-                    // DEDUPLICATION: Track seen event IDs to prevent duplicate events in state
-                    const seenEventIds = new Set();
-                    
-                    const sanitizedEvents = Array.isArray(events) ? events.reduce((acc, event) => {
-                        // Skip duplicate events by ID
-                        if (event.id && seenEventIds.has(event.id)) {
-                            console.warn('Skipping duplicate event ID:', event.id);
-                            return acc;
-                        }
-                        if (event.id) seenEventIds.add(event.id);
-                        
-                        // Never discard a saved event just because its study is closed,
-                        // temporarily absent from ARTEMIS, or outside the current study
-                        // filter. That made valid schedule rows disappear after refresh.
-                        acc.push(event);
-                        return acc;
-                    }, []) : events;
+                    const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
+                    const sanitizedEvents = typeof sanitizeEventsFromApi === 'function'
+                        ? sanitizeEventsFromApi(events, artemisStudyIdsSet)
+                        : (Array.isArray(events) ? events : []);
 
                     const updates = {
                         crcs,
@@ -11543,8 +11531,12 @@
                     }
 
                     if (!hasError) {
-                        await apiService.createEvent(eventData);
-                        successCount++;
+                        try {
+                            requireCreatedEvent(await apiService.createEvent(eventData), 'shift');
+                            successCount++;
+                        } catch (createErr) {
+                            errors.push(`Row ${rowNum}: ${createErr.message || 'Failed to save shift'}`);
+                        }
                     }
                 }
 
@@ -39380,6 +39372,7 @@
                                         newStudyName: studyName,
                                         roleAssignmentsChanged: Object.keys(roleAssignments).length > 0
                                     });
+                                    return;
                                 } else {
                                     const groupId = crypto.randomUUID();
                                     // Batch operations replaced with individual API calls
@@ -39739,6 +39732,7 @@
                                             if (startDateObjLoop && endDateObjLoop) {
                                                 const allCrcIdsList = [...allAssignedCrcs].filter(id => id && String(id).trim() !== '' && id !== 'UNASSIGNED' && id !== 'SITE_STAFF');
                                                 const primaryCrcId = allCrcIdsList[0] || null;
+                                                const failedDates = [];
                                                 for (let d = new Date(startDateObjLoop); d <= endDateObjLoop; d.setDate(d.getDate() + 1)) {
                                                     const dateStr = toDateOnlyString(d);
                                                     const currentEventData = {
@@ -39757,8 +39751,16 @@
                                                         travelDayPreferences: Object.keys(travelDayPreferences).length > 0 ? travelDayPreferences : undefined,
                                                         skipTravelDayProcessing: true
                                                     };
-                                                    const created = await apiService.createEvent(currentEventData);
-                                                    addEventToState(requireCreatedEvent(created, 'Site Assignment'));
+                                                    try {
+                                                        const created = await apiService.createEvent(currentEventData);
+                                                        addEventToState(requireCreatedEvent(created, 'Site Assignment'));
+                                                    } catch (createErr) {
+                                                        console.error(`Error creating Site Assignment for ${dateStr}:`, createErr);
+                                                        failedDates.push(dateStr);
+                                                    }
+                                                }
+                                                if (failedDates.length > 0) {
+                                                    throw new Error(`Saved some days, but these dates failed: ${failedDates.join(', ')}. Retry the missing days — do not resubmit the whole range.`);
                                                 }
                                             }
                                         } else {
@@ -39798,6 +39800,7 @@
                                                         roleQuantityOverrides: baseEventData.roleQuantityOverrides || undefined,
                                                         openForVolunteers: form.querySelector('input[name="askForVolunteers"]')?.checked === true,
                                                         volunteerApplications: [],
+                                                        skipTravelDayProcessing: true
                                                     };
                                                     
                                                     console.log('=== CREATING OPEN SHIFT ===');
