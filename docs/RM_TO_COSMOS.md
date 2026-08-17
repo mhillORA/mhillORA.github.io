@@ -160,17 +160,33 @@ Wait until it prints `Deployed`.
 
 ---
 
-## F. Upload the workbook (once, then whenever RM refreshes)
+## F. Upload the files (once, then whenever RM refreshes)
 
-Storage Explorer or portal → container **`insightsrm`** → upload:
+Storage Explorer or portal → container **`insightsrm`**. Create folders, then upload. Use today’s date and a 4-digit time (example `1730`).
+
+**Workbook** (star schema):
 
 ```text
-landing/2026/08/17/1630/Ora_Resource_Model_1.xlsx
+landing/2026/08/17/1730/Ora_Resource_Model_1.xlsx
 ```
 
-Use today’s date and a 4-digit time folder. The blob trigger fires on create. First load is ~20k docs (actuals are the bulk) and can take a few minutes.
+**Staffing grids zip** (`RM-Staffing-By-Employee.csv` + work-item CSVs):
 
-Timer also runs **6:35 AM Eastern** daily and loads the **latest** `landing/**/*.xlsx`.
+```text
+landing/2026/08/17/1731/drive-download-staffing.zip
+```
+
+**Roster / assignments / schedule zip** (`RM-employees.csv`, `RM-assignments.csv`, `RM-Sch_4Aug2026.csv`):
+
+```text
+landing/2026/08/17/1732/drive-download-roster.zip
+```
+
+You can upload the CSVs loose in the same `landing/yyyy/MM/dd/HHmm/` shape instead of zips. Do **not** put them in container `netsuite`.
+
+The blob trigger fires on create. First workbook load is ~20k docs and can take a few minutes. Cosmos containers (`lens_rm_*`) are created automatically on that run — do not add them in Data Explorer first.
+
+Timer also runs **6:35 AM Eastern** daily and loads the latest landing files of each kind.
 
 To kick without waiting: Function App → **Functions** → `rmLoadNow` → Test (POST), or:
 
@@ -178,7 +194,7 @@ To kick without waiting: Function App → **Functions** → `rmLoadNow` → Test
 POST /api/rm/load
 ```
 
-with the function key.
+with the function key. That loads the latest xlsx **and** the latest RM csv/zip of each kind.
 
 ---
 
@@ -197,6 +213,18 @@ SELECT VALUE COUNT(1) FROM c WHERE c.docType = "lens_rm_actual"
 ```
 
 in `lens_rm_actuals` — about **13682**.
+
+```sql
+SELECT VALUE COUNT(1) FROM c WHERE c.docType = "lens_rm_roster"
+```
+
+in `lens_rm_roster` — about **470**.
+
+```sql
+SELECT VALUE COUNT(1) FROM c WHERE c.docType = "lens_rm_export_assignment"
+```
+
+in `lens_rm_export_assignments` — about **1300**.
 
 ```sql
 SELECT * FROM c WHERE c.docType = "lens_rm_run" ORDER BY c.finishedAt DESC

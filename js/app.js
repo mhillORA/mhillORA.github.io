@@ -16,6 +16,7 @@
     },
     briefing: null,
     finance: null,
+    rm: null,
     project: null,
     projectNumber: "",
     projectFilter: "",
@@ -303,6 +304,40 @@
     });
   }
 
+  function renderRmIdle(panel) {
+    const r = state.rm;
+    if (!r) {
+      panel.innerHTML = `<div class="briefing"><div class="suggest-head">RM</div><div class="briefing-note">Loading InsightsRM briefing…</div></div>`;
+      return;
+    }
+    const kpis = r.loaded
+      ? `<div class="kpi-row">
+          <div class="kpi"><div class="kpi-value">${r.overCount}</div><div class="kpi-label">Over-allocated</div></div>
+          <div class="kpi"><div class="kpi-value">${r.shortRoles}</div><div class="kpi-label">Roles short</div></div>
+          <div class="kpi"><div class="kpi-value">${r.studies}</div><div class="kpi-label">Studies</div></div>
+          <div class="kpi"><div class="kpi-value">${r.employees}</div><div class="kpi-label">Employees</div></div>
+          <div class="kpi"><div class="kpi-value">${r.assignments}</div><div class="kpi-label">Assignments</div></div>
+        </div>`
+      : `<div class="briefing-note">${escapeHtml(r.note || "No RM snapshot in Cosmos yet.")}</div>`;
+    const top =
+      r.loaded && r.topOver && r.topOver.length
+        ? `<div class="briefing-note" style="margin-top:6px">Top: ${r.topOver
+            .map((x) => `${escapeHtml(x.name || "—")} (+${Number(x.overFte || 0).toFixed(2)} FTE)`)
+            .join(" · ")}</div>`
+        : "";
+    const q = typeof STAFFING_QUESTIONS !== "undefined" ? STAFFING_QUESTIONS : EXAMPLE_QUESTIONS;
+    panel.innerHTML =
+      `<div class="briefing">
+        <div class="suggest-head">RM briefing</div>
+        ${kpis}
+        <div class="briefing-note">${escapeHtml(r.asOfLabel || "")}${r.lastBlob ? ` · ${escapeHtml(String(r.lastBlob).split("/").pop())}` : ""}. Joins follow Model_Relationships (studyKey, employeeKey, roleId).</div>
+        ${top}
+      </div>
+      <div class="suggest-head">Suggested prompts</div>` +
+      suggestButtons(q);
+    bindSuggests(panel, q);
+  }
+
   function renderFinanceIdle(panel) {
     const f = state.finance;
     if (!f) {
@@ -409,14 +444,7 @@
     }
 
     if (state.purpose === "staffing") {
-      const q = typeof STAFFING_QUESTIONS !== "undefined" ? STAFFING_QUESTIONS : EXAMPLE_QUESTIONS;
-      panel.innerHTML =
-        `<div class="briefing">
-          <div class="suggest-head">RM</div>
-          <div class="briefing-note">Actual Ora resource-management data in Cosmos (assignments, timesheet FTE, role capacity). Queryable now. The warehouse feed will replace this landing later. Not NetSuite and not a demo pack.</div>
-        </div>
-        <div class="suggest-head">Suggested prompts</div>` + suggestButtons(q);
-      bindSuggests(panel, q);
+      renderRmIdle(panel);
       return;
     }
 
@@ -1181,6 +1209,26 @@
     if (state.phase === "idle" && state.purpose === "finance") render();
   }
 
+  async function loadRm() {
+    try {
+      const res = await fetch("/api/rm");
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `RM briefing failed (${res.status})`);
+      state.rm = body.rm || null;
+    } catch (err) {
+      state.rm = {
+        loaded: false,
+        overCount: 0,
+        shortRoles: 0,
+        studies: 0,
+        employees: 0,
+        assignments: 0,
+        note: String(err.message || err)
+      };
+    }
+    if (state.phase === "idle" && state.purpose === "staffing") render();
+  }
+
   async function openProject(number) {
     const pn = String(number || "").trim();
     if (!pn) return;
@@ -1209,5 +1257,6 @@
   render();
   loadBriefing();
   loadFinance();
+  loadRm();
   loadViewer();
 })();

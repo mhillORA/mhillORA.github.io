@@ -161,6 +161,8 @@ function systemPrompt(cfg) {
       "Null enrolled is missing, not zero. Do not say a study enrolled 0 unless CONTEXT has the number 0.",
       "Site questions use ora_fact_site in CONTEXT when present (org, country, enrolled, site PSM). That is the same Veeva site pack as Buddy — not live EDC.",
       "Finance / GM questions use lens_ns_projects (NetSuite Project Profitability). Null GM is missing, not zero. Do not treat blank as 0%.",
+      "InsightsRM / RM questions use lens_rm_* packs joined per Model_Relationships (studyKey, employeeKey, roleId). If rows array in CONTEXT is non-empty, summarize those rows — never say no data when rows exist.",
+      "Over-allocation = assigned FTE minus Dim_Employee.TimeAllocation. Blank FTE is missing, not zero.",
       "If CONTEXT is empty or thin, say what is missing.",
       "VIEWER is secondary context (Entra preference). Frame the narrative for that role. Do not change Cosmos numbers. Do not invent people, reports, or projects that are not in CONTEXT or VIEWER extras.",
       "If VIEWER says the project is primary, lead with the project then people. If VIEWER is a director, stay high-level. If VIEWER is a manager, lead with direct reports when CONTEXT has them.",

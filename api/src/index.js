@@ -1,6 +1,7 @@
 const { app } = require("@azure/functions");
 const { answerFromCosmos, getBriefing } = require("./ask");
 const { getFinanceBriefing, getProjectBundle } = require("./projectJoin");
+const { getRmBriefing } = require("./rmPack");
 const { foundryStatus } = require("./foundry");
 const { principalFromRequest } = require("./principal");
 const { getViewerContext, upsertPref, deletePref } = require("./userPrefs");
@@ -87,6 +88,20 @@ app.http("finance", {
     try {
       const finance = await getFinanceBriefing();
       return json(200, { finance });
+    } catch (err) {
+      return json(503, { error: String(err.message || err) });
+    }
+  }
+});
+
+app.http("rmBriefing", {
+  methods: ["GET"],
+  authLevel: "anonymous",
+  route: "rm",
+  handler: async () => {
+    try {
+      const rm = await getRmBriefing();
+      return json(200, { rm });
     } catch (err) {
       return json(503, { error: String(err.message || err) });
     }

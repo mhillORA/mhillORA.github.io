@@ -77,11 +77,22 @@ const BOOL_FIELDS = new Set([
 const DATE_FIELDS = new Set(["beginDate", "endDate", "hireRehireDate", "createdOn", "modifiedOn", "date"]);
 
 function toCamel(name) {
-  const n = String(name || "")
-    .replace(/_raw$/i, "Raw")
-    .replace(/_([a-z])/gi, (_, c) => c.toUpperCase());
-  if (!n) return n;
-  return n.charAt(0).toLowerCase() + n.slice(1);
+  const raw = String(name || "").trim();
+  if (!raw) return raw;
+  const parts = raw
+    .replace(/_raw$/i, " Raw")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/_/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!parts.length) return raw;
+  let out = parts[0].charAt(0).toLowerCase() + parts[0].slice(1).toLowerCase();
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i];
+    out += p.charAt(0).toUpperCase() + p.slice(1).toLowerCase();
+  }
+  if (out.endsWith("FTE")) out = `${out.slice(0, -3)}Fte`;
+  return out;
 }
 
 function numOrNull(v) {
