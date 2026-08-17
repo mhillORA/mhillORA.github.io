@@ -1381,6 +1381,82 @@
             // --- Azure API Configuration ---
             const API_BASE_URL = '/api';
 
+            // Collect client/API failures for Managers (stored via /api/client-errors).
+            const __clientErrorReportState = {
+                recentFingerprints: new Map(),
+                recentCount: 0,
+                windowStartedAt: Date.now()
+            };
+            const reportClientError = (payload = {}) => {
+                try {
+                    if (!payload || typeof payload !== 'object') return;
+                    const endpoint = String(payload.path || payload.url || '');
+                    if (endpoint.includes('/client-errors')) return;
+
+                    const now = Date.now();
+                    if (now - __clientErrorReportState.windowStartedAt > 60000) {
+                        __clientErrorReportState.windowStartedAt = now;
+                        __clientErrorReportState.recentCount = 0;
+                    }
+                    if (__clientErrorReportState.recentCount >= 20) return;
+
+                    const message = String(payload.message || 'Unknown client error').slice(0, 1000);
+                    const fingerprint = String(
+                        payload.fingerprint ||
+                        `${payload.source || 'client'}|${payload.status || ''}|${message}|${payload.path || ''}`
+                    ).slice(0, 200);
+                    const lastSeen = __clientErrorReportState.recentFingerprints.get(fingerprint) || 0;
+                    if (now - lastSeen < 30000) return;
+                    __clientErrorReportState.recentFingerprints.set(fingerprint, now);
+                    __clientErrorReportState.recentCount += 1;
+
+                    const user = (typeof state !== 'undefined' && state && state.currentUser) ? state.currentUser : null;
+                    const body = {
+                        source: String(payload.source || 'client').slice(0, 80),
+                        message,
+                        stack: String(payload.stack || '').slice(0, 4000),
+                        url: String(payload.url || (typeof location !== 'undefined' ? location.href : '')).slice(0, 500),
+                        path: String(payload.path || '').slice(0, 300),
+                        method: String(payload.method || '').slice(0, 20),
+                        status: typeof payload.status === 'number' ? payload.status : null,
+                        userAgent: String((typeof navigator !== 'undefined' && navigator.userAgent) || '').slice(0, 400),
+                        username: String(user?.username || payload.username || '').slice(0, 120),
+                        userId: String(user?.id || payload.userId || '').slice(0, 120),
+                        permissionLevel: String(user?.permissionLevel || payload.permissionLevel || '').slice(0, 40),
+                        context: String(payload.context || '').slice(0, 500),
+                        fingerprint
+                    };
+
+                    // Fire-and-forget; never block the user flow on reporting.
+                    fetch(`${API_BASE_URL}/client-errors`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                        keepalive: true
+                    }).catch(() => {});
+                } catch (_) {
+                    // Never let error reporting break the app.
+                }
+            };
+
+            window.addEventListener('error', (event) => {
+                reportClientError({
+                    source: 'window.onerror',
+                    message: event?.message || event?.error?.message || 'Unhandled window error',
+                    stack: event?.error?.stack || '',
+                    context: event?.filename ? `${event.filename}:${event.lineno || 0}:${event.colno || 0}` : ''
+                });
+            });
+            window.addEventListener('unhandledrejection', (event) => {
+                const reason = event?.reason;
+                reportClientError({
+                    source: 'unhandledrejection',
+                    message: reason?.message || String(reason || 'Unhandled promise rejection'),
+                    stack: reason?.stack || '',
+                    status: typeof reason?.status === 'number' ? reason.status : null
+                });
+            });
+
             /** Single calendar month. Only the visible month is loaded; navigating months fetches that month. */
             const getCalendarMonthRange = (dateInput) => {
                 const d = dateInput instanceof Date ? new Date(dateInput.getTime()) : new Date(dateInput || Date.now());
@@ -1492,14 +1568,17 @@
             class ApiService {
                 async request(endpoint, options = {}, isRetry = false) {
                     const url = `${API_BASE_URL}${endpoint}`;
+                    const method = options.method || 'GET';
                     const config = {
+                        ...options,
                         headers: {
                             'Content-Type': 'application/json',
                             ...options.headers
                         },
-                        ...options
+                        // Scheduler reads must not be satisfied by a stale browser/proxy response.
+                        ...(method === 'GET' ? { cache: 'no-store' } : {})
                     };
-                    const isGet = !config.method || config.method === 'GET';
+                    const isGet = method === 'GET';
 
                     try {
                         const response = await fetch(url, config);
@@ -1550,6 +1629,16 @@
                                     url: url,
                                     method: config.method
                                 });
+                                if (response.status >= 500 || response.status === 408 || response.status === 429 || response.status === 409) {
+                                    reportClientError({
+                                        source: 'api.response',
+                                        message: errorDetails || `${response.status} ${response.statusText}`,
+                                        path: endpoint,
+                                        method: config.method || 'GET',
+                                        status: response.status,
+                                        context: 'apiService.request'
+                                    });
+                                }
                             }
                             
                             const error = new Error(`API request failed: ${response.status} ${response.statusText}${errorDetails ? ` - ${errorDetails}` : ''}`);
@@ -1582,8 +1671,35 @@
                         // 404 for schedule-finalized is expected when month not finalized; don't spam console
                         const isScheduleNotFound404 = error.status === 404 && (error.detail === 'schedules not found' || (error.message && error.message.includes('schedules not found')));
                         if (!isScheduleNotFound404) console.error('API request error:', error);
+                        if (!error.status || error.status >= 500) {
+                            reportClientError({
+                                source: 'api.network',
+                                message: error.message || 'API network error',
+                                stack: error.stack || '',
+                                path: endpoint,
+                                method: config.method || 'GET',
+                                status: error.status || null,
+                                context: 'apiService.request.catch'
+                            });
+                        }
                         throw error;
                     }
+                }
+
+                async reportClientError(data) {
+                    return this.request('/client-errors', {
+                        method: 'POST',
+                        body: JSON.stringify(data || {})
+                    });
+                }
+
+                async getClientErrors(limit = 100) {
+                    const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 250);
+                    return this.request(`/client-errors?limit=${safeLimit}`, {
+                        headers: {
+                            'x-user-permission': state.currentUser?.permissionLevel || ''
+                        }
+                    });
                 }
 
                 // Studies
@@ -2765,8 +2881,9 @@
                             const session = JSON.parse(sessionData);
                             const u = session.user;
                             if (u && u.permissionLevel === 'CRC') {
+                                const uname = (u.username || '').toLowerCase().trim();
                                 const email = (u.email || u.username || '').toLowerCase().trim();
-                                if (email.includes('jkirby@oraclinical')) return 'scheduler'; // Admin-by-email: never default to CRC dashboard
+                                if (uname === 'admin' || email.includes('jkirby@oraclinical')) return 'scheduler';
                                 return 'dashboard';
                             }
                         }
@@ -7809,6 +7926,18 @@
             // Permission checking helper functions
             const getUserPermissions = () => {
                 if (!state.currentUser) return null;
+
+                const effectiveLevel = getEffectivePermissionLevel(state.currentUser);
+                if (isAdminUser() || effectiveLevel === 'Manager') {
+                    return {
+                        tabs: 'all',
+                        studiesAccess: 'all',
+                        studies: [],
+                        sitesAccess: 'all',
+                        sites: [],
+                        permissionLevel: 'full'
+                    };
+                }
                 
                 // If user has a permission set, use it
                 if (state.currentUser.permissionSetId) {
@@ -7844,23 +7973,9 @@
                     };
                 }
                 
-                // Admin users and Managers have full access
-                const effectiveLevel = getEffectivePermissionLevel(state.currentUser);
-                if (effectiveLevel === 'Manager') {
-                    return {
-                        tabs: 'all',
-                        studiesAccess: 'all',
-                        studies: [],
-                        sitesAccess: 'all',
-                        sites: [],
-                        permissionLevel: 'full'
-                    };
-                }
-                
                 // Default for non-Managers: limited access
                 // Supervisors get scheduler access with read-only permissions
-                const userEffectiveLevel = getEffectivePermissionLevel(state.currentUser);
-                if (userEffectiveLevel === 'Supervisor') {
+                if (effectiveLevel === 'Supervisor') {
                     return {
                         tabs: ['scheduler', 'timeOff'],
                         studiesAccess: 'all',
@@ -8620,7 +8735,7 @@
                                 <i data-lucide="settings" class="w-4 h-4"></i> Settings
                             </button>
                             ` : ''}
-                            ${state.currentUser && state.currentUser.permissionLevel === 'Supervisor' ? `
+                            ${state.currentUser && getEffectivePermissionLevel() === 'Supervisor' ? `
                             <button data-action="export-csv-btn" class="mobile-action-button bg-green-600 text-white hover:bg-green-700">
                                 <i data-lucide="download" class="w-4 h-4"></i> Export
                             </button>
@@ -8628,7 +8743,7 @@
                                 <i data-lucide="settings" class="w-4 h-4"></i> Settings
                             </button>
                             ` : ''}
-                            ${state.currentUser && state.currentUser.permissionLevel === 'CRC' ? `
+                            ${state.currentUser && effectiveIsCrcView() ? `
                             <button data-action="open-settings" class="mobile-action-button bg-gray-600 text-white hover:bg-gray-700">
                                 <i data-lucide="settings" class="w-4 h-4"></i> Settings
                             </button>
@@ -9373,12 +9488,15 @@
             };
 
             const DATA_REFRESH_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+            const SCHEDULER_REFRESH_INTERVAL_MS = 60 * 1000;
             const NAVAN_CONNECTION_CHECK_INTERVAL_MS = 120000;
             // Default: 30 days past, 60 days future (90 days total)
             // This range should complete within the 30-second platform timeout
             const DEFAULT_NAVAN_PAST_DAYS = 30;
             const DEFAULT_NAVAN_FUTURE_DAYS = 60;
             let dataRefreshTimerId = null;
+            let schedulerRefreshTimerId = null;
+            let schedulerRefreshHandler = null;
             let isRefreshingData = false;
 
             // --- Change Logging for Catch-Up Feature ---
@@ -9743,119 +9861,6 @@
                     sanitizedStudies.sort((a, b) => (a.title || a.name || '').localeCompare(b.title || b.name || ''));
                     ensureTrainingRole(roles);
                     roles.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                    
-                    // Clean up duplicate PTO/Unavailable events - keep only one per CRC per day
-                    // Only runs if duplicates are detected, and only deletes them once
-                    // Tracks cleaned CRC+date combinations to avoid re-processing
-                    const cleanupDuplicatePTOEvents = async (eventsList) => {
-                        // Load previously cleaned CRC+date combinations from localStorage
-                        const cleanedDuplicatesKey = 'chaos_cleaned_pto_duplicates';
-                        let cleanedDuplicateKeys = new Set();
-                        try {
-                            const stored = localStorage.getItem(cleanedDuplicatesKey);
-                            if (stored) {
-                                cleanedDuplicateKeys = new Set(JSON.parse(stored));
-                            }
-                        } catch (e) {
-                            // If localStorage fails, start fresh
-                            cleanedDuplicateKeys = new Set();
-                        }
-                        
-                        const ptoMap = new Map(); // key: `${crcId}-${date}`, value: array of events
-                        let hasDuplicates = false;
-                        
-                        // First pass: Find all PTO/Unavailable events and group by CRC+date
-                        // Early exit if no duplicates found
-                        eventsList.forEach(event => {
-                            if ((event.type === 'Unavailable' || event.type === 'Paid Time Off' || event.type === 'PTO' || event.type === 'Capped - FTE only') && event.crcId && event.date) {
-                                const key = `${event.crcId}-${event.date}`;
-                                if (!ptoMap.has(key)) {
-                                    ptoMap.set(key, []);
-                                }
-                                ptoMap.get(key).push(event);
-                                // Check if we found a duplicate (more than 1 event for same CRC+date)
-                                if (ptoMap.get(key).length > 1) {
-                                    hasDuplicates = true;
-                                }
-                            }
-                        });
-                        
-                        // Early return if no duplicates found - no need to process further
-                        if (!hasDuplicates) {
-                            return eventsList;
-                        }
-                        
-                        // Only process if duplicates exist
-                        const duplicatesToDelete = [];
-                        const cleanedKeys = [];
-                        
-                        // For each CRC+date with multiple events, keep the first one, mark others for deletion
-                        ptoMap.forEach((eventList, key) => {
-                            if (eventList.length > 1) {
-                                // Skip if we've already cleaned this CRC+date combination
-                                if (cleanedDuplicateKeys.has(key)) {
-                                    return; // Already cleaned, skip
-                                }
-                                
-                                // Sort by createdAt (most recent first) or keep first
-                                eventList.sort((a, b) => {
-                                    const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-                                    const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-                                    return bTime - aTime; // Most recent first
-                                });
-                                
-                                // Keep the first (most recent), delete the rest
-                                for (let i = 1; i < eventList.length; i++) {
-                                    duplicatesToDelete.push(eventList[i]);
-                                }
-                                
-                                // Mark this CRC+date combination as cleaned
-                                cleanedKeys.push(key);
-                            }
-                        });
-                        
-                        // Delete duplicates from database (only if we found any NEW duplicates)
-                        if (duplicatesToDelete.length > 0) {
-                            console.log(`Found ${duplicatesToDelete.length} new duplicate PTO events to clean up`);
-                            
-                            for (const duplicate of duplicatesToDelete) {
-                                try {
-                                    await apiService.deleteEvent(duplicate.id);
-                                    console.log(`Deleted duplicate PTO event ${duplicate.id} for CRC ${duplicate.crcId} on ${duplicate.date}`);
-                                } catch (error) {
-                                    console.error(`Error deleting duplicate PTO event ${duplicate.id}:`, error);
-                                    // Remove the key from cleanedKeys if deletion failed
-                                    const key = `${duplicate.crcId}-${duplicate.date}`;
-                                    const keyIndex = cleanedKeys.indexOf(key);
-                                    if (keyIndex > -1) {
-                                        cleanedKeys.splice(keyIndex, 1);
-                                    }
-                                }
-                            }
-                            
-                            // Mark successfully processed CRC+date combinations as cleaned
-                            if (cleanedKeys.length > 0) {
-                                cleanedKeys.forEach(key => cleanedDuplicateKeys.add(key));
-                                try {
-                                    // Store cleaned keys (keep only last 500 to avoid localStorage bloat)
-                                    const cleanedArray = Array.from(cleanedDuplicateKeys);
-                                    const trimmedArray = cleanedArray.slice(-500);
-                                    localStorage.setItem(cleanedDuplicatesKey, JSON.stringify(trimmedArray));
-                                } catch (e) {
-                                    console.warn('Failed to save cleaned duplicates to localStorage:', e);
-                                }
-                            }
-                            
-                            // Remove duplicates from the events array
-                            const duplicateIds = new Set(duplicatesToDelete.map(e => e.id));
-                            return eventsList.filter(e => !duplicateIds.has(e.id));
-                        }
-                        
-                        return eventsList;
-                    };
-                    
-                    // Re-enable PTO cleanup to handle any legacy duplicates
-                    events = await cleanupDuplicatePTOEvents(events || []);
                     
                     const artemisStudyIdsSet = new Set(sanitizedStudies.map(study => study.id));
                     const sanitizedEvents = typeof sanitizeEventsFromApi === 'function'
@@ -12258,8 +12263,8 @@
 
             // --- HTML GETTERS ---
             const getSchedulerHTML = () => {
-                const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
-                const isCRC = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isSupervisor = getEffectivePermissionLevel() === 'Supervisor';
+                const isCRC = effectiveIsCrcView();
                 const isCollapsed = state.sidebarCollapsed || false;
                 const sidebarHidden = isSupervisor || isCRC || isViewingAsCrc(); // Hide sidebar for supervisors, CRCs, and when viewing as CRC
                 return `
@@ -13736,7 +13741,7 @@
 
             const getAllInclusiveScheduleHTML = () => {
                 // Check if current user is CRC and find matching CRC
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 const matchingCrcId = getLoggedInCrcId();
                 // Check permissions for edit/delete buttons - CRC users cannot edit/delete events
                 const isManager = state.currentUser && state.currentUser.permissionLevel === 'Manager';
@@ -14022,6 +14027,11 @@
                                 <button data-action="export-all-schedule" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 flex items-center text-sm">
                                     <i data-lucide="download" class="w-4 h-4 mr-2"></i>Export to CSV
                                 </button>
+                                ${state.currentUser && state.currentUser.permissionLevel === 'Manager' ? `
+                                <button data-action="view-client-errors" class="bg-slate-700 text-white px-4 py-2 rounded-md hover:bg-slate-800 flex items-center text-sm" title="Errors reported from other users' browsers">
+                                    <i data-lucide="bug" class="w-4 h-4 mr-2"></i>Client Errors
+                                </button>
+                                ` : ''}
                             </div>
                         </div>
                         
@@ -15690,7 +15700,7 @@
                 if (!container) return;
                 
                 // Hide filters only for CRC users, show for supervisors and managers
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 if (isCRCUser) {
                     container.innerHTML = '';
                     return;
@@ -16387,7 +16397,7 @@
                 const month = now.getMonth();
                 
                 // Check if CRC user - filter to only their events
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 const matchingCrcId = getLoggedInCrcId();
 
                 let crcsToDisplay = state.crcs;
@@ -16745,7 +16755,7 @@
                 endOfWeek.setDate(endOfWeek.getDate() + 6);
                 
                 // Check if CRC user - filter to only their events
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 const matchingCrcId = getLoggedInCrcId();
 
                 let crcsToDisplay = state.crcs;
@@ -18158,7 +18168,7 @@
                 const isDarkMode = document.documentElement.classList.contains('dark');
                 
                 // Check if CRC user - filter to only their events
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 const matchingCrcId = getLoggedInCrcId();
 
                 let crcsToDisplay = state.crcs;
@@ -18649,7 +18659,7 @@
                 const isDarkMode = document.documentElement.classList.contains('dark');
                 
                 // Check if CRC user - filter to only their events
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 const matchingCrcId = getLoggedInCrcId();
 
                 let crcsToDisplay = state.crcs;
@@ -19304,7 +19314,7 @@
                 
                 
                 // Check if CRC user - filter to only their events
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 const matchingCrcId = getLoggedInCrcId();
 
                 let crcsToDisplay = state.crcs;
@@ -20720,7 +20730,7 @@
 
                 const now = state.crcCalendarDate;
                 const monthName = now.toLocaleString('default', { month: 'long', year: 'numeric' });
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC' && !isAdminUser();
+                const isCRCUser = effectiveIsCrcView();
                 const matchingCrcId = isCRCUser ? getLoggedInCrcId() : null;
                 
                 let utilizationHTML = '';
@@ -20810,7 +20820,7 @@
 
             const setupAllScheduleFilters = () => {
                 // Check if current user is CRC - if so, don't allow filter changes
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 
                 const startDateInput = document.getElementById('all-schedule-start-date');
                 const endDateInput = document.getElementById('all-schedule-end-date');
@@ -23531,6 +23541,11 @@
                                 <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Remove events with empty or invalid role assignments (N/A entries) from the database.</p>
                                 <button type="button" data-action="cleanup-events" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700">Clean Up N/A Entries</button>
                             </div>
+                            <div class="border-t dark:border-gray-700 pt-6">
+                                <h3 class="text-lg font-semibold dark:text-white mb-4">Client Error Log</h3>
+                                <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Review save/API/browser errors reported from other users' sessions.</p>
+                                <button type="button" data-action="view-client-errors" class="bg-slate-700 text-white py-2 px-4 rounded-md hover:bg-slate-800">View Recent Errors</button>
+                            </div>
                         ` : ''}
                     </div>
                 `;
@@ -23588,7 +23603,7 @@
                 forceDeduplicateState();
                 
                 // Check if current user is CRC and get their ID
-                const isCRCUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCRCUser = effectiveIsCrcView();
                 const matchingCrcId = getLoggedInCrcId();
                 
                 // DEDUPLICATION: Track seen event IDs to prevent duplicate events in export
@@ -27783,7 +27798,7 @@
             
             // New PTO request modal - Step 1: Select Employee
             const getPTOEmployeeSelectionModalHTML = () => {
-                const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCrcUser = effectiveIsCrcView();
                 const loggedInCrcId = getLoggedInCrcId();
                 const loggedInCrc = loggedInCrcId ? state.crcs.find(c => c.id === loggedInCrcId) : null;
                 
@@ -27972,7 +27987,7 @@
                 const thirtyDaysAgoStr = toDateOnlyString(thirtyDaysAgo);
                 
                 // Get CRC ID for checking existing time off
-                const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCrcUser = effectiveIsCrcView();
                 const loggedInCrcId = getLoggedInCrcId();
                 const crcId = isCrcUser && loggedInCrcId ? loggedInCrcId : state.selectedCrcForUnavailability;
                 
@@ -28252,7 +28267,7 @@
             };
 
             const getManageUnavailabilityModalHTML = () => {
-                const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCrcUser = effectiveIsCrcView();
                 const loggedInCrcId = getLoggedInCrcId();
                 const loggedInCrc = loggedInCrcId ? state.crcs.find(c => c.id === loggedInCrcId) : null;
                 
@@ -31422,7 +31437,7 @@
                         }
                         
                         // For CRC users, ensure their CRC is selected
-                        const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                        const isCrcUser = effectiveIsCrcView();
                         const loggedInCrcId = getLoggedInCrcId();
                         if (isCrcUser && loggedInCrcId && !state.selectedCrcForUnavailability) {
                             setState({ selectedCrcForUnavailability: loggedInCrcId }, { skipRender: true });
@@ -31495,7 +31510,7 @@
                         const canSelectPastDates = isAdminUser() || getEffectivePermissionLevel() === 'Manager';
                         if (dateStr < today && !canSelectPastDates) return;
                         
-                        const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                        const isCrcUser = effectiveIsCrcView();
                         const loggedInCrcId = getLoggedInCrcId();
                         const crcId = isCrcUser && loggedInCrcId ? loggedInCrcId : state.selectedCrcForUnavailability;
                         const periodSelect = document.getElementById('pto-period-select');
@@ -31546,7 +31561,7 @@
                         }
                         
                         // Get CRC ID
-                        const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                        const isCrcUser = effectiveIsCrcView();
                         const loggedInCrcId = getLoggedInCrcId();
                         const crcId = isCrcUser && loggedInCrcId 
                             ? loggedInCrcId 
@@ -31811,8 +31826,8 @@
                     }
                     case 'toggle-sidebar': {
                         // Prevent CRC and Supervisor users from accessing sidebar
-                        const isCRC = state.currentUser && state.currentUser.permissionLevel === 'CRC';
-                        const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
+                        const isCRC = effectiveIsCrcView();
+                        const isSupervisor = getEffectivePermissionLevel() === 'Supervisor';
                         if (isCRC || isSupervisor) break;
                         
                         const newCollapsedState = !state.sidebarCollapsed;
@@ -31840,6 +31855,11 @@
                             setState({ activeTab: 'planning-grid', calendarView: 'planning-grid', planningGridMode: 'monthly' });
                         } else {
                             setState({ activeTab: desiredTab });
+                        }
+                        if (desiredTab === 'scheduler' || desiredTab === 'planning-grid' || desiredTab === 'allSchedule') {
+                            // Opening a schedule view should always reconcile with Cosmos, not a
+                            // potentially old snapshot left in this browser.
+                            ensureEventsCoverVisibleMonth({ force: true });
                         }
                         break;
                     }
@@ -32201,6 +32221,68 @@
                     case 'open-maintenance-modal': openModal(getMaintenanceModalHTML(), '4xl'); break;
                     case 'find-duplicates': showDuplicateFinderModal(); break;
                     case 'auto-cleanup-duplicates': autoCleanupDuplicates(); break;
+                    case 'view-client-errors': {
+                        (async () => {
+                            if (!state.currentUser || state.currentUser.permissionLevel !== 'Manager') {
+                                showNotification('Managers only.', 'error');
+                                return;
+                            }
+                            try {
+                                showNotification('Loading client errors…', 'info');
+                                const rows = await apiService.getClientErrors(100);
+                                const list = Array.isArray(rows) ? rows : [];
+                                const escapeHtml = (value) => String(value ?? '')
+                                    .replace(/&/g, '&amp;')
+                                    .replace(/</g, '&lt;')
+                                    .replace(/>/g, '&gt;')
+                                    .replace(/"/g, '&quot;');
+                                const body = list.length === 0
+                                    ? `<p class="text-sm text-gray-600 dark:text-gray-300">No client errors reported yet.</p>`
+                                    : `
+                                        <div class="overflow-x-auto max-h-[65vh] border border-gray-200 dark:border-gray-700 rounded-md">
+                                            <table class="min-w-full text-sm">
+                                                <thead class="bg-gray-50 dark:bg-gray-800 sticky top-0">
+                                                    <tr>
+                                                        <th class="text-left px-3 py-2">When</th>
+                                                        <th class="text-left px-3 py-2">User</th>
+                                                        <th class="text-left px-3 py-2">Source</th>
+                                                        <th class="text-left px-3 py-2">Status</th>
+                                                        <th class="text-left px-3 py-2">Message</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+                                                    ${list.map(row => `
+                                                        <tr class="align-top">
+                                                            <td class="px-3 py-2 whitespace-nowrap text-xs text-gray-500">${escapeHtml(row.createdAt || '')}</td>
+                                                            <td class="px-3 py-2 whitespace-nowrap">${escapeHtml(row.username || row.userId || 'anonymous')}</td>
+                                                            <td class="px-3 py-2 whitespace-nowrap text-xs">${escapeHtml(row.source || '')}${row.path ? `<div class="text-gray-500">${escapeHtml(row.path)}</div>` : ''}</td>
+                                                            <td class="px-3 py-2">${escapeHtml(row.status ?? '')}</td>
+                                                            <td class="px-3 py-2">
+                                                                <div class="font-medium">${escapeHtml(row.message || '')}</div>
+                                                                ${row.context ? `<div class="text-xs text-gray-500 mt-1">${escapeHtml(row.context)}</div>` : ''}
+                                                                ${row.stack ? `<pre class="mt-2 text-[11px] whitespace-pre-wrap text-gray-500 max-h-28 overflow-auto">${escapeHtml(row.stack)}</pre>` : ''}
+                                                            </td>
+                                                        </tr>
+                                                    `).join('')}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    `;
+                                openModal(`
+                                    <h3 class="text-xl font-bold dark:text-white mb-2">Client Error Log</h3>
+                                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Latest ${list.length} report(s) from user browsers (save failures, API 5xx/timeouts, uncaught errors).</p>
+                                    ${body}
+                                    <div class="flex justify-end mt-4">
+                                        <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Close</button>
+                                    </div>
+                                `, '4xl');
+                            } catch (err) {
+                                console.error('Failed to load client errors:', err);
+                                showNotification(err.message || 'Failed to load client errors.', 'error');
+                            }
+                        })();
+                        break;
+                    }
                     case 'view-truck-details': {
                         const truck = state.trucks.find(t => t.id === id);
                         if (truck) openModal(getTruckDetailsModalHTML(truck), '4xl');
@@ -35272,7 +35354,7 @@
                                     const isSupervisor = state.currentUser && state.currentUser.permissionLevel === 'Supervisor';
                                     const isAdmin = state.currentUser && state.currentUser.permissionLevel === 'Admin';
                                     const isManager = state.currentUser && state.currentUser.permissionLevel === 'Manager';
-                                    const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                                    const isCrcUser = effectiveIsCrcView();
                                     const isOwnRequest = state.currentUser && (
                                         (loggedInCrcId && (request.crcId === loggedInCrcId || request.requestedBy === loggedInCrcId)) ||
                                         request.requestedBy === state.currentUser.id ||
@@ -40136,6 +40218,13 @@
                                 }, 1500);
                             } catch (err) {
                                 console.error("Error submitting form:", err);
+                                reportClientError({
+                                    source: 'crc-event-form',
+                                    message: err?.message || 'Shift form submit failed',
+                                    stack: err?.stack || '',
+                                    status: typeof err?.status === 'number' ? err.status : null,
+                                    context: isEditing ? `edit:${eventId || ''}` : 'create'
+                                });
                                 showNotification(err?.message || 'An error occurred while saving. Nothing may have been stored — please try again.', 'error');
                             } finally {
                                 form.dataset.submitting = 'false';
@@ -41590,15 +41679,24 @@
                 }
             });
 
-            /** Load only the calendar month being viewed (replaces prior month data in memory). */
-            const ensureEventsCoverVisibleMonth = async () => {
+            let visibleMonthLoadSequence = 0;
+
+            /** Load the canonical calendar month being viewed (replaces prior month data in memory). */
+            const ensureEventsCoverVisibleMonth = async (options = {}) => {
                 if (!state.initialLoadComplete) return;
+                const force = options.force === true;
                 const range = getCalendarMonthRange(state.crcCalendarDate || new Date());
                 const rng = state.eventsQueryRange;
-                if (rng && rng.startDate === range.startDate && rng.endDate === range.endDate) return;
+                if (!force && rng && rng.startDate === range.startDate && rng.endDate === range.endDate) return;
 
+                const loadSequence = ++visibleMonthLoadSequence;
                 try {
+                    if (force) apiService.invalidateEventsHttpCache();
                     const fetched = await apiService.getEvents(range);
+                    // Ignore an older response if the user navigated again while it was loading.
+                    if (loadSequence !== visibleMonthLoadSequence) return;
+                    const currentRange = getCalendarMonthRange(state.crcCalendarDate || new Date());
+                    if (currentRange.startDate !== range.startDate || currentRange.endDate !== range.endDate) return;
                     const arr = Array.isArray(fetched) ? fetched : [];
                     const artemisStudyIdsSet = new Set((state.studies || []).map(study => study.id));
                     const sanitized = sanitizeEventsFromApi(arr, artemisStudyIdsSet);
@@ -47818,7 +47916,7 @@
                 // For CRC users, they can ONLY see their own requests
                 // Use getLoggedInCrcId() to get the matched CRC ID
                 const loggedInCrcId = getLoggedInCrcId();
-                const isCrcUser = state.currentUser && state.currentUser.permissionLevel === 'CRC';
+                const isCrcUser = effectiveIsCrcView();
                 
                 let requestsToShow;
                 if (isCrcUser && loggedInCrcId) {
@@ -53758,6 +53856,20 @@
                 // Use background polling to keep data fresh without disrupting the user
                 debugLog('CHAOS: Starting background data refresh loop');
                 scheduleDataRefresh();
+
+                if (schedulerRefreshHandler) {
+                    window.removeEventListener('focus', schedulerRefreshHandler);
+                    document.removeEventListener('visibilitychange', schedulerRefreshHandler);
+                }
+                schedulerRefreshHandler = () => {
+                    if (!state.initialLoadComplete || document.hidden) return;
+                    if (!['scheduler', 'planning-grid', 'allSchedule'].includes(state.activeTab)) return;
+                    ensureEventsCoverVisibleMonth({ force: true });
+                };
+                if (schedulerRefreshTimerId) clearInterval(schedulerRefreshTimerId);
+                schedulerRefreshTimerId = setInterval(schedulerRefreshHandler, SCHEDULER_REFRESH_INTERVAL_MS);
+                window.addEventListener('focus', schedulerRefreshHandler);
+                document.addEventListener('visibilitychange', schedulerRefreshHandler);
                 
                 // Schedule hourly Navan imports (7AM-9PM, every hour on the hour)
                 const scheduleHourlyNavanImport = () => {
@@ -54269,13 +54381,31 @@
 					// Check for existing session
 					if (session && session.user) {
 						debugLog('CHAOS: Restoring session for user:', session.user.username);
-						const email = (session.user.email || session.user.username || '').toLowerCase().trim();
+						let restoredUser = session.user;
+						if (restoredUser.id && restoredUser.id !== 'admin-backdoor') {
+							try {
+								const fresh = await apiService.getUser(restoredUser.id);
+								if (fresh && typeof fresh === 'object') {
+									const { password, ...safeUser } = fresh;
+									restoredUser = { ...restoredUser, ...safeUser };
+									try {
+										localStorage.setItem('ora_smo_session', JSON.stringify({
+											user: restoredUser,
+											timestamp: session.timestamp || Date.now()
+										}));
+									} catch (_) { /* ignore */ }
+								}
+							} catch (error) {
+								console.warn('CHAOS: Could not refresh user from API; using stored session', error);
+							}
+						}
+						const email = (restoredUser.email || restoredUser.username || '').toLowerCase().trim();
 						const isAdminByEmailSession = email.includes('jkirby@oraclinical');
-						const isManagerOrAdmin = session.user.permissionLevel === 'Manager' ||
-							(session.user.username && session.user.username.toLowerCase().trim() === 'admin') ||
+						const isManagerOrAdmin = restoredUser.permissionLevel === 'Manager' ||
+							(restoredUser.username && restoredUser.username.toLowerCase().trim() === 'admin') ||
 							isAdminByEmailSession;
 						setState({
-							currentUser: session.user,
+							currentUser: restoredUser,
 							isAuthenticated: true,
 							...(isManagerOrAdmin ? { viewAsCrcId: null } : {})
 						});
@@ -54283,7 +54413,7 @@
 						state.userId = 'chaos-user';
 						
 						// Load users if Manager (or admin-by-email)
-						if (session.user.permissionLevel === 'Manager' || isAdminByEmailSession) {
+						if (isManagerOrAdmin) {
 							try {
 								const users = await apiService.getUsers();
 								setState({ users });
@@ -54293,7 +54423,7 @@
 						}
 						
 						// Redirect CRC users to dashboard on refresh — but never for managers/admins or admin-by-email (they must not get stuck in CRC view)
-						if (session.user.permissionLevel === 'CRC' && !isManagerOrAdmin) {
+						if (!isManagerOrAdmin && getEffectivePermissionLevel(restoredUser) === 'CRC') {
 							setState({ activeTab: 'dashboard' });
 						}
 						if (isManagerOrAdmin && state.activeTab === 'dashboard') {

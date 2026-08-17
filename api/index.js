@@ -156,6 +156,15 @@ const ensureEmailTriggersContainer = async () => {
     });
 };
 
+// Client-reported browser/API errors for Managers to review.
+const ensureClientErrorsContainer = async () => {
+    const { database } = getCosmosClient();
+    await database.containers.createIfNotExists({
+        id: 'client-errors',
+        partitionKey: { paths: ['/id'] }
+    });
+};
+
 // ---------------------------------------------------------------------------------
 // EMAIL TEMPLATE RENDERING + SEND
 // ---------------------------------------------------------------------------------
@@ -7615,6 +7624,86 @@ app.http('usersMergeDuplicates', {
             };
         } catch (error) {
             return handleError(context, error, 'Merge duplicate users failed');
+        }
+    },
+});
+
+// Collect / list client-side errors so Managers can see failures other users hit.
+app.http('clientErrors', {
+    methods: ['GET', 'POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'client-errors',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } };
+        }
+        try {
+            await ensureClientErrorsContainer();
+            const container = getContainer('client-errors');
+
+            if (request.method === 'GET') {
+                const permission = String(
+                    request.headers.get?.('x-user-permission') ||
+                    request.headers.get?.('user-permission') ||
+                    ''
+                ).trim().toLowerCase();
+                if (permission !== 'manager') {
+                    return {
+                        status: 403,
+                        jsonBody: { error: 'Managers only' },
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    };
+                }
+                const limitRaw = Number(request.query.get('limit') || 100);
+                const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 100, 1), 250);
+                const { resources } = await container.items
+                    .query({
+                        query: 'SELECT TOP @limit * FROM c ORDER BY c.createdAt DESC',
+                        parameters: [{ name: '@limit', value: limit }]
+                    })
+                    .fetchAll();
+                return {
+                    status: 200,
+                    jsonBody: Array.isArray(resources) ? resources : [],
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+
+            if (request.method === 'POST') {
+                const body = await request.json().catch(() => ({}));
+                const truncate = (value, max = 2000) => {
+                    const text = value == null ? '' : String(value);
+                    return text.length > max ? `${text.slice(0, max)}…` : text;
+                };
+                const now = new Date().toISOString();
+                const item = {
+                    id: generateId(),
+                    createdAt: now,
+                    source: truncate(body.source || 'client', 80),
+                    message: truncate(body.message || 'Unknown client error', 1000),
+                    stack: truncate(body.stack || '', 4000),
+                    url: truncate(body.url || '', 500),
+                    path: truncate(body.path || '', 300),
+                    method: truncate(body.method || '', 20),
+                    status: typeof body.status === 'number' ? body.status : null,
+                    userAgent: truncate(body.userAgent || '', 400),
+                    username: truncate(body.username || '', 120),
+                    userId: truncate(body.userId || '', 120),
+                    permissionLevel: truncate(body.permissionLevel || '', 40),
+                    context: truncate(body.context || '', 500),
+                    fingerprint: truncate(body.fingerprint || '', 200)
+                };
+                const { resource } = await container.items.create(item);
+                return {
+                    status: 201,
+                    jsonBody: { id: resource.id, createdAt: resource.createdAt },
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                };
+            }
+
+            return { status: 405, jsonBody: { error: 'Method Not Allowed' } };
+        } catch (error) {
+            return handleError(context, error, 'Client errors operation failed');
         }
     },
 });
