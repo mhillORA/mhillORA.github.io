@@ -18191,10 +18191,13 @@
                     weekDays.push(day);
                 }
                 
-                // Filter events for the week
+                // Filter events for the week. Compare date-only strings so a daylight-saving
+                // shift can never pull in an eighth day or drop the last one.
+                const weekStartStr = toDateOnlyString(startOfWeek);
+                const weekEndStr = toDateOnlyString(weekDays[weekDays.length - 1]);
                 let filteredEvents = getDisplayEvents().filter(e => {
-                    const eventDate = new Date(e.date + 'T00:00:00');
-                    return eventDate >= startOfWeek && eventDate < new Date(startOfWeek.getTime() + 7 * 24 * 60 * 60 * 1000);
+                    const eventDate = String(e.date || '').slice(0, 10);
+                    return !!eventDate && eventDate >= weekStartStr && eventDate <= weekEndStr;
                 });
                 // Exclude Time Off / PTO – they belong on the time off calendar, not the planning grid
                 filteredEvents = filteredEvents.filter(e =>
@@ -31797,29 +31800,41 @@
                         e.stopPropagation();
                         if (view) {
                             setState({ calendarView: view });
-                            if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') {
-                                renderCRCCalendar();
-                            }
+                            (async () => {
+                                await ensureEventsCoverVisibleMonth();
+                                if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') {
+                                    renderCRCCalendar();
+                                }
+                            })();
                         }
                         break;
                     case 'set-planning-grid-mode':
                         setState({ planningGridMode: mode });
-                        if ((state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') && state.calendarView === 'planning-grid') {
-                            renderCRCCalendar();
-                        }
+                        (async () => {
+                            await ensureEventsCoverVisibleMonth();
+                            if ((state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') && state.calendarView === 'planning-grid') {
+                                renderCRCCalendar();
+                            }
+                        })();
                         break;
                     case 'set-display-mode': 
                         setState({ calendarDisplayMode: mode }); 
-                        if (state.activeTab === 'scheduler') {
-                            renderCRCCalendar();
-                        }
+                        (async () => {
+                            await ensureEventsCoverVisibleMonth();
+                            if (state.activeTab === 'scheduler') {
+                                renderCRCCalendar();
+                            }
+                        })();
                         break;
                     case 'set-at-a-glance-group': setState({ atAGlanceGroupBy: group }); break;
                     case 'set-at-a-glance-view-mode':
                         setState({ atAGlanceViewMode: mode });
-                        if (state.activeTab === 'scheduler' && state.calendarDisplayMode === 'at-a-glance') {
-                            renderCRCCalendar();
-                        }
+                        (async () => {
+                            await ensureEventsCoverVisibleMonth();
+                            if (state.activeTab === 'scheduler' && state.calendarDisplayMode === 'at-a-glance') {
+                                renderCRCCalendar();
+                            }
+                        })();
                         break;
                     case 'set-sidebar-tab': {
                         break;
@@ -41681,11 +41696,52 @@
 
             let visibleMonthLoadSequence = 0;
 
-            /** Load the canonical calendar month being viewed (replaces prior month data in memory). */
+            /** Calendar span currently on screen. Week and day views can cross month boundaries. */
+            const getVisibleSchedulerRange = () => {
+                const base = state.crcCalendarDate instanceof Date ? new Date(state.crcCalendarDate.getTime()) : new Date();
+                const isPlanningGrid = state.calendarView === 'planning-grid';
+                const isAtAGlance = state.calendarDisplayMode === 'at-a-glance';
+                const showsWeek = state.calendarView === 'week'
+                    || state.calendarView === 'roles'
+                    || (isPlanningGrid && state.planningGridMode === 'weekly')
+                    || (isAtAGlance && state.atAGlanceViewMode === 'weekly');
+                const showsDay = (isPlanningGrid && state.planningGridMode === 'daily')
+                    || (isAtAGlance && state.atAGlanceViewMode === 'daily');
+
+                if (showsWeek) {
+                    const start = new Date(base);
+                    start.setDate(start.getDate() - getDaySaturdayStart(base));
+                    const end = new Date(start);
+                    end.setDate(start.getDate() + 6);
+                    return { startDate: toDateOnlyString(start), endDate: toDateOnlyString(end) };
+                }
+                if (showsDay) {
+                    const day = toDateOnlyString(base);
+                    return { startDate: day, endDate: day };
+                }
+                return getCalendarMonthRange(base);
+            };
+
+            /** Widen a span to whole months so a week straddling two months loads both of them. */
+            const expandRangeToWholeMonths = (range) => {
+                const start = range && range.startDate ? new Date(`${range.startDate}T00:00:00`) : null;
+                const end = range && range.endDate ? new Date(`${range.endDate}T00:00:00`) : null;
+                if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+                    return getDefaultEventsDateRange();
+                }
+                return {
+                    startDate: toDateOnlyString(new Date(start.getFullYear(), start.getMonth(), 1)),
+                    endDate: toDateOnlyString(new Date(end.getFullYear(), end.getMonth() + 1, 0)),
+                };
+            };
+
+            const getEventsRangeForVisibleSchedule = () => expandRangeToWholeMonths(getVisibleSchedulerRange());
+
+            /** Load every month the current view touches (replaces prior range data in memory). */
             const ensureEventsCoverVisibleMonth = async (options = {}) => {
                 if (!state.initialLoadComplete) return;
                 const force = options.force === true;
-                const range = getCalendarMonthRange(state.crcCalendarDate || new Date());
+                const range = getEventsRangeForVisibleSchedule();
                 const rng = state.eventsQueryRange;
                 if (!force && rng && rng.startDate === range.startDate && rng.endDate === range.endDate) return;
 
@@ -41695,7 +41751,7 @@
                     const fetched = await apiService.getEvents(range);
                     // Ignore an older response if the user navigated again while it was loading.
                     if (loadSequence !== visibleMonthLoadSequence) return;
-                    const currentRange = getCalendarMonthRange(state.crcCalendarDate || new Date());
+                    const currentRange = getEventsRangeForVisibleSchedule();
                     if (currentRange.startDate !== range.startDate || currentRange.endDate !== range.endDate) return;
                     const arr = Array.isArray(fetched) ? fetched : [];
                     const artemisStudyIdsSet = new Set((state.studies || []).map(study => study.id));
