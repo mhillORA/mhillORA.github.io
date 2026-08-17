@@ -6,7 +6,23 @@ const { getDatabase, replaceSheet, replaceDocs, replaceDq, writeRun } = require(
 const { docsFromCsvText, classifyCsvName, WORKITEM_SPEC } = require("./csvStaffing");
 
 const BLOB_CONTAINER = "insightsrm";
-const LANDING_RE = /^landing\/\d{4}\/\d{2}\/\d{2}\/\d+\/.+/;
+/** landing/2026/08/17/1800/file.xlsx — time folder optional: landing/2026/8/17/file.xlsx also ok */
+const LANDING_RE = /^landing\/\d{4}\/\d{1,2}\/\d{1,2}(?:\/[^/]+)?\/[^/]+$/i;
+
+function storageAccountHint(conn) {
+  const m = String(conn || "").match(/AccountName=([^;]+)/i);
+  return m ? m[1] : "unknown";
+}
+
+async function sampleBlobNames(limit = 20) {
+  const container = blobClient();
+  const names = [];
+  for await (const blob of container.listBlobsFlat()) {
+    names.push(blob.name);
+    if (names.length >= limit) break;
+  }
+  return names;
+}
 
 function env(name, fallback = "") {
   const v = (process.env[name] || "").trim();
@@ -245,7 +261,16 @@ async function runRmIngest(log) {
     out.csv = await loadStaffingParts(parts, log);
   }
   if (!out.xlsx && !out.csv) {
-    throw new Error("No landing/yyyy/MM/dd/HHmm xlsx, RM csv, or zip in container insightsrm");
+    const seen = await sampleBlobNames(20);
+    const acct = storageAccountHint(env("INSIGHTSRM_STORAGE"));
+    throw new Error(
+      "No RM files matched landing/yyyy/MM/dd/(optional-time)/filename in container insightsrm. " +
+        `Storage account from INSIGHTSRM_STORAGE: ${acct}. ` +
+        "Upload example: landing/2026/08/17/1800/Ora_Resource_Model_1.xlsx (not container root, not netsuite). " +
+        (seen.length
+          ? `Blobs in this container (first ${seen.length}): ${seen.join(" | ")}`
+          : "Container insightsrm is empty — wrong storage account or wrong container name.")
+    );
   }
   return out;
 }

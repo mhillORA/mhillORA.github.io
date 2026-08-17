@@ -23,6 +23,7 @@ app.http("rmLoadNow", {
       const result = await runRmIngest((m) => context.log(m));
       return { status: 200, jsonBody: { ok: true, ...result } };
     } catch (err) {
+      context.error(String(err.stack || err));
       return { status: 500, jsonBody: { ok: false, error: String(err.message || err) } };
     }
   }
