@@ -17,7 +17,7 @@ function guessKey(text) {
   if (/(netsuite|profitability|gross margin|\bgm\b|budgeted gm|actual gm|change order|billable hr|cost per billable|eos gm|service line)/.test(t)) {
     return "netsuite";
   }
-  if (/(staff|resource|cra|fte|capacity|assign|backfill|headcount)/.test(t)) return "staffing";
+  if (/(staff|resource|cra|fte|capacity|assign|backfill|headcount|over.?allocat|overallocat|allocation)/.test(t)) return "staffing";
   if (/(visit|visits)/.test(t)) return "visits";
   return "enrollment";
 }
@@ -329,6 +329,32 @@ async function fromRmStaffing(question) {
       )
     : [];
 
+  if (wantOver && !over.length) {
+    const totals = await safeQuery(
+      LENS.rmStaffingEmployee,
+      "SELECT TOP 400 * FROM c WHERE c.docType = @t AND c.rowKind = @k",
+      [
+        { name: "@t", value: "lens_rm_staffing_employee" },
+        { name: "@k", value: "total" }
+      ]
+    );
+    const months = totals.map((r) => r.yearMonth).filter(Boolean).sort();
+    const latest = months.length ? months[months.length - 1] : null;
+    const slice = latest ? totals.filter((r) => r.yearMonth === latest) : totals;
+    for (const r of slice) {
+      const assigned = numOrNull(r.valueFte) || 0;
+      if (assigned <= 1) continue;
+      over.push({
+        fullName: r.employeeName,
+        jobTitle: r.roleCode || "",
+        currentAssignedFte: assigned,
+        overAllocationFte: assigned - 1,
+        active: true,
+        _ts: r._ts
+      });
+    }
+  }
+
   const hasAny = over.length || gaps.length || headcount.length || assignments.length || studies.length || schedule.length;
   if (!hasAny) return null;
 
@@ -463,7 +489,9 @@ async function fromRmStaffing(question) {
     );
   }
 
-  if (wantOver || (!wantGap && over.length && !wantAssign)) {
+  if (wantOver && !over.length) return null;
+
+  if ((wantOver && over.length) || (!wantGap && over.length && !wantAssign)) {
     const ranked = over
       .slice()
       .sort((a, b) => (numOrNull(b.overAllocationFte) || 0) - (numOrNull(a.overAllocationFte) || 0));
@@ -892,6 +920,35 @@ async function fromRegistry(question) {
   );
 }
 
+function emptyRmAnswer(question) {
+  return stamp(
+    {
+      q: question,
+      needs: ["insightsrm"],
+      icon: "users",
+      summary:
+        "RM is in scope. Cosmos lens_rm_* has no rows for this question yet — InsightsRM has not been loaded (ora-lens-rm-ingest), or this pack is empty. Not an Ora clinical-rollup question.",
+      chartTitle: "No InsightsRM rows yet",
+      chartNote: "lens_rm_* · not NetSuite · not ora_fact_study",
+      chartType: "bar",
+      bars: [],
+      tableTitle: "InsightsRM",
+      grid: "1fr",
+      cols: ["Note"],
+      rows: [["No lens_rm_* documents yet. Upload the RM workbook/zips to container insightsrm and run ora-lens-rm-ingest."]],
+      caveat: rmCaveat(),
+      trace: [
+        "Purpose is RM (insightsrm). Did not query ora_fact_study.",
+        "lens_rm_dq / roster / assignments / staffing grids were empty or missing."
+      ],
+      query: "lens_rm_* (empty)",
+      confidence: "medium",
+      followUps: ["Who is over-allocated?", "Which roles are short on capacity?", "Show CRA assignments"]
+    },
+    []
+  );
+}
+
 function emptyAnswer(question) {
   return stamp(
     {
@@ -1110,10 +1167,14 @@ async function answerFromCosmos(question, sources, opts) {
   getDb();
   const fromQ = String(question).match(/\b\d{2}-\d{3}-\d{4}\b/);
   const projectNumber = String((opts && opts.projectNumber) || (fromQ && fromQ[0]) || "").trim();
-  const key = guessKey(question);
+  const src = new Set((sources || []).map(String));
+  const rmScope = src.has("insightsrm") && !src.has("ora");
+  let key = guessKey(question);
+  if (rmScope) key = "staffing";
   let answer = null;
   if (projectNumber && key !== "staffing") answer = await fromProjectContext(question, projectNumber);
   if (!answer && key === "staffing") answer = await fromRmStaffing(question);
+  if (!answer && key === "staffing") answer = emptyRmAnswer(question);
   if (!answer && key === "missing_enrolled") answer = await fromOraFactStudy(question, { missingOnly: true });
   if (!answer && key === "netsuite") answer = await fromNsProjects(question);
   if (!answer && key === "sites") answer = await fromOraFactSite(question);

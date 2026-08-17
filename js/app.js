@@ -80,7 +80,7 @@
     if (/\b(sites?|investigator|scorecard|site psm)\b/.test(t) && !/\bvisits?\b/.test(t)) return "sites";
     const competitive = ["competitor", "sponsor", "registry", "market", "poland", "cac", "pipeline", "bid"];
     if (competitive.some((w) => t.includes(w))) return "competitive";
-    const staffing = ["staff", "resource", "cra", "fte", "capacity", "assign", "backfill", "rolls off", "headcount"];
+    const staffing = ["staff", "resource", "cra", "fte", "capacity", "assign", "backfill", "rolls off", "headcount", "over-allocated", "overallocated", "allocation"];
     if (staffing.some((w) => t.includes(w))) return "staffing";
     return "enrollment";
   }
