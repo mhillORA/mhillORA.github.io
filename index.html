@@ -6125,8 +6125,131 @@
                 return assigned && crc.id === assignedCrcId;
             };
 
+            /** Same physical visit: date + site + period + visit + group number + studies. Ignores groupId so re-saves do not look like extra shifts. */
+            const getSiteAssignmentIdentityKey = (event) => {
+                if (!event) return '';
+                const date = String(event.date || event.startDate || '').slice(0, 10);
+                const siteId = event.siteId || '';
+                const period = event.period || 'Full Day';
+                const visit = event.visitNumber || '';
+                const groupNumber = event.groupNumber || '';
+                const studies = Array.isArray(event.studyIds) ? [...event.studyIds].filter(Boolean).map(String).sort().join(',') : '';
+                return `sa:${date}|${siteId}|${period}|${visit}|${groupNumber}|${studies}`;
+            };
+
+            const countAssignedCrcsOnEvent = (event) => {
+                const ids = new Set();
+                const add = (id) => {
+                    if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') ids.add(id);
+                };
+                add(event?.crcId);
+                if (Array.isArray(event?.crcIds)) event.crcIds.forEach(add);
+                if (event?.roleAssignments && typeof event.roleAssignments === 'object') {
+                    Object.values(event.roleAssignments).forEach((assignments) => {
+                        if (Array.isArray(assignments)) assignments.forEach(add);
+                    });
+                }
+                return ids.size;
+            };
+
+            const pickRicherSiteAssignment = (a, b) => {
+                if (!a) return b;
+                if (!b) return a;
+                const roleCount = (e) => (e.roleAssignments && typeof e.roleAssignments === 'object') ? Object.keys(e.roleAssignments).length : 0;
+                const ra = roleCount(a);
+                const rb = roleCount(b);
+                if (ra !== rb) return ra > rb ? a : b;
+                const ca = countAssignedCrcsOnEvent(a);
+                const cb = countAssignedCrcsOnEvent(b);
+                if (ca !== cb) return ca > cb ? a : b;
+                const ta = Date.parse(a.updatedAt || a.createdAt || 0) || Number(a._ts) || 0;
+                const tb = Date.parse(b.updatedAt || b.createdAt || 0) || Number(b._ts) || 0;
+                if (ta !== tb) return ta >= tb ? a : b;
+                return String(a.id || '') >= String(b.id || '') ? a : b;
+            };
+
+            const collapseDuplicateSiteAssignments = (events) => {
+                if (!Array.isArray(events)) return [];
+                const bestByKey = new Map();
+                const order = [];
+                events.forEach((event) => {
+                    if (!event || event.type !== 'Site Assignment') {
+                        order.push({ kind: 'other', event });
+                        return;
+                    }
+                    const key = getSiteAssignmentIdentityKey(event);
+                    if (!key || key === 'sa:|||||') {
+                        order.push({ kind: 'other', event });
+                        return;
+                    }
+                    if (!bestByKey.has(key)) {
+                        bestByKey.set(key, event);
+                        order.push({ kind: 'sa', key });
+                    } else {
+                        bestByKey.set(key, pickRicherSiteAssignment(bestByKey.get(key), event));
+                    }
+                });
+                return order.map((item) => item.kind === 'sa' ? bestByKey.get(item.key) : item.event);
+            };
+
+            const findEventAnywhere = (id) => {
+                if (!id) return null;
+                return (state.crc_events || []).find((e) => e && e.id === id)
+                    || (Array.isArray(state.crc_events_display) ? state.crc_events_display.find((e) => e && e.id === id) : null)
+                    || null;
+            };
+
+            const findSiteAssignmentDuplicates = (event) => {
+                if (!event) return [];
+                if (event.type !== 'Site Assignment') return event.id ? [event] : [];
+                const key = getSiteAssignmentIdentityKey(event);
+                const byId = new Map();
+                const consider = (e) => {
+                    if (!e || e.type !== 'Site Assignment' || !e.id) return;
+                    if (getSiteAssignmentIdentityKey(e) === key) byId.set(e.id, e);
+                };
+                (state.crc_events || []).forEach(consider);
+                if (Array.isArray(state.crc_events_display)) state.crc_events_display.forEach(consider);
+                if (event.id && !byId.has(event.id)) byId.set(event.id, event);
+                return [...byId.values()];
+            };
+
+            const deleteSiteAssignmentWithDuplicates = async (eventOrId) => {
+                const event = typeof eventOrId === 'string' ? findEventAnywhere(eventOrId) : eventOrId;
+                const primaryId = event?.id || (typeof eventOrId === 'string' ? eventOrId : null);
+                if (!primaryId) throw new Error('Cannot delete: missing event id');
+                const toDelete = event && event.type === 'Site Assignment'
+                    ? findSiteAssignmentDuplicates(event)
+                    : [event || { id: primaryId }];
+                const ids = [...new Set(toDelete.map((e) => e.id).filter(Boolean))];
+                let failed = 0;
+                for (const id of ids) {
+                    const row = toDelete.find((e) => e.id === id);
+                    try {
+                        if (row?.type === 'Site Assignment' && typeof deleteTravelDaysLinkedToShift === 'function') {
+                            try { await deleteTravelDaysLinkedToShift(row); } catch (_) { /* still delete the shift */ }
+                        }
+                        await apiService.deleteEvent(id);
+                    } catch (err) {
+                        if (err?.status === 404) continue;
+                        failed += 1;
+                        console.error('Failed to delete shift copy', id, err);
+                    }
+                }
+                removeDeletedEventsFromLocalState(ids);
+                if (Array.isArray(state.crc_events_display)) {
+                    state.crc_events_display = state.crc_events_display.filter((e) => !e?.id || !ids.includes(e.id));
+                }
+                if (failed && failed === ids.length) {
+                    throw new Error('Failed to delete event.');
+                }
+                return { deleted: ids.length - failed, failed, ids };
+            };
+
             /** CRC dashboard: show cancelled visits greyed out (still excluded from utilization via isCancelledShift). */
-            const getCrcDashboardEvents = () => (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
+            const getCrcDashboardEvents = () => collapseDuplicateSiteAssignments(
+                (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || []
+            );
 
             const staffWithoutLogin = () => (state.crcs || []).filter(c => c?.id && !findUserByCrcId(c.id));
 
@@ -13040,9 +13163,10 @@
                             if (event.id) seen.add(event.id);
                         }
                     } else {
-                        // Site Assignment: only add once per event id per date (no duplicates)
-                        if (event.id && seen.has(event.id)) return;
-                        if (event.id) seen.add(event.id);
+                        // Site Assignment: one card per physical visit (date/site/period/studies), not per leftover copy
+                        const shiftKey = getSiteAssignmentIdentityKey(event) || event.id;
+                        if (shiftKey && seen.has(shiftKey)) return;
+                        if (shiftKey) seen.add(shiftKey);
                         eventsByDate[event.date].shifts.push(event);
                     }
                 });
@@ -15946,7 +16070,8 @@
 
             /** Events for calendar/planning grid. CRCs see the same list: deduplicated in setState (by id, travel by crc+date, PTO by crc+date) so no duplicate events. */
             const getDisplayEvents = () => {
-                const base = (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
+                const raw = (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
+                const base = collapseDuplicateSiteAssignments(raw);
                 // Cancelled shifts are hidden by default, but can be shown via filter.
                 return state.showCancelledShifts ? base : base.filter(e => !isCancelledShift(e));
             };
@@ -16003,10 +16128,10 @@
                     const [y, m] = monthKey.split('-').map(Number);
                     const monthStart = `${y}-${String(m).padStart(2, '0')}-01`;
                     const monthEnd = toDateOnlyString(new Date(y, m, 0));
-                    const snapshotEvents = rawSnapshot.filter(e => {
+                    const snapshotEvents = collapseDuplicateSiteAssignments(rawSnapshot.filter(e => {
                         const d = (e.date || e.startDate || '').toString().substring(0, 10);
                         return d && d >= monthStart && d <= monthEnd;
-                    });
+                    }));
                     const liveEvents = (state.crc_events || []).filter(e => {
                         const d = (e.date || e.startDate || '').toString().substring(0, 10);
                         if (!d) return true;
@@ -18431,13 +18556,15 @@
                                 }
                                 
                                 // Create a unique key for this shift
-                                const shiftKey = event.groupId || JSON.stringify({
+                                const shiftKey = event.type === 'Site Assignment'
+                                    ? getSiteAssignmentIdentityKey(event)
+                                    : (event.groupId || JSON.stringify({
                                     studyIds: (event.studyIds || []).sort().join(','),
                                     visitNumber: event.visitNumber || '',
                                     groupNumber: event.groupNumber || '',
                                     period: event.period || 'Full Day',
                                     type: event.type || 'Site Assignment'
-                                });
+                                }));
                                 
                                 if (!shiftGroups.has(shiftKey)) {
                                     shiftGroups.set(shiftKey, {
@@ -18888,13 +19015,15 @@
                             }
                             
                             // Create a unique key for this shift
-                            const shiftKey = event.groupId || JSON.stringify({
+                            const shiftKey = event.type === 'Site Assignment'
+                                ? getSiteAssignmentIdentityKey(event)
+                                : (event.groupId || JSON.stringify({
                                 studyIds: (event.studyIds || []).sort().join(','),
                                 visitNumber: event.visitNumber || '',
                                 groupNumber: event.groupNumber || '',
                                 period: event.period || 'Full Day',
                                 type: event.type || 'Site Assignment'
-                            });
+                            }));
                             
                             if (!shiftGroups.has(shiftKey)) {
                                 shiftGroups.set(shiftKey, {
@@ -19568,13 +19697,15 @@
                                 }
                                 
                                 // Create a unique key for this shift
-                                const shiftKey = event.groupId || JSON.stringify({
+                                const shiftKey = event.type === 'Site Assignment'
+                                    ? getSiteAssignmentIdentityKey(event)
+                                    : (event.groupId || JSON.stringify({
                                     studyIds: (event.studyIds || []).sort().join(','),
                                     visitNumber: event.visitNumber || '',
                                     groupNumber: event.groupNumber || '',
                                     period: event.period || 'Full Day',
                                     type: event.type || 'Site Assignment'
-                                });
+                                }));
                                 
                                 if (!shiftGroups.has(shiftKey)) {
                                     shiftGroups.set(shiftKey, {
@@ -33720,11 +33851,8 @@
                             `);
                         } else {
                             try {
-                            const eventToDelete = state.crc_events.find(e => e.id === eventId);
-                            if (eventToDelete?.type === 'Site Assignment') {
-                                await deleteTravelDaysLinkedToShift(eventToDelete);
-                            }
-                            await apiService.deleteEvent(eventId);
+                            const eventToDelete = findEventAnywhere(eventId) || state.crc_events.find(e => e.id === eventId);
+                            const result = await deleteSiteAssignmentWithDuplicates(eventToDelete || eventId);
                                 // Log change for Catch-Up
                                 if (eventToDelete) {
                                     const siteName = eventToDelete.siteId ? (state.crc_sites.find(s => s.id === eventToDelete.siteId)?.name || 'Unknown Site') : null;
@@ -33741,9 +33869,8 @@
                                         crcNames
                                     });
                                 }
-                                removeDeletedEventsFromLocalState([eventId]);
                                 setState({ crc_events: [...state.crc_events] });
-                                showNotification('Event deleted successfully!', 'success');
+                                showNotification(result.deleted > 1 ? `Deleted ${result.deleted} duplicate copies of this shift.` : 'Event deleted successfully!', 'success');
                             closeModal();
                                 // Refresh calendar views
                                 renderCRCCalendar();
@@ -33760,11 +33887,8 @@
                     }
                     case 'delete-single-event': {
                         try {
-                        const eventToDelete = state.crc_events.find(e => e.id === eventId);
-                        if (eventToDelete?.type === 'Site Assignment') {
-                            await deleteTravelDaysLinkedToShift(eventToDelete);
-                        }
-                        await apiService.deleteEvent(eventId);
+                        const eventToDelete = findEventAnywhere(eventId) || state.crc_events.find(e => e.id === eventId);
+                        const result = await deleteSiteAssignmentWithDuplicates(eventToDelete || eventId);
                             // Log change for Catch-Up
                             if (eventToDelete) {
                                 const siteName = eventToDelete.siteId ? (state.crc_sites.find(s => s.id === eventToDelete.siteId)?.name || 'Unknown Site') : null;
@@ -33781,9 +33905,8 @@
                                     crcNames
                                 });
                             }
-                            removeDeletedEventsFromLocalState([eventId]);
                             setState({ crc_events: [...state.crc_events] });
-                            showNotification('Event deleted successfully!', 'success');
+                            showNotification(result.deleted > 1 ? `Deleted ${result.deleted} duplicate copies of this shift.` : 'Event deleted successfully!', 'success');
                         closeModal();
                             // Refresh calendar views
                             renderCRCCalendar();
@@ -33799,13 +33922,23 @@
                     }
                     case 'delete-event-series': {
                         try {
-                        // Find all events with the same groupId
+                        // Find all events with the same groupId, plus leftover copies of those visits
                         const eventsToDelete = state.crc_events.filter(event => event.groupId === groupId);
+                        const extraCopies = [];
+                        eventsToDelete.forEach((event) => {
+                            if (event?.type !== 'Site Assignment') return;
+                            findSiteAssignmentDuplicates(event).forEach((copy) => {
+                                if (copy.id && !eventsToDelete.some((e) => e.id === copy.id) && !extraCopies.some((e) => e.id === copy.id)) {
+                                    extraCopies.push(copy);
+                                }
+                            });
+                        });
+                        const allShiftCopies = [...eventsToDelete, ...extraCopies];
                         // Also delete travel days linked to this shift series via parentShiftGroupId
                         const linkedTravelDays = state.crc_events.filter(e => e.type === 'Travel Day' && e.parentShiftGroupId === groupId);
                         let seriesDeleteErrors = 0;
                         // Delete each event individually
-                        for (const event of eventsToDelete) {
+                        for (const event of allShiftCopies) {
                             try {
                                 await apiService.deleteEvent(event.id);
                             } catch (seriesDelErr) {
@@ -33827,13 +33960,13 @@
                                 setState({ crc_events: merged });
                             } else {
                                 const deletedIds = [
-                                    ...eventsToDelete.map(e => e.id).filter(Boolean),
+                                    ...allShiftCopies.map(e => e.id).filter(Boolean),
                                     ...linkedTravelDays.map(e => e.id).filter(Boolean)
                                 ];
                                 removeDeletedEventsFromLocalState(deletedIds);
                                 setState({ crc_events: [...state.crc_events] });
                             }
-                            const totalDeleted = eventsToDelete.length + linkedTravelDays.length;
+                            const totalDeleted = allShiftCopies.length + linkedTravelDays.length;
                             showNotification(`Successfully deleted ${totalDeleted} event${totalDeleted !== 1 ? 's' : ''} (including linked travel days).`, 'success');
                         closeModal();
                             // Refresh calendar views
@@ -33861,8 +33994,8 @@
                             showNotification('Cannot delete: event id missing. Try again.', 'error');
                             return;
                         }
-                        const event = state.crc_events.find(e => e.id === idToDelete);
-                        if (event) {
+                        const event = findEventAnywhere(idToDelete) || state.crc_events.find(e => e.id === idToDelete);
+                        if (event || idToDelete) {
                             setState({ pendingDeleteEventId: idToDelete });
                             openModal(`
                                 <h3 class="text-xl font-bold dark:text-white mb-4">Delete Individual Event</h3>
@@ -33900,20 +34033,16 @@
                             return;
                         }
                         try {
-                            const eventBeforeDelete = state.crc_events.find(e => e.id === idToDelete);
+                            const eventBeforeDelete = findEventAnywhere(idToDelete) || state.crc_events.find(e => e.id === idToDelete);
                             saveStateToUndoHistory();
-                            if (eventBeforeDelete?.type === 'Site Assignment') {
-                                await deleteTravelDaysLinkedToShift(eventBeforeDelete);
-                            }
-                            await apiService.deleteEvent(idToDelete);
+                            const result = await deleteSiteAssignmentWithDuplicates(eventBeforeDelete || idToDelete);
                             setState({ pendingDeleteEventId: null });
-                            removeDeletedEventsFromLocalState([idToDelete]);
                             setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             if (eventBeforeDelete && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
                                 setTimeout(() => markScheduleModifiedForMonth(getScheduleMonthKeyFromEvent(eventBeforeDelete)), 0);
                             }
                             updateUndoButtonState();
-                            showNotification('Event deleted successfully!', 'success');
+                            showNotification(result.deleted > 1 ? `Deleted ${result.deleted} duplicate copies of this shift.` : 'Event deleted successfully!', 'success');
                             closeModal();
                             renderContentPreservingScroll();
                         } catch (error) {
