@@ -6246,6 +6246,38 @@
                 return { deleted: ids.length - failed, failed, ids };
             };
 
+            const upsertSiteAssignmentByIdentity = async (payload) => {
+                const probe = { ...payload, type: 'Site Assignment' };
+                const existing = findSiteAssignmentDuplicates(probe);
+                if (existing.length === 0) {
+                    const created = requireCreatedEvent(await apiService.createEvent(payload), 'Site Assignment');
+                    addEventToState(created);
+                    return created;
+                }
+                const keeper = existing.reduce((best, row) => pickRicherSiteAssignment(best, row));
+                let saved = { ...keeper, ...payload, id: keeper.id, groupId: keeper.groupId || payload.groupId };
+                try {
+                    const updated = await apiService.updateEvent(keeper.id, saved);
+                    saved = (typeof mergeEventAssignmentFields === 'function')
+                        ? mergeEventAssignmentFields(updated || saved, payload)
+                        : (updated || saved);
+                } catch (err) {
+                    if (err?.status !== 409) throw err;
+                    console.warn('Shift already existed; keeping the original row and removing extra copies.', keeper.id);
+                }
+                state.crc_events = (state.crc_events || []).map((e) => e && e.id === keeper.id ? saved : e);
+                const extraIds = existing.map((e) => e.id).filter((id) => id && id !== keeper.id);
+                for (const extraId of extraIds) {
+                    try {
+                        await apiService.deleteEvent(extraId);
+                    } catch (err) {
+                        if (err?.status !== 404) console.error('Failed to remove duplicate shift', extraId, err);
+                    }
+                }
+                if (extraIds.length) removeDeletedEventsFromLocalState(extraIds);
+                return saved;
+            };
+
             /** CRC dashboard: show cancelled visits greyed out (still excluded from utilization via isCancelledShift). */
             const getCrcDashboardEvents = () => collapseDuplicateSiteAssignments(
                 (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || []
@@ -7460,6 +7492,19 @@
             return;
         }
     }
+    // CRITICAL: Never add a second Site Assignment for the same visit identity
+    if (newEvent.type === 'Site Assignment') {
+        const key = getSiteAssignmentIdentityKey(newEvent);
+        if (key && key !== 'sa:|||||') {
+            const already = state.crc_events.some((e) =>
+                e && e.id !== newEvent.id && e.type === 'Site Assignment' && getSiteAssignmentIdentityKey(e) === key
+            );
+            if (already) {
+                debugWarn('CHAOS: Prevented duplicate Site Assignment for', key);
+                return;
+            }
+        }
+    }
     state.crc_events.push(newEvent);
     // Defer so we don't trigger setState in the middle of add flow (can cause duplicate renders/state issues)
     if (!options.silent && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
@@ -8593,11 +8638,11 @@
             
             const getFilteredEvents = () => {
                 if (!state.crc_events) return [];
-                if (!state.currentUser) return state.crc_events;
+                if (!state.currentUser) return collapseDuplicateSiteAssignments(state.crc_events);
                 
                 // Managers see all
                 if (isAdminUser() || getEffectivePermissionLevel() === 'Manager') {
-                    return state.crc_events;
+                    return collapseDuplicateSiteAssignments(state.crc_events);
                 }
                 
                 const filteredStudies = getFilteredStudies();
@@ -8605,7 +8650,7 @@
                 const studyIds = new Set(filteredStudies.map(s => s.id));
                 const siteIds = new Set(filteredSites.map(s => s.id));
                 
-                return state.crc_events.filter(event => {
+                return collapseDuplicateSiteAssignments(state.crc_events.filter(event => {
                     // If event has studyIds, check if any are accessible
                     if (event.studyIds && Array.isArray(event.studyIds) && event.studyIds.length > 0) {
                         return event.studyIds.some(id => studyIds.has(id));
@@ -8616,7 +8661,7 @@
                     }
                     // If no study or site restriction, allow it
                     return true;
-                });
+                }));
             };
 
             // Weather widget functionality
@@ -12832,13 +12877,13 @@
                 } else {
                     const raw = (getDisplayEvents() || []).filter(e => e.type === 'Site Assignment');
                     const seenIds = new Set();
-                    const seenDateGroup = new Set();
+                    const seenVisit = new Set();
                     filteredEvents = raw.filter(e => {
                         if (e.id && seenIds.has(e.id)) return false;
-                        const key = e.groupId ? `${e.date}\t${e.groupId}` : (e.id || e.date);
-                        if (seenDateGroup.has(key)) return false;
+                        const key = getSiteAssignmentIdentityKey(e) || e.id || e.date;
+                        if (seenVisit.has(key)) return false;
                         if (e.id) seenIds.add(e.id);
-                        seenDateGroup.add(key);
+                        seenVisit.add(key);
                         return true;
                     });
                 }
@@ -12856,7 +12901,8 @@
                         eventsByDate[event.date] = [];
                     }
                     const dayList = eventsByDate[event.date];
-                    if (event.id && dayList.some(e => e.id === event.id)) return;
+                    const visitKey = event.type === 'Site Assignment' ? (getSiteAssignmentIdentityKey(event) || event.id) : event.id;
+                    if (visitKey && dayList.some(e => (e.type === 'Site Assignment' ? (getSiteAssignmentIdentityKey(e) || e.id) : e.id) === visitKey)) return;
                     dayList.push(event);
                 });
                 
@@ -34181,8 +34227,17 @@
                             let errorCount = 0;
                             
                             const successfullyDeletedEventIds = [];
+                            const expandedEventIds = new Set();
+                            eventIds.forEach((id) => {
+                                const row = findEventAnywhere(id);
+                                if (row && row.type === 'Site Assignment') {
+                                    findSiteAssignmentDuplicates(row).forEach((copy) => { if (copy.id) expandedEventIds.add(copy.id); });
+                                } else if (id) {
+                                    expandedEventIds.add(id);
+                                }
+                            });
                             // Delete regular events
-                            for (const eventId of eventIds) {
+                            for (const eventId of expandedEventIds) {
                                 try {
                                     await apiService.deleteEvent(eventId);
                                     deletedCount++;
@@ -39978,8 +40033,7 @@
                                                         skipTravelDayProcessing: true
                                                     };
                                                     try {
-                                                        const created = await apiService.createEvent(currentEventData);
-                                                        addEventToState(requireCreatedEvent(created, 'Site Assignment'));
+                                                        await upsertSiteAssignmentByIdentity(currentEventData);
                                                     } catch (createErr) {
                                                         console.error(`Error creating Site Assignment for ${dateStr}:`, createErr);
                                                         failedDates.push(dateStr);
