@@ -31,6 +31,7 @@
     rmDept: "",
     rmActivity: "",
     rmLayer: "study",
+    rmView: "tree",
     project: null,
     projectNumber: "",
     projectFilter: "",
@@ -1133,6 +1134,347 @@
     return true;
   }
 
+  function addMonthsYm(ym, n) {
+    const [y, m] = String(ym).split("-").map(Number);
+    const dt = new Date(y, m - 1 + n, 1);
+    return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function monthEndYmd(ym) {
+    const [y, m] = String(ym).split("-").map(Number);
+    const last = new Date(y, m, 0).getDate();
+    return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(last).padStart(2, "0")}`;
+  }
+
+  function monthLabel(ym) {
+    const [y, m] = String(ym).split("-").map(Number);
+    const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return `${names[m - 1] || ym} ${String(y).slice(2)}`;
+  }
+
+  function monthsInView(from, to, today) {
+    let start = String(from || "").slice(0, 7);
+    let end = String(to || "").slice(0, 7);
+    if (!start && !end) {
+      start = String(today).slice(0, 7);
+      end = addMonthsYm(start, 11);
+    } else if (start && !end) {
+      end = addMonthsYm(start, 11);
+    } else if (!start && end) {
+      start = addMonthsYm(end, -11);
+    }
+    if (start > end) {
+      const swap = start;
+      start = end;
+      end = swap;
+    }
+    const out = [];
+    let cur = start;
+    while (cur <= end && out.length < 24) {
+      out.push(cur);
+      cur = addMonthsYm(cur, 1);
+    }
+    return out;
+  }
+
+  function lineCoversMonth(line, ym) {
+    return lineOverlaps(line, `${ym}-01`, monthEndYmd(ym));
+  }
+
+  function fmtFte(n) {
+    if (n == null || !Number.isFinite(n) || n <= 0) return "";
+    if (n >= 9.95) return n.toFixed(0);
+    const t = Math.round(n * 10) / 10;
+    if (t === 0) return "<0.1";
+    return t.toFixed(1);
+  }
+
+  function fmtSpan(begin, end) {
+    if (begin && end) return `${begin} → ${end}`;
+    return begin || end || "";
+  }
+
+  function ymdToDays(ymd) {
+    const [y, m, d] = String(ymd || "").split("-").map(Number);
+    if (!y || !m || !d) return null;
+    return Date.UTC(y, m - 1, d) / 86400000;
+  }
+
+  function spanFromLines(lines) {
+    const begins = (lines || []).map((l) => l.beginDate).filter(Boolean).sort();
+    const ends = (lines || []).map((l) => l.endDate).filter(Boolean).sort();
+    return { begin: begins[0] || null, end: ends.length ? ends[ends.length - 1] : null };
+  }
+
+  function studyStaffEntries(study) {
+    if (Array.isArray(study.staff) && study.staff.length) {
+      return study.staff.map((p) => ({ person: p }));
+    }
+    const out = [];
+    for (const role of study.roles || []) {
+      if (role.person) out.push({ person: role.person, role });
+      for (const p of role.staff || []) out.push({ person: p, role });
+    }
+    return out;
+  }
+
+  function collectStudyLines(study) {
+    return studyStaffEntries(study).flatMap((e) => e.person.lines || []);
+  }
+
+  function activitiesForStudy(study) {
+    const byAct = new Map();
+    for (const { person } of studyStaffEntries(study)) {
+      for (const line of person.lines || []) {
+        const act = line.activity || "—";
+        if (!byAct.has(act)) byAct.set(act, { activity: act, lines: [], people: new Map() });
+        const node = byAct.get(act);
+        node.lines.push(line);
+        if (person.id) node.people.set(person.id, person);
+      }
+    }
+    return sortActivities([...byAct.keys()]).map((key) => {
+      const node = byAct.get(key);
+      const span = spanFromLines(node.lines);
+      return {
+        activity: key,
+        begin: span.begin,
+        end: span.end,
+        staffCount: node.people.size,
+        people: [...node.people.values()],
+        lines: node.lines
+      };
+    });
+  }
+
+  function peopleInMonth(staff, ym) {
+    const byId = new Map();
+    for (const p of staff || []) {
+      const lines = (p.lines || []).filter((l) => lineCoversMonth(l, ym));
+      if (!lines.length) continue;
+      const fte = Math.max(...lines.map((l) => Number(l.valueFte) || 0));
+      const id = p.id || p.fullName;
+      const cur = byId.get(id);
+      if (!cur) byId.set(id, { person: p, fte });
+      else cur.fte = Math.max(cur.fte, fte);
+    }
+    return [...byId.values()].sort((a, b) =>
+      String(a.person.fullName || "").localeCompare(String(b.person.fullName || ""))
+    );
+  }
+
+  function studyOverlapsMonths(study, months) {
+    if (!months.length) return false;
+    const from = `${months[0]}-01`;
+    const to = monthEndYmd(months[months.length - 1]);
+    return collectStudyLines(study).some((l) => lineOverlaps(l, from, to));
+  }
+
+  function ganttBarHtml(begin, end, axisBegin, axisEnd) {
+    const a0 = ymdToDays(axisBegin);
+    const a1 = ymdToDays(axisEnd);
+    const b0 = ymdToDays(begin);
+    const b1 = ymdToDays(end);
+    if (a0 == null || a1 == null || b0 == null || b1 == null || a1 <= a0) {
+      return `<span class="rm-gantt-track"></span>`;
+    }
+    const left = Math.max(0, Math.min(100, ((b0 - a0) / (a1 - a0)) * 100));
+    const right = Math.max(0, Math.min(100, ((b1 - a0) / (a1 - a0)) * 100));
+    const w = Math.max(2, right - left);
+    return `<span class="rm-gantt-track"><span class="rm-gantt-bar" style="left:${left}%;width:${w}%"></span></span>`;
+  }
+
+  function rmActivityGantt(study) {
+    const lines = collectStudyLines(study);
+    const span = spanFromLines(lines);
+    const acts = activitiesForStudy(study);
+    if (!span.begin || !span.end || !acts.length) return "";
+    const rows = acts
+      .map((act) => {
+        const names = act.people.map((p) => p.fullName).filter(Boolean).join(", ");
+        return `<div class="rm-gantt-row" title="${escapeHtml(names)}">
+          <span class="rm-gantt-act">${escapeHtml(act.activity)}</span>
+          ${ganttBarHtml(act.begin, act.end, span.begin, span.end)}
+          <span class="rm-gantt-dates">${escapeHtml(fmtSpan(act.begin, act.end))}</span>
+          <span class="rm-gantt-n">${act.staffCount} staff</span>
+        </div>`;
+      })
+      .join("");
+    return `<div class="rm-gantt">
+      <div class="rm-gantt-head">
+        <span>Activity</span>
+        <span class="rm-gantt-axis">Assigned ${escapeHtml(fmtSpan(span.begin, span.end))}</span>
+        <span>Window</span>
+        <span></span>
+      </div>
+      ${rows}
+    </div>`;
+  }
+
+  function studyMetaHtml(study, extra) {
+    const span = spanFromLines(collectStudyLines(study));
+    const dates = fmtSpan(span.begin, span.end);
+    return [extra, dates].filter(Boolean).join(" · ");
+  }
+
+  function rmCalCell(fte, title) {
+    if (!fte || fte <= 0) return `<td class="rm-cal-empty"></td>`;
+    const heat = Math.min(1, fte / 4);
+    return `<td class="rm-cal-cell" style="--rm-heat:${heat}" title="${escapeHtml(title || "")}"><span>${escapeHtml(fmtFte(fte))}</span></td>`;
+  }
+
+  function rmCalNameCell(id, open, title, meta) {
+    return `<th class="rm-cal-name" scope="row"><button type="button" class="rm-cal-toggle" data-cal-open="${escapeHtml(id)}" aria-expanded="${open ? "true" : "false"}"><span class="rm-cal-caret" aria-hidden="true">${open ? "▾" : "▸"}</span><span class="rm-cal-label">${escapeHtml(title)}</span><span class="rm-cal-meta">${escapeHtml(meta)}</span></button></th>`;
+  }
+
+  function rmCalSubName(title, meta, cls) {
+    return `<th class="rm-cal-name rm-cal-indent${cls ? " " + cls : ""}" scope="row"><span class="rm-cal-label">${escapeHtml(title)}</span><span class="rm-cal-meta">${escapeHtml(meta)}</span></th>`;
+  }
+
+  function renderRmCalendar(layer, studies, months, opts) {
+    if (!months.length) return `<p class="empty">Pick a date range to show months.</p>`;
+    const monthHeads = months.map((ym) => `<th class="rm-cal-mon">${escapeHtml(monthLabel(ym))}</th>`).join("");
+    const auto = opts.autoOpen;
+    let body = "";
+
+    if (layer === "employee") {
+      const people = layerByEmployee(studies).filter((row) =>
+        row.studies.some((s) => studyOverlapsMonths(s, months))
+      );
+      body = people
+        .map((row) => {
+          const id = `cal-emp:${row.person.id}`;
+          const open = !!state.rmOpen[id] || auto || people.length === 1;
+          const staffAll = row.studies.flatMap((s) => studyStaffEntries(s).map((e) => e.person));
+          const cells = months
+            .map((ym) => {
+              let fte = 0;
+              let n = 0;
+              for (const study of row.studies) {
+                const load = peopleInMonth(
+                  studyStaffEntries(study).map((e) => e.person),
+                  ym
+                );
+                const studyFte = load.reduce((sum, x) => sum + x.fte, 0);
+                if (studyFte > 0) {
+                  fte += studyFte;
+                  n += 1;
+                }
+              }
+              return rmCalCell(fte, fte ? `${row.person.fullName} · ${n} stud${n === 1 ? "y" : "ies"} · ${fmtFte(fte)} FTE` : "");
+            })
+            .join("");
+          const span = spanFromLines(staffAll.flatMap((p) => p.lines || []));
+          const active = months.filter((ym) =>
+            row.studies.some((s) => peopleInMonth(studyStaffEntries(s).map((e) => e.person), ym).length)
+          ).length;
+          let html = `<tr class="rm-cal-study">${rmCalNameCell(id, open, row.person.fullName, [row.person.jobTitle || "—", fmtSpan(span.begin, span.end), `${active} mo`].filter(Boolean).join(" · "))}${cells}</tr>`;
+          if (open) {
+            for (const study of row.studies) {
+              const staff = studyStaffEntries(study).map((e) => e.person);
+              const scells = months
+                .map((ym) => {
+                  const load = peopleInMonth(staff, ym);
+                  const fte = load.reduce((n, x) => n + x.fte, 0);
+                  return rmCalCell(fte, fte ? `${study.studyKey} · ${fmtFte(fte)} FTE` : "");
+                })
+                .join("");
+              html += `<tr class="rm-cal-sub">${rmCalSubName(study.studyKey, studyMetaHtml(study, study.studyName || ""))}${scells}</tr>`;
+            }
+          }
+          return html;
+        })
+        .join("");
+    } else if (layer === "role") {
+      const roles = layerByRole(studies).filter((role) =>
+        role.studies.some((s) => studyOverlapsMonths(s, months))
+      );
+      body = roles
+        .map((role) => {
+          const id = `cal-role:${role.roleCode}`;
+          const open = !!state.rmOpen[id] || !!opts.roleSel || auto || roles.length === 1;
+          const cells = months
+            .map((ym) => {
+              const load = peopleInMonth(role.studies.flatMap((s) => s.staff || []), ym);
+              const fte = load.reduce((n, x) => n + x.fte, 0);
+              return rmCalCell(fte, fte ? `${role.roleCode} · ${load.length} staff · ${fmtFte(fte)} FTE` : "");
+            })
+            .join("");
+          let html = `<tr class="rm-cal-study">${rmCalNameCell(id, open, role.roleCode, `${role.roleGroup || "Role"} · ${role.studyCount} studies`)}${cells}</tr>`;
+          if (open) {
+            for (const study of role.studies) {
+              if (!studyOverlapsMonths(study, months)) continue;
+              const scells = months
+                .map((ym) => {
+                  const load = peopleInMonth(study.staff, ym);
+                  const fte = load.reduce((n, x) => n + x.fte, 0);
+                  return rmCalCell(fte, fte ? `${study.studyKey} · ${load.length} staff · ${fmtFte(fte)} FTE` : "");
+                })
+                .join("");
+              html += `<tr class="rm-cal-sub">${rmCalSubName(study.studyKey, studyMetaHtml(study, `${study.staff.length} staff`))}${scells}</tr>`;
+            }
+          }
+          return html;
+        })
+        .join("");
+    } else {
+      const shown = studies.filter((s) => studyOverlapsMonths(s, months));
+      body = shown
+        .map((study) => {
+          const id = `cal:${study.studyKey}`;
+          const open = !!state.rmOpen[id] || !!opts.studySel || auto || shown.length === 1;
+          const staff = studyStaffEntries(study).map((e) => e.person);
+          const perMonth = months.map((ym) => peopleInMonth(staff, ym));
+          const cells = perMonth
+            .map((load) => {
+              const fte = load.reduce((n, x) => n + x.fte, 0);
+              const names = load.map((x) => x.person.fullName).join(", ");
+              return rmCalCell(fte, fte ? `${load.length} staff · ${fmtFte(fte)} FTE${names ? " · " + names : ""}` : "");
+            })
+            .join("");
+          const span = spanFromLines(collectStudyLines(study));
+          const active = perMonth.filter((p) => p.length).length;
+          let html = `<tr class="rm-cal-study">${rmCalNameCell(id, open, study.studyKey, [study.studyName || "", fmtSpan(span.begin, span.end), `${active} mo`].filter(Boolean).join(" · "))}${cells}</tr>`;
+          if (open) {
+            for (const act of activitiesForStudy(study)) {
+              const actStaff = staff.map((p) => ({
+                ...p,
+                lines: (p.lines || []).filter((l) => String(l.activity || "") === act.activity)
+              }));
+              const acells = months
+                .map((ym) => {
+                  const load = peopleInMonth(actStaff, ym);
+                  const fte = load.reduce((n, x) => n + x.fte, 0);
+                  const names = load.map((x) => x.person.fullName).join(", ");
+                  return rmCalCell(fte, fte ? `${act.activity} · ${load.length} staff · ${fmtFte(fte)} FTE${names ? " · " + names : ""}` : "");
+                })
+                .join("");
+              html += `<tr class="rm-cal-sub rm-cal-act">${rmCalSubName(act.activity, `${fmtSpan(act.begin, act.end)} · ${act.staffCount} staff`, "rm-cal-act-name")}${acells}</tr>`;
+            }
+            const people = [...new Map(staff.map((p) => [p.id || p.fullName, p])).values()].sort((a, b) =>
+              String(a.fullName || "").localeCompare(String(b.fullName || ""))
+            );
+            for (const p of people) {
+              const pcells = months
+                .map((ym) => {
+                  const load = peopleInMonth([p], ym);
+                  const fte = load.reduce((n, x) => n + x.fte, 0);
+                  return rmCalCell(fte, fte ? `${p.fullName} · ${fmtFte(fte)} FTE` : "");
+                })
+                .join("");
+              html += `<tr class="rm-cal-sub">${rmCalSubName(p.fullName, p.jobTitle || "")}${pcells}</tr>`;
+            }
+          }
+          return html;
+        })
+        .join("");
+    }
+
+    return `<div class="rm-cal-wrap"><table class="rm-cal"><thead><tr><th class="rm-cal-name">Study / activity</th>${monthHeads}</tr></thead><tbody>${
+      body || `<tr><td class="rm-cal-empty-msg" colspan="${months.length + 1}">No assignments overlap this month window.</td></tr>`
+    }</tbody></table></div>`;
+  }
+
   function restoreRmField(id, selStart) {
     const el = document.getElementById(id);
     if (!el) return;
@@ -1312,8 +1654,8 @@
               return rmDetails(
                 sid,
                 sOpen,
-                `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${study.staff.length} staff</span>`,
-                `<div class="rm-staff-head"><span>Staff</span><span>Position</span><span>Peak</span><span>%</span><span></span></div>${rmStaffRows(study.staff, sid)}`,
+                `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${escapeHtml(studyMetaHtml(study, study.staff.length + " staff"))}</span>`,
+                `${rmActivityGantt(study)}<div class="rm-staff-head"><span>Staff</span><span>Position</span><span>Peak</span><span>%</span><span></span></div>${rmStaffRows(study.staff, sid)}`,
                 "rm-role"
               );
             })
@@ -1346,8 +1688,8 @@
               return rmDetails(
                 sid,
                 sOpen,
-                `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${study.roles.length} role${study.roles.length === 1 ? "" : "s"}</span>`,
-                `<div class="rm-staff-head"><span>Staff</span><span>Role</span><span>Peak</span><span>%</span><span></span></div>${rmStaffRows(staff, sid)}`,
+                `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${escapeHtml(studyMetaHtml(study, study.roles.length + " role" + (study.roles.length === 1 ? "" : "s")))}</span>`,
+                `${rmActivityGantt(study)}<div class="rm-staff-head"><span>Staff</span><span>Role</span><span>Peak</span><span>%</span><span></span></div>${rmStaffRows(staff, sid)}`,
                 "rm-role"
               );
             })
@@ -1382,8 +1724,8 @@
         return rmDetails(
           sid,
           studyOpen,
-          `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${study.roleCount} role${study.roleCount === 1 ? "" : "s"} · ${study.staffCount} staff</span>`,
-          `<div class="rm-roles">${rolesHtml}</div>`,
+          `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${escapeHtml(studyMetaHtml(study, study.roleCount + " role" + (study.roleCount === 1 ? "" : "s") + " · " + study.staffCount + " staff"))}</span>`,
+          `${rmActivityGantt(study)}<div class="rm-roles">${rolesHtml}</div>`,
           "rm-study"
         );
       })
@@ -1492,23 +1834,38 @@
     const minBound = pack.dateMin || "2020-01-01";
     const maxBound = pack.dateMax || "2035-12-31";
     const today = ymdLocal(new Date());
+    const next12To = monthEndYmd(addMonthsYm(today.slice(0, 7), 11));
     const presetAll = !from && !to;
     const presetToday = from === today && to === today;
     const preset90 = from === today && to === addDaysYmd(today, 90);
+    const preset12 = from === today && to === next12To;
     const sliced = !!(studySel || roleSel || posSel || deptSel || actSel || needle);
     const autoOpen = sliced && studies.length <= 8;
     const layer = state.rmLayer === "role" || state.rmLayer === "employee" ? state.rmLayer : "study";
+    const view = state.rmView === "months" ? "months" : "tree";
+    const months = monthsInView(from, to, today);
     const utilById = new Map();
     for (const p of pack.people || []) {
       if (p.id) utilById.set(p.id, p);
       if (p.employeeKey) utilById.set(String(p.employeeKey), p);
     }
-    const tree = renderRmTree(layer, studies, {
-      autoOpen,
-      studySel,
-      roleSel,
-      utilById
-    });
+    const tree =
+      view === "tree"
+        ? renderRmTree(layer, studies, {
+            autoOpen,
+            studySel,
+            roleSel,
+            utilById
+          })
+        : "";
+    const calendar =
+      view === "months"
+        ? renderRmCalendar(layer, studies, months, {
+            autoOpen,
+            studySel,
+            roleSel
+          })
+        : "";
     const roleLayerCount = layer === "role" ? layerByRole(studies).length : roleTotal;
     const empLayerCount = layer === "employee" ? layerByEmployee(studies).length : staffTotal;
     const countLabel =
@@ -1517,6 +1874,19 @@
         : layer === "employee"
           ? `${empLayerCount} people · ${studies.length} stud${studies.length === 1 ? "y" : "ies"}`
           : `${studies.length} stud${studies.length === 1 ? "y" : "ies"} · ${roleTotal} roles · ${staffTotal} staff`;
+    const layerNote =
+      view === "months"
+        ? (layer === "study"
+            ? "Study × month — FTE assigned that month. Expand a study for activities, then people. Empty cells mean nobody is booked."
+            : layer === "role"
+              ? "Role × month — FTE assigned that month. Expand a role for studies."
+              : "Employee × month — FTE assigned that month. Expand a person for studies.") +
+          (presetAll ? " Window is the next 12 months unless you set From/To." : "")
+        : layer === "study"
+          ? "Study → activity timeline → role → employee. Run dates are the earliest and latest assignment windows on the study."
+          : layer === "role"
+            ? "Role → study → employee. Study dates come from assignment windows."
+            : "Employee → study → role. Study dates come from assignment windows.";
 
     panel.innerHTML = `<div class="rm-staffing">
       <div class="rm-filters">
@@ -1524,6 +1894,10 @@
           <button type="button" class="purpose-btn${layer === "study" ? " active" : ""}" data-rm-layer="study">By study</button>
           <button type="button" class="purpose-btn${layer === "role" ? " active" : ""}" data-rm-layer="role">By role</button>
           <button type="button" class="purpose-btn${layer === "employee" ? " active" : ""}" data-rm-layer="employee">By employee</button>
+        </div>
+        <div class="purpose rm-view" role="tablist" aria-label="RM view">
+          <button type="button" class="purpose-btn${view === "tree" ? " active" : ""}" data-rm-view="tree">List</button>
+          <button type="button" class="purpose-btn${view === "months" ? " active" : ""}" data-rm-view="months">Months</button>
         </div>
         <div class="purpose rm-acts" role="tablist" aria-label="Activity">
           <button type="button" class="purpose-btn${!actSel ? " active" : ""}" data-rm-act="">All</button>
@@ -1550,12 +1924,17 @@
           <button type="button" class="purpose-btn${presetAll ? " active" : ""}" data-rm-preset="all">All dates</button>
           <button type="button" class="purpose-btn${presetToday ? " active" : ""}" data-rm-preset="today">As of today</button>
           <button type="button" class="purpose-btn${preset90 ? " active" : ""}" data-rm-preset="next90">Next 90 days</button>
+          <button type="button" class="purpose-btn${preset12 ? " active" : ""}" data-rm-preset="next12">Next 12 months</button>
           <button type="button" class="purpose-btn" id="rmExpand">Expand shown</button>
           <button type="button" class="purpose-btn" id="rmCollapse">Collapse</button>
         </div>
       </div>
-      <p class="rm-layer-note">${layer === "study" ? "Study → role → employee" : layer === "role" ? "Role → study → employee" : "Employee → study → role"}</p>
-      <div class="rm-tree">${tree || `<p class="empty">No assignments overlap this filter.</p>`}</div>
+      <p class="rm-layer-note">${escapeHtml(layerNote)}</p>
+      ${
+        view === "months"
+          ? calendar || `<p class="empty">No assignments overlap this month window.</p>`
+          : `<div class="rm-tree">${tree || `<p class="empty">No assignments overlap this filter.</p>`}</div>`
+      }
     </div>
     <div class="briefing-note" style="margin-top:12px">${escapeHtml(pack.note || "")}</div>`;
 
@@ -1586,6 +1965,14 @@
         state.rmLayer = next;
         state.rmOpen = {};
         state.rmOpenStaff = {};
+        renderRmBoard();
+      };
+    });
+    panel.querySelectorAll("[data-rm-view]").forEach((btn) => {
+      btn.onclick = () => {
+        const next = btn.dataset.rmView === "months" ? "months" : "tree";
+        if (state.rmView === next) return;
+        state.rmView = next;
         renderRmBoard();
       };
     });
@@ -1623,6 +2010,9 @@
         } else if (p === "next90") {
           state.rmDateFrom = today;
           state.rmDateTo = addDaysYmd(today, 90);
+        } else if (p === "next12") {
+          state.rmDateFrom = today;
+          state.rmDateTo = next12To;
         } else {
           state.rmDateFrom = "";
           state.rmDateTo = "";
@@ -1636,6 +2026,9 @@
       expand.onclick = () => {
         panel.querySelectorAll("details[data-open-id]").forEach((el) => {
           state.rmOpen[el.dataset.openId] = true;
+        });
+        panel.querySelectorAll("[data-cal-open]").forEach((el) => {
+          state.rmOpen[el.dataset.calOpen] = true;
         });
         renderRmBoard();
       };
@@ -1656,6 +2049,13 @@
       btn.onclick = () => {
         const id = btn.dataset.staffId;
         state.rmOpenStaff[id] = !state.rmOpenStaff[id];
+        renderRmBoard();
+      };
+    });
+    panel.querySelectorAll("[data-cal-open]").forEach((btn) => {
+      btn.onclick = () => {
+        const id = btn.dataset.calOpen;
+        state.rmOpen[id] = !state.rmOpen[id];
         renderRmBoard();
       };
     });
