@@ -17,6 +17,10 @@
     briefing: null,
     finance: null,
     rm: null,
+    rmPeople: null,
+    rmPersonId: "",
+    rmPeopleFilter: "",
+    rmPeopleError: "",
     project: null,
     projectNumber: "",
     projectFilter: "",
@@ -40,6 +44,7 @@
 
   const NAV = [
     { key: "ask", label: "Ask", icon: "search" },
+    { key: "rm", label: "RM", icon: "users" },
     { key: "context", label: "My context", icon: "user" },
     { key: "saved", label: "Saved answers", icon: "file" },
     { key: "sources", label: "Sources", icon: "database" },
@@ -134,6 +139,11 @@
   function setNav(key) {
     state.nav = key;
     closeMobileDrawers();
+    if (key === "rm") {
+      applyPurposeSources("staffing");
+      save("odl.purpose", "staffing");
+      loadRmPeople();
+    }
     render();
   }
 
@@ -1071,18 +1081,138 @@
     if (state.nav === "context") render();
   }
 
+  function renderRmBoard() {
+    const panel = document.getElementById("viewRm");
+    if (!panel) return;
+    panel.classList.toggle("hidden", state.nav !== "rm");
+    if (state.nav !== "rm") return;
+
+    if (!state.rmPeople && !state.rmPeopleError) {
+      panel.innerHTML = `<div class="briefing"><div class="suggest-head">RM</div><div class="briefing-note">Loading people and assignments…</div></div>`;
+      return;
+    }
+    if (state.rmPeopleError) {
+      panel.innerHTML = `<div class="briefing-note">${escapeHtml(state.rmPeopleError)}</div>`;
+      return;
+    }
+
+    const pack = state.rmPeople;
+    const needle = (state.rmPeopleFilter || "").trim().toLowerCase();
+    const people = (pack.people || []).filter((p) => {
+      if (!needle) return true;
+      return [p.fullName, p.jobTitle, p.employeeKey, ...(p.studies || []).map((s) => s.studyKey)]
+        .join(" ")
+        .toLowerCase()
+        .includes(needle);
+    });
+    if (!state.rmPersonId && people[0]) state.rmPersonId = people[0].id;
+    const selected = people.find((p) => p.id === state.rmPersonId) || people[0] || null;
+
+    const list = people
+      .slice(0, 400)
+      .map((p) => {
+        const over = (p.overAllocationFte || 0) > 0.001;
+        const spare = (p.spareFte || 0) > 0.05;
+        const badge = over ? "over" : spare ? "spare" : "ok";
+        return `<button type="button" class="person-card${selected && selected.id === p.id ? " active" : ""}" data-pid="${escapeHtml(p.id)}">
+          <span class="person-name">${escapeHtml(p.fullName || "—")}</span>
+          <span class="person-title">${escapeHtml(p.jobTitle || "—")}</span>
+          <span class="person-meta">${p.studyCount || 0} stud${p.studyCount === 1 ? "y" : "ies"} · cap ${escapeHtml(String((p.timeAllocation || 0).toFixed(2)))} FTE</span>
+          <span class="person-badge ${badge}">${over ? `+${(p.overAllocationFte || 0).toFixed(2)} over` : spare ? `${(p.spareFte || 0).toFixed(2)} spare` : "at capacity"}</span>
+        </button>`;
+      })
+      .join("");
+
+    let detail = `<p class="empty">No matching people.</p>`;
+    if (selected) {
+      const rows = [];
+      (selected.studies || []).forEach((s) => {
+        (s.lines || []).forEach((line) => {
+          const pct = line.dedicatedPct;
+          const w = pct == null ? 0 : Math.min(100, pct);
+          rows.push(`<div class="assign-row">
+            <span class="assign-study">${escapeHtml(s.studyKey)}</span>
+            <span class="assign-act">${escapeHtml(line.activity || "—")}</span>
+            <span class="assign-dates">${escapeHtml((line.beginDate || "—") + " → " + (line.endDate || "—"))}</span>
+            <span class="assign-bar"><span class="dedicate-track"><span class="dedicate-fill" style="width:${w}%"></span></span></span>
+            <span class="assign-pct">${pct == null ? "—" : pct.toFixed(1) + "%"}</span>
+          </div>`);
+        });
+      });
+      detail = `<div class="briefing">
+        <div class="suggest-head">${escapeHtml(selected.fullName)}</div>
+        <div class="briefing-note">${escapeHtml(selected.jobTitle || "")} · time allocation ${selected.timeAllocation.toFixed(2)} FTE · assigned ${selected.assignedFte == null ? "—" : selected.assignedFte.toFixed(2)} FTE · ${selected.studyCount} studies. Dedicated % is ValueFTE × 100 for that activity window — sequential phases are not concurrent.</div>
+      </div>
+      <div class="assign-head">
+        <span>Study</span><span>Activity</span><span>Window</span><span>Dedicated</span><span>%</span>
+      </div>
+      ${rows.join("") || `<p class="empty">No assignment rows.</p>`}`;
+    }
+
+    panel.innerHTML = `<div class="rm-board">
+      <div class="rm-list">
+        <div class="project-toolbar">
+          <input class="project-filter" id="rmPeopleFilter" type="search" placeholder="Filter by name, title, study…" value="${escapeHtml(state.rmPeopleFilter)}" />
+          <span class="project-count">${people.length} people</span>
+        </div>
+        <div class="person-list">${list || `<p class="empty">No people in lens_rm_assignments yet.</p>`}</div>
+      </div>
+      <div class="rm-detail">${detail}</div>
+    </div>
+    <div class="briefing-note" style="margin-top:12px">${escapeHtml(pack.note || "")}</div>`;
+
+    const filter = document.getElementById("rmPeopleFilter");
+    if (filter) {
+      filter.oninput = (e) => {
+        state.rmPeopleFilter = e.target.value;
+        const pos = e.target.selectionStart;
+        renderRmBoard();
+        const again = document.getElementById("rmPeopleFilter");
+        if (again) {
+          again.focus();
+          try {
+            again.setSelectionRange(pos, pos);
+          } catch (_) {}
+        }
+      };
+    }
+    panel.querySelectorAll("[data-pid]").forEach((btn) => {
+      btn.onclick = () => {
+        state.rmPersonId = btn.dataset.pid;
+        renderRmBoard();
+      };
+    });
+  }
+
+  async function loadRmPeople() {
+    if (state.rmPeople && state.rmPeople.loaded) return;
+    try {
+      const res = await fetch("/api/rm/people");
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `RM people failed (${res.status})`);
+      state.rmPeople = body.people || body;
+      state.rmPeopleError = "";
+    } catch (err) {
+      state.rmPeopleError = String(err.message || err);
+      state.rmPeople = null;
+    }
+    if (state.nav === "rm") render();
+  }
+
   function renderLists() {
     const saved = document.getElementById("viewSaved");
     const hist = document.getElementById("viewHistory");
     const help = document.getElementById("viewSourcesHelp");
     const ctx = document.getElementById("viewContext");
     const ask = document.getElementById("viewAsk");
+    const rm = document.getElementById("viewRm");
 
     ask.classList.toggle("hidden", state.nav !== "ask");
     saved.classList.toggle("hidden", state.nav !== "saved");
     hist.classList.toggle("hidden", state.nav !== "history");
     help.classList.toggle("hidden", state.nav !== "sources");
     if (ctx) ctx.classList.toggle("hidden", state.nav !== "context");
+    if (rm) rm.classList.toggle("hidden", state.nav !== "rm");
 
     const idleTitle =
       state.purpose === "finance"
@@ -1102,7 +1232,8 @@
       saved: "Saved answers",
       history: "History",
       sources: "Sources",
-      context: "My context"
+      context: "My context",
+      rm: "Resource management"
     };
     document.getElementById("pageTitle").textContent = titles[state.nav];
 
@@ -1233,6 +1364,7 @@
     renderAnswer();
     renderProject();
     renderLists();
+    renderRmBoard();
     renderContext();
     bindChrome();
   }

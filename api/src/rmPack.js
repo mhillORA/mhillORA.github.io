@@ -466,6 +466,116 @@ async function loadHeadcount(dims) {
   return rows.map((r) => enrichFact("Fact_Headcount", r, dims));
 }
 
+async function loadAllAssignments(dims) {
+  const fact = await safeQuery(LENS.rmAssignments, "SELECT * FROM c WHERE c.docType = @t", [
+    { name: "@t", value: RM_ENTITIES.Fact_Assignments.docType }
+  ]);
+  if (fact.length) return fact.map((r) => enrichFact("Fact_Assignments", r, dims));
+  return safeQuery(LENS.rmExportAssignments, "SELECT * FROM c WHERE c.docType = @t", [
+    { name: "@t", value: RM_LANDING.export_assignments.docType }
+  ]);
+}
+
+function ymd(v) {
+  if (v == null || v === "") return null;
+  return String(v).slice(0, 10);
+}
+
+function dedicatedPct(fte) {
+  if (fte == null) return null;
+  return Math.round(Number(fte) * 1000) / 10;
+}
+
+async function getRmPeopleBoard() {
+  const dims = await loadDimensions();
+  const [rows, util] = await Promise.all([loadAllAssignments(dims), loadUtilization(dims)]);
+  const utilByKey = new Map();
+  for (const r of [...(util.over || []), ...(util.under || [])]) {
+    const k = personKey(r);
+    if (k) utilByKey.set(k, r);
+    if (r.employeeKey) utilByKey.set(String(r.employeeKey), r);
+  }
+
+  const people = new Map();
+  for (const a of rows) {
+    const empKey = String(pickField(a, "employeeKey") || "");
+    const name = String(pickField(a, "employeeName", "fullName") || "").trim();
+    const id = empKey || slugName(name);
+    if (!id) continue;
+    if (!people.has(id)) {
+      const emp = empKey ? dims.employeeByKey.get(empKey) : null;
+      people.set(id, {
+        id,
+        employeeKey: empKey || null,
+        fullName: name || pickField(emp, "fullName") || "—",
+        jobTitle: pickField(a, "jobTitle") || pickField(emp, "jobTitle") || null,
+        timeAllocation: numOrNull(emp ? pickField(emp, "timeAllocation") : null) ?? 1,
+        studies: new Map()
+      });
+    }
+    const p = people.get(id);
+    const sk = String(pickField(a, "studyKey") || "").trim() || "—";
+    if (!p.studies.has(sk)) {
+      const study = dims.studyByKey.get(sk);
+      p.studies.set(sk, {
+        studyKey: sk,
+        studyName: pickField(study, "studyName") || pickField(a, "studyName", "studyLabel") || sk,
+        lines: []
+      });
+    }
+    const fte = numOrNull(pickField(a, "valueFte"));
+    p.studies.get(sk).lines.push({
+      activity: pickField(a, "activity", "activityName", "activityNameRaw") || "—",
+      beginDate: ymd(pickField(a, "beginDate")),
+      endDate: ymd(pickField(a, "endDate")),
+      valueFte: fte,
+      dedicatedPct: dedicatedPct(fte),
+      status: pickField(a, "status") || null
+    });
+  }
+
+  const list = [...people.values()]
+    .map((p) => {
+      const studies = [...p.studies.values()]
+        .map((s) => {
+          const begins = s.lines.map((l) => l.beginDate).filter(Boolean).sort();
+          const ends = s.lines.map((l) => l.endDate).filter(Boolean).sort();
+          const ftes = s.lines.map((l) => l.valueFte).filter((n) => n != null);
+          s.lines.sort((a, b) => String(a.beginDate || "").localeCompare(String(b.beginDate || "")));
+          return {
+            studyKey: s.studyKey,
+            studyName: s.studyName,
+            beginDate: begins[0] || null,
+            endDate: ends.length ? ends[ends.length - 1] : null,
+            peakDedicatedPct: ftes.length ? dedicatedPct(Math.max(...ftes)) : null,
+            lineCount: s.lines.length,
+            lines: s.lines
+          };
+        })
+        .sort((a, b) => (b.peakDedicatedPct || 0) - (a.peakDedicatedPct || 0));
+      const u = utilByKey.get(p.id) || utilByKey.get(String(p.employeeKey)) || utilByKey.get(slugName(p.fullName));
+      return {
+        id: p.id,
+        employeeKey: p.employeeKey,
+        fullName: p.fullName,
+        jobTitle: p.jobTitle,
+        timeAllocation: p.timeAllocation,
+        assignedFte: u ? u.currentAssignedFte : null,
+        spareFte: u ? u.spareFte : null,
+        overAllocationFte: u ? u.overAllocationFte : null,
+        studyCount: studies.length,
+        studies
+      };
+    })
+    .sort((a, b) => String(a.fullName).localeCompare(String(b.fullName)));
+
+  return {
+    loaded: list.length > 0,
+    people: list,
+    note: "Dedicated % is Fact_Assignments.ValueFTE × 100 (0.17 = 17% of one FTE). Rows are activity windows (BeginDate–EndDate); they are sequential, not stacked concurrent load. Peak % on a study is the highest activity window."
+  };
+}
+
 async function getRmInventory() {
   const [studies, employees, assignments, actuals, roster, exportAssign, staffingEmp, dqSheets, runs] =
     await Promise.all([
@@ -894,6 +1004,7 @@ async function answerRmQuestion(question, stampFn) {
 module.exports = {
   answerRmQuestion,
   getRmBriefing,
+  getRmPeopleBoard,
   getRmInventory,
   loadOverAllocated,
   loadUnderUtilized,
