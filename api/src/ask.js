@@ -18,7 +18,7 @@ function guessKey(text) {
   if (/(netsuite|profitability|gross margin|\bgm\b|budgeted gm|actual gm|change order|billable hr|cost per billable|eos gm|service line)/.test(t)) {
     return "netsuite";
   }
-  if (/(staff|resource|cra|fte|capacity|assign|backfill|headcount|over.?allocat|overallocat|allocation)/.test(t)) return "staffing";
+  if (/(staff|resource|cra|fte|capacity|assign|backfill|headcount|over.?allocat|overallocat|under.?utili|under.?allocat|allocation)/.test(t)) return "staffing";
   if (/(visit|visits)/.test(t)) return "visits";
   return "enrollment";
 }

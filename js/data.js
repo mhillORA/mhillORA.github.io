@@ -107,9 +107,9 @@ const BD_QUESTIONS = [
 
 const STAFFING_QUESTIONS = [
   { text: "Who is over-allocated?", icon: "users", needs: "Actual RM · until DW" },
+  { text: "Who is under-utilized?", icon: "users", needs: "Spare FTE vs time allocation" },
   { text: "Which roles are short on capacity?", icon: "users", needs: "Actual RM headcount" },
-  { text: "Show CRA assignments", icon: "users", needs: "Actual RM assignments" },
-  { text: "Show assignments for 19-120-0012", icon: "users", needs: "Actual RM study key" }
+  { text: "Show CRA assignments", icon: "users", needs: "Actual RM assignments" }
 ];
 
 const ROLE_PLAYBOOKS = [

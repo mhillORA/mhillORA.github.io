@@ -49,14 +49,32 @@ function studyKeyFromQuestion(question) {
 
 function parseRmIntent(question) {
   const t = String(question || "").toLowerCase();
+  const wantUnder = /(under.?utili[sz]|under.?allocat|underused|under.?used|on the bench|on bench|available fte|unused fte|spare fte|not fully booked|who has capacity)/.test(
+    t
+  );
+  const wantOver = /(over.?allocat|overbook|too many hours|over.?utili[sz])/.test(t) && !wantUnder;
+  const wantSpareRole = /(spare capacity|surplus capacity|roles? with spare|roles? with surplus)/.test(t);
+  const wantGap = !wantUnder && /(capacity|headcount|gap|shortfall|demand|short on)/.test(t);
   return {
     studyKey: studyKeyFromQuestion(question),
-    wantOver: /(over.?allocat|overbook|too many hours)/.test(t),
-    wantGap: /(capacity|headcount|gap|shortfall|demand|short on)/.test(t),
+    wantOver,
+    wantUnder,
+    wantSpareRole,
+    wantGap,
     wantAssign: /(assign|booked|staffed|who is on|who.?s on|cra)/.test(t),
     craOnly: /\bcra\b/.test(t),
     wantOverview: /(overview|summary|briefing|what.?s loaded|how many)/.test(t)
   };
+}
+
+function isActiveEmployee(row) {
+  const status = String(pickField(row, "positionStatus") || "").toLowerCase();
+  if (status && /inactiv|terminat|leave|separat/.test(status)) return false;
+  if (status.includes("active")) return true;
+  const a = pickField(row, "active");
+  if (a === false) return false;
+  if (a === true) return true;
+  return true;
 }
 
 async function countDocs(containerId, docType) {
@@ -206,7 +224,31 @@ async function loadDqGaps() {
   return raw.map(normalizeGapRow).filter(Boolean);
 }
 
-async function loadOverFromAssignments(dims) {
+function personKey(row) {
+  return String(row.employeeKey || slugName(row.fullName) || row.fullName || "");
+}
+
+function utilizationRow({ employeeKey, fullName, jobTitle, timeAllocation, assigned, active, contractor, source, _ts }) {
+  const cap = timeAllocation == null ? 1 : timeAllocation;
+  const booked = assigned == null ? 0 : assigned;
+  const delta = booked - cap;
+  return {
+    employeeKey,
+    fullName,
+    jobTitle,
+    timeAllocation: cap,
+    currentAssignedFte: booked,
+    overAllocationFte: delta > 0.001 ? delta : 0,
+    spareFte: delta < -0.001 ? -delta : 0,
+    utilizationPct: cap > 0 ? booked / cap : null,
+    active,
+    contractor,
+    source,
+    _ts
+  };
+}
+
+async function assignedByPerson(dims) {
   const rows = await safeQuery(LENS.rmAssignments, "SELECT * FROM c WHERE c.docType = @t", [
     { name: "@t", value: RM_ENTITIES.Fact_Assignments.docType }
   ]);
@@ -222,39 +264,18 @@ async function loadOverFromAssignments(dims) {
         fullName: a.employeeName,
         jobTitle: a.jobTitle,
         assigned: 0,
-        _ts: a._ts
+        _ts: a._ts,
+        source: "fact_assignments"
       });
     }
     const g = byEmp.get(key);
     g.assigned += fte;
     if (a._ts && (!g._ts || a._ts > g._ts)) g._ts = a._ts;
   }
-  const out = [];
-  for (const g of byEmp.values()) {
-    const emp = g.employeeKey ? dims.employeeByKey.get(String(g.employeeKey)) : null;
-    const timeAllocation = numOrNull(emp ? pickField(emp, "timeAllocation") : null) ?? 1;
-    const over = g.assigned - timeAllocation;
-    if (over <= 0.001) continue;
-    const n = normalizeOverRow(
-      {
-        employeeKey: g.employeeKey,
-        fullName: g.fullName || (emp && pickField(emp, "fullName")),
-        jobTitle: g.jobTitle || (emp && pickField(emp, "jobTitle")),
-        timeAllocation,
-        currentAssignedFte: g.assigned,
-        overAllocationFte: over,
-        active: emp ? pickField(emp, "active") : null,
-        source: "fact_assignments",
-        _ts: g._ts
-      },
-      dims
-    );
-    if (n) out.push(n);
-  }
-  return out;
+  return byEmp;
 }
 
-async function loadOverFromStaffingGrid(dims) {
+async function assignedFromStaffingGrid(dims) {
   const totals = await safeQuery(
     LENS.rmStaffingEmployee,
     "SELECT * FROM c WHERE c.docType = @t AND c.rowKind = @k",
@@ -266,37 +287,114 @@ async function loadOverFromStaffingGrid(dims) {
   const months = totals.map((r) => r.yearMonth).filter(Boolean).sort();
   const latest = months.length ? months[months.length - 1] : null;
   const slice = latest ? totals.filter((r) => r.yearMonth === latest) : totals;
-  const out = [];
+  const byEmp = new Map();
   for (const r of slice) {
     const name = pickField(r, "employeeName", "name");
     const nk = slugName(name);
-    const roster = nk ? dims.nameByKey.get(nk) : null;
-    const timeAllocation = numOrNull(roster ? pickField(roster, "timeAllocation") : null) ?? 1;
-    const assigned = numOrNull(pickField(r, "valueFte")) || 0;
-    const n = normalizeOverRow(
-      {
-        fullName: name,
-        jobTitle: pickField(r, "roleCode") || (roster && pickField(roster, "jobTitle")),
-        timeAllocation,
-        currentAssignedFte: assigned,
-        overAllocationFte: assigned - timeAllocation,
-        active: roster ? pickField(roster, "active") : null,
-        source: "staffing_employee",
-        _ts: r._ts
-      },
-      dims
-    );
-    if (n) out.push(n);
+    if (!nk) continue;
+    const roster = dims.nameByKey.get(nk);
+    const key = String((roster && pickField(roster, "employeeKey")) || nk);
+    byEmp.set(key, {
+      employeeKey: roster ? pickField(roster, "employeeKey") : null,
+      fullName: name,
+      jobTitle: pickField(r, "roleCode") || (roster && pickField(roster, "jobTitle")),
+      assigned: numOrNull(pickField(r, "valueFte")) || 0,
+      _ts: r._ts,
+      source: "staffing_employee"
+    });
   }
-  return out;
+  return byEmp;
+}
+
+function toUtilizationLists(byEmp, dims) {
+  const over = [];
+  const under = [];
+  const seen = new Set();
+  for (const g of byEmp.values()) {
+    const emp = g.employeeKey ? dims.employeeByKey.get(String(g.employeeKey)) : null;
+    const nameKey = slugName(g.fullName);
+    const roster = nameKey ? dims.nameByKey.get(nameKey) : null;
+    const person = emp || roster || {};
+    if (emp && !isActiveEmployee(emp) && g.assigned <= 0.001) continue;
+    const timeAllocation =
+      numOrNull(emp ? pickField(emp, "timeAllocation") : null) ??
+      numOrNull(roster ? pickField(roster, "timeAllocation") : null) ??
+      1;
+    const row = utilizationRow({
+      employeeKey: g.employeeKey || pickField(person, "employeeKey"),
+      fullName: g.fullName || pickField(person, "fullName"),
+      jobTitle: g.jobTitle || pickField(person, "jobTitle"),
+      timeAllocation,
+      assigned: g.assigned,
+      active: pickField(person, "active"),
+      contractor: pickField(person, "contractor"),
+      source: g.source,
+      _ts: g._ts
+    });
+    const key = personKey(row);
+    if (key) seen.add(key);
+    if (row.overAllocationFte > 0.001) over.push(row);
+    else if (row.spareFte > 0.05) under.push(row);
+  }
+  for (const emp of dims.employees || []) {
+    if (!isActiveEmployee(emp)) continue;
+    const timeAllocation = numOrNull(pickField(emp, "timeAllocation")) ?? 1;
+    if (timeAllocation <= 0) continue;
+    const key = String(pickField(emp, "employeeKey") || slugName(pickField(emp, "fullName")) || "");
+    if (!key || seen.has(key) || seen.has(slugName(pickField(emp, "fullName")))) continue;
+    const row = utilizationRow({
+      employeeKey: pickField(emp, "employeeKey"),
+      fullName: pickField(emp, "fullName"),
+      jobTitle: pickField(emp, "jobTitle"),
+      timeAllocation,
+      assigned: 0,
+      active: pickField(emp, "active"),
+      contractor: pickField(emp, "contractor"),
+      source: "dim_employee",
+      _ts: emp._ts
+    });
+    if (row.spareFte > 0.05) under.push(row);
+  }
+  over.sort((a, b) => (b.overAllocationFte || 0) - (a.overAllocationFte || 0));
+  under.sort((a, b) => (b.spareFte || 0) - (a.spareFte || 0));
+  return { over, under };
+}
+
+let utilizationCache = null;
+
+async function loadUtilization(dims) {
+  const d = dims || (await loadDimensions());
+  if (utilizationCache && utilizationCache.dims === d) return utilizationCache.value;
+  const [facts, grid] = await Promise.all([assignedByPerson(d), assignedFromStaffingGrid(d)]);
+  const merged = new Map(grid);
+  for (const [k, v] of facts) merged.set(k, v);
+  const value = toUtilizationLists(merged, d);
+  const dqOver = await loadDqOver(d);
+  const byKey = new Map(value.over.map((r) => [personKey(r), r]));
+  for (const r of dqOver) {
+    const key = personKey(r);
+    if (!key) continue;
+    const prev = byKey.get(key);
+    if (!prev || (r.source === "dq04" && prev.source !== "dq04")) {
+      byKey.set(key, {
+        ...r,
+        spareFte: 0,
+        utilizationPct:
+          r.timeAllocation > 0 && r.currentAssignedFte != null ? r.currentAssignedFte / r.timeAllocation : null
+      });
+    }
+  }
+  value.over = [...byKey.values()].sort((a, b) => (b.overAllocationFte || 0) - (a.overAllocationFte || 0));
+  utilizationCache = { dims: d, value };
+  return value;
 }
 
 function mergeOverRows(lists) {
   const byKey = new Map();
-  const priority = { dq04: 3, fact_assignments: 2, staffing_employee: 1 };
+  const priority = { dq04: 3, fact_assignments: 2, staffing_employee: 1, dim_employee: 0 };
   for (const list of lists) {
     for (const r of list) {
-      const key = String(r.employeeKey || slugName(r.fullName) || r.fullName || "");
+      const key = personKey(r);
       if (!key) continue;
       const prev = byKey.get(key);
       if (!prev || (priority[r.source] || 0) >= (priority[prev.source] || 0)) {
@@ -308,13 +406,13 @@ function mergeOverRows(lists) {
 }
 
 async function loadOverAllocated(dims) {
-  const d = dims || (await loadDimensions());
-  const [dq, facts, grid] = await Promise.all([
-    loadDqOver(d),
-    loadOverFromAssignments(d),
-    loadOverFromStaffingGrid(d)
-  ]);
-  return mergeOverRows([dq, facts, grid]);
+  const util = await loadUtilization(dims);
+  return util.over;
+}
+
+async function loadUnderUtilized(dims) {
+  const util = await loadUtilization(dims);
+  return util.under;
 }
 
 async function loadAssignments(dims, { studyKey, craOnly, limit = 200 } = {}) {
@@ -399,8 +497,9 @@ async function getRmInventory() {
 async function getRmBriefing() {
   const dims = await loadDimensions();
   const inventory = await getRmInventory();
-  const [over, gaps, headcount] = await Promise.all([
+  const [over, under, gaps, headcount] = await Promise.all([
     loadOverAllocated(dims),
+    loadUnderUtilized(dims),
     loadDqGaps(),
     loadHeadcount(dims)
   ]);
@@ -420,6 +519,7 @@ async function getRmBriefing() {
       loaded: false,
       ...meta,
       overCount: 0,
+      underCount: 0,
       shortRoles: 0,
       studies: 0,
       employees: 0,
@@ -435,6 +535,7 @@ async function getRmBriefing() {
     loaded: true,
     ...meta,
     overCount: over.length,
+    underCount: under.length,
     shortRoles: short.length,
     studies: inventory.studies,
     employees: inventory.employees,
@@ -446,6 +547,12 @@ async function getRmBriefing() {
     topOver: over.slice(0, 5).map((r) => ({
       name: r.fullName,
       overFte: r.overAllocationFte,
+      assigned: r.currentAssignedFte,
+      source: r.source
+    })),
+    topUnder: under.slice(0, 5).map((r) => ({
+      name: r.fullName,
+      spareFte: r.spareFte,
       assigned: r.currentAssignedFte,
       source: r.source
     })),
@@ -497,27 +604,78 @@ function buildOverAnswer(question, over, stampFn) {
       ],
       query: "lens_rm_dq DQ_04 + lens_rm_assignments Σ valueFte by employeeKey",
       confidence: "high",
-      followUps: ["Which roles are short on capacity?", "Show CRA assignments", "Show assignments for 19-120-0012"]
+      followUps: ["Who is under-utilized?", "Which roles are short on capacity?", "Show CRA assignments"]
     },
     over
   );
 }
 
-function buildGapAnswer(question, gaps, headcount, stampFn) {
+function buildUnderAnswer(question, under, stampFn) {
+  const maxSpare = Math.max(0.01, ...under.map((r) => Math.abs(r.spareFte || 0)));
+  const sources = [...new Set(under.map((r) => r.source))];
+  return stampFn(
+    {
+      q: question,
+      needs: ["insightsrm"],
+      icon: "users",
+      summary: `${under.length} people have unused capacity vs their time allocation in InsightsRM (${sources.join(" + ")}). Spare FTE = TimeAllocation minus assigned FTE. Not NetSuite.`,
+      chartTitle: "Under-utilized (spare FTE vs time allocation)",
+      chartNote: "InsightsRM · Fact_Assignments + Dim_Employee.TimeAllocation · not over-allocation",
+      chartType: "bar",
+      bars: under.slice(0, 8).map((r) => ({
+        label: String(r.fullName || "—").slice(0, 36),
+        pct: Math.round((Math.abs(r.spareFte || 0) / maxSpare) * 100),
+        value: fteLabel(r.spareFte),
+        color: "#3ebdac"
+      })),
+      tableTitle: "Under-utilized personnel",
+      grid: "1.3fr 1.1fr 0.5fr 0.5fr 0.5fr 0.6fr",
+      cols: ["Name", "Title", "Capacity", "Assigned", "Spare", "Source"],
+      rows: under.slice(0, 12).map((r) => [
+        r.fullName || "—",
+        r.jobTitle || "—",
+        fteLabel(r.timeAllocation),
+        fteLabel(r.currentAssignedFte),
+        fteLabel(r.spareFte),
+        r.source || "—"
+      ]),
+      caveat:
+        "Actual RM landing in Cosmos until DW. Under-utilized = Dim_Employee.TimeAllocation minus assigned FTE on Fact_Assignments. People with no assignment rows and an Active position status are listed as spare = full allocation. Blank FTE is missing, not zero.",
+      trace: [
+        "Joined Fact_Assignments → Dim_Employee on employeeKey per Model_Relationships.",
+        "Did not use DQ_04 (that sheet is over-allocation only).",
+        "Did not read lens_ns_projects or ora_fact_study."
+      ],
+      query: "lens_rm_assignments Σ valueFte by employeeKey vs Dim_Employee.timeAllocation (spare > 0.05)",
+      confidence: "high",
+      followUps: ["Who is over-allocated?", "Which roles are short on capacity?", "Show CRA assignments"]
+    },
+    under
+  );
+}
+
+function buildGapAnswer(question, gaps, headcount, stampFn, preferSurplus = false) {
   const short = gaps.filter((g) => (g.gapFte || 0) < 0).sort((a, b) => (a.gapFte || 0) - (b.gapFte || 0));
-  const surplus = gaps.filter((g) => (g.gapFte || 0) > 0);
-  const chartSource = (short.length ? short : surplus).slice(0, 8);
+  const surplus = gaps.filter((g) => (g.gapFte || 0) > 0).sort((a, b) => (b.gapFte || 0) - (a.gapFte || 0));
+  const useSurplus = preferSurplus && surplus.length;
+  const chartSource = (useSurplus ? surplus : short.length ? short : surplus).slice(0, 8);
   const maxAbs = Math.max(0.01, ...chartSource.map((r) => Math.abs(r.gapFte || 0)));
-  const tableSource = (short.length ? short : gaps).slice(0, 12);
+  const tableSource = (useSurplus ? surplus : short.length ? short : gaps).slice(0, 12);
   return stampFn(
     {
       q: question,
       needs: ["insightsrm"],
       icon: "users",
       summary: gaps.length
-        ? `${short.length} role${short.length === 1 ? "" : "s"} are short vs headcount (gap FTE < 0). ${surplus.length} have spare capacity.`
+        ? useSurplus
+          ? `${surplus.length} InsightsRM role${surplus.length === 1 ? "" : "s"} have spare capacity (gap FTE > 0). ${short.length} are short.`
+          : `${short.length} role${short.length === 1 ? "" : "s"} are short vs headcount (gap FTE < 0). ${surplus.length} have spare capacity.`
         : `${headcount.length} headcount rows from Fact_Headcount joined to Dim_Role.`,
-      chartTitle: short.length ? "Role capacity shortfall (FTE)" : "Role capacity (Fact_Headcount)",
+      chartTitle: useSurplus
+        ? "Role spare capacity (FTE)"
+        : short.length
+          ? "Role capacity shortfall (FTE)"
+          : "Role capacity (Fact_Headcount)",
       chartNote: "InsightsRM DQ_07 + Fact_Headcount · not NetSuite",
       chartType: "bar",
       bars: chartSource.map((r) => {
@@ -529,7 +687,7 @@ function buildGapAnswer(question, gaps, headcount, stampFn) {
           color: v < 0 ? "#ed1c24" : "#3ebdac"
         };
       }),
-      tableTitle: short.length ? "Roles short on capacity" : "Role capacity gaps",
+      tableTitle: useSurplus ? "Roles with spare capacity" : short.length ? "Roles short on capacity" : "Role capacity gaps",
       grid: "0.9fr 0.7fr 0.7fr 0.7fr 0.7fr",
       cols: ["Role", "Capacity", "Demand", "Gap FTE", "Note"],
       rows: tableSource.map((r) => [
@@ -646,21 +804,51 @@ function buildInventoryAnswer(question, inventory, briefing, stampFn) {
 }
 
 async function answerRmQuestion(question, stampFn) {
+  utilizationCache = null;
   const intent = parseRmIntent(question);
   const dims = await loadDimensions();
   const inventory = await getRmInventory();
 
   if (!inventory.loaded) {
-    return buildInventoryAnswer(question, inventory, { overCount: 0 }, stampFn);
+    return buildInventoryAnswer(question, inventory, { overCount: 0, underCount: 0 }, stampFn);
   }
 
-  const [over, gaps, headcount] = await Promise.all([
-    intent.wantOver || !intent.wantGap ? loadOverAllocated(dims) : Promise.resolve([]),
-    intent.wantGap || intent.wantOver ? loadDqGaps() : Promise.resolve([]),
-    loadHeadcount(dims)
+  const needPeople = intent.wantOver || intent.wantUnder || (!intent.wantGap && !intent.wantSpareRole && !intent.wantAssign && !intent.studyKey);
+  const [over, under, gaps, headcount] = await Promise.all([
+    needPeople || intent.wantOver ? loadOverAllocated(dims) : Promise.resolve([]),
+    intent.wantUnder || needPeople ? loadUnderUtilized(dims) : Promise.resolve([]),
+    intent.wantGap || intent.wantSpareRole ? loadDqGaps() : Promise.resolve([]),
+    intent.wantGap || intent.wantSpareRole ? loadHeadcount(dims) : Promise.resolve([])
   ]);
 
-  if (intent.studyKey || (intent.wantAssign && !intent.wantOver)) {
+  if (intent.wantUnder) {
+    if (under.length) return buildUnderAnswer(question, under, stampFn);
+    return stampFn(
+      {
+        q: question,
+        needs: ["insightsrm"],
+        icon: "users",
+        summary:
+          "No under-utilized people matched: nobody with assigned FTE more than 0.05 below Dim_Employee.TimeAllocation. This is not the over-allocation list.",
+        chartTitle: "No under-utilized personnel",
+        chartNote: "InsightsRM · spare FTE vs time allocation",
+        chartType: "bar",
+        bars: [],
+        tableTitle: "Under-utilized personnel",
+        grid: "1fr",
+        cols: ["Note"],
+        rows: [["Assigned FTE is at or above time allocation for people in Fact_Assignments / Dim_Employee."]],
+        caveat: "Under-utilized is spare capacity at the person grain. Role spare capacity is a different question.",
+        trace: ["Computed assigned FTE from Fact_Assignments vs Dim_Employee.TimeAllocation.", "Did not return DQ_04 over-allocation."],
+        query: "spare FTE = timeAllocation - Σ assignment valueFte",
+        confidence: "medium",
+        followUps: ["Who is over-allocated?", "Which roles are short on capacity?", "Show CRA assignments"]
+      },
+      []
+    );
+  }
+
+  if (intent.studyKey || (intent.wantAssign && !intent.wantOver && !intent.wantUnder)) {
     const assignments = await loadAssignments(dims, {
       studyKey: intent.studyKey,
       craOnly: intent.craOnly
@@ -674,12 +862,20 @@ async function answerRmQuestion(question, stampFn) {
     return buildOverAnswer(question, over, stampFn);
   }
 
-  if (intent.wantGap && (gaps.length || headcount.length)) {
-    return buildGapAnswer(question, gaps, headcount, stampFn);
+  if (intent.wantSpareRole && (gaps.length || headcount.length)) {
+    return buildGapAnswer(question, gaps, headcount, stampFn, true);
   }
 
-  if (over.length) {
+  if (intent.wantGap && (gaps.length || headcount.length)) {
+    return buildGapAnswer(question, gaps, headcount, stampFn, false);
+  }
+
+  if (over.length && !intent.wantUnder) {
     return buildOverAnswer(question, over, stampFn);
+  }
+
+  if (under.length) {
+    return buildUnderAnswer(question, under, stampFn);
   }
 
   if (gaps.length || headcount.length) {
@@ -700,6 +896,7 @@ module.exports = {
   getRmBriefing,
   getRmInventory,
   loadOverAllocated,
+  loadUnderUtilized,
   loadDimensions,
   pickField,
   fteLabel,

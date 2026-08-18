@@ -345,10 +345,10 @@
     const kpis = r.loaded
       ? `<div class="kpi-row">
           <div class="kpi"><div class="kpi-value">${r.overCount}</div><div class="kpi-label">Over-allocated</div></div>
+          <div class="kpi"><div class="kpi-value">${r.underCount != null ? r.underCount : "—"}</div><div class="kpi-label">Under-utilized</div></div>
           <div class="kpi"><div class="kpi-value">${r.shortRoles}</div><div class="kpi-label">Roles short</div></div>
           <div class="kpi"><div class="kpi-value">${r.studies}</div><div class="kpi-label">Studies</div></div>
           <div class="kpi"><div class="kpi-value">${r.employees}</div><div class="kpi-label">Employees</div></div>
-          <div class="kpi"><div class="kpi-value">${r.assignments}</div><div class="kpi-label">Assignments</div></div>
         </div>`
       : `<div class="briefing-note">${escapeHtml(r.note || "No RM snapshot in Cosmos yet.")}</div>`;
     const top =
