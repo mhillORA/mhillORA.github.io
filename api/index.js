@@ -1261,29 +1261,48 @@ app.http('surveyDefinitions', {
     handler: (request, context) => crudHandler(context, request, 'site-survey-definitions'),
 });
 
+function jsonHeaders() {
+    return {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+    };
+}
+
+function sortByIsoDesc(rows, keys) {
+    const list = Array.isArray(rows) ? rows.slice() : [];
+    const fields = Array.isArray(keys) ? keys : [keys];
+    list.sort((a, b) => {
+        const av = fields.map((k) => a?.[k]).find(Boolean) || '';
+        const bv = fields.map((k) => b?.[k]).find(Boolean) || '';
+        return String(bv).localeCompare(String(av));
+    });
+    return list;
+}
+
+function readQueryParam(request, name) {
+    if (request.query && typeof request.query.get === 'function') return request.query.get(name);
+    if (request.query) return request.query[name];
+    return null;
+}
+
 app.http('surveyAssignments', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'site-survey-assignments/{id?}',
     handler: async (request, context) => {
-        // Support filtered reads: /site-survey-assignments?siteId=...&surveyId=...&status=...
-        // (keeps data logically "per site" without forcing a full container read)
+        if (request.method === 'OPTIONS') {
+            return { status: 204, headers: jsonHeaders() };
+        }
+
+        // Filtered reads: /site-survey-assignments?siteId=...&surveyId=...&status=...
         if (request.method === 'GET') {
             const id = getIdFromRequest(request);
             if (!id) {
-                let siteId = null;
-                let surveyId = null;
-                let status = null;
-
-                if (request.query && typeof request.query.get === 'function') {
-                    siteId = request.query.get('siteId');
-                    surveyId = request.query.get('surveyId');
-                    status = request.query.get('status');
-                } else if (request.query) {
-                    siteId = request.query.siteId;
-                    surveyId = request.query.surveyId;
-                    status = request.query.status;
-                }
+                const siteId = readQueryParam(request, 'siteId');
+                const surveyId = readQueryParam(request, 'surveyId');
+                const status = readQueryParam(request, 'status');
 
                 if (siteId || surveyId || status) {
                     try {
@@ -1295,7 +1314,7 @@ app.http('surveyAssignments', {
                         if (status) { where.push('LOWER(c.status) = @status'); parameters.push({ name: '@status', value: String(status).toLowerCase() }); }
 
                         const query = {
-                            query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.createdAt DESC`
+                            query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`
                                 .replace(/\s+/g, ' ')
                                 .trim(),
                             parameters
@@ -1304,7 +1323,10 @@ app.http('surveyAssignments', {
                         const { resources } = await container.items
                             .query(query, { enableCrossPartitionQuery: true })
                             .fetchAll();
-                        return { jsonBody: resources || [] };
+                        return {
+                            jsonBody: sortByIsoDesc(resources || [], ['createdAt', '_ts']),
+                            headers: jsonHeaders(),
+                        };
                     } catch (error) {
                         return handleError(context, error, 'Query site-survey-assignments');
                     }
@@ -1312,19 +1334,58 @@ app.http('surveyAssignments', {
             }
         }
 
-        // For POST, set defaults for unique-link behavior
         if (request.method === 'POST') {
             try {
                 const body = await request.json();
-                // default status and timestamps
                 if (!body.status) body.status = 'sent';
                 if (!body.createdAt) body.createdAt = new Date().toISOString();
-                // ensure one-time-ish link semantics: each assignment is a unique id
+                body.updatedAt = new Date().toISOString();
                 request.json = async () => body;
             } catch (e) {
                 // fall through; crudHandler will return appropriate error
             }
         }
+
+        // Merge PUT/PATCH so status updates (opened/submitted) cannot wipe required fields
+        if (request.method === 'PUT' || request.method === 'PATCH') {
+            const id = getIdFromRequest(request);
+            if (id) {
+                try {
+                    const container = getContainer('site-survey-assignments');
+                    let existing = null;
+                    try {
+                        const read = await container.item(id, id).read();
+                        existing = read.resource;
+                    } catch (_) {
+                        existing = null;
+                    }
+                    if (!existing) {
+                        return { status: 404, jsonBody: { error: 'Assignment not found' }, headers: jsonHeaders() };
+                    }
+                    const body = await request.json();
+                    const merged = {
+                        ...existing,
+                        ...body,
+                        id: existing.id,
+                        surveyId: existing.surveyId,
+                        siteId: existing.siteId,
+                        targetRole: body.targetRole || existing.targetRole,
+                        updatedAt: new Date().toISOString(),
+                    };
+                    // Never reopen a submitted assignment via an "opened" ping
+                    if (String(existing.status || '').toLowerCase() === 'submitted') {
+                        merged.status = 'submitted';
+                        merged.submittedAt = existing.submittedAt || merged.submittedAt;
+                    }
+                    validateSurveyAssignmentsSchema(merged);
+                    const { resource } = await container.items.upsert(merged);
+                    return { jsonBody: resource, headers: jsonHeaders() };
+                } catch (error) {
+                    return handleError(context, error, 'Update site-survey-assignments');
+                }
+            }
+        }
+
         return crudHandler(context, request, 'site-survey-assignments');
     },
 });
@@ -1334,27 +1395,18 @@ app.http('surveyResponses', {
     authLevel: 'anonymous',
     route: 'site-survey-responses/{id?}',
     handler: async (request, context) => {
-        // Support filtered reads: /site-survey-responses?siteId=...&assignmentId=...&surveyId=...
-        // This is the main "stored on each site" retrieval path (responses carry siteId).
+        if (request.method === 'OPTIONS') {
+            return { status: 204, headers: jsonHeaders() };
+        }
+
+        // Filtered reads: /site-survey-responses?siteId=...&assignmentId=...&surveyId=...
         if (request.method === 'GET') {
             const id = getIdFromRequest(request);
             if (!id) {
-                let siteId = null;
-                let assignmentId = null;
-                let surveyId = null;
-                let targetRole = null;
-
-                if (request.query && typeof request.query.get === 'function') {
-                    siteId = request.query.get('siteId');
-                    assignmentId = request.query.get('assignmentId');
-                    surveyId = request.query.get('surveyId');
-                    targetRole = request.query.get('targetRole');
-                } else if (request.query) {
-                    siteId = request.query.siteId;
-                    assignmentId = request.query.assignmentId;
-                    surveyId = request.query.surveyId;
-                    targetRole = request.query.targetRole;
-                }
+                const siteId = readQueryParam(request, 'siteId');
+                const assignmentId = readQueryParam(request, 'assignmentId');
+                const surveyId = readQueryParam(request, 'surveyId');
+                const targetRole = readQueryParam(request, 'targetRole');
 
                 if (siteId || assignmentId || surveyId || targetRole) {
                     try {
@@ -1367,7 +1419,7 @@ app.http('surveyResponses', {
                         if (targetRole) { where.push('LOWER(c.targetRole) = @targetRole'); parameters.push({ name: '@targetRole', value: String(targetRole).toLowerCase() }); }
 
                         const query = {
-                            query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.submittedAt DESC`
+                            query: `SELECT * FROM c ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`
                                 .replace(/\s+/g, ' ')
                                 .trim(),
                             parameters
@@ -1376,7 +1428,10 @@ app.http('surveyResponses', {
                         const { resources } = await container.items
                             .query(query, { enableCrossPartitionQuery: true })
                             .fetchAll();
-                        return { jsonBody: resources || [] };
+                        return {
+                            jsonBody: sortByIsoDesc(resources || [], ['submittedAt', 'createdAt']),
+                            headers: jsonHeaders(),
+                        };
                     } catch (error) {
                         return handleError(context, error, 'Query site-survey-responses');
                     }
@@ -1387,12 +1442,68 @@ app.http('surveyResponses', {
         if (request.method === 'POST') {
             try {
                 const body = await request.json();
-                if (!body.submittedAt) body.submittedAt = new Date().toISOString();
-                request.json = async () => body;
-            } catch (e) {
-                // fall through
+                const now = new Date().toISOString();
+                if (!body.assignmentId) {
+                    return { status: 400, jsonBody: { error: 'assignmentId is required' }, headers: jsonHeaders() };
+                }
+
+                let assignment = null;
+                try {
+                    const asgC = getContainer('site-survey-assignments');
+                    const read = await asgC.item(body.assignmentId, body.assignmentId).read();
+                    assignment = read.resource;
+                } catch (_) {
+                    assignment = null;
+                }
+                if (!assignment) {
+                    return { status: 400, jsonBody: { error: 'Assignment not found' }, headers: jsonHeaders() };
+                }
+
+                // Stamp identity from assignment so the client cannot attach answers to the wrong site
+                body.surveyId = assignment.surveyId;
+                body.siteId = assignment.siteId;
+                body.targetRole = assignment.targetRole || body.targetRole;
+                body.submittedAt = body.submittedAt || now;
+                body.updatedAt = now;
+                if (!Array.isArray(body.answers)) body.answers = [];
+
+                const rspC = getContainer('site-survey-responses');
+                const { resources: existing } = await rspC.items.query({
+                    query: 'SELECT * FROM c WHERE c.assignmentId = @assignmentId',
+                    parameters: [{ name: '@assignmentId', value: String(body.assignmentId) }],
+                }, { enableCrossPartitionQuery: true }).fetchAll();
+
+                if (existing && existing.length) {
+                    const latest = sortByIsoDesc(existing, ['submittedAt', 'createdAt'])[0];
+                    return {
+                        status: 200,
+                        jsonBody: { ...latest, alreadySubmitted: true },
+                        headers: jsonHeaders(),
+                    };
+                }
+
+                validateSurveyResponsesSchema(body);
+                const created = { ...body, id: generateId(), createdAt: now };
+                const { resource } = await rspC.items.create(created);
+
+                try {
+                    const asgC = getContainer('site-survey-assignments');
+                    await asgC.items.upsert({
+                        ...assignment,
+                        status: 'submitted',
+                        submittedAt: now,
+                        updatedAt: now,
+                    });
+                } catch (markErr) {
+                    context.log.warn('Response saved but assignment status update failed', markErr);
+                }
+
+                return { status: 201, jsonBody: resource, headers: jsonHeaders() };
+            } catch (error) {
+                return handleError(context, error, 'Create site-survey-responses');
             }
         }
+
         return crudHandler(context, request, 'site-survey-responses');
     },
 });
@@ -2449,7 +2560,7 @@ app.http('routeDirections', {
 });
 
 // =================================================================================
-// LEGACY STUDIES (ARTEMIS only) — new Cosmos containers; does not touch live studies/sites/patients
+// LEGACY STUDIES (ARTEMIS only) - new Cosmos containers; does not touch live studies/sites/patients
 // =================================================================================
 const { registerLegacyRoutes } = require('./legacy-routes');
 registerLegacyRoutes(app, {
