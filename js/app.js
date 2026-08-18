@@ -37,6 +37,7 @@
     projectFilter: "",
     projectError: "",
     mobileDrawer: null,
+    sourcesOpen: load("odl.sourcesOpen", false),
     draft: "",
     phase: "idle",
     key: "live",
@@ -164,11 +165,24 @@
     const backdrop = document.getElementById("drawerBackdrop");
     const navBtn = document.getElementById("btnMobileNav");
     const srcBtn = document.getElementById("btnMobileSources");
-    const next = state.mobileDrawer === which ? null : which || null;
+    let next = which || null;
+    if (which === "sources") {
+      if (state.mobileDrawer === "nav") {
+        next = null;
+      } else {
+        state.sourcesOpen = true;
+        save("odl.sourcesOpen", true);
+        const panel = document.getElementById("sourcesPanel");
+        if (panel) panel.open = true;
+        next = "nav";
+      }
+    } else {
+      next = state.mobileDrawer === which ? null : which || null;
+    }
     state.mobileDrawer = next;
     if (root) {
       root.classList.toggle("drawer-nav-open", next === "nav");
-      root.classList.toggle("drawer-sources-open", next === "sources");
+      root.classList.remove("drawer-sources-open");
     }
     if (backdrop) {
       backdrop.hidden = !next;
@@ -176,7 +190,13 @@
     }
     document.body.style.overflow = next ? "hidden" : "";
     if (navBtn) navBtn.setAttribute("aria-expanded", next === "nav" ? "true" : "false");
-    if (srcBtn) srcBtn.setAttribute("aria-expanded", next === "sources" ? "true" : "false");
+    if (srcBtn) srcBtn.setAttribute("aria-expanded", next === "nav" && state.sourcesOpen ? "true" : "false");
+    if (next === "nav" && which === "sources") {
+      requestAnimationFrame(() => {
+        const panel = document.getElementById("sourcesPanel");
+        if (panel) panel.scrollIntoView({ block: "nearest" });
+      });
+    }
   }
 
   function closeMobileDrawers() {
@@ -340,6 +360,16 @@
         </span>
       </div>`;
     }).join("");
+
+    const panel = document.getElementById("sourcesPanel");
+    if (panel) {
+      if (panel.open !== !!state.sourcesOpen) panel.open = !!state.sourcesOpen;
+      panel.ontoggle = () => {
+        if (state.sourcesOpen === panel.open) return;
+        state.sourcesOpen = panel.open;
+        save("odl.sourcesOpen", panel.open);
+      };
+    }
   }
 
   function suggestButtons(questions) {
