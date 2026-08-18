@@ -101,11 +101,12 @@ async function loadLatestRun() {
 }
 
 async function loadDimensions() {
-  const [employees, roles, studies, activities] = await Promise.all([
+  const [employees, roles, studies, activities, departments] = await Promise.all([
     safeQuery(LENS.rmEmployees, "SELECT * FROM c WHERE c.docType = @t", [{ name: "@t", value: RM_ENTITIES.Dim_Employee.docType }]),
     safeQuery(LENS.rmRoles, "SELECT * FROM c WHERE c.docType = @t", [{ name: "@t", value: RM_ENTITIES.Dim_Role.docType }]),
     safeQuery(LENS.rmStudies, "SELECT * FROM c WHERE c.docType = @t", [{ name: "@t", value: RM_ENTITIES.Dim_Study.docType }]),
-    safeQuery(LENS.rmActivities, "SELECT * FROM c WHERE c.docType = @t", [{ name: "@t", value: RM_ENTITIES.Dim_Activity.docType }])
+    safeQuery(LENS.rmActivities, "SELECT * FROM c WHERE c.docType = @t", [{ name: "@t", value: RM_ENTITIES.Dim_Activity.docType }]),
+    safeQuery(LENS.rmDepartments, "SELECT * FROM c WHERE c.docType = @t", [{ name: "@t", value: RM_ENTITIES.Dim_Department.docType }])
   ]);
   const roster = await safeQuery(LENS.rmRoster, "SELECT * FROM c WHERE c.docType = @t", [{ name: "@t", value: RM_LANDING.roster.docType }]);
   const nameByKey = new Map();
@@ -121,11 +122,20 @@ async function loadDimensions() {
     roleById: indexBy(roles, "roleId"),
     studyByKey: indexBy(studies, "studyKey"),
     activityById: indexBy(activities, "activityId"),
+    departmentById: indexBy(departments, "departmentId"),
     nameByKey,
     employees,
     roles,
     studies
   };
+}
+
+function departmentOfEmployee(emp, dims) {
+  if (!emp || !dims.departmentById) return null;
+  const homeRole = dims.roleById.get(String(pickField(emp, "roleId") || ""));
+  const deptId = homeRole ? pickField(homeRole, "departmentId") : null;
+  const dept = deptId ? dims.departmentById.get(String(deptId)) : null;
+  return dept ? pickField(dept, "departmentName") : null;
 }
 
 function enrichFact(factName, row, dims) {
@@ -486,6 +496,24 @@ function dedicatedPct(fte) {
   return Math.round(Number(fte) * 1000) / 10;
 }
 
+function touchYmd(bounds, d) {
+  if (!d) return;
+  if (!bounds.min || d < bounds.min) bounds.min = d;
+  if (!bounds.max || d > bounds.max) bounds.max = d;
+}
+
+function assignmentLine(a) {
+  const fte = numOrNull(pickField(a, "valueFte"));
+  return {
+    activity: pickField(a, "activity", "activityName", "activityNameRaw") || "—",
+    beginDate: ymd(pickField(a, "beginDate")),
+    endDate: ymd(pickField(a, "endDate")),
+    valueFte: fte,
+    dedicatedPct: dedicatedPct(fte),
+    status: pickField(a, "status") || null
+  };
+}
+
 async function getRmPeopleBoard() {
   const dims = await loadDimensions();
   const [rows, util] = await Promise.all([loadAllAssignments(dims), loadUtilization(dims)]);
@@ -497,18 +525,24 @@ async function getRmPeopleBoard() {
   }
 
   const people = new Map();
+  const studies = new Map();
+  const bounds = { min: null, max: null };
   for (const a of rows) {
     const empKey = String(pickField(a, "employeeKey") || "");
     const name = String(pickField(a, "employeeName", "fullName") || "").trim();
     const id = empKey || slugName(name);
     if (!id) continue;
+    const emp = empKey ? dims.employeeByKey.get(empKey) : null;
+    const fullName = name || pickField(emp, "fullName") || "—";
+    const jobTitle = pickField(a, "jobTitle") || pickField(emp, "jobTitle") || null;
+    const department = departmentOfEmployee(emp, dims);
     if (!people.has(id)) {
-      const emp = empKey ? dims.employeeByKey.get(empKey) : null;
       people.set(id, {
         id,
         employeeKey: empKey || null,
-        fullName: name || pickField(emp, "fullName") || "—",
-        jobTitle: pickField(a, "jobTitle") || pickField(emp, "jobTitle") || null,
+        fullName,
+        jobTitle,
+        department,
         timeAllocation: numOrNull(emp ? pickField(emp, "timeAllocation") : null) ?? 1,
         studies: new Map()
       });
@@ -523,20 +557,47 @@ async function getRmPeopleBoard() {
         lines: []
       });
     }
-    const fte = numOrNull(pickField(a, "valueFte"));
-    p.studies.get(sk).lines.push({
-      activity: pickField(a, "activity", "activityName", "activityNameRaw") || "—",
-      beginDate: ymd(pickField(a, "beginDate")),
-      endDate: ymd(pickField(a, "endDate")),
-      valueFte: fte,
-      dedicatedPct: dedicatedPct(fte),
-      status: pickField(a, "status") || null
-    });
+    const line = assignmentLine(a);
+    touchYmd(bounds, line.beginDate);
+    touchYmd(bounds, line.endDate);
+    p.studies.get(sk).lines.push(line);
+
+    const studyDim = dims.studyByKey.get(sk);
+    if (!studies.has(sk)) {
+      studies.set(sk, {
+        studyKey: sk,
+        studyName: pickField(studyDim, "studyName") || pickField(a, "studyName", "studyLabel") || sk,
+        sponsor: pickField(studyDim, "sponsor") || null,
+        status: pickField(studyDim, "currentProjectStatus", "status") || null,
+        roles: new Map()
+      });
+    }
+    const roleId = String(pickField(a, "roleId") || "") || "—";
+    const role = roleId !== "—" ? dims.roleById.get(roleId) : null;
+    const roleCode =
+      pickField(a, "roleCode") || (role ? pickField(role, "roleCode") : null) || "Unmapped";
+    const roleGroup = pickField(a, "roleGroup") || (role ? pickField(role, "roleGroup") : null);
+    const studyNode = studies.get(sk);
+    if (!studyNode.roles.has(roleId)) {
+      studyNode.roles.set(roleId, { roleId, roleCode, roleGroup, staff: new Map() });
+    }
+    const roleNode = studyNode.roles.get(roleId);
+    if (!roleNode.staff.has(id)) {
+      roleNode.staff.set(id, {
+        id,
+        employeeKey: empKey || null,
+        fullName,
+        jobTitle,
+        department,
+        lines: []
+      });
+    }
+    roleNode.staff.get(id).lines.push(line);
   }
 
   const list = [...people.values()]
     .map((p) => {
-      const studies = [...p.studies.values()]
+      const personStudies = [...p.studies.values()]
         .map((s) => {
           const begins = s.lines.map((l) => l.beginDate).filter(Boolean).sort();
           const ends = s.lines.map((l) => l.endDate).filter(Boolean).sort();
@@ -559,20 +620,65 @@ async function getRmPeopleBoard() {
         employeeKey: p.employeeKey,
         fullName: p.fullName,
         jobTitle: p.jobTitle,
+        department: p.department || null,
         timeAllocation: p.timeAllocation,
         assignedFte: u ? u.currentAssignedFte : null,
         spareFte: u ? u.spareFte : null,
         overAllocationFte: u ? u.overAllocationFte : null,
-        studyCount: studies.length,
-        studies
+        studyCount: personStudies.length,
+        studies: personStudies
       };
     })
     .sort((a, b) => String(a.fullName).localeCompare(String(b.fullName)));
 
+  const studyList = [...studies.values()]
+    .map((s) => {
+      const roles = [...s.roles.values()]
+        .map((r) => {
+          const staff = [...r.staff.values()]
+            .map((p) => {
+              p.lines.sort((a, b) => String(a.beginDate || "").localeCompare(String(b.beginDate || "")));
+              const ftes = p.lines.map((l) => l.valueFte).filter((n) => n != null);
+              return {
+                id: p.id,
+                employeeKey: p.employeeKey,
+                fullName: p.fullName,
+                jobTitle: p.jobTitle,
+                department: p.department || null,
+                peakDedicatedPct: ftes.length ? dedicatedPct(Math.max(...ftes)) : null,
+                lines: p.lines
+              };
+            })
+            .sort((a, b) => String(a.fullName).localeCompare(String(b.fullName)));
+          return {
+            roleId: r.roleId,
+            roleCode: r.roleCode,
+            roleGroup: r.roleGroup,
+            staffCount: staff.length,
+            staff
+          };
+        })
+        .sort((a, b) => String(a.roleCode).localeCompare(String(b.roleCode)));
+      const staffIds = new Set(roles.flatMap((r) => r.staff.map((p) => p.id)));
+      return {
+        studyKey: s.studyKey,
+        studyName: s.studyName,
+        sponsor: s.sponsor,
+        status: s.status,
+        roleCount: roles.length,
+        staffCount: staffIds.size,
+        roles
+      };
+    })
+    .sort((a, b) => String(a.studyKey).localeCompare(String(b.studyKey)));
+
   return {
-    loaded: list.length > 0,
+    loaded: list.length > 0 || studyList.length > 0,
     people: list,
-    note: "Dedicated % is Fact_Assignments.ValueFTE × 100 (0.17 = 17% of one FTE). Rows are activity windows (BeginDate–EndDate); they are sequential, not stacked concurrent load. Peak % on a study is the highest activity window."
+    studies: studyList,
+    dateMin: bounds.min,
+    dateMax: bounds.max,
+    note: "By study / by role / by employee restacks the same assignment facts. Date filter keeps windows that overlap From–To. Dedicated % is Fact_Assignments.ValueFTE × 100. Click a name for activity windows."
   };
 }
 

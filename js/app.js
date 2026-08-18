@@ -21,6 +21,15 @@
     rmPersonId: "",
     rmPeopleFilter: "",
     rmPeopleError: "",
+    rmDateFrom: "",
+    rmDateTo: "",
+    rmOpen: {},
+    rmOpenStaff: {},
+    rmStudy: "",
+    rmRole: "",
+    rmPosition: "",
+    rmDept: "",
+    rmLayer: "study",
     project: null,
     projectNumber: "",
     projectFilter: "",
@@ -1081,6 +1090,274 @@
     if (state.nav === "context") render();
   }
 
+  function ymdLocal(d) {
+    const dt = d instanceof Date ? d : new Date();
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, "0");
+    const day = String(dt.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+
+  function addDaysYmd(ymd, n) {
+    const [y, m, d] = String(ymd)
+      .split("-")
+      .map((x) => Number(x));
+    const dt = new Date(y, m - 1, d);
+    dt.setDate(dt.getDate() + n);
+    return ymdLocal(dt);
+  }
+
+  function lineOverlaps(line, from, to) {
+    if (!from && !to) return true;
+    const start = line.beginDate || "0000-01-01";
+    const stop = line.endDate || "9999-12-31";
+    if (from && stop < from) return false;
+    if (to && start > to) return false;
+    return true;
+  }
+
+  function restoreRmField(id, selStart) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.focus();
+    if (typeof selStart === "number" && el.setSelectionRange) {
+      try {
+        el.setSelectionRange(selStart, selStart);
+      } catch (_) {}
+    }
+  }
+
+  function uniqueSorted(vals) {
+    return [...new Set((vals || []).filter((v) => v != null && String(v).trim() !== ""))]
+      .map(String)
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  function optionList(values, selected, allLabel) {
+    return `<option value="">${escapeHtml(allLabel)}</option>` +
+      values
+        .map((v) => `<option value="${escapeHtml(v)}"${v === selected ? " selected" : ""}>${escapeHtml(v)}</option>`)
+        .join("");
+  }
+
+  function rmStaffRows(people, idPrefix) {
+    return people
+      .map((p) => {
+        const pid = `${idPrefix}:${p.id}`;
+        const open = !!(state.rmOpenStaff && state.rmOpenStaff[pid]);
+        const pct = p.peakDedicatedPct;
+        const w = pct == null ? 0 : Math.min(100, pct);
+        const n = (p.lines || []).length;
+        const windows = open
+          ? (p.lines || [])
+              .map((line) => {
+                const lp = line.dedicatedPct;
+                const lw = lp == null ? 0 : Math.min(100, lp);
+                return `<div class="rm-window-row">
+                  <span class="rm-staff-act">${escapeHtml(line.activity || "—")}</span>
+                  <span class="rm-staff-dates">${escapeHtml((line.beginDate || "—") + " → " + (line.endDate || "—"))}</span>
+                  <span class="assign-bar"><span class="dedicate-track"><span class="dedicate-fill" style="width:${lw}%"></span></span></span>
+                  <span class="assign-pct">${lp == null ? "—" : lp.toFixed(1) + "%"}</span>
+                </div>`;
+              })
+              .join("")
+          : "";
+        return `<button type="button" class="rm-staff-row${open ? " open" : ""}" data-staff-id="${escapeHtml(pid)}">
+            <span class="rm-staff-name">${escapeHtml(p.fullName)}</span>
+            <span class="rm-staff-title">${escapeHtml(p.jobTitle || "—")}</span>
+            <span class="rm-staff-peak"><span class="dedicate-track"><span class="dedicate-fill" style="width:${w}%"></span></span></span>
+            <span class="assign-pct">${pct == null ? "—" : pct.toFixed(1) + "%"}</span>
+            <span class="rm-staff-win">${n} window${n === 1 ? "" : "s"}</span>
+          </button>${windows}`;
+      })
+      .join("");
+  }
+
+  function rmDetails(id, open, summary, body, cls) {
+    return `<details class="${cls}" data-open-id="${escapeHtml(id)}"${open ? " open" : ""}>
+      <summary>${summary}</summary>
+      ${body}
+    </details>`;
+  }
+
+  function flattenRmFacts(studies) {
+    const facts = [];
+    for (const study of studies) {
+      for (const role of study.roles || []) {
+        for (const person of role.staff || []) {
+          facts.push({ study, role, person });
+        }
+      }
+    }
+    return facts;
+  }
+
+  function layerByRole(studies) {
+    const map = new Map();
+    for (const f of flattenRmFacts(studies)) {
+      const key = f.role.roleCode || f.role.roleId || "Unmapped";
+      if (!map.has(key)) {
+        map.set(key, {
+          roleCode: key,
+          roleGroup: f.role.roleGroup,
+          studies: new Map()
+        });
+      }
+      const node = map.get(key);
+      if (!node.studies.has(f.study.studyKey)) {
+        node.studies.set(f.study.studyKey, {
+          studyKey: f.study.studyKey,
+          studyName: f.study.studyName,
+          staff: []
+        });
+      }
+      node.studies.get(f.study.studyKey).staff.push(f.person);
+    }
+    return [...map.values()]
+      .map((r) => {
+        const studyList = [...r.studies.values()].sort((a, b) => String(a.studyKey).localeCompare(String(b.studyKey)));
+        const staffIds = new Set(studyList.flatMap((s) => s.staff.map((p) => p.id)));
+        return {
+          roleCode: r.roleCode,
+          roleGroup: r.roleGroup,
+          studies: studyList,
+          studyCount: studyList.length,
+          staffCount: staffIds.size
+        };
+      })
+      .sort((a, b) => String(a.roleCode).localeCompare(String(b.roleCode)));
+  }
+
+  function layerByEmployee(studies) {
+    const map = new Map();
+    for (const f of flattenRmFacts(studies)) {
+      if (!map.has(f.person.id)) {
+        map.set(f.person.id, {
+          person: f.person,
+          studies: new Map()
+        });
+      }
+      const node = map.get(f.person.id);
+      if (!node.studies.has(f.study.studyKey)) {
+        node.studies.set(f.study.studyKey, {
+          studyKey: f.study.studyKey,
+          studyName: f.study.studyName,
+          roles: []
+        });
+      }
+      node.studies.get(f.study.studyKey).roles.push({
+        roleCode: f.role.roleCode,
+        roleId: f.role.roleId,
+        roleGroup: f.role.roleGroup,
+        person: f.person
+      });
+    }
+    return [...map.values()]
+      .map((n) => {
+        const studyList = [...n.studies.values()].sort((a, b) => String(a.studyKey).localeCompare(String(b.studyKey)));
+        return {
+          person: n.person,
+          studies: studyList,
+          studyCount: studyList.length,
+          roleCount: studyList.reduce((c, s) => c + s.roles.length, 0)
+        };
+      })
+      .sort((a, b) => String(a.person.fullName).localeCompare(String(b.person.fullName)));
+  }
+
+  function renderRmTree(layer, studies, opts) {
+    const auto = opts.autoOpen;
+    if (layer === "role") {
+      const roles = layerByRole(studies);
+      return roles
+        .map((role) => {
+          const rid = `role:${role.roleCode}`;
+          const open = !!state.rmOpen[rid] || !!opts.roleSel || auto || roles.length === 1;
+          const inner = role.studies
+            .map((study) => {
+              const sid = `role-study:${role.roleCode}:${study.studyKey}`;
+              const sOpen = !!state.rmOpen[sid] || !!opts.studySel || (open && role.studies.length === 1);
+              return rmDetails(
+                sid,
+                sOpen,
+                `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${study.staff.length} staff</span>`,
+                `<div class="rm-staff-head"><span>Staff</span><span>Position</span><span>Peak</span><span>%</span><span></span></div>${rmStaffRows(study.staff, sid)}`,
+                "rm-role"
+              );
+            })
+            .join("");
+          return rmDetails(
+            rid,
+            open,
+            `<span class="rm-role-code">${escapeHtml(role.roleCode)}</span><span class="rm-study-name">${escapeHtml(role.roleGroup || "Role")}</span><span class="rm-role-meta">${role.studyCount} stud${role.studyCount === 1 ? "y" : "ies"} · ${role.staffCount} staff</span>`,
+            `<div class="rm-roles">${inner}</div>`,
+            "rm-study"
+          );
+        })
+        .join("");
+    }
+    if (layer === "employee") {
+      const people = layerByEmployee(studies);
+      return people
+        .map((row) => {
+          const eid = `emp:${row.person.id}`;
+          const open = !!state.rmOpen[eid] || auto || people.length === 1;
+          const inner = row.studies
+            .map((study) => {
+              const sid = `emp-study:${row.person.id}:${study.studyKey}`;
+              const sOpen = !!state.rmOpen[sid] || !!opts.studySel || (open && row.studies.length === 1);
+              const staff = study.roles.map((r) => ({
+                ...r.person,
+                id: `${r.person.id}:${r.roleId || r.roleCode}`,
+                jobTitle: r.roleCode
+              }));
+              return rmDetails(
+                sid,
+                sOpen,
+                `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${study.roles.length} role${study.roles.length === 1 ? "" : "s"}</span>`,
+                `<div class="rm-staff-head"><span>Staff</span><span>Role</span><span>Peak</span><span>%</span><span></span></div>${rmStaffRows(staff, sid)}`,
+                "rm-role"
+              );
+            })
+            .join("");
+          return rmDetails(
+            eid,
+            open,
+            `<span class="rm-study-key">${escapeHtml(row.person.fullName)}</span><span class="rm-study-name">${escapeHtml(row.person.jobTitle || "—")}</span><span class="rm-study-meta">${row.studyCount} stud${row.studyCount === 1 ? "y" : "ies"} · ${row.roleCount} role${row.roleCount === 1 ? "" : "s"}</span>`,
+            `<div class="rm-roles">${inner}</div>`,
+            "rm-study"
+          );
+        })
+        .join("");
+    }
+    return studies
+      .map((study) => {
+        const sid = `s:${study.studyKey}`;
+        const studyOpen = !!state.rmOpen[sid] || !!opts.studySel || auto || studies.length === 1;
+        const rolesHtml = study.roles
+          .map((role) => {
+            const rid = `r:${study.studyKey}:${role.roleId}`;
+            const roleOpen = !!state.rmOpen[rid] || !!opts.roleSel || (studyOpen && study.roleCount === 1);
+            return rmDetails(
+              rid,
+              roleOpen,
+              `<span class="rm-role-code">${escapeHtml(role.roleCode)}</span><span class="rm-role-meta">${role.staffCount} staff${role.roleGroup ? " · " + escapeHtml(role.roleGroup) : ""}</span>`,
+              `<div class="rm-staff-head"><span>Staff</span><span>Position</span><span>Peak</span><span>%</span><span></span></div>${rmStaffRows(role.staff, rid)}`,
+              "rm-role"
+            );
+          })
+          .join("");
+        return rmDetails(
+          sid,
+          studyOpen,
+          `<span class="rm-study-key">${escapeHtml(study.studyKey)}</span><span class="rm-study-name">${escapeHtml(study.studyName || "")}</span><span class="rm-study-meta">${study.roleCount} role${study.roleCount === 1 ? "" : "s"} · ${study.staffCount} staff</span>`,
+          `<div class="rm-roles">${rolesHtml}</div>`,
+          "rm-study"
+        );
+      })
+      .join("");
+  }
+
   function renderRmBoard() {
     const panel = document.getElementById("viewRm");
     if (!panel) return;
@@ -1088,7 +1365,7 @@
     if (state.nav !== "rm") return;
 
     if (!state.rmPeople && !state.rmPeopleError) {
-      panel.innerHTML = `<div class="briefing"><div class="suggest-head">RM</div><div class="briefing-note">Loading people and assignments…</div></div>`;
+      panel.innerHTML = `<div class="briefing"><div class="suggest-head">RM</div><div class="briefing-note">Loading studies, roles, and staff…</div></div>`;
       return;
     }
     if (state.rmPeopleError) {
@@ -1098,87 +1375,214 @@
 
     const pack = state.rmPeople;
     const needle = (state.rmPeopleFilter || "").trim().toLowerCase();
-    const people = (pack.people || []).filter((p) => {
-      if (!needle) return true;
-      return [p.fullName, p.jobTitle, p.employeeKey, ...(p.studies || []).map((s) => s.studyKey)]
-        .join(" ")
-        .toLowerCase()
-        .includes(needle);
-    });
-    if (!state.rmPersonId && people[0]) state.rmPersonId = people[0].id;
-    const selected = people.find((p) => p.id === state.rmPersonId) || people[0] || null;
+    const from = state.rmDateFrom || "";
+    const to = state.rmDateTo || "";
+    const studySel = state.rmStudy || "";
+    const roleSel = state.rmRole || "";
+    const posSel = state.rmPosition || "";
+    const deptSel = state.rmDept || "";
+    if (!state.rmOpen) state.rmOpen = {};
+    if (!state.rmOpenStaff) state.rmOpenStaff = {};
 
-    const list = people
-      .slice(0, 400)
-      .map((p) => {
-        const over = (p.overAllocationFte || 0) > 0.001;
-        const spare = (p.spareFte || 0) > 0.05;
-        const badge = over ? "over" : spare ? "spare" : "ok";
-        return `<button type="button" class="person-card${selected && selected.id === p.id ? " active" : ""}" data-pid="${escapeHtml(p.id)}">
-          <span class="person-name">${escapeHtml(p.fullName || "—")}</span>
-          <span class="person-title">${escapeHtml(p.jobTitle || "—")}</span>
-          <span class="person-meta">${p.studyCount || 0} stud${p.studyCount === 1 ? "y" : "ies"} · cap ${escapeHtml(String((p.timeAllocation || 0).toFixed(2)))} FTE</span>
-          <span class="person-badge ${badge}">${over ? `+${(p.overAllocationFte || 0).toFixed(2)} over` : spare ? `${(p.spareFte || 0).toFixed(2)} spare` : "at capacity"}</span>
-        </button>`;
+    const allStudies = pack.studies || [];
+    const studySelect =
+      `<option value="">All studies</option>` +
+      allStudies
+        .map(
+          (s) =>
+            `<option value="${escapeHtml(s.studyKey)}"${s.studyKey === studySel ? " selected" : ""}>${escapeHtml(s.studyKey)}${s.studyName ? " · " + escapeHtml(s.studyName) : ""}</option>`
+        )
+        .join("");
+    const roleOptions = uniqueSorted(allStudies.flatMap((s) => (s.roles || []).map((r) => r.roleCode)));
+    const posOptions = uniqueSorted(
+      allStudies.flatMap((s) => (s.roles || []).flatMap((r) => (r.staff || []).map((p) => p.jobTitle)))
+    );
+    const deptOptions = uniqueSorted(
+      allStudies.flatMap((s) => (s.roles || []).flatMap((r) => (r.staff || []).map((p) => p.department)))
+    );
+
+    const studies = allStudies
+      .map((study) => {
+        if (studySel && study.studyKey !== studySel) return null;
+        const roles = (study.roles || [])
+          .map((role) => {
+            if (roleSel && role.roleCode !== roleSel) return null;
+            const staff = (role.staff || [])
+              .map((p) => {
+                if (posSel && p.jobTitle !== posSel) return null;
+                if (deptSel && p.department !== deptSel) return null;
+                const lines = (p.lines || []).filter((l) => lineOverlaps(l, from, to));
+                if (!lines.length) return null;
+                const hay = [p.fullName, p.jobTitle, p.department, role.roleCode, study.studyKey, study.studyName]
+                  .join(" ")
+                  .toLowerCase();
+                if (needle && !hay.includes(needle)) return null;
+                const ftes = lines.map((l) => l.valueFte).filter((n) => n != null);
+                return {
+                  ...p,
+                  lines,
+                  peakDedicatedPct: ftes.length ? Math.round(Math.max(...ftes) * 1000) / 10 : null
+                };
+              })
+              .filter(Boolean);
+            if (!staff.length) return null;
+            return { ...role, staff, staffCount: staff.length };
+          })
+          .filter(Boolean);
+        if (!roles.length) return null;
+        const staffIds = new Set(roles.flatMap((r) => r.staff.map((p) => p.id)));
+        return { ...study, roles, roleCount: roles.length, staffCount: staffIds.size };
       })
-      .join("");
+      .filter(Boolean);
 
-    let detail = `<p class="empty">No matching people.</p>`;
-    if (selected) {
-      const rows = [];
-      (selected.studies || []).forEach((s) => {
-        (s.lines || []).forEach((line) => {
-          const pct = line.dedicatedPct;
-          const w = pct == null ? 0 : Math.min(100, pct);
-          rows.push(`<div class="assign-row">
-            <span class="assign-study">${escapeHtml(s.studyKey)}</span>
-            <span class="assign-act">${escapeHtml(line.activity || "—")}</span>
-            <span class="assign-dates">${escapeHtml((line.beginDate || "—") + " → " + (line.endDate || "—"))}</span>
-            <span class="assign-bar"><span class="dedicate-track"><span class="dedicate-fill" style="width:${w}%"></span></span></span>
-            <span class="assign-pct">${pct == null ? "—" : pct.toFixed(1) + "%"}</span>
-          </div>`);
-        });
-      });
-      detail = `<div class="briefing">
-        <div class="suggest-head">${escapeHtml(selected.fullName)}</div>
-        <div class="briefing-note">${escapeHtml(selected.jobTitle || "")} · time allocation ${selected.timeAllocation.toFixed(2)} FTE · assigned ${selected.assignedFte == null ? "—" : selected.assignedFte.toFixed(2)} FTE · ${selected.studyCount} studies. Dedicated % is ValueFTE × 100 for that activity window — sequential phases are not concurrent.</div>
-      </div>
-      <div class="assign-head">
-        <span>Study</span><span>Activity</span><span>Window</span><span>Dedicated</span><span>%</span>
-      </div>
-      ${rows.join("") || `<p class="empty">No assignment rows.</p>`}`;
-    }
+    const staffTotal = new Set(studies.flatMap((s) => s.roles.flatMap((r) => r.staff.map((p) => p.id)))).size;
+    const roleTotal = studies.reduce((n, s) => n + s.roleCount, 0);
+    const minBound = pack.dateMin || "2020-01-01";
+    const maxBound = pack.dateMax || "2035-12-31";
+    const today = ymdLocal(new Date());
+    const presetAll = !from && !to;
+    const presetToday = from === today && to === today;
+    const preset90 = from === today && to === addDaysYmd(today, 90);
+    const sliced = !!(studySel || roleSel || posSel || deptSel || needle);
+    const autoOpen = sliced && studies.length <= 8;
+    const layer = state.rmLayer === "role" || state.rmLayer === "employee" ? state.rmLayer : "study";
+    const tree = renderRmTree(layer, studies, {
+      autoOpen,
+      studySel,
+      roleSel
+    });
+    const roleLayerCount = layer === "role" ? layerByRole(studies).length : roleTotal;
+    const empLayerCount = layer === "employee" ? layerByEmployee(studies).length : staffTotal;
+    const countLabel =
+      layer === "role"
+        ? `${roleLayerCount} role${roleLayerCount === 1 ? "" : "s"} · ${studies.length} stud${studies.length === 1 ? "y" : "ies"} · ${staffTotal} staff`
+        : layer === "employee"
+          ? `${empLayerCount} people · ${studies.length} stud${studies.length === 1 ? "y" : "ies"}`
+          : `${studies.length} stud${studies.length === 1 ? "y" : "ies"} · ${roleTotal} roles · ${staffTotal} staff`;
 
-    panel.innerHTML = `<div class="rm-board">
-      <div class="rm-list">
-        <div class="project-toolbar">
-          <input class="project-filter" id="rmPeopleFilter" type="search" placeholder="Filter by name, title, study…" value="${escapeHtml(state.rmPeopleFilter)}" />
-          <span class="project-count">${people.length} people</span>
+    panel.innerHTML = `<div class="rm-staffing">
+      <div class="rm-filters">
+        <div class="purpose rm-layer" role="tablist" aria-label="RM layering">
+          <button type="button" class="purpose-btn${layer === "study" ? " active" : ""}" data-rm-layer="study">By study</button>
+          <button type="button" class="purpose-btn${layer === "role" ? " active" : ""}" data-rm-layer="role">By role</button>
+          <button type="button" class="purpose-btn${layer === "employee" ? " active" : ""}" data-rm-layer="employee">By employee</button>
         </div>
-        <div class="person-list">${list || `<p class="empty">No people in lens_rm_assignments yet.</p>`}</div>
+        <div class="project-toolbar rm-slice">
+          <select class="project-filter rm-select" id="rmStudy" aria-label="Study">${studySelect}</select>
+          <select class="project-filter rm-select" id="rmRole" aria-label="Role">${optionList(roleOptions, roleSel, "All roles")}</select>
+          <select class="project-filter rm-select" id="rmPosition" aria-label="Position">${optionList(posOptions, posSel, "All positions")}</select>
+          ${deptOptions.length ? `<select class="project-filter rm-select" id="rmDept" aria-label="Department">${optionList(deptOptions, deptSel, "All departments")}</select>` : ""}
+        </div>
+        <div class="project-toolbar">
+          <input class="project-filter" id="rmPeopleFilter" type="search" placeholder="Jump to a name, study, or role…" value="${escapeHtml(state.rmPeopleFilter)}" />
+          <span class="project-count">${countLabel}</span>
+        </div>
+        <div class="project-toolbar rm-datebar">
+          <label class="rm-date-label">From <input class="project-filter rm-date" id="rmDateFrom" type="date" min="${escapeHtml(minBound)}" max="${escapeHtml(maxBound)}" value="${escapeHtml(from)}" /></label>
+          <label class="rm-date-label">To <input class="project-filter rm-date" id="rmDateTo" type="date" min="${escapeHtml(minBound)}" max="${escapeHtml(maxBound)}" value="${escapeHtml(to)}" /></label>
+          <button type="button" class="purpose-btn${presetAll ? " active" : ""}" data-rm-preset="all">All dates</button>
+          <button type="button" class="purpose-btn${presetToday ? " active" : ""}" data-rm-preset="today">As of today</button>
+          <button type="button" class="purpose-btn${preset90 ? " active" : ""}" data-rm-preset="next90">Next 90 days</button>
+          <button type="button" class="purpose-btn" id="rmExpand">Expand shown</button>
+          <button type="button" class="purpose-btn" id="rmCollapse">Collapse</button>
+        </div>
       </div>
-      <div class="rm-detail">${detail}</div>
+      <p class="rm-layer-note">${layer === "study" ? "Study → role → employee" : layer === "role" ? "Role → study → employee" : "Employee → study → role"}</p>
+      <div class="rm-tree">${tree || `<p class="empty">No assignments overlap this filter.</p>`}</div>
     </div>
     <div class="briefing-note" style="margin-top:12px">${escapeHtml(pack.note || "")}</div>`;
 
+    const bindSelect = (id, key) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.onchange = (e) => {
+        state[key] = e.target.value;
+        renderRmBoard();
+        const again = document.getElementById(id);
+        if (again) again.focus();
+      };
+    };
+    bindSelect("rmStudy", "rmStudy");
+    bindSelect("rmRole", "rmRole");
+    bindSelect("rmPosition", "rmPosition");
+    bindSelect("rmDept", "rmDept");
+    panel.querySelectorAll("[data-rm-layer]").forEach((btn) => {
+      btn.onclick = () => {
+        const next = btn.dataset.rmLayer;
+        if (state.rmLayer === next) return;
+        state.rmLayer = next;
+        state.rmOpen = {};
+        state.rmOpenStaff = {};
+        renderRmBoard();
+      };
+    });
     const filter = document.getElementById("rmPeopleFilter");
     if (filter) {
       filter.oninput = (e) => {
         state.rmPeopleFilter = e.target.value;
         const pos = e.target.selectionStart;
         renderRmBoard();
-        const again = document.getElementById("rmPeopleFilter");
-        if (again) {
-          again.focus();
-          try {
-            again.setSelectionRange(pos, pos);
-          } catch (_) {}
-        }
+        restoreRmField("rmPeopleFilter", pos);
       };
     }
-    panel.querySelectorAll("[data-pid]").forEach((btn) => {
+    const fromEl = document.getElementById("rmDateFrom");
+    const toEl = document.getElementById("rmDateTo");
+    if (fromEl) {
+      fromEl.onchange = (e) => {
+        state.rmDateFrom = e.target.value;
+        renderRmBoard();
+        restoreRmField("rmDateFrom");
+      };
+    }
+    if (toEl) {
+      toEl.onchange = (e) => {
+        state.rmDateTo = e.target.value;
+        renderRmBoard();
+        restoreRmField("rmDateTo");
+      };
+    }
+    panel.querySelectorAll("[data-rm-preset]").forEach((btn) => {
       btn.onclick = () => {
-        state.rmPersonId = btn.dataset.pid;
+        const p = btn.dataset.rmPreset;
+        if (p === "today") {
+          state.rmDateFrom = today;
+          state.rmDateTo = today;
+        } else if (p === "next90") {
+          state.rmDateFrom = today;
+          state.rmDateTo = addDaysYmd(today, 90);
+        } else {
+          state.rmDateFrom = "";
+          state.rmDateTo = "";
+        }
+        renderRmBoard();
+      };
+    });
+    const expand = document.getElementById("rmExpand");
+    const collapse = document.getElementById("rmCollapse");
+    if (expand) {
+      expand.onclick = () => {
+        panel.querySelectorAll("details[data-open-id]").forEach((el) => {
+          state.rmOpen[el.dataset.openId] = true;
+        });
+        renderRmBoard();
+      };
+    }
+    if (collapse) {
+      collapse.onclick = () => {
+        state.rmOpen = {};
+        state.rmOpenStaff = {};
+        renderRmBoard();
+      };
+    }
+    panel.querySelectorAll("details[data-open-id]").forEach((el) => {
+      el.addEventListener("toggle", () => {
+        state.rmOpen[el.dataset.openId] = el.open;
+      });
+    });
+    panel.querySelectorAll("[data-staff-id]").forEach((btn) => {
+      btn.onclick = () => {
+        const id = btn.dataset.staffId;
+        state.rmOpenStaff[id] = !state.rmOpenStaff[id];
         renderRmBoard();
       };
     });
