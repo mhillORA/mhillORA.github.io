@@ -120,6 +120,37 @@
     return n < 0 ? "under" : "over";
   }
 
+  function cssToken(name, fallback) {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  }
+
+  function currentTheme() {
+    return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+  }
+
+  function applyTheme(theme, persist) {
+    const next = theme === "dark" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", next);
+    if (persist) save("odl.theme", next);
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", next === "dark" ? "#001123" : "#052c49");
+    const btn = document.getElementById("btnTheme");
+    if (btn) {
+      btn.setAttribute("aria-pressed", next === "dark" ? "true" : "false");
+      btn.setAttribute("aria-label", next === "dark" ? "Switch to light mode" : "Switch to dark mode");
+    }
+    const mode = document.getElementById("themeModeLabel");
+    const hint = document.getElementById("themeHint");
+    if (mode) mode.textContent = next === "dark" ? "Dark" : "Light";
+    if (hint) hint.textContent = next === "dark" ? "Switch to light" : "Switch to dark";
+  }
+
+  function toggleTheme() {
+    applyTheme(currentTheme() === "dark" ? "light" : "dark", true);
+    render();
+  }
+
   function purposeOf(id) {
     return (typeof PURPOSES !== "undefined" ? PURPOSES : []).find((p) => p.id === id);
   }
@@ -898,12 +929,12 @@
         scales: {
           x: {
             max: 112,
-            grid: { color: "#e3e4e6" },
-            ticks: { color: "#63666b", font: { family: "Roboto Mono", size: 11 } }
+            grid: { color: cssToken("--chart-grid", "#e3e4e6") },
+            ticks: { color: cssToken("--text-muted", "#63666b"), font: { family: "Roboto Mono", size: 11 } }
           },
           y: {
             grid: { display: false },
-            ticks: { color: "#052c49", font: { family: "Roboto", size: 12 } }
+            ticks: { color: cssToken("--chart-tick", "#052c49"), font: { family: "Roboto", size: 12 } }
           }
         }
       }
@@ -2253,8 +2284,16 @@
       window.matchMedia("(min-width: 981px)").addEventListener("change", (ev) => {
         if (ev.matches) closeMobileDrawers();
       });
+      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (ev) => {
+        const stored = load("odl.theme", "");
+        if (stored === "dark" || stored === "light") return;
+        applyTheme(ev.matches ? "dark" : "light", false);
+        render();
+      });
     }
     document.getElementById("btnNew").onclick = resetAsk;
+    const themeBtn = document.getElementById("btnTheme");
+    if (themeBtn) themeBtn.onclick = toggleTheme;
     document.getElementById("btnSave").onclick = () => {
       if (state.phase !== "answered") return;
       state.saved.unshift({ at: new Date().toISOString(), text: state.askedText, key: state.key });
@@ -2265,6 +2304,7 @@
   }
 
   function render() {
+    applyTheme(currentTheme(), false);
     renderNav();
     renderPurpose();
     renderSources();
