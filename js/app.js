@@ -1151,13 +1151,7 @@
   }
 
   function sortActivities(list) {
-    const order = ["startup", "conduct", "dbl", "closeout", "tmf"];
-    const rank = (s) => {
-      const t = String(s).toLowerCase();
-      const i = order.findIndex((p) => t === p || t.startsWith(p) || t.includes(p));
-      return i < 0 ? 50 : i;
-    };
-    return [...list].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+    return [...list].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
   }
 
   function utilBarHtml(u) {
@@ -1531,11 +1525,19 @@
           <button type="button" class="purpose-btn${layer === "role" ? " active" : ""}" data-rm-layer="role">By role</button>
           <button type="button" class="purpose-btn${layer === "employee" ? " active" : ""}" data-rm-layer="employee">By employee</button>
         </div>
+        <div class="purpose rm-acts" role="tablist" aria-label="Activity">
+          <button type="button" class="purpose-btn${!actSel ? " active" : ""}" data-rm-act="">All</button>
+          ${actOptions
+            .map(
+              (a) =>
+                `<button type="button" class="purpose-btn${actSel === a ? " active" : ""}" data-rm-act="${escapeHtml(a)}">${escapeHtml(a)}</button>`
+            )
+            .join("")}
+        </div>
         <div class="project-toolbar rm-slice">
           <select class="project-filter rm-select" id="rmStudy" aria-label="Study">${studySelect}</select>
           <select class="project-filter rm-select" id="rmRole" aria-label="Role">${optionList(roleOptions, roleSel, "All roles")}</select>
           <select class="project-filter rm-select" id="rmPosition" aria-label="Position">${optionList(posOptions, posSel, "All positions")}</select>
-          <select class="project-filter rm-select" id="rmActivity" aria-label="Activity">${optionList(actOptions, actSel, "All activities")}</select>
           ${deptOptions.length ? `<select class="project-filter rm-select" id="rmDept" aria-label="Department">${optionList(deptOptions, deptSel, "All departments")}</select>` : ""}
         </div>
         <div class="project-toolbar">
@@ -1570,8 +1572,13 @@
     bindSelect("rmStudy", "rmStudy");
     bindSelect("rmRole", "rmRole");
     bindSelect("rmPosition", "rmPosition");
-    bindSelect("rmActivity", "rmActivity");
     bindSelect("rmDept", "rmDept");
+    panel.querySelectorAll("[data-rm-act]").forEach((btn) => {
+      btn.onclick = () => {
+        state.rmActivity = btn.dataset.rmAct || "";
+        renderRmBoard();
+      };
+    });
     panel.querySelectorAll("[data-rm-layer]").forEach((btn) => {
       btn.onclick = () => {
         const next = btn.dataset.rmLayer;
