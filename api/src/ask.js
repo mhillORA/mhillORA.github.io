@@ -2,9 +2,9 @@ const { getDb, safeQuery, LENS, SHARED_READ } = require("./cosmos");
 const { narrateWithFoundry } = require("./foundry");
 const { getProjectBundle, studyMatchesProject } = require("./projectJoin");
 const { getViewerContext, foundryViewerSlice } = require("./userPrefs");
-const { answerRmQuestion } = require("./rmPack");
+const { answerRmQuestion, looksLikeRmRefinement } = require("./rmPack");
 
-function guessKey(text) {
+function guessKey(text, priorTurns) {
   const t = String(text || "").toLowerCase();
   if (/(no enrolled|missing enrolled|without enrolled|enrolled count|null enrolled)/.test(t)) {
     return "missing_enrolled";
@@ -19,6 +19,13 @@ function guessKey(text) {
     return "netsuite";
   }
   if (/(staff|resource|cra|fte|capacity|assign|backfill|headcount|over.?allocat|overallocat|under.?utili|under.?allocat|allocation)/.test(t)) return "staffing";
+  const priorStaffing = (priorTurns || []).some(
+    (turn) =>
+      (turn.needs || []).includes("insightsrm") ||
+      turn.rmIntent ||
+      /(staff|resource|fte|allocat|utili)/i.test(turn.question || "")
+  );
+  if (priorStaffing && looksLikeRmRefinement(text)) return "staffing";
   if (/(visit|visits)/.test(t)) return "visits";
   return "enrollment";
 }
@@ -217,8 +224,8 @@ async function fromNsProjects(question) {
   );
 }
 
-async function fromRmStaffing(question) {
-  return answerRmQuestion(question, stamp);
+async function fromRmStaffing(question, priorTurns) {
+  return answerRmQuestion(question, stamp, priorTurns);
 }
 
 function missingNote(missingCount, knownCount) {
@@ -803,13 +810,14 @@ async function answerFromCosmos(question, sources, opts) {
   getDb();
   const fromQ = String(question).match(/\b\d{2}-\d{3}-\d{4}\b/);
   const projectNumber = String((opts && opts.projectNumber) || (fromQ && fromQ[0]) || "").trim();
+  const priorTurns = Array.isArray(opts && opts.prior) ? opts.prior : [];
   const src = new Set((sources || []).map(String));
   const rmScope = src.has("insightsrm") && !src.has("ora");
-  let key = guessKey(question);
+  let key = guessKey(question, priorTurns);
   if (rmScope) key = "staffing";
   let answer = null;
   if (projectNumber && key !== "staffing") answer = await fromProjectContext(question, projectNumber);
-  if (!answer && key === "staffing") answer = await fromRmStaffing(question);
+  if (!answer && key === "staffing") answer = await fromRmStaffing(question, priorTurns);
   if (!answer && key === "staffing") answer = emptyRmAnswer(question);
   if (!answer && key === "missing_enrolled") answer = await fromOraFactStudy(question, { missingOnly: true });
   if (!answer && key === "netsuite") answer = await fromNsProjects(question);
@@ -842,7 +850,7 @@ async function answerFromCosmos(question, sources, opts) {
   }
 
   try {
-    const llm = await narrateWithFoundry(question, answer, viewerSlice);
+    const llm = await narrateWithFoundry(question, answer, viewerSlice, priorTurns);
     answer.summary = llm.summary || answer.summary;
     answer.chartTitle = llm.chartTitle || answer.chartTitle;
     answer.caveat = llm.caveat || answer.caveat;

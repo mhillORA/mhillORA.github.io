@@ -29,6 +29,7 @@
     rmRole: "",
     rmPosition: "",
     rmDept: "",
+    rmActivity: "",
     rmLayer: "study",
     project: null,
     projectNumber: "",
@@ -48,7 +49,8 @@
     viewerError: "",
     extraDraft: "",
     notesDraft: "",
-    savingContext: false
+    savingContext: false,
+    thread: []
   };
 
   const NAV = [
@@ -190,6 +192,7 @@
     state.project = null;
     state.projectNumber = "";
     state.projectError = "";
+    state.thread = [];
     render();
     const el = document.getElementById("draft");
     if (el) el.value = "";
@@ -210,13 +213,15 @@
     render();
 
     try {
+      const prior = (state.thread || []).slice(-3);
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
           sources: enabledList().map((s) => s.id),
-          projectNumber: state.projectNumber || ""
+          projectNumber: state.projectNumber || "",
+          prior
         })
       });
       const body = await res.json().catch(() => ({}));
@@ -226,6 +231,18 @@
       if (!body.answer) throw new Error("API returned no answer");
       state.answer = body.answer;
       state.phase = "answered";
+      state.thread = [
+        ...prior,
+        {
+          question,
+          summary: body.answer.summary || "",
+          tableTitle: body.answer.tableTitle || "",
+          cols: body.answer.cols || [],
+          rows: (body.answer.rows || []).slice(0, 12),
+          needs: body.answer.needs || [],
+          rmIntent: body.answer.rmIntent || null
+        }
+      ].slice(-4);
       state.history.unshift({ at: new Date().toISOString(), text: question, key: "live" });
       state.history = state.history.slice(0, 40);
       save("odl.history", state.history);
@@ -1128,9 +1145,30 @@
   }
 
   function uniqueSorted(vals) {
-    return [...new Set((vals || []).filter((v) => v != null && String(v).trim() !== ""))]
+    return [...new Set((vals || []).filter((v) => v != null && String(v).trim() !== "" && String(v).trim() !== "—"))]
       .map(String)
       .sort((a, b) => a.localeCompare(b));
+  }
+
+  function sortActivities(list) {
+    const order = ["startup", "conduct", "dbl", "closeout", "tmf"];
+    const rank = (s) => {
+      const t = String(s).toLowerCase();
+      const i = order.findIndex((p) => t === p || t.startsWith(p) || t.includes(p));
+      return i < 0 ? 50 : i;
+    };
+    return [...list].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  }
+
+  function utilBarHtml(u) {
+    if (!u) return "";
+    const cap = Number(u.timeAllocation);
+    const assigned = u.assignedFte == null ? null : Number(u.assignedFte);
+    if (!Number.isFinite(cap) || cap <= 0 || assigned == null || !Number.isFinite(assigned)) return "";
+    const pct = Math.round((assigned / cap) * 1000) / 10;
+    const w = Math.min(100, Math.max(0, pct));
+    const tone = assigned - cap > 0.001 ? "over" : cap - assigned > 0.05 ? "spare" : "ok";
+    return `<span class="rm-util"><span class="dedicate-track rm-util-track"><span class="dedicate-fill ${tone}" style="width:${w}%"></span></span><span class="rm-util-label">${pct.toFixed(0)}% · ${assigned.toFixed(2)}/${cap.toFixed(2)} FTE</span></span>`;
   }
 
   function optionList(values, selected, allLabel) {
@@ -1323,9 +1361,9 @@
           return rmDetails(
             eid,
             open,
-            `<span class="rm-study-key">${escapeHtml(row.person.fullName)}</span><span class="rm-study-name">${escapeHtml(row.person.jobTitle || "—")}</span><span class="rm-study-meta">${row.studyCount} stud${row.studyCount === 1 ? "y" : "ies"} · ${row.roleCount} role${row.roleCount === 1 ? "" : "s"}</span>`,
+            `<span class="rm-study-key">${escapeHtml(row.person.fullName)}</span><span class="rm-study-name">${escapeHtml(row.person.jobTitle || "—")}</span>${utilBarHtml(opts.utilById && (opts.utilById.get(row.person.id) || opts.utilById.get(String(row.person.employeeKey || ""))))}<span class="rm-study-meta">${row.studyCount} stud${row.studyCount === 1 ? "y" : "ies"} · ${row.roleCount} role${row.roleCount === 1 ? "" : "s"}</span>`,
             `<div class="rm-roles">${inner}</div>`,
-            "rm-study"
+            "rm-study rm-emp"
           );
         })
         .join("");
@@ -1381,6 +1419,7 @@
     const roleSel = state.rmRole || "";
     const posSel = state.rmPosition || "";
     const deptSel = state.rmDept || "";
+    const actSel = state.rmActivity || "";
     if (!state.rmOpen) state.rmOpen = {};
     if (!state.rmOpenStaff) state.rmOpenStaff = {};
 
@@ -1400,6 +1439,13 @@
     const deptOptions = uniqueSorted(
       allStudies.flatMap((s) => (s.roles || []).flatMap((r) => (r.staff || []).map((p) => p.department)))
     );
+    const actOptions = sortActivities(
+      uniqueSorted(
+        allStudies.flatMap((s) =>
+          (s.roles || []).flatMap((r) => (r.staff || []).flatMap((p) => (p.lines || []).map((l) => l.activity)))
+        )
+      )
+    );
 
     const studies = allStudies
       .map((study) => {
@@ -1411,9 +1457,21 @@
               .map((p) => {
                 if (posSel && p.jobTitle !== posSel) return null;
                 if (deptSel && p.department !== deptSel) return null;
-                const lines = (p.lines || []).filter((l) => lineOverlaps(l, from, to));
+                const lines = (p.lines || []).filter((l) => {
+                  if (!lineOverlaps(l, from, to)) return false;
+                  if (actSel && String(l.activity || "") !== actSel) return false;
+                  return true;
+                });
                 if (!lines.length) return null;
-                const hay = [p.fullName, p.jobTitle, p.department, role.roleCode, study.studyKey, study.studyName]
+                const hay = [
+                  p.fullName,
+                  p.jobTitle,
+                  p.department,
+                  role.roleCode,
+                  study.studyKey,
+                  study.studyName,
+                  ...lines.map((l) => l.activity)
+                ]
                   .join(" ")
                   .toLowerCase();
                 if (needle && !hay.includes(needle)) return null;
@@ -1443,13 +1501,19 @@
     const presetAll = !from && !to;
     const presetToday = from === today && to === today;
     const preset90 = from === today && to === addDaysYmd(today, 90);
-    const sliced = !!(studySel || roleSel || posSel || deptSel || needle);
+    const sliced = !!(studySel || roleSel || posSel || deptSel || actSel || needle);
     const autoOpen = sliced && studies.length <= 8;
     const layer = state.rmLayer === "role" || state.rmLayer === "employee" ? state.rmLayer : "study";
+    const utilById = new Map();
+    for (const p of pack.people || []) {
+      if (p.id) utilById.set(p.id, p);
+      if (p.employeeKey) utilById.set(String(p.employeeKey), p);
+    }
     const tree = renderRmTree(layer, studies, {
       autoOpen,
       studySel,
-      roleSel
+      roleSel,
+      utilById
     });
     const roleLayerCount = layer === "role" ? layerByRole(studies).length : roleTotal;
     const empLayerCount = layer === "employee" ? layerByEmployee(studies).length : staffTotal;
@@ -1471,10 +1535,11 @@
           <select class="project-filter rm-select" id="rmStudy" aria-label="Study">${studySelect}</select>
           <select class="project-filter rm-select" id="rmRole" aria-label="Role">${optionList(roleOptions, roleSel, "All roles")}</select>
           <select class="project-filter rm-select" id="rmPosition" aria-label="Position">${optionList(posOptions, posSel, "All positions")}</select>
+          <select class="project-filter rm-select" id="rmActivity" aria-label="Activity">${optionList(actOptions, actSel, "All activities")}</select>
           ${deptOptions.length ? `<select class="project-filter rm-select" id="rmDept" aria-label="Department">${optionList(deptOptions, deptSel, "All departments")}</select>` : ""}
         </div>
         <div class="project-toolbar">
-          <input class="project-filter" id="rmPeopleFilter" type="search" placeholder="Jump to a name, study, or role…" value="${escapeHtml(state.rmPeopleFilter)}" />
+          <input class="project-filter" id="rmPeopleFilter" type="search" placeholder="Jump to a name, study, role, or activity…" value="${escapeHtml(state.rmPeopleFilter)}" />
           <span class="project-count">${countLabel}</span>
         </div>
         <div class="project-toolbar rm-datebar">
@@ -1505,6 +1570,7 @@
     bindSelect("rmStudy", "rmStudy");
     bindSelect("rmRole", "rmRole");
     bindSelect("rmPosition", "rmPosition");
+    bindSelect("rmActivity", "rmActivity");
     bindSelect("rmDept", "rmDept");
     panel.querySelectorAll("[data-rm-layer]").forEach((btn) => {
       btn.onclick = () => {
@@ -1653,6 +1719,7 @@
     saved.querySelectorAll("[data-saved]").forEach((btn) => {
       btn.onclick = () => {
         const s = state.saved[Number(btn.dataset.saved)];
+        state.thread = [];
         run(s.key, s.text);
       };
     });
@@ -1669,6 +1736,7 @@
     hist.querySelectorAll("[data-hist]").forEach((btn) => {
       btn.onclick = () => {
         const s = state.history[Number(btn.dataset.hist)];
+        state.thread = [];
         run(s.key, s.text);
       };
     });

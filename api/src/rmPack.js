@@ -47,6 +47,77 @@ function studyKeyFromQuestion(question) {
   return "";
 }
 
+function parseExcludeTitle(question) {
+  const t = String(question || "").toLowerCase();
+  const needles = [];
+  const withTitle = t.match(/with\s+([a-z][a-z .&/-]{1,40}?)\s+in\s+(?:their\s+)?titles?/);
+  if (withTitle) needles.push(withTitle[1].trim());
+  if (/(remove|exclude|without|drop|except|filter out|do not include|don't include|not the)/.test(t)) {
+    if (/\bdirectors?\b/.test(t)) needles.push("director");
+    if (/\bmanagers?\b/.test(t) && !/\bproject manager\b/.test(t)) needles.push("manager");
+    if (/\bvps?\b|vice president/.test(t)) needles.push("vp");
+  }
+  return [...new Set(needles.filter(Boolean))];
+}
+
+function looksLikeRmRefinement(question) {
+  const t = String(question || "").toLowerCase();
+  return /(remove|exclude|without|drop|except|filter out|those|them|that list|the list|only (show|keep|include)|do not include|don't include|with .+ in (their )?title|\bdirectors?\b)/.test(
+    t
+  );
+}
+
+function mergeRmIntent(question, priorTurns) {
+  const intent = parseRmIntent(question);
+  intent.excludeTitle = parseExcludeTitle(question);
+  const last = [...(priorTurns || [])].reverse().find((t) => t && t.rmIntent);
+  if (!last || !last.rmIntent) return intent;
+  const blank =
+    !intent.wantUnder &&
+    !intent.wantOver &&
+    !intent.wantGap &&
+    !intent.wantSpareRole &&
+    !intent.wantAssign &&
+    !intent.studyKey &&
+    !intent.wantOverview;
+  if (blank) {
+    intent.wantUnder = !!last.rmIntent.wantUnder;
+    intent.wantOver = !!last.rmIntent.wantOver;
+    intent.wantGap = !!last.rmIntent.wantGap;
+    intent.wantSpareRole = !!last.rmIntent.wantSpareRole;
+    intent.wantAssign = !!last.rmIntent.wantAssign;
+    intent.studyKey = last.rmIntent.studyKey || "";
+    intent.craOnly = intent.craOnly || !!last.rmIntent.craOnly;
+  }
+  intent.excludeTitle = [...new Set([...(last.rmIntent.excludeTitle || []), ...intent.excludeTitle])];
+  return intent;
+}
+
+function applyTitleFilters(rows, intent) {
+  const needles = (intent && intent.excludeTitle) || [];
+  if (!needles.length) return rows || [];
+  return (rows || []).filter((r) => {
+    const title = String(pickField(r, "jobTitle", "title") || "").toLowerCase();
+    return !needles.some((n) => title.includes(String(n).toLowerCase()));
+  });
+}
+
+function withRmIntent(answer, intent) {
+  if (answer) {
+    answer.rmIntent = {
+      wantUnder: !!intent.wantUnder,
+      wantOver: !!intent.wantOver,
+      wantGap: !!intent.wantGap,
+      wantSpareRole: !!intent.wantSpareRole,
+      wantAssign: !!intent.wantAssign,
+      studyKey: intent.studyKey || "",
+      craOnly: !!intent.craOnly,
+      excludeTitle: intent.excludeTitle || []
+    };
+  }
+  return answer;
+}
+
 function parseRmIntent(question) {
   const t = String(question || "").toLowerCase();
   const wantUnder = /(under.?utili[sz]|under.?allocat|underused|under.?used|on the bench|on bench|available fte|unused fte|spare fte|not fully booked|who has capacity)/.test(
@@ -1019,92 +1090,114 @@ function buildInventoryAnswer(question, inventory, briefing, stampFn) {
   );
 }
 
-async function answerRmQuestion(question, stampFn) {
+async function answerRmQuestion(question, stampFn, priorTurns) {
   utilizationCache = null;
-  const intent = parseRmIntent(question);
+  const intent = mergeRmIntent(question, priorTurns);
   const dims = await loadDimensions();
   const inventory = await getRmInventory();
 
   if (!inventory.loaded) {
-    return buildInventoryAnswer(question, inventory, { overCount: 0, underCount: 0 }, stampFn);
+    return withRmIntent(buildInventoryAnswer(question, inventory, { overCount: 0, underCount: 0 }, stampFn), intent);
   }
 
   const needPeople = intent.wantOver || intent.wantUnder || (!intent.wantGap && !intent.wantSpareRole && !intent.wantAssign && !intent.studyKey);
-  const [over, under, gaps, headcount] = await Promise.all([
+  const [overRaw, underRaw, gaps, headcount] = await Promise.all([
     needPeople || intent.wantOver ? loadOverAllocated(dims) : Promise.resolve([]),
     intent.wantUnder || needPeople ? loadUnderUtilized(dims) : Promise.resolve([]),
     intent.wantGap || intent.wantSpareRole ? loadDqGaps() : Promise.resolve([]),
     intent.wantGap || intent.wantSpareRole ? loadHeadcount(dims) : Promise.resolve([])
   ]);
+  const over = applyTitleFilters(overRaw, intent);
+  const under = applyTitleFilters(underRaw, intent);
+  const titleNote = (intent.excludeTitle || []).length
+    ? ` Excluded titles containing ${intent.excludeTitle.map((n) => `"${n}"`).join(", ")}.`
+    : "";
 
   if (intent.wantUnder) {
-    if (under.length) return buildUnderAnswer(question, under, stampFn);
-    return stampFn(
-      {
-        q: question,
-        needs: ["insightsrm"],
-        icon: "users",
-        summary:
-          "No under-utilized people matched: nobody with assigned FTE more than 0.05 below Dim_Employee.TimeAllocation. This is not the over-allocation list.",
-        chartTitle: "No under-utilized personnel",
-        chartNote: "InsightsRM · spare FTE vs time allocation",
-        chartType: "bar",
-        bars: [],
-        tableTitle: "Under-utilized personnel",
-        grid: "1fr",
-        cols: ["Note"],
-        rows: [["Assigned FTE is at or above time allocation for people in Fact_Assignments / Dim_Employee."]],
-        caveat: "Under-utilized is spare capacity at the person grain. Role spare capacity is a different question.",
-        trace: ["Computed assigned FTE from Fact_Assignments vs Dim_Employee.TimeAllocation.", "Did not return DQ_04 over-allocation."],
-        query: "spare FTE = timeAllocation - Σ assignment valueFte",
-        confidence: "medium",
-        followUps: ["Who is over-allocated?", "Which roles are short on capacity?", "Show CRA assignments"]
-      },
-      []
+    if (under.length) {
+      const ans = buildUnderAnswer(question, under, stampFn);
+      if (titleNote) ans.summary = `${ans.summary}${titleNote}`;
+      return withRmIntent(ans, intent);
+    }
+    return withRmIntent(
+      stampFn(
+        {
+          q: question,
+          needs: ["insightsrm"],
+          icon: "users",
+          summary:
+            `No under-utilized people matched after filters.${titleNote} Nobody with assigned FTE more than 0.05 below Dim_Employee.TimeAllocation. This is not the over-allocation list.`,
+          chartTitle: "No under-utilized personnel",
+          chartNote: "InsightsRM · spare FTE vs time allocation",
+          chartType: "bar",
+          bars: [],
+          tableTitle: "Under-utilized personnel",
+          grid: "1fr",
+          cols: ["Note"],
+          rows: [["Assigned FTE is at or above time allocation, or remaining people were excluded by the title filter."]],
+          caveat: "Under-utilized is spare capacity at the person grain. Role spare capacity is a different question.",
+          trace: ["Computed assigned FTE from Fact_Assignments vs Dim_Employee.TimeAllocation.", "Did not return DQ_04 over-allocation.", titleNote.trim() || "No title filter."],
+          query: "spare FTE = timeAllocation - Σ assignment valueFte",
+          confidence: "medium",
+          followUps: ["Who is over-allocated?", "Which roles are short on capacity?", "Show CRA assignments"]
+        },
+        []
+      ),
+      intent
     );
   }
 
   if (intent.studyKey || (intent.wantAssign && !intent.wantOver && !intent.wantUnder)) {
-    const assignments = await loadAssignments(dims, {
-      studyKey: intent.studyKey,
-      craOnly: intent.craOnly
-    });
+    const assignments = applyTitleFilters(
+      await loadAssignments(dims, {
+        studyKey: intent.studyKey,
+        craOnly: intent.craOnly
+      }),
+      intent
+    );
     if (assignments.length) {
-      return buildAssignAnswer(question, assignments, intent.studyKey, stampFn);
+      return withRmIntent(buildAssignAnswer(question, assignments, intent.studyKey, stampFn), intent);
     }
   }
 
   if (intent.wantOver && over.length) {
-    return buildOverAnswer(question, over, stampFn);
+    const ans = buildOverAnswer(question, over, stampFn);
+    if (titleNote) ans.summary = `${ans.summary}${titleNote}`;
+    return withRmIntent(ans, intent);
   }
 
   if (intent.wantSpareRole && (gaps.length || headcount.length)) {
-    return buildGapAnswer(question, gaps, headcount, stampFn, true);
+    return withRmIntent(buildGapAnswer(question, gaps, headcount, stampFn, true), intent);
   }
 
   if (intent.wantGap && (gaps.length || headcount.length)) {
-    return buildGapAnswer(question, gaps, headcount, stampFn, false);
+    return withRmIntent(buildGapAnswer(question, gaps, headcount, stampFn, false), intent);
   }
 
   if (over.length && !intent.wantUnder) {
-    return buildOverAnswer(question, over, stampFn);
+    return withRmIntent(buildOverAnswer(question, over, stampFn), intent);
   }
 
   if (under.length) {
-    return buildUnderAnswer(question, under, stampFn);
+    const ans = buildUnderAnswer(question, under, stampFn);
+    if (titleNote) ans.summary = `${ans.summary}${titleNote}`;
+    return withRmIntent(ans, intent);
   }
 
   if (gaps.length || headcount.length) {
-    return buildGapAnswer(question, gaps, headcount, stampFn);
+    return withRmIntent(buildGapAnswer(question, gaps, headcount, stampFn), intent);
   }
 
-  const assignments = await loadAssignments(dims, { craOnly: intent.craOnly, limit: 80 });
+  const assignments = applyTitleFilters(
+    await loadAssignments(dims, { craOnly: intent.craOnly, limit: 80 }),
+    intent
+  );
   if (assignments.length) {
-    return buildAssignAnswer(question, assignments, "", stampFn);
+    return withRmIntent(buildAssignAnswer(question, assignments, "", stampFn), intent);
   }
 
   const briefing = await getRmBriefing();
-  return buildInventoryAnswer(question, inventory, briefing, stampFn);
+  return withRmIntent(buildInventoryAnswer(question, inventory, briefing, stampFn), intent);
 }
 
 module.exports = {
@@ -1117,5 +1210,6 @@ module.exports = {
   loadDimensions,
   pickField,
   fteLabel,
-  studyKeyFromQuestion
+  studyKeyFromQuestion,
+  looksLikeRmRefinement
 };

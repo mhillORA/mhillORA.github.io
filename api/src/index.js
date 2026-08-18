@@ -71,7 +71,8 @@ app.http("ask", {
       const principal = principalFromRequest(request);
       const answer = await answerFromCosmos(question, body.sources || [], {
         projectNumber: String(body.projectNumber || "").trim(),
-        principal
+        principal,
+        prior: Array.isArray(body.prior) ? body.prior.slice(-3) : []
       });
       return json(200, { answer });
     } catch (err) {

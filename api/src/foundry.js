@@ -163,6 +163,7 @@ function systemPrompt(cfg) {
       "Finance / GM questions use lens_ns_projects (NetSuite Project Profitability). Null GM is missing, not zero. Do not treat blank as 0%.",
       "InsightsRM / RM questions use lens_rm_* packs joined per Model_Relationships (studyKey, employeeKey, roleId). If rows array in CONTEXT is non-empty, summarize those rows — never say no data when rows exist.",
       "Over-allocation = assigned FTE minus Dim_Employee.TimeAllocation. Under-utilized = TimeAllocation minus assigned FTE (spare). Never answer an under-utilized question with the over-allocation list.",
+      "PRIOR is previous Ask turns in this thread. Follow-ups like 'remove anyone with director in their title' refine that same list. CONTEXT this turn is already filtered. Do not ask who the user means when PRIOR exists.",
       "If CONTEXT is empty or thin, say what is missing.",
       "VIEWER is secondary context (Entra preference). Frame the narrative for that role. Do not change Cosmos numbers. Do not invent people, reports, or projects that are not in CONTEXT or VIEWER extras.",
       "If VIEWER says the project is primary, lead with the project then people. If VIEWER is a director, stay high-level. If VIEWER is a manager, lead with direct reports when CONTEXT has them.",
@@ -173,7 +174,7 @@ function systemPrompt(cfg) {
   );
 }
 
-async function narrateWithFoundry(question, cosmosAnswer, viewerSlice) {
+async function narrateWithFoundry(question, cosmosAnswer, viewerSlice, priorTurns) {
   if (!foundryConfigured()) {
     throw new Error(
       "Foundry is not configured. Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT on this SWA."
@@ -197,11 +198,24 @@ async function narrateWithFoundry(question, cosmosAnswer, viewerSlice) {
     containers: cosmosAnswer.trace
   };
   const viewer = viewerSlice || null;
+  const prior = (priorTurns || [])
+    .slice(-3)
+    .map((t) => ({
+      question: t.question,
+      summary: t.summary,
+      tableTitle: t.tableTitle,
+      cols: t.cols,
+      rows: t.rows,
+      rmIntent: t.rmIntent || null
+    }));
   const messages = [
     { role: "system", content: systemPrompt(cfg) },
     {
       role: "user",
       content:
+        (prior.length
+          ? `PRIOR TURNS (same thread — this question continues them):\n${JSON.stringify(prior).slice(0, 20000)}\n\n`
+          : "") +
         `Question:\n${question}\n\nCONTEXT (JSON, Cosmos read-only):\n${JSON.stringify(context).slice(0, 70000)}` +
         (viewer ? `\n\nVIEWER (secondary, Entra preference — do not invent numbers):\n${JSON.stringify(viewer).slice(0, 8000)}` : "")
     }
