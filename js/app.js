@@ -135,15 +135,14 @@
     if (persist) save("odl.theme", next);
     const meta = document.querySelector('meta[name="theme-color"]');
     if (meta) meta.setAttribute("content", next === "dark" ? "#001123" : "#052c49");
-    const btn = document.getElementById("btnTheme");
-    if (btn) {
-      btn.setAttribute("aria-pressed", next === "dark" ? "true" : "false");
-      btn.setAttribute("aria-label", next === "dark" ? "Switch to light mode" : "Switch to dark mode");
-    }
-    const mode = document.getElementById("themeModeLabel");
-    const hint = document.getElementById("themeHint");
-    if (mode) mode.textContent = next === "dark" ? "Dark" : "Light";
-    if (hint) hint.textContent = next === "dark" ? "Switch to light" : "Switch to dark";
+    const label = next === "dark" ? "Ora Data Lens, switch to light mode" : "Ora Data Lens, switch to dark mode";
+    ["brandHome", "mobileBrandHome"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.setAttribute("aria-pressed", next === "dark" ? "true" : "false");
+      el.setAttribute("aria-label", label);
+      el.title = next === "dark" ? "Switch to light mode" : "Switch to dark mode";
+    });
   }
 
   function toggleTheme() {
@@ -2249,21 +2248,9 @@
       if (t) run("live", t);
     };
     const brand = document.getElementById("brandHome");
-    if (brand) {
-      brand.onclick = (e) => {
-        e.preventDefault();
-        closeMobileDrawers();
-        resetAsk();
-      };
-    }
+    if (brand) brand.onclick = toggleTheme;
     const mobileBrand = document.getElementById("mobileBrandHome");
-    if (mobileBrand) {
-      mobileBrand.onclick = (e) => {
-        e.preventDefault();
-        closeMobileDrawers();
-        resetAsk();
-      };
-    }
+    if (mobileBrand) mobileBrand.onclick = toggleTheme;
     const navToggle = document.getElementById("btnMobileNav");
     if (navToggle) {
       navToggle.onclick = () => setMobileDrawer("nav");
@@ -2292,8 +2279,6 @@
       });
     }
     document.getElementById("btnNew").onclick = resetAsk;
-    const themeBtn = document.getElementById("btnTheme");
-    if (themeBtn) themeBtn.onclick = toggleTheme;
     document.getElementById("btnSave").onclick = () => {
       if (state.phase !== "answered") return;
       state.saved.unshift({ at: new Date().toISOString(), text: state.askedText, key: state.key });
