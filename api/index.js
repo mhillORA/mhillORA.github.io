@@ -1467,19 +1467,92 @@ app.http('surveyResponses', {
                 body.updatedAt = now;
                 if (!Array.isArray(body.answers)) body.answers = [];
 
+                        // Compute score if definition has scoringWeight on questions
+                const computeScore = async (answers) => {
+                    try {
+                        const defC = getContainer('site-survey-definitions');
+                        const defRead = await defC.item(body.surveyId, body.surveyId).read();
+                        const def = defRead.resource;
+                        if (!def || !Array.isArray(def.questions)) return null;
+                        const scorableQs = def.questions.filter(q => typeof q.scoringWeight === 'number' && q.scoringWeight > 0 && q.scoringOptions);
+                        if (!scorableQs.length) return null;
+                        let totalWeight = 0;
+                        let earned = 0;
+                        scorableQs.forEach(q => {
+                            const ans = (Array.isArray(answers) ? answers : []).find(a => a.questionId === q.id || a.questionId === String(q.id));
+                            if (!ans || ans.skipped) return;
+                            totalWeight += q.scoringWeight;
+                            const opts = Array.isArray(q.scoringOptions) ? q.scoringOptions : [];
+                            const match = opts.find(o => String(o.value ?? o.label ?? '') === String(ans.value ?? '').trim());
+                            if (match && typeof match.points === 'number') earned += match.points;
+                        });
+                        if (totalWeight === 0) return null;
+                        return { earned, totalWeight, pct: Math.round((earned / totalWeight) * 100) };
+                    } catch (_) { return null; }
+                };
+
                 const rspC = getContainer('site-survey-responses');
+                // Find prior responses for same siteId+surveyId+targetRole (any assignment link)
                 const { resources: existing } = await rspC.items.query({
-                    query: 'SELECT * FROM c WHERE c.assignmentId = @assignmentId',
-                    parameters: [{ name: '@assignmentId', value: String(body.assignmentId) }],
+                    query: 'SELECT * FROM c WHERE c.siteId = @siteId AND c.surveyId = @surveyId AND c.targetRole = @targetRole',
+                    parameters: [
+                        { name: '@siteId', value: String(body.siteId) },
+                        { name: '@surveyId', value: String(body.surveyId) },
+                        { name: '@targetRole', value: String(body.targetRole) },
+                    ],
                 }, { enableCrossPartitionQuery: true }).fetchAll();
 
+                const score = await computeScore(body.answers);
+                if (score !== null) body.score = score;
+
                 if (existing && existing.length) {
-                    const latest = sortByIsoDesc(existing, ['submittedAt', 'createdAt'])[0];
-                    return {
-                        status: 200,
-                        jsonBody: { ...latest, alreadySubmitted: true },
-                        headers: jsonHeaders(),
+                    const prior = sortByIsoDesc(existing, ['submittedAt', 'createdAt'])[0];
+                    // Archive the old response (preserve history)
+                    try {
+                        await rspC.items.upsert({
+                            ...prior,
+                            id: `${prior.id}_archived_${now}`,
+                            _archived: true,
+                            _archivedAt: now,
+                            _replacedBy: prior.id,
+                        });
+                    } catch (_) { /* non-fatal */ }
+                    // Merge: new answers overwrite matching questionIds; old answers fill gaps where new answer is empty/skipped
+                    const oldAnswerMap = new Map((prior.answers || []).map(a => [String(a.questionId ?? a.id ?? ''), a]));
+                    const mergedAnswers = (Array.isArray(body.answers) ? body.answers : []).map(a => {
+                        const hasValue = !a.skipped && String(a.value ?? '').trim() !== '';
+                        if (!hasValue) {
+                            const prev = oldAnswerMap.get(String(a.questionId ?? ''));
+                            if (prev && !prev.skipped && String(prev.value ?? '').trim() !== '') {
+                                return { ...a, value: prev.value, _keptFromPrior: true };
+                            }
+                        }
+                        return a;
+                    });
+                    const reScore = await computeScore(mergedAnswers);
+                    const updated = {
+                        ...prior,
+                        ...body,
+                        id: prior.id,
+                        answers: mergedAnswers,
+                        submittedAt: now,
+                        updatedAt: now,
+                        _resubmitCount: (prior._resubmitCount || 0) + 1,
+                        score: reScore !== null ? reScore : body.score ?? prior.score ?? null,
                     };
+                    validateSurveyResponsesSchema(updated);
+                    const { resource } = await rspC.items.upsert(updated);
+                    // Keep assignment stamped as submitted
+                    try {
+                        const asgC2 = getContainer('site-survey-assignments');
+                        await asgC2.items.upsert({
+                            ...assignment,
+                            status: 'submitted',
+                            submittedAt: prior.submittedAt || now,
+                            updatedAt: now,
+                        });
+                    } catch (_) { /* non-fatal */ }
+                    return { status: 200, jsonBody: { ...resource, resubmitted: true }, headers: jsonHeaders() };
                 }
 
                 validateSurveyResponsesSchema(body);

@@ -87,12 +87,14 @@
       content.innerHTML = renderBanner('Error', message, 'error');
     };
 
-    const renderDone = (already) => {
-      subtitle.textContent = already ? 'Already submitted' : 'Submitted';
-      setChip(already ? 'Already in' : 'Submitted', 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200');
+    const renderDone = (resubmitted) => {
+      subtitle.textContent = resubmitted ? 'Updated' : 'Submitted';
+      setChip(resubmitted ? 'Updated' : 'Submitted', 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200');
       content.innerHTML = renderBanner(
-        already ? 'This survey was already submitted' : 'Thanks — your response was submitted',
-        'You can close this tab. Operations can see these answers on the site record in ARTEMIS.',
+        resubmitted ? 'Answers updated' : 'Thanks — your response was submitted',
+        resubmitted
+          ? 'Your new answers have been saved. Any previously answered questions you left blank have been kept from your prior submission. Operations can see the latest answers on the site record in ARTEMIS.'
+          : 'You can close this tab. Operations can see these answers on the site record in ARTEMIS.',
         'ok'
       );
     };
@@ -144,9 +146,10 @@
     };
 
     const renderSurvey = ({ assignment, definition, siteName, alreadySubmitted }) => {
+      const hasPriorChip = !!definition._hasPrior;
       subtitle.textContent = `${siteName} • ${roleLabel(assignment.targetRole)}`;
-      setChip(alreadySubmitted ? 'Read only' : 'In progress', alreadySubmitted
-        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200'
+      setChip(hasPriorChip ? 'Update' : 'In progress', hasPriorChip
+        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-200'
         : 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900/50 dark:text-indigo-200');
 
       const questions = Array.isArray(definition.questions) ? definition.questions : [];
@@ -206,8 +209,9 @@
         ? renderBanner('No questions yet', 'Ask operations to add questions to this survey in ARTEMIS (Comms).', 'warn')
         : '';
 
+      const hasPrior = !!definition._hasPrior;
       content.innerHTML = `
-        ${alreadySubmitted ? renderBanner('Already submitted', 'This link has a completed response. Answers below are read-only.', 'ok') : ''}
+        ${hasPrior ? renderBanner('Updating previous submission', 'Your prior answers are pre-filled below. Fill in or change any answers and hit Submit. Blank fields will keep the previous answer.', 'warn') : ''}
         <div class="space-y-1">
           <div class="text-xs uppercase tracking-wide text-indigo-600 dark:text-indigo-300 font-semibold">Survey</div>
           <div class="text-2xl font-semibold text-gray-900 dark:text-gray-100">${escapeHtml(definition.title || 'Untitled')}</div>
@@ -232,8 +236,8 @@
           <div class="pt-2 flex items-center justify-end">
             <button id="submit-btn" type="submit"
               class="w-full sm:w-auto min-h-[44px] px-5 py-2.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 font-medium shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-              ${questions.length === 0 || alreadySubmitted ? 'disabled' : ''}>
-              ${alreadySubmitted ? 'Submitted' : 'Submit answers'}
+              ${questions.length === 0 ? 'disabled' : ''}>
+              ${hasPrior ? 'Update answers' : 'Submit answers'}
             </button>
           </div>
         </form>
@@ -301,7 +305,7 @@
             })
           });
 
-          renderDone(!!result?.alreadySubmitted);
+          renderDone(!!result?.resubmitted);
         } catch (err) {
           submitBtn.disabled = false;
           submitBtn.classList.remove('opacity-60', 'cursor-not-allowed');
@@ -324,7 +328,8 @@
           return;
         }
 
-        const alreadySubmitted = String(assignment.status || '').toLowerCase() === 'submitted';
+        // Allow re-submission: if already submitted, show prefilled form with a "Update answers" button
+        const alreadySubmitted = false; // re-submit is always allowed; prior answers are merged server-side
 
         if (!assignment.openedAt && !alreadySubmitted) {
           try {
@@ -342,14 +347,17 @@
         }
 
         try {
+          // Prefer responses for this specific assignment, then fall back to site+survey+role
           const byAssignment = await request(`/site-survey-responses?assignmentId=${encodeURIComponent(assignment.id)}`).catch(() => []);
-          const last = Array.isArray(byAssignment) && byAssignment.length
-            ? byAssignment[0]
-            : (await request(`/site-survey-responses?siteId=${encodeURIComponent(assignment.siteId)}&surveyId=${encodeURIComponent(assignment.surveyId)}&targetRole=${encodeURIComponent(assignment.targetRole)}`).catch(() => []))[0];
+          const bySite = Array.isArray(byAssignment) && byAssignment.length
+            ? byAssignment
+            : await request(`/site-survey-responses?siteId=${encodeURIComponent(assignment.siteId)}&surveyId=${encodeURIComponent(assignment.surveyId)}&targetRole=${encodeURIComponent(assignment.targetRole)}`).catch(() => []);
+          const last = Array.isArray(bySite) ? bySite.filter(r => !r._archived)[0] : null;
 
           if (last && last.answers) {
             const prefill = answersToDefaults(last.answers);
             definition.defaultValues = { ...(definition.defaultValues || {}), ...prefill };
+            definition._hasPrior = true;
           }
         } catch (_) {}
 
