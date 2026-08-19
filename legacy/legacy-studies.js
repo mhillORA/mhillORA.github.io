@@ -81,6 +81,98 @@
     return list;
   }
 
+  function normSiteName(s) {
+    return String(s ?? '')
+      .toLowerCase()
+      .replace(/\b(inc\.?|llc|corp\.?|ltd\.?|pllc|pc|md|dr\.?|sc)\b/gi, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .replace(/\s+/g, ' ');
+  }
+
+  /** artemisSiteId -> merged legacy stats for that live site */
+  let artemisLegacyIndex = null;
+
+  function mergeLegacyIntoIndex(artemisId, legacySite, matchVia) {
+    if (!artemisId || !legacySite) return;
+    const m = legacySite.metrics || {};
+    const studyNames = Array.isArray(m.studyNames) ? m.studyNames : [];
+    const existing = artemisLegacyIndex.get(artemisId);
+    if (existing) {
+      existing.nStudies += num(m.nStudies);
+      existing.enrolled += num(m.enrolled);
+      existing.screened += num(m.screened);
+      existing.scheduled += num(m.scheduled);
+      existing.targetScheduled += num(m.targetScheduled);
+      for (const n of studyNames) {
+        if (n && !existing.studyNames.includes(n)) existing.studyNames.push(n);
+      }
+      if (!existing.legacySiteIds.includes(legacySite.id)) {
+        existing.legacySiteIds.push(legacySite.id);
+      }
+      if (!existing.matchVia.includes(matchVia)) existing.matchVia.push(matchVia);
+    } else {
+      artemisLegacyIndex.set(artemisId, {
+        legacySiteId: legacySite.id,
+        legacySiteIds: [legacySite.id],
+        legacyName: legacySite.name,
+        nStudies: num(m.nStudies),
+        enrolled: num(m.enrolled),
+        screened: num(m.screened),
+        scheduled: num(m.scheduled),
+        targetScheduled: num(m.targetScheduled),
+        studyNames: [...studyNames],
+        matchVia: [matchVia],
+      });
+    }
+  }
+
+  function rebuildArtemisLegacyIndex(artemisSites) {
+    artemisLegacyIndex = new Map();
+    const liveSites = Array.isArray(artemisSites) ? artemisSites : [];
+    if (!state.sites.length || !liveSites.length) return artemisLegacyIndex;
+
+    const artemisByNorm = new Map();
+    for (const s of liveSites) {
+      if (!s?.id || !s?.name) continue;
+      const norm = normSiteName(s.name);
+      if (norm && !artemisByNorm.has(norm)) artemisByNorm.set(norm, s.id);
+    }
+
+    for (const ls of state.sites) {
+      if (ls.linkedArtemisSiteId) {
+        mergeLegacyIntoIndex(ls.linkedArtemisSiteId, ls, 'linked');
+        continue;
+      }
+      const norm = normSiteName(ls.name);
+      const artemisId = artemisByNorm.get(norm);
+      if (artemisId) mergeLegacyIntoIndex(artemisId, ls, 'name');
+    }
+
+    return artemisLegacyIndex;
+  }
+
+  function getLegacyForArtemisSite(siteId) {
+    if (!siteId || !artemisLegacyIndex) return null;
+    return artemisLegacyIndex.get(siteId) || null;
+  }
+
+  /** Load legacy-sites only (lightweight) for matching live ARTEMIS sites. */
+  async function ensureLegacySitesForMatching(force = false) {
+    if (state.sites.length && !force) return state.sites;
+    const sites = await req('/legacy-sites').catch((e) => {
+      console.error('legacy-sites (matching) load failed', e);
+      return [];
+    });
+    state.sites = Array.isArray(sites) ? sites : [];
+    return state.sites;
+  }
+
+  async function refreshArtemisLegacyIndex(artemisSites) {
+    await ensureLegacySitesForMatching();
+    return rebuildArtemisLegacyIndex(artemisSites);
+  }
+
   function fmt(n) {
     if (n == null || n === '') return '—';
     const x = Number(n);
@@ -2077,6 +2169,10 @@
     mountDashboard,
     openSiteDetail,
     ensureLoaded,
+    ensureLegacySitesForMatching,
+    refreshArtemisLegacyIndex,
+    rebuildArtemisLegacyIndex,
+    getLegacyForArtemisSite,
     attachApiMethods,
     state,
   };

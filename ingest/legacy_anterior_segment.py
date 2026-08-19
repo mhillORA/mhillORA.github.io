@@ -441,8 +441,17 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
     ):
         existing_sites[item["id"]] = item
 
-    # Optional soft-match to live ARTEMIS sites by exact name (read-only; never writes to sites)
+    # Optional soft-match to live ARTEMIS sites by name (read-only; never writes to sites)
     live_by_name = {}
+    live_by_norm = {}
+
+    def norm_site_name(s: str) -> str:
+        import re
+        x = (s or "").lower()
+        x = re.sub(r"\b(inc\.?|llc|corp\.?|ltd\.?|pllc|pc|md|dr\.?|sc)\b", "", x, flags=re.I)
+        x = re.sub(r"[^a-z0-9]+", " ", x)
+        return " ".join(x.split())
+
     try:
         live_c = db.get_container_client("sites")
         for item in live_c.query_items(
@@ -450,7 +459,11 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
             enable_cross_partition_query=True,
         ):
             if item.get("name"):
-                live_by_name[str(item["name"]).strip().lower()] = item["id"]
+                key = str(item["name"]).strip().lower()
+                live_by_name[key] = item["id"]
+                norm = norm_site_name(item["name"])
+                if norm and norm not in live_by_norm:
+                    live_by_norm[norm] = item["id"]
     except Exception as e:
         print("Note: could not read live sites for linking:", e)
 
@@ -496,7 +509,8 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
             if prev.get("createdAt"):
                 doc["createdAt"] = prev["createdAt"]
         if not doc.get("linkedArtemisSiteId"):
-            link = live_by_name.get((doc.get("name") or "").strip().lower())
+            name = (doc.get("name") or "").strip()
+            link = live_by_name.get(name.lower()) or live_by_norm.get(norm_site_name(name))
             if link:
                 doc["linkedArtemisSiteId"] = link
         sites_c.upsert_item(doc)
