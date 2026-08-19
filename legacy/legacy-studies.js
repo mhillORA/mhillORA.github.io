@@ -859,32 +859,73 @@
             </button>
           </div>
         </div>
+
         <div id="legacy-dash-status" class="text-xs text-gray-500 dark:text-gray-400">Loading legacy data…</div>
-        <div id="legacy-dash-kpis" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3"></div>
+
+        <!-- Primary KPI strip -->
+        <div id="legacy-dash-kpis" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3"></div>
+
+        <!-- Conversion rate row -->
+        <div id="legacy-dash-rates" class="grid grid-cols-2 sm:grid-cols-4 gap-3"></div>
+
+        <!-- Row 1: top sites bar + funnel -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div class="lg:col-span-2 bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-            <h4 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Top sites by enrolled</h4>
+          <div class="lg:col-span-2 bg-white dark:bg-gray-800 p-5 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+            <h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-4">Top sites by enrolled</h4>
             <div class="relative h-72">
               <canvas id="legacy-dash-chart-sites"></canvas>
             </div>
           </div>
-          <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-            <h4 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Enrollment funnel</h4>
+          <div class="bg-white dark:bg-gray-800 p-5 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+            <h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-4">Enrollment funnel</h4>
             <div class="relative h-72">
               <canvas id="legacy-dash-chart-funnel"></canvas>
             </div>
           </div>
         </div>
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-            <h4 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">Studies by therapeutic area</h4>
+
+        <!-- Row 2: TA doughnut + enrollment rate by site bar + site breakdown table -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div class="bg-white dark:bg-gray-800 p-5 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+            <h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-4">Studies by therapeutic area</h4>
             <div class="relative h-64">
               <canvas id="legacy-dash-chart-ta"></canvas>
             </div>
           </div>
-          <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 overflow-hidden">
-            <h4 class="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4 px-1">Top sites</h4>
-            <div id="legacy-dash-table-wrap" class="overflow-x-auto"></div>
+          <div class="bg-white dark:bg-gray-800 p-5 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+            <h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-4">Screen → enroll rate by site (top 10)</h4>
+            <div class="relative h-64">
+              <canvas id="legacy-dash-chart-enroll-rate"></canvas>
+            </div>
+          </div>
+          <div class="bg-white dark:bg-gray-800 p-5 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+            <h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-4">Studies per site distribution</h4>
+            <div class="relative h-64">
+              <canvas id="legacy-dash-chart-studies-per-site"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Row 3: site productivity table (full width) -->
+        <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 overflow-hidden">
+          <div class="px-5 py-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between gap-3">
+            <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide">Site productivity (all sites)</h4>
+            <span class="text-xs text-gray-400" id="legacy-dash-table-note"></span>
+          </div>
+          <div id="legacy-dash-table-wrap" class="overflow-x-auto max-h-80"></div>
+        </div>
+
+        <!-- Row 4: top study performers + low-enrollment tail -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div class="bg-white dark:bg-gray-800 p-5 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+            <h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-4">Top 10 studies by enrolled</h4>
+            <div class="relative h-64">
+              <canvas id="legacy-dash-chart-top-studies"></canvas>
+            </div>
+          </div>
+          <div class="bg-white dark:bg-gray-800 p-5 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 overflow-hidden">
+            <h4 class="text-sm font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide mb-3">Study summary</h4>
+            <div id="legacy-dash-study-table" class="overflow-x-auto max-h-64"></div>
           </div>
         </div>
       </section>`;
@@ -1129,7 +1170,7 @@
   }
 
   let charts = { studies: null, funnel: null };
-  let dashCharts = { sites: null, funnel: null, ta: null };
+  let dashCharts = { sites: null, funnel: null, ta: null, enrollRate: null, studiesPerSite: null, topStudies: null };
 
   function destroyCharts() {
     if (charts.studies) {
@@ -1153,44 +1194,107 @@
 
   function renderDashboard() {
     const kpis = document.getElementById('legacy-dash-kpis');
+    const ratesEl = document.getElementById('legacy-dash-rates');
     const tableWrap = document.getElementById('legacy-dash-table-wrap');
+    const tableNote = document.getElementById('legacy-dash-table-note');
+    const studyTable = document.getElementById('legacy-dash-study-table');
     const status = document.getElementById('legacy-dash-status');
     if (!kpis) return;
 
     const outcomes = state.outcomes.map(normOutcome);
     const totals = sumOutcomes(outcomes);
     const sitesMaster = uniqueSitesFromState();
+
+    // Build rich site rows with per-site aggregates
     const siteRows = sitesMaster
       .map((s) => {
         const rows = outcomes.filter((o) => o.siteId === s.id);
-        return { site: s, rows, t: sumOutcomes(rows) };
+        const t = sumOutcomes(rows);
+        const studyIds = [...new Set(rows.map((r) => r.studyId).filter(Boolean))];
+        const piSet = new Set(rows.map((r) => r.pi).filter(Boolean));
+        // Earliest visit1 / latest LPLV across all rows for this site
+        const visits = rows.map((r) => r.visit1Start).filter(Boolean).sort();
+        const lplvs = rows.map((r) => r.lplv).filter(Boolean).sort();
+        const avgEnrollRate = t.screened > 0 ? (t.enrolled / t.screened) * 100 : null;
+        const schedRate = t.targetScheduled > 0 ? (t.scheduled / t.targetScheduled) * 100 : null;
+        return {
+          site: s, rows, t, studyIds,
+          piList: [...piSet].join(', '),
+          nStudies: studyIds.length,
+          nPIs: piSet.size,
+          firstVisit: visits[0] || null,
+          lastLplv: lplvs[lplvs.length - 1] || null,
+          enrollRate: avgEnrollRate,
+          schedRate,
+        };
       })
       .filter((x) => x.rows.length > 0)
       .sort((a, b) => b.t.enrolled - a.t.enrolled);
+
+    // Aggregate across all studies
+    const totalSitesWithData = siteRows.length;
+    const avgEnrolledPerSite = totalSitesWithData > 0
+      ? (totals.enrolled / totalSitesWithData).toFixed(1)
+      : '—';
+    const medianEnrolled = (() => {
+      const vals = siteRows.map((x) => x.t.enrolled).sort((a, b) => a - b);
+      if (!vals.length) return '—';
+      const mid = Math.floor(vals.length / 2);
+      return vals.length % 2 === 0
+        ? ((vals[mid - 1] + vals[mid]) / 2).toFixed(1)
+        : String(vals[mid]);
+    })();
+    const topSiteShare = totals.enrolled > 0 && siteRows.length
+      ? ((siteRows[0]?.t.enrolled / totals.enrolled) * 100).toFixed(1) + '%'
+      : '—';
+    const sitesAboveAvg = siteRows.filter(
+      (x) => x.t.enrolled > num(avgEnrolledPerSite)
+    ).length;
 
     if (status) {
       status.textContent = `${state.studies.length} studies · ${sitesMaster.length} unique sites · ${outcomes.length} outcome rows · data from Anterior Segment Overview`;
     }
 
+    // KPI strip
+    const kpiDef = (label, val, sub) => `
+      <div class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 text-center">
+        <div class="text-[11px] font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide">${label}</div>
+        <div class="text-2xl font-bold text-gray-900 dark:text-white mt-0.5">${val}</div>
+        ${sub ? `<div class="text-[11px] text-gray-400 mt-0.5">${sub}</div>` : ''}
+      </div>`;
+
     kpis.innerHTML = [
-      ['Unique sites', sitesMaster.length],
-      ['Studies', state.studies.length],
-      ['Scheduled', fmt(totals.scheduled)],
-      ['Screened', fmt(totals.screened)],
-      ['Enrolled', fmt(totals.enrolled)],
-      ['Screen → Enroll', rate(totals.enrolled, totals.screened)],
-    ]
-      .map(
-        ([label, val]) => `
-      <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 text-center">
-        <div class="text-xs text-gray-500 dark:text-gray-400">${label}</div>
-        <div class="text-xl font-semibold text-gray-900 dark:text-white">${val}</div>
-      </div>`
-      )
-      .join('');
+      kpiDef('Unique sites', sitesMaster.length, `${totalSitesWithData} with data`),
+      kpiDef('Studies', state.studies.length, ''),
+      kpiDef('Scheduled', fmt(totals.scheduled), `Target: ${fmt(totals.targetScheduled)}`),
+      kpiDef('Screened', fmt(totals.screened), rate(totals.screened, totals.scheduled) + ' of sched'),
+      kpiDef('Enrolled', fmt(totals.enrolled), `Avg/site ${avgEnrolledPerSite}`),
+      kpiDef('Screen→Enroll', rate(totals.enrolled, totals.screened), ''),
+    ].join('');
+
+    // Rates row
+    if (ratesEl) {
+      const rateDef = (label, val, color) => `
+        <div class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 flex items-center gap-3">
+          <div class="w-1 self-stretch rounded-full ${color}"></div>
+          <div>
+            <div class="text-[11px] font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide">${label}</div>
+            <div class="text-xl font-bold text-gray-900 dark:text-white">${val}</div>
+          </div>
+        </div>`;
+      ratesEl.innerHTML = [
+        rateDef('Sched / Target', rate(totals.scheduled, totals.targetScheduled), 'bg-slate-400'),
+        rateDef('Median enrolled / site', medianEnrolled, 'bg-indigo-500'),
+        rateDef('Sites above avg enrolled', sitesAboveAvg + ' / ' + totalSitesWithData, 'bg-emerald-500'),
+        rateDef('Top site share', topSiteShare + ' of total enrolled', 'bg-amber-400'),
+      ].join('');
+    }
 
     destroyDashCharts();
     if (global.Chart) {
+      const PALETTE = ['#4f46e5','#f59e0b','#10b981','#ef4444','#8b5cf6','#64748b','#ec4899','#0ea5e9','#f97316','#14b8a6','#a855f7','#6366f1'];
+
+      // Chart 1: top sites by enrolled (horizontal bar)
       const topSites = siteRows.slice(0, 12);
       const ctxSites = document.getElementById('legacy-dash-chart-sites');
       if (ctxSites) {
@@ -1198,17 +1302,22 @@
           type: 'bar',
           data: {
             labels: topSites.map((x) => x.site.name),
-            datasets: [{ label: 'Enrolled', data: topSites.map((x) => x.t.enrolled), backgroundColor: '#4f46e5' }],
+            datasets: [
+              { label: 'Enrolled', data: topSites.map((x) => x.t.enrolled), backgroundColor: '#4f46e5' },
+              { label: 'Screened', data: topSites.map((x) => x.t.screened), backgroundColor: '#a5b4fc' },
+            ],
           },
           options: {
             indexAxis: 'y',
             responsive: true,
             maintainAspectRatio: false,
-            plugins: { legend: { display: false } },
+            plugins: { legend: { display: true, position: 'top' } },
+            scales: { x: { stacked: false } },
           },
         });
       }
 
+      // Chart 2: funnel
       const ctxFunnel = document.getElementById('legacy-dash-chart-funnel');
       if (ctxFunnel) {
         dashCharts.funnel = new global.Chart(ctxFunnel, {
@@ -1226,11 +1335,24 @@
           options: {
             responsive: true,
             maintainAspectRatio: false,
-            plugins: { legend: { display: false } },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  afterLabel: (ctx) => {
+                    const vals = [totals.targetScheduled, totals.scheduled, totals.screened, totals.enrolled];
+                    const prev = vals[ctx.dataIndex - 1];
+                    if (prev == null || prev === 0) return '';
+                    return `${((ctx.parsed.y / prev) * 100).toFixed(1)}% of prev step`;
+                  },
+                },
+              },
+            },
           },
         });
       }
 
+      // Chart 3: studies by TA (doughnut)
       const taData = state.studies.reduce((acc, s) => {
         const ta = (s.therapeuticArea || s.indication || 'Unspecified').trim();
         acc[ta] = (acc[ta] || 0) + 1;
@@ -1242,44 +1364,138 @@
           type: 'doughnut',
           data: {
             labels: Object.keys(taData),
-            datasets: [
-              {
-                data: Object.values(taData),
-                backgroundColor: ['#4f46e5', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#64748b', '#ec4899'],
-              },
-            ],
+            datasets: [{ data: Object.values(taData), backgroundColor: PALETTE }],
           },
           options: {
             responsive: true,
             maintainAspectRatio: false,
-            plugins: { legend: { position: 'bottom' } },
+            plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } } },
+          },
+        });
+      }
+
+      // Chart 4: screen→enroll rate by site (horizontal bar, top 10 with ≥5 screened)
+      const ratedSites = siteRows
+        .filter((x) => x.t.screened >= 5)
+        .map((x) => ({ name: x.site.name, rate: (x.t.enrolled / x.t.screened) * 100 }))
+        .sort((a, b) => b.rate - a.rate)
+        .slice(0, 10);
+      const ctxRate = document.getElementById('legacy-dash-chart-enroll-rate');
+      if (ctxRate) {
+        dashCharts.enrollRate = new global.Chart(ctxRate, {
+          type: 'bar',
+          data: {
+            labels: ratedSites.map((x) => x.name),
+            datasets: [{
+              label: 'Enroll rate %',
+              data: ratedSites.map((x) => parseFloat(x.rate.toFixed(1))),
+              backgroundColor: ratedSites.map((x) =>
+                x.rate >= 80 ? '#10b981' : x.rate >= 50 ? '#f59e0b' : '#ef4444'
+              ),
+            }],
+          },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: { x: { max: 100, title: { display: true, text: '%' } } },
+          },
+        });
+      }
+
+      // Chart 5: studies per site distribution (histogram buckets)
+      const studyCountBuckets = { '1': 0, '2': 0, '3-4': 0, '5-9': 0, '10+': 0 };
+      siteRows.forEach(({ nStudies }) => {
+        if (nStudies === 1) studyCountBuckets['1']++;
+        else if (nStudies === 2) studyCountBuckets['2']++;
+        else if (nStudies <= 4) studyCountBuckets['3-4']++;
+        else if (nStudies <= 9) studyCountBuckets['5-9']++;
+        else studyCountBuckets['10+']++;
+      });
+      const ctxSps = document.getElementById('legacy-dash-chart-studies-per-site');
+      if (ctxSps) {
+        dashCharts.studiesPerSite = new global.Chart(ctxSps, {
+          type: 'bar',
+          data: {
+            labels: Object.keys(studyCountBuckets),
+            datasets: [{
+              label: 'Sites',
+              data: Object.values(studyCountBuckets),
+              backgroundColor: PALETTE,
+            }],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false }, tooltip: { callbacks: { title: (i) => `${i[0].label} studies` } } },
+            scales: { y: { title: { display: true, text: 'Sites' } } },
+          },
+        });
+      }
+
+      // Chart 6: top 10 studies by enrolled (horizontal bar)
+      const topStudies = [...state.studies]
+        .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled))
+        .slice(0, 10);
+      const ctxTopStudies = document.getElementById('legacy-dash-chart-top-studies');
+      if (ctxTopStudies) {
+        dashCharts.topStudies = new global.Chart(ctxTopStudies, {
+          type: 'bar',
+          data: {
+            labels: topStudies.map((s) => s.name || s.title),
+            datasets: [
+              { label: 'Enrolled', data: topStudies.map((s) => num(s.metrics?.enrolled)), backgroundColor: '#4f46e5' },
+              { label: 'Screened', data: topStudies.map((s) => num(s.metrics?.screened)), backgroundColor: '#a5b4fc' },
+            ],
+          },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: true, position: 'top' } },
           },
         });
       }
     }
 
+    // Site productivity table (all sites, scrollable)
     if (tableWrap) {
-      const top = siteRows.slice(0, 10);
+      if (tableNote) tableNote.textContent = `${siteRows.length} sites`;
       tableWrap.innerHTML = `
         <table class="min-w-full text-sm">
-          <thead class="bg-gray-50 dark:bg-gray-900/40 text-left">
+          <thead class="bg-gray-50 dark:bg-gray-900/40 text-left sticky top-0">
             <tr>
-              <th class="px-3 py-2">Site</th>
-              <th class="px-3 py-2 text-right">Studies</th>
-              <th class="px-3 py-2 text-right">Enrolled</th>
-              <th class="px-3 py-2 text-right">E/S</th>
+              <th class="px-3 py-2 font-semibold">Site</th>
+              <th class="px-3 py-2 font-semibold text-right">Studies</th>
+              <th class="px-3 py-2 font-semibold text-right">PIs</th>
+              <th class="px-3 py-2 font-semibold text-right">Target</th>
+              <th class="px-3 py-2 font-semibold text-right">Sched</th>
+              <th class="px-3 py-2 font-semibold text-right">Screened</th>
+              <th class="px-3 py-2 font-semibold text-right">Enrolled</th>
+              <th class="px-3 py-2 font-semibold text-right">Sched/Tgt</th>
+              <th class="px-3 py-2 font-semibold text-right">E/S rate</th>
+              <th class="px-3 py-2 font-semibold">First Visit1</th>
+              <th class="px-3 py-2 font-semibold">Last LPLV</th>
               <th class="px-3 py-2"></th>
             </tr>
           </thead>
           <tbody>
-            ${top
-              .map(({ site: s, rows, t }) => {
-                const studyCount = new Set(rows.map((r) => r.studyId)).size;
-                return `<tr class="border-t dark:border-gray-700">
-                  <td class="px-3 py-1.5 font-medium">${escapeHtml(s.name)}</td>
-                  <td class="px-3 py-1.5 text-right">${studyCount}</td>
+            ${siteRows
+              .map(({ site: s, t, nStudies, nPIs, enrollRate, schedRate, firstVisit, lastLplv }) => {
+                const erColor = enrollRate == null ? '' : enrollRate >= 80 ? 'text-emerald-600 dark:text-emerald-400' : enrollRate >= 50 ? 'text-amber-600 dark:text-amber-400' : 'text-red-600 dark:text-red-400';
+                return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/30">
+                  <td class="px-3 py-1.5 font-medium max-w-[180px] truncate">${escapeHtml(s.name)}</td>
+                  <td class="px-3 py-1.5 text-right">${nStudies}</td>
+                  <td class="px-3 py-1.5 text-right">${nPIs}</td>
+                  <td class="px-3 py-1.5 text-right">${fmt(t.targetScheduled)}</td>
+                  <td class="px-3 py-1.5 text-right">${fmt(t.scheduled)}</td>
+                  <td class="px-3 py-1.5 text-right">${fmt(t.screened)}</td>
                   <td class="px-3 py-1.5 text-right font-semibold">${fmt(t.enrolled)}</td>
-                  <td class="px-3 py-1.5 text-right">${rate(t.enrolled, t.screened)}</td>
+                  <td class="px-3 py-1.5 text-right">${schedRate != null ? schedRate.toFixed(1) + '%' : '—'}</td>
+                  <td class="px-3 py-1.5 text-right font-semibold ${erColor}">${enrollRate != null ? enrollRate.toFixed(1) + '%' : '—'}</td>
+                  <td class="px-3 py-1.5 text-xs whitespace-nowrap">${escapeHtml(firstVisit || '—')}</td>
+                  <td class="px-3 py-1.5 text-xs whitespace-nowrap">${escapeHtml(lastLplv || '—')}</td>
                   <td class="px-3 py-1.5 text-right">
                     <button type="button" data-legacy-dash-site="${escapeHtml(s.id)}" class="text-indigo-600 hover:underline text-xs">Open</button>
                   </td>
@@ -1291,6 +1507,40 @@
       tableWrap.querySelectorAll('[data-legacy-dash-site]').forEach((btn) => {
         btn.addEventListener('click', () => openSiteDetail(btn.getAttribute('data-legacy-dash-site')));
       });
+    }
+
+    // Study summary table
+    if (studyTable) {
+      const studiesSorted = [...state.studies].sort(
+        (a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled)
+      );
+      studyTable.innerHTML = `
+        <table class="min-w-full text-sm">
+          <thead class="bg-gray-50 dark:bg-gray-900/40 text-left sticky top-0">
+            <tr>
+              <th class="px-3 py-2 font-semibold">Study</th>
+              <th class="px-3 py-2 font-semibold">TA</th>
+              <th class="px-3 py-2 font-semibold text-right">Sites</th>
+              <th class="px-3 py-2 font-semibold text-right">Screened</th>
+              <th class="px-3 py-2 font-semibold text-right">Enrolled</th>
+              <th class="px-3 py-2 font-semibold text-right">E/S</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${studiesSorted.map((s) => {
+              const m = s.metrics || {};
+              const siteCount = new Set(outcomes.filter((o) => o.studyId === s.id).map((o) => o.siteId)).size;
+              return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/30">
+                <td class="px-3 py-1.5 font-medium max-w-[200px] truncate">${escapeHtml(s.name || s.title)}</td>
+                <td class="px-3 py-1.5 text-xs">${escapeHtml(s.therapeuticArea || s.indication || '—')}</td>
+                <td class="px-3 py-1.5 text-right">${siteCount || fmt(m.nSites)}</td>
+                <td class="px-3 py-1.5 text-right">${fmt(m.screened)}</td>
+                <td class="px-3 py-1.5 text-right font-semibold">${fmt(m.enrolled)}</td>
+                <td class="px-3 py-1.5 text-right">${rate(m.enrolled, m.screened)}</td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>`;
     }
   }
 
