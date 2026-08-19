@@ -180,11 +180,24 @@
     return x.toLocaleString(undefined, { maximumFractionDigits: 1 });
   }
 
-  function rate(a, b) {
+  /** Conversion rate as percentage. Funnel steps (E/S, S/Sched) cap at 100%. */
+  function rate(a, b, { cap = true } = {}) {
     const x = Number(a);
     const y = Number(b);
-    if (!y || Number.isNaN(x) || Number.isNaN(y)) return '—';
-    return `${((x / y) * 100).toFixed(1)}%`;
+    if (!y || Number.isNaN(x) || Number.isNaN(y) || y <= 0) return '—';
+    let pct = (x / y) * 100;
+    if (cap) pct = Math.min(100, Math.max(0, pct));
+    return `${pct.toFixed(1)}%`;
+  }
+
+  /** Numeric funnel rate for charts (0–100). */
+  function ratePct(a, b, { cap = true } = {}) {
+    const x = Number(a);
+    const y = Number(b);
+    if (!y || Number.isNaN(x) || Number.isNaN(y) || y <= 0) return null;
+    let pct = (x / y) * 100;
+    if (cap) pct = Math.min(100, Math.max(0, pct));
+    return pct;
   }
 
   function num(v) {
@@ -341,7 +354,7 @@
                 <td class="px-2 py-1.5 text-right">${fmt(o.scheduled)}</td>
                 <td class="px-2 py-1.5 text-right">${fmt(o.screened)}</td>
                 <td class="px-2 py-1.5 text-right font-semibold">${fmt(o.enrolled)}</td>
-                <td class="px-2 py-1.5 text-right">${rate(o.scheduled, o.targetScheduled)}</td>
+                <td class="px-2 py-1.5 text-right">${rate(o.scheduled, o.targetScheduled, { cap: false })}</td>
                 <td class="px-2 py-1.5 text-right">${rate(o.screened, o.scheduled)}</td>
                 <td class="px-2 py-1.5 text-right">${rate(o.enrolled, o.screened)}</td>
               </tr>`
@@ -354,7 +367,7 @@
               <td class="px-2 py-2 text-right">${fmt(totals.scheduled)}</td>
               <td class="px-2 py-2 text-right">${fmt(totals.screened)}</td>
               <td class="px-2 py-2 text-right">${fmt(totals.enrolled)}</td>
-              <td class="px-2 py-2 text-right">${rate(totals.scheduled, totals.targetScheduled)}</td>
+              <td class="px-2 py-2 text-right">${rate(totals.scheduled, totals.targetScheduled, { cap: false })}</td>
               <td class="px-2 py-2 text-right">${rate(totals.screened, totals.scheduled)}</td>
               <td class="px-2 py-2 text-right">${rate(totals.enrolled, totals.screened)}</td>
             </tr>
@@ -791,7 +804,7 @@
           <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Scheduled</div><div class="font-semibold">${fmt(t.scheduled || m.scheduled)}</div></div>
           <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Screened</div><div class="font-semibold">${fmt(t.screened || m.screened)}</div></div>
           <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enrolled</div><div class="font-semibold text-indigo-600 dark:text-indigo-300">${fmt(t.enrolled || m.enrolled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Sched / Target</div><div class="font-semibold">${rate(t.scheduled || m.scheduled, t.targetScheduled || m.targetScheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Sched / Target</div><div class="font-semibold">${rate(t.scheduled || m.scheduled, t.targetScheduled || m.targetScheduled, { cap: false })}</div></div>
           <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Screen / Sched</div><div class="font-semibold">${rate(t.screened || m.screened, t.scheduled || m.scheduled)}</div></div>
           <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enroll / Screen</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.screened || m.screened)}</div></div>
           <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enroll / Sched</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.scheduled || m.scheduled)}</div></div>
@@ -1307,8 +1320,8 @@
         // Earliest visit1 / latest LPLV across all rows for this site
         const visits = rows.map((r) => r.visit1Start).filter(Boolean).sort();
         const lplvs = rows.map((r) => r.lplv).filter(Boolean).sort();
-        const avgEnrollRate = t.screened > 0 ? (t.enrolled / t.screened) * 100 : null;
-        const schedRate = t.targetScheduled > 0 ? (t.scheduled / t.targetScheduled) * 100 : null;
+        const avgEnrollRate = ratePct(t.enrolled, t.screened);
+        const schedRate = ratePct(t.scheduled, t.targetScheduled, { cap: false });
         return {
           site: s, rows, t, studyIds,
           piList: [...piSet].join(', '),
@@ -1375,7 +1388,7 @@
           </div>
         </div>`;
       ratesEl.innerHTML = [
-        rateDef('Sched / Target', rate(totals.scheduled, totals.targetScheduled), 'bg-slate-400'),
+        rateDef('Sched / Target', rate(totals.scheduled, totals.targetScheduled, { cap: false }), 'bg-slate-400'),
         rateDef('Median enrolled / site', medianEnrolled, 'bg-indigo-500'),
         rateDef('Sites above avg enrolled', sitesAboveAvg + ' / ' + totalSitesWithData, 'bg-emerald-500'),
         rateDef('Top site share', topSiteShare + ' of total enrolled', 'bg-amber-400'),
@@ -1435,7 +1448,8 @@
                     const vals = [totals.targetScheduled, totals.scheduled, totals.screened, totals.enrolled];
                     const prev = vals[ctx.dataIndex - 1];
                     if (prev == null || prev === 0) return '';
-                    return `${((ctx.parsed.y / prev) * 100).toFixed(1)}% of prev step`;
+                    const stepPct = Math.min(100, Math.max(0, (ctx.parsed.y / prev) * 100));
+                    return `${stepPct.toFixed(1)}% of prev step`;
                   },
                 },
               },
@@ -1469,7 +1483,8 @@
       // Chart 4: screen→enroll rate by site (horizontal bar, top 10 with ≥5 screened)
       const ratedSites = siteRows
         .filter((x) => x.t.screened >= 5)
-        .map((x) => ({ name: x.site.name, rate: (x.t.enrolled / x.t.screened) * 100 }))
+        .map((x) => ({ name: x.site.name, rate: ratePct(x.t.enrolled, x.t.screened) }))
+        .filter((x) => x.rate != null)
         .sort((a, b) => b.rate - a.rate)
         .slice(0, 10);
       const ctxRate = document.getElementById('legacy-dash-chart-enroll-rate');
