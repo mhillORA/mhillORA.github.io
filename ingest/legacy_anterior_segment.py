@@ -438,7 +438,7 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
     existing_sites = {}
     for item in sites_c.query_items(
         query=(
-            "SELECT c.id, c.status, c.notes, c.linkedArtemisSiteId, c.siteCode, "
+            "SELECT c.id, c.name, c.status, c.notes, c.linkedArtemisSiteId, c.siteCode, "
             "c.relationshipPreference, c.advantages, c.disadvantages, c.relationshipNotes, c.createdAt FROM c"
         ),
         enable_cross_partition_query=True,
@@ -501,6 +501,7 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
         prev = existing_sites.get(doc["id"])
         if prev:
             for k in (
+                "name",
                 "status",
                 "notes",
                 "siteCode",

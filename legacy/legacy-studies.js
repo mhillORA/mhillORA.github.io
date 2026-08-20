@@ -11,6 +11,8 @@
     selectedStudyId: null,
     selectedSiteId: null,
     reportMode: 'bySite', // bySite | byStudy — bySite is ~50 rows, not ~700
+    studySort: 'name-asc',
+    siteSort: 'name-asc',
   };
 
   function apiBase() {
@@ -171,6 +173,33 @@
   async function refreshArtemisLegacyIndex(artemisSites) {
     await ensureLegacySitesForMatching();
     return rebuildArtemisLegacyIndex(artemisSites);
+  }
+
+  function sortLegacyRows(rows, sortKey, nameFn, enrolledFn) {
+    const list = Array.isArray(rows) ? rows.slice() : [];
+    const nameOf = nameFn || ((r) => r.name || r.title || '');
+    const enrollOf = enrolledFn || ((r) => num(r.metrics?.enrolled));
+    const key = sortKey || 'name-asc';
+    if (key === 'name-desc') {
+      list.sort((a, b) => String(nameOf(b)).localeCompare(String(nameOf(a)), undefined, { sensitivity: 'base' }));
+    } else if (key === 'enrolled') {
+      list.sort((a, b) => enrollOf(b) - enrollOf(a) || String(nameOf(a)).localeCompare(String(nameOf(b)), undefined, { sensitivity: 'base' }));
+    } else {
+      // name-asc (default)
+      list.sort((a, b) => String(nameOf(a)).localeCompare(String(nameOf(b)), undefined, { sensitivity: 'base' }));
+    }
+    return list;
+  }
+
+  function sortSelectHtml(id, current) {
+    const opts = [
+      ['name-asc', 'A → Z'],
+      ['name-desc', 'Z → A'],
+      ['enrolled', 'Most enrolled'],
+    ];
+    return `<select id="${id}" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Sort">
+      ${opts.map(([v, label]) => `<option value="${v}" ${current === v ? 'selected' : ''}>${label}</option>`).join('')}
+    </select>`;
   }
 
   function fmt(n) {
@@ -453,6 +482,11 @@
             </p>
           </div>
           <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+            <select id="legacy-study-sort" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Sort studies">
+              <option value="name-asc" selected>A → Z</option>
+              <option value="name-desc">Z → A</option>
+              <option value="enrolled">Most enrolled</option>
+            </select>
             <input id="legacy-study-search" type="search" placeholder="Search studies…"
               class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-64 min-h-[44px]" />
             <button id="legacy-studies-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 min-h-[44px] shrink-0">Refresh</button>
@@ -518,6 +552,11 @@
             </p>
           </div>
           <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2 w-full">
+            <select id="legacy-site-sort" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Sort sites">
+              <option value="name-asc" selected>A → Z</option>
+              <option value="name-desc">Z → A</option>
+              <option value="enrolled">Most enrolled</option>
+            </select>
             <select id="legacy-site-pref-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]">
               <option value="">All preferences</option>
               <option value="prefer">Prefer</option>
@@ -620,18 +659,22 @@
 
     const qq = q.trim().toLowerCase();
     const pf = (prefFilter || '').toLowerCase();
-    const rows = sites
-      .filter((s) => {
-        if (pf === 'unset') {
-          if (s.relationshipPreference) return false;
-        } else if (pf && (s.relationshipPreference || '') !== pf) {
-          return false;
-        }
-        if (!qq) return true;
-        const blob = `${s.name} ${s.siteCode || ''} ${s.advantages || ''} ${s.disadvantages || ''} ${s.relationshipNotes || ''}`.toLowerCase();
-        return blob.includes(qq);
-      })
-      .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled));
+    const filtered = sites.filter((s) => {
+      if (pf === 'unset') {
+        if (s.relationshipPreference) return false;
+      } else if (pf && (s.relationshipPreference || '') !== pf) {
+        return false;
+      }
+      if (!qq) return true;
+      const blob = `${s.name} ${s.siteCode || ''} ${s.advantages || ''} ${s.disadvantages || ''} ${s.relationshipNotes || ''}`.toLowerCase();
+      return blob.includes(qq);
+    });
+    const rows = sortLegacyRows(
+      filtered,
+      state.siteSort || document.getElementById('legacy-site-sort')?.value || 'name-asc',
+      (s) => s.name || '',
+      (s) => num(s.metrics?.enrolled)
+    );
 
     siteSummaryCards(summary, sites);
 
@@ -789,14 +832,25 @@
         <div class="flex flex-col gap-3">
           <div>
             <button type="button" id="legacy-back-sites" class="${TAP_BACK}">← All legacy sites</button>
-            <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1">${escapeHtml(site.name)}</h3>
+            <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1" id="legacy-site-heading">${escapeHtml(site.name)}</h3>
             <p class="text-sm text-gray-500 flex flex-wrap items-center gap-2 mt-1">
               <span class="font-mono text-xs">${escapeHtml(site.siteCode || site.id)}</span>
               ${preferenceBadge(site.relationshipPreference)}
               <span>· ${studyIds.length} studies · ${outcomes.length} rows · ${pis.length} PI(s)</span>
             </p>
           </div>
-          <button type="button" id="legacy-save-site" class="${TAP_BTN} w-full sm:w-auto">Save relationship</button>
+          <button type="button" id="legacy-save-site" class="${TAP_BTN} w-full sm:w-auto">Save site</button>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <label class="text-sm sm:col-span-2">Site name
+            <input id="legacy-site-name" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
+              value="${escapeHtml(site.name || '')}" required />
+          </label>
+          <label class="text-sm">Site code
+            <input id="legacy-site-code" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px] font-mono"
+              value="${escapeHtml(site.siteCode || '')}" placeholder="Optional short code" />
+          </label>
         </div>
 
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-sm">
@@ -917,7 +971,14 @@
     });
 
     document.getElementById('legacy-save-site')?.addEventListener('click', async () => {
+      const nameVal = document.getElementById('legacy-site-name')?.value.trim();
+      if (!nameVal) {
+        alert('Site name is required');
+        return;
+      }
       const payload = {
+        name: nameVal,
+        siteCode: document.getElementById('legacy-site-code')?.value.trim() || null,
         relationshipPreference: document.getElementById('legacy-site-pref').value || null,
         advantages: document.getElementById('legacy-site-advantages').value.trim() || null,
         disadvantages: document.getElementById('legacy-site-disadvantages').value.trim() || null,
@@ -932,6 +993,8 @@
         const idx = state.sites.findIndex((s) => s.id === site.id);
         if (idx >= 0) state.sites[idx] = { ...state.sites[idx], ...updated };
         else state.sites.push(updated);
+        artemisLegacyIndex = null; // force rematch after rename
+        if (global.showNotification) global.showNotification('Legacy site saved', 'success');
         openSiteDetail(site.id);
       } catch (e) {
         alert('Save failed: ' + e.message);
@@ -1074,13 +1137,16 @@
       status.textContent = `Loaded ${state.studies.length} studies · ${state.sites.length || '—'} unique sites · ${state.outcomes.length} outcome rows (site×study lines)`;
     }
     const qq = q.trim().toLowerCase();
-    const rows = state.studies
-      .filter((s) => {
+    const rows = sortLegacyRows(
+      state.studies.filter((s) => {
         if (!qq) return true;
         const blob = `${s.name} ${s.title} ${s.oraProjectNumber || ''} ${s.therapeuticArea || ''} ${s.indication || ''}`.toLowerCase();
         return blob.includes(qq);
-      })
-      .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled));
+      }),
+      state.studySort || document.getElementById('legacy-study-sort')?.value || 'name-asc',
+      (s) => s.name || s.title || '',
+      (s) => num(s.metrics?.enrolled)
+    );
 
     if (summary) summaryCards(summary, state.studies);
 
@@ -2121,6 +2187,10 @@
     document.getElementById('legacy-study-search')?.addEventListener('input', (e) => {
       renderStudiesTable(e.target.value);
     });
+    document.getElementById('legacy-study-sort')?.addEventListener('change', (e) => {
+      state.studySort = e.target.value || 'name-asc';
+      renderStudiesTable(document.getElementById('legacy-study-search')?.value || '');
+    });
     document.getElementById('legacy-studies-refresh')?.addEventListener('click', async () => {
       state.loaded = false;
       await ensureLoaded(true);
@@ -2138,6 +2208,10 @@
     rerender();
     document.getElementById('legacy-site-search')?.addEventListener('input', rerender);
     document.getElementById('legacy-site-pref-filter')?.addEventListener('change', rerender);
+    document.getElementById('legacy-site-sort')?.addEventListener('change', (e) => {
+      state.siteSort = e.target.value || 'name-asc';
+      rerender();
+    });
     document.getElementById('legacy-sites-refresh')?.addEventListener('click', async () => {
       state.loaded = false;
       await ensureLoaded(true);

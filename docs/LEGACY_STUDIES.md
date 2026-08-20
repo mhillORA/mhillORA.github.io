@@ -23,8 +23,8 @@ Site–study outcomes from **Anterior Segment Overview.xlsx**, stored in the sam
 
 ## UI
 
-- **Legacy Studies** — list → open study → site table + edit study name / ORA project number / TA/metadata  
-- **Legacy Sites** — list → open site → overall funnel metrics, studies at site, relationship preference / advantages / disadvantages  
+- **Legacy Studies** — list → open study → site table + edit study name / ORA project number / TA/metadata; sort A→Z / Z→A / enrolled  
+- **Legacy Sites** — list → open site → edit site name / code, overall funnel metrics, studies at site, relationship preference / advantages / disadvantages; sort A→Z / Z→A / enrolled  
 - **Legacy Reporting** — KPIs, charts, by-study / by-site tables, CSV export  
 - **Dashboard** — live ops charts + legacy overview panel at bottom  
 
@@ -38,4 +38,4 @@ python ingest/legacy_anterior_segment.py "C:\path\to\Anterior Segment Overview.x
 ```
 
 Uses `COSMOS_ENDPOINT` / `COSMOS_KEY` / `DATABASE_ID` from env, or falls back to `HoldAll\CHAOS\azure-api-fixed\local.settings.json`.  
-Re-ingest **preserves** manually edited study `name`, `title`, `oraProjectNumber`, `sponsor`, `phase`, `status`, `notes`, and site `relationshipPreference`, `advantages`, `disadvantages`, `relationshipNotes`, `notes`. **`therapeuticArea` is kept in sync with `indication`** (TA = Indication).
+Re-ingest **preserves** manually edited study `name`, `title`, `oraProjectNumber`, `sponsor`, `phase`, `status`, `notes`, and site `name`, `siteCode`, `relationshipPreference`, `advantages`, `disadvantages`, `relationshipNotes`, `notes`. **`therapeuticArea` is kept in sync with `indication`** (TA = Indication).
