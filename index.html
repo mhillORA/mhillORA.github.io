@@ -1443,6 +1443,7 @@
                     case 'reporting':
                         mainContentArea.innerHTML = getReportingHTML();
                         renderReportTables();
+                        mountFeasibilityReport();
                         break;
                     case 'legacy-reporting':
                         mainContentArea.innerHTML = (window.ArtemisLegacy && window.ArtemisLegacy.getLegacyReportingHTML()) || '<p>Legacy module failed to load.</p>';
@@ -2167,6 +2168,308 @@
                     if (!grouped.has(key)) grouped.set(key, r);
                 });
             return Array.from(grouped.values());
+        };
+
+        let feasibilityReportSurveyId = null;
+        let feasibilityReportRole = 'all';
+
+        const csvEscapeCell = (value) => {
+            const s = String(value ?? '');
+            if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+            return s;
+        };
+
+        const truncateLabel = (label, max = 28) => {
+            const s = String(label || '').trim();
+            if (s.length <= max) return s;
+            return `${s.slice(0, max - 1)}…`;
+        };
+
+        const findAnswerForQuestion = (response, question) => {
+            const answers = asSurveyList(response?.answers);
+            const qid = question?.id;
+            const a = answers.find(x => x && (x.questionId === qid || String(x.questionId) === String(qid)
+                || (x.label && question?.label && String(x.label).trim() === String(question.label).trim())));
+            if (!a) return { skipped: true, value: '' };
+            if (a.skipped && (a.value == null || String(a.value).trim() === '')) return { skipped: true, value: '' };
+            const value = String(a.value ?? '').trim();
+            return { skipped: !value, value };
+        };
+
+        const buildFeasibilityQuestionReport = (surveyId, targetRole = 'all') => {
+            const def = (allSiteSurveyDefinitions || []).find(d => d && d.id === surveyId) || null;
+            const questions = asSurveyList(def?.questions);
+            const roleFilter = String(targetRole || 'all').trim().toLowerCase();
+
+            let responses = (allSiteSurveyResponses || []).filter(r =>
+                r && !r._archived && r.surveyId === surveyId
+            );
+            if (roleFilter && roleFilter !== 'all') {
+                responses = responses.filter(r => String(r.targetRole || '').toLowerCase() === roleFilter);
+            }
+
+            const bySite = new Map();
+            responses
+                .slice()
+                .sort((a, b) => String(b.submittedAt || b.createdAt || '').localeCompare(String(a.submittedAt || a.createdAt || '')))
+                .forEach(r => {
+                    if (!r.siteId) return;
+                    if (!bySite.has(r.siteId)) bySite.set(r.siteId, r);
+                });
+
+            const siteRows = Array.from(bySite.entries()).map(([siteId, response]) => {
+                const site = (allSites || []).find(s => s && s.id === siteId);
+                return {
+                    siteId,
+                    siteName: site?.name || siteId,
+                    response,
+                    when: response.submittedAt || response.createdAt || ''
+                };
+            }).sort((a, b) => String(a.siteName).localeCompare(String(b.siteName)));
+
+            const questionStats = questions.map(q => {
+                const counts = new Map();
+                let answered = 0;
+                let skipped = 0;
+                const samples = [];
+                siteRows.forEach(({ siteName, response }) => {
+                    const { skipped: isSkipped, value } = findAnswerForQuestion(response, q);
+                    if (isSkipped || !value) {
+                        skipped += 1;
+                        return;
+                    }
+                    answered += 1;
+                    counts.set(value, (counts.get(value) || 0) + 1);
+                    samples.push({ siteName, value, responseId: response.id });
+                });
+                const distribution = Array.from(counts.entries())
+                    .map(([value, count]) => ({
+                        value,
+                        count,
+                        pct: answered ? Math.round((count / answered) * 100) : 0
+                    }))
+                    .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
+                const isLongText = String(q.type || '').toLowerCase() === 'textarea'
+                    || distribution.some(d => d.value.length > 80)
+                    || distribution.length > 12;
+                return { question: q, answered, skipped, distribution, samples, isLongText };
+            });
+
+            return { def, questions, siteRows, questionStats };
+        };
+
+        const renderFeasibilityReportBodyHtml = (report) => {
+            if (!report?.def) {
+                return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">Select a survey definition to report on feasibility answers.</div>`;
+            }
+            if (!report.questions.length) {
+                return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">This survey has no questions.</div>`;
+            }
+            if (!report.siteRows.length) {
+                return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No responses yet for this survey${feasibilityReportRole !== 'all' ? ` (${escapeHtml(formatSiteSurveyRoleLabel(feasibilityReportRole))})` : ''}.</div>`;
+            }
+
+            const distHtml = report.questionStats.map((stat, idx) => {
+                const q = stat.question;
+                const label = q.label || q.id || `Question ${idx + 1}`;
+                let body;
+                if (stat.answered === 0) {
+                    body = `<div class="text-xs text-gray-500 dark:text-gray-400">No answers (${stat.skipped} blank/skipped).</div>`;
+                } else if (stat.isLongText) {
+                    body = `
+                        <div class="text-xs text-gray-600 dark:text-gray-300 mb-2">${stat.answered} free-text answer${stat.answered === 1 ? '' : 's'} · ${stat.skipped} blank</div>
+                        <details class="text-xs">
+                            <summary class="cursor-pointer text-indigo-600 dark:text-indigo-400 hover:underline">Show site answers</summary>
+                            <ul class="mt-2 space-y-2 max-h-48 overflow-y-auto">
+                                ${stat.samples.map(s => `
+                                    <li class="border-b border-gray-100 dark:border-gray-700 pb-1">
+                                        <button type="button" class="view-site-survey-response-btn font-medium text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(s.responseId)}">${escapeHtml(s.siteName)}</button>
+                                        <div class="text-gray-700 dark:text-gray-300 mt-0.5 whitespace-pre-wrap">${escapeHtml(s.value)}</div>
+                                    </li>`).join('')}
+                            </ul>
+                        </details>`;
+                } else {
+                    body = `
+                        <div class="flex flex-wrap gap-2">
+                            ${stat.distribution.map(d => `
+                                <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100" title="${escapeHtml(d.value)}">
+                                    <span class="max-w-[14rem] truncate">${escapeHtml(d.value)}</span>
+                                    <span class="font-bold text-indigo-600 dark:text-indigo-300">${d.count}</span>
+                                    <span class="text-gray-500 dark:text-gray-400">${d.pct}%</span>
+                                </span>`).join('')}
+                        </div>
+                        <div class="text-[11px] text-gray-500 dark:text-gray-400 mt-2">${stat.answered} answered · ${stat.skipped} blank/skipped</div>`;
+                }
+                return `
+                    <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900/30">
+                        <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-2">${escapeHtml(label)}</div>
+                        ${body}
+                    </div>`;
+            }).join('');
+
+            const matrixHead = `
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase sticky left-0 bg-gray-50 dark:bg-gray-700 z-10">Site</th>
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
+                ${report.questions.map(q => `
+                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap" title="${escapeHtml(q.label || q.id || '')}">${escapeHtml(truncateLabel(q.label || q.id || ''))}</th>`).join('')}`;
+
+            const matrixBody = report.siteRows.map(row => {
+                const when = row.when ? new Date(row.when).toLocaleDateString() : '—';
+                const cells = report.questions.map(q => {
+                    const { skipped, value } = findAnswerForQuestion(row.response, q);
+                    const display = skipped || !value ? '—' : (value.length > 60 ? `${value.slice(0, 59)}…` : value);
+                    return `<td class="px-3 py-2 text-xs text-gray-700 dark:text-gray-300 max-w-[12rem] truncate" title="${escapeHtml(value || '')}">${escapeHtml(display)}</td>`;
+                }).join('');
+                return `
+                    <tr class="hover:bg-gray-50 dark:hover:bg-gray-700/40">
+                        <td class="px-3 py-2 text-sm font-medium text-gray-900 dark:text-gray-100 sticky left-0 bg-white dark:bg-gray-800 z-10 whitespace-nowrap">
+                            <button type="button" class="view-site-details-btn hover:underline" data-site-id="${escapeHtml(row.siteId)}">${escapeHtml(row.siteName)}</button>
+                            <div class="text-[10px] text-gray-400 font-normal">${escapeHtml(when)}</div>
+                        </td>
+                        <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">
+                            <button type="button" class="view-site-survey-response-btn text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(row.response.id)}">${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole))}</button>
+                        </td>
+                        ${cells}
+                    </tr>`;
+            }).join('');
+
+            return `
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
+                    <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 text-center">
+                        <div class="text-xs text-gray-500 dark:text-gray-400">Questions</div>
+                        <div class="text-xl font-bold text-gray-900 dark:text-gray-100">${report.questions.length}</div>
+                    </div>
+                    <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 text-center">
+                        <div class="text-xs text-gray-500 dark:text-gray-400">Sites responded</div>
+                        <div class="text-xl font-bold text-gray-900 dark:text-gray-100">${report.siteRows.length}</div>
+                    </div>
+                    <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 text-center">
+                        <div class="text-xs text-gray-500 dark:text-gray-400">Survey</div>
+                        <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate" title="${escapeHtml(report.def.title || report.def.id)}">${escapeHtml(report.def.title || report.def.id)}</div>
+                    </div>
+                </div>
+                <h4 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Answer distributions</h4>
+                <div class="space-y-3 mb-6">${distHtml}</div>
+                <h4 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Site × question matrix</h4>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">Latest response per site. Use Export CSV for full cell values.</p>
+                <div class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
+                    <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                        <thead class="bg-gray-50 dark:bg-gray-700"><tr>${matrixHead}</tr></thead>
+                        <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">${matrixBody}</tbody>
+                    </table>
+                </div>`;
+        };
+
+        const downloadCsvText = (filename, csvText) => {
+            const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = filename;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        };
+
+        const exportFeasibilitySurveyCsv = ({ surveyId, mode = 'wide', targetRole = 'all' } = {}) => {
+            try {
+                const sid = surveyId || feasibilityReportSurveyId;
+                if (!sid) {
+                    showNotification('Select a survey first.', 'info');
+                    return;
+                }
+                const report = buildFeasibilityQuestionReport(sid, targetRole || feasibilityReportRole);
+                if (!report.def) {
+                    showNotification('Survey definition not found.', 'error');
+                    return;
+                }
+                if (!report.siteRows.length) {
+                    showNotification('No responses to export.', 'info');
+                    return;
+                }
+                const safeTitle = String(report.def.title || sid).replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
+                const lines = [];
+                if (mode === 'long') {
+                    lines.push(['Site', 'SiteId', 'Role', 'SubmittedAt', 'Question', 'Answer'].map(csvEscapeCell).join(','));
+                    report.siteRows.forEach(row => {
+                        report.questions.forEach(q => {
+                            const { value } = findAnswerForQuestion(row.response, q);
+                            lines.push([
+                                row.siteName,
+                                row.siteId,
+                                formatSiteSurveyRoleLabel(row.response.targetRole),
+                                row.when || '',
+                                q.label || q.id || '',
+                                value
+                            ].map(csvEscapeCell).join(','));
+                        });
+                    });
+                    downloadCsvText(`feasibility_${safeTitle}_long.csv`, lines.join('\n'));
+                } else {
+                    const headers = ['Site', 'SiteId', 'Role', 'SubmittedAt', ...report.questions.map(q => q.label || q.id || '')];
+                    lines.push(headers.map(csvEscapeCell).join(','));
+                    report.siteRows.forEach(row => {
+                        const cells = report.questions.map(q => findAnswerForQuestion(row.response, q).value);
+                        lines.push([
+                            row.siteName,
+                            row.siteId,
+                            formatSiteSurveyRoleLabel(row.response.targetRole),
+                            row.when || '',
+                            ...cells
+                        ].map(csvEscapeCell).join(','));
+                    });
+                    downloadCsvText(`feasibility_${safeTitle}_matrix.csv`, lines.join('\n'));
+                }
+                showNotification('Feasibility CSV downloaded.', 'success');
+            } catch (err) {
+                console.error(err);
+                showNotification('Failed to export feasibility CSV.', 'error');
+            }
+        };
+
+        const refreshFeasibilityReportRoot = () => {
+            const root = document.getElementById('feasibility-report-root');
+            if (!root) return;
+            const surveyId = feasibilityReportSurveyId
+                || (allSiteSurveyDefinitions || []).find(d => d.id === 'survey-general-feasibility')?.id
+                || (allSiteSurveyDefinitions || [])[0]?.id
+                || null;
+            feasibilityReportSurveyId = surveyId;
+            const report = surveyId
+                ? buildFeasibilityQuestionReport(surveyId, feasibilityReportRole)
+                : null;
+            root.innerHTML = renderFeasibilityReportBodyHtml(report);
+        };
+
+        const mountFeasibilityReport = () => {
+            const surveySel = document.getElementById('feasibility-survey-select');
+            const roleSel = document.getElementById('feasibility-role-select');
+            if (surveySel) {
+                const preferred = feasibilityReportSurveyId
+                    || (asSurveyList(allSiteSurveyDefinitions).some(d => d.id === 'survey-general-feasibility')
+                        ? 'survey-general-feasibility'
+                        : (allSiteSurveyDefinitions?.[0]?.id || ''));
+                if (preferred && [...surveySel.options].some(o => o.value === preferred)) {
+                    surveySel.value = preferred;
+                }
+                feasibilityReportSurveyId = surveySel.value || null;
+                if (!surveySel.dataset.bound) {
+                    surveySel.dataset.bound = '1';
+                    surveySel.addEventListener('change', () => {
+                        feasibilityReportSurveyId = surveySel.value || null;
+                        refreshFeasibilityReportRoot();
+                    });
+                }
+            }
+            if (roleSel) {
+                roleSel.value = feasibilityReportRole || 'all';
+                if (!roleSel.dataset.bound) {
+                    roleSel.dataset.bound = '1';
+                    roleSel.addEventListener('change', () => {
+                        feasibilityReportRole = roleSel.value || 'all';
+                        refreshFeasibilityReportRoot();
+                    });
+                }
+            }
+            refreshFeasibilityReportRoot();
         };
 
         const siteSurveyStatusHtml = (siteId) => {
@@ -3421,6 +3724,38 @@
                                      }).join('')}
                                  </tbody>
                              </table>
+                         </div>
+                     </div>
+
+                     <!-- Feasibility Questions Report -->
+                     <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md">
+                         <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+                             <div>
+                                 <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Feasibility Questions</h3>
+                                 <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Answer distributions and site × question matrix. Defaults to General Feasibility. Latest response per site.</p>
+                             </div>
+                             <div class="flex flex-wrap items-end gap-2">
+                                 <label class="block text-xs text-gray-500 dark:text-gray-400">Survey
+                                     <select id="feasibility-survey-select" class="mt-1 block w-full min-w-[14rem] p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                         ${(allSiteSurveyDefinitions || []).slice().sort((a, b) => String(a.title || '').localeCompare(String(b.title || ''))).map(d => {
+                                             const selected = (d.id === 'survey-general-feasibility') ? ' selected' : '';
+                                             return `<option value="${escapeHtml(d.id)}"${selected}>${escapeHtml(d.title || d.id)}</option>`;
+                                         }).join('') || '<option value="">No surveys</option>'}
+                                     </select>
+                                 </label>
+                                 <label class="block text-xs text-gray-500 dark:text-gray-400">Role
+                                     <select id="feasibility-role-select" class="mt-1 block w-full min-w-[8rem] p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                         <option value="all">All</option>
+                                         <option value="pi">PI</option>
+                                         <option value="coordinator">Coordinator</option>
+                                     </select>
+                                 </label>
+                                 <button type="button" id="feasibility-export-wide-btn" class="px-3 py-2 rounded-md bg-indigo-600 text-white text-sm hover:bg-indigo-700">Export CSV</button>
+                                 <button type="button" id="feasibility-export-long-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">Export long CSV</button>
+                             </div>
+                         </div>
+                         <div id="feasibility-report-root" class="mt-6">
+                             <div class="text-sm text-gray-500 dark:text-gray-400 py-4 text-center">Loading feasibility report…</div>
                          </div>
                      </div>
 
@@ -8317,6 +8652,24 @@
             }
             if (e.target.id === 'export-surveys-btn') {
                 exportSurveysToCSV();
+            }
+            if (e.target.id === 'feasibility-export-wide-btn') {
+                const surveySel = document.getElementById('feasibility-survey-select');
+                const roleSel = document.getElementById('feasibility-role-select');
+                exportFeasibilitySurveyCsv({
+                    surveyId: surveySel?.value || feasibilityReportSurveyId,
+                    mode: 'wide',
+                    targetRole: roleSel?.value || feasibilityReportRole
+                });
+            }
+            if (e.target.id === 'feasibility-export-long-btn') {
+                const surveySel = document.getElementById('feasibility-survey-select');
+                const roleSel = document.getElementById('feasibility-role-select');
+                exportFeasibilitySurveyCsv({
+                    surveyId: surveySel?.value || feasibilityReportSurveyId,
+                    mode: 'long',
+                    targetRole: roleSel?.value || feasibilityReportRole
+                });
             }
             if (e.target.id === 'generate-dashboard-btn') {
                 renderDashboardCharts();
