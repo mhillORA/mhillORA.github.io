@@ -1077,7 +1077,7 @@
     const rows = state.studies
       .filter((s) => {
         if (!qq) return true;
-        const blob = `${s.name} ${s.title} ${s.therapeuticArea || ''} ${s.indication || ''}`.toLowerCase();
+        const blob = `${s.name} ${s.title} ${s.oraProjectNumber || ''} ${s.therapeuticArea || ''} ${s.indication || ''}`.toLowerCase();
         return blob.includes(qq);
       })
       .sort((a, b) => num(b.metrics?.enrolled) - num(a.metrics?.enrolled));
@@ -1091,7 +1091,10 @@
         return `<button type="button" data-legacy-open="${escapeHtml(s.id)}"
           class="w-full text-left p-4 border-b dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-700/40 active:bg-indigo-50 dark:active:bg-indigo-900/20 transition-colors">
           <div class="flex items-start justify-between gap-2 mb-1">
-            <div class="font-semibold text-gray-900 dark:text-white truncate">${escapeHtml(s.name || s.title)}</div>
+            <div class="min-w-0">
+              <div class="font-semibold text-gray-900 dark:text-white truncate">${escapeHtml(s.name || s.title)}</div>
+              ${s.oraProjectNumber ? `<div class="text-[11px] font-mono text-indigo-600 dark:text-indigo-300 mt-0.5">${escapeHtml(s.oraProjectNumber)}</div>` : ''}
+            </div>
             <span class="text-indigo-600 dark:text-indigo-300 text-sm font-medium shrink-0">Open →</span>
           </div>
           <div class="text-xs text-gray-500 mb-3 truncate">${escapeHtml(s.therapeuticArea || s.indication || 'No TA/indication')}</div>
@@ -1112,6 +1115,7 @@
         const siteCount = state.outcomes.filter((o) => o.studyId === s.id).length;
         return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
           <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(s.name || s.title)}</td>
+          <td class="px-3 py-2 font-mono text-xs">${escapeHtml(s.oraProjectNumber || '—')}</td>
           <td class="px-3 py-2">${escapeHtml(s.therapeuticArea || '—')}</td>
           <td class="px-3 py-2">${escapeHtml(s.indication || '—')}</td>
           <td class="px-3 py-2 text-right">${fmt(m.nSites ?? siteCount)}</td>
@@ -1136,6 +1140,7 @@
           <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
             <tr>
               <th class="px-3 py-2">Study</th>
+              <th class="px-3 py-2">ORA #</th>
               <th class="px-3 py-2">Therapeutic Area</th>
               <th class="px-3 py-2">Indication</th>
               <th class="px-3 py-2 text-right">Sites</th>
@@ -1178,8 +1183,9 @@
         <div class="flex flex-col gap-3">
           <div>
             <button type="button" id="legacy-back-list" class="${TAP_BACK}">← All legacy studies</button>
-            <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1">${escapeHtml(study.name)}</h3>
+            <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1" id="legacy-study-heading">${escapeHtml(study.name || study.title)}</h3>
             <p class="text-sm text-gray-500">
+              ${study.oraProjectNumber ? `ORA ${escapeHtml(study.oraProjectNumber)} · ` : ''}
               Visit 1 ${escapeHtml(m.visit1StartMin || totals.visitStarts.sort()[0] || '—')}
               → ${escapeHtml(m.visit1StartMax || totals.visitStarts.sort().slice(-1)[0] || '—')}
               · LPLV ${escapeHtml(m.lplvMin || '—')} → ${escapeHtml(m.lplvMax || '—')}
@@ -1189,6 +1195,14 @@
           <button type="button" id="legacy-save-meta" class="${TAP_BTN} w-full sm:w-auto">Save metadata</button>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+          <label class="text-sm sm:col-span-2">Study name
+            <input id="legacy-meta-name" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
+              value="${escapeHtml(study.name || study.title || '')}" required />
+          </label>
+          <label class="text-sm">ORA project number
+            <input id="legacy-meta-ora" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
+              value="${escapeHtml(study.oraProjectNumber || '')}" placeholder="e.g. ORA-1234 or project #" />
+          </label>
           <label class="text-sm">Therapeutic Area
             <input id="legacy-meta-ta" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
               value="${escapeHtml(study.therapeuticArea || study.indication || '')}" placeholder="Same as Indication" />
@@ -1245,7 +1259,15 @@
     });
 
     document.getElementById('legacy-save-meta')?.addEventListener('click', async () => {
+      const nameVal = document.getElementById('legacy-meta-name').value.trim();
+      if (!nameVal) {
+        alert('Study name is required');
+        return;
+      }
       const payload = {
+        name: nameVal,
+        title: nameVal,
+        oraProjectNumber: document.getElementById('legacy-meta-ora').value.trim() || null,
         therapeuticArea:
           document.getElementById('legacy-meta-ta').value.trim() ||
           document.getElementById('legacy-meta-indication').value.trim() ||
@@ -1265,6 +1287,8 @@
         });
         const idx = state.studies.findIndex((s) => s.id === studyId);
         if (idx >= 0) state.studies[idx] = updated;
+        const heading = document.getElementById('legacy-study-heading');
+        if (heading) heading.textContent = updated.name || updated.title || nameVal;
         if (global.showNotification) global.showNotification('Legacy study metadata saved', 'success');
         else alert('Saved');
       } catch (e) {

@@ -104,6 +104,7 @@ function registerLegacyRoutes(app, deps) {
                         type: 'legacyStudy',
                         name,
                         title: body.title || name,
+                        oraProjectNumber: body.oraProjectNumber ?? body.oraId ?? null,
                         therapeuticArea: body.therapeuticArea ?? null,
                         indication: body.indication ?? null,
                         sponsor: body.sponsor ?? null,
@@ -137,12 +138,20 @@ function registerLegacyRoutes(app, deps) {
                     }
                     // Allow editing metadata without clobbering metrics unless provided
                     const editable = [
-                        'name', 'title', 'therapeuticArea', 'indication', 'sponsor',
-                        'phase', 'status', 'notes',
+                        'name', 'title', 'oraProjectNumber', 'therapeuticArea', 'indication',
+                        'sponsor', 'phase', 'status', 'notes',
                     ];
                     const updated = { ...existing };
                     for (const k of editable) {
                         if (body[k] !== undefined) updated[k] = body[k];
+                    }
+                    // Alias: oraId -> oraProjectNumber
+                    if (body.oraId !== undefined && body.oraProjectNumber === undefined) {
+                        updated.oraProjectNumber = body.oraId;
+                    }
+                    // Keep title aligned with name when name is edited
+                    if (body.name !== undefined && body.title === undefined) {
+                        updated.title = body.name;
                     }
                     if (body.metrics && typeof body.metrics === 'object') {
                         updated.metrics = { ...(existing.metrics || {}), ...body.metrics };

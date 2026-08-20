@@ -336,6 +336,7 @@ def build_docs(records, indication_by_study, source_file: str):
                 # In this workbook TA == Indication
                 "therapeuticArea": indication,
                 "indication": indication,
+                "oraProjectNumber": None,
                 "sponsor": None,
                 "phase": None,
                 "status": "Completed",
@@ -425,7 +426,10 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
     # Preserve manually edited study metadata
     existing_meta = {}
     for item in studies_c.query_items(
-        query="SELECT c.id, c.therapeuticArea, c.sponsor, c.phase, c.status, c.notes, c.indication FROM c",
+        query=(
+            "SELECT c.id, c.name, c.title, c.oraProjectNumber, c.therapeuticArea, "
+            "c.sponsor, c.phase, c.status, c.notes, c.indication FROM c"
+        ),
         enable_cross_partition_query=True,
     ):
         existing_meta[item["id"]] = item
@@ -471,7 +475,8 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
     for doc in studies:
         prev = existing_meta.get(doc["id"])
         if prev:
-            for k in ("sponsor", "phase", "status", "notes"):
+            # Preserve manually edited display name / ORA project number / metadata
+            for k in ("name", "title", "oraProjectNumber", "sponsor", "phase", "status", "notes"):
                 if prev.get(k) not in (None, ""):
                     doc[k] = prev[k]
             # Prefer freshly resolved indication; fall back to prior manual value
@@ -487,6 +492,8 @@ def upsert_all(studies, sites, outcomes, dry_run=False):
                 doc["createdAt"] = prev["createdAt"]
         elif doc.get("indication"):
             doc["therapeuticArea"] = doc["indication"]
+        if "oraProjectNumber" not in doc:
+            doc["oraProjectNumber"] = None
         studies_c.upsert_item(doc)
 
     print(f"Upserting {len(sites)} unique legacy sites (not {len(outcomes)} rows)...")
