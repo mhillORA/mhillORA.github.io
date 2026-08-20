@@ -979,6 +979,57 @@
                 });
             }
 
+            privacyHeaders() {
+                const h = {};
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) h['X-Artemis-Operator'] = u.username;
+                } catch (_) {}
+                return h;
+            }
+
+            async privacyExport({ email, siteId } = {}) {
+                const qs = new URLSearchParams();
+                if (email) qs.set('email', email);
+                if (siteId) qs.set('siteId', siteId);
+                return this.request(`/privacy/export?${qs.toString()}`, {
+                    headers: this.privacyHeaders()
+                });
+            }
+
+            async privacyErase({ email, mode = 'redact', confirm = false } = {}) {
+                let operator = 'unknown';
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) operator = u.username;
+                } catch (_) {}
+                return this.request('/privacy/erase', {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({ email, mode, confirm, operator })
+                });
+            }
+
+            async privacyPurgeArchived({ olderThanDays = 365, confirm = false } = {}) {
+                let operator = 'unknown';
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) operator = u.username;
+                } catch (_) {}
+                return this.request('/privacy/retention/purge-archived', {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({ olderThanDays, confirm, operator })
+                });
+            }
+
+            async privacyAudit() {
+                return this.request('/privacy/audit', { headers: this.privacyHeaders() });
+            }
+
             // Site Staff (PI / Coordinator)
             async getSiteStaff() {
                 return this.request('/site-staff');
@@ -2608,6 +2659,29 @@
                             <div id="site-survey-responses-list" class="space-y-2"></div>
                         </div>
                     </div>
+
+                    <div class="rounded-lg border border-violet-200 dark:border-violet-900/50 bg-violet-50/40 dark:bg-violet-950/20 overflow-hidden">
+                        <div class="px-4 py-3 border-b border-violet-200 dark:border-violet-900/40 font-semibold text-violet-900 dark:text-violet-100">Privacy tools (GDPR ops)</div>
+                        <div class="p-4 space-y-4 text-sm">
+                            <p class="text-xs text-gray-600 dark:text-gray-400">Export or erase survey personal data by respondent email. Actions are written to <code class="text-xs">privacy-audit-log</code>. See <code class="text-xs">docs/GDPR_HARDENING.md</code>.</p>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <label class="block">Email
+                                    <input id="privacy-email" type="email" placeholder="pi@example.com" class="mt-1 w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2" />
+                                </label>
+                                <label class="block">Archive retention (days)
+                                    <input id="privacy-retention-days" type="number" min="1" value="365" class="mt-1 w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2" />
+                                </label>
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <button type="button" id="privacy-export-btn" class="px-3 py-2 rounded-md bg-indigo-600 text-white text-sm hover:bg-indigo-700">Export JSON</button>
+                                <button type="button" id="privacy-erase-btn" class="px-3 py-2 rounded-md bg-amber-600 text-white text-sm hover:bg-amber-700">Redact by email</button>
+                                <button type="button" id="privacy-purge-btn" class="px-3 py-2 rounded-md bg-red-700 text-white text-sm hover:bg-red-800">Purge old archives</button>
+                                <button type="button" id="privacy-audit-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm">Refresh audit</button>
+                            </div>
+                            <pre id="privacy-ops-result" class="hidden text-xs bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-md p-3 max-h-48 overflow-auto whitespace-pre-wrap"></pre>
+                            <div id="privacy-audit-list" class="text-xs text-gray-600 dark:text-gray-400 space-y-1"></div>
+                        </div>
+                    </div>
                 </div>
             `;
         };
@@ -2715,6 +2789,103 @@
                     }
                 });
             });
+
+            const privacyResult = document.getElementById('privacy-ops-result');
+            const showPrivacyResult = (obj) => {
+                if (!privacyResult) return;
+                privacyResult.classList.remove('hidden');
+                privacyResult.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+            };
+            const loadPrivacyAudit = async () => {
+                const list = document.getElementById('privacy-audit-list');
+                if (!list) return;
+                try {
+                    const rows = await apiService.privacyAudit();
+                    const arr = Array.isArray(rows) ? rows : [];
+                    list.innerHTML = arr.length === 0
+                        ? `<div>No privacy audit events yet.</div>`
+                        : arr.slice(0, 20).map(e => `
+                            <div class="border-b border-violet-100 dark:border-violet-900/30 py-1">
+                                <span class="font-medium">${escapeHtml(e.action || '')}</span>
+                                · ${escapeHtml(e.createdAt || '')}
+                                · op ${escapeHtml(e.operator || '')}
+                                ${e.counts ? ` · ${escapeHtml(JSON.stringify(e.counts))}` : ''}
+                            </div>`).join('');
+                } catch (err) {
+                    list.textContent = 'Audit load failed: ' + (err.message || err);
+                }
+            };
+
+            const exportBtn = document.getElementById('privacy-export-btn');
+            if (exportBtn && !exportBtn.dataset.bound) {
+                exportBtn.dataset.bound = '1';
+                exportBtn.addEventListener('click', async () => {
+                    const email = document.getElementById('privacy-email')?.value.trim();
+                    if (!email) {
+                        showNotification('Enter an email to export', 'error');
+                        return;
+                    }
+                    try {
+                        const data = await apiService.privacyExport({ email });
+                        showPrivacyResult(data);
+                        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                        const a = document.createElement('a');
+                        a.href = URL.createObjectURL(blob);
+                        a.download = `artemis-privacy-export-${email.replace(/[^a-z0-9@._-]/gi, '_')}.json`;
+                        a.click();
+                        showNotification('Export ready', 'success');
+                        loadPrivacyAudit();
+                    } catch (err) {
+                        showNotification('Export failed: ' + (err.message || err), 'error');
+                    }
+                });
+            }
+
+            const eraseBtn = document.getElementById('privacy-erase-btn');
+            if (eraseBtn && !eraseBtn.dataset.bound) {
+                eraseBtn.dataset.bound = '1';
+                eraseBtn.addEventListener('click', async () => {
+                    const email = document.getElementById('privacy-email')?.value.trim();
+                    if (!email) {
+                        showNotification('Enter an email to redact', 'error');
+                        return;
+                    }
+                    if (!confirm(`Redact survey PII for ${email}? Answers become [redacted]; email fields cleared.`)) return;
+                    try {
+                        const data = await apiService.privacyErase({ email, mode: 'redact', confirm: true });
+                        showPrivacyResult(data);
+                        showNotification('Redaction complete', 'success');
+                        allSiteSurveyResponses = await apiService.getSiteSurveyResponses().catch(() => allSiteSurveyResponses);
+                        renderCommunications();
+                    } catch (err) {
+                        showNotification('Erase failed: ' + (err.message || err), 'error');
+                    }
+                });
+            }
+
+            const purgeBtn = document.getElementById('privacy-purge-btn');
+            if (purgeBtn && !purgeBtn.dataset.bound) {
+                purgeBtn.dataset.bound = '1';
+                purgeBtn.addEventListener('click', async () => {
+                    const days = parseInt(document.getElementById('privacy-retention-days')?.value || '365', 10);
+                    if (!confirm(`Permanently delete archived survey responses older than ${days} days?`)) return;
+                    try {
+                        const data = await apiService.privacyPurgeArchived({ olderThanDays: days, confirm: true });
+                        showPrivacyResult(data);
+                        showNotification(`Purged ${data.deleted || 0} archived responses`, 'success');
+                        loadPrivacyAudit();
+                    } catch (err) {
+                        showNotification('Purge failed: ' + (err.message || err), 'error');
+                    }
+                });
+            }
+
+            const auditBtn = document.getElementById('privacy-audit-btn');
+            if (auditBtn && !auditBtn.dataset.bound) {
+                auditBtn.dataset.bound = '1';
+                auditBtn.addEventListener('click', () => loadPrivacyAudit());
+            }
+            loadPrivacyAudit();
         };
 
         const createSiteSurveyDefinitionModal = (existingDefinition = null) => {

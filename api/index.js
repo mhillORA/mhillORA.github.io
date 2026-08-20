@@ -2642,3 +2642,14 @@ registerLegacyRoutes(app, {
     handleError,
     generateId,
 });
+
+// =================================================================================
+// PRIVACY / GDPR ops (ARTEMIS only) — survey export, erase, retention; no Chaos/NASA
+// =================================================================================
+const { registerPrivacyRoutes } = require('./privacy-routes');
+registerPrivacyRoutes(app, {
+    getContainer,
+    getCosmosClient,
+    handleError,
+    generateId,
+});
