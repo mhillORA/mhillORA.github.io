@@ -3752,10 +3752,14 @@ async function crudHandler(context, request, containerName) {
                             }
                             break;
                         case 'schedules':
-                            // Finalization records (schedule-finalized-{monthKey}) store snapshot + finalized flag; skip strict schema
-                            if (!updateId || !String(updateId).startsWith('schedule-finalized-')) {
-                                validateSchedulesSchema(requestBody);
-                                await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
+                            // Finalization + daily backup snapshots skip site/study schema
+                            {
+                                const sid = updateId ? String(updateId) : '';
+                                const isSnapshotDoc = sid.startsWith('schedule-finalized-') || sid.startsWith('schedule-backup-');
+                                if (!isSnapshotDoc) {
+                                    validateSchedulesSchema(requestBody);
+                                    await validateSiteStudyRelationship(requestBody.siteId, requestBody.studyId);
+                                }
                             }
                             break;
                         case 'surveys':
@@ -5785,6 +5789,23 @@ async function processEmailTriggers(context, payload) {
         if (filteredRules.length === 0) {
             log.info(`processEmailTriggers: no matching rules after filters for triggerType=${triggerType}`);
             return;
+        }
+
+        // CRCs were getting hammered by new_shift / shift_edit / etc. Policy:
+        // "Who's on shift" (CRC) auto-emails only for schedule finalized.
+        // Managers / specific recipients still get operational triggers.
+        // Manual Comms-tab sends are unchanged (separate /send-email route).
+        const CRC_ON_SHIFT_ALLOWED_TRIGGERS = new Set(['finalized_schedule', 'pto_approved', 'pto_request']);
+        if (!CRC_ON_SHIFT_ALLOWED_TRIGGERS.has(triggerType)) {
+            const before = filteredRules.length;
+            filteredRules = filteredRules.filter(rule => rule.sendTo !== 'on_shift');
+            if (filteredRules.length < before) {
+                log.info(`processEmailTriggers: blocked ${before - filteredRules.length} on_shift (CRC) rule(s) for triggerType=${triggerType}; CRC emails only on finalize / PTO`);
+            }
+            if (filteredRules.length === 0) {
+                log.info(`processEmailTriggers: nothing left to send after CRC on_shift gate for triggerType=${triggerType}`);
+                return;
+            }
         }
 
         const senderAddress = process.env.EMAIL_SENDER_ADDRESS;

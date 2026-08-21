@@ -1619,7 +1619,7 @@
                             const isPermissionSets404 = response.status === 404 && 
                                 (url.includes('/permission-sets') || url.includes('/permissionsets'));
                             const isScheduleFinalized404 = response.status === 404 && 
-                                url.includes('/schedules/') && url.includes('schedule-finalized-');
+                                url.includes('/schedules/') && (url.includes('schedule-finalized-') || url.includes('schedule-backup-'));
                             
                             if (!isPermissionSets404 && !isScheduleFinalized404) {
                                 console.error(`API Error Response: ${response.status} ${response.statusText}`, {
@@ -6203,6 +6203,7 @@
                 if (!event) return [];
                 if (event.type !== 'Site Assignment') return event.id ? [event] : [];
                 const key = getSiteAssignmentIdentityKey(event);
+                if (!key || key === 'sa:|||||') return event.id ? [event] : [];
                 const byId = new Map();
                 const consider = (e) => {
                     if (!e || e.type !== 'Site Assignment' || !e.id) return;
@@ -6214,12 +6215,22 @@
                 return [...byId.values()];
             };
 
+            /** Same visit copies only — never pull in another multi-day series (different groupId). */
+            const findDeletableSiteAssignmentCopies = (event) => {
+                const dups = findSiteAssignmentDuplicates(event);
+                if (dups.length <= 1) return dups;
+                const gid = event?.groupId || null;
+                if (!gid) return dups;
+                const sameGroup = dups.filter((e) => !e.groupId || e.groupId === gid);
+                return sameGroup.length ? sameGroup : [event];
+            };
+
             const deleteSiteAssignmentWithDuplicates = async (eventOrId) => {
                 const event = typeof eventOrId === 'string' ? findEventAnywhere(eventOrId) : eventOrId;
                 const primaryId = event?.id || (typeof eventOrId === 'string' ? eventOrId : null);
                 if (!primaryId) throw new Error('Cannot delete: missing event id');
                 const toDelete = event && event.type === 'Site Assignment'
-                    ? findSiteAssignmentDuplicates(event)
+                    ? findDeletableSiteAssignmentCopies(event)
                     : [event || { id: primaryId }];
                 const ids = [...new Set(toDelete.map((e) => e.id).filter(Boolean))];
                 let failed = 0;
@@ -6249,12 +6260,17 @@
             const upsertSiteAssignmentByIdentity = async (payload) => {
                 const probe = { ...payload, type: 'Site Assignment' };
                 const existing = findSiteAssignmentDuplicates(probe);
-                if (existing.length === 0) {
+                const payloadGroup = payload.groupId || null;
+                // Never absorb / delete another series. Same groupId only; otherwise create.
+                const candidates = payloadGroup
+                    ? existing.filter((e) => e.groupId === payloadGroup)
+                    : existing.filter((e) => !e.groupId);
+                if (candidates.length === 0) {
                     const created = requireCreatedEvent(await apiService.createEvent(payload), 'Site Assignment');
                     addEventToState(created);
                     return created;
                 }
-                const keeper = existing.reduce((best, row) => pickRicherSiteAssignment(best, row));
+                const keeper = candidates.reduce((best, row) => pickRicherSiteAssignment(best, row));
                 let saved = { ...keeper, ...payload, id: keeper.id, groupId: keeper.groupId || payload.groupId };
                 try {
                     const updated = await apiService.updateEvent(keeper.id, saved);
@@ -6266,7 +6282,7 @@
                     console.warn('Shift already existed; keeping the original row and removing extra copies.', keeper.id);
                 }
                 state.crc_events = (state.crc_events || []).map((e) => e && e.id === keeper.id ? saved : e);
-                const extraIds = existing.map((e) => e.id).filter((id) => id && id !== keeper.id);
+                const extraIds = candidates.map((e) => e.id).filter((id) => id && id !== keeper.id);
                 for (const extraId of extraIds) {
                     try {
                         await apiService.deleteEvent(extraId);
@@ -16077,6 +16093,83 @@
 
             const getFinalizationRecordId = (monthKey) => `schedule-finalized-${monthKey}`;
 
+            const getDailyBackupRecordId = (dayKey = null) => {
+                const key = dayKey || toDateOnlyString(new Date());
+                return `schedule-backup-${key}`;
+            };
+
+            /** Hard copy of currently loaded events (daily + before destructive rewrites). */
+            const createScheduleBackupSnapshot = async (reason = 'manual', options = {}) => {
+                const force = options.force === true;
+                const today = toDateOnlyString(new Date());
+                const backupId = force
+                    ? `schedule-backup-${today}-${Date.now()}`
+                    : getDailyBackupRecordId(today);
+                if (!force) {
+                    try {
+                        const existing = await apiService.getSchedule(backupId);
+                        if (existing && existing.id) {
+                            debugLog('CHAOS: Daily backup already exists for', today);
+                            return existing;
+                        }
+                    } catch (_) { /* create below */ }
+                }
+                const events = (state.crc_events || []).map((e) => ({ ...e }));
+                const monthKey = getScheduleMonthKey(state.crcCalendarDate);
+                const payload = {
+                    id: backupId,
+                    type: 'daily-backup',
+                    reason: String(reason || 'manual'),
+                    backupDate: today,
+                    monthKey,
+                    createdAt: new Date().toISOString(),
+                    createdBy: {
+                        userId: state.currentUser?.id || null,
+                        userName: (state.currentUser?.name || state.currentUser?.username || state.currentUser?.email || 'Unknown').trim()
+                    },
+                    eventCount: events.length,
+                    events
+                };
+                await apiService.upsertSchedule(backupId, payload);
+                debugLog('CHAOS: Saved schedule backup', backupId, `(${events.length} events)`, reason);
+                return payload;
+            };
+
+            const ensureDailyScheduleBackup = async () => {
+                if (!(isAdminUser() || getEffectivePermissionLevel() === 'Manager')) return;
+                if (!state.initialLoadComplete) return;
+                if (!Array.isArray(state.crc_events) || state.crc_events.length === 0) return;
+                try {
+                    await createScheduleBackupSnapshot('daily-auto');
+                } catch (err) {
+                    console.warn('CHAOS: Daily schedule backup failed:', err);
+                }
+            };
+
+            const restoreScheduleFromBackup = async (backupId) => {
+                if (!backupId) throw new Error('Missing backup id');
+                const record = await apiService.getSchedule(backupId);
+                if (!record || !Array.isArray(record.events)) {
+                    throw new Error('Backup has no events to restore.');
+                }
+                // Restore is a local view recovery: put snapshot events into memory and widen the query range.
+                // Does not delete live Cosmos rows — managers can then re-save / re-finalize deliberately.
+                const dates = record.events
+                    .map((e) => String(e?.date || e?.startDate || '').slice(0, 10))
+                    .filter(Boolean)
+                    .sort();
+                const range = dates.length
+                    ? { startDate: dates[0], endDate: dates[dates.length - 1] }
+                    : (state.eventsQueryRange || getDefaultEventsDateRange());
+                setState({
+                    crc_events: record.events.map((e) => ({ ...e })),
+                    crc_events_display: undefined,
+                    eventsQueryRange: range
+                });
+                showNotification(`Loaded backup (${record.events.length} events) into the scheduler view. Live DB rows were not deleted — re-finalize or edit to persist.`, 'success');
+                if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar();
+            };
+
             const loadMonthFinalization = async (monthKey) => {
                 if (state.finalizedMonths[monthKey] !== undefined) return state.finalizedMonths[monthKey];
                 try {
@@ -16494,6 +16587,12 @@
                                         <i data-lucide="lock-open" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Unfinalize</span>
                                     </button>
                                     ` : ''}
+                                    <button type="button" data-action="backup-schedule-now" class="p-1.5 md:p-2 rounded-md bg-slate-600 hover:bg-slate-700 text-white text-xs md:text-sm flex items-center gap-1" title="Save a hard copy of the currently loaded schedule">
+                                        <i data-lucide="hard-drive" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Backup</span>
+                                    </button>
+                                    <button type="button" data-action="restore-schedule-backup" class="p-1.5 md:p-2 rounded-md bg-slate-500 hover:bg-slate-600 text-white text-xs md:text-sm flex items-center gap-1" title="Load today's automatic hard copy into the view">
+                                        <i data-lucide="history" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Restore backup</span>
+                                    </button>
                                     ${finalizeLastAtFormatted ? `<span class="finalize-timestamp-clock whitespace-nowrap" title="Last finalized">Last finalized <span class="finalize-time">${finalizeLastAtFormatted}</span></span>` : ''}
                                 </div>
                                     `;
@@ -31831,6 +31930,7 @@
                         const alreadyFinalized = !!existing?.finalized;
                         if (!alreadyFinalized) {
                             try {
+                                try { await createScheduleBackupSnapshot('before-finalize', { force: true }); } catch (_) { /* non-fatal */ }
                                 const snapshotAt = new Date().toISOString();
                                 const finalizedBy = {
                                     userId: state.currentUser?.id || state.userId || null,
@@ -31854,6 +31954,29 @@
                             openModal(getFinalizeChangesModalHTML(changes, formatScheduleMonthLabel(monthKey)), 'xl');
                         }
                         if (btn) { btn.disabled = false; btn.innerHTML = btn.dataset.originalContent || ''; delete btn.dataset.originalContent; lucide.createIcons(); }
+                        break;
+                    }
+                    case 'backup-schedule-now': {
+                        try {
+                            const snap = await createScheduleBackupSnapshot('manual', { force: true });
+                            showNotification(`Hard copy saved (${snap.eventCount || 0} events).`, 'success');
+                        } catch (err) {
+                            console.error('Backup failed:', err);
+                            showNotification(err?.message || 'Failed to save backup.', 'error');
+                        }
+                        break;
+                    }
+                    case 'restore-schedule-backup': {
+                        const todayId = getDailyBackupRecordId();
+                        const typed = prompt(`Load a hard copy into the scheduler view (does not wipe the database).\nEnter backup id, or leave blank for today's automatic backup:\n${todayId}`);
+                        if (typed === null) break;
+                        const backupId = (typed || '').trim() || todayId;
+                        try {
+                            await restoreScheduleFromBackup(backupId);
+                        } catch (err) {
+                            console.error('Restore backup failed:', err);
+                            showNotification(err?.message || 'No backup found for that id.', 'error');
+                        }
                         break;
                     }
                     case 'confirm-refinalize': {
@@ -33973,7 +34096,7 @@
                         const extraCopies = [];
                         eventsToDelete.forEach((event) => {
                             if (event?.type !== 'Site Assignment') return;
-                            findSiteAssignmentDuplicates(event).forEach((copy) => {
+                            findDeletableSiteAssignmentCopies(event).forEach((copy) => {
                                 if (copy.id && !eventsToDelete.some((e) => e.id === copy.id) && !extraCopies.some((e) => e.id === copy.id)) {
                                     extraCopies.push(copy);
                                 }
@@ -34231,7 +34354,7 @@
                             eventIds.forEach((id) => {
                                 const row = findEventAnywhere(id);
                                 if (row && row.type === 'Site Assignment') {
-                                    findSiteAssignmentDuplicates(row).forEach((copy) => { if (copy.id) expandedEventIds.add(copy.id); });
+                                    findDeletableSiteAssignmentCopies(row).forEach((copy) => { if (copy.id) expandedEventIds.add(copy.id); });
                                 } else if (id) {
                                     expandedEventIds.add(id);
                                 }
@@ -38290,13 +38413,24 @@
                                     // Check if changing from single-day to multi-day (or vice versa)
                                     const wasSingleDay = oldStartDateStr === oldEndDateStr;
                                     const isNowMultiDay = newStartDateStr !== newEndDateStr;
-                                    const changedToMultiDay = wasSingleDay && isNowMultiDay;
-                                    const changedFromMultiDay = !wasSingleDay && !isNowMultiDay;
+                                    // Multi-day series: default edit is THIS DAY only. Never delete/recreate
+                                    // the whole group unless "Apply changes to all days" is checked.
+                                    const applyToAllDaysEarly = form.querySelector('input[name="applyToAllDaysInShift"]')?.checked === true;
+                                    const mayRewriteWholeGroup = !isGroupedMultiDaySeries || applyToAllDaysEarly;
+                                    const changedToMultiDay = wasSingleDay && isNowMultiDay && mayRewriteWholeGroup;
+                                    const changedFromMultiDay = !wasSingleDay && !isNowMultiDay && mayRewriteWholeGroup;
                                     
                                     // If it's a group event and the date range has changed, we need to handle the group
-                                    if (isGroupEvent && dateRangeChanged) {
+                                    if (isGroupEvent && dateRangeChanged && mayRewriteWholeGroup) {
                                         // Date range changed for a group event - need to handle the entire group
                                         // Get all events in the group (exclude Travel Days)
+                                        if (typeof createScheduleBackupSnapshot === 'function') {
+                                            try {
+                                                await createScheduleBackupSnapshot('before-group-date-rewrite', { force: true });
+                                            } catch (backupErr) {
+                                                console.warn('Pre-rewrite backup failed:', backupErr);
+                                            }
+                                        }
                                         const groupEvents = state.crc_events.filter(e => 
                                             e.groupId === existingGroupId && e.type !== 'Travel Day'
                                         );
@@ -41920,7 +42054,7 @@
 
             const getEventsRangeForVisibleSchedule = () => expandRangeToWholeMonths(getVisibleSchedulerRange());
 
-            /** Load every month the current view touches (replaces prior range data in memory). */
+            /** Load every month the current view touches. Merges into memory; never blank-wipes a loaded schedule. */
             const ensureEventsCoverVisibleMonth = async (options = {}) => {
                 if (!state.initialLoadComplete) return;
                 const force = options.force === true;
@@ -41939,8 +42073,29 @@
                     const arr = Array.isArray(fetched) ? fetched : [];
                     const artemisStudyIdsSet = new Set((state.studies || []).map(study => study.id));
                     const sanitized = sanitizeEventsFromApi(arr, artemisStudyIdsSet);
+                    const eventDate = (e) => (e && (e.date || e.startDate)) ? String(e.date || e.startDate).slice(0, 10) : '';
+                    const previousInRange = (state.crc_events || []).filter((e) => {
+                        const d = eventDate(e);
+                        return d && d >= range.startDate && d <= range.endDate;
+                    });
+                    // Hard stop: an empty/partial API response must not erase a full week of live work.
+                    if (previousInRange.length >= 5 && sanitized.length === 0) {
+                        console.error('CHAOS: Refusing to wipe schedule — API returned 0 events for', range, `(had ${previousInRange.length} locally)`);
+                        showNotification('Schedule refresh returned no events; keeping your current view. Try again in a moment.', 'error');
+                        return;
+                    }
+                    if (previousInRange.length >= 15 && sanitized.length < Math.floor(previousInRange.length * 0.25)) {
+                        console.error('CHAOS: Refusing partial wipe — API returned', sanitized.length, 'vs local', previousInRange.length, range);
+                        showNotification('Schedule refresh looked incomplete; keeping your current view. Hard-refresh if needed.', 'error');
+                        return;
+                    }
+                    const outside = (state.crc_events || []).filter((e) => {
+                        const d = eventDate(e);
+                        if (!d) return false;
+                        return d < range.startDate || d > range.endDate;
+                    });
                     setState({
-                        crc_events: sanitized,
+                        crc_events: mergeEventsById(outside, sanitized),
                         crc_events_display: undefined,
                         eventsQueryRange: { startDate: range.startDate, endDate: range.endDate },
                     });
@@ -48514,7 +48669,8 @@
                                 <i data-lucide="zap" class="w-5 h-5"></i>
                                 Triggered Emails
                             </h4>
-                            <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Send automatic emails when something happens (new shift, shift edit, removed from shift, PTO, schedule finalized, etc.). Choose the trigger, recipients, and optional template. Template variables are listed when you add or edit a trigger.</p>
+                            <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">Automatic emails when something happens. <strong>CRC (“Who’s on shift”) emails only fire when the schedule is finalized</strong> — create/edit/delete shift triggers no longer email CRCs (managers and specific recipients still can). Use Email Templates below to send schedules manually anytime.</p>
+                            <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Choose the trigger, recipients, and optional template. Template variables are listed when you add or edit a trigger.</p>
                             <div id="triggered-emails-list" class="space-y-3"></div>
                             <button type="button" data-action="add-triggered-email" class="mt-3 px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 text-sm font-medium flex items-center gap-2">
                                 <i data-lucide="plus" class="w-4 h-4"></i>
@@ -54525,6 +54681,7 @@
                     }
                     setupRealtimeListeners();
                     loadDeferredAppData();
+                    setTimeout(() => { ensureDailyScheduleBackup(); }, 2500);
                     setTimeout(() => {
                         if (pendingInitialTabPaint && !initialAppRevealed) {
                             debugWarn('CHAOS: Initial load safety timeout — revealing app');
