@@ -125,6 +125,16 @@
     return v || fallback;
   }
 
+  function chartBarColor(color) {
+    const c = String(color || "").trim().toLowerCase();
+    if (currentTheme() !== "dark") return color || cssToken("--chart-1", "#052c49");
+    const navy = new Set(["#052c49", "#001123", "#032039", "#0a3f66", "#0a314c", "#052c49ff"]);
+    const blue = new Set(["#273b8a", "#1d2c68", "#273b8aff"]);
+    if (!c || navy.has(c)) return cssToken("--chart-1", "#3ebdac");
+    if (blue.has(c)) return cssToken("--chart-2", "#7eb8ff");
+    return color;
+  }
+
   function currentTheme() {
     return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
   }
@@ -670,7 +680,7 @@
       .map(
         (b) => `<div class="bar-row">
           <span class="bar-label">${b.label}</span>
-          <span class="bar-track"><span class="bar-fill" style="width:${b.pct}%;background:${b.color}"></span></span>
+          <span class="bar-track"><span class="bar-fill" style="width:${b.pct}%;background:${chartBarColor(b.color)}"></span></span>
           <span class="bar-val">${b.value}</span>
         </div>`
       )
@@ -914,7 +924,7 @@
         datasets: [
           {
             data: a.bars.map((b) => b.pct),
-            backgroundColor: a.bars.map((b) => b.color),
+            backgroundColor: a.bars.map((b) => chartBarColor(b.color)),
             borderRadius: 8,
             barThickness: 18
           }
