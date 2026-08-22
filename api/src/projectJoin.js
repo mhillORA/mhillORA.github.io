@@ -1,7 +1,8 @@
-const { getDb, safeQuery, LENS, SHARED_READ } = require("./cosmos");
+const { getDb, safeQuery, LENS } = require("./cosmos");
+const { loadLivePack } = require("./veevaLive");
 
 /**
- * Project number ↔ ora_fact_study is computed at read time.
+ * Project number ↔ live ora_veeva_study.study_number is computed at read time.
  * There is no mapping container. Match on study_number (exact, prefix, or token).
  */
 
@@ -73,15 +74,13 @@ function matchKind(studyNumber, projectNumber) {
 const NS_SELECT =
   "SELECT TOP 200 c.id, c.project_number, c.project_name, c.project_manager, c.customer_name, c.project_status, c.service_line, c.change_order_status, c.budgeted_gm_pct, c.actual_gm_pct_prior_month, c.gm_pct_variance, c.projected_eos_gm_pct_prior_month, c.cost_per_billable_hr_actual, c.cost_per_billable_hr_budgeted, c.sourceBlob, c.syncedAt, c._ts FROM c WHERE c.docType = @t";
 
-const STUDY_SELECT =
-  "SELECT TOP 200 c.study_number, c.sponsor, c.indication, c.phase, c.total_enrolled, c.psm, c.screen_fail_rate_recomputed, c.lifecycle_state, c.n_contributing_sites, c._ts FROM c WHERE c.docType = @t";
-
 async function loadNsProjects() {
   return safeQuery(LENS.nsProjects, NS_SELECT, [{ name: "@t", value: "lens_ns_project" }]);
 }
 
 async function loadStudies() {
-  return safeQuery(SHARED_READ.oraFactStudy, STUDY_SELECT, [{ name: "@t", value: "ora_fact_study" }]);
+  const pack = await loadLivePack();
+  return pack.studies || [];
 }
 
 function studiesForProject(studies, projectNumber) {
@@ -195,7 +194,7 @@ async function getFinanceBriefing() {
     serviceLines: Object.entries(byLine)
       .sort((a, b) => b[1] - a[1])
       .map(([name, n]) => ({ name, n })),
-    note: `${missing.length} job${missing.length === 1 ? "" : "s"} have GM% missing (not zero). Join to ora_fact_study is computed here on project_number ↔ study_number — no mapping table.`,
+    note: `${missing.length} job${missing.length === 1 ? "" : "s"} have GM% missing (not zero). Join to ora_veeva_study is computed here on project_number ↔ study_number — no mapping table.`,
     rows
   };
 }
@@ -203,28 +202,20 @@ async function getFinanceBriefing() {
 async function loadSitesForStudies(studyNumbers) {
   const nums = [...new Set((studyNumbers || []).map((s) => String(s || "").trim()).filter(Boolean))].slice(0, 8);
   if (!nums.length) return [];
-  const batches = await Promise.all(
-    nums.map((sn) =>
-      safeQuery(
-        SHARED_READ.oraFactSite,
-        `SELECT TOP 12 c.org_clean, c.organization, c.country, c.indication, c.phase, c.site_psm, c.total_enrolled, c.study_name, c._ts
-         FROM c WHERE c.docType = @t AND c.study_name = @sn`,
-        [
-          { name: "@t", value: "ora_fact_site" },
-          { name: "@sn", value: sn }
-        ]
-      )
-    )
-  );
-  return batches.flat().map((s) => ({
-    study_name: s.study_name || "",
-    site: s.org_clean || s.organization || "—",
-    country: s.country || "",
-    indication: s.indication || "",
-    phase: s.phase || "",
-    enrolled: enrolledOf(s),
-    site_psm: s.site_psm != null ? s.site_psm : null
-  }));
+  const want = new Set(nums.map((s) => String(s).toUpperCase()));
+  const pack = await loadLivePack();
+  return (pack.sites || [])
+    .filter((s) => want.has(String(s.study_number || s.study_name || "").toUpperCase()))
+    .slice(0, 96)
+    .map((s) => ({
+      study_name: s.study_name || "",
+      site: s.org_clean || s.organization || "—",
+      country: s.country || "",
+      indication: s.indication || "",
+      phase: s.phase || "",
+      enrolled: enrolledOf(s),
+      site_psm: s.site_psm != null ? s.site_psm : null
+    }));
 }
 
 async function getProjectBundle(projectNumber) {
@@ -248,13 +239,13 @@ async function getProjectBundle(projectNumber) {
 
   let note;
   if (!matchedJobs.length && !matchedStudies.length) {
-    note = `No lens_ns_projects row and no ora_fact_study.study_number matching ${pn}. Join is computed at read time (exact / prefix / token on study_number).`;
+    note = `No lens_ns_projects row and no ora_veeva_study.study_number matching ${pn}. Join is computed at read time (exact / prefix / token on study_number).`;
   } else if (!matchedStudies.length) {
-    note = `NetSuite has this project. No ora_fact_study.study_number equals or contains ${pn}. There is no mapping table — if Veeva uses a different study id, it will not join.`;
+    note = `NetSuite has this project. No live Veeva study_number equals or contains ${pn}. There is no mapping table — if Vault uses a different study id, it will not join.`;
   } else if (!matchedJobs.length) {
-    note = `ora_fact_study matched on study_number, but lens_ns_projects has no job for ${pn}.`;
+    note = `ora_veeva_study matched on study_number, but lens_ns_projects has no job for ${pn}.`;
   } else {
-    note = `Joined ${matchedJobs.length} NetSuite job${matchedJobs.length === 1 ? "" : "s"} to ${matchedStudies.length} ora_fact_study row${matchedStudies.length === 1 ? "" : "s"} on project_number ↔ study_number (${kinds.join(", ") || "computed"}). No mapping table.`;
+    note = `Joined ${matchedJobs.length} NetSuite job${matchedJobs.length === 1 ? "" : "s"} to ${matchedStudies.length} live Veeva study row${matchedStudies.length === 1 ? "" : "s"} on project_number ↔ study_number (${kinds.join(", ") || "computed"}). No mapping table.`;
   }
 
   const meta = asOfMeta([...jobs.filter((r) => normalizeId(r.project_number) === normalizeId(pn)), ...studies.filter((s) => studyMatchesProject(s.study_number, pn))]);
@@ -268,7 +259,7 @@ async function getProjectBundle(projectNumber) {
     sites,
     join: {
       method: "computed",
-      matchedOn: "project_number ↔ ora_fact_study.study_number",
+      matchedOn: "project_number ↔ ora_veeva_study.study_number",
       count: matchedStudies.length,
       kinds,
       note

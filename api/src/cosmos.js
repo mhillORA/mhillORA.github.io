@@ -37,11 +37,21 @@ const LENS = {
 
 const SHARED_READ = {
   budgets: "studies",
-  oraFactStudy: "ora_fact_study",
-  oraFactSite: "ora_fact_site",
+  veevaStudy: "ora_veeva_study",
+  veevaSite: "ora_veeva_site",
+  veevaOrg: "ora_veeva_organization",
+  veevaSponsor: "ora_veeva_sponsor",
+  veevaMilestone: "ora_veeva_milestone",
+  veevaStudyCountry: "ora_veeva_study_country",
+  veevaSubject: "ora_veeva_subject",
+  sfAccount: "ora_sf_account",
+  sfOpportunity: "ora_sf_opportunity",
+  sfActivityRequest: "ora_sf_activity_request",
+  oraCrosswalk: "ora_sponsor_crosswalk",
+  oraSiteAlias: "ora_site_alias_table",
   oraCtgov: "ora_ctgov_trials",
   oraTrialhub: "ora_trialhub_trials",
-  oraCrosswalk: "ora_sponsor_crosswalk"
+  syncState: "syncState"
 };
 
 const CONTAINERS = [

@@ -3,6 +3,7 @@ const { narrateWithFoundry } = require("./foundry");
 const { getProjectBundle, studyMatchesProject } = require("./projectJoin");
 const { getViewerContext, foundryViewerSlice } = require("./userPrefs");
 const { answerRmQuestion, looksLikeRmRefinement } = require("./rmPack");
+const { loadLivePack } = require("./veevaLive");
 
 function guessKey(text, priorTurns) {
   const t = String(text || "").toLowerCase();
@@ -12,7 +13,10 @@ function guessKey(text, priorTurns) {
   if (/(site scorecard|which sites|site performance|site psm|investigators?|\bsites?\b)/.test(t) && !/\bvisits?\b/.test(t)) {
     return "sites";
   }
-  if (/(competitor|sponsor|registry|market|poland|cac|pipeline|bid|trialhub|ct\.gov|clinicaltrials)/.test(t)) {
+  if (/(pipeline|opportunit|net revenue|open deals|salesforce account)/.test(t)) {
+    return "pipeline";
+  }
+  if (/(competitor|sponsor|registry|market|poland|cac|bid|trialhub|ct\.gov|clinicaltrials)/.test(t)) {
     return "competitive";
   }
   if (/(netsuite|profitability|gross margin|\bgm\b|budgeted gm|actual gm|change order|billable hr|cost per billable|eos gm|service line)/.test(t)) {
@@ -233,27 +237,51 @@ function missingNote(missingCount, knownCount) {
   return `${missingCount} ${missingCount === 1 ? "study has" : "studies have"} no enrolled value. They are listed in the table and omitted from the chart — not plotted as zero. ${knownCount} ${knownCount === 1 ? "study has" : "studies have"} a number.`;
 }
 
+function emptyLiveAnswer(question, pack) {
+  return stamp(
+    {
+      q: question,
+      needs: ["ora", "veeva"],
+      icon: "chart",
+      summary: `Live Veeva ingest has not landed in Cosmos yet (${pack} is empty). Data Lens does not fall back to ora_fact_* Excel dumps.`,
+      chartTitle: "No live Vault rows",
+      chartNote: "ora_veeva_* · read-only",
+      chartType: "bar",
+      bars: [],
+      tableTitle: "Result",
+      grid: "1fr",
+      cols: ["Note"],
+      rows: [["Workbench ingest of ora_veeva_* has not written documents this SWA can read."]],
+      caveat: "Null is missing, not zero. When the live containers populate, Ask will use FSI→LSI PSM from ora_veeva_milestone.",
+      trace: [`Queried ${pack} on bd-budgets. Zero documents. Did not read ora_fact_study / ora_fact_site.`],
+      query: `${pack} empty`,
+      confidence: "low",
+      followUps: [
+        "Which Ora dry eye studies enrolled the most subjects?",
+        "Show competing dry eye trials",
+        "Which projects are under budgeted GM?"
+      ]
+    },
+    []
+  );
+}
+
 async function fromOraFactSite(question) {
   const needle = indicationNeedle(question);
   const country = countryNeedle(question);
   const studyMatch = String(question).match(/\b(?:ORA[- ]?\d{3,}|ADX[-][\w-]+)\b/i);
-  const params = [{ name: "@t", value: "ora_fact_site" }];
-  let q = `SELECT TOP 400 c.org_clean, c.organization, c.country, c.indication, c.phase,
-    c.site_psm, c.total_enrolled, c.site_enroll_months, c.fsi_trust, c.screen_fail_rate, c.study_name, c._ts
-    FROM c WHERE c.docType = @t`;
-  if (needle) {
-    q += " AND CONTAINS(c.indication, @ind, true)";
-    params.push({ name: "@ind", value: needle });
-  }
-  if (country) {
-    q += " AND c.country = @geo";
-    params.push({ name: "@geo", value: country });
-  }
-  if (studyMatch) {
-    q += " AND c.study_name = @study";
-    params.push({ name: "@study", value: studyMatch[0].replace(/\s+/g, "-") });
-  }
-  const rows = await safeQuery(SHARED_READ.oraFactSite, q, params);
+  const pack = await loadLivePack();
+  if (!(pack.sites || []).length) return emptyLiveAnswer(question, SHARED_READ.veevaSite);
+  const studyKey = studyMatch ? studyMatch[0].replace(/\s+/g, "-").toUpperCase() : null;
+  const rows = pack.sites.filter((r) => {
+    if (needle && !String(r.indication || "").toLowerCase().includes(needle)) return false;
+    if (country && String(r.country || "") !== country) return false;
+    if (studyKey) {
+      const sn = String(r.study_number || r.study_name || "").toUpperCase();
+      if (!sn.includes(studyKey)) return false;
+    }
+    return true;
+  });
   if (!rows.length) return null;
 
   const byKey = new Map();
@@ -296,9 +324,9 @@ async function fromOraFactSite(question) {
       q: question,
       needs: ["ora"],
       icon: "users",
-      summary: `${known.length} Ora sites in ora_fact_site have an enrolled total for ${scope}. ${missingCount} more site rows have enrolled missing. Same Veeva site pack Buddy uses.`,
+      summary: `${known.length} Ora sites in live Vault have an enrolled total for ${scope}. ${missingCount} more site rows have enrolled missing. PSM uses enrolled / months(FSI→LSI); null dates stay null.`,
       chartTitle: `Ora sites by enrolled · ${scope} · known values only`,
-      chartNote: "Ora clinical rollup · ora_fact_site · read-only",
+      chartNote: "Live Vault · ora_veeva_site · read-only",
       chartType: "bar",
       bars: chartRows.map((a) => ({
         label: `${a.org} (${a.country})`,
@@ -318,14 +346,14 @@ async function fromOraFactSite(question) {
       ]),
       missingCount,
       missingNote: missingNote(missingCount, known.length),
-      caveat: "ora_fact_site is Veeva site×study history (same pack as Buddy), not live EDC and not lens_visits. Blank enrolled is missing, not zero. study_name joins to ora_fact_study.study_number.",
+      caveat: "Live ora_veeva_site joined to org + milestone FSI/LSI. Blank enrolled or missing FSI/LSI is missing PSM, not zero. Concurrent studies = distinct active Vault studies at the same org×country.",
       trace: [
-        `Read container ${SHARED_READ.oraFactSite} (docType = ora_fact_site). Did not write.`,
+        `Read ${SHARED_READ.veevaSite} + ${SHARED_READ.veevaMilestone} (live mirrors). Did not write. Did not read ora_fact_*.`,
         needle ? `Indication CONTAINS "${needle}".` : "No indication filter.",
         country ? `country = ${country}.` : "No country filter.",
         `${rows.length} site×study rows → ${aggregates.length} org×country sites.`
       ],
-      query: "ora_fact_site where docType = 'ora_fact_site'",
+      query: "ora_veeva_site + ora_veeva_milestone FSI→LSI PSM",
       confidence: "high",
       followUps: [
         "Which Ora sites enrolled the most in glaucoma?",
@@ -431,12 +459,9 @@ async function fromLensStudies(question) {
 
 async function fromOraFactStudy(question, opts = {}) {
   const needle = indicationNeedle(question);
-  const rows = await safeQuery(
-    SHARED_READ.oraFactStudy,
-    "SELECT TOP 80 c.study_number, c.sponsor, c.indication, c.phase, c.total_enrolled, c.psm, c.screen_fail_rate_recomputed, c.lifecycle_state, c.n_contributing_sites, c._ts FROM c WHERE c.docType = @t",
-    [{ name: "@t", value: "ora_fact_study" }]
-  );
-  if (!rows.length) return null;
+  const pack = await loadLivePack();
+  const rows = pack.studies || [];
+  if (!rows.length) return emptyLiveAnswer(question, SHARED_READ.veevaStudy);
   const filtered = rows.filter((r) => {
     if (needle && !String(r.indication || "").toLowerCase().includes(needle)) return false;
     if (opts.projectNumber && !studyMatchesProject(r.study_number, opts.projectNumber)) return false;
@@ -459,13 +484,13 @@ async function fromOraFactStudy(question, opts = {}) {
         ? `${missing.length} of ${used.length}${needle ? ` “${needle}”` : ""} Ora studies in the clinical rollup have no enrolled value.`
         : needle
           ? `${known.length} Ora “${needle}” studies have an enrolled count. ${missing.length} more match the indication with enrolled missing.`
-          : `${known.length} Ora studies have an enrolled count in ora_fact_study. ${missing.length} have enrolled missing.`,
+          : `${known.length} Ora studies have an enrolled count in live Vault. ${missing.length} have enrolled missing.`,
       chartTitle: wantMissing
         ? "No enrollment chart — values are missing"
         : needle
           ? `Ora enrollment · ${needle} · known values only`
           : "Ora study enrollment · known values only",
-      chartNote: "Ora clinical rollup · read-only",
+      chartNote: "Live Vault · ora_veeva_study · read-only",
       chartType: "bar",
       bars: chartSource.map((r) => {
         const n = enrolledOf(r);
@@ -478,23 +503,23 @@ async function fromOraFactStudy(question, opts = {}) {
       }),
       tableTitle: wantMissing ? "Studies with enrolled missing" : "Study rollups",
       grid: "1fr .7fr .7fr .8fr 1fr",
-      cols: ["Study", "Enrolled", "PSM", "Screen fail", "Indication"],
+      cols: ["Study", "Enrolled", "PSM", "Lifecycle", "Indication"],
       rows: tableRows.slice(0, 12).map((r) => [
         r.study_number || "—",
         enrolledOf(r) == null ? "—" : String(enrolledOf(r)),
         r.psm != null ? String(r.psm) : "—",
-        r.screen_fail_rate_recomputed != null ? String(r.screen_fail_rate_recomputed) : "—",
+        r.lifecycle_state || "—",
         r.indication || "—"
       ]),
       missingCount: missing.length,
       missingNote: wantMissing ? "" : missingNote(missing.length, known.length),
-      caveat: "This is the Ora clinical rollup already in Cosmos, not live iMedNet or Medidata. Blank enrolled is missing, not zero.",
+      caveat: "Live ora_veeva_study. Study PSM is the median of positive site PSMs (enrolled / FSI→LSI months). Blank enrolled or missing FSI/LSI is missing, not zero.",
       trace: [
         "Connected to the same Cosmos database as Study Bid Workbench (bd-budgets).",
-        `Read container ${SHARED_READ.oraFactStudy} (docType = ora_fact_study). Did not write.`,
+        `Read ${SHARED_READ.veevaStudy} + sites/milestones. Did not write. Did not read ora_fact_*.`,
         wantMissing ? "Filtered to rows with total_enrolled null." : "Chart excludes null enrolled."
       ],
-      query: "ora_fact_study where docType = 'ora_fact_study'",
+      query: "ora_veeva_study + median positive site PSM",
       confidence: "high",
       followUps: wantMissing
         ? ["Which Ora dry eye studies enrolled the most subjects?", "List Ora glaucoma studies", "Show competing dry eye trials"]
@@ -550,7 +575,7 @@ async function fromRegistry(question) {
       grid: "1.1fr .6fr 1.2fr .8fr",
       cols: ["NCT", "Phase", "Sponsor", "Status"],
       rows: used.slice(0, 8).map((r) => [r.nct || "—", r.phase || "—", r.sponsor || "—", r.status || "—"]),
-      caveat: "Read-only on existing intelligence containers. Salesforce is a sponsor crosswalk, not pipeline revenue.",
+      caveat: "Public registry facts stay public. Do not mix CT.gov / TrialHub counts with Salesforce Total_Ora_Net_Revenue__c or 10-K.",
       trace: [
         `Read ${SHARED_READ.oraTrialhub} and ${SHARED_READ.oraCtgov} on bd-budgets.`,
         "Did not write."
@@ -563,6 +588,87 @@ async function fromRegistry(question) {
   );
 }
 
+async function fromSfPipeline(question) {
+  const rows = await safeQuery(
+    SHARED_READ.sfOpportunity,
+    `SELECT TOP 80 c.Name, c.StageName, c.IsClosed, c.IsWon, c.CloseDate, c.AccountId,
+            c.Total_Ora_Net_Revenue__c, c._ts
+     FROM c WHERE c.docType = @t`,
+    [{ name: "@t", value: "ora_sf_opportunity" }]
+  );
+  if (!rows.length) {
+    return stamp(
+      {
+        q: question,
+        needs: ["salesforce"],
+        icon: "chart",
+        summary:
+          "Live Salesforce opportunity ingest has not landed (ora_sf_opportunity is empty). Data Lens does not use Amount and does not fall back to Excel dumps.",
+        chartTitle: "No Salesforce opportunities",
+        chartNote: "ora_sf_opportunity · Total_Ora_Net_Revenue__c only",
+        chartType: "bar",
+        bars: [],
+        tableTitle: "Result",
+        grid: "1fr",
+        cols: ["Note"],
+        rows: [["Workbench ingest of ora_sf_opportunity has not written documents this SWA can read."]],
+        caveat: "Pipeline $ is Total_Ora_Net_Revenue__c only — never Amount. Never mix with 10-K.",
+        trace: [`Queried ${SHARED_READ.sfOpportunity}. Zero documents.`],
+        query: "ora_sf_opportunity empty",
+        confidence: "low",
+        followUps: ["Show competing dry eye trials", "Which Ora dry eye studies enrolled the most subjects?"]
+      },
+      []
+    );
+  }
+  const netOf = (r) => numOrNull(r.Total_Ora_Net_Revenue__c);
+  const open = rows.filter((r) => r.IsClosed !== true && !/^closed/i.test(String(r.StageName || "")));
+  const known = open.filter((r) => netOf(r) != null);
+  const missing = open.length - known.length;
+  const byStage = {};
+  for (const r of known) {
+    const st = String(r.StageName || "—").trim() || "—";
+    byStage[st] = (byStage[st] || 0) + netOf(r);
+  }
+  const stageRows = Object.entries(byStage).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  const max = Math.max(1, ...stageRows.map((x) => x[1]));
+  const money = (n) => (n == null ? "—" : `$${Math.round(n / 1000)}K`);
+  return stamp(
+    {
+      q: question,
+      needs: ["salesforce"],
+      icon: "chart",
+      summary: `${open.length} open Salesforce opportunities. ${known.length} have Total_Ora_Net_Revenue__c; ${missing} are missing $ (not zero). Bars are Ora net revenue by stage — not Amount, not 10-K.`,
+      chartTitle: "Open pipeline · Total_Ora_Net_Revenue__c by stage",
+      chartNote: "ora_sf_opportunity · never Amount",
+      chartType: "bar",
+      bars: stageRows.map(([label, n]) => ({
+        label,
+        pct: Math.round((n / max) * 100),
+        value: money(n),
+        color: "#273b8a"
+      })),
+      tableTitle: "Open opportunities",
+      grid: "1.3fr .8fr .8fr .8fr",
+      cols: ["Opportunity", "Stage", "Close", "Ora net $"],
+      rows: open.slice(0, 12).map((r) => [
+        r.Name || "—",
+        r.StageName || "—",
+        r.CloseDate || "—",
+        money(netOf(r))
+      ]),
+      missingCount: missing,
+      missingNote: missing ? `${missing} open opps have Total_Ora_Net_Revenue__c missing — omitted from the chart, not plotted as $0.` : "",
+      caveat: "Salesforce $ = Total_Ora_Net_Revenue__c only. Do not mix with CT.gov, TrialHub, or public 10-K revenue.",
+      trace: [`Read ${SHARED_READ.sfOpportunity}. Did not select Amount.`],
+      query: "ora_sf_opportunity Total_Ora_Net_Revenue__c (open)",
+      confidence: "high",
+      followUps: ["Show competing dry eye trials", "Which Ora dry eye studies enrolled the most subjects?"]
+    },
+    rows
+  );
+}
+
 function emptyRmAnswer(question) {
   return stamp(
     {
@@ -572,16 +678,16 @@ function emptyRmAnswer(question) {
       summary:
         "RM is in scope. Cosmos lens_rm_* has no rows for this question yet — InsightsRM has not been loaded (ora-lens-rm-ingest), or this pack is empty. Not an Ora clinical-rollup question.",
       chartTitle: "No InsightsRM rows yet",
-      chartNote: "lens_rm_* · not NetSuite · not ora_fact_study",
+      chartNote: "lens_rm_* · not NetSuite · not ora_veeva_study",
       chartType: "bar",
       bars: [],
       tableTitle: "InsightsRM",
       grid: "1fr",
       cols: ["Note"],
       rows: [["No lens_rm_* documents yet. Upload the RM workbook/zips to container insightsrm and run ora-lens-rm-ingest."]],
-      caveat: rmCaveat(),
+      caveat: "InsightsRM packs are separate from live Veeva and NetSuite. Blank FTE is missing, not zero.",
       trace: [
-        "Purpose is RM (insightsrm). Did not query ora_fact_study.",
+        "Purpose is RM (insightsrm). Did not query ora_veeva_*.",
         "lens_rm_dq / roster / assignments / staffing grids were empty or missing."
       ],
       query: "lens_rm_* (empty)",
@@ -598,7 +704,7 @@ function emptyAnswer(question) {
       q: question,
       needs: [],
       icon: "chart",
-      summary: "Cosmos answered, but no documents matched this question in ora_fact_study, TrialHub, CT.gov, or lens_* marts.",
+      summary: "Cosmos answered, but no documents matched this question in live Veeva, Salesforce, TrialHub, CT.gov, or lens_* marts.",
       chartTitle: "No matching rows",
       chartNote: "bd-budgets · read-only",
       chartType: "bar",
@@ -607,8 +713,8 @@ function emptyAnswer(question) {
       grid: "1fr",
       cols: ["Note"],
       rows: [["No matching documents"]],
-      caveat: "Gold visit/study marts are empty until the warehouse ETL runs. Intelligence containers are queried first.",
-      trace: ["Connected to bd-budgets.", "Queried lens_* then ora_fact_study / TrialHub / CT.gov. Zero matches."],
+      caveat: "Ask reads ora_veeva_* / ora_sf_* live mirrors, not ora_fact_* Excel dumps. Blank is missing, not zero.",
+      trace: ["Connected to bd-budgets.", "Queried lens_* then live Veeva / SF / TrialHub / CT.gov. Zero matches."],
       query: "-- no matching documents",
       confidence: "medium",
       followUps: [
@@ -623,11 +729,8 @@ function emptyAnswer(question) {
 
 async function getBriefing() {
   getDb();
-  const rows = await safeQuery(
-    SHARED_READ.oraFactStudy,
-    "SELECT TOP 200 c.study_number, c.indication, c.phase, c.total_enrolled, c._ts FROM c WHERE c.docType = @t",
-    [{ name: "@t", value: "ora_fact_study" }]
-  );
+  const pack = await loadLivePack();
+  const rows = pack.studies || [];
   const known = rows.filter((r) => enrolledOf(r) != null);
   const missing = rows.filter((r) => enrolledOf(r) == null);
   const top = known.slice().sort((a, b) => enrolledOf(b) - enrolledOf(a))[0];
@@ -666,7 +769,7 @@ async function fromProjectContext(question, projectNumber) {
         q: question,
         needs: ["ora", "netsuite"],
         icon: "users",
-        summary: `${sites.length} ora_fact_site row${sites.length === 1 ? "" : "s"} for studies joined to ${projectNumber}. ${bundle.join.note}`,
+        summary: `${sites.length} live Vault site row${sites.length === 1 ? "" : "s"} for studies joined to ${projectNumber}. ${bundle.join.note}`,
         chartTitle: `Sites · ${projectNumber}`,
         chartNote: "Join computed at read time · no mapping table",
         chartType: "bar",
@@ -688,10 +791,10 @@ async function fromProjectContext(question, projectNumber) {
         ]),
         caveat: bundle.join.note,
         trace: [
-          `Computed join project_number ${projectNumber} → ora_fact_study.study_number.`,
-          `Read ${SHARED_READ.oraFactSite} for those study names. Did not write.`
+          `Computed join project_number ${projectNumber} → ora_veeva_study.study_number.`,
+          `Read live ${SHARED_READ.veevaSite} for those study names. Did not write.`
         ],
-        query: `computed join ${projectNumber} → ora_fact_site`,
+        query: `computed join ${projectNumber} → ora_veeva_site`,
         confidence: studies.length ? "high" : "medium",
         followUps: [
           `What is GM on ${projectNumber}?`,
@@ -711,7 +814,7 @@ async function fromProjectContext(question, projectNumber) {
         q: question,
         needs: ["ora", "netsuite"],
         icon: "chart",
-        summary: `${studies.length} ora_fact_study row${studies.length === 1 ? "" : "s"} joined to ${projectNumber}. ${jobs.length} NetSuite job${jobs.length === 1 ? "" : "s"} share that number. ${bundle.join.note}`,
+        summary: `${studies.length} live Veeva study row${studies.length === 1 ? "" : "s"} joined to ${projectNumber}. ${jobs.length} NetSuite job${jobs.length === 1 ? "" : "s"} share that number. ${bundle.join.note}`,
         chartTitle: `Enrollment · studies joined to ${projectNumber}`,
         chartNote: "Join computed at read time · no mapping table",
         chartType: "bar",
@@ -721,7 +824,7 @@ async function fromProjectContext(question, projectNumber) {
           value: String(s.total_enrolled),
           color: "#052c49"
         })),
-        tableTitle: "ora_fact_study rows for this project number",
+        tableTitle: "ora_veeva_study rows for this project number",
         grid: "1fr 0.7fr 0.7fr 0.8fr 1fr",
         cols: ["Study", "Enrolled", "PSM", "Match", "Indication"],
         rows: studies.slice(0, 12).map((s) => [
@@ -736,7 +839,7 @@ async function fromProjectContext(question, projectNumber) {
           `Computed join: ${bundle.join.matchedOn}.`,
           "Did not write Cosmos. No mapping container."
         ],
-        query: `computed join ${projectNumber} → ora_fact_study.study_number`,
+        query: `computed join ${projectNumber} → ora_veeva_study.study_number`,
         confidence: "high",
         followUps: [
           `Sites for ${projectNumber}`,
@@ -757,7 +860,7 @@ async function fromProjectContext(question, projectNumber) {
         q: question,
         needs: ["netsuite", "ora"],
         icon: "chart",
-        summary: `${jobs.length} NetSuite job${jobs.length === 1 ? "" : "s"} for ${projectNumber}. ${studies.length} ora_fact_study match${studies.length === 1 ? "" : "es"} on study_number. ${bundle.join.note}`,
+        summary: `${jobs.length} NetSuite job${jobs.length === 1 ? "" : "s"} for ${projectNumber}. ${studies.length} live Veeva match${studies.length === 1 ? "" : "es"} on study_number. ${bundle.join.note}`,
         chartTitle: `GM% variance · ${projectNumber}`,
         chartNote: "NetSuite + computed study join · read-only",
         chartType: "bar",
@@ -789,9 +892,9 @@ async function fromProjectContext(question, projectNumber) {
         caveat: bundle.join.note,
         trace: [
           `Read ${LENS.nsProjects} for project_number = ${projectNumber}.`,
-          `Joined in-memory to ${SHARED_READ.oraFactStudy}.study_number. Did not write.`
+          `Joined in-memory to ${SHARED_READ.veevaStudy}.study_number. Did not write.`
         ],
-        query: `lens_ns_projects + computed join to ora_fact_study (${projectNumber})`,
+        query: `lens_ns_projects + computed join to ora_veeva_study (${projectNumber})`,
         confidence: "high",
         followUps: [
           `Enrollment for ${projectNumber}`,
@@ -825,9 +928,11 @@ async function answerFromCosmos(question, sources, opts) {
   if (!answer && key === "visits") answer = await fromLensVisits(question);
   if (!answer && key === "visits") answer = await fromOraFactSite(question);
   if (!answer && key === "competitive") answer = await fromRegistry(question);
+  if (!answer && key === "pipeline") answer = await fromSfPipeline(question);
+  if (!answer && key !== "competitive" && key !== "pipeline") answer = await fromOraFactStudy(question, projectNumber ? { projectNumber } : {});
   if (!answer) answer = await fromLensStudies(question);
-  if (!answer && key !== "competitive") answer = await fromOraFactStudy(question, projectNumber ? { projectNumber } : {});
   if (!answer) answer = await fromRegistry(question);
+  if (!answer) answer = await fromSfPipeline(question);
   if (!answer) answer = emptyAnswer(question);
   answer.sourcesUsed = sources;
   if (projectNumber) answer.projectNumber = projectNumber;

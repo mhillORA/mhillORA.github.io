@@ -887,7 +887,7 @@ function buildOverAnswer(question, over, stampFn) {
       trace: [
         "Joined Fact_Assignments → Dim_Employee / Dim_Role / Dim_Study per Model_Relationships.",
         "DQ_04_OverAllocatedPersonnel + assignment rollups + staffing totals.",
-        "Did not read lens_ns_projects or ora_fact_study."
+        "Did not read lens_ns_projects or ora_veeva_study."
       ],
       query: "lens_rm_dq DQ_04 + lens_rm_assignments Σ valueFte by employeeKey",
       confidence: "high",
@@ -931,7 +931,7 @@ function buildUnderAnswer(question, under, stampFn) {
       trace: [
         "Joined Fact_Assignments → Dim_Employee on employeeKey per Model_Relationships.",
         "Did not use DQ_04 (that sheet is over-allocation only).",
-        "Did not read lens_ns_projects or ora_fact_study."
+        "Did not read lens_ns_projects or ora_veeva_study."
       ],
       query: "lens_rm_assignments Σ valueFte by employeeKey vs Dim_Employee.timeAllocation (spare > 0.05)",
       confidence: "high",

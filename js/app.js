@@ -789,7 +789,7 @@
     }
     if (!state.project) {
       panel.innerHTML = `<div class="thinking">
-        <div class="thinking-row"><span class="lens-mark" aria-hidden="true"></span><span>Joining NetSuite to ora_fact_study…</span></div>
+        <div class="thinking-row"><span class="lens-mark" aria-hidden="true"></span><span>Joining NetSuite to ora_veeva_study…</span></div>
         <div class="skel" style="width:72%"></div>
         <div class="skel" style="width:48%"></div>
       </div>`;
@@ -828,7 +828,7 @@
             </div>`
           )
           .join("")
-      : `<p class="empty">No ora_fact_study.study_number matched ${escapeHtml(p.project_number)}.</p>`;
+      : `<p class="empty">No ora_veeva_study.study_number matched ${escapeHtml(p.project_number)}.</p>`;
 
     const siteRows = sites.length
       ? sites
@@ -877,7 +877,7 @@
           </div>
         </div>
         <div class="block">
-          <span class="block-title">ora_fact_study (${studies.length}) · joined on study_number</span>
+          <span class="block-title">ora_veeva_study (${studies.length}) · joined on study_number</span>
           <div class="table-wrap">
             ${
               studies.length
@@ -889,7 +889,7 @@
         ${
           sites.length
             ? `<div class="block">
-          <span class="block-title">ora_fact_site (${sites.length})</span>
+          <span class="block-title">ora_veeva_site (${sites.length})</span>
           <div class="table-wrap">
             <div class="table-head" style="grid-template-columns:1.2fr 0.8fr 0.7fr 0.6fr 0.6fr"><span>Site</span><span>Study</span><span>Country</span><span>Enrolled</span><span>Site PSM</span></div>
             ${siteRows}
@@ -2219,8 +2219,8 @@
     });
 
     help.innerHTML = `<div class="answer">
-      <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / RM / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey — including anything not used for that question. Veeva / live EDC stay not loaded until gold ETL. InsightsRM is actual RM data in lens_rm_* until the DW feed exists — not NetSuite, not a mock.</p>
-      <p class="caveat">Blank enrolled or GM is missing, not zero. Project number joins to ora_fact_study.study_number in the app — no mapping table. Ask never writes warehouse containers. Your Entra preference lives in lens_user_prefs and only frames the narrative.</p>
+      <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / RM / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey — including anything not used for that question. ClinOps reads live ora_veeva_* (study / site / milestone / subject). Salesforce pipeline uses Total_Ora_Net_Revenue__c only. InsightsRM is actual RM data in lens_rm_* until the DW feed exists — not NetSuite, not a mock.</p>
+      <p class="caveat">Blank enrolled or GM is missing, not zero. PSM needs FSI and LSI from ora_veeva_milestone — missing dates stay null. Project number joins to ora_veeva_study.study_number in the app — no mapping table. Ask never writes warehouse containers and never falls back to ora_fact_* Excel dumps. Your Entra preference lives in lens_user_prefs and only frames the narrative.</p>
     </div>`;
   }
 

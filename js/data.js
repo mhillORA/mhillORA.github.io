@@ -1,11 +1,11 @@
 const SOURCES = [
-  { id: "ora", name: "Ora clinical rollup", cat: "Studies + sites (Veeva pack)", sync: "from Cosmos", scope: "ora_fact_study + ora_fact_site", fresh: true, loaded: true },
+  { id: "ora", name: "Ora clinical (live Vault)", cat: "Studies + sites + milestones", sync: "from Cosmos", scope: "ora_veeva_study + ora_veeva_site", fresh: true, loaded: true },
   { id: "ctgov", name: "ClinicalTrials.gov", cat: "Public registry", sync: "from Cosmos", scope: "ora_ctgov_trials", fresh: true, loaded: true },
-  { id: "trialhub", name: "TrialHub", cat: "Feasibility and sites", sync: "from Cosmos", scope: "ora_trialhub_trials", fresh: true, loaded: true },
-  { id: "salesforce", name: "Salesforce", cat: "Sponsor crosswalk", sync: "from Cosmos", scope: "ora_sponsor_crosswalk", fresh: true, loaded: true },
-  { id: "veeva", name: "Veeva Vault", cat: "eTMF, regulatory, safety", sync: "not in Cosmos yet", scope: "gold ETL later", fresh: false, loaded: false },
-  { id: "imednet", name: "iMedNet", cat: "Live EDC — not a separate feed", sync: "use Ora clinical rollup", scope: "not split out yet", fresh: false, loaded: false },
-  { id: "medidata", name: "Medidata", cat: "Live EDC — not a separate feed", sync: "use Ora clinical rollup", scope: "not split out yet", fresh: false, loaded: false },
+  { id: "trialhub", name: "TrialHub", cat: "Industry feasibility", sync: "from Cosmos", scope: "ora_trialhub_trials", fresh: true, loaded: true },
+  { id: "salesforce", name: "Salesforce", cat: "Pipeline + sponsor crosswalk", sync: "from Cosmos", scope: "ora_sf_opportunity + ora_sponsor_crosswalk", fresh: true, loaded: true },
+  { id: "veeva", name: "Veeva Vault", cat: "Live study / site / milestone / subject", sync: "from Cosmos", scope: "ora_veeva_*", fresh: true, loaded: true },
+  { id: "imednet", name: "iMedNet", cat: "Live EDC — not a separate feed", sync: "use live Vault", scope: "not split out", fresh: false, loaded: false },
+  { id: "medidata", name: "Medidata", cat: "Live EDC — not a separate feed", sync: "use live Vault", scope: "not split out", fresh: false, loaded: false },
   { id: "insightsrm", name: "InsightsRM", cat: "Resource management", sync: "temporary Cosmos until DW", scope: "lens_rm_* actual FTE", fresh: true, loaded: true },
   { id: "netsuite", name: "NetSuite", cat: "Project profitability", sync: "from Cosmos", scope: "lens_ns_projects", fresh: true, loaded: true }
 ];
@@ -50,15 +50,15 @@ const PURPOSES = [
 ];
 
 const DETAIL = {
-  ora: "ora_fact_study + ora_fact_site",
-  veeva: "not loaded",
+  ora: "ora_veeva_study + ora_veeva_site",
+  veeva: "ora_veeva_* live mirrors",
   imednet: "not a separate feed",
   medidata: "not a separate feed",
   ctgov: "ora_ctgov_trials",
   trialhub: "ora_trialhub_trials",
   insightsrm: "lens_rm_* actual RM (until DW)",
   netsuite: "lens_ns_projects",
-  salesforce: "ora_sponsor_crosswalk"
+  salesforce: "ora_sf_opportunity + ora_sponsor_crosswalk"
 };
 
 const DOT = {
@@ -85,9 +85,9 @@ const ICONS = {
 };
 
 const EXAMPLE_QUESTIONS = [
-  { text: "Which Ora dry eye studies enrolled the most subjects?", icon: "chart", needs: "Certified · ora_fact_study" },
-  { text: "List Ora glaucoma studies", icon: "chart", needs: "Certified · ora_fact_study" },
-  { text: "Which Ora sites enrolled the most in dry eye?", icon: "users", needs: "Certified · ora_fact_site" },
+  { text: "Which Ora dry eye studies enrolled the most subjects?", icon: "chart", needs: "Live · ora_veeva_study" },
+  { text: "List Ora glaucoma studies", icon: "chart", needs: "Live · ora_veeva_study" },
+  { text: "Which Ora sites enrolled the most in dry eye?", icon: "users", needs: "Live · ora_veeva_site" },
   { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
   { text: "Which projects are under budgeted GM?", icon: "chart", needs: "Certified · NetSuite profitability" }
 ];
@@ -102,7 +102,8 @@ const FINANCE_QUESTIONS = [
 const BD_QUESTIONS = [
   { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
   { text: "Show competing glaucoma trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
-  { text: "Which Ora studies match this indication?", icon: "chart", needs: "ora_fact_study" }
+  { text: "What is open Salesforce pipeline?", icon: "chart", needs: "ora_sf_opportunity · Ora net $" },
+  { text: "Which Ora studies match this indication?", icon: "chart", needs: "ora_veeva_study" }
 ];
 
 const STAFFING_QUESTIONS = [
