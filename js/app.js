@@ -16,6 +16,7 @@
     },
     briefing: null,
     finance: null,
+    pipeline: null,
     rm: null,
     rmPeople: null,
     rmPersonId: "",
@@ -97,8 +98,9 @@
   function guessKey(text) {
     const t = (text || "").toLowerCase();
     if (/\b(netsuite|profitability|gross margin|\bgm\b|change order|billable)\b/.test(t)) return "netsuite";
+    if (/\b(pipeline|opportunit|net revenue|open deals|\bsalesforce\b|\bsf\b|ora net)\b/.test(t)) return "pipeline";
     if (/\b(sites?|investigator|scorecard|site psm)\b/.test(t) && !/\bvisits?\b/.test(t)) return "sites";
-    const competitive = ["competitor", "sponsor", "registry", "market", "poland", "cac", "pipeline", "bid"];
+    const competitive = ["competitor", "sponsor", "registry", "market", "poland", "cac", "bid", "trialhub", "ct.gov"];
     if (competitive.some((w) => t.includes(w))) return "competitive";
     const staffing = ["staff", "resource", "cra", "fte", "capacity", "assign", "backfill", "rolls off", "headcount", "over-allocated", "overallocated", "allocation"];
     if (staffing.some((w) => t.includes(w))) return "staffing";
@@ -111,8 +113,11 @@
   }
 
   function fmtMoney(n) {
-    if (n == null || n === "") return "—";
-    return `$${Math.round(Number(n))}`;
+    if (n == null || n === "" || !Number.isFinite(Number(n))) return "—";
+    const v = Number(n);
+    if (Math.abs(v) >= 1e6) return `$${Math.round((v / 1e6) * 10) / 10}M`;
+    if (Math.abs(v) >= 1000) return `$${Math.round(v / 1000)}K`;
+    return `$${Math.round(v)}`;
   }
 
   function gmClass(n) {
@@ -187,6 +192,8 @@
     }
     render();
     if (id === "finance") loadFinance();
+    if (id === "bd") loadPipeline();
+    if (id === "staffing") loadRm();
   }
 
   function setNav(key) {
@@ -560,6 +567,46 @@
     });
   }
 
+  function renderBdIdle(panel) {
+    const p = state.pipeline;
+    const q = typeof BD_QUESTIONS !== "undefined" ? BD_QUESTIONS : EXAMPLE_QUESTIONS;
+    if (!p) {
+      panel.innerHTML =
+        `<div class="briefing"><div class="suggest-head">Business development</div><div class="briefing-note">Loading Salesforce pipeline…</div></div>
+        <div class="suggest-head">Suggested prompts</div>` + suggestButtons(q);
+      bindSuggests(panel, q);
+      return;
+    }
+    const kpis = p.loaded
+      ? `<div class="kpi-row">
+          <div class="kpi"><div class="kpi-value">${p.open}</div><div class="kpi-label">Open opportunities</div></div>
+          <div class="kpi"><div class="kpi-value">${fmtMoney(p.openNetSum)}</div><div class="kpi-label">Open Ora net $</div></div>
+          <div class="kpi"><div class="kpi-value">${p.openWithNet}</div><div class="kpi-label">Have Ora net $</div></div>
+          <div class="kpi"><div class="kpi-value">${p.openMissingNet}</div><div class="kpi-label">Ora net missing</div></div>
+          <div class="kpi"><div class="kpi-value">${(p.stages || []).length}</div><div class="kpi-label">Stages in pipeline</div></div>
+        </div>`
+      : `<div class="briefing-note">${escapeHtml(p.note || "No Salesforce opportunities in Cosmos yet.")}</div>`;
+    const stageList = p.loaded && (p.stages || []).length
+      ? `<div class="suggest-head" style="margin-top:8px">Open pipeline by stage</div>` +
+        (p.stages || [])
+          .slice(0, 8)
+          .map(
+            (s) =>
+              `<div class="list-card"><strong>${escapeHtml(s.stage)}</strong><div class="list-meta">${s.n} open · ${fmtMoney(s.netSum)} Ora net</div></div>`
+          )
+          .join("")
+      : "";
+    panel.innerHTML =
+      `<div class="briefing">
+        <div class="suggest-head">BD briefing · Salesforce pipeline</div>
+        ${kpis}
+        <div class="briefing-note">${escapeHtml(p.asOfLabel || "")}. Stage is the pipeline indicator. Dollars are Total Ora Net Revenue only — never Amount. ${escapeHtml(p.note || "")}</div>
+      </div>
+      ${stageList}
+      <div class="suggest-head">Suggested prompts</div>` + suggestButtons(q);
+    bindSuggests(panel, q);
+  }
+
   function renderIdle() {
     const panel = document.getElementById("idlePanel");
     panel.classList.toggle("hidden", state.phase !== "idle");
@@ -571,14 +618,7 @@
     }
 
     if (state.purpose === "bd") {
-      const q = typeof BD_QUESTIONS !== "undefined" ? BD_QUESTIONS : EXAMPLE_QUESTIONS;
-      panel.innerHTML =
-        `<div class="briefing">
-          <div class="suggest-head">Business development</div>
-          <div class="briefing-note">Registry and sponsor questions. Salesforce is a crosswalk, not pipeline revenue.</div>
-        </div>
-        <div class="suggest-head">Suggested prompts</div>` + suggestButtons(q);
-      bindSuggests(panel, q);
+      renderBdIdle(panel);
       return;
     }
 
@@ -2219,8 +2259,8 @@
     });
 
     help.innerHTML = `<div class="answer">
-      <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / RM / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey — including anything not used for that question. ClinOps reads live ora_veeva_* (study / site / milestone / subject). Salesforce pipeline uses Total_Ora_Net_Revenue__c only. InsightsRM is actual RM data in lens_rm_* until the DW feed exists — not NetSuite, not a mock.</p>
-      <p class="caveat">Blank enrolled or GM is missing, not zero. PSM needs FSI and LSI from ora_veeva_milestone — missing dates stay null. Project number joins to ora_veeva_study.study_number in the app — no mapping table. Ask never writes warehouse containers and never falls back to ora_fact_* Excel dumps. Your Entra preference lives in lens_user_prefs and only frames the narrative.</p>
+      <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / RM / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey. ClinOps reads live ora_veeva_*. Salesforce pipeline uses StageName as the stage indicator and Total_Ora_Net_Revenue__c as the dollar amount — never Amount. InsightsRM is actual RM in lens_rm_* until the DW feed exists.</p>
+      <p class="caveat">Blank enrolled, GM, or Ora net $ is missing, not zero. PSM needs FSI and LSI from ora_veeva_milestone. Project number joins to ora_veeva_study.study_number — no mapping table. Ask never falls back to ora_fact_* Excel dumps.</p>
     </div>`;
   }
 
@@ -2347,6 +2387,27 @@
     if (state.phase === "idle" && state.purpose === "finance") render();
   }
 
+  async function loadPipeline() {
+    try {
+      const res = await fetch("/api/pipeline");
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Pipeline failed (${res.status})`);
+      state.pipeline = body.pipeline || null;
+    } catch (err) {
+      state.pipeline = {
+        loaded: false,
+        opportunities: 0,
+        open: 0,
+        openWithNet: 0,
+        openMissingNet: 0,
+        openNetSum: null,
+        stages: [],
+        note: String(err.message || err)
+      };
+    }
+    if (state.phase === "idle" && state.purpose === "bd") render();
+  }
+
   async function loadRm() {
     try {
       const res = await fetch("/api/rm");
@@ -2395,6 +2456,7 @@
   render();
   loadBriefing();
   loadFinance();
+  loadPipeline();
   loadRm();
   loadViewer();
 })();

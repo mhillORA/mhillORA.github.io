@@ -1,5 +1,5 @@
 const { app } = require("@azure/functions");
-const { answerFromCosmos, getBriefing } = require("./ask");
+const { answerFromCosmos, getBriefing, getSfBriefing } = require("./ask");
 const { getFinanceBriefing, getProjectBundle } = require("./projectJoin");
 const { getRmBriefing, getRmPeopleBoard } = require("./rmPack");
 const { foundryStatus } = require("./foundry");
@@ -89,6 +89,20 @@ app.http("finance", {
     try {
       const finance = await getFinanceBriefing();
       return json(200, { finance });
+    } catch (err) {
+      return json(503, { error: String(err.message || err) });
+    }
+  }
+});
+
+app.http("pipeline", {
+  methods: ["GET"],
+  authLevel: "anonymous",
+  route: "pipeline",
+  handler: async () => {
+    try {
+      const pipeline = await getSfBriefing();
+      return json(200, { pipeline });
     } catch (err) {
       return json(503, { error: String(err.message || err) });
     }

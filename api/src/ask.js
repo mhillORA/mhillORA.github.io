@@ -4,6 +4,7 @@ const { getProjectBundle, studyMatchesProject } = require("./projectJoin");
 const { getViewerContext, foundryViewerSlice } = require("./userPrefs");
 const { answerRmQuestion, looksLikeRmRefinement } = require("./rmPack");
 const { loadLivePack } = require("./veevaLive");
+const { loadOpportunities, isOppOpen, pickOraNetRevenue, moneyLabel, getSfBriefing } = require("./sfPipeline");
 
 function guessKey(text, priorTurns) {
   const t = String(text || "").toLowerCase();
@@ -13,7 +14,7 @@ function guessKey(text, priorTurns) {
   if (/(site scorecard|which sites|site performance|site psm|investigators?|\bsites?\b)/.test(t) && !/\bvisits?\b/.test(t)) {
     return "sites";
   }
-  if (/(pipeline|opportunit|net revenue|open deals|salesforce account)/.test(t)) {
+  if (/(pipeline|opportunit|net revenue|open deals|\bsalesforce\b|\bsf\b|ora net)/.test(t)) {
     return "pipeline";
   }
   if (/(competitor|sponsor|registry|market|poland|cac|bid|trialhub|ct\.gov|clinicaltrials)/.test(t)) {
@@ -589,13 +590,7 @@ async function fromRegistry(question) {
 }
 
 async function fromSfPipeline(question) {
-  const rows = await safeQuery(
-    SHARED_READ.sfOpportunity,
-    `SELECT TOP 80 c.Name, c.StageName, c.IsClosed, c.IsWon, c.CloseDate, c.AccountId,
-            c.Total_Ora_Net_Revenue__c, c._ts
-     FROM c WHERE c.docType = @t`,
-    [{ name: "@t", value: "ora_sf_opportunity" }]
-  );
+  const rows = await loadOpportunities();
   if (!rows.length) {
     return stamp(
       {
@@ -603,16 +598,16 @@ async function fromSfPipeline(question) {
         needs: ["salesforce"],
         icon: "chart",
         summary:
-          "Live Salesforce opportunity ingest has not landed (ora_sf_opportunity is empty). Data Lens does not use Amount and does not fall back to Excel dumps.",
+          "Salesforce pipeline ingest has not landed (ora_sf_opportunity is empty). Stage and Total Ora Net Revenue are not available yet — Data Lens does not invent pipeline $ or fall back to Amount.",
         chartTitle: "No Salesforce opportunities",
-        chartNote: "ora_sf_opportunity · Total_Ora_Net_Revenue__c only",
+        chartNote: "ora_sf_opportunity · Total Ora Net Revenue only",
         chartType: "bar",
         bars: [],
         tableTitle: "Result",
         grid: "1fr",
         cols: ["Note"],
-        rows: [["Workbench ingest of ora_sf_opportunity has not written documents this SWA can read."]],
-        caveat: "Pipeline $ is Total_Ora_Net_Revenue__c only — never Amount. Never mix with 10-K.",
+        rows: [["Workbench Salesforce table sync has not written ora_sf_opportunity documents this SWA can read."]],
+        caveat: "Pipeline indicator = StageName. Pipeline $ = Total_Ora_Net_Revenue__c only — never Amount, never 10-K.",
         trace: [`Queried ${SHARED_READ.sfOpportunity}. Zero documents.`],
         query: "ora_sf_opportunity empty",
         confidence: "low",
@@ -621,47 +616,51 @@ async function fromSfPipeline(question) {
       []
     );
   }
-  const netOf = (r) => numOrNull(r.Total_Ora_Net_Revenue__c);
-  const open = rows.filter((r) => r.IsClosed !== true && !/^closed/i.test(String(r.StageName || "")));
-  const known = open.filter((r) => netOf(r) != null);
+  const open = rows.filter(isOppOpen);
+  const known = open.filter((r) => pickOraNetRevenue(r).value != null);
   const missing = open.length - known.length;
   const byStage = {};
   for (const r of known) {
     const st = String(r.StageName || "—").trim() || "—";
-    byStage[st] = (byStage[st] || 0) + netOf(r);
+    byStage[st] = (byStage[st] || 0) + pickOraNetRevenue(r).value;
   }
   const stageRows = Object.entries(byStage).sort((a, b) => b[1] - a[1]).slice(0, 8);
   const max = Math.max(1, ...stageRows.map((x) => x[1]));
-  const money = (n) => (n == null ? "—" : `$${Math.round(n / 1000)}K`);
+  const ranked = known.slice().sort((a, b) => pickOraNetRevenue(b).value - pickOraNetRevenue(a).value);
   return stamp(
     {
       q: question,
       needs: ["salesforce"],
       icon: "chart",
-      summary: `${open.length} open Salesforce opportunities. ${known.length} have Total_Ora_Net_Revenue__c; ${missing} are missing $ (not zero). Bars are Ora net revenue by stage — not Amount, not 10-K.`,
-      chartTitle: "Open pipeline · Total_Ora_Net_Revenue__c by stage",
-      chartNote: "ora_sf_opportunity · never Amount",
+      summary: `${open.length} open Salesforce opportunities (of ${rows.length} total). Stage is the pipeline indicator. ${known.length} have Total Ora Net Revenue; ${missing} are missing $ (not zero). Bars are Ora net $ by stage — never Amount.`,
+      chartTitle: "Open pipeline · Total Ora Net Revenue by stage",
+      chartNote: "ora_sf_opportunity · StageName + Total_Ora_Net_Revenue__c",
       chartType: "bar",
       bars: stageRows.map(([label, n]) => ({
         label,
         pct: Math.round((n / max) * 100),
-        value: money(n),
+        value: moneyLabel(n),
         color: "#273b8a"
       })),
-      tableTitle: "Open opportunities",
-      grid: "1.3fr .8fr .8fr .8fr",
+      tableTitle: "Open opportunities (Ora net $)",
+      grid: "1.3fr .9fr .7fr .8fr",
       cols: ["Opportunity", "Stage", "Close", "Ora net $"],
-      rows: open.slice(0, 12).map((r) => [
+      rows: ranked.slice(0, 12).map((r) => [
         r.Name || "—",
         r.StageName || "—",
         r.CloseDate || "—",
-        money(netOf(r))
+        moneyLabel(pickOraNetRevenue(r).value)
       ]),
       missingCount: missing,
-      missingNote: missing ? `${missing} open opps have Total_Ora_Net_Revenue__c missing — omitted from the chart, not plotted as $0.` : "",
-      caveat: "Salesforce $ = Total_Ora_Net_Revenue__c only. Do not mix with CT.gov, TrialHub, or public 10-K revenue.",
-      trace: [`Read ${SHARED_READ.sfOpportunity}. Did not select Amount.`],
-      query: "ora_sf_opportunity Total_Ora_Net_Revenue__c (open)",
+      missingNote: missing
+        ? `${missing} open opportunities have Total Ora Net Revenue missing — omitted from the chart, not plotted as $0.`
+        : "",
+      caveat: "Salesforce pipeline: StageName = stage. $ = Total_Ora_Net_Revenue__c only. Never Amount (contract). Never mix with CT.gov / TrialHub / 10-K.",
+      trace: [
+        `Read all ${rows.length} rows from ${SHARED_READ.sfOpportunity}.`,
+        "Open = not IsClosed and stage not Closed*. Aggregated Total Ora Net Revenue by StageName. Did not select Amount."
+      ],
+      query: "ora_sf_opportunity · StageName + Total_Ora_Net_Revenue__c (open)",
       confidence: "high",
       followUps: ["Show competing dry eye trials", "Which Ora dry eye studies enrolled the most subjects?"]
     },
@@ -976,4 +975,4 @@ async function answerFromCosmos(question, sources, opts) {
   return answer;
 }
 
-module.exports = { answerFromCosmos, guessKey, getBriefing };
+module.exports = { answerFromCosmos, guessKey, getBriefing, getSfBriefing };

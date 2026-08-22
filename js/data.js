@@ -2,7 +2,7 @@ const SOURCES = [
   { id: "ora", name: "Ora clinical (live Vault)", cat: "Studies + sites + milestones", sync: "from Cosmos", scope: "ora_veeva_study + ora_veeva_site", fresh: true, loaded: true },
   { id: "ctgov", name: "ClinicalTrials.gov", cat: "Public registry", sync: "from Cosmos", scope: "ora_ctgov_trials", fresh: true, loaded: true },
   { id: "trialhub", name: "TrialHub", cat: "Industry feasibility", sync: "from Cosmos", scope: "ora_trialhub_trials", fresh: true, loaded: true },
-  { id: "salesforce", name: "Salesforce", cat: "Pipeline + sponsor crosswalk", sync: "from Cosmos", scope: "ora_sf_opportunity + ora_sponsor_crosswalk", fresh: true, loaded: true },
+  { id: "salesforce", name: "Salesforce", cat: "Pipeline (stage + Ora net $)", sync: "from Cosmos", scope: "ora_sf_opportunity · StageName + Total_Ora_Net_Revenue__c", fresh: true, loaded: true },
   { id: "veeva", name: "Veeva Vault", cat: "Live study / site / milestone / subject", sync: "from Cosmos", scope: "ora_veeva_*", fresh: true, loaded: true },
   { id: "imednet", name: "iMedNet", cat: "Live EDC — not a separate feed", sync: "use live Vault", scope: "not split out", fresh: false, loaded: false },
   { id: "medidata", name: "Medidata", cat: "Live EDC — not a separate feed", sync: "use live Vault", scope: "not split out", fresh: false, loaded: false },
@@ -43,7 +43,7 @@ const PURPOSES = [
   {
     id: "bd",
     label: "Business development",
-    hint: "Registry and sponsors",
+    hint: "Pipeline, registry, sponsors",
     workspace: "bd",
     ids: ["salesforce", "ctgov", "trialhub"]
   }
@@ -58,7 +58,7 @@ const DETAIL = {
   trialhub: "ora_trialhub_trials",
   insightsrm: "lens_rm_* actual RM (until DW)",
   netsuite: "lens_ns_projects",
-  salesforce: "ora_sf_opportunity + ora_sponsor_crosswalk"
+  salesforce: "StageName + Total_Ora_Net_Revenue__c"
 };
 
 const DOT = {
@@ -100,9 +100,9 @@ const FINANCE_QUESTIONS = [
 ];
 
 const BD_QUESTIONS = [
+  { text: "What is open Salesforce pipeline?", icon: "chart", needs: "Stage · Total Ora Net Revenue" },
   { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
   { text: "Show competing glaucoma trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
-  { text: "What is open Salesforce pipeline?", icon: "chart", needs: "ora_sf_opportunity · Ora net $" },
   { text: "Which Ora studies match this indication?", icon: "chart", needs: "ora_veeva_study" }
 ];
 
