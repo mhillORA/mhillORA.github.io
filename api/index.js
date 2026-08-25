@@ -4451,12 +4451,14 @@ async function crudHandler(context, request, containerName) {
                                         // Travel range = all dates we might have ever created for this shift (default range)
                                         const rangeDates = [defaults.start, defaults.end, startDatePref, endDatePref].filter(Boolean);
                                         const uniqueRangeDates = Array.from(new Set(rangeDates));
-                                        // Remove stale travel days: for this CRC, delete any travel day on range dates that is NOT in the new datesToCreate (edit changed travel dates)
+                                        // Remove stale travel days ONLY when linked to this shift
                                         for (const travelDate of uniqueRangeDates) {
                                             if (datesToCreateSet.has(travelDate)) continue;
                                             const travelDaysOnDate = await getTravelDaysForDate(travelDate, crcId);
+                                            const shiftForTravel = { ...result, id: updateId };
                                             const forThisCrc = (travelDaysOnDate || []).filter(td => {
                                                 if (!td || td.type !== 'Travel Day') return false;
+                                                if (!isTravelDayLinkedToShift(td, shiftForTravel)) return false;
                                                 if (td.crcId === crcId) return true;
                                                 if (td.crcIds && Array.isArray(td.crcIds) && td.crcIds.includes(crcId)) return true;
                                                 return false;
@@ -4668,6 +4670,48 @@ async function crudHandler(context, request, containerName) {
                     
                     // AUDIT LOG: Record what's being deleted for debugging/recovery
                     if (containerName === 'events' && resource) {
+                        // HARDEN: Site Assignments may only be deleted with an explicit client intent header.
+                        // This blocks accidental cascade/system deletes that omit the header.
+                        if (resource.type === 'Site Assignment') {
+                            const intent = String(
+                                request.headers.get?.('x-chaos-intent') ||
+                                request.headers.get?.('X-Chaos-Intent') ||
+                                ''
+                            ).trim().toLowerCase();
+                            if (intent !== 'delete') {
+                                context.log.warn(`[AUDIT DELETE BLOCKED] Site Assignment ${id} missing x-chaos-intent=delete`);
+                                try {
+                                    await ensureClientErrorsContainer();
+                                    await getContainer('client-errors').items.create({
+                                        id: generateId(),
+                                        createdAt: new Date().toISOString(),
+                                        source: 'api.event.delete-blocked',
+                                        message: `Blocked Site Assignment delete without intent header: ${id}${resource.date ? ` on ${resource.date}` : ''}`,
+                                        path: `/events/${id}`,
+                                        method: 'DELETE',
+                                        username: String(request.headers.get?.('x-username') || '').slice(0, 120),
+                                        userId: String(request.headers.get?.('x-user-id') || '').slice(0, 120),
+                                        permissionLevel: String(request.headers.get?.('x-user-permission') || '').slice(0, 40),
+                                        context: 'missing x-chaos-intent=delete',
+                                        details: JSON.stringify({
+                                            id: resource.id,
+                                            type: resource.type,
+                                            date: resource.date || resource.startDate || null,
+                                            siteId: resource.siteId || null,
+                                            groupId: resource.groupId || null
+                                        }).slice(0, 6000),
+                                        fingerprint: `api.event.delete-blocked|${id}|${Date.now()}`
+                                    });
+                                } catch (auditErr) {
+                                    context.log.warn(`Failed to persist blocked-delete audit: ${auditErr.message}`);
+                                }
+                                return {
+                                    status: 403,
+                                    jsonBody: { error: 'Site Assignment delete requires explicit intent. Refresh and try again from the schedule UI.' },
+                                    headers: { 'Content-Type': 'application/json' }
+                                };
+                            }
+                        }
                         context.log.info(`[AUDIT DELETE] Event ${id} | Type: ${resource.type} | Date: ${resource.date} | Site: ${resource.siteId} | CRCs: ${JSON.stringify(resource.crcIds || resource.crcId)} | RoleAssignments: ${JSON.stringify(Object.keys(resource.roleAssignments || {}))}`);
                         // Persist a durable audit row so Managers can see deletes in Client Error Log
                         try {

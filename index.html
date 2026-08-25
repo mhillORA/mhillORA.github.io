@@ -2770,7 +2770,9 @@
                         'x-user-id': state.currentUser?.id || '',
                         'x-user-permission': (typeof getEffectivePermissionLevel === 'function'
                             ? getEffectivePermissionLevel(state.currentUser)
-                            : null) || state.currentUser?.permissionLevel || ''
+                            : null) || state.currentUser?.permissionLevel || '',
+                        // Required by API for Site Assignment deletes — blocks accidental/system deletes.
+                        'x-chaos-intent': 'delete'
                     };
                     const out = await this.request(`/events/${eventId}`, {
                         method: 'DELETE',
@@ -38429,17 +38431,29 @@
                                     // Multi-day *grouped* shifts store one event per calendar day (`date`), but each row often
                                     // still carries `startDate`/`endDate` denormalized to the full series. Comparing the form
                                     // (which defaults to *this row's* day only) against that series end incorrectly flags
-                                    // `dateRangeChanged` and runs the "delete entire group and recreate" path — blocking normal per-day edits.
+                                    // `dateRangeChanged` / `changedFromMultiDay` and deletes the rest of the week.
                                     const groupSeriesRows = existingGroupId
                                         ? state.crc_events.filter(e => e.groupId === existingGroupId && e.type !== 'Travel Day')
                                         : [];
-                                    const isGroupedMultiDaySeries = !!(existingGroupId && existingEvent.groupId && groupSeriesRows.length > 1);
+                                    const isGroupedSeriesRow = !!(existingGroupId && existingEvent.groupId);
+                                    const isGroupedMultiDaySeries = !!(isGroupedSeriesRow && groupSeriesRows.length > 1);
+                                    // Multi-day series: default edit is THIS DAY only. Never delete/recreate
+                                    // the whole group unless "Apply changes to all days" is checked.
+                                    const applyToAllDaysEarly = form.querySelector('input[name="applyToAllDaysInShift"]')?.checked === true;
                                     let oldStartDateStr;
                                     let oldEndDateStr;
-                                    if (isGroupedMultiDaySeries) {
+                                    if (isGroupedSeriesRow && !applyToAllDaysEarly) {
+                                        // Always treat per-day edits as single-day vs this row — never trust denormalized endDate.
                                         const rowDay = toDateOnlyString(parseDateFlexible(existingEvent.date || existingEvent.startDate));
                                         oldStartDateStr = rowDay;
                                         oldEndDateStr = rowDay;
+                                    } else if (isGroupedSeriesRow && applyToAllDaysEarly && groupSeriesRows.length > 0) {
+                                        const seriesDays = groupSeriesRows
+                                            .map(e => toDateOnlyString(parseDateFlexible(e.date || e.startDate)))
+                                            .filter(Boolean)
+                                            .sort();
+                                        oldStartDateStr = seriesDays[0];
+                                        oldEndDateStr = seriesDays[seriesDays.length - 1];
                                     } else {
                                         const oldStartDate = existingEvent.date || existingEvent.startDate;
                                         const oldEndDate = existingEvent.endDate || existingEvent.date;
@@ -38460,10 +38474,9 @@
                                     // Check if changing from single-day to multi-day (or vice versa)
                                     const wasSingleDay = oldStartDateStr === oldEndDateStr;
                                     const isNowMultiDay = newStartDateStr !== newEndDateStr;
-                                    // Multi-day series: default edit is THIS DAY only. Never delete/recreate
-                                    // the whole group unless "Apply changes to all days" is checked.
-                                    const applyToAllDaysEarly = form.querySelector('input[name="applyToAllDaysInShift"]')?.checked === true;
-                                    const mayRewriteWholeGroup = !isGroupedMultiDaySeries || applyToAllDaysEarly;
+                                    // HARD RULE: grouped one-row-per-day shifts never cascade-delete
+                                    // sibling days unless Apply to all days is checked.
+                                    const mayRewriteWholeGroup = !isGroupedSeriesRow || applyToAllDaysEarly;
                                     const changedToMultiDay = wasSingleDay && isNowMultiDay && mayRewriteWholeGroup;
                                     const changedFromMultiDay = !wasSingleDay && !isNowMultiDay && mayRewriteWholeGroup;
                                     
