@@ -1516,6 +1516,53 @@
                 };
             };
 
+            /**
+             * If an action would delete more schedule rows than the user explicitly asked for,
+             * stop and require confirmation. Resolves true only if they confirm.
+             */
+            const confirmExtraScheduleDeletes = ({
+                title = 'Confirm extra deletes',
+                requestedLabel = '1 item',
+                requestedCount = 1,
+                willDeleteCount = 0,
+                detailsLines = [],
+                confirmLabel = null,
+                forceConfirm = false
+            } = {}) => {
+                const requested = Math.max(1, Number(requestedCount) || 1);
+                const total = Number(willDeleteCount) || 0;
+                const extra = Math.max(0, total - requested);
+                if (!forceConfirm && extra <= 0) return Promise.resolve(true);
+                return new Promise((resolve) => {
+                    const finish = (ok) => {
+                        try {
+                            window.__chaosCascadeConfirmResolve = null;
+                        } catch (_) { /* ignore */ }
+                        try { closeModal(); } catch (_) { /* ignore */ }
+                        resolve(!!ok);
+                    };
+                    window.__chaosCascadeConfirmResolve = finish;
+                    const lines = (detailsLines || [])
+                        .filter(Boolean)
+                        .map((line) => `<li>${String(line).replace(/</g, '&lt;')}</li>`)
+                        .join('');
+                    const btnLabel = confirmLabel || `Yes, delete all ${total}`;
+                    const extraText = extra > 0
+                        ? ` (<strong>${extra}</strong> more than you selected)`
+                        : '';
+                    openModal(`
+                        <h3 class="text-xl font-bold dark:text-white mb-3">${String(title).replace(/</g, '&lt;')}</h3>
+                        <p class="dark:text-gray-300 mb-3">You asked to change <strong>${String(requestedLabel).replace(/</g, '&lt;')}</strong>, but this would remove <strong>${total}</strong> schedule row(s)${extraText}.</p>
+                        ${lines ? `<ul class="list-disc ml-5 mb-4 text-sm text-gray-700 dark:text-gray-300 space-y-1">${lines}</ul>` : ''}
+                        <p class="text-sm text-amber-800 dark:text-amber-200 mb-6">Nothing will be deleted unless you confirm.</p>
+                        <div class="flex justify-end gap-3 flex-wrap">
+                            <button type="button" data-action="cascade-confirm-cancel" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button type="button" data-action="cascade-confirm-ok" class="py-2 px-4 rounded-md bg-red-700 text-white hover:bg-red-800">${btnLabel.replace(/</g, '&lt;')}</button>
+                        </div>
+                    `, 'lg');
+                });
+            };
+
             window.addEventListener('error', (event) => {
                 reportClientError({
                     source: 'window.onerror',
@@ -6329,7 +6376,7 @@
                 return sameGroup.length ? sameGroup : [event];
             };
 
-            const deleteSiteAssignmentWithDuplicates = async (eventOrId) => {
+            const deleteSiteAssignmentWithDuplicates = async (eventOrId, options = {}) => {
                 const event = typeof eventOrId === 'string' ? findEventAnywhere(eventOrId) : eventOrId;
                 const primaryId = event?.id || (typeof eventOrId === 'string' ? eventOrId : null);
                 if (!primaryId) throw new Error('Cannot delete: missing event id');
@@ -6337,6 +6384,37 @@
                     ? findDeletableSiteAssignmentCopies(event)
                     : [event || { id: primaryId }];
                 const ids = [...new Set(toDelete.map((e) => e.id).filter(Boolean))];
+                const linkedTravel = (typeof findTravelDaysLinkedToShift === 'function' && event)
+                    ? findTravelDaysLinkedToShift(event)
+                    : [];
+                const travelIds = [...new Set((linkedTravel || []).map((t) => t?.id).filter(Boolean))];
+                const totalImpact = ids.length + travelIds.length;
+                if (!options.skipConfirm && totalImpact > 1) {
+                    const dateList = toDelete
+                        .map((e) => e?.date || e?.startDate)
+                        .filter(Boolean)
+                        .slice(0, 8)
+                        .join(', ');
+                    const ok = await confirmExtraScheduleDeletes({
+                        title: 'This deletes more than one row',
+                        requestedLabel: options.requestedLabel || '1 shift',
+                        willDeleteCount: totalImpact,
+                        detailsLines: [
+                            ids.length > 1 ? `${ids.length} shift row(s) (includes duplicate copies)` : '1 shift row',
+                            travelIds.length ? `${travelIds.length} linked travel day(s)` : null,
+                            dateList ? `Dates: ${dateList}` : null
+                        ].filter(Boolean)
+                    });
+                    if (!ok) {
+                        reportScheduleAudit('event.delete-cancelled-by-user', {
+                            eventId: primaryId,
+                            ids,
+                            travelIds,
+                            reason: 'user declined expanded delete'
+                        });
+                        return { deleted: 0, failed: 0, ids: [], cancelled: true };
+                    }
+                }
                 reportScheduleAudit('event.delete-with-copies', {
                     eventId: primaryId,
                     ids,
@@ -31964,6 +32042,20 @@
                         openModal(getCRCEventModalHTML(toDateOnlyString(new Date())), '4xl'); 
                         break;
                     case 'close-modal': closeModal(); break;
+                    case 'cascade-confirm-cancel': {
+                        const resolveCancel = window.__chaosCascadeConfirmResolve;
+                        window.__chaosCascadeConfirmResolve = null;
+                        if (typeof resolveCancel === 'function') resolveCancel(false);
+                        else closeModal();
+                        break;
+                    }
+                    case 'cascade-confirm-ok': {
+                        const resolveOk = window.__chaosCascadeConfirmResolve;
+                        window.__chaosCascadeConfirmResolve = null;
+                        if (typeof resolveOk === 'function') resolveOk(true);
+                        else closeModal();
+                        break;
+                    }
                     case 'prev-crc-month': 
                         setState({ crcCalendarDate: new Date(state.crcCalendarDate.getFullYear(), state.crcCalendarDate.getMonth() - 1, 1) }); 
                         (async () => { await ensureEventsCoverVisibleMonth(); await ensureFinalizedSnapshotForCurrentMonth(); if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar(); })();
@@ -34058,19 +34150,26 @@
                             break;
                         }
                         if (groupId) {
+                            const seriesRows = state.crc_events.filter(e => e.groupId === groupId && e.type !== 'Travel Day');
+                            const seriesTravel = state.crc_events.filter(e => e.type === 'Travel Day' && e.parentShiftGroupId === groupId);
                             openModal(`
                                 <h3 class="text-xl font-bold dark:text-white mb-4">Delete Event Series</h3>
-                                <p class="dark:text-gray-300 mb-6">This event is part of a series. Do you want to delete only this single event or the entire series?</p>
-                                <div class="flex justify-end gap-4">
+                                <p class="dark:text-gray-300 mb-3">This event is part of a series (<strong>${seriesRows.length}</strong> day(s)${seriesTravel.length ? `, ${seriesTravel.length} travel day(s)` : ''}).</p>
+                                <p class="dark:text-gray-300 mb-6">Delete only this single day, or the entire series?</p>
+                                <div class="flex justify-end gap-4 flex-wrap">
                                     <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
                                     <button data-action="delete-single-event" data-event-id="${eventId}" class="py-2 px-4 rounded-md bg-red-600 text-white hover:bg-red-700">Delete Just This One</button>
-                                    <button data-action="delete-event-series" data-group-id="${groupId}" class="py-2 px-4 rounded-md bg-red-800 text-white hover:bg-red-900">Delete Entire Series</button>
+                                    <button data-action="delete-event-series" data-group-id="${groupId}" class="py-2 px-4 rounded-md bg-red-800 text-white hover:bg-red-900">Delete Entire Series (${seriesRows.length + seriesTravel.length})</button>
                                 </div>
                             `);
                         } else {
                             try {
                             const eventToDelete = findEventAnywhere(eventId) || state.crc_events.find(e => e.id === eventId);
                             const result = await deleteSiteAssignmentWithDuplicates(eventToDelete || eventId);
+                            if (result?.cancelled) {
+                                showNotification('Delete cancelled — nothing was removed.', 'info');
+                                break;
+                            }
                                 // Log change for Catch-Up
                                 if (eventToDelete) {
                                     const siteName = eventToDelete.siteId ? (state.crc_sites.find(s => s.id === eventToDelete.siteId)?.name || 'Unknown Site') : null;
@@ -34107,6 +34206,10 @@
                         try {
                         const eventToDelete = findEventAnywhere(eventId) || state.crc_events.find(e => e.id === eventId);
                         const result = await deleteSiteAssignmentWithDuplicates(eventToDelete || eventId);
+                        if (result?.cancelled) {
+                            showNotification('Delete cancelled — nothing was removed.', 'info');
+                            break;
+                        }
                             // Log change for Catch-Up
                             if (eventToDelete) {
                                 const siteName = eventToDelete.siteId ? (state.crc_sites.find(s => s.id === eventToDelete.siteId)?.name || 'Unknown Site') : null;
@@ -34154,6 +34257,22 @@
                         const allShiftCopies = [...eventsToDelete, ...extraCopies];
                         // Also delete travel days linked to this shift series via parentShiftGroupId
                         const linkedTravelDays = state.crc_events.filter(e => e.type === 'Travel Day' && e.parentShiftGroupId === groupId);
+                        const totalImpact = allShiftCopies.length + linkedTravelDays.length;
+                        const statedSeriesCount = eventsToDelete.length + linkedTravelDays.length;
+                        const ok = await confirmExtraScheduleDeletes({
+                            title: 'Delete entire series?',
+                            requestedLabel: 'the whole series',
+                            requestedCount: Math.max(1, statedSeriesCount),
+                            willDeleteCount: totalImpact,
+                            forceConfirm: totalImpact > 1,
+                            detailsLines: [
+                                `${allShiftCopies.length} shift day(s)`,
+                                linkedTravelDays.length ? `${linkedTravelDays.length} linked travel day(s)` : null,
+                                extraCopies.length ? `${extraCopies.length} duplicate copy row(s)` : null
+                            ].filter(Boolean),
+                            confirmLabel: `Yes, delete all ${totalImpact}`
+                        });
+                        if (!ok) break;
                         let seriesDeleteErrors = 0;
                         // Delete each event individually
                         for (const event of allShiftCopies) {
@@ -34408,6 +34527,22 @@
                                     expandedEventIds.add(id);
                                 }
                             });
+                            if (expandedEventIds.size > eventIds.length) {
+                                const okBulk = await confirmExtraScheduleDeletes({
+                                    title: 'Bulk delete includes extra copies',
+                                    requestedLabel: `${eventIds.length} selected item(s)`,
+                                    requestedCount: eventIds.length,
+                                    willDeleteCount: expandedEventIds.size + ptoRequestIds.length,
+                                    detailsLines: [
+                                        `${expandedEventIds.size} event row(s) after including duplicates`,
+                                        ptoRequestIds.length ? `${ptoRequestIds.length} PTO request(s)` : null
+                                    ].filter(Boolean)
+                                });
+                                if (!okBulk) {
+                                    showNotification('Bulk delete cancelled.', 'info');
+                                    break;
+                                }
+                            }
                             // Delete regular events
                             for (const eventId of expandedEventIds) {
                                 try {
@@ -38487,6 +38622,31 @@
                                         const groupEvents = state.crc_events.filter(e => 
                                             e.groupId === existingGroupId && e.type !== 'Travel Day'
                                         );
+                                        if (groupEvents.length > 1) {
+                                            const dayList = groupEvents
+                                                .map(e => e.date || e.startDate)
+                                                .filter(Boolean)
+                                                .sort()
+                                                .slice(0, 12)
+                                                .join(', ');
+                                            const okRewrite = await confirmExtraScheduleDeletes({
+                                                title: 'Date range change removes multiple days',
+                                                requestedLabel: 'this date-range edit',
+                                                requestedCount: 1,
+                                                willDeleteCount: groupEvents.length,
+                                                forceConfirm: true,
+                                                detailsLines: [
+                                                    `Will delete ${groupEvents.length} existing day(s) and recreate the new range`,
+                                                    dayList ? `Current days: ${dayList}` : null,
+                                                    `New range: ${newStartDateStr} → ${newEndDateStr}`
+                                                ].filter(Boolean),
+                                                confirmLabel: `Yes, replace ${groupEvents.length} days`
+                                            });
+                                            if (!okRewrite) {
+                                                showNotification('Date range change cancelled — nothing was deleted.', 'info');
+                                                return;
+                                            }
+                                        }
                                         // Preserve travel days tied to this group (linked via parentShiftGroupId)
                                         const travelDayEvents = state.crc_events.filter(e => 
                                             e.parentShiftGroupId === existingGroupId && e.type === 'Travel Day'
@@ -38856,6 +39016,24 @@
                                             e.id !== eventId &&
                                             e.type !== 'Travel Day'
                                         );
+                                        if (groupEvents.length > 0) {
+                                            const okShrink = await confirmExtraScheduleDeletes({
+                                                title: 'Shrinking to one day removes other days',
+                                                requestedLabel: 'this one day',
+                                                requestedCount: 1,
+                                                willDeleteCount: groupEvents.length + 1,
+                                                forceConfirm: true,
+                                                detailsLines: [
+                                                    `Will keep this day and delete ${groupEvents.length} other day(s) in the series`,
+                                                    groupEvents.map(e => e.date || e.startDate).filter(Boolean).slice(0, 12).join(', ')
+                                                ].filter(Boolean),
+                                                confirmLabel: `Yes, delete ${groupEvents.length} other day(s)`
+                                            });
+                                            if (!okShrink) {
+                                                showNotification('Change cancelled — other days were kept.', 'info');
+                                                return;
+                                            }
+                                        }
                                         
                                         // Update the remaining event to remove groupId and set endDate to same as date
                                         // Preserve shift type when editing so we never turn a shift into travel
@@ -39142,6 +39320,10 @@
                                         const payloadType = (isGroupEvent && existingGroupId)
                                             ? 'Site Assignment'
                                             : (isEditing && existingEvent ? existingEvent.type : data.eventType);
+                                        // Per-day grouped edits: force endDate = this day so denormalized series endDate cannot poison later saves.
+                                        const saveEndDateStr = (isGroupEvent && existingGroupId && !applyToAllDays)
+                                            ? startDateStr
+                                            : toDateOnlyString(endDateObj);
                                         const updatePayload = {
                                             ...baseEventData,
                                             // CRITICAL: Preserve the event ID and type to ensure it's an UPDATE, not a delete
@@ -39157,7 +39339,7 @@
                                             groupNumber: groupNumberValue,
                                             date: startDateStr,
                                             startDate: startDateStr,
-                                            endDate: toDateOnlyString(endDateObj),
+                                            endDate: saveEndDateStr,
                                             // Keep prefs for assigned CRCs; also include removed CRCs so the API can delete their travel (see api travelDayPreferences cleanup loop).
                                             travelDayPreferences: (() => {
                                                 const merged = { ...(existingEvent?.travelDayPreferences || {}), ...travelDayPreferences };
