@@ -268,14 +268,63 @@ def load_aliases() -> dict[str, str]:
     return {str(k): str(v) for k, v in raw.items() if not str(k).startswith("_") and v}
 
 
+def is_address_like_name(name: str) -> bool:
+    """True when a 'name' is really a street address (not a practice name)."""
+    n = (name or "").strip()
+    if not n:
+        return True
+    if is_phone_name(n) or EMAIL_RE.match(n):
+        return True
+    # "123 Main St…" / "123 Main Street, City, ST 12345"
+    if re.match(
+        r"^\d+\s+.+\b(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|hwy|pkwy|parkway|circle|cir|suite|ste)\b",
+        n,
+        re.I,
+    ):
+        return True
+    if ZIP_RE.search(n) and re.search(
+        r"\b(st|street|ave|avenue|rd|road|blvd|dr|drive|ln|lane|way|suite|ste)\b", n, re.I
+    ):
+        return True
+    return False
+
+
+def preferred_display_name(ident_bits: dict) -> str | None:
+    """Never use a raw street address as the site title."""
+    names = [n for n in (ident_bits.get("names") or []) if n and not is_address_like_name(n) and not is_unusable_name(n)]
+    if names:
+        return sorted(names, key=lambda x: (-len(x), x))[0]
+
+    pis = ident_bits.get("pis") or []
+    addrs = ident_bits.get("addresses") or []
+    city = ""
+    if addrs:
+        city = (addrs[0].get("address_city") or "") if isinstance(addrs[0], dict) else ""
+    if not city and addrs and isinstance(addrs[0], dict) and addrs[0].get("address_raw"):
+        city = parse_address_blob(addrs[0]["address_raw"]).get("address_city") or ""
+
+    if pis:
+        pi = pis[0]
+        return f"{pi} - {city}" if city else f"{pi} (site)"
+
+    if city:
+        return f"Site in {city}"
+
+    # last resort: keep non-address canonical if any
+    canonical = ident_bits.get("canonical_name") or ""
+    if canonical and not is_address_like_name(canonical) and not is_unusable_name(canonical):
+        return canonical
+    return None
+
+
 def extract_site_identity(site_key: str, site: dict) -> dict:
     """Pull best display name, addresses, PIs, emails from nested surveys."""
     canonical = (site.get("canonical_name") or site_key or "").strip()
     names = set()
-    if canonical and not is_unusable_name(canonical):
+    if canonical and not is_unusable_name(canonical) and not is_address_like_name(canonical):
         names.add(canonical)
     for n in site.get("names_used") or []:
-        if n and not is_unusable_name(str(n)):
+        if n and not is_unusable_name(str(n)) and not is_address_like_name(str(n)):
             names.add(str(n).strip())
 
     addresses = []
@@ -298,43 +347,31 @@ def extract_site_identity(site_key: str, site: dict) -> dict:
                 phones.add(val)
             if "address" in lk and "email" not in lk:
                 addresses.append(val)
-            if "site name" in lk and not is_unusable_name(val):
+            if "site name" in lk and not is_unusable_name(val) and not is_address_like_name(val):
                 names.add(val)
             if ("principal investigator" in lk and "name" in lk) or lk.startswith("investigator #"):
-                if not EMAIL_RE.match(val):
+                if not EMAIL_RE.match(val) and not is_address_like_name(val):
                     pis.append(val)
-
-    # prefer longest non-phone name
-    display = None
-    if names:
-        display = sorted(names, key=lambda x: (-len(x), x))[0]
-    elif pis:
-        # e.g. "Site of Victor H. Gonzalez" fallback
-        addr = parse_address_blob(addresses[0]) if addresses else {}
-        city = addr.get("address_city") or ""
-        display = f"{pis[0]} Site" + (f" ({city})" if city else "")
-    elif addresses:
-        addr = parse_address_blob(addresses[0])
-        display = addr.get("address_street") or addresses[0][:80]
-    elif is_phone_name(canonical):
-        display = None  # truly unusable without recovery
-    else:
-        display = canonical or None
 
     parsed_addrs = [parse_address_blob(a) for a in addresses]
     parsed_addrs = [a for a in parsed_addrs if a]
 
-    return {
+    bits = {
         "site_key": site_key,
         "canonical_name": canonical,
-        "display_name": display,
-        "name_unusable_reason": is_unusable_name(canonical),
         "names": sorted(names),
         "pis": sorted({p for p in pis if p}),
         "emails": sorted(emails),
         "phones": sorted(phones),
         "addresses_raw": addresses,
         "addresses": parsed_addrs,
+    }
+    display = preferred_display_name(bits)
+
+    return {
+        **bits,
+        "display_name": display,
+        "name_unusable_reason": is_unusable_name(canonical) or ("address_as_name" if is_address_like_name(canonical) else None),
         "surveys": site.get("surveys") or [],
         "raw": site,
     }
@@ -786,7 +823,12 @@ def main():
 
     def resolve_legacy_bucket(hit, realm, method, score, ident):
         """Map a match onto a legacy-sites id. Never create ARTEMIS `sites` docs."""
-        site_name = ident["display_name"] or ident["canonical_name"] or ident["site_key"]
+        site_name = (
+            ident["display_name"]
+            or preferred_display_name(ident)
+            or (ident["canonical_name"] if ident.get("canonical_name") and not is_address_like_name(ident["canonical_name"]) and not is_unusable_name(ident["canonical_name"]) else None)
+            or "Unnamed feasibility site"
+        )
         if hit and realm == "artemis":
             for leg in legacy_sites:
                 if leg.get("linkedArtemisSiteId") == hit["id"]:
