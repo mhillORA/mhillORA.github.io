@@ -1381,10 +1381,11 @@
             // --- Azure API Configuration ---
             const API_BASE_URL = '/api';
 
-            // Collect client/API failures for Managers (stored via /api/client-errors).
+            // Collect client/API failures + schedule mutation audits for Managers (stored via /api/client-errors).
             const __clientErrorReportState = {
                 recentFingerprints: new Map(),
                 recentCount: 0,
+                auditCount: 0,
                 windowStartedAt: Date.now()
             };
             const reportClientError = (payload = {}) => {
@@ -1393,26 +1394,47 @@
                     const endpoint = String(payload.path || payload.url || '');
                     if (endpoint.includes('/client-errors')) return;
 
+                    const source = String(payload.source || 'client').slice(0, 80);
+                    const isAudit = source.startsWith('schedule.') || source.startsWith('api.event.');
+
                     const now = Date.now();
                     if (now - __clientErrorReportState.windowStartedAt > 60000) {
                         __clientErrorReportState.windowStartedAt = now;
                         __clientErrorReportState.recentCount = 0;
+                        __clientErrorReportState.auditCount = 0;
                     }
-                    if (__clientErrorReportState.recentCount >= 20) return;
+                    if (isAudit) {
+                        if (__clientErrorReportState.auditCount >= 80) return;
+                    } else if (__clientErrorReportState.recentCount >= 20) {
+                        return;
+                    }
 
                     const message = String(payload.message || 'Unknown client error').slice(0, 1000);
                     const fingerprint = String(
                         payload.fingerprint ||
-                        `${payload.source || 'client'}|${payload.status || ''}|${message}|${payload.path || ''}`
+                        `${source}|${payload.status || ''}|${message}|${payload.path || ''}`
                     ).slice(0, 200);
                     const lastSeen = __clientErrorReportState.recentFingerprints.get(fingerprint) || 0;
-                    if (now - lastSeen < 30000) return;
+                    // Audits with unique event ids should not be collapsed; errors still de-dupe.
+                    const dedupeMs = isAudit ? 2000 : 30000;
+                    if (now - lastSeen < dedupeMs) return;
                     __clientErrorReportState.recentFingerprints.set(fingerprint, now);
-                    __clientErrorReportState.recentCount += 1;
+                    if (isAudit) __clientErrorReportState.auditCount += 1;
+                    else __clientErrorReportState.recentCount += 1;
 
                     const user = (typeof state !== 'undefined' && state && state.currentUser) ? state.currentUser : null;
+                    let details = '';
+                    try {
+                        if (payload.details != null) {
+                            details = typeof payload.details === 'string'
+                                ? payload.details
+                                : JSON.stringify(payload.details);
+                        }
+                    } catch (_) {
+                        details = '';
+                    }
                     const body = {
-                        source: String(payload.source || 'client').slice(0, 80),
+                        source,
                         message,
                         stack: String(payload.stack || '').slice(0, 4000),
                         url: String(payload.url || (typeof location !== 'undefined' ? location.href : '')).slice(0, 500),
@@ -1422,8 +1444,14 @@
                         userAgent: String((typeof navigator !== 'undefined' && navigator.userAgent) || '').slice(0, 400),
                         username: String(user?.username || payload.username || '').slice(0, 120),
                         userId: String(user?.id || payload.userId || '').slice(0, 120),
-                        permissionLevel: String(user?.permissionLevel || payload.permissionLevel || '').slice(0, 40),
+                        permissionLevel: String(
+                            (typeof getEffectivePermissionLevel === 'function' ? getEffectivePermissionLevel(user) : null)
+                            || user?.permissionLevel
+                            || payload.permissionLevel
+                            || ''
+                        ).slice(0, 40),
                         context: String(payload.context || '').slice(0, 500),
+                        details: String(details || '').slice(0, 6000),
                         fingerprint
                     };
 
@@ -1437,6 +1465,55 @@
                 } catch (_) {
                     // Never let error reporting break the app.
                 }
+            };
+
+            /** Always-on trail for shift deletes / suspicious schedule changes (shows in Client Error Log). */
+            const reportScheduleAudit = (action, details = {}) => {
+                try {
+                    const eventId = details.eventId || details.id || '';
+                    const ids = Array.isArray(details.ids) ? details.ids : (eventId ? [eventId] : []);
+                    const date = details.date || details.startDate || '';
+                    const type = details.type || 'Site Assignment';
+                    const summary = details.message
+                        || `${action}: ${type}${date ? ` on ${date}` : ''}${ids.length ? ` (${ids.length} id(s))` : ''}`;
+                    reportClientError({
+                        source: `schedule.${action}`,
+                        message: summary,
+                        context: String(details.context || details.reason || action).slice(0, 500),
+                        stack: String(details.stack || new Error(`schedule.${action}`).stack || '').slice(0, 4000),
+                        fingerprint: `schedule.${action}|${ids.slice(0, 5).join(',')}|${date}|${Date.now()}`,
+                        details: {
+                            action,
+                            tab: (typeof state !== 'undefined' && state) ? state.activeTab : null,
+                            month: (typeof state !== 'undefined' && state && state.crcCalendarDate)
+                                ? String(state.crcCalendarDate).slice(0, 15)
+                                : null,
+                            ...details,
+                            // Avoid huge nested stacks in details
+                            stack: undefined
+                        }
+                    });
+                } catch (_) { /* never throw */ }
+            };
+
+            const summarizeEventForAudit = (event) => {
+                if (!event || typeof event !== 'object') return null;
+                return {
+                    id: event.id || null,
+                    type: event.type || null,
+                    date: event.date || event.startDate || null,
+                    endDate: event.endDate || null,
+                    siteId: event.siteId || null,
+                    studyIds: Array.isArray(event.studyIds) ? event.studyIds.slice(0, 8) : [],
+                    groupId: event.groupId || null,
+                    visitNumber: event.visitNumber || null,
+                    groupNumber: event.groupNumber || null,
+                    period: event.period || null,
+                    crcId: event.crcId || null,
+                    roleKeys: event.roleAssignments && typeof event.roleAssignments === 'object'
+                        ? Object.keys(event.roleAssignments).slice(0, 12)
+                        : []
+                };
             };
 
             window.addEventListener('error', (event) => {
@@ -1695,9 +1772,14 @@
 
                 async getClientErrors(limit = 100) {
                     const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 250);
+                    const permission = (typeof getEffectivePermissionLevel === 'function'
+                        ? getEffectivePermissionLevel(state.currentUser)
+                        : null) || state.currentUser?.permissionLevel || '';
                     return this.request(`/client-errors?limit=${safeLimit}`, {
                         headers: {
-                            'x-user-permission': state.currentUser?.permissionLevel || ''
+                            'x-user-permission': permission,
+                            'x-username': state.currentUser?.username || '',
+                            'x-user-id': state.currentUser?.id || ''
                         }
                     });
                 }
@@ -2671,8 +2753,28 @@
                 }
 
                 async deleteEvent(eventId) {
+                    const existing = (typeof findEventAnywhere === 'function')
+                        ? findEventAnywhere(eventId)
+                        : ((state.crc_events || []).find((e) => e && e.id === eventId) || null);
+                    const auditStack = new Error('deleteEvent caller').stack;
+                    if (typeof reportScheduleAudit === 'function') {
+                        reportScheduleAudit('event.delete', {
+                            eventId,
+                            reason: 'apiService.deleteEvent',
+                            stack: auditStack,
+                            ...((typeof summarizeEventForAudit === 'function') ? (summarizeEventForAudit(existing) || {}) : {})
+                        });
+                    }
+                    const headers = {
+                        'x-username': state.currentUser?.username || '',
+                        'x-user-id': state.currentUser?.id || '',
+                        'x-user-permission': (typeof getEffectivePermissionLevel === 'function'
+                            ? getEffectivePermissionLevel(state.currentUser)
+                            : null) || state.currentUser?.permissionLevel || ''
+                    };
                     const out = await this.request(`/events/${eventId}`, {
-                        method: 'DELETE'
+                        method: 'DELETE',
+                        headers
                     });
                     this.invalidateEventsHttpCache();
                     return out;
@@ -6233,6 +6335,14 @@
                     ? findDeletableSiteAssignmentCopies(event)
                     : [event || { id: primaryId }];
                 const ids = [...new Set(toDelete.map((e) => e.id).filter(Boolean))];
+                reportScheduleAudit('event.delete-with-copies', {
+                    eventId: primaryId,
+                    ids,
+                    count: ids.length,
+                    reason: 'deleteSiteAssignmentWithDuplicates',
+                    stack: new Error('deleteSiteAssignmentWithDuplicates').stack,
+                    events: toDelete.map(summarizeEventForAudit).filter(Boolean)
+                });
                 let failed = 0;
                 for (const id of ids) {
                     const row = toDelete.find((e) => e.id === id);
@@ -6245,6 +6355,11 @@
                         if (err?.status === 404) continue;
                         failed += 1;
                         console.error('Failed to delete shift copy', id, err);
+                        reportScheduleAudit('event.delete-failed', {
+                            eventId: id,
+                            message: err?.message || 'delete failed',
+                            status: err?.status || null
+                        });
                     }
                 }
                 removeDeletedEventsFromLocalState(ids);
@@ -6279,18 +6394,25 @@
                         : (updated || saved);
                 } catch (err) {
                     if (err?.status !== 409) throw err;
-                    console.warn('Shift already existed; keeping the original row and removing extra copies.', keeper.id);
+                    console.warn('Shift already existed; keeping the original row without deleting siblings.', keeper.id);
+                    reportScheduleAudit('event.upsert.conflict-409', {
+                        eventId: keeper.id,
+                        message: '409 on upsert; kept original, did not delete extras'
+                    });
                 }
                 state.crc_events = (state.crc_events || []).map((e) => e && e.id === keeper.id ? saved : e);
+                // HARDEN: never auto-delete "extra" rows during save/upsert. Display collapse
+                // hides dupes; silent deletes here were wiping real shifts.
                 const extraIds = candidates.map((e) => e.id).filter((id) => id && id !== keeper.id);
-                for (const extraId of extraIds) {
-                    try {
-                        await apiService.deleteEvent(extraId);
-                    } catch (err) {
-                        if (err?.status !== 404) console.error('Failed to remove duplicate shift', extraId, err);
-                    }
+                if (extraIds.length) {
+                    reportScheduleAudit('event.upsert.extras-not-deleted', {
+                        eventId: keeper.id,
+                        ids: extraIds,
+                        count: extraIds.length,
+                        reason: 'identity upsert keeps sibling rows; no cascade delete',
+                        events: candidates.map(summarizeEventForAudit).filter(Boolean)
+                    });
                 }
-                if (extraIds.length) removeDeletedEventsFromLocalState(extraIds);
                 return saved;
             };
 
@@ -10056,18 +10178,43 @@
                         studies: sanitizedStudies,
                         // Keep local events outside the fetched date window so out-of-month
                         // schedule work is not wiped by the 10-minute silent refresh.
+                        // Also keep in-range Site Assignments the API omitted (partial responses).
                         crc_events: (() => {
                             const range = state.eventsQueryRange || (typeof getDefaultEventsDateRange === 'function' ? getDefaultEventsDateRange() : null);
+                            const eventDate = (e) => (e && (e.date || e.startDate)) ? String(e.date || e.startDate).slice(0, 10) : '';
                             const outside = (range && range.startDate && range.endDate)
                                 ? (state.crc_events || []).filter(e => {
-                                    const d = (e && (e.date || e.startDate)) ? String(e.date || e.startDate).slice(0, 10) : '';
+                                    const d = eventDate(e);
                                     if (!d) return false;
                                     return d < range.startDate || d > range.endDate;
                                 })
                                 : [];
+                            const previousInRange = (range && range.startDate && range.endDate)
+                                ? (state.crc_events || []).filter(e => {
+                                    const d = eventDate(e);
+                                    return d && d >= range.startDate && d <= range.endDate;
+                                })
+                                : [];
+                            const sanitizedIds = new Set((sanitizedEvents || []).map(e => e && e.id).filter(Boolean));
+                            const keptMissing = previousInRange.filter(e => {
+                                if (!e?.id || sanitizedIds.has(e.id)) return false;
+                                return e.type === 'Site Assignment' || e.type === 'Travel Day' || e.type === 'Paid Time Off';
+                            });
+                            if (keptMissing.length && typeof reportScheduleAudit === 'function') {
+                                reportScheduleAudit('silent-refresh.kept-missing-local', {
+                                    message: `Silent refresh kept ${keptMissing.length} local shift(s) missing from API`,
+                                    reason: 'refreshDataSilently',
+                                    ids: keptMissing.map(e => e.id),
+                                    previousCount: previousInRange.length,
+                                    fetchedCount: (sanitizedEvents || []).length
+                                });
+                            }
+                            const mergedInRange = (typeof mergeEventsById === 'function')
+                                ? mergeEventsById(keptMissing, sanitizedEvents)
+                                : [...keptMissing, ...(sanitizedEvents || [])];
                             return typeof mergeEventsById === 'function'
-                                ? mergeEventsById(outside, sanitizedEvents)
-                                : [...outside, ...(sanitizedEvents || [])];
+                                ? mergeEventsById(outside, mergedInRange)
+                                : [...outside, ...mergedInRange];
                         })(),
                         roles,
                         training_types,
@@ -32430,19 +32577,26 @@
                     case 'auto-cleanup-duplicates': autoCleanupDuplicates(); break;
                     case 'view-client-errors': {
                         (async () => {
-                            if (!state.currentUser || state.currentUser.permissionLevel !== 'Manager') {
+                            const canView = (typeof isAdminUser === 'function' && isAdminUser())
+                                || (typeof getEffectivePermissionLevel === 'function' && getEffectivePermissionLevel() === 'Manager')
+                                || state.currentUser?.permissionLevel === 'Manager';
+                            if (!state.currentUser || !canView) {
                                 showNotification('Managers only.', 'error');
                                 return;
                             }
                             try {
                                 showNotification('Loading client errors…', 'info');
-                                const rows = await apiService.getClientErrors(100);
+                                const rows = await apiService.getClientErrors(200);
                                 const list = Array.isArray(rows) ? rows : [];
                                 const escapeHtml = (value) => String(value ?? '')
                                     .replace(/&/g, '&amp;')
                                     .replace(/</g, '&lt;')
                                     .replace(/>/g, '&gt;')
                                     .replace(/"/g, '&quot;');
+                                const isScheduleRow = (row) => {
+                                    const src = String(row?.source || '');
+                                    return src.startsWith('schedule.') || src.startsWith('api.event.');
+                                };
                                 const body = list.length === 0
                                     ? `<p class="text-sm text-gray-600 dark:text-gray-300">No client errors reported yet.</p>`
                                     : `
@@ -32454,19 +32608,20 @@
                                                         <th class="text-left px-3 py-2">User</th>
                                                         <th class="text-left px-3 py-2">Source</th>
                                                         <th class="text-left px-3 py-2">Status</th>
-                                                        <th class="text-left px-3 py-2">Message</th>
+                                                        <th class="text-left px-3 py-2">Message / Details</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
                                                     ${list.map(row => `
-                                                        <tr class="align-top">
+                                                        <tr class="align-top ${isScheduleRow(row) ? 'bg-amber-50/80 dark:bg-amber-950/20' : ''}">
                                                             <td class="px-3 py-2 whitespace-nowrap text-xs text-gray-500">${escapeHtml(row.createdAt || '')}</td>
-                                                            <td class="px-3 py-2 whitespace-nowrap">${escapeHtml(row.username || row.userId || 'anonymous')}</td>
-                                                            <td class="px-3 py-2 whitespace-nowrap text-xs">${escapeHtml(row.source || '')}${row.path ? `<div class="text-gray-500">${escapeHtml(row.path)}</div>` : ''}</td>
+                                                            <td class="px-3 py-2 whitespace-nowrap">${escapeHtml(row.username || row.userId || 'anonymous')}${row.permissionLevel ? `<div class="text-xs text-gray-500">${escapeHtml(row.permissionLevel)}</div>` : ''}</td>
+                                                            <td class="px-3 py-2 whitespace-nowrap text-xs">${escapeHtml(row.source || '')}${row.path ? `<div class="text-gray-500">${escapeHtml(row.path)}</div>` : ''}${row.method ? `<div class="text-gray-500">${escapeHtml(row.method)}</div>` : ''}</td>
                                                             <td class="px-3 py-2">${escapeHtml(row.status ?? '')}</td>
                                                             <td class="px-3 py-2">
                                                                 <div class="font-medium">${escapeHtml(row.message || '')}</div>
                                                                 ${row.context ? `<div class="text-xs text-gray-500 mt-1">${escapeHtml(row.context)}</div>` : ''}
+                                                                ${row.details ? `<pre class="mt-2 text-[11px] whitespace-pre-wrap text-amber-900 dark:text-amber-100/90 bg-amber-100/50 dark:bg-amber-900/30 p-2 rounded max-h-36 overflow-auto">${escapeHtml(row.details)}</pre>` : ''}
                                                                 ${row.stack ? `<pre class="mt-2 text-[11px] whitespace-pre-wrap text-gray-500 max-h-28 overflow-auto">${escapeHtml(row.stack)}</pre>` : ''}
                                                             </td>
                                                         </tr>
@@ -32477,7 +32632,7 @@
                                     `;
                                 openModal(`
                                     <h3 class="text-xl font-bold dark:text-white mb-2">Client Error Log</h3>
-                                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Latest ${list.length} report(s) from user browsers (save failures, API 5xx/timeouts, uncaught errors).</p>
+                                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Latest ${list.length} report(s). Highlighted rows are <strong>schedule audits</strong> (deletes, refused refreshes, kept-missing shifts) — use these when shifts disappear.</p>
                                     ${body}
                                     <div class="flex justify-end mt-4">
                                         <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Close</button>
@@ -38419,6 +38574,15 @@
                                         // Only remove the old series after every replacement day is
                                         // confirmed saved. Retry each delete once; never claim success
                                         // while old rows remain (which would look like duplicates).
+                                        reportScheduleAudit('event.group-rewrite-delete', {
+                                            message: `Deleting ${groupEvents.length} old group day(s) after date-range rewrite`,
+                                            reason: 'group date range changed',
+                                            groupId: existingGroupId,
+                                            ids: groupEvents.map(e => e.id).filter(Boolean),
+                                            count: groupEvents.length,
+                                            events: groupEvents.map(summarizeEventForAudit).filter(Boolean),
+                                            stack: new Error('group-rewrite-delete').stack
+                                        });
                                         const failedOldDeletes = [];
                                         for (const groupEvent of groupEvents) {
                                             let deleted = false;
@@ -41964,13 +42128,27 @@
                         return d && d >= range.startDate && d <= range.endDate;
                     });
                     // Hard stop: an empty/partial API response must not erase a full week of live work.
-                    if (previousInRange.length >= 5 && sanitized.length === 0) {
+                    if (previousInRange.length >= 3 && sanitized.length === 0) {
                         console.error('CHAOS: Refusing to wipe schedule — API returned 0 events for', range, `(had ${previousInRange.length} locally)`);
+                        reportScheduleAudit('refresh.refused-empty', {
+                            message: `Refused empty refresh (had ${previousInRange.length}, got 0)`,
+                            reason: 'api returned zero events',
+                            detailsRange: range,
+                            previousCount: previousInRange.length,
+                            fetchedCount: 0
+                        });
                         showNotification('Schedule refresh returned no events; keeping your current view. Try again in a moment.', 'error');
                         return;
                     }
-                    if (previousInRange.length >= 15 && sanitized.length < Math.floor(previousInRange.length * 0.25)) {
+                    if (previousInRange.length >= 10 && sanitized.length < Math.floor(previousInRange.length * 0.4)) {
                         console.error('CHAOS: Refusing partial wipe — API returned', sanitized.length, 'vs local', previousInRange.length, range);
+                        reportScheduleAudit('refresh.refused-partial', {
+                            message: `Refused partial refresh (had ${previousInRange.length}, got ${sanitized.length})`,
+                            reason: 'api returned far fewer events than local',
+                            detailsRange: range,
+                            previousCount: previousInRange.length,
+                            fetchedCount: sanitized.length
+                        });
                         showNotification('Schedule refresh looked incomplete; keeping your current view. Hard-refresh if needed.', 'error');
                         return;
                     }
@@ -41979,14 +42157,40 @@
                         if (!d) return false;
                         return d < range.startDate || d > range.endDate;
                     });
+                    // If API omitted some in-range Site Assignments / Travel Days, keep them locally
+                    // so shifts do not "fly off" the grid on a flaky/partial response.
+                    const sanitizedIds = new Set(sanitized.map((e) => e && e.id).filter(Boolean));
+                    const keptMissing = previousInRange.filter((e) => {
+                        if (!e?.id || sanitizedIds.has(e.id)) return false;
+                        return e.type === 'Site Assignment' || e.type === 'Travel Day' || e.type === 'Paid Time Off';
+                    });
+                    let mergedInRange = sanitized;
+                    if (keptMissing.length > 0) {
+                        reportScheduleAudit('refresh.kept-missing-local', {
+                            message: `Kept ${keptMissing.length} local shift(s) missing from API refresh`,
+                            reason: 'partial api response',
+                            detailsRange: range,
+                            previousCount: previousInRange.length,
+                            fetchedCount: sanitized.length,
+                            ids: keptMissing.map((e) => e.id),
+                            events: keptMissing.slice(0, 25).map(summarizeEventForAudit)
+                        });
+                        mergedInRange = mergeEventsById(keptMissing, sanitized);
+                    }
                     setState({
-                        crc_events: mergeEventsById(outside, sanitized),
+                        crc_events: mergeEventsById(outside, mergedInRange),
                         crc_events_display: undefined,
                         eventsQueryRange: { startDate: range.startDate, endDate: range.endDate },
                     });
-                    debugLog('CHAOS: Loaded events for month', range.startDate.slice(0, 7), `(${arr.length} fetched)`);
+                    debugLog('CHAOS: Loaded events for month', range.startDate.slice(0, 7), `(${arr.length} fetched, kept ${keptMissing.length} local)`);
                 } catch (err) {
                     console.error('CHAOS: Failed to load events for month', range.startDate, err);
+                    reportScheduleAudit('refresh.failed', {
+                        message: err?.message || 'Failed to load events for month',
+                        reason: 'ensureEventsCoverVisibleMonth',
+                        detailsRange: range,
+                        stack: err?.stack || ''
+                    });
                 }
             };
 
