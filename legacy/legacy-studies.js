@@ -12,9 +12,11 @@
     loaded: false,
     selectedStudyId: null,
     selectedSiteId: null,
+    selectedSurveyId: null,
     reportMode: 'bySite', // bySite | byStudy — bySite is ~50 rows, not ~700
     studySort: 'name-asc',
     siteSort: 'name-asc',
+    feasSort: 'responses-desc',
   };
 
   function apiBase() {
@@ -605,6 +607,38 @@
       </div>`;
   }
 
+  function getLegacyFeasibilityHTML() {
+    return `
+      <div class="space-y-4 px-1 sm:px-0" id="legacy-feasibility-root">
+        <div class="flex flex-col gap-3">
+          <div>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Feasibility Surveys</h2>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+              Browse by survey definition — open a survey to see every site response (legacy-only; not shared with Chaos).
+            </p>
+          </div>
+          <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2 w-full">
+            <select id="legacy-feas-sort" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Sort surveys">
+              <option value="responses-desc" selected>Most responses</option>
+              <option value="responses-asc">Fewest responses</option>
+              <option value="name-asc">A → Z</option>
+              <option value="name-desc">Z → A</option>
+            </select>
+            <select id="legacy-feas-indication-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Filter by indication / TA">
+              <option value="">All indications / TA</option>
+            </select>
+            <input id="legacy-feas-search" type="search" placeholder="Search surveys…"
+              class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:flex-1 sm:min-w-[12rem] min-h-[44px]" />
+            <button id="legacy-feas-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 min-h-[44px] shrink-0">Refresh</button>
+          </div>
+        </div>
+        <div id="legacy-feas-summary" class="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-3"></div>
+        <div id="legacy-feas-load-status" class="text-xs text-gray-500"></div>
+        <div id="legacy-feas-table-wrap" class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden"></div>
+        <div id="legacy-feas-detail" class="hidden"></div>
+      </div>`;
+  }
+
   function metricChip(label, value, emphasize = false) {
     return `<div class="rounded-md bg-gray-50 dark:bg-gray-900/50 px-2 py-1.5 text-center min-w-0">
       <div class="text-[10px] sm:text-xs text-gray-500 truncate">${label}</div>
@@ -638,32 +672,6 @@
     const label = p ? p.charAt(0).toUpperCase() + p.slice(1) : 'Not set';
     const cls = map[p] || 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300';
     return `<span class="inline-flex px-2 py-0.5 rounded text-xs font-medium ${cls}">${escapeHtml(label)}</span>`;
-  }
-
-  function siteIndications(site) {
-    const fromSite = [
-      ...(Array.isArray(site?.indicationsCovered) ? site.indicationsCovered : []),
-      ...(Array.isArray(site?.therapeuticAreas) ? site.therapeuticAreas : []),
-    ];
-    const fromSurveys = (state.feasibilityResponses || [])
-      .filter((r) => r && r.siteId === site?.id)
-      .map((r) => r.indication || r.therapeuticArea || (r.study && r.study.indication))
-      .filter(Boolean);
-    return [...new Set([...fromSite, ...fromSurveys].map((x) => String(x).trim()).filter(Boolean))].sort((a, b) =>
-      a.localeCompare(b)
-    );
-  }
-
-  function allIndicationOptions() {
-    const set = new Set();
-    for (const s of state.sites || []) {
-      for (const i of siteIndications(s)) set.add(i);
-    }
-    for (const r of state.feasibilityResponses || []) {
-      const i = r.indication || r.therapeuticArea || (r.study && r.study.indication);
-      if (i) set.add(String(i).trim());
-    }
-    return [...set].sort((a, b) => a.localeCompare(b));
   }
 
   function indicationPills(inds) {
@@ -741,6 +749,10 @@
     }
     for (const r of state.feasibilityResponses || []) {
       const i = r.indication || r.therapeuticArea || (r.study && r.study.indication);
+      if (i) set.add(String(i).trim());
+    }
+    for (const d of state.feasibilityDefs || []) {
+      const i = d.indication || d.therapeuticArea || (d.study && d.study.indication);
       if (i) set.add(String(i).trim());
     }
     return [...set].filter(Boolean).sort((a, b) => a.localeCompare(b));
@@ -2548,6 +2560,417 @@
     }
   }
 
+  function surveyDefIndication(def) {
+    return (
+      (def && (def.indication || def.therapeuticArea || (def.study && def.study.indication))) ||
+      ''
+    )
+      .toString()
+      .trim();
+  }
+
+  function responsesForSurvey(surveyId) {
+    return (state.feasibilityResponses || []).filter((r) => r && r.surveyId === surveyId && !r._archived);
+  }
+
+  /** Latest response per site for one survey definition. */
+  function latestResponsesBySiteForSurvey(surveyId) {
+    const grouped = new Map();
+    responsesForSurvey(surveyId)
+      .slice()
+      .sort((a, b) =>
+        String(b.submittedAt || b.createdAt || '').localeCompare(String(a.submittedAt || a.createdAt || ''))
+      )
+      .forEach((r) => {
+        const key = r.siteId || r.id;
+        if (!grouped.has(key)) grouped.set(key, r);
+      });
+    return Array.from(grouped.values());
+  }
+
+  function buildFeasibilitySurveyRows() {
+    const bySurvey = new Map();
+    for (const r of state.feasibilityResponses || []) {
+      if (!r || r._archived || !r.surveyId) continue;
+      if (!bySurvey.has(r.surveyId)) bySurvey.set(r.surveyId, []);
+      bySurvey.get(r.surveyId).push(r);
+    }
+
+    const defIds = new Set((state.feasibilityDefs || []).map((d) => d.id));
+    const rows = [];
+
+    for (const def of state.feasibilityDefs || []) {
+      const responses = bySurvey.get(def.id) || [];
+      const sites = new Set(responses.map((r) => r.siteId).filter(Boolean));
+      const inds = new Set();
+      const di = surveyDefIndication(def);
+      if (di) inds.add(di);
+      for (const r of responses) {
+        const i = r.indication || r.therapeuticArea || (r.study && r.study.indication);
+        if (i) inds.add(String(i).trim());
+      }
+      rows.push({
+        id: def.id,
+        title: def.title || def.id,
+        platform: def.platform || def.source || def.sourcePlatform || '',
+        indication: di,
+        indications: [...inds].filter(Boolean).sort((a, b) => a.localeCompare(b)),
+        responseCount: responses.length,
+        siteCount: sites.size,
+        questionCount: Array.isArray(def.questions) ? def.questions.length : def.questionCount || 0,
+        def,
+      });
+    }
+
+    // Orphan responses with no definition doc
+    for (const [surveyId, responses] of bySurvey) {
+      if (defIds.has(surveyId)) continue;
+      const sites = new Set(responses.map((r) => r.siteId).filter(Boolean));
+      const inds = new Set();
+      for (const r of responses) {
+        const i = r.indication || r.therapeuticArea || (r.study && r.study.indication);
+        if (i) inds.add(String(i).trim());
+      }
+      const title =
+        responses[0]?.study?.study_name ||
+        responses[0]?.sourceTab ||
+        surveyId;
+      rows.push({
+        id: surveyId,
+        title,
+        platform: responses[0]?.platform || '',
+        indication: [...inds][0] || '',
+        indications: [...inds].filter(Boolean).sort((a, b) => a.localeCompare(b)),
+        responseCount: responses.length,
+        siteCount: sites.size,
+        questionCount: 0,
+        def: null,
+      });
+    }
+
+    return rows;
+  }
+
+  function renderFeasibilitySummary(el, rows) {
+    if (!el) return;
+    const totalResponses = rows.reduce((n, r) => n + r.responseCount, 0);
+    const totalSites = new Set(
+      (state.feasibilityResponses || []).filter((r) => r && !r._archived && r.siteId).map((r) => r.siteId)
+    ).size;
+    el.innerHTML = [
+      ['Surveys', rows.length],
+      ['Responses', totalResponses],
+      ['Sites with responses', totalSites],
+      ['Definitions', (state.feasibilityDefs || []).length],
+    ]
+      .map(
+        ([label, val]) => `
+      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3">
+        <div class="text-xs text-gray-500 dark:text-gray-400">${label}</div>
+        <div class="text-xl font-semibold text-gray-900 dark:text-white">${val}</div>
+      </div>`
+      )
+      .join('');
+  }
+
+  function renderFeasibilitySurveysList(search = '', indication = '') {
+    const wrap = document.getElementById('legacy-feas-table-wrap');
+    const status = document.getElementById('legacy-feas-load-status');
+    if (!wrap) return;
+
+    let rows = buildFeasibilitySurveyRows();
+    const q = (search || '').trim().toLowerCase();
+    const ind = (indication || '').trim().toLowerCase();
+    if (q) {
+      rows = rows.filter(
+        (r) =>
+          r.title.toLowerCase().includes(q) ||
+          r.id.toLowerCase().includes(q) ||
+          (r.platform || '').toLowerCase().includes(q) ||
+          r.indications.some((i) => i.toLowerCase().includes(q))
+      );
+    }
+    if (ind) {
+      rows = rows.filter((r) => r.indications.some((i) => i.toLowerCase() === ind));
+    }
+
+    const sort = state.feasSort || 'responses-desc';
+    rows.sort((a, b) => {
+      if (sort === 'name-asc') return a.title.localeCompare(b.title);
+      if (sort === 'name-desc') return b.title.localeCompare(a.title);
+      if (sort === 'responses-asc') return a.responseCount - b.responseCount || a.title.localeCompare(b.title);
+      return b.responseCount - a.responseCount || a.title.localeCompare(b.title);
+    });
+
+    renderFeasibilitySummary(document.getElementById('legacy-feas-summary'), buildFeasibilitySurveyRows());
+    if (status) {
+      status.textContent = `${rows.length} survey${rows.length === 1 ? '' : 's'} shown · ${state.feasibilityResponses.length} total responses`;
+    }
+
+    if (!rows.length) {
+      wrap.innerHTML = `<div class="p-6 text-sm text-gray-500">No feasibility surveys match these filters.</div>`;
+      return;
+    }
+
+    const mobile = rows
+      .map(
+        (r) => `
+      <button type="button" class="legacy-feas-open w-full text-left rounded-lg border dark:border-gray-700 p-3 hover:bg-gray-50 dark:hover:bg-gray-900/40 transition"
+        data-survey-id="${escapeHtml(r.id)}">
+        <div class="font-medium text-gray-900 dark:text-white">${escapeHtml(r.title)}</div>
+        <div class="flex flex-wrap gap-1.5 mt-1.5">${indicationPills(r.indications)}</div>
+        <div class="grid grid-cols-3 gap-1.5 mt-2">
+          ${metricChip('Sites', r.siteCount)}
+          ${metricChip('Responses', r.responseCount, true)}
+          ${metricChip('Qs', r.questionCount || '—')}
+        </div>
+      </button>`
+      )
+      .join('');
+
+    const desktop = `
+      <table class="min-w-full text-sm">
+        <thead class="bg-gray-50 dark:bg-gray-900/40 text-left">
+          <tr>
+            <th class="px-3 py-2">Survey</th>
+            <th class="px-3 py-2">Indication / TA</th>
+            <th class="px-3 py-2">Platform</th>
+            <th class="px-3 py-2 text-right">Sites</th>
+            <th class="px-3 py-2 text-right">Responses</th>
+            <th class="px-3 py-2 text-right">Questions</th>
+            <th class="px-3 py-2"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (r) => `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-900/30">
+              <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(r.title)}</td>
+              <td class="px-3 py-2">${indicationPills(r.indications)}</td>
+              <td class="px-3 py-2 text-xs text-gray-500">${escapeHtml(r.platform || '—')}</td>
+              <td class="px-3 py-2 text-right">${r.siteCount}</td>
+              <td class="px-3 py-2 text-right font-semibold text-indigo-600 dark:text-indigo-300">${r.responseCount}</td>
+              <td class="px-3 py-2 text-right">${r.questionCount || '—'}</td>
+              <td class="px-3 py-2 text-right">
+                <button type="button" class="legacy-feas-open ${TAP_LINK}" data-survey-id="${escapeHtml(r.id)}">Open</button>
+              </td>
+            </tr>`
+            )
+            .join('')}
+        </tbody>
+      </table>`;
+
+    wrap.innerHTML = `
+      <div class="md:hidden p-2 space-y-2">${mobile}</div>
+      <div class="hidden md:block overflow-x-auto">${desktop}</div>`;
+
+    wrap.querySelectorAll('.legacy-feas-open').forEach((btn) => {
+      btn.addEventListener('click', () => openFeasibilitySurvey(btn.getAttribute('data-survey-id')));
+    });
+  }
+
+  function siteNameForId(siteId) {
+    const sites = uniqueSitesFromState();
+    const s = sites.find((x) => x.id === siteId) || (state.sites || []).find((x) => x.id === siteId);
+    return s?.name || siteId || 'Unknown site';
+  }
+
+  function openFeasibilitySurvey(surveyId) {
+    state.selectedSurveyId = surveyId;
+    const wrap = document.getElementById('legacy-feas-table-wrap');
+    const summary = document.getElementById('legacy-feas-summary');
+    const detail = document.getElementById('legacy-feas-detail');
+    if (!detail) return;
+
+    const rows = buildFeasibilitySurveyRows();
+    const meta = rows.find((r) => r.id === surveyId);
+    const def = (state.feasibilityDefs || []).find((d) => d.id === surveyId) || meta?.def;
+    const title = meta?.title || def?.title || surveyId;
+    const surveyUi = global.ArtemisSurveyUI;
+    if (surveyUi?.syncCache) {
+      surveyUi.syncCache({
+        definitions: state.feasibilityDefs,
+        responses: state.feasibilityResponses,
+      });
+    }
+
+    let siteResponses = latestResponsesBySiteForSurvey(surveyId);
+    const detailSearchEl = document.getElementById('legacy-feas-detail-search');
+    const siteSearch = (detailSearchEl?.value || '').trim().toLowerCase();
+    if (siteSearch) {
+      siteResponses = siteResponses.filter((r) => {
+        const name = siteNameForId(r.siteId).toLowerCase();
+        return (
+          name.includes(siteSearch) ||
+          String(r.siteId || '')
+            .toLowerCase()
+            .includes(siteSearch) ||
+          String(r.displayName || '')
+            .toLowerCase()
+            .includes(siteSearch)
+        );
+      });
+    }
+    siteResponses.sort((a, b) => siteNameForId(a.siteId).localeCompare(siteNameForId(b.siteId)));
+
+    wrap?.classList.add('hidden');
+    summary?.classList.add('hidden');
+    detail.classList.remove('hidden');
+
+    const inds = meta?.indications || [];
+    const totalSites = latestResponsesBySiteForSurvey(surveyId).length;
+    const cards = siteResponses
+      .map((r, idx) => {
+        const siteName = siteNameForId(r.siteId);
+        const when = r.submittedAt
+          ? new Date(r.submittedAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+          : r.createdAt
+            ? new Date(r.createdAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+            : 'N/A';
+        const answerCount = surveyUi?.surveyAnswerCount ? surveyUi.surveyAnswerCount(r) : (r.answers || []).length;
+        const scoreBadge = surveyUi?.surveyScoreBadgeHtml ? surveyUi.surveyScoreBadgeHtml(r) : '';
+        const answersHtml = surveyUi?.surveyAnswersListHtml
+          ? surveyUi.surveyAnswersListHtml(r, { skipEmpty: true })
+          : '<p class="text-sm text-gray-500">Survey UI not loaded.</p>';
+        const openFirst = idx === 0 ? ' open' : '';
+        const ind = r.indication || r.therapeuticArea || '';
+        return `
+          <details class="survey-accordion"${openFirst}>
+            <summary>
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="font-semibold text-gray-900 dark:text-gray-100">${escapeHtml(siteName)}</span>
+                  ${scoreBadge}
+                </div>
+                <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  <span class="font-mono">${escapeHtml(r.siteId || '')}</span>
+                  <span>${escapeHtml(when)}</span>
+                  <span>${answerCount} answer${answerCount === 1 ? '' : 's'}</span>
+                  ${ind ? `<span>${escapeHtml(ind)}</span>` : ''}
+                  ${r.displayName ? `<span>${escapeHtml(r.displayName)}</span>` : ''}
+                </div>
+              </div>
+            </summary>
+            <div class="survey-accordion-body">
+              ${answersHtml}
+              <div class="mt-4 pt-3 border-t border-gray-100 dark:border-gray-700 flex flex-wrap gap-3 justify-end">
+                <button type="button" class="legacy-feas-open-site text-sm text-indigo-600 dark:text-indigo-400 hover:underline font-medium" data-site-id="${escapeHtml(r.siteId || '')}">Open site</button>
+                <button type="button" class="view-site-survey-response-btn text-sm text-indigo-600 dark:text-indigo-400 hover:underline font-medium" data-response-id="${escapeHtml(r.id)}">Open full view</button>
+              </div>
+            </div>
+          </details>`;
+      })
+      .join('');
+
+    detail.innerHTML = `
+      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4 space-y-4">
+        <div>
+          <button type="button" id="legacy-back-feas" class="${TAP_BACK}">← All feasibility surveys</button>
+          <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1">${escapeHtml(title)}</h3>
+          <p class="text-sm text-gray-500 mt-1">
+            <span class="font-mono text-xs">${escapeHtml(surveyId)}</span>
+            · ${siteSearch ? `${siteResponses.length} of ${totalSites}` : totalSites} site${totalSites === 1 ? '' : 's'}
+            · ${meta?.responseCount ?? responsesForSurvey(surveyId).length} response(s)
+            ${meta?.platform ? ` · ${escapeHtml(meta.platform)}` : ''}
+          </p>
+          <div class="flex flex-wrap gap-1.5 mt-2">
+            ${inds.map((i) => `<span class="inline-flex px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200">${escapeHtml(i)}</span>`).join('') || '<span class="text-xs text-gray-400">No indication / TA tagged</span>'}
+          </div>
+        </div>
+        <div class="flex flex-col sm:flex-row gap-2">
+          <input id="legacy-feas-detail-search" type="search" placeholder="Filter sites in this survey…"
+            class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm w-full sm:flex-1 min-h-[44px]"
+            value="${escapeHtml(siteSearch)}" />
+        </div>
+        <div class="space-y-3">
+          ${cards || '<p class="text-sm text-gray-500 py-4 text-center">No site responses for this survey.</p>'}
+        </div>
+      </div>`;
+
+    document.getElementById('legacy-back-feas')?.addEventListener('click', () => {
+      detail.classList.add('hidden');
+      detail.innerHTML = '';
+      wrap?.classList.remove('hidden');
+      summary?.classList.remove('hidden');
+      state.selectedSurveyId = null;
+      renderFeasibilitySurveysList(
+        document.getElementById('legacy-feas-search')?.value || '',
+        document.getElementById('legacy-feas-indication-filter')?.value || ''
+      );
+    });
+
+    let searchTimer;
+    document.getElementById('legacy-feas-detail-search')?.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => openFeasibilitySurvey(surveyId), 150);
+    });
+
+    detail.querySelectorAll('.view-site-survey-response-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-response-id');
+        const response = (state.feasibilityResponses || []).find((r) => r.id === id);
+        if (response && surveyUi?.createSiteSurveyResponseModal) {
+          surveyUi.createSiteSurveyResponseModal(response);
+        }
+      });
+    });
+
+    detail.querySelectorAll('.legacy-feas-open-site').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const siteId = btn.getAttribute('data-site-id');
+        if (!siteId) return;
+        global.__legacyPendingSiteId = siteId;
+        document.getElementById('legacy-sites-tab-btn')?.click();
+      });
+    });
+
+    const searchInput = document.getElementById('legacy-feas-detail-search');
+    if (searchInput && siteSearch) {
+      searchInput.focus();
+      const len = searchInput.value.length;
+      try {
+        searchInput.setSelectionRange(len, len);
+      } catch (_) {}
+    }
+  }
+
+  async function mountFeasibility() {
+    await ensureLoaded();
+    populateIndicationFilter('legacy-feas-indication-filter');
+    const rerender = () =>
+      renderFeasibilitySurveysList(
+        document.getElementById('legacy-feas-search')?.value || '',
+        document.getElementById('legacy-feas-indication-filter')?.value || ''
+      );
+    const detail = document.getElementById('legacy-feas-detail');
+    if (detail && !detail.classList.contains('hidden') && state.selectedSurveyId) {
+      openFeasibilitySurvey(state.selectedSurveyId);
+    } else {
+      rerender();
+    }
+    document.getElementById('legacy-feas-search')?.addEventListener('input', rerender);
+    document.getElementById('legacy-feas-indication-filter')?.addEventListener('change', rerender);
+    document.getElementById('legacy-feas-sort')?.addEventListener('change', (e) => {
+      state.feasSort = e.target.value || 'responses-desc';
+      rerender();
+    });
+    document.getElementById('legacy-feas-refresh')?.addEventListener('click', async () => {
+      state.loaded = false;
+      await ensureLoaded(true);
+      populateIndicationFilter('legacy-feas-indication-filter');
+      if (detail && !detail.classList.contains('hidden') && state.selectedSurveyId) {
+        openFeasibilitySurvey(state.selectedSurveyId);
+      } else {
+        rerender();
+      }
+    });
+    if (global.__legacyPendingSurveyId) {
+      const id = global.__legacyPendingSurveyId;
+      global.__legacyPendingSurveyId = null;
+      openFeasibilitySurvey(id);
+    }
+  }
+
   async function mountReporting() {
     await ensureLoaded();
     const studySel = document.getElementById('legacy-report-study');
@@ -2597,13 +3020,16 @@
   global.ArtemisLegacy = {
     getLegacyStudiesHTML,
     getLegacySitesHTML,
+    getLegacyFeasibilityHTML,
     getLegacyReportingHTML,
     getLegacyDashboardHTML,
     mountStudies,
     mountSites,
+    mountFeasibility,
     mountReporting,
     mountDashboard,
     openSiteDetail,
+    openFeasibilitySurvey,
     ensureLoaded,
     ensureLegacySitesForMatching,
     refreshArtemisLegacyIndex,

@@ -28,6 +28,7 @@ Source: `Ora_Feasibility_Data_All_Sites.json` (SurveyMonkey + Monday tabs). Matc
 ## UI
 
 - **Legacy Sites** — Overview / **Surveys** (same accordion as live Sites) / **Site profile**; filter by indication/TA
+- **Feasibility Surveys** — list survey definitions → open one → site responses accordion (by survey, not by site)
 - **Legacy Reporting** — funnel KPIs + **Feasibility by indication/TA** table + indication filter
 - **Legacy Studies** — list → open study → site table + edit metadata; sort A→Z / Z→A / enrolled
 - **Dashboard** — live ops charts + legacy overview panel at bottom
