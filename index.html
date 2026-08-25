@@ -9672,7 +9672,8 @@
             };
 
             const DATA_REFRESH_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-            const SCHEDULER_REFRESH_INTERVAL_MS = 60 * 1000;
+            // Focus/visibility refresh only — a 60s force-fetch was hammering the API and UI.
+            const SCHEDULER_REFRESH_INTERVAL_MS = 0;
             const NAVAN_CONNECTION_CHECK_INTERVAL_MS = 120000;
             // Default: 30 days past, 60 days future (90 days total)
             // This range should complete within the 30-second platform timeout
@@ -16093,83 +16094,6 @@
 
             const getFinalizationRecordId = (monthKey) => `schedule-finalized-${monthKey}`;
 
-            const getDailyBackupRecordId = (dayKey = null) => {
-                const key = dayKey || toDateOnlyString(new Date());
-                return `schedule-backup-${key}`;
-            };
-
-            /** Hard copy of currently loaded events (daily + before destructive rewrites). */
-            const createScheduleBackupSnapshot = async (reason = 'manual', options = {}) => {
-                const force = options.force === true;
-                const today = toDateOnlyString(new Date());
-                const backupId = force
-                    ? `schedule-backup-${today}-${Date.now()}`
-                    : getDailyBackupRecordId(today);
-                if (!force) {
-                    try {
-                        const existing = await apiService.getSchedule(backupId);
-                        if (existing && existing.id) {
-                            debugLog('CHAOS: Daily backup already exists for', today);
-                            return existing;
-                        }
-                    } catch (_) { /* create below */ }
-                }
-                const events = (state.crc_events || []).map((e) => ({ ...e }));
-                const monthKey = getScheduleMonthKey(state.crcCalendarDate);
-                const payload = {
-                    id: backupId,
-                    type: 'daily-backup',
-                    reason: String(reason || 'manual'),
-                    backupDate: today,
-                    monthKey,
-                    createdAt: new Date().toISOString(),
-                    createdBy: {
-                        userId: state.currentUser?.id || null,
-                        userName: (state.currentUser?.name || state.currentUser?.username || state.currentUser?.email || 'Unknown').trim()
-                    },
-                    eventCount: events.length,
-                    events
-                };
-                await apiService.upsertSchedule(backupId, payload);
-                debugLog('CHAOS: Saved schedule backup', backupId, `(${events.length} events)`, reason);
-                return payload;
-            };
-
-            const ensureDailyScheduleBackup = async () => {
-                if (!(isAdminUser() || getEffectivePermissionLevel() === 'Manager')) return;
-                if (!state.initialLoadComplete) return;
-                if (!Array.isArray(state.crc_events) || state.crc_events.length === 0) return;
-                try {
-                    await createScheduleBackupSnapshot('daily-auto');
-                } catch (err) {
-                    console.warn('CHAOS: Daily schedule backup failed:', err);
-                }
-            };
-
-            const restoreScheduleFromBackup = async (backupId) => {
-                if (!backupId) throw new Error('Missing backup id');
-                const record = await apiService.getSchedule(backupId);
-                if (!record || !Array.isArray(record.events)) {
-                    throw new Error('Backup has no events to restore.');
-                }
-                // Restore is a local view recovery: put snapshot events into memory and widen the query range.
-                // Does not delete live Cosmos rows — managers can then re-save / re-finalize deliberately.
-                const dates = record.events
-                    .map((e) => String(e?.date || e?.startDate || '').slice(0, 10))
-                    .filter(Boolean)
-                    .sort();
-                const range = dates.length
-                    ? { startDate: dates[0], endDate: dates[dates.length - 1] }
-                    : (state.eventsQueryRange || getDefaultEventsDateRange());
-                setState({
-                    crc_events: record.events.map((e) => ({ ...e })),
-                    crc_events_display: undefined,
-                    eventsQueryRange: range
-                });
-                showNotification(`Loaded backup (${record.events.length} events) into the scheduler view. Live DB rows were not deleted — re-finalize or edit to persist.`, 'success');
-                if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar();
-            };
-
             const loadMonthFinalization = async (monthKey) => {
                 if (state.finalizedMonths[monthKey] !== undefined) return state.finalizedMonths[monthKey];
                 try {
@@ -16587,12 +16511,6 @@
                                         <i data-lucide="lock-open" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Unfinalize</span>
                                     </button>
                                     ` : ''}
-                                    <button type="button" data-action="backup-schedule-now" class="p-1.5 md:p-2 rounded-md bg-slate-600 hover:bg-slate-700 text-white text-xs md:text-sm flex items-center gap-1" title="Save a hard copy of the currently loaded schedule">
-                                        <i data-lucide="hard-drive" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Backup</span>
-                                    </button>
-                                    <button type="button" data-action="restore-schedule-backup" class="p-1.5 md:p-2 rounded-md bg-slate-500 hover:bg-slate-600 text-white text-xs md:text-sm flex items-center gap-1" title="Load today's automatic hard copy into the view">
-                                        <i data-lucide="history" class="w-4 h-4 md:w-5 md:h-5"></i><span class="hidden sm:inline">Restore backup</span>
-                                    </button>
                                     ${finalizeLastAtFormatted ? `<span class="finalize-timestamp-clock whitespace-nowrap" title="Last finalized">Last finalized <span class="finalize-time">${finalizeLastAtFormatted}</span></span>` : ''}
                                 </div>
                                     `;
@@ -31930,7 +31848,6 @@
                         const alreadyFinalized = !!existing?.finalized;
                         if (!alreadyFinalized) {
                             try {
-                                try { await createScheduleBackupSnapshot('before-finalize', { force: true }); } catch (_) { /* non-fatal */ }
                                 const snapshotAt = new Date().toISOString();
                                 const finalizedBy = {
                                     userId: state.currentUser?.id || state.userId || null,
@@ -31954,29 +31871,6 @@
                             openModal(getFinalizeChangesModalHTML(changes, formatScheduleMonthLabel(monthKey)), 'xl');
                         }
                         if (btn) { btn.disabled = false; btn.innerHTML = btn.dataset.originalContent || ''; delete btn.dataset.originalContent; lucide.createIcons(); }
-                        break;
-                    }
-                    case 'backup-schedule-now': {
-                        try {
-                            const snap = await createScheduleBackupSnapshot('manual', { force: true });
-                            showNotification(`Hard copy saved (${snap.eventCount || 0} events).`, 'success');
-                        } catch (err) {
-                            console.error('Backup failed:', err);
-                            showNotification(err?.message || 'Failed to save backup.', 'error');
-                        }
-                        break;
-                    }
-                    case 'restore-schedule-backup': {
-                        const todayId = getDailyBackupRecordId();
-                        const typed = prompt(`Load a hard copy into the scheduler view (does not wipe the database).\nEnter backup id, or leave blank for today's automatic backup:\n${todayId}`);
-                        if (typed === null) break;
-                        const backupId = (typed || '').trim() || todayId;
-                        try {
-                            await restoreScheduleFromBackup(backupId);
-                        } catch (err) {
-                            console.error('Restore backup failed:', err);
-                            showNotification(err?.message || 'No backup found for that id.', 'error');
-                        }
                         break;
                     }
                     case 'confirm-refinalize': {
@@ -38424,13 +38318,6 @@
                                     if (isGroupEvent && dateRangeChanged && mayRewriteWholeGroup) {
                                         // Date range changed for a group event - need to handle the entire group
                                         // Get all events in the group (exclude Travel Days)
-                                        if (typeof createScheduleBackupSnapshot === 'function') {
-                                            try {
-                                                await createScheduleBackupSnapshot('before-group-date-rewrite', { force: true });
-                                            } catch (backupErr) {
-                                                console.warn('Pre-rewrite backup failed:', backupErr);
-                                            }
-                                        }
                                         const groupEvents = state.crc_events.filter(e => 
                                             e.groupId === existingGroupId && e.type !== 'Travel Day'
                                         );
@@ -54259,10 +54146,13 @@
                 schedulerRefreshHandler = () => {
                     if (!state.initialLoadComplete || document.hidden) return;
                     if (!['scheduler', 'planning-grid', 'allSchedule'].includes(state.activeTab)) return;
+                    // Only on tab focus / become-visible — not on a tight polling loop.
                     ensureEventsCoverVisibleMonth({ force: true });
                 };
-                if (schedulerRefreshTimerId) clearInterval(schedulerRefreshTimerId);
-                schedulerRefreshTimerId = setInterval(schedulerRefreshHandler, SCHEDULER_REFRESH_INTERVAL_MS);
+                if (schedulerRefreshTimerId) {
+                    clearInterval(schedulerRefreshTimerId);
+                    schedulerRefreshTimerId = null;
+                }
                 window.addEventListener('focus', schedulerRefreshHandler);
                 document.addEventListener('visibilitychange', schedulerRefreshHandler);
                 
@@ -54681,7 +54571,6 @@
                     }
                     setupRealtimeListeners();
                     loadDeferredAppData();
-                    setTimeout(() => { ensureDailyScheduleBackup(); }, 2500);
                     setTimeout(() => {
                         if (pendingInitialTabPaint && !initialAppRevealed) {
                             debugWarn('CHAOS: Initial load safety timeout — revealing app');
