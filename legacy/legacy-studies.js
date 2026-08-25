@@ -7,6 +7,8 @@
     studies: [],
     sites: [],
     outcomes: [],
+    feasibilityResponses: [],
+    feasibilityDefs: [],
     loaded: false,
     selectedStudyId: null,
     selectedSiteId: null,
@@ -37,7 +39,7 @@
 
   async function ensureLoaded(force = false) {
     if (state.loaded && !force) return state;
-    const [studies, sites, outcomes] = await Promise.all([
+    const [studies, sites, outcomes, feasibilityResponses, feasibilityDefs] = await Promise.all([
       req('/legacy-studies').catch((e) => {
         console.error('legacy-studies load failed', e);
         return [];
@@ -50,11 +52,29 @@
         console.error('legacy outcomes load failed', e);
         return [];
       }),
+      req('/site-survey-responses').catch((e) => {
+        console.error('feasibility responses load failed', e);
+        return [];
+      }),
+      req('/site-survey-definitions').catch((e) => {
+        console.error('feasibility defs load failed', e);
+        return [];
+      }),
     ]);
     state.studies = Array.isArray(studies) ? studies : [];
     state.sites = Array.isArray(sites) ? sites : [];
     state.outcomes = Array.isArray(outcomes) ? outcomes : [];
+    state.feasibilityResponses = (Array.isArray(feasibilityResponses) ? feasibilityResponses : []).filter(
+      (r) => r && !r._archived
+    );
+    state.feasibilityDefs = Array.isArray(feasibilityDefs) ? feasibilityDefs : [];
     state.loaded = true;
+    if (global.ArtemisSurveyUI && typeof global.ArtemisSurveyUI.syncCache === 'function') {
+      global.ArtemisSurveyUI.syncCache({
+        definitions: state.feasibilityDefs,
+        responses: state.feasibilityResponses,
+      });
+    }
     console.log(
       'Legacy loaded',
       state.studies.length,
@@ -62,7 +82,9 @@
       state.sites.length,
       'unique sites,',
       state.outcomes.length,
-      'outcome rows'
+      'outcome rows,',
+      state.feasibilityResponses.length,
+      'feasibility responses'
     );
     return state;
   }
@@ -521,6 +543,9 @@
               <select id="legacy-report-site" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full lg:min-w-[12rem] min-h-[44px]">
                 <option value="">All sites</option>
               </select>
+              <select id="legacy-report-indication" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full lg:min-w-[12rem] min-h-[44px]" aria-label="Indication / TA">
+                <option value="">All indications / TA</option>
+              </select>
               <button id="legacy-report-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 min-h-[44px]">Refresh</button>
               <button id="legacy-report-export" class="px-4 py-3 sm:py-2 text-sm rounded-md border dark:border-gray-600 min-h-[44px]">Export CSV</button>
             </div>
@@ -548,7 +573,7 @@
           <div>
             <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Legacy Sites</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              Overall site performance plus relationship notes (prefer / cautious / avoid, advantages & disadvantages).
+              Funnel history, relationship notes, and the same feasibility surveys / site profile as live Sites — stored on legacy only (not shared with Chaos).
             </p>
           </div>
           <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2 w-full">
@@ -564,6 +589,9 @@
               <option value="cautious">Cautious</option>
               <option value="avoid">Avoid</option>
               <option value="unset">Not set</option>
+            </select>
+            <select id="legacy-site-indication-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Filter by indication / TA">
+              <option value="">All indications / TA</option>
             </select>
             <input id="legacy-site-search" type="search" placeholder="Search sites…"
               class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:flex-1 sm:min-w-[12rem] min-h-[44px]" />
@@ -612,6 +640,52 @@
     return `<span class="inline-flex px-2 py-0.5 rounded text-xs font-medium ${cls}">${escapeHtml(label)}</span>`;
   }
 
+  function siteIndications(site) {
+    const fromSite = [
+      ...(Array.isArray(site?.indicationsCovered) ? site.indicationsCovered : []),
+      ...(Array.isArray(site?.therapeuticAreas) ? site.therapeuticAreas : []),
+    ];
+    const fromSurveys = (state.feasibilityResponses || [])
+      .filter((r) => r && r.siteId === site?.id)
+      .map((r) => r.indication || r.therapeuticArea || (r.study && r.study.indication))
+      .filter(Boolean);
+    return [...new Set([...fromSite, ...fromSurveys].map((x) => String(x).trim()).filter(Boolean))].sort((a, b) =>
+      a.localeCompare(b)
+    );
+  }
+
+  function allIndicationOptions() {
+    const set = new Set();
+    for (const s of state.sites || []) {
+      for (const i of siteIndications(s)) set.add(i);
+    }
+    for (const r of state.feasibilityResponses || []) {
+      const i = r.indication || r.therapeuticArea || (r.study && r.study.indication);
+      if (i) set.add(String(i).trim());
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }
+
+  function indicationPills(inds) {
+    if (!inds || !inds.length) return `<span class="text-xs text-gray-400">—</span>`;
+    return inds
+      .slice(0, 4)
+      .map(
+        (i) =>
+          `<span class="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200">${escapeHtml(i)}</span>`
+      )
+      .join(' ') + (inds.length > 4 ? ` <span class="text-[10px] text-gray-400">+${inds.length - 4}</span>` : '');
+  }
+
+  function feasibilityForSite(siteId) {
+    return (state.feasibilityResponses || []).filter((r) => r && r.siteId === siteId);
+  }
+
+  function feasibilityTitle(r) {
+    const def = (state.feasibilityDefs || []).find((d) => d.id === r.surveyId);
+    return def?.title || r.study?.study_name || r.sourceTab || r.surveyId || 'Survey';
+  }
+
   function siteSummaryCards(el, sites) {
     if (!el) return;
     const m = sites.reduce(
@@ -646,7 +720,93 @@
     return state.outcomes.map(normOutcome).filter((o) => o.siteId === siteId);
   }
 
-  function renderSitesTable(q = '', prefFilter = '') {
+  function siteIndications(site) {
+    const fromSite = [
+      ...(Array.isArray(site?.indicationsCovered) ? site.indicationsCovered : []),
+      ...(Array.isArray(site?.therapeuticAreas) ? site.therapeuticAreas : []),
+    ];
+    const fromSurveys = (state.feasibilityResponses || [])
+      .filter((r) => r && r.siteId === site.id)
+      .map((r) => r.indication || r.therapeuticArea || (r.study && r.study.indication))
+      .filter(Boolean);
+    return [...new Set([...fromSite, ...fromSurveys].map((x) => String(x).trim()).filter(Boolean))].sort((a, b) =>
+      a.localeCompare(b)
+    );
+  }
+
+  function allIndicationOptions() {
+    const set = new Set();
+    for (const s of uniqueSitesFromState()) {
+      for (const i of siteIndications(s)) set.add(i);
+    }
+    for (const r of state.feasibilityResponses || []) {
+      const i = r.indication || r.therapeuticArea || (r.study && r.study.indication);
+      if (i) set.add(String(i).trim());
+    }
+    return [...set].filter(Boolean).sort((a, b) => a.localeCompare(b));
+  }
+
+  function populateIndicationFilter(selectId) {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const current = sel.value || '';
+    const opts = allIndicationOptions();
+    sel.innerHTML =
+      `<option value="">All indications / TA</option>` +
+      opts.map((i) => `<option value="${escapeHtml(i)}">${escapeHtml(i)}</option>`).join('');
+    if (current && opts.includes(current)) sel.value = current;
+  }
+
+  function profileFieldHtml(label, value) {
+    if (value == null || value === '' || (Array.isArray(value) && !value.length)) return '';
+    const display = Array.isArray(value) ? value.join(', ') : String(value);
+    return `<div>
+      <dt class="text-xs text-gray-500">${escapeHtml(label)}</dt>
+      <dd class="text-sm text-gray-900 dark:text-gray-100 mt-0.5 whitespace-pre-wrap">${escapeHtml(display)}</dd>
+    </div>`;
+  }
+
+  function renderSiteProfileHtml(profile) {
+    if (!profile) {
+      return `<div class="text-sm text-gray-500 py-6 text-center">No site profile document yet for this legacy site.</div>`;
+    }
+    const inds = profile.indicationsCovered || profile.therapeuticAreas || [];
+    const inv = Array.isArray(profile.investigators) ? profile.investigators : [];
+    const contacts = Array.isArray(profile.contacts) ? profile.contacts : [];
+    const studies = Array.isArray(profile.study_responses) ? profile.study_responses : [];
+    return `
+      <div class="space-y-4">
+        <div class="flex flex-wrap gap-1.5">
+          ${(inds || []).map((i) => `<span class="inline-flex px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200">${escapeHtml(i)}</span>`).join('') || '<span class="text-xs text-gray-500">No indications tagged</span>'}
+        </div>
+        <div class="rounded-lg border dark:border-gray-700 p-4">
+          <h5 class="text-sm font-semibold mb-3">Site details</h5>
+          <dl class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            ${profileFieldHtml('Institution', profile.institution_name)}
+            ${profileFieldHtml('Site type', profile.site_type)}
+            ${profileFieldHtml('Address', [profile.address_street, profile.address_city, profile.address_state, profile.address_zip].filter(Boolean).join(', ') || profile.address_raw)}
+            ${profileFieldHtml('Phone', profile.phone)}
+            ${profileFieldHtml('IRB type', profile.irb_type)}
+            ${profileFieldHtml('FDA audit history', profile.fda_audit_history == null ? '' : profile.fda_audit_history ? 'Yes' : 'No')}
+            ${profileFieldHtml('Profile confirmed', profile.profile_last_confirmed)}
+          </dl>
+        </div>
+        ${inv.length ? `<div class="rounded-lg border dark:border-gray-700 p-4">
+          <h5 class="text-sm font-semibold mb-3">Investigators</h5>
+          <ul class="space-y-2 text-sm">${inv.map((p) => `<li><span class="font-medium">${escapeHtml(p.name || '—')}</span>${p.credentials ? ` · ${escapeHtml(p.credentials)}` : ''}${p.specialty ? ` · ${escapeHtml(p.specialty)}` : ''}${p.email ? `<div class="text-xs text-gray-500">${escapeHtml(p.email)}</div>` : ''}</li>`).join('')}</ul>
+        </div>` : ''}
+        ${contacts.length ? `<div class="rounded-lg border dark:border-gray-700 p-4">
+          <h5 class="text-sm font-semibold mb-3">Contacts</h5>
+          <ul class="space-y-2 text-sm">${contacts.map((c) => `<li><span class="font-medium">${escapeHtml(c.name || '—')}</span> <span class="text-xs text-gray-500">(${escapeHtml(c.role || 'contact')})</span>${c.email ? `<div class="text-xs text-gray-500">${escapeHtml(c.email)}</div>` : ''}</li>`).join('')}</ul>
+        </div>` : ''}
+        ${studies.length ? `<div class="rounded-lg border dark:border-gray-700 p-4">
+          <h5 class="text-sm font-semibold mb-3">Feasibility surveys on profile (${studies.length})</h5>
+          <ul class="space-y-1.5 text-sm">${studies.map((s) => `<li class="flex flex-wrap gap-2 items-baseline"><span class="font-medium">${escapeHtml((s.study && s.study.study_name) || s.sourceTab || s.surveyId || 'Survey')}</span>${s.indication || s.therapeuticArea ? `<span class="text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700">${escapeHtml(s.indication || s.therapeuticArea)}</span>` : ''}<span class="text-xs text-gray-500">${escapeHtml(s.sourcePlatform || '')} · ${s.fieldCount || 0} fields</span></li>`).join('')}</ul>
+        </div>` : ''}
+      </div>`;
+  }
+
+  function renderSitesTable(q = '', prefFilter = '', indicationFilter = '') {
     const wrap = document.getElementById('legacy-sites-table-wrap');
     const summary = document.getElementById('legacy-sites-summary');
     const status = document.getElementById('legacy-sites-load-status');
@@ -659,14 +819,19 @@
 
     const qq = q.trim().toLowerCase();
     const pf = (prefFilter || '').toLowerCase();
+    const indf = (indicationFilter || '').trim();
     const filtered = sites.filter((s) => {
       if (pf === 'unset') {
         if (s.relationshipPreference) return false;
       } else if (pf && (s.relationshipPreference || '') !== pf) {
         return false;
       }
+      if (indf) {
+        const inds = siteIndications(s);
+        if (!inds.includes(indf)) return false;
+      }
       if (!qq) return true;
-      const blob = `${s.name} ${s.siteCode || ''} ${s.advantages || ''} ${s.disadvantages || ''} ${s.relationshipNotes || ''}`.toLowerCase();
+      const blob = `${s.name} ${s.siteCode || ''} ${s.advantages || ''} ${s.disadvantages || ''} ${s.relationshipNotes || ''} ${(siteIndications(s) || []).join(' ')}`.toLowerCase();
       return blob.includes(qq);
     });
     const rows = sortLegacyRows(
@@ -827,6 +992,28 @@
       (o) => `<option value="${o.value}" ${pref === o.value ? 'selected' : ''}>${o.label}</option>`
     ).join('');
 
+    const inds = siteIndications(site);
+    const surveyUi = global.ArtemisSurveyUI;
+    if (surveyUi?.syncCache) {
+      surveyUi.syncCache({
+        definitions: state.feasibilityDefs,
+        responses: state.feasibilityResponses,
+      });
+    }
+    const latestSurveys = surveyUi?.latestSurveyResponsesBySurvey
+      ? surveyUi.latestSurveyResponsesBySurvey(site.id)
+      : (state.feasibilityResponses || []).filter((r) => r.siteId === site.id);
+    const surveysHtml = surveyUi?.siteSurveySectionsHtml
+      ? surveyUi.siteSurveySectionsHtml(site.id)
+      : `<div class="text-sm text-gray-500">Survey UI not loaded.</div>`;
+
+    let profile = null;
+    try {
+      profile = await req(`/site-profiles/${encodeURIComponent(site.id)}`);
+    } catch (_) {
+      profile = null;
+    }
+
     detail.innerHTML = `
       <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4 space-y-5">
         <div class="flex flex-col gap-3">
@@ -836,12 +1023,24 @@
             <p class="text-sm text-gray-500 flex flex-wrap items-center gap-2 mt-1">
               <span class="font-mono text-xs">${escapeHtml(site.siteCode || site.id)}</span>
               ${preferenceBadge(site.relationshipPreference)}
-              <span>· ${studyIds.length} studies · ${outcomes.length} rows · ${pis.length} PI(s)</span>
+              <span>· ${studyIds.length} studies · ${outcomes.length} rows · ${pis.length} PI(s) · ${latestSurveys.length} surveys</span>
             </p>
+            <div class="flex flex-wrap gap-1.5 mt-2">
+              ${inds.map((i) => `<span class="inline-flex px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200">${escapeHtml(i)}</span>`).join('') || '<span class="text-xs text-gray-400">No indications / TA tagged</span>'}
+            </div>
           </div>
           <button type="button" id="legacy-save-site" class="${TAP_BTN} w-full sm:w-auto">Save site</button>
         </div>
 
+        <div class="flex gap-1 border-b dark:border-gray-700 overflow-x-auto">
+          <button type="button" class="legacy-site-tab px-3 py-2 text-sm font-medium border-b-2 border-indigo-600 text-indigo-700 dark:text-indigo-300" data-legacy-site-tab="overview">Overview</button>
+          <button type="button" class="legacy-site-tab px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500" data-legacy-site-tab="surveys">
+            Surveys ${latestSurveys.length ? `<span class="ml-1 inline-flex min-w-[1.25rem] h-5 px-1 items-center justify-center rounded-full bg-indigo-600 text-white text-[10px] font-bold">${latestSurveys.length}</span>` : ''}
+          </button>
+          <button type="button" class="legacy-site-tab px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500" data-legacy-site-tab="profile">Site profile</button>
+        </div>
+
+        <div data-legacy-site-panel="overview" class="space-y-5">
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label class="text-sm sm:col-span-2">Site name
             <input id="legacy-site-name" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
@@ -956,7 +1155,44 @@
           <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Every study × group row</h4>
           ${siteOutcomesTableHtml(outcomes, { showStudy: true })}
         </div>
+        </div>
+
+        <div data-legacy-site-panel="surveys" class="hidden space-y-4">
+          <p class="text-xs text-gray-500">Same survey accordion as live Sites. Responses are keyed to this legacy site id (not shared Chaos sites).</p>
+          ${surveysHtml}
+        </div>
+
+        <div data-legacy-site-panel="profile" class="hidden space-y-4">
+          <p class="text-xs text-gray-500">Site profile master fields for Budget Buddy / feasibility — ARTEMIS-only container <code class="text-[10px]">site-profiles</code>.</p>
+          ${renderSiteProfileHtml(profile)}
+        </div>
       </div>`;
+
+    const setLegacySiteTab = (tab) => {
+      detail.querySelectorAll('[data-legacy-site-tab]').forEach((btn) => {
+        const on = btn.getAttribute('data-legacy-site-tab') === tab;
+        btn.classList.toggle('border-indigo-600', on);
+        btn.classList.toggle('text-indigo-700', on);
+        btn.classList.toggle('dark:text-indigo-300', on);
+        btn.classList.toggle('border-transparent', !on);
+        btn.classList.toggle('text-gray-500', !on);
+      });
+      detail.querySelectorAll('[data-legacy-site-panel]').forEach((panel) => {
+        panel.classList.toggle('hidden', panel.getAttribute('data-legacy-site-panel') !== tab);
+      });
+    };
+    detail.querySelectorAll('[data-legacy-site-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => setLegacySiteTab(btn.getAttribute('data-legacy-site-tab')));
+    });
+    detail.querySelectorAll('.view-site-survey-response-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-response-id');
+        const response = (state.feasibilityResponses || []).find((r) => r.id === id);
+        if (response && surveyUi?.createSiteSurveyResponseModal) {
+          surveyUi.createSiteSurveyResponseModal(response);
+        }
+      });
+    });
 
     document.getElementById('legacy-back-sites')?.addEventListener('click', () => {
       detail.classList.add('hidden');
@@ -966,7 +1202,8 @@
       state.selectedSiteId = null;
       renderSitesTable(
         document.getElementById('legacy-site-search')?.value || '',
-        document.getElementById('legacy-site-pref-filter')?.value || ''
+        document.getElementById('legacy-site-pref-filter')?.value || '',
+        document.getElementById('legacy-site-indication-filter')?.value || ''
       );
     });
 
@@ -1829,7 +2066,10 @@
     const tables = document.getElementById('legacy-report-tables');
     const studySel = document.getElementById('legacy-report-study');
     const siteSel = document.getElementById('legacy-report-site');
+    const indSel = document.getElementById('legacy-report-indication');
     if (!kpis || !tables) return;
+
+    populateIndicationFilter('legacy-report-indication');
 
     if (studySel && studySel.options.length <= 1) {
       [...state.studies]
@@ -1856,21 +2096,57 @@
 
     const studyFilter = studySel?.value || '';
     const siteFilter = siteSel?.value || '';
+    const indicationFilter = indSel?.value || '';
     let outcomes = state.outcomes.map(normOutcome);
     if (studyFilter) outcomes = outcomes.filter((o) => o.studyId === studyFilter);
     if (siteFilter) outcomes = outcomes.filter((o) => o.siteId === siteFilter);
 
+    // When filtering by indication, prefer sites that have that feasibility TA
+    let sitesForReport = sitesMaster;
+    if (indicationFilter) {
+      sitesForReport = sitesMaster.filter((s) => siteIndications(s).includes(indicationFilter));
+      if (!siteFilter) {
+        const allowed = new Set(sitesForReport.map((s) => s.id));
+        outcomes = outcomes.filter((o) => allowed.has(o.siteId));
+      }
+    }
+
     const studyIds = new Set(outcomes.map((o) => o.studyId));
-    const studies = state.studies.filter((s) => studyIds.has(s.id) || (!studyFilter && !siteFilter));
     const filteredStudies = studyFilter ? state.studies.filter((s) => s.id === studyFilter) : state.studies;
     const totals = sumOutcomes(outcomes);
     const uniqueSiteCount = new Set(outcomes.map((o) => o.siteId).filter(Boolean)).size;
 
+    let feas = state.feasibilityResponses || [];
+    if (siteFilter) feas = feas.filter((r) => r.siteId === siteFilter);
+    if (indicationFilter) {
+      feas = feas.filter((r) => {
+        const i = r.indication || r.therapeuticArea || (r.study && r.study.indication);
+        return i === indicationFilter;
+      });
+    }
+
+    const feasByInd = {};
+    for (const r of feas) {
+      const i = r.indication || r.therapeuticArea || (r.study && r.study.indication) || 'Unknown';
+      if (!feasByInd[i]) feasByInd[i] = { responses: 0, sites: new Set(), surveys: new Set() };
+      feasByInd[i].responses += 1;
+      if (r.siteId) feasByInd[i].sites.add(r.siteId);
+      if (r.surveyId) feasByInd[i].surveys.add(r.surveyId);
+    }
+    const feasRows = Object.entries(feasByInd)
+      .map(([indication, v]) => ({
+        indication,
+        responses: v.responses,
+        sites: v.sites.size,
+        surveys: v.surveys.size,
+      }))
+      .sort((a, b) => b.responses - a.responses);
+
     kpis.innerHTML = [
-      ['Unique sites', siteFilter ? 1 : state.sites.length || uniqueSiteCount],
+      ['Unique sites', siteFilter ? 1 : indicationFilter ? sitesForReport.length : state.sites.length || uniqueSiteCount],
       ['Studies', studyFilter ? 1 : filteredStudies.length],
       ['Outcome rows', outcomes.length],
-      ['Scheduled', fmt(totals.scheduled)],
+      ['Feasibility responses', feas.length],
       ['Screened', fmt(totals.screened)],
       ['Enrolled', fmt(totals.enrolled)],
     ]
@@ -1888,13 +2164,13 @@
       const ctx1 = document.getElementById('legacy-chart-studies');
       const ctx2 = document.getElementById('legacy-chart-funnel');
       if (state.reportMode === 'bySite') {
-        let siteRows = sitesMaster
+        let siteRows = sitesForReport
           .map((s) => {
             const rows = outcomes.filter((o) => o.siteId === s.id);
             const t = sumOutcomes(rows);
             return { ...s, _t: t, _rows: rows };
           })
-          .filter((s) => s._rows.length > 0)
+          .filter((s) => s._rows.length > 0 || (state.feasibilityResponses || []).some((r) => r.siteId === s.id))
           .sort((a, b) => b._t.enrolled - a._t.enrolled);
         const top = siteRows.slice(0, 12);
         if (ctx1) {
@@ -1941,15 +2217,16 @@
     }
 
     if (state.reportMode === 'bySite') {
-      const siteRows = sitesMaster
+      const siteRows = sitesForReport
         .map((s) => {
           const rows = outcomes.filter((o) => o.siteId === s.id);
           const t = sumOutcomes(rows);
           const studyNames = [...new Set(rows.map((r) => r.studyName))];
-          return { site: s, rows, t, studyNames };
+          const feasCount = (state.feasibilityResponses || []).filter((r) => r.siteId === s.id).length;
+          return { site: s, rows, t, studyNames, feasCount };
         })
-        .filter((x) => x.rows.length > 0)
-        .sort((a, b) => b.t.enrolled - a.t.enrolled);
+        .filter((x) => x.rows.length > 0 || x.feasCount > 0)
+        .sort((a, b) => b.t.enrolled - a.t.enrolled || b.feasCount - a.feasCount);
 
       tables.innerHTML = `
         <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden">
@@ -2082,6 +2359,7 @@
       tables.querySelectorAll('[data-legacy-report-open-site]').forEach((btn) => {
         btn.addEventListener('click', () => openSiteDetail(btn.getAttribute('data-legacy-report-open-site')));
       });
+      tables.innerHTML += feasByIndicationSectionHtml(feasRows, feas.length);
       return;
     }
 
@@ -2145,6 +2423,43 @@
         <h3 class="font-semibold text-gray-900 dark:text-white">Breakdown by study → site</h3>
         ${studyBlocks || '<p class="text-sm text-gray-500">No studies in filter.</p>'}
       </div>`;
+    tables.innerHTML += feasByIndicationSectionHtml(feasRows, feas.length);
+  }
+
+  function feasByIndicationSectionHtml(feasRows, totalFeas) {
+    return `
+      <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden mt-4">
+        <div class="px-3 py-2 font-semibold border-b dark:border-gray-700">
+          Feasibility by indication / TA (${totalFeas} responses)
+          <div class="text-xs font-normal text-gray-500">SurveyMonkey + Monday master ingest · TA = Indication</div>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="min-w-full text-sm">
+            <thead class="bg-gray-50 dark:bg-gray-900/40 text-left">
+              <tr>
+                <th class="px-3 py-2">Indication / TA</th>
+                <th class="px-3 py-2 text-right">Responses</th>
+                <th class="px-3 py-2 text-right">Sites</th>
+                <th class="px-3 py-2 text-right">Survey defs</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${feasRows.length
+                ? feasRows
+                    .map(
+                      (r) => `<tr class="border-t dark:border-gray-700">
+                  <td class="px-3 py-1.5 font-medium">${escapeHtml(r.indication)}</td>
+                  <td class="px-3 py-1.5 text-right">${r.responses}</td>
+                  <td class="px-3 py-1.5 text-right">${r.sites}</td>
+                  <td class="px-3 py-1.5 text-right">${r.surveys}</td>
+                </tr>`
+                    )
+                    .join('')
+                : `<tr><td colspan="4" class="px-3 py-4 text-sm text-gray-500 text-center">No feasibility responses in filter.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>`;
   }
 
   function exportCsv() {
@@ -2200,14 +2515,17 @@
 
   async function mountSites() {
     await ensureLoaded();
+    populateIndicationFilter('legacy-site-indication-filter');
     const rerender = () =>
       renderSitesTable(
         document.getElementById('legacy-site-search')?.value || '',
-        document.getElementById('legacy-site-pref-filter')?.value || ''
+        document.getElementById('legacy-site-pref-filter')?.value || '',
+        document.getElementById('legacy-site-indication-filter')?.value || ''
       );
     rerender();
     document.getElementById('legacy-site-search')?.addEventListener('input', rerender);
     document.getElementById('legacy-site-pref-filter')?.addEventListener('change', rerender);
+    document.getElementById('legacy-site-indication-filter')?.addEventListener('change', rerender);
     document.getElementById('legacy-site-sort')?.addEventListener('change', (e) => {
       state.siteSort = e.target.value || 'name-asc';
       rerender();
@@ -2215,6 +2533,7 @@
     document.getElementById('legacy-sites-refresh')?.addEventListener('click', async () => {
       state.loaded = false;
       await ensureLoaded(true);
+      populateIndicationFilter('legacy-site-indication-filter');
       const detail = document.getElementById('legacy-site-detail');
       if (detail && !detail.classList.contains('hidden') && state.selectedSiteId) {
         await openSiteDetail(state.selectedSiteId);
@@ -2233,12 +2552,15 @@
     await ensureLoaded();
     const studySel = document.getElementById('legacy-report-study');
     const siteSel = document.getElementById('legacy-report-site');
+    const indSel = document.getElementById('legacy-report-indication');
     if (studySel) studySel.innerHTML = '<option value="">All studies</option>';
     if (siteSel) siteSel.innerHTML = '<option value="">All sites</option>';
+    populateIndicationFilter('legacy-report-indication');
     setReportMode('bySite');
     renderReporting();
     studySel?.addEventListener('change', renderReporting);
     siteSel?.addEventListener('change', renderReporting);
+    indSel?.addEventListener('change', renderReporting);
     document.getElementById('legacy-mode-site')?.addEventListener('click', () => {
       setReportMode('bySite');
       renderReporting();
@@ -2252,6 +2574,7 @@
       await ensureLoaded(true);
       if (studySel) studySel.innerHTML = '<option value="">All studies</option>';
       if (siteSel) siteSel.innerHTML = '<option value="">All sites</option>';
+      populateIndicationFilter('legacy-report-indication');
       renderReporting();
     });
     document.getElementById('legacy-report-export')?.addEventListener('click', exportCsv);

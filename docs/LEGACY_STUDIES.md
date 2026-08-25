@@ -7,12 +7,30 @@ Site–study outcomes from **Anterior Segment Overview.xlsx**, stored in the sam
 | Container | Partition key | Purpose |
 |-----------|---------------|---------|
 | `legacy-studies` | `/id` | One doc per study + rolled-up metrics + **editable** metadata (`name`, `oraProjectNumber`, `therapeuticArea`, `indication`, `sponsor`, `phase`, `status`, `notes`). **TA = Indication** in this workbook. |
-| `legacy-sites` | `/id` | One doc per unique site (~80), with rolled metrics + optional `linkedArtemisSiteId` + **editable relationship** (`relationshipPreference`, `advantages`, `disadvantages`, `relationshipNotes`) |
+| `legacy-sites` | `/id` | One doc per unique site, funnel metrics + optional `linkedArtemisSiteId` + relationship fields + **feasibility** `indicationsCovered` / `therapeuticAreas` |
 | `legacy-study-site-outcomes` | `/studyId` | One doc per study × site × group (scheduled / screened / enrolled / dates); includes `siteId` |
+| `site-profiles` | `/id` | Feasibility site profile master (keyed by **legacy site id**). ARTEMIS-only; for Budget Buddy later. |
+| `site-survey-*` | `/id` | Feasibility survey defs/assignments/responses; **`siteId` = legacy site id** so Chaos shared `sites` is untouched |
 
-**Never written:** `studies`, `sites`, `patients`, `crcs`, `events`, `schedules`, etc.
+**Never written:** live `sites`, `studies`, `patients`, `crcs`, `events`, `schedules`, etc.
 
 **Not shipped to:** CHAOS or NASA branches — this lives on the ARTEMIS Static Web App only.
+
+## Feasibility master ingest
+
+```powershell
+python ingest/feasibility_master_ingest.py
+python ingest/feasibility_master_ingest.py --apply
+```
+
+Source: `Ora_Feasibility_Data_All_Sites.json` (SurveyMonkey + Monday tabs). Matches existing ARTEMIS/legacy sites by email/name/PI/address, then upserts **legacy-sites only**. Indication/TA is stored on survey defs, responses, profiles, and `legacy-sites.indicationsCovered`.
+
+## UI
+
+- **Legacy Sites** — Overview / **Surveys** (same accordion as live Sites) / **Site profile**; filter by indication/TA
+- **Legacy Reporting** — funnel KPIs + **Feasibility by indication/TA** table + indication filter
+- **Legacy Studies** — list → open study → site table + edit metadata; sort A→Z / Z→A / enrolled
+- **Dashboard** — live ops charts + legacy overview panel at bottom
 
 ## API routes
 
@@ -20,13 +38,7 @@ Site–study outcomes from **Anterior Segment Overview.xlsx**, stored in the sam
 - `GET/POST/PATCH/DELETE /api/legacy-sites/{id?}`
 - `GET/POST /api/legacy-study-site-outcomes?studyId=`
 - `GET /api/legacy-reporting/summary`
-
-## UI
-
-- **Legacy Studies** — list → open study → site table + edit study name / ORA project number / TA/metadata; sort A→Z / Z→A / enrolled  
-- **Legacy Sites** — list → open site → edit site name / code, overall funnel metrics, studies at site, relationship preference / advantages / disadvantages; sort A→Z / Z→A / enrolled  
-- **Legacy Reporting** — KPIs, charts, by-study / by-site tables, CSV export  
-- **Dashboard** — live ops charts + legacy overview panel at bottom  
+- `GET /api/site-profiles/{id?}` (optional `?indication=`)
 
 ## Re-ingest
 

@@ -6,6 +6,7 @@
 const LEGACY_STUDIES = 'legacy-studies';
 const LEGACY_SITES = 'legacy-sites';
 const LEGACY_OUTCOMES = 'legacy-study-site-outcomes';
+const SITE_PROFILES = 'site-profiles';
 
 function corsHeaders() {
     return {
@@ -39,7 +40,11 @@ async function ensureLegacyContainers(getCosmosClient, context) {
         id: LEGACY_OUTCOMES,
         partitionKey: { paths: ['/studyId'] },
     });
-    if (context?.log) context.log(`Ensured containers ${LEGACY_STUDIES}, ${LEGACY_SITES}, ${LEGACY_OUTCOMES}`);
+    await database.containers.createIfNotExists({
+        id: SITE_PROFILES,
+        partitionKey: { paths: ['/id'] },
+    });
+    if (context?.log) context.log(`Ensured containers ${LEGACY_STUDIES}, ${LEGACY_SITES}, ${LEGACY_OUTCOMES}, ${SITE_PROFILES}`);
 }
 
 function registerLegacyRoutes(app, deps) {
@@ -520,6 +525,50 @@ function registerLegacyRoutes(app, deps) {
             }
         },
     });
+
+    // ---------- site-profiles (feasibility profile layer; ARTEMIS-only) ----------
+    app.http('siteProfiles', {
+        methods: ['GET', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-profiles/{id?}',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                await ensureLegacyContainers(getCosmosClient, context);
+                const container = getContainer(SITE_PROFILES);
+                const id = request.params?.id || null;
+                if (id) {
+                    const { resource } = await container.item(id, id).read();
+                    if (!resource) {
+                        return { status: 404, jsonBody: { error: 'Profile not found' }, headers: corsHeaders() };
+                    }
+                    return { jsonBody: resource, headers: corsHeaders() };
+                }
+                const indication = request.query?.get?.('indication') || null;
+                let query = 'SELECT * FROM c';
+                const parameters = [];
+                if (indication) {
+                    query = 'SELECT * FROM c WHERE ARRAY_CONTAINS(c.indicationsCovered, @ind) OR ARRAY_CONTAINS(c.therapeuticAreas, @ind)';
+                    parameters.push({ name: '@ind', value: indication });
+                }
+                const { resources } = await container.items
+                    .query({ query, parameters }, { enableCrossPartitionQuery: true })
+                    .fetchAll();
+                return { jsonBody: resources || [], headers: corsHeaders() };
+            } catch (error) {
+                return handleError(context, error, 'site-profiles');
+            }
+        },
+    });
 }
 
-module.exports = { registerLegacyRoutes, ensureLegacyContainers, LEGACY_STUDIES, LEGACY_SITES, LEGACY_OUTCOMES };
+module.exports = {
+    registerLegacyRoutes,
+    ensureLegacyContainers,
+    LEGACY_STUDIES,
+    LEGACY_SITES,
+    LEGACY_OUTCOMES,
+    SITE_PROFILES,
+};
