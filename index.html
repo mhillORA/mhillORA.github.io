@@ -1467,30 +1467,39 @@
                 }
             };
 
-            /** Always-on trail for shift deletes / suspicious schedule changes (shows in Client Error Log). */
+            /** Schedule mutation trail for Managers. Keep light — never block UX with huge stacks/payloads. */
             const reportScheduleAudit = (action, details = {}) => {
                 try {
+                    // High-frequency / non-actionable noise — skip network round-trips.
+                    if (
+                        action === 'event.upsert.extras-not-deleted' ||
+                        action === 'silent-refresh.kept-missing-local' ||
+                        action === 'refresh.kept-missing-local'
+                    ) {
+                        return;
+                    }
                     const eventId = details.eventId || details.id || '';
                     const ids = Array.isArray(details.ids) ? details.ids : (eventId ? [eventId] : []);
                     const date = details.date || details.startDate || '';
                     const type = details.type || 'Site Assignment';
                     const summary = details.message
                         || `${action}: ${type}${date ? ` on ${date}` : ''}${ids.length ? ` (${ids.length} id(s))` : ''}`;
+                    const includeStack = details.includeStack === true;
                     reportClientError({
                         source: `schedule.${action}`,
                         message: summary,
                         context: String(details.context || details.reason || action).slice(0, 500),
-                        stack: String(details.stack || new Error(`schedule.${action}`).stack || '').slice(0, 4000),
-                        fingerprint: `schedule.${action}|${ids.slice(0, 5).join(',')}|${date}|${Date.now()}`,
+                        stack: includeStack ? String(details.stack || '').slice(0, 2000) : '',
+                        fingerprint: `schedule.${action}|${ids.slice(0, 3).join(',')}|${date}|${Math.floor(Date.now() / 60000)}`,
                         details: {
                             action,
                             tab: (typeof state !== 'undefined' && state) ? state.activeTab : null,
-                            month: (typeof state !== 'undefined' && state && state.crcCalendarDate)
-                                ? String(state.crcCalendarDate).slice(0, 15)
-                                : null,
-                            ...details,
-                            // Avoid huge nested stacks in details
-                            stack: undefined
+                            eventId: eventId || null,
+                            ids: ids.slice(0, 12),
+                            date: date || null,
+                            type,
+                            count: details.count || ids.length || null,
+                            reason: details.reason || null
                         }
                     });
                 } catch (_) { /* never throw */ }
@@ -1902,8 +1911,8 @@
                 // so planning grid and Backend (All Schedule) tab stay in sync after save and on refresh.
                 // rangeOverride: { startDate, endDate } or { full: true } for admin scans of entire container.
                 async getEvents(rangeOverride) {
-                    const c = state.eventsHttpCache || { ttl: 2500, inflight: new Map(), entries: new Map() };
-                    const ttl = typeof c.ttl === 'number' ? c.ttl : 2500;
+                    const c = state.eventsHttpCache || { ttl: 30000, inflight: new Map(), entries: new Map() };
+                    const ttl = typeof c.ttl === 'number' ? c.ttl : 30000;
                     const isFull = rangeOverride === 'full' || (rangeOverride && rangeOverride.full === true);
                     const endpoint = isFull
                         ? '/events?full=true'
@@ -2803,12 +2812,11 @@
                     const existing = (typeof findEventAnywhere === 'function')
                         ? findEventAnywhere(eventId)
                         : ((state.crc_events || []).find((e) => e && e.id === eventId) || null);
-                    const auditStack = new Error('deleteEvent caller').stack;
+                    // Light audit only — never allocate Error stacks on the hot path.
                     if (typeof reportScheduleAudit === 'function') {
                         reportScheduleAudit('event.delete', {
                             eventId,
                             reason: 'apiService.deleteEvent',
-                            stack: auditStack,
                             ...((typeof summarizeEventForAudit === 'function') ? (summarizeEventForAudit(existing) || {}) : {})
                         });
                     }
@@ -3015,11 +3023,11 @@
                 calendarView: 'planning-grid', // 'month', 'week', or 'planning-grid'
                 calendarDisplayMode: 'employee', // 'employee', 'study', 'site', 'at-a-glance', 'world', 'travel'
                 planningGridMode: (() => {
-                    // Default to daily view on mobile devices
+                    // Default to daily on mobile; weekly on desktop (monthly freezes the tab on large schedules).
                     if (typeof window !== 'undefined' && window.innerWidth <= 768) {
                         return 'daily';
                     }
-                    return 'monthly';
+                    return 'weekly';
                 })(), // 'monthly', 'weekly', or 'daily' for planning grid view
                 atAGlanceGroupBy: 'study', // 'study' or 'site'
                 atAGlanceViewMode: 'monthly', // 'daily', 'weekly', or 'monthly'
@@ -3165,7 +3173,7 @@
                 },
                 /** Short-lived dedupe cache for identical GET /events queries (parallel renders / saves). Invalidated on event writes. */
                 eventsHttpCache: {
-                    ttl: 2500,
+                    ttl: 30000,
                     inflight: new Map(),
                     entries: new Map()
                 }
@@ -3472,43 +3480,9 @@
 
             let distanceLabelJobCounter = 0;
             const scheduleDeferredDistanceLabels = (container, site) => {
-                if (!container || !site) return;
-                const jobId = ++distanceLabelJobCounter;
-                const run = async () => {
-                    const siteCoords = await resolveSiteCoordinates(site);
-                    if (!siteCoords || jobId !== distanceLabelJobCounter) return;
-                    const selects = container.querySelectorAll('select[name^="role-"]');
-                    const crcIds = new Set();
-                    selects.forEach((sel) => {
-                        Array.from(sel.options).forEach((opt) => {
-                            const v = opt.value;
-                            if (v && v !== 'SITE_STAFF' && v !== 'UNASSIGNED') crcIds.add(v);
-                        });
-                    });
-                    const distances = new Map();
-                    await Promise.all([...crcIds].map(async (crcId) => {
-                        const crc = state.crcs.find((c) => c.id === crcId);
-                        if (!crc) return;
-                        const d = await calculateCrcToSiteDistance(crc, site, siteCoords);
-                        if (d != null) distances.set(crcId, d);
-                    }));
-                    if (jobId !== distanceLabelJobCounter) return;
-                    selects.forEach((sel) => {
-                        Array.from(sel.options).forEach((opt) => {
-                            const d = distances.get(opt.value);
-                            if (d == null) return;
-                            const base = opt.textContent.replace(/\s*-\s*\d+(\.\d+)?\s*mi\s*$/i, '').trim();
-                            opt.textContent = `${base} - ${d} mi`;
-                        });
-                    });
-                };
-                if (typeof requestIdleCallback === 'function') {
-                    requestIdleCallback(() => run(), { timeout: 3000 });
-                } else {
-                    setTimeout(run, 50);
-                }
+                // Disabled: geocoding every CRC in every role dropdown froze the shift modal.
+                return;
             };
-
 
             const normalizeEmploymentType = (value) => {
                 const v = (value || '').toString().trim().toLowerCase();
@@ -5207,8 +5181,8 @@
             const TRAINING_ROLE_ID = 'training-role';
             const TRAINING_ROLE_KEY = TRAINING_ROLE_NAME.toLowerCase();
             const isTrainingRoleName = (name) => (name || '').trim().toLowerCase() === TRAINING_ROLE_KEY;
-            // Roles open to everyone (no training requirement) - both Trainer and Training
-            const OPEN_TO_ALL_ROLE_KEYS = ['training', 'trainer'];
+            // Roles open to everyone (no training requirement) - Training / Trainer variants
+            const OPEN_TO_ALL_ROLE_KEYS = ['training', 'trainer', 'in training', 'trainee'];
             const isOpenToAllRole = (name) => OPEN_TO_ALL_ROLE_KEYS.includes((name || '').trim().toLowerCase());
             
             const ensureTrainingRole = (rolesArray = []) => {
@@ -5760,57 +5734,52 @@
                 return null;
             };
 
+            let _siteAssignByDateCache = { rawRef: null, map: null };
+
             const isCRCScheduledOnDate = (crcId, date, period, excludeEventId = null, excludeGroupId = null) => {
                 if (!crcId || !date) return false;
 
-                const normalizedDate = toDateOnlyString(parseDateFlexible(date));
+                const normalizedDate = toDateOnlyString(parseDateFlexible(date)) || String(date).slice(0, 10);
                 if (!normalizedDate) return false;
 
-                const conflictingSiteAssignments = state.crc_events.filter(event => {
-                    if (isCancelledShift(event)) return false;
-                    // Exclude the current event being edited
-                    if (excludeEventId && event.id === excludeEventId) return false;
-                    
-                    // Also exclude all events in the same group (for multi-day shifts)
-                    if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
-                    
-                    // Must be a Site Assignment
-                    if (event.type !== 'Site Assignment') return false;
-                    
-                    // Normalize event date for comparison
-                    const eventDate = toDateOnlyString(parseDateFlexible(event.date));
-                    if (!eventDate || eventDate !== normalizedDate) return false;
-                    
-                    // Ignore N/A entries - events with no CRC and no valid role assignments
-                    const hasCrcId = event.crcId && event.crcId.trim() !== '';
+                // Index by date once per crc_events array — callers were scanning the full month per CRC.
+                if (!_siteAssignByDateCache.map || _siteAssignByDateCache.rawRef !== state.crc_events) {
+                    const map = new Map();
+                    (state.crc_events || []).forEach((event) => {
+                        if (!event || event.type !== 'Site Assignment') return;
+                        if (typeof isCancelledShift === 'function' && isCancelledShift(event)) return;
+                        const eventDate = String(event.date || event.startDate || '').slice(0, 10);
+                        if (!eventDate) return;
+                        if (!map.has(eventDate)) map.set(eventDate, []);
+                        map.get(eventDate).push(event);
+                    });
+                    _siteAssignByDateCache = { rawRef: state.crc_events, map };
+                }
+                const dayEvents = _siteAssignByDateCache.map.get(normalizedDate) || [];
+
+                for (let i = 0; i < dayEvents.length; i++) {
+                    const event = dayEvents[i];
+                    if (excludeEventId && event.id === excludeEventId) continue;
+                    if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) continue;
+
+                    const hasCrcId = event.crcId && String(event.crcId).trim() !== '';
                     const hasValidRoleAssignments = event.roleAssignments &&
                         Object.keys(event.roleAssignments).length > 0 &&
                         Object.values(event.roleAssignments).some(assignments =>
-                            Array.isArray(assignments) && assignments.some(crcId => 
-                                crcId && crcId.trim() !== '' && crcId !== 'UNASSIGNED' && crcId !== 'SITE_STAFF'
+                            Array.isArray(assignments) && assignments.some(id =>
+                                id && String(id).trim() !== '' && id !== 'UNASSIGNED' && id !== 'SITE_STAFF'
                             )
                         );
-                    
-                    // Skip N/A entries (no CRC and no valid role assignments)
-                    if (!hasCrcId && !hasValidRoleAssignments) return false;
-                    
-                    // Check if this CRC is assigned to this event
+                    if (!hasCrcId && !hasValidRoleAssignments) continue;
                     if (event.crcId === crcId) return true;
-                    
-                    // Check roleAssignments
                     if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                        return Object.values(event.roleAssignments).some(assignments => {
-                            if (Array.isArray(assignments)) {
-                                return assignments.includes(crcId);
-                            }
-                            return false;
-                        });
+                        const hit = Object.values(event.roleAssignments).some(assignments =>
+                            Array.isArray(assignments) && assignments.includes(crcId)
+                        );
+                        if (hit) return true;
                     }
-                    
-                    return false;
-                });
-                
-                return conflictingSiteAssignments.length > 0;
+                }
+                return false;
             };
 
             /** PTO / approved time off — informational for calendar; does not block shift assignment. */
@@ -6259,12 +6228,10 @@
             const isCrcSchedulable = (crc) => {
                 if (!crc || !crc.id) return false;
                 if (crc.archived === true) return false;
+                // Staff UI only toggles `active` / Archive. Do not use `crc.status` here —
+                // stale values like "Inactive" (unused in the profile form) were hiding people
+                // from Training and other role pickers even when they were still active staff.
                 if (crc.active === false) return false;
-                const status = String(crc.status || '').trim().toLowerCase();
-                if (status === 'inactive' || status === 'archived' || status === 'deactivated') return false;
-                // Linked login deactivated → treat staff as not selectable for new assignments
-                const linkedUser = findUserByCrcId(crc.id);
-                if (linkedUser && linkedUser.active === false) return false;
                 return true;
             };
             const getSchedulableCrcs = (list) => (list || state.crcs || []).filter(isCrcSchedulable);
@@ -7184,6 +7151,24 @@
                 };
             };
 
+            /** Fast grid-only check — no study/site requirement scans (those freeze weekly/monthly paint). */
+            const quickRoleFulfillment = (event) => {
+                let totalUnfilled = 0;
+                const missingRoles = [];
+                if (event?.roleAssignments && typeof event.roleAssignments === 'object') {
+                    Object.entries(event.roleAssignments).forEach(([roleId, assignments]) => {
+                        if (!Array.isArray(assignments)) return;
+                        const unfilled = assignments.filter((a) => !a || a === '' || a === 'UNASSIGNED').length;
+                        if (unfilled > 0) {
+                            totalUnfilled += unfilled;
+                            const role = (state.roles || []).find((r) => r && r.id === roleId);
+                            if (role?.name) missingRoles.push(role.name);
+                        }
+                    });
+                }
+                return { fulfilled: totalUnfilled === 0, missingRoles, totalUnfilled };
+            };
+
             const checkRoleFulfillment = (event) => {
                 // IMPORTANT: First check for UNASSIGNED roles regardless of study/site config
                 // This ensures shifts with UNASSIGNED always show as unfilled
@@ -7913,7 +7898,7 @@
                 const localWithoutDeleted = (state.crc_events || []).filter(e => !deletedIds.has(e?.id));
                 const merged = mergeEventsById(localWithoutDeleted, Array.isArray(updated) ? updated : []);
                 const evRange = widenEventsQueryRange(state.eventsQueryRange, getDefaultEventsDateRange());
-                setState({ crc_events: merged, eventsQueryRange: evRange });
+                setState({ crc_events: merged, eventsQueryRange: evRange, eventsQueryRangeLoadedAt: Date.now() });
                 showNotification(
                     deletedIds.size === toDelete.length
                         ? `Removed ${deletedIds.size} duplicate PTO/time off event(s). One per person per date kept.`
@@ -9617,15 +9602,24 @@
                     const paintScheduler = () => {
                         try {
                             renderCRCCalendar();
-                            renderUtilization();
-                            if (typeof lucide !== 'undefined') lucide.createIcons();
+                            // Reveal UI immediately — don't wait on utilization/maps/icons.
                             if (pendingInitialTabPaint) afterNextPaint(() => markInitialTabContentReady());
-                            if (typeof initializeSchedulerMap === 'function') setTimeout(() => initializeSchedulerMap(), 200);
-                            if (typeof initializeDeploymentMap === 'function') setTimeout(() => initializeDeploymentMap(), 300);
+                            setTimeout(() => {
+                                try { renderUtilization(); } catch (_) { /* ignore */ }
+                            }, 400);
+                            setTimeout(() => {
+                                try {
+                                    if (typeof initializeSchedulerMap === 'function') initializeSchedulerMap();
+                                } catch (_) { /* ignore */ }
+                            }, 1200);
+                            setTimeout(() => {
+                                try {
+                                    if (typeof initializeDeploymentMap === 'function') initializeDeploymentMap();
+                                } catch (_) { /* ignore */ }
+                            }, 1800);
                         } catch (e) {
                             console.error('Scheduler deferred render failed:', e);
                             if (pendingInitialTabPaint) markInitialTabContentReady();
-                            try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch (_) {}
                         }
                     };
                     window.requestAnimationFrame(paintScheduler);
@@ -14550,7 +14544,7 @@
                                     statusDisplay = 'Open until filled';
                                 } else {
                                     try {
-                                        const roleFulfillment = checkRoleFulfillment(event);
+                                        const roleFulfillment = quickRoleFulfillment(event);
                                         const assignedCount = getEventCRCs(event).length;
                                         const missingCount = roleFulfillment?.totalUnfilled || 0;
                                         const requiredCount = assignedCount + missingCount;
@@ -16249,48 +16243,77 @@
                 }
             };
 
+            let _calendarPaintToken = 0;
             const renderCRCCalendar = () => {
                 const container = ensureSchedulerCalendarShell();
                 if (!container) return;
                 try {
                     renderSchedulerCalendarHeader();
-                    let bodyHtml = '';
-                    if (state.calendarView === 'month') {
-                        if (state.calendarDisplayMode === 'study') {
-                            bodyHtml = getStudyCalendarHTML();
-                        } else if (state.calendarDisplayMode === 'site') {
-                            bodyHtml = getSiteCalendarHTML();
-                        } else if (state.calendarDisplayMode === 'shift') {
-                            bodyHtml = getShiftViewCalendarHTML();
-                        } else {
-                            bodyHtml = getMonthlyCalendarHTML();
-                        }
-                    } else if (state.calendarView === 'week') {
-                        if (state.calendarDisplayMode === 'shift') {
-                            bodyHtml = getShiftViewWeeklyHTML();
-                        } else {
-                            bodyHtml = getWeeklyCalendarHTML();
-                        }
-                    } else if (state.calendarView === 'planning-grid') {
-                        if (state.calendarDisplayMode === 'at-a-glance') {
-                            bodyHtml = getAtAGlanceViewHTML();
-                        } else if (state.calendarDisplayMode === 'travel') {
-                            bodyHtml = getTravelViewHTML();
-                        } else {
-                            if (state.planningGridMode === 'daily') {
-                                bodyHtml = getDailyPlanningGridHTML();
-                            } else if (state.planningGridMode === 'weekly') {
-                                bodyHtml = getWeeklyPlanningGridHTML();
+                    const paintBody = () => {
+                        let bodyHtml = '';
+                        if (state.calendarView === 'month') {
+                            if (state.calendarDisplayMode === 'study') {
+                                bodyHtml = getStudyCalendarHTML();
+                            } else if (state.calendarDisplayMode === 'site') {
+                                bodyHtml = getSiteCalendarHTML();
+                            } else if (state.calendarDisplayMode === 'shift') {
+                                bodyHtml = getShiftViewCalendarHTML();
                             } else {
-                                bodyHtml = getGlobalViewDetailedHTML();
+                                bodyHtml = getMonthlyCalendarHTML();
                             }
+                        } else if (state.calendarView === 'week') {
+                            if (state.calendarDisplayMode === 'shift') {
+                                bodyHtml = getShiftViewWeeklyHTML();
+                            } else {
+                                bodyHtml = getWeeklyCalendarHTML();
+                            }
+                        } else if (state.calendarView === 'planning-grid') {
+                            if (state.calendarDisplayMode === 'at-a-glance') {
+                                bodyHtml = getAtAGlanceViewHTML();
+                            } else if (state.calendarDisplayMode === 'travel') {
+                                bodyHtml = getTravelViewHTML();
+                            } else {
+                                if (state.planningGridMode === 'daily') {
+                                    bodyHtml = getDailyPlanningGridHTML();
+                                } else if (state.planningGridMode === 'weekly') {
+                                    bodyHtml = getWeeklyPlanningGridHTML();
+                                } else {
+                                    bodyHtml = getGlobalViewDetailedHTML();
+                                }
+                            }
+                        } else if (state.calendarView === 'roles') {
+                            bodyHtml = getRolesViewHTML();
+                        } else if (state.calendarView === 'total-view') {
+                            bodyHtml = getTotalViewHTML();
                         }
-                    } else if (state.calendarView === 'roles') {
-                        bodyHtml = getRolesViewHTML();
-                    } else if (state.calendarView === 'total-view') {
-                        bodyHtml = getTotalViewHTML();
+                        container.innerHTML = bodyHtml;
+                        // Skip Lucide on planning grids — converting hundreds of icons locks the tab.
+                        if (state.calendarView !== 'planning-grid' && typeof lucide !== 'undefined' && lucide.createIcons) {
+                            try { lucide.createIcons({ nodes: [container] }); } catch (_) { /* ignore */ }
+                        }
+                    };
+
+                    // Heavy grids can block the main thread for seconds — paint a stub first so Chrome doesn't kill the tab.
+                    const isHeavyGrid = state.calendarView === 'planning-grid'
+                        && state.calendarDisplayMode !== 'travel'
+                        && (state.planningGridMode === 'monthly' || state.planningGridMode === 'weekly' || state.planningGridMode === 'daily');
+                    if (isHeavyGrid) {
+                        const token = ++_calendarPaintToken;
+                        container.innerHTML = '<div class="p-8 text-center text-sm text-gray-500 dark:text-gray-400">Loading schedule…</div>';
+                        requestAnimationFrame(() => {
+                            setTimeout(() => {
+                                if (token !== _calendarPaintToken) return;
+                                try {
+                                    paintBody();
+                                } catch (err) {
+                                    console.error('Error rendering calendar:', err);
+                                    container.innerHTML = '<div class="p-4 text-center text-red-600 dark:text-red-400"><p class="font-medium">Something went wrong loading the calendar.</p><p class="text-sm mt-1 text-gray-500 dark:text-gray-400">Check the console for details.</p><button type="button" data-action="retry-calendar" class="mt-3 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm">Try again</button></div>';
+                                }
+                            }, 0);
+                        });
+                        return;
                     }
-                    container.innerHTML = bodyHtml;
+                    paintBody();
                 } catch (err) {
                     console.error('Error rendering calendar:', err);
                     container.innerHTML = '<div class="p-4 text-center text-red-600 dark:text-red-400"><p class="font-medium">Something went wrong loading the calendar.</p><p class="text-sm mt-1 text-gray-500 dark:text-gray-400">Check the console for details.</p><button type="button" data-action="retry-calendar" class="mt-3 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm">Try again</button></div>';
@@ -16357,11 +16380,42 @@
             };
 
             /** Events for calendar/planning grid. CRCs see the same list: deduplicated in setState (by id, travel by crc+date, PTO by crc+date) so no duplicate events. */
+            let _displayEventsCache = { rawRef: null, showCancelled: null, result: null };
             const getDisplayEvents = () => {
                 const raw = (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || [];
+                const showCancelled = !!state.showCancelledShifts;
+                if (_displayEventsCache.rawRef === raw && _displayEventsCache.showCancelled === showCancelled && Array.isArray(_displayEventsCache.result)) {
+                    return _displayEventsCache.result;
+                }
                 const base = collapseDuplicateSiteAssignments(raw);
                 // Cancelled shifts are hidden by default, but can be shown via filter.
-                return state.showCancelledShifts ? base : base.filter(e => !isCancelledShift(e));
+                const result = showCancelled ? base : base.filter(e => !isCancelledShift(e));
+                _displayEventsCache = { rawRef: raw, showCancelled, result };
+                return result;
+            };
+
+            /** Daily summary staff count — never call isCRCUnavailable here (that scans every event per person). */
+            const buildDayStaffSummary = (dayEvents) => {
+                const uniqueCRCs = new Set();
+                let openShifts = 0;
+                let totalHours = 0;
+                (dayEvents || []).forEach((event) => {
+                    if (!event) return;
+                    if (event.type === 'Open Shift') openShifts += 1;
+                    totalHours += parseFloat(event.hours) || 0;
+                    if (event.crcId && event.crcId !== 'SITE_STAFF' && event.crcId !== 'UNASSIGNED') {
+                        uniqueCRCs.add(event.crcId);
+                    }
+                    if (event.roleAssignments && typeof event.roleAssignments === 'object') {
+                        Object.values(event.roleAssignments).forEach((assignments) => {
+                            if (!Array.isArray(assignments)) return;
+                            assignments.forEach((crcId) => {
+                                if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') uniqueCRCs.add(crcId);
+                            });
+                        });
+                    }
+                });
+                return { totalStaff: uniqueCRCs.size, openShifts, totalHours };
             };
 
             /** Returns true if the current user should see the finalized snapshot (CRC viewing a finalized month). */
@@ -16830,8 +16884,6 @@
                 const crcIdsToDisplay = crcsToDisplay.map(c => c.id);
 
                 let filteredEvents = getDisplayEvents();
-                console.log('All events:', getDisplayEvents().length);
-                console.log('Travel Day events in state:', getDisplayEvents().filter(e => e.type === 'Travel Day'));
                 
                 // Filter out PTO/Unavailable/Sick Time events - they should only appear in the time off calendar, not the main scheduler
                 filteredEvents = filteredEvents.filter(e => 
@@ -16846,7 +16898,6 @@
                     e.siteId || 
                     (e.studyIds && Array.isArray(e.studyIds) && e.studyIds.length > 0 && e.studyIds.filter(Boolean).length > 0)
                 );
-                console.log('After filtering out PTO/Unavailable/Sick and unassigned:', filteredEvents.length);
                 
                 // For CRC users, ONLY show their events (check both crcId and roleAssignments)
                 if (isCRCUser && matchingCrcId) {
@@ -17033,7 +17084,7 @@
                                 const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-300 ml-1"></i>` : '';
                                 
                                 // Check role fulfillment
-                                const roleFulfillment = checkRoleFulfillment(event);
+                                const roleFulfillment = quickRoleFulfillment(event);
                                 const roleIcon = roleFulfillment.fulfilled ? 
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                     `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
@@ -17112,7 +17163,7 @@
                             const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-300 ml-1"></i>` : '';
                             
                             // Check role fulfillment
-                            const roleFulfillment = checkRoleFulfillment(event);
+                            const roleFulfillment = quickRoleFulfillment(event);
                             const roleIcon = roleFulfillment.fulfilled ? 
                                 `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                 `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
@@ -17361,7 +17412,7 @@
                                 const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-300 ml-1"></i>` : '';
                                 
                                 // Check role fulfillment
-                                const roleFulfillment = checkRoleFulfillment(event);
+                                const roleFulfillment = quickRoleFulfillment(event);
                                 const roleIcon = roleFulfillment.fulfilled ? 
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                     `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
@@ -17440,7 +17491,7 @@
                             const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-300 ml-1"></i>` : '';
                             
                             // Check role fulfillment
-                            const roleFulfillment = checkRoleFulfillment(event);
+                            const roleFulfillment = quickRoleFulfillment(event);
                             const roleIcon = roleFulfillment.fulfilled ? 
                                 `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                 `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
@@ -18656,43 +18707,23 @@
                 }
                 filteredEvents = applyOpenShiftsFilter(filteredEvents);
 
-                // Calculate daily stats for the week
+                // Index once — weekly used to filter + isCRCUnavailable(full scan) per staffer (multi-second hangs).
+                const eventsByDate = new Map();
+                filteredEvents.forEach((e) => {
+                    const d = String(e.date || '').slice(0, 10);
+                    if (!d) return;
+                    if (!eventsByDate.has(d)) eventsByDate.set(d, []);
+                    eventsByDate.get(d).push(e);
+                });
+                const siteById = new Map((state.crc_sites || []).map((s) => [s.id, s]));
+                const crcById = new Map((state.crcs || []).map((c) => [c.id, c]));
+                const studyById = new Map((state.studies || []).map((s) => [s.id, s]));
+                const weekDateStrs = weekDays.map((d) => toDateOnlyString(d));
+
                 const dailyStats = {};
                 weekDays.forEach((day, index) => {
-                    const dateStr = toDateOnlyString(day);
-                    const dayEvents = filteredEvents.filter(e => e.date === dateStr);
-                    const uniqueCRCs = new Set();
-                    dayEvents.forEach(event => {
-                        // Check legacy crcId
-                        if (event.crcId) {
-                            const isUnavailable = isCRCUnavailable(event.crcId, dateStr, event.period || 'Full Day');
-                            if (!isUnavailable) {
-                                uniqueCRCs.add(event.crcId);
-                            }
-                        }
-                        // Check roleAssignments for all assigned CRCs
-                        if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                            Object.values(event.roleAssignments).forEach(assignments => {
-                                if (Array.isArray(assignments)) {
-                                    assignments.forEach(crcId => {
-                                        if (crcId && crcId !== 'SITE_STAFF' && crcId !== 'UNASSIGNED') {
-                                            const isUnavailable = isCRCUnavailable(crcId, dateStr, event.period || 'Full Day');
-                                            if (!isUnavailable) {
-                                                uniqueCRCs.add(crcId);
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                        }
-                    });
-                    const openShifts = dayEvents.filter(e => e.type === 'Open Shift').length;
-                    const totalHours = dayEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
-                    dailyStats[index] = {
-                        totalStaff: uniqueCRCs.size,
-                        openShifts,
-                        totalHours
-                    };
+                    const dateStr = weekDateStrs[index];
+                    dailyStats[index] = buildDayStaffSummary(eventsByDate.get(dateStr) || []);
                 });
 
                 const eventsByStudy = filteredEvents.reduce((acc, event) => {
@@ -18745,10 +18776,10 @@
                     const stats = dailyStats[index];
                     const openShiftClass = stats.openShifts > 0 ? 'text-red-500 font-bold' : '';
                     const firstDayBorder = index === 0 ? ' border-l-2 border-gray-400 dark:border-gray-500' : ' border-l dark:border-gray-700';
-                    tableHtml += `<td class="p-1 text-center${firstDayBorder}">
-                        <div class="flex items-center justify-center" title="Total Staff Assigned"><i data-lucide="users" class="w-3 h-3 mr-1 text-gray-500"></i>${stats.totalStaff}</div>
-                        <div class="flex items-center justify-center ${openShiftClass}" title="Open Shifts"><i data-lucide="alert-circle" class="w-3 h-3 mr-1"></i>${stats.openShifts}</div>
-                        <div class="flex items-center justify-center" title="Total Hours Scheduled"><i data-lucide="clock" class="w-3 h-3 mr-1 text-gray-500"></i>${stats.totalHours}</div>
+                    tableHtml += `<td class="p-1 text-center text-[11px]${firstDayBorder}">
+                        <div title="Total Staff Assigned">Staff ${stats.totalStaff}</div>
+                        <div class="${openShiftClass}" title="Open Shifts">Open ${stats.openShifts}</div>
+                        <div title="Total Hours Scheduled">Hrs ${stats.totalHours}</div>
                     </td>`;
                 });
                 tableHtml += `</tr></thead><tbody>`;
@@ -18790,18 +18821,17 @@
                     }, {});
                             
                     const sortedSiteIds = Object.keys(eventsBySite).sort((a, b) => {
-                        const siteA = state.crc_sites.find(s => s.id === a)?.name || 'zz';
-                        const siteB = state.crc_sites.find(s => s.id === b)?.name || 'zz';
+                        const siteA = siteById.get(a)?.name || 'zz';
+                        const siteB = siteById.get(b)?.name || 'zz';
                         return siteA.localeCompare(siteB);
                     });
                     
                     sortedSiteIds.forEach(siteId => {
-                        const site = state.crc_sites.find(s => s.id === siteId);
+                        const site = siteById.get(siteId);
                         const siteName = site ? `${site.name} <span class='font-light text-gray-500'>(${site.city || ''}, ${site.state || ''})</span>` : (study.id === '__NO_STUDY__' ? 'Unassigned site' : 'Time Off');
                         const piDisplay = site && site.principalInvestigator ? `<div class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-normal">PI: ${site.principalInvestigator}</div>` : '';
                         // Multi-day shift detection for weekly view (same idea as monthly)
                         const siteEventsForWeek = eventsBySite[siteId] || [];
-                        const weekDateStrs = weekDays.map(d => toDateOnlyString(d));
                         const byGroupId = {};
                         siteEventsForWeek.forEach(e => {
                             if (e.type === 'Travel Day' || !e.groupId) return;
@@ -18818,11 +18848,19 @@
                             const primaryEvent = events.find(e => e.date === firstDayDateStr) || events[0];
                             multiDayGroups.push({ firstDayDateStr, lastDayDateStr, primaryEvent });
                         });
+                        // Index this site's events by date once (avoid filter per day cell)
+                        const siteEventsByDate = new Map();
+                        siteEventsForWeek.forEach((e) => {
+                            const d = String(e.date || '').slice(0, 10);
+                            if (!d) return;
+                            if (!siteEventsByDate.has(d)) siteEventsByDate.set(d, []);
+                            siteEventsByDate.get(d).push(e);
+                        });
                         tableHtml += `<tr class="border-t dark:border-gray-700"><td class="global-view-header global-view-site-header sticky left-0 z-10 bg-white dark:bg-gray-900 pl-8 font-medium" style="width: 200px; min-width: 200px; max-width: 200px; box-sizing: border-box;">${siteName}${piDisplay}</td>`;
                         
                         weekDays.forEach((day, dayIndex) => {
-                            const dateStr = toDateOnlyString(day);
-                            const dayEvents = (eventsBySite[siteId] || []).filter(e => e.date === dateStr);
+                            const dateStr = weekDateStrs[dayIndex];
+                            const dayEvents = siteEventsByDate.get(dateStr) || [];
                             
                             // Group events by shift characteristics (groupId or visit/group/period combo)
                             // This prevents showing the same shift multiple times when multiple CRCs are assigned
@@ -18920,21 +18958,19 @@
                             // Render each grouped shift as ONE block
                             Array.from(shiftGroups.values()).forEach(group => {
                                 const event = group.primaryEvent;
-                                const eventSite = state.crc_sites.find(s => s.id === event.siteId);
-                                const study = (event.studyIds && event.studyIds.length > 0) ? state.studies.find(s => s.id === event.studyIds[0]) : null;
+                                const eventSite = siteById.get(event.siteId);
+                                const study = (event.studyIds && event.studyIds.length > 0) ? studyById.get(event.studyIds[0]) : null;
                                 const pi = event.principalInvestigator || eventSite?.principalInvestigator;
                                 let eventBgColor = study?.color || eventSite?.color || (isDarkMode ? '#1e3a8a' : '#dbeafe');
                                 if (event.type === 'Open Shift') eventBgColor = isDarkMode ? '#450a0a' : '#fecaca';
                                 else if (event.type === 'Travel Day') eventBgColor = study?.color || (isDarkMode ? '#1e3a5f' : '#3b82f6');
                                 const eventTextColor = getContrastColor(eventBgColor);
                                 const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
-                                const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
+                                const overrideIcon = event.isOverridden ? '<span class="text-yellow-600 font-bold ml-1">!</span>' : '';
                                 
-                                // Check role fulfillment using the aggregated data
-                                const roleFulfillment = checkRoleFulfillment(event);
-                                const roleIcon = roleFulfillment.fulfilled ? 
-                                    `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
-                                    `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
+                                // Fast check only — full checkRoleFulfillment scans study requirements per cell and freezes weekly.
+                                const roleFulfillment = quickRoleFulfillment(event);
+                                const roleIcon = roleFulfillment.fulfilled ? '' : '<span class="text-red-500 font-bold ml-1">!</span>';
                                 
                                 // Build header with visit and group (V1G1 format) - skip for Travel Days
                                 const visitGroupHeader = [];
@@ -18943,7 +18979,7 @@
                                 const headerText = visitGroupHeader.length > 0 ? visitGroupHeader.join(' • ') : '';
                                 
                                 // Get all CRC names from the grouped shift
-                                const allCrcs = Array.from(group.allCrcIds).map(crcId => state.crcs.find(c => c.id === crcId)).filter(Boolean);
+                                const allCrcs = Array.from(group.allCrcIds).map(crcId => crcById.get(crcId)).filter(Boolean);
                                 const crcNamesList = allCrcs.length > 0 ? allCrcs.map(c => c.name.split(' ')[0]).join(', ') : '';
                                 
                                 // Build tooltip
@@ -18963,9 +18999,9 @@
                                     // Get CRCs from crcIds array (for multi-person travel days) or fall back to grouped CRCs
                                     let travelDayCrcs = [];
                                     if (event.crcIds && Array.isArray(event.crcIds) && event.crcIds.length > 0) {
-                                        travelDayCrcs = event.crcIds.map(crcId => state.crcs.find(c => c.id === crcId)).filter(Boolean);
+                                        travelDayCrcs = event.crcIds.map(crcId => crcById.get(crcId)).filter(Boolean);
                                     } else if (event.crcId) {
-                                        const singleCrc = state.crcs.find(c => c.id === event.crcId);
+                                        const singleCrc = crcById.get(event.crcId);
                                         if (singleCrc) travelDayCrcs = [singleCrc];
                                     } else {
                                         travelDayCrcs = allCrcs; // Fallback to grouped CRCs
@@ -18998,7 +19034,7 @@
                                     const totalBlocks = crcToRoles.size + (siteStaffRoles.length > 0 ? 1 : 0);
                                     
                                     crcToRoles.forEach((roles, crcId) => {
-                                        const crc = state.crcs.find(c => c.id === crcId);
+                                        const crc = crcById.get(crcId);
                                         const crcName = crcId === 'SITE_STAFF' ? 'Site Staff' : (crcId === 'UNASSIGNED' ? '⚠ Unassigned' : (crc ? crc.name.split(' ')[0] : 'Unknown'));
                                         // Show ALL roles before the name
                                         const displayText = roles.length > 0 ? `${roles.join(', ')} - ${crcName}` : crcName;
@@ -19141,39 +19177,7 @@
                 filteredEvents = applyOpenShiftsFilter(filteredEvents);
 
                 // Calculate daily stats
-                const dayEvents = filteredEvents;
-                const uniqueCRCs = new Set();
-                dayEvents.forEach(event => {
-                    // Check legacy crcId
-                    if (event.crcId) {
-                        const isUnavailable = isCRCUnavailable(event.crcId, dateStr, event.period || 'Full Day');
-                        if (!isUnavailable) {
-                            uniqueCRCs.add(event.crcId);
-                        }
-                    }
-                    // Check roleAssignments for all assigned CRCs
-                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                        Object.values(event.roleAssignments).forEach(assignments => {
-                            if (Array.isArray(assignments)) {
-                                assignments.forEach(crcId => {
-                                    if (crcId && crcId !== 'SITE_STAFF') {
-                                        const isUnavailable = isCRCUnavailable(crcId, dateStr, event.period || 'Full Day');
-                                        if (!isUnavailable) {
-                                            uniqueCRCs.add(crcId);
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                    }
-                });
-                const openShifts = dayEvents.filter(e => e.type === 'Open Shift').length;
-                const totalHours = dayEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
-                const dailyStats = {
-                    totalStaff: uniqueCRCs.size,
-                    openShifts,
-                    totalHours
-                };
+                const dailyStats = buildDayStaffSummary(filteredEvents);
 
                 const eventsByStudy = filteredEvents.reduce((acc, event) => {
                     // Only group events that have studyIds assigned
@@ -19390,7 +19394,7 @@
                             const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
                             
                             // Check role fulfillment
-                            const roleFulfillment = checkRoleFulfillment(event);
+                            const roleFulfillment = quickRoleFulfillment(event);
                             const roleIcon = roleFulfillment.fulfilled ? 
                                 `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                 `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
@@ -19797,43 +19801,16 @@
                 filteredEvents = applyOpenShiftsFilter(filteredEvents);
 
                 const dailyStats = {};
+                const eventsByDateMonthly = new Map();
+                filteredEvents.forEach((e) => {
+                    const d = String(e.date || '').slice(0, 10);
+                    if (!d) return;
+                    if (!eventsByDateMonthly.has(d)) eventsByDateMonthly.set(d, []);
+                    eventsByDateMonthly.get(d).push(e);
+                });
                 for (let day = 1; day <= daysInMonth; day++) {
                     const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                    const dayEvents = filteredEvents.filter(e => e.date === dateStr);
-                    const uniqueCRCs = new Set();
-                    dayEvents.forEach(event => {
-                        // Check legacy crcId
-                        if (event.crcId) {
-                            // Exclude if this CRC has unavailable/PTO on this day
-                            const isUnavailable = isCRCUnavailable(event.crcId, dateStr, event.period || 'Full Day');
-                            if (!isUnavailable) {
-                                uniqueCRCs.add(event.crcId);
-                            }
-                        }
-                        // Check roleAssignments for all assigned CRCs
-                        if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                            Object.values(event.roleAssignments).forEach(assignments => {
-                                if (Array.isArray(assignments)) {
-                                    assignments.forEach(crcId => {
-                                        if (crcId && crcId !== 'SITE_STAFF') {
-                                            // Exclude if this CRC has unavailable/PTO on this day
-                                            const isUnavailable = isCRCUnavailable(crcId, dateStr, event.period || 'Full Day');
-                                            if (!isUnavailable) {
-                                                uniqueCRCs.add(crcId);
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                        }
-                    });
-                    const openShifts = dayEvents.filter(e => e.type === 'Open Shift').length;
-                    const totalHours = dayEvents.reduce((sum, e) => sum + (parseFloat(e.hours) || 0), 0);
-                    dailyStats[day] = {
-                        totalStaff: uniqueCRCs.size,
-                        openShifts,
-                        totalHours
-                    };
+                    dailyStats[day] = buildDayStaffSummary(eventsByDateMonthly.get(dateStr) || []);
                 }
 
                 const eventsByStudy = filteredEvents.reduce((acc, event) => {
@@ -19883,13 +19860,17 @@
                     const stats = dailyStats[day];
                     const openShiftClass = stats.openShifts > 0 ? 'text-red-500 font-bold' : '';
                     const firstDayBorder = day === 1 ? ' border-l-2 border-gray-400 dark:border-gray-500' : ' border-l dark:border-gray-700';
-                    tableHtml += `<td class="p-1 text-center${firstDayBorder}">
-                        <div class="flex items-center justify-center" title="Total Staff Assigned"><i data-lucide="users" class="w-3 h-3 mr-1 text-gray-500"></i>${stats.totalStaff}</div>
-                        <div class="flex items-center justify-center ${openShiftClass}" title="Open Shifts"><i data-lucide="alert-circle" class="w-3 h-3 mr-1"></i>${stats.openShifts}</div>
-                        <div class="flex items-center justify-center" title="Total Hours Scheduled"><i data-lucide="clock" class="w-3 h-3 mr-1 text-gray-500"></i>${stats.totalHours}</div>
+                    tableHtml += `<td class="p-1 text-center text-[11px]${firstDayBorder}">
+                        <div title="Total Staff Assigned">Staff ${stats.totalStaff}</div>
+                        <div class="${openShiftClass}" title="Open Shifts">Open ${stats.openShifts}</div>
+                        <div title="Total Hours Scheduled">Hrs ${stats.totalHours}</div>
                     </td>`;
                 }
                 tableHtml += `</tr></thead><tbody>`;
+
+                const siteByIdMonthly = new Map((state.crc_sites || []).map((s) => [s.id, s]));
+                const crcByIdMonthly = new Map((state.crcs || []).map((c) => [c.id, c]));
+                const studyByIdMonthly = new Map((state.studies || []).map((s) => [s.id, s]));
                 
                 let sortedStudies = [...state.studies]
                     .filter(study => eventsByStudy[study.id])
@@ -19926,20 +19907,27 @@
                         acc[siteId].push(event);
                         return acc;
                     }, {});
-                    
+                            
                     const sortedSiteIds = Object.keys(eventsBySite).sort((a, b) => {
-                        const siteA = state.crc_sites.find(s => s.id === a)?.name || 'zz';
-                        const siteB = state.crc_sites.find(s => s.id === b)?.name || 'zz';
+                        const siteA = siteByIdMonthly.get(a)?.name || 'zz';
+                        const siteB = siteByIdMonthly.get(b)?.name || 'zz';
                         return siteA.localeCompare(siteB);
                     });
                     
                     sortedSiteIds.forEach(siteId => {
-                        const site = state.crc_sites.find(s => s.id === siteId);
+                        const site = siteByIdMonthly.get(siteId);
                         const siteName = site ? `${site.name} <span class='font-light text-gray-500'>(${site.city || ''}, ${site.state || ''})</span>` : (study.id === '__NO_STUDY__' ? 'Unassigned site' : 'Time Off');
                         const piDisplay = site && site.principalInvestigator ? `<div class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-normal">PI: ${site.principalInvestigator}</div>` : '';
                         
                         // Multi-day shift banners (monthly only): thin bar spanning first–last day; click opens edit modal for whole shift
                         const siteEventsForMonth = eventsBySite[siteId] || [];
+                        const siteEventsByDate = new Map();
+                        siteEventsForMonth.forEach((e) => {
+                            const d = String(e.date || '').slice(0, 10);
+                            if (!d) return;
+                            if (!siteEventsByDate.has(d)) siteEventsByDate.set(d, []);
+                            siteEventsByDate.get(d).push(e);
+                        });
                         const byGroupId = {};
                         siteEventsForMonth.forEach(e => {
                             if (e.type === 'Travel Day' || !e.groupId) return;
@@ -19962,8 +19950,11 @@
                         
                         for (let day = 1; day <= daysInMonth; day++) {
                             const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                            const allSiteEvents = eventsBySite[siteId] || [];
-                            const dayEvents = allSiteEvents.filter(e => e.date === dateStr);
+                            const dayEvents = siteEventsByDate.get(dateStr) || [];
+                            if (dayEvents.length === 0) {
+                                tableHtml += `<td class="global-view-cell bg-white dark:bg-gray-900 align-top p-1" data-action="open-crc-event-modal" data-date="${dateStr}"></td>`;
+                                continue;
+                            }
                             
                             // Group events by shift characteristics (groupId or visit/group/period combo)
                             // This prevents showing the same shift multiple times when multiple CRCs are assigned
@@ -20071,7 +20062,7 @@
                                 const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
                                 
                                 // Check role fulfillment using the aggregated data
-                                const roleFulfillment = checkRoleFulfillment(event);
+                                const roleFulfillment = quickRoleFulfillment(event);
                                 const roleIcon = roleFulfillment.fulfilled ? 
                                     `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                     `<span class="inline-flex items-center ml-1"><span class="text-red-400 font-bold" style="font-size: 14px;">⚠</span></span>`;
@@ -20804,7 +20795,7 @@
                                     const spanTextColor = eventTextColor === '#FFFFFF' ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
                                     const overrideIcon = event.isOverridden ? `<i data-lucide="alert-triangle" class="inline-block w-3 h-3 text-yellow-500 ml-1"></i>` : '';
                                     
-                                    const roleFulfillment = checkRoleFulfillment(event);
+                                    const roleFulfillment = quickRoleFulfillment(event);
                                     const roleIcon = roleFulfillment.fulfilled ? 
                                         `<i data-lucide="check-circle" class="inline-block w-3 h-3 text-green-400 ml-1"></i>` : 
                                         `<i data-lucide="x-circle" class="inline-block w-3 h-3 text-red-400 ml-1"></i>`;
@@ -32205,12 +32196,20 @@
                         (async () => { await ensureEventsCoverVisibleMonth(); if (state.activeTab === 'crc-schedule') renderCRCScheduleView(); })();
                         break;
                     case 'prev-crc-week':
-                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() - 7)) });
-                        (async () => { await ensureEventsCoverVisibleMonth(); if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar(); })();
+                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() - 7)) }, { skipRender: true });
+                        if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar();
+                        (async () => {
+                            const changed = await ensureEventsCoverVisibleMonth();
+                            if (changed && (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid')) renderCRCCalendar();
+                        })();
                         break;
                     case 'next-crc-week':
-                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() + 7)) });
-                        (async () => { await ensureEventsCoverVisibleMonth(); if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar(); })();
+                        setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() + 7)) }, { skipRender: true });
+                        if (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid') renderCRCCalendar();
+                        (async () => {
+                            const changed = await ensureEventsCoverVisibleMonth();
+                            if (changed && (state.activeTab === 'scheduler' || state.activeTab === 'planning-grid')) renderCRCCalendar();
+                        })();
                         break;
                     case 'prev-crc-day':
                         setState({ crcCalendarDate: new Date(state.crcCalendarDate.setDate(state.crcCalendarDate.getDate() - 1)) });
@@ -32550,7 +32549,7 @@
                                 const events = await apiService.getEvents({ full: true });
                                 const merged = mergeEventsById(state.crc_events, Array.isArray(events) ? events : []);
                                 const evRange = widenEventsQueryRange(state.eventsQueryRange, getDefaultEventsDateRange());
-                                setState({ crc_events: merged, eventsQueryRange: evRange });
+                                setState({ crc_events: merged, eventsQueryRange: evRange, eventsQueryRangeLoadedAt: Date.now() });
                                 renderContent();
                             } else {
                                 showNotification('Cleanup completed with errors. Check console for details.', 'warning');
@@ -34373,6 +34372,11 @@
                             const eventBeforeDelete = findEventAnywhere(idToDelete) || state.crc_events.find(e => e.id === idToDelete);
                             saveStateToUndoHistory();
                             const result = await deleteSiteAssignmentWithDuplicates(eventBeforeDelete || idToDelete);
+                            if (result?.cancelled) {
+                                setState({ pendingDeleteEventId: null });
+                                showNotification('Delete cancelled — nothing was removed.', 'info');
+                                break;
+                            }
                             setState({ pendingDeleteEventId: null });
                             setState({ crc_events: [...state.crc_events] }, { skipRender: true });
                             if (eventBeforeDelete && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
@@ -42298,22 +42302,23 @@
 
             const getEventsRangeForVisibleSchedule = () => expandRangeToWholeMonths(getVisibleSchedulerRange());
 
-            /** Load every month the current view touches. Merges into memory; never blank-wipes a loaded schedule. */
+            /** Load every month the current view touches. Merges into memory; never blank-wipes a loaded schedule.
+             *  Returns true when events state was updated (caller may re-render). */
             const ensureEventsCoverVisibleMonth = async (options = {}) => {
-                if (!state.initialLoadComplete) return;
+                if (!state.initialLoadComplete) return false;
                 const force = options.force === true;
                 const range = getEventsRangeForVisibleSchedule();
                 const rng = state.eventsQueryRange;
-                if (!force && rng && rng.startDate === range.startDate && rng.endDate === range.endDate) return;
+                if (!force && rng && rng.startDate === range.startDate && rng.endDate === range.endDate) return false;
 
                 const loadSequence = ++visibleMonthLoadSequence;
                 try {
                     if (force) apiService.invalidateEventsHttpCache();
                     const fetched = await apiService.getEvents(range);
                     // Ignore an older response if the user navigated again while it was loading.
-                    if (loadSequence !== visibleMonthLoadSequence) return;
+                    if (loadSequence !== visibleMonthLoadSequence) return false;
                     const currentRange = getEventsRangeForVisibleSchedule();
-                    if (currentRange.startDate !== range.startDate || currentRange.endDate !== range.endDate) return;
+                    if (currentRange.startDate !== range.startDate || currentRange.endDate !== range.endDate) return false;
                     const arr = Array.isArray(fetched) ? fetched : [];
                     const artemisStudyIdsSet = new Set((state.studies || []).map(study => study.id));
                     const sanitized = sanitizeEventsFromApi(arr, artemisStudyIdsSet);
@@ -42333,7 +42338,7 @@
                             fetchedCount: 0
                         });
                         showNotification('Schedule refresh returned no events; keeping your current view. Try again in a moment.', 'error');
-                        return;
+                        return false;
                     }
                     if (previousInRange.length >= 10 && sanitized.length < Math.floor(previousInRange.length * 0.4)) {
                         console.error('CHAOS: Refusing partial wipe — API returned', sanitized.length, 'vs local', previousInRange.length, range);
@@ -42345,7 +42350,7 @@
                             fetchedCount: sanitized.length
                         });
                         showNotification('Schedule refresh looked incomplete; keeping your current view. Hard-refresh if needed.', 'error');
-                        return;
+                        return false;
                     }
                     const outside = (state.crc_events || []).filter((e) => {
                         const d = eventDate(e);
@@ -42376,8 +42381,10 @@
                         crc_events: mergeEventsById(outside, mergedInRange),
                         crc_events_display: undefined,
                         eventsQueryRange: { startDate: range.startDate, endDate: range.endDate },
+                        eventsQueryRangeLoadedAt: Date.now(),
                     });
                     debugLog('CHAOS: Loaded events for month', range.startDate.slice(0, 7), `(${arr.length} fetched, kept ${keptMissing.length} local)`);
+                    return true;
                 } catch (err) {
                     console.error('CHAOS: Failed to load events for month', range.startDate, err);
                     reportScheduleAudit('refresh.failed', {
@@ -42386,6 +42393,7 @@
                         detailsRange: range,
                         stack: err?.stack || ''
                     });
+                    return false;
                 }
             };
 
@@ -43827,19 +43835,19 @@
                                     : '';
                                 return `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''}>${crc.name}${timeOffText}</option>`;
                             }).join('');
-                            // Omit unselected unavailable CRCs from shift staff pickers (same as study-configured role path).
+                            // Always list conflicted staff too (Training often needs someone already on-site that day).
                             optionsHtml += unavailable.map(crc => {
-                                if (assignedCrcId !== crc.id) return '';
                                 const unavailPeriod = getUnavailabilityPeriod(crc.id, date);
                                 const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventId, excludeGroupId);
                                 let statusText = '';
                                 if (conflictInfo) {
                                     statusText = ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`;
+                                } else if (unavailPeriod) {
+                                    statusText = ` (Time Off - ${unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod})`;
                                 } else {
-                                    const periodText = unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Unavailable';
-                                    statusText = ` (Time Off - ${periodText})`;
+                                    statusText = ' (Scheduled)';
                                 }
-                                return `<option value="${crc.id}" selected class="text-gray-400 dark:text-gray-500">${crc.name}${statusText}</option>`;
+                                return `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''} class="text-gray-500">${crc.name}${statusText}</option>`;
                             }).join('');
 
                             if (!optionsHtml) {
@@ -44124,14 +44132,10 @@
                         const volunteerCrcIdsForRole = (existingEvent && existingEvent.volunteerApplications && Array.isArray(existingEvent.volunteerApplications))
                             ? existingEvent.volunteerApplications.filter(a => a.status === 'pending' && (a.roleId === role.id || !a.roleId)).map(a => a.crcId)
                             : [];
-                        // Do not list unselected unavailable CRCs: they sat at the bottom with gray "(Time Off / Scheduled)" and read as still on the shift after removal.
-                        // Keep selected slots, untrained-but-still-assigned, volunteers, and everyone who is actually available to pick.
+                        // Keep everyone selectable (including already scheduled that day). Conflicts stay labeled and sorted to the bottom.
+                        // Hiding "unavailable" staff hid trainees like Claudia from the Training role picker.
                         crcsWithInfo = crcsWithInfo.filter(entry =>
-                            (isCrcSchedulable(entry.crc) || existingAssignmentsRaw.includes(entry.crc.id)) &&
-                            (entry.isSelected ||
-                            entry.isUntrained ||
-                            !entry.isUnavailable ||
-                            volunteerCrcIdsForRole.includes(entry.crc.id))
+                            isCrcSchedulable(entry.crc) || existingAssignmentsRaw.includes(entry.crc.id)
                         );
                         
                         const buildRoleOptions = (slotIndex, roleIdForSlot) => {
@@ -44678,12 +44682,9 @@
                     const volunteerCrcIdsForReqRole = (existingEvent && existingEvent.volunteerApplications && Array.isArray(existingEvent.volunteerApplications))
                         ? existingEvent.volunteerApplications.filter(a => a.status === 'pending' && (a.roleId === roleId || !a.roleId)).map(a => a.crcId)
                         : [];
+                    // Keep everyone selectable (including already scheduled). Conflicts stay labeled at the bottom.
                     crcsWithInfo = crcsWithInfo.filter(entry =>
-                        (isCrcSchedulable(entry.crc) || existingAssignmentsRaw.includes(entry.crc.id)) &&
-                        (entry.isSelected ||
-                        entry.isUntrained ||
-                        !entry.isUnavailable ||
-                        volunteerCrcIdsForReqRole.includes(entry.crc.id))
+                        isCrcSchedulable(entry.crc) || existingAssignmentsRaw.includes(entry.crc.id)
                     );
                     
                     const buildRoleOptions = (slotIndex, roleIdForSlot) => {
@@ -54543,7 +54544,12 @@
                 schedulerRefreshHandler = () => {
                     if (!state.initialLoadComplete || document.hidden) return;
                     if (!['scheduler', 'planning-grid', 'allSchedule'].includes(state.activeTab)) return;
-                    // Only on tab focus / become-visible — not on a tight polling loop.
+                    // Debounce alt-tab focus storms; only force-refetch if data is stale (5+ min).
+                    const now = Date.now();
+                    if (now - (window.__chaosLastFocusRefreshAt || 0) < 5000) return;
+                    window.__chaosLastFocusRefreshAt = now;
+                    const lastLoad = state.eventsQueryRangeLoadedAt || 0;
+                    if (lastLoad && (now - lastLoad) < 5 * 60 * 1000) return;
                     ensureEventsCoverVisibleMonth({ force: true });
                 };
                 if (schedulerRefreshTimerId) {
@@ -54941,6 +54947,7 @@
                         studies: sanitizedStudies, 
                         crc_events: sanitizedEvents, 
                         eventsQueryRange: evRange,
+                        eventsQueryRangeLoadedAt: Date.now(),
                         roles, 
                         training_types,
                         trucks: [],
@@ -54951,7 +54958,7 @@
                         announcements: [],
                         deferredAppDataLoaded: false,
                         initialLoadComplete: true 
-                    });
+                    }, { skipEventDedupe: true });
                     loadChangeLog(); // Load change log from localStorage
                     // Load Navan import last run from localStorage
                     try {

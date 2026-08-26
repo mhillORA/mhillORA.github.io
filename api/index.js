@@ -157,12 +157,32 @@ const ensureEmailTriggersContainer = async () => {
 };
 
 // Client-reported browser/API errors for Managers to review.
+let __clientErrorsContainerReady = null;
 const ensureClientErrorsContainer = async () => {
-    const { database } = getCosmosClient();
-    await database.containers.createIfNotExists({
-        id: 'client-errors',
-        partitionKey: { paths: ['/id'] }
+    if (__clientErrorsContainerReady) return __clientErrorsContainerReady;
+    __clientErrorsContainerReady = (async () => {
+        const { database } = getCosmosClient();
+        await database.containers.createIfNotExists({
+            id: 'client-errors',
+            partitionKey: { paths: ['/id'] }
+        });
+    })().catch((err) => {
+        __clientErrorsContainerReady = null;
+        throw err;
     });
+    return __clientErrorsContainerReady;
+};
+
+const persistClientErrorAuditAsync = (item) => {
+    // Never block the request path on audit writes.
+    Promise.resolve()
+        .then(async () => {
+            await ensureClientErrorsContainer();
+            await getContainer('client-errors').items.create(item);
+        })
+        .catch((auditErr) => {
+            console.warn(`persistClientErrorAuditAsync failed: ${auditErr.message}`);
+        });
 };
 
 // ---------------------------------------------------------------------------------
@@ -4680,31 +4700,26 @@ async function crudHandler(context, request, containerName) {
                             ).trim().toLowerCase();
                             if (intent !== 'delete') {
                                 context.log.warn(`[AUDIT DELETE BLOCKED] Site Assignment ${id} missing x-chaos-intent=delete`);
-                                try {
-                                    await ensureClientErrorsContainer();
-                                    await getContainer('client-errors').items.create({
-                                        id: generateId(),
-                                        createdAt: new Date().toISOString(),
-                                        source: 'api.event.delete-blocked',
-                                        message: `Blocked Site Assignment delete without intent header: ${id}${resource.date ? ` on ${resource.date}` : ''}`,
-                                        path: `/events/${id}`,
-                                        method: 'DELETE',
-                                        username: String(request.headers.get?.('x-username') || '').slice(0, 120),
-                                        userId: String(request.headers.get?.('x-user-id') || '').slice(0, 120),
-                                        permissionLevel: String(request.headers.get?.('x-user-permission') || '').slice(0, 40),
-                                        context: 'missing x-chaos-intent=delete',
-                                        details: JSON.stringify({
-                                            id: resource.id,
-                                            type: resource.type,
-                                            date: resource.date || resource.startDate || null,
-                                            siteId: resource.siteId || null,
-                                            groupId: resource.groupId || null
-                                        }).slice(0, 6000),
-                                        fingerprint: `api.event.delete-blocked|${id}|${Date.now()}`
-                                    });
-                                } catch (auditErr) {
-                                    context.log.warn(`Failed to persist blocked-delete audit: ${auditErr.message}`);
-                                }
+                                persistClientErrorAuditAsync({
+                                    id: generateId(),
+                                    createdAt: new Date().toISOString(),
+                                    source: 'api.event.delete-blocked',
+                                    message: `Blocked Site Assignment delete without intent header: ${id}${resource.date ? ` on ${resource.date}` : ''}`,
+                                    path: `/events/${id}`,
+                                    method: 'DELETE',
+                                    username: String(request.headers.get?.('x-username') || '').slice(0, 120),
+                                    userId: String(request.headers.get?.('x-user-id') || '').slice(0, 120),
+                                    permissionLevel: String(request.headers.get?.('x-user-permission') || '').slice(0, 40),
+                                    context: 'missing x-chaos-intent=delete',
+                                    details: JSON.stringify({
+                                        id: resource.id,
+                                        type: resource.type,
+                                        date: resource.date || resource.startDate || null,
+                                        siteId: resource.siteId || null,
+                                        groupId: resource.groupId || null
+                                    }).slice(0, 6000),
+                                    fingerprint: `api.event.delete-blocked|${id}|${Date.now()}`
+                                });
                                 return {
                                     status: 403,
                                     jsonBody: { error: 'Site Assignment delete requires explicit intent. Refresh and try again from the schedule UI.' },
@@ -4713,9 +4728,8 @@ async function crudHandler(context, request, containerName) {
                             }
                         }
                         context.log.info(`[AUDIT DELETE] Event ${id} | Type: ${resource.type} | Date: ${resource.date} | Site: ${resource.siteId} | CRCs: ${JSON.stringify(resource.crcIds || resource.crcId)} | RoleAssignments: ${JSON.stringify(Object.keys(resource.roleAssignments || {}))}`);
-                        // Persist a durable audit row so Managers can see deletes in Client Error Log
-                        try {
-                            await ensureClientErrorsContainer();
+                        // Persist audit off the hot path so deletes stay fast
+                        {
                             const username = String(
                                 request.headers.get?.('x-username') ||
                                 request.headers.get?.('username') ||
@@ -4748,7 +4762,7 @@ async function crudHandler(context, request, containerName) {
                                     ? Object.keys(resource.roleAssignments).slice(0, 12)
                                     : []
                             }).slice(0, 6000);
-                            await getContainer('client-errors').items.create({
+                            persistClientErrorAuditAsync({
                                 id: generateId(),
                                 createdAt: new Date().toISOString(),
                                 source: 'api.event.delete',
@@ -4766,8 +4780,6 @@ async function crudHandler(context, request, containerName) {
                                 details,
                                 fingerprint: `api.event.delete|${id}|${Date.now()}`
                             });
-                        } catch (auditErr) {
-                            context.log.warn(`Failed to persist delete audit for ${id}: ${auditErr.message}`);
                         }
                     }
                     
