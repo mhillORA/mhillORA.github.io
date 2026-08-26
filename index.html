@@ -60,15 +60,35 @@
                 var s1 = document.createElement('script');
                 s1.src = 'https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.js';
                 s1.onload = function () {
-                    var s2 = document.createElement('script');
-                    s2.src = 'https://cdn.jsdelivr.net/gh/Azure-Samples/azure-maps-animations@main/dist/azure-maps-animations.min.js';
-                    s2.onload = function () { resolve(); };
-                    s2.onerror = function () { resolve(); };
-                    document.head.appendChild(s2);
+                    // Skip animation SDK by default — extra download and rarely needed for cost-lite mode
+                    resolve();
                 };
                 s1.onerror = function () { reject(new Error('Azure Maps failed to load')); };
                 document.head.appendChild(s1);
             });
+        };
+        // Azure Maps cost control: lite (default) = on-demand tiles + Haversine distances; full = auto maps + routing
+        window.CHAOS_MAPS_MODE_KEY = 'chaos_azureMapsMode';
+        window._chaosMapsSessionLoad = { scheduler: false, deployment: false, hotel: false };
+        window.getChaosMapsMode = function () {
+            try {
+                var v = localStorage.getItem(window.CHAOS_MAPS_MODE_KEY);
+                if (v === 'full' || v === 'lite' || v === 'off') return v;
+            } catch (_) {}
+            return 'lite';
+        };
+        window.setChaosMapsMode = function (mode) {
+            var next = (mode === 'full' || mode === 'off') ? mode : 'lite';
+            try { localStorage.setItem(window.CHAOS_MAPS_MODE_KEY, next); } catch (_) {}
+            return next;
+        };
+        window.chaosMapsAutoLoad = function () { return window.getChaosMapsMode() === 'full'; };
+        window.chaosMapsAllowRoutingApi = function () { return window.getChaosMapsMode() === 'full'; };
+        window.chaosMapsAllowInteractive = function (which) {
+            var mode = window.getChaosMapsMode();
+            if (mode === 'off') return false;
+            if (mode === 'full') return true;
+            return !!(window._chaosMapsSessionLoad && window._chaosMapsSessionLoad[which]);
         };
     </script>
     <!-- Removed Handsontable and Gantt chart libraries to improve load performance -->
@@ -3522,7 +3542,7 @@
             const GEOCODE_LS_KEY = 'chaos_geocode_cache_v1';
             const GEOCODE_LS_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days — addresses rarely move
             const ROUTE_LS_KEY = 'chaos_route_cache_v1';
-            const ROUTE_LS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+            const ROUTE_LS_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days — same addresses rarely need re-routing
             const pendingCoordBackfills = new Set();
 
             const normalizeCoordPair = (obj) => {
@@ -3762,8 +3782,9 @@
                 };
             };
             
-            // Calculate distance between two addresses using Azure Maps Route API
-            // First geocode addresses, then use coordinates in route API
+            // Calculate distance between two addresses.
+            // Lite/off mode: geocode + Haversine estimate (no Route API bill).
+            // Full mode: Azure Maps Route Directions.
             const calculateDistance = async (hotelAddress, siteAddress) => {
                 try {
                     if (!hotelAddress || !siteAddress) {
@@ -3777,7 +3798,10 @@
                     
                     if (!hotelGeocode || !siteGeocode) {
                         console.error('calculateDistance: Failed to geocode addresses', { hotelGeocode, siteGeocode });
-                        // Fallback: try with addresses directly
+                        // Avoid Route API fallback in cost-lite modes (still billable)
+                        if (typeof window.chaosMapsAllowRoutingApi === 'function' && !window.chaosMapsAllowRoutingApi()) {
+                            return null;
+                        }
                         const queryParam = `${encodeURIComponent(hotelAddress)}:${encodeURIComponent(siteAddress)}`;
                         const url = `/api/route/directions?api-version=1.0&query=${queryParam}&travelMode=car&routeType=shortest`;
                         const response = await fetch(url);
@@ -3794,6 +3818,28 @@
                     ].join(':');
                     if (routeDistanceCache.has(routeCacheKey)) {
                         return routeDistanceCache.get(routeCacheKey);
+                    }
+
+                    // Cost-lite: skip Route Directions; estimate from Haversine
+                    if (typeof window.chaosMapsAllowRoutingApi === 'function' && !window.chaosMapsAllowRoutingApi()) {
+                        const straight = calculateHaversineDistance(
+                            hotelGeocode.lat, hotelGeocode.lng, siteGeocode.lat, siteGeocode.lng
+                        );
+                        const roadMiles = Math.round(straight * 1.3 * 10) / 10;
+                        const travelTime = Math.max(1, Math.round((roadMiles / 30) * 60));
+                        const parsed = {
+                            distance: roadMiles.toFixed(2),
+                            distanceMeters: roadMiles * 1609.34,
+                            travelTime,
+                            travelTimeSeconds: travelTime * 60,
+                            path: [[hotelGeocode.lng, hotelGeocode.lat], [siteGeocode.lng, siteGeocode.lat]],
+                            hotelCoords: { lat: hotelGeocode.lat, lng: hotelGeocode.lng },
+                            siteCoords: { lat: siteGeocode.lat, lng: siteGeocode.lng },
+                            estimated: true
+                        };
+                        routeDistanceCache.set(routeCacheKey, parsed);
+                        writePersistedCacheEntry(ROUTE_LS_KEY, ROUTE_LS_TTL_MS, routeCacheKey, parsed);
+                        return parsed;
                     }
                     
                     // Use coordinates in route API (Azure Maps Route API expects latitude,longitude format)
@@ -3861,6 +3907,23 @@
             
             // Update map with current pins (hotel and/or site)
             // Uses Azure Maps; the Azure Maps JavaScript SDK exposes the global "atlas" (see https://docs.microsoft.com/azure/azure-maps/)
+            const updateHaversineDistanceLabel = () => {
+                if (!currentHotelCoords || !currentSiteCoords) return;
+                const distanceDisplay = document.getElementById('distance-display');
+                const distanceText = document.getElementById('distance-text');
+                const calculateBtn = document.getElementById('calculate-route-btn');
+                if (!distanceDisplay || !distanceText) return;
+                const straight = calculateHaversineDistance(
+                    currentHotelCoords.lat, currentHotelCoords.lng,
+                    currentSiteCoords.lat, currentSiteCoords.lng
+                );
+                const roadMiles = Math.round(straight * 1.3 * 10) / 10;
+                const mins = Math.max(1, Math.round((roadMiles / 30) * 60));
+                distanceDisplay.classList.remove('hidden');
+                distanceText.textContent = `~${roadMiles} mi estimated drive (${mins} min). Click Calculate Route for turn-by-turn (uses Azure Maps billing).`;
+                if (calculateBtn) calculateBtn.classList.remove('hidden');
+            };
+
             const updateMapWithPins = async () => {
                 const mapContainer = document.getElementById('hotel-site-map');
                 const mapContainerWrapper = document.getElementById('hotel-site-map-container');
@@ -3872,6 +3935,13 @@
                 // Only show map if at least one location is pinned
                 if (!currentHotelCoords && !currentSiteCoords) {
                     mapContainerWrapper.classList.add('hidden');
+                    return;
+                }
+
+                // Cost-lite: distance estimate only — no map tiles / route API until user opts in
+                if (typeof window.chaosMapsAllowInteractive === 'function' && !window.chaosMapsAllowInteractive('hotel')) {
+                    mapContainerWrapper.classList.add('hidden');
+                    updateHaversineDistanceLabel();
                     return;
                 }
                 
@@ -3979,9 +4049,13 @@
                             });
                         }
                         
-                        // If both pins exist, calculate route
+                        // Auto route only in full maps mode (Route API is billable)
                         if (currentHotelCoords && currentSiteCoords) {
-                            calculateRouteFromCoords();
+                            if (typeof window.chaosMapsAllowRoutingApi === 'function' && window.chaosMapsAllowRoutingApi()) {
+                                calculateRouteFromCoords();
+                            } else {
+                                updateHaversineDistanceLabel();
+                            }
                         }
                     });
                 } catch (error) {
@@ -4419,10 +4493,13 @@
                     });
                 }
                 
-                // Add event listener for Calculate Route button (manual trigger)
+                // Add event listener for Calculate Route button (manual trigger — unlocks map/route for this session)
                 if (calculateBtn) {
                     calculateBtn.addEventListener('click', async () => {
                         if (currentHotelCoords && currentSiteCoords) {
+                            if (window._chaosMapsSessionLoad) window._chaosMapsSessionLoad.hotel = true;
+                            // Load interactive map + billable route only when requested
+                            await updateMapWithPins();
                             calculateRouteFromCoords();
                         }
                     });
@@ -5638,7 +5715,8 @@
             };
 
             const hasValidTraining = (crc, roleName) => {
-                if (isOpenToAllRole(roleName)) return true;
+                // Training / Trainer slots are always open — never gate on training records.
+                if (isOpenToAllRole(roleName) || isTrainingRoleName(roleName)) return true;
                 const requiredTrainingNames = getTrainingNamesForRole(roleName);
                 // If no training is required for this role, all CRCs are eligible
                 if (requiredTrainingNames.length === 0) return true;
@@ -6235,12 +6313,18 @@
                 return true;
             };
             const getSchedulableCrcs = (list) => (list || state.crcs || []).filter(isCrcSchedulable);
+            /** Everyone who can appear in a shift role dropdown. Only archived staff are excluded.
+             *  Inactive (`active === false`) still show so managers can assign Training / cover shifts
+             *  (labeled in the option text). Hiding them dropped people like Claudia, Grace, Senait. */
+            const getAssignableCrcs = (list) => (list || state.crcs || []).filter((c) => c && c.id && c.archived !== true);
             /** Active staff only; keep inactive/archived visible when already assigned on this slot (read-only). */
             const includeCrcInShiftRolePicker = (crc, assignedCrcId) => {
                 if (!crc?.id) return false;
-                if (isCrcSchedulable(crc)) return true;
-                const assigned = assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED';
-                return assigned && crc.id === assignedCrcId;
+                if (crc.archived === true) {
+                    const assigned = assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED';
+                    return assigned && crc.id === assignedCrcId;
+                }
+                return true;
             };
 
             /** Same physical visit: date + site + period + visit + group number + studies. Ignores groupId so re-saves do not look like extra shifts. */
@@ -9607,16 +9691,19 @@
                             setTimeout(() => {
                                 try { renderUtilization(); } catch (_) { /* ignore */ }
                             }, 400);
-                            setTimeout(() => {
-                                try {
-                                    if (typeof initializeSchedulerMap === 'function') initializeSchedulerMap();
-                                } catch (_) { /* ignore */ }
-                            }, 1200);
-                            setTimeout(() => {
-                                try {
-                                    if (typeof initializeDeploymentMap === 'function') initializeDeploymentMap();
-                                } catch (_) { /* ignore */ }
-                            }, 1800);
+                            // Scheduler tab historically kicked off dashboard maps — skip unless full mode
+                            if (typeof window.chaosMapsAutoLoad === 'function' && window.chaosMapsAutoLoad()) {
+                                setTimeout(() => {
+                                    try {
+                                        if (typeof initializeSchedulerMap === 'function') initializeSchedulerMap({ force: true });
+                                    } catch (_) { /* ignore */ }
+                                }, 1200);
+                                setTimeout(() => {
+                                    try {
+                                        if (typeof initializeDeploymentMap === 'function') initializeDeploymentMap({ force: true });
+                                    } catch (_) { /* ignore */ }
+                                }, 1800);
+                            }
                         } catch (e) {
                             console.error('Scheduler deferred render failed:', e);
                             if (pendingInitialTabPaint) markInitialTabContentReady();
@@ -9705,16 +9792,18 @@
                         });
                     } else {
                         mainAppContent.innerHTML = getDashboardHTML();
-                        // Initialize maps when dashboard is shown
-                        if (typeof initializeSchedulerMap === 'function') {
-                            setTimeout(() => {
-                                initializeSchedulerMap();
-                            }, 100);
-                        }
-                        if (typeof initializeDeploymentMap === 'function') {
-                            setTimeout(() => {
-                                initializeDeploymentMap();
-                            }, 200);
+                        // Maps: only auto-load in "full" mode (tiles are the expensive Azure Maps usage)
+                        if (typeof window.chaosMapsAutoLoad === 'function' && window.chaosMapsAutoLoad()) {
+                            window._chaosMapsSessionLoad.scheduler = true;
+                            window._chaosMapsSessionLoad.deployment = true;
+                            document.getElementById('chaos-scheduler-map-placeholder')?.classList.add('hidden');
+                            document.getElementById('crc-deployment-map-placeholder')?.classList.add('hidden');
+                            if (typeof initializeSchedulerMap === 'function') {
+                                setTimeout(() => { initializeSchedulerMap({ force: true }); }, 100);
+                            }
+                            if (typeof initializeDeploymentMap === 'function') {
+                                setTimeout(() => { initializeDeploymentMap({ force: true }); }, 200);
+                            }
                         }
                         renderDashboardCharts().catch((e) => console.error('Dashboard render failed:', e));
                         if (pendingInitialTabPaint) afterNextPaint(() => markInitialTabContentReady());
@@ -11190,7 +11279,7 @@
                             const roleName = role ? role.name : 'Role';
                             
                             // Get all qualified CRCs for this role (exclude deactivated)
-                            const qualifiedCrcs = getSchedulableCrcs().filter(c => hasValidTraining(c, roleName))
+                            const qualifiedCrcs = getAssignableCrcs().filter(c => hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             // Get existing assignments for this role
@@ -11225,7 +11314,7 @@
                                         <input type="checkbox" name="duplicateSelection" value="${roleId}::${crcId}" ${crcId ? 'checked' : ''} class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                                         <select name="duplicate-role-${roleId}-${index}" class="flex-1 p-1 text-xs border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                             <option value="">Select Staff</option>
-                                            ${qualifiedCrcs.map(c => `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''}>${c.name}</option>`).join('')}
+                                            ${qualifiedCrcs.map(c => `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''}>${c.name}${!isCrcSchedulable(c) ? ' (Inactive)' : ''}</option>`).join('')}
                                         </select>
                                     </div>
                                 `;
@@ -11430,7 +11519,7 @@
                             if (!role) return;
                             
                             const roleName = role.name;
-                            const qualifiedCrcs = getSchedulableCrcs().filter(c => hasValidTraining(c, roleName))
+                            const qualifiedCrcs = getAssignableCrcs().filter(c => hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             const container = e.target.previousElementSibling;
@@ -11446,7 +11535,7 @@
                                 <input type="checkbox" name="duplicateSelection" value="${roleId}::" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" disabled>
                                 <select name="duplicate-role-${roleId}-${existingCount}" class="flex-1 p-1 text-xs border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                     <option value="">Select Staff</option>
-                                    ${qualifiedCrcs.map(c => `<option value="${c.id}">${c.name}</option>`).join('')}
+                                    ${qualifiedCrcs.map(c => `<option value="${c.id}">${c.name}${!isCrcSchedulable(c) ? ' (Inactive)' : ''}</option>`).join('')}
                                 </select>
                             `;
                             
@@ -11494,7 +11583,7 @@
                             if (!role) return;
                             
                             const roleName = role.name;
-                            const qualifiedCrcs = getSchedulableCrcs().filter(c => hasValidTraining(c, roleName))
+                            const qualifiedCrcs = getAssignableCrcs().filter(c => hasValidTraining(c, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             
                             const container = e.target.closest('.border').querySelector(`#duplicate-role-${roleId}-assignments`);
@@ -11523,7 +11612,7 @@
                                     <input type="checkbox" name="duplicateSelection" value="${roleId}::${crcId}" ${crcId ? 'checked' : ''} class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                                     <select name="duplicate-role-${roleId}-${index}" class="flex-1 p-1 text-xs border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
                                         <option value="">Select Staff</option>
-                                        ${qualifiedCrcs.map(c => `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''}>${c.name}</option>`).join('')}
+                                        ${qualifiedCrcs.map(c => `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''}>${c.name}${!isCrcSchedulable(c) ? ' (Inactive)' : ''}</option>`).join('')}
                                     </select>
                                 `;
                                 
@@ -12829,7 +12918,12 @@
                         </section>
                     </div>
                     <div class="mt-6 mb-6">
-                        <h3 class="text-lg font-semibold mb-3 text-gray-700 dark:text-gray-300">Site & CRC Home Locations</h3>
+                        <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
+                            <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">Site & CRC Home Locations</h3>
+                            <button type="button" id="load-scheduler-map-btn" data-action="load-scheduler-map" class="px-3 py-1.5 bg-slate-700 text-white rounded hover:bg-slate-800 text-sm">
+                                Load map
+                            </button>
+                        </div>
                         <div class="flex gap-4 mb-2">
                             <div class="flex items-center gap-2">
                                 <div style="background-color: #3b82f6; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white;"></div>
@@ -12840,14 +12934,24 @@
                                 <span class="text-sm text-gray-600 dark:text-gray-400">CRC Home Locations</span>
                             </div>
                         </div>
-                        <div class="rounded-lg overflow-hidden border dark:border-gray-700" style="height: 500px;">
+                        <div class="rounded-lg overflow-hidden border dark:border-gray-700 relative" style="height: 500px;">
+                            <div id="chaos-scheduler-map-placeholder" class="absolute inset-0 flex flex-col items-center justify-center bg-gray-50 dark:bg-gray-900/60 p-6 text-center z-10">
+                                <p class="text-sm text-gray-600 dark:text-gray-300 mb-2">Map tiles are off by default to reduce Azure Maps cost.</p>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">Click Load map when you need the interactive view.</p>
+                                <button type="button" data-action="load-scheduler-map" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">Load map</button>
+                            </div>
                             <div id="chaos-scheduler-map" class="w-full h-full"></div>
                         </div>
                         <p class="text-xs text-center text-gray-500 dark:text-gray-400 mt-2">Hover over pins to see names • Blue = Sites, Green = CRC Homes</p>
                     </div>
                     
                     <div class="mt-6 mb-6">
-                        <h3 class="text-lg font-semibold mb-3 text-gray-700 dark:text-gray-300">CRC Deployment Map</h3>
+                        <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
+                            <h3 class="text-lg font-semibold text-gray-700 dark:text-gray-300">CRC Deployment Map</h3>
+                            <button type="button" id="load-deployment-map-btn" data-action="load-deployment-map" class="px-3 py-1.5 bg-slate-700 text-white rounded hover:bg-slate-800 text-sm">
+                                Load map
+                            </button>
+                        </div>
                         <div class="flex items-center gap-4 mb-3">
                             <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Select Date:</label>
                             <input type="date" id="crc-deployment-date" value="${toDateOnlyString(new Date())}" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
@@ -12865,7 +12969,11 @@
                                 <span class="text-sm text-gray-600 dark:text-gray-400">Sites with Shifts</span>
                             </div>
                         </div>
-                        <div class="rounded-lg overflow-hidden border dark:border-gray-700" style="height: 500px;">
+                        <div class="rounded-lg overflow-hidden border dark:border-gray-700 relative" style="height: 500px;">
+                            <div id="crc-deployment-map-placeholder" class="absolute inset-0 flex flex-col items-center justify-center bg-gray-50 dark:bg-gray-900/60 p-6 text-center z-10">
+                                <p class="text-sm text-gray-600 dark:text-gray-300 mb-2">Map tiles are off by default to reduce Azure Maps cost.</p>
+                                <button type="button" data-action="load-deployment-map" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">Load map</button>
+                            </div>
                             <div id="crc-deployment-map" class="w-full h-full"></div>
                         </div>
                     </div>
@@ -21348,12 +21456,17 @@
             // Initialize scheduler map with site locations
             let schedulerMap = null;
             let schedulerMapInitPromise = null;
-            const initializeSchedulerMap = async () => {
+            const initializeSchedulerMap = async (opts = {}) => {
+                const force = opts && opts.force === true;
+                if (!force && typeof window.chaosMapsAllowInteractive === 'function' && !window.chaosMapsAllowInteractive('scheduler')) {
+                    return;
+                }
                 const mapContainer = document.getElementById('chaos-scheduler-map');
                 if (!mapContainer) {
                     debugLog('Scheduler map container not found (expected when not on scheduler tab)');
                     return;
                 }
+                document.getElementById('chaos-scheduler-map-placeholder')?.classList.add('hidden');
                 // Already live — just refresh markers (avoid re-billing for a new map tile session)
                 if (schedulerMap) {
                     const alive = mapContainer.querySelector('canvas') || mapContainer.childElementCount > 0;
@@ -21589,9 +21702,14 @@
             let deploymentMap = null;
             let deploymentMapInitPromise = null;
             
-            const initializeDeploymentMap = async () => {
+            const initializeDeploymentMap = async (opts = {}) => {
+                const force = opts && opts.force === true;
+                if (!force && typeof window.chaosMapsAllowInteractive === 'function' && !window.chaosMapsAllowInteractive('deployment')) {
+                    return;
+                }
                 const mapContainer = document.getElementById('crc-deployment-map');
                 if (!mapContainer) return;
+                document.getElementById('crc-deployment-map-placeholder')?.classList.add('hidden');
 
                 if (deploymentMap) {
                     const alive = mapContainer.querySelector('canvas') || mapContainer.childElementCount > 0;
@@ -23943,6 +24061,17 @@
                         </div>
                         ${isManager ? `
                             <div class="border-t dark:border-gray-700 pt-6">
+                                <h3 class="text-lg font-semibold dark:text-white mb-4">Azure Maps usage</h3>
+                                <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Controls interactive map tiles and driving-route API calls (biggest cost drivers). Geocoding still runs when needed and is cached.</p>
+                                <label class="block text-sm font-medium dark:text-gray-300 mb-2">Maps mode</label>
+                                <select id="chaos-maps-mode-select" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                    <option value="lite" ${((typeof window.getChaosMapsMode === 'function' ? window.getChaosMapsMode() : 'lite') === 'lite') ? 'selected' : ''}>Lite (recommended) — load maps on demand; estimate hotel distance</option>
+                                    <option value="full" ${((typeof window.getChaosMapsMode === 'function' ? window.getChaosMapsMode() : 'lite') === 'full') ? 'selected' : ''}>Full — auto-load dashboard maps + driving routes</option>
+                                    <option value="off" ${((typeof window.getChaosMapsMode === 'function' ? window.getChaosMapsMode() : 'lite') === 'off') ? 'selected' : ''}>Off — no interactive maps (estimates only)</option>
+                                </select>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">Saved in this browser. Switch to Lite if Azure Maps bills are high.</p>
+                            </div>
+                            <div class="border-t dark:border-gray-700 pt-6">
                                 <h3 class="text-lg font-semibold dark:text-white mb-4">User Management</h3>
                                 <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Manage users and permissions from the Users tab.</p>
                                 <button type="button" data-action="navigate-to-users" class="bg-purple-600 text-white py-2 px-4 rounded-md hover:bg-purple-700">Go to Users Tab</button>
@@ -26005,14 +26134,15 @@
                         const crcId = option.value;
                         const crc = state.crcs.find(c => c.id === crcId);
                         const isInactive = crc && !isCrcSchedulable(crc);
-                        // Hide inactive/archived CRCs from selection lists so they can't be scheduled going forward.
-                        // If an inactive CRC is already selected on an existing event, keep it visible (read-only) to avoid data loss.
-                        if (isInactive && !currentlySelectedCrcIds.has(crcId)) {
+                        // Keep inactive staff visible and selectable for Training / cover (label only).
+                        // Archived staff stay hidden unless already selected on this event.
+                        if (crc && crc.archived === true && !currentlySelectedCrcIds.has(crcId)) {
                             option.hidden = true;
                             option.disabled = true;
                             continue;
                         }
                         option.hidden = false;
+                        option.disabled = false;
                         option.textContent = crc ? `${crc.name}${isInactive ? ' (Inactive)' : ''}` : 'Unknown CRC';
                         option.classList.remove('text-red-500', 'font-bold', 'text-gray-400', 'dark:text-gray-500');
 
@@ -26428,10 +26558,10 @@
                 
                 // For Site Assignment events, filter CRCs by training when roles are known
                 const dateStr = toDateOnlyString(parseDateFlexible(date));
-                const schedulableCrcs = getSchedulableCrcs();
+                const assignableCrcs = getAssignableCrcs();
                 const crcIdsOnEvent = event && typeof getCrcIdsOnShiftEvent === 'function' ? getCrcIdsOnShiftEvent(event) : new Set();
-                const crcListForPicker = schedulableCrcs.concat(
-                    (state.crcs || []).filter(c => c?.id && crcIdsOnEvent.has(c.id) && !schedulableCrcs.some(s => s.id === c.id))
+                const crcListForPicker = assignableCrcs.concat(
+                    (state.crcs || []).filter(c => c?.id && crcIdsOnEvent.has(c.id) && !assignableCrcs.some(s => s.id === c.id))
                 );
                 const crcOptions = crcListForPicker.map(crc => {
                     const isUnavailable = isCRCUnavailable(crc.id, date, period);
@@ -26439,7 +26569,7 @@
                     
                     // If editing and this CRC is selected, always include them
                     const isSelected = event && (event.crcId === crc.id || crcIdsOnEvent.has(crc.id));
-                    if (!isCrcSchedulable(crc) && !isSelected) return '';
+                    if (crc.archived === true && !isSelected) return '';
                     
                     // For Site Assignment with known roles, check training
                     let trainingNote = '';
@@ -26451,9 +26581,8 @@
                     }
                     
                     const pendingText = hasPendingTimeOffOnDate(crc.id, dateStr) ? ' (Pending Review)' : '';
-                    const inactiveAttr = !isCrcSchedulable(crc) ? 'disabled' : '';
                     const inactiveLabel = !isCrcSchedulable(crc) ? ' (Inactive)' : '';
-                    return `<option value="${crc.id}" ${isSelected ? 'selected' : ''} ${inactiveAttr}>${crc.name}${inactiveLabel}${pendingText}${unavailableText}${trainingNote}</option>`;
+                    return `<option value="${crc.id}" ${isSelected ? 'selected' : ''}>${crc.name}${inactiveLabel}${pendingText}${unavailableText}${trainingNote}</option>`;
                 }).filter(Boolean).join('');
                 // Debug site loading for shift creation
                 debugLog('CHAOS: Sites available for shift creation:', state.crc_sites.length);
@@ -30754,6 +30883,18 @@
                 // Collection reference function removed - using Azure API directly
 
                 // Handle dashboard view toggles
+                if (action === 'load-scheduler-map' || action === 'load-deployment-map') {
+                    if (action === 'load-scheduler-map') {
+                        if (window._chaosMapsSessionLoad) window._chaosMapsSessionLoad.scheduler = true;
+                        document.getElementById('chaos-scheduler-map-placeholder')?.classList.add('hidden');
+                        if (typeof initializeSchedulerMap === 'function') initializeSchedulerMap({ force: true });
+                    } else {
+                        if (window._chaosMapsSessionLoad) window._chaosMapsSessionLoad.deployment = true;
+                        document.getElementById('crc-deployment-map-placeholder')?.classList.add('hidden');
+                        if (typeof initializeDeploymentMap === 'function') initializeDeploymentMap({ force: true });
+                    }
+                    return;
+                }
                 if (action === 'toggle-visit-study-view' || action === 'toggle-visit-site-view' || action === 'toggle-crc-monthly-view') {
                     const viewType = e.target.dataset.view;
                     if (!state.dashboardViewState) {
@@ -32474,6 +32615,17 @@
                         openModal(getUserSettingsModalHTML(), 'lg');
                         setTimeout(() => {
                             lucide.createIcons();
+                            const mapsModeSelect = document.getElementById('chaos-maps-mode-select');
+                            if (mapsModeSelect && typeof window.setChaosMapsMode === 'function') {
+                                mapsModeSelect.addEventListener('change', () => {
+                                    window.setChaosMapsMode(mapsModeSelect.value);
+                                    if (typeof showToast === 'function') {
+                                        showToast(`Azure Maps mode set to ${mapsModeSelect.value}`, 'success');
+                                    } else if (typeof showNotification === 'function') {
+                                        showNotification(`Azure Maps mode set to ${mapsModeSelect.value}`, 'success');
+                                    }
+                                });
+                            }
                         }, 100);
                         break;
                     }
@@ -43152,7 +43304,7 @@
                                                 const roleName = role ? role.name : '';
                                                 
                                                 const allowOverrideEdit = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                                const qualifiedCrcs = getSchedulableCrcs().filter(c => (allowOverrideEdit ? true : hasValidTraining(c, roleName)))
+                                                const qualifiedCrcs = getAssignableCrcs().filter(c => (allowOverrideEdit ? true : hasValidTraining(c, roleName)))
                                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                                 const trainingTypeValue = (mergedTrainingAssignments[roleId] && mergedTrainingAssignments[roleId][index]) || getExistingTrainingType(roleId, index);
                                                 const trainingModeKey = `${roleId}-${index}`;
@@ -43179,7 +43331,7 @@
                                                                     }
                                                                     const isInactive = !isCrcSchedulable(c);
                                                                     const styleClass = isUnavailable && c.id !== crcId ? 'text-red-600 dark:text-red-400' : '';
-                                                                    return `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''} ${isInactive ? 'disabled' : ''} class="${styleClass}">${c.name}${isInactive ? ' (Inactive)' : ''}${statusText}</option>`;
+                                                                    return `<option value="${c.id}" ${c.id === crcId ? 'selected' : ''} class="${styleClass}">${c.name}${isInactive ? ' (Inactive)' : ''}${statusText}</option>`;
                                                                 }).join('')}
                                                                 ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
                                                             </select>
@@ -43372,11 +43524,11 @@
                             if (crc) {
                                 // Filter CRCs based on the roles in the event
                                 const eventRoles = existingEvent.roles || [];
-                                let qualifiedCrcs = getSchedulableCrcs();
+                                let qualifiedCrcs = getAssignableCrcs();
                                 
-                                // If there are specific roles, filter by training (and active status)
+                                // If there are specific roles, filter by training (inactive still listed)
                                 if (eventRoles.length > 0) {
-                                    qualifiedCrcs = getSchedulableCrcs().filter(c =>
+                                    qualifiedCrcs = getAssignableCrcs().filter(c =>
                                         eventRoles.some(role => hasValidTraining(c, role))
                                     );
                                 }
@@ -43412,7 +43564,7 @@
                                                         }
                                                         const isInactive = !isCrcSchedulable(c);
                                                         const styleClass = isUnavailable && c.id !== existingEvent.crcId ? 'text-red-600 dark:text-red-400' : '';
-                                                        return `<option value="${c.id}" ${c.id === existingEvent.crcId ? 'selected' : ''} ${isInactive ? 'disabled' : ''} class="${styleClass}">${c.name}${isInactive ? ' (Inactive)' : ''}${statusText}</option>`;
+                                                        return `<option value="${c.id}" ${c.id === existingEvent.crcId ? 'selected' : ''} class="${styleClass}">${c.name}${isInactive ? ' (Inactive)' : ''}${statusText}</option>`;
                                                     }).join('')}
                                                     ${qualifiedCrcs.length === 0 ? '<option value="" disabled>No qualified staff available</option>' : ''}
                                                 </select>
@@ -43801,7 +43953,7 @@
                             const excludeGroupId = existingEvent ? existingEvent.groupId : null;
                             const allowOverride = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
 
-                            let qualifiedCrcs = getSchedulableCrcs()
+                            let qualifiedCrcs = getAssignableCrcs()
                                 .filter(crc => allowOverride ? true : hasValidTraining(crc, roleName))
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                             if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED' && !qualifiedCrcs.some(c => c.id === assignedCrcId)) {
@@ -43833,7 +43985,8 @@
                                 const timeOffText = onTimeOff
                                     ? ` (Time Off - ${unavailPeriod ? (unavailPeriod === 'Full Day' ? 'Full Day' : unavailPeriod) : 'Partial'})`
                                     : '';
-                                return `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''}>${crc.name}${timeOffText}</option>`;
+                                const inactiveText = !isCrcSchedulable(crc) ? ' (Inactive)' : '';
+                                return `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''}>${crc.name}${inactiveText}${timeOffText}</option>`;
                             }).join('');
                             // Always list conflicted staff too (Training often needs someone already on-site that day).
                             optionsHtml += unavailable.map(crc => {
@@ -43847,7 +44000,8 @@
                                 } else {
                                     statusText = ' (Scheduled)';
                                 }
-                                return `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''} class="text-gray-500">${crc.name}${statusText}</option>`;
+                                const inactiveText = !isCrcSchedulable(crc) ? ' (Inactive)' : '';
+                                return `<option value="${crc.id}" ${assignedCrcId === crc.id ? 'selected' : ''} class="text-gray-500">${crc.name}${inactiveText}${statusText}</option>`;
                             }).join('');
 
                             if (!optionsHtml) {
@@ -44046,7 +44200,7 @@
                         const allowOverrideRole = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
                         // Only show CRCs who are active and have valid training for this role (or all if override)
                         // Only active staff are selectable for scheduling, even when overriding restrictions.
-                        let qualifiedCrcs = getSchedulableCrcs().filter(crc => (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
+                        let qualifiedCrcs = getAssignableCrcs().filter(crc => (allowOverrideRole ? true : hasValidTraining(crc, roleName)))
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         
                         // IMPORTANT: If editing, include assigned CRCs even if they don't have training
@@ -44057,9 +44211,8 @@
                                 if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED') {
                                     const assignedCrc = state.crcs.find(c => c.id === assignedCrcId);
                                     if (assignedCrc && !qualifiedCrcs.find(c => c.id === assignedCrcId)) {
-                                        if (isCrcSchedulable(assignedCrc) || existingAssignmentsRaw.includes(assignedCrcId)) {
+                                        if (assignedCrc.archived !== true || existingAssignmentsRaw.includes(assignedCrcId)) {
                                             untrainedAssignedCrcs.push(assignedCrc);
-                                            console.log(`Including assigned CRC ${assignedCrc.name} even though they don't have training for ${roleName}`);
                                         }
                                     }
                                 }
@@ -44068,11 +44221,11 @@
                         
                         // Check if this role requires training - if not, allow all CRCs (including new ones without training)
                         const requiredTrainingNames = getTrainingNamesForRole(roleName);
-                        const roleRequiresTraining = requiredTrainingNames.length > 0;
+                        const roleRequiresTraining = requiredTrainingNames.length > 0 && !isOpenToAllRole(roleName) && !isTrainingRoleName(roleName);
                         
-                        // If role doesn't require training, include all active CRCs (for new CRCs without training records)
-                        if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                            qualifiedCrcs = getSchedulableCrcs()
+                        // If role doesn't require training, include all assignable CRCs
+                        if (!roleRequiresTraining) {
+                            qualifiedCrcs = getAssignableCrcs()
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                         }
                         
@@ -44132,10 +44285,10 @@
                         const volunteerCrcIdsForRole = (existingEvent && existingEvent.volunteerApplications && Array.isArray(existingEvent.volunteerApplications))
                             ? existingEvent.volunteerApplications.filter(a => a.status === 'pending' && (a.roleId === role.id || !a.roleId)).map(a => a.crcId)
                             : [];
-                        // Keep everyone selectable (including already scheduled that day). Conflicts stay labeled and sorted to the bottom.
-                        // Hiding "unavailable" staff hid trainees like Claudia from the Training role picker.
+                        // Keep everyone assignable (including inactive + already scheduled). Conflicts stay labeled at the bottom.
+                        // Filtering on isCrcSchedulable hid Grace/Senait/Claudia when active===false.
                         crcsWithInfo = crcsWithInfo.filter(entry =>
-                            isCrcSchedulable(entry.crc) || existingAssignmentsRaw.includes(entry.crc.id)
+                            includeCrcInShiftRolePicker(entry.crc, existingAssignmentsRaw.includes(entry.crc.id) ? entry.crc.id : '')
                         );
                         
                         const buildRoleOptions = (slotIndex, roleIdForSlot) => {
@@ -44172,7 +44325,7 @@
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
                             if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            const disabledAttr = isInactive ? 'disabled' : '';
+                            const disabledAttr = ''; // Inactive stay selectable (labeled); only archived are omitted upstream.
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         // Other available CRCs (includes staff on PTO — selectable with warning label)
@@ -44190,7 +44343,7 @@
                             if (isOnTimeOff) styleClasses.push('text-amber-600 dark:text-amber-400');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            const disabledAttr = isInactive ? 'disabled' : '';
+                            const disabledAttr = ''; // Inactive stay selectable (labeled); only archived are omitted upstream.
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${timeOffText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         // Volunteers (scheduling conflict) - still show with (volunteer)
@@ -44202,7 +44355,7 @@
                             const styleClasses = ['text-gray-400 dark:text-gray-500', 'text-green-600 dark:text-green-500'];
                             if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            const disabledAttr = isInactive ? 'disabled' : '';
+                            const disabledAttr = ''; // Inactive stay selectable (labeled); only archived are omitted upstream.
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
                         // Other unavailable CRCs
@@ -44221,7 +44374,7 @@
                             if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            const disabledAttr = isInactive ? 'disabled' : '';
+                            const disabledAttr = ''; // Inactive stay selectable (labeled); only archived are omitted upstream.
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
 
@@ -44394,8 +44547,7 @@
                                 if (!roleForSlot) return;
                                 
                                 const allowOverrideQty = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                // Only active staff are selectable for scheduling, even when overriding restrictions.
-                                const qualifiedCrcs = getSchedulableCrcs().filter(crc => (allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name)))
+                                const qualifiedCrcs = getAssignableCrcs().filter(crc => (allowOverrideQty ? true : hasValidTraining(crc, roleForSlot.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
@@ -44411,14 +44563,23 @@
                                 const availableCrcs = [];
                                 const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
+                                    if (!includeCrcInShiftRolePicker(crc, '')) return;
                                     const isUnavailable = allowOverrideQty ? false : isCRCScheduledOnDate(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
                                     if (isUnavailable) unavailableCrcs.push(crc);
                                     else availableCrcs.push(crc);
                                 });
                                 
-                                // New slots: only list CRCs who can actually be assigned (omit unselected unavailable).
                                 availableCrcs.forEach(crc => {
-                                    optionsHtml += `<option value="${crc.id}">${crc.name}</option>`;
+                                    const inactiveText = !isCrcSchedulable(crc) ? ' (Inactive)' : '';
+                                    optionsHtml += `<option value="${crc.id}">${crc.name}${inactiveText}</option>`;
+                                });
+                                unavailableCrcs.forEach(crc => {
+                                    const inactiveText = !isCrcSchedulable(crc) ? ' (Inactive)' : '';
+                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic, excludeGroupIdForDynamic);
+                                    const statusText = conflictInfo
+                                        ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`
+                                        : ' (Scheduled)';
+                                    optionsHtml += `<option value="${crc.id}" class="text-gray-500">${crc.name}${inactiveText}${statusText}</option>`;
                                 });
                                 
                                 const isTraining = isTrainingRoleName(roleForSlot.name);
@@ -44603,9 +44764,8 @@
                     const existingAssignments = existingAssignmentsRaw.filter(x => x && x !== 'SITE_STAFF' && x !== 'UNASSIGNED');
                     
                     const allowOverrideReq = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                    // Get CRCs who are active and can fill this role (only show those with valid training, or all if override)
-                    // Only active staff are selectable for scheduling, even when overriding restrictions.
-                    let qualifiedCrcs = getSchedulableCrcs().filter(crc => (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
+                    // Non-archived staff with valid training (or all if override). Inactive remain selectable.
+                    let qualifiedCrcs = getAssignableCrcs().filter(crc => (allowOverrideReq ? true : hasValidTraining(crc, role.name)))
                         .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     
                     const untrainedAssignedCrcs = [];
@@ -44614,9 +44774,8 @@
                             if (assignedCrcId && assignedCrcId !== 'SITE_STAFF' && assignedCrcId !== 'UNASSIGNED') {
                                 const assignedCrc = state.crcs.find(c => c.id === assignedCrcId);
                                 if (assignedCrc && !qualifiedCrcs.find(c => c.id === assignedCrcId)) {
-                                    if (isCrcSchedulable(assignedCrc) || existingAssignmentsRaw.includes(assignedCrcId)) {
+                                    if (assignedCrc.archived !== true || existingAssignmentsRaw.includes(assignedCrcId)) {
                                         untrainedAssignedCrcs.push(assignedCrc);
-                                        console.log(`Tracking assigned CRC ${assignedCrc.name} who doesn't have training for ${role.name}`);
                                     }
                                 }
                             }
@@ -44624,10 +44783,10 @@
                     }
                     
                     const requiredTrainingNames = getTrainingNamesForRole(role.name);
-                    const roleRequiresTraining = requiredTrainingNames.length > 0;
+                    const roleRequiresTraining = requiredTrainingNames.length > 0 && !isOpenToAllRole(role.name) && !isTrainingRoleName(role.name);
                     
-                    if (!roleRequiresTraining && qualifiedCrcs.length === 0) {
-                        qualifiedCrcs = getSchedulableCrcs()
+                    if (!roleRequiresTraining) {
+                        qualifiedCrcs = getAssignableCrcs()
                             .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                     }
                     
@@ -44682,9 +44841,9 @@
                     const volunteerCrcIdsForReqRole = (existingEvent && existingEvent.volunteerApplications && Array.isArray(existingEvent.volunteerApplications))
                         ? existingEvent.volunteerApplications.filter(a => a.status === 'pending' && (a.roleId === roleId || !a.roleId)).map(a => a.crcId)
                         : [];
-                    // Keep everyone selectable (including already scheduled). Conflicts stay labeled at the bottom.
+                    // Keep everyone assignable (including inactive + already scheduled). Conflicts stay labeled at the bottom.
                     crcsWithInfo = crcsWithInfo.filter(entry =>
-                        isCrcSchedulable(entry.crc) || existingAssignmentsRaw.includes(entry.crc.id)
+                        includeCrcInShiftRolePicker(entry.crc, existingAssignmentsRaw.includes(entry.crc.id) ? entry.crc.id : '')
                     );
                     
                     const buildRoleOptions = (slotIndex, roleIdForSlot) => {
@@ -44716,7 +44875,7 @@
                             if (isUntrained) styleClasses.push('text-orange-600 dark:text-orange-400');
                             if (hasPending) styleClasses.push('text-yellow-600 dark:text-yellow-400');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            const disabledAttr = isInactive ? 'disabled' : '';
+                            const disabledAttr = ''; // Inactive stay selectable (labeled); only archived are omitted upstream.
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         optionsHtml += otherAvailable.filter(pickerVisibleReq).map(({ crc, distance, hasPending, isUntrained, isInactive, isOnTimeOff, unavailPeriod }) => {
@@ -44733,7 +44892,7 @@
                             const inactiveText = isInactive ? ' (Inactive)' : '';
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            const disabledAttr = isInactive ? 'disabled' : '';
+                            const disabledAttr = ''; // Inactive stay selectable (labeled); only archived are omitted upstream.
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${timeOffText}${pendingText}${distanceText}</option>`;
                         }).join('');
                         optionsHtml += volunteerUnavailable.filter(pickerVisibleReq).map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
@@ -44744,7 +44903,7 @@
                             const styleClasses = ['text-gray-400 dark:text-gray-500', 'text-green-600 dark:text-green-500'];
                             if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            const disabledAttr = isInactive ? 'disabled' : '';
+                            const disabledAttr = ''; // Inactive stay selectable (labeled); only archived are omitted upstream.
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClasses.join(' ')}">${crc.name}${volunteerLabel}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
                         optionsHtml += otherUnavailable.filter(pickerVisibleReq).map(({ crc, unavailPeriod, conflictInfo, distance, isUntrained, isInactive }) => {
@@ -44756,7 +44915,7 @@
                             if (isUntrained) styleClasses.push('text-orange-400 dark:text-orange-500');
                             const styleClass = styleClasses.join(' ');
                             const selectedAttr = assignedCrcId === crc.id ? 'selected' : '';
-                            const disabledAttr = isInactive ? 'disabled' : '';
+                            const disabledAttr = ''; // Inactive stay selectable (labeled); only archived are omitted upstream.
                             return `<option value="${crc.id}" ${selectedAttr} ${disabledAttr} class="${styleClass}">${crc.name}${inactiveText}${untrainedText}${statusText}${distanceText}</option>`;
                         }).join('');
 
@@ -45050,8 +45209,7 @@
                             
                             if (newQuantity > currentSlots) {
                                 const allowOverrideInc = form.querySelector('input[name="overrideCrcRestrictions"]')?.checked;
-                                // Only active staff are selectable for scheduling, even when overriding restrictions.
-                                const qualifiedCrcs = getSchedulableCrcs().filter(crc => (allowOverrideInc ? true : hasValidTraining(crc, role.name)))
+                                const qualifiedCrcs = getAssignableCrcs().filter(crc => (allowOverrideInc ? true : hasValidTraining(crc, role.name)))
                                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
                                 
                                 const site = selectedSiteId ? state.crc_sites.find(s => s.id === selectedSiteId) : null;
@@ -45067,12 +45225,24 @@
                                 const availableCrcs = [];
                                 const unavailableCrcs = [];
                                 qualifiedCrcs.forEach(crc => {
+                                    if (!includeCrcInShiftRolePicker(crc, '')) return;
                                     const isUnavailable = allowOverrideInc ? false : isCRCScheduledOnDate(crc.id, date, period, excludeEventIdForDynamic, excludeGroupIdForDynamic);
                                     if (isUnavailable) unavailableCrcs.push(crc);
                                     else availableCrcs.push(crc);
                                 });
                                 
-                                availableCrcs.forEach(crc => { optionsHtml += `<option value="${crc.id}">${crc.name}</option>`; });
+                                availableCrcs.forEach(crc => {
+                                    const inactiveText = !isCrcSchedulable(crc) ? ' (Inactive)' : '';
+                                    optionsHtml += `<option value="${crc.id}">${crc.name}${inactiveText}</option>`;
+                                });
+                                unavailableCrcs.forEach(crc => {
+                                    const inactiveText = !isCrcSchedulable(crc) ? ' (Inactive)' : '';
+                                    const conflictInfo = getConflictingAppointmentInfo(crc.id, date, excludeEventIdForDynamic, excludeGroupIdForDynamic);
+                                    const statusText = conflictInfo
+                                        ? ` (Scheduled: ${conflictInfo.site} - ${conflictInfo.study})`
+                                        : ' (Scheduled)';
+                                    optionsHtml += `<option value="${crc.id}" class="text-gray-500">${crc.name}${inactiveText}${statusText}</option>`;
+                                });
                                 
                                 const isTraining = isTrainingRoleName(role.name);
                                 
@@ -53433,7 +53603,7 @@
                                         </p>
                                         <button type="button" id="calculate-route-btn" class="mt-2 bg-blue-600 text-white py-1 px-3 rounded-md hover:bg-blue-700 text-sm">Calculate Route</button>
                                     </div>
-                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hotel location shown above. Select a site and the route will be calculated automatically, or click "Calculate Route" to calculate manually.</p>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Distance is estimated automatically (no map tiles). Click "Calculate Route" only when you need turn-by-turn (uses Azure Maps billing).</p>
                                 </div>
                             </div>
                             <div class="grid grid-cols-2 gap-4 mt-4">
@@ -53680,7 +53850,7 @@
                                         </p>
                                         <button type="button" id="calculate-route-btn" class="mt-2 bg-blue-600 text-white py-1 px-3 rounded-md hover:bg-blue-700 text-sm">Calculate Route</button>
                                     </div>
-                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Hotel location shown above. Select a site and the route will be calculated automatically, or click "Calculate Route" to calculate manually.</p>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Distance is estimated automatically (no map tiles). Click "Calculate Route" only when you need turn-by-turn (uses Azure Maps billing).</p>
                                 </div>
                             </div>
                             <div class="grid grid-cols-2 gap-4 mt-4">

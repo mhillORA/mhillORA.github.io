@@ -9623,8 +9623,8 @@ app.http('navanTest', {
 // Azure Maps Geocoding Proxy — in-memory cache shared across requests in this instance
 const azureMapsGeocodeCache = new Map(); // key -> { expires, body }
 const azureMapsRouteCache = new Map();
-const AZURE_MAPS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-const AZURE_MAPS_CACHE_MAX = 2000;
+const AZURE_MAPS_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days — addresses rarely move; cuts repeat billable calls
+const AZURE_MAPS_CACHE_MAX = 5000;
 
 const getAzureMapsCache = (map, key) => {
     const hit = map.get(key);
