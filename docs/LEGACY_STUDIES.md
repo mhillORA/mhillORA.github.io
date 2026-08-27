@@ -59,12 +59,10 @@ python ingest/legacy_anterior_segment.py
 # or
 python ingest/legacy_anterior_segment.py "C:\path\to\Anterior Segment Overview.xlsx"
 
-# Dry Eye Overview (per-study tabs; matches existing studies by protocol code / sites by PI)
-# Prefer feasibility sites so surveys line up. Never overwrites existing metrics/edits.
+# Dry Eye Overview — **Complete tabs only** (e.g. Aerie-Complete). Rebuilds dry-eye outcomes from those sheets.
+# Prefer feasibility sites so surveys line up. Never overwrites existing anterior metrics/edits.
 python ingest/legacy_dry_eye_overview.py --dry-run
 python ingest/legacy_dry_eye_overview.py --apply
-# Retarget dry-eye outcomes onto feasibility sites; merge/delete PI stubs
-python ingest/legacy_dry_eye_overview.py --relink --dry-run
 python ingest/legacy_dry_eye_overview.py --relink --apply
 ```
 

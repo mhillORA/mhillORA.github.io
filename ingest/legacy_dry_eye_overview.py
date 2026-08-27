@@ -4,9 +4,12 @@ Ingest Dry Eye Overview.xlsx → Cosmos (ora-clinical-recruiting / crcscheduling
 Same containers as anterior-segment ingest:
   legacy-studies, legacy-sites, legacy-study-site-outcomes
 
-Workbook shape differs (per-study tabs with a mid-sheet site table), but docs are
-the same schema. Studies/sites that already exist are matched 1:1 by name and
-REUSE existing ids — no duplicate study/site docs. New ones are created.
+Only sheets with "Complete" in the tab name are ingested (e.g. Aerie-Complete).
+Active/planning tabs are skipped. Re-ingest prunes previously loaded dry-eye
+outcomes from non-Complete tabs.
+
+Studies/sites that already exist are matched 1:1 by name and REUSE existing
+ids — no duplicate study/site docs. New ones are created.
 
 Outcomes use source=dry-eye-overview. If an outcome for the same
 studyId|siteId|group already exists (e.g. from anterior), funnel fields are
@@ -15,6 +18,8 @@ preserved and we only annotate sourceFiles.
 Usage:
   python ingest/legacy_dry_eye_overview.py --dry-run
   python ingest/legacy_dry_eye_overview.py --apply
+  python ingest/legacy_dry_eye_overview.py --prune --apply   # prune only
+  python ingest/legacy_dry_eye_overview.py --relink --apply
   python ingest/legacy_dry_eye_overview.py path/to/file.xlsx --apply
 """
 from __future__ import annotations
@@ -54,6 +59,14 @@ SKIP_SHEETS = {
     "sheet38",
     "aldeyra overview",
 }
+
+# Only tabs with "complete" in the name (e.g. Aerie-Complete). Active/planning tabs skipped.
+COMPLETE_ONLY = True
+
+
+def is_complete_sheet(sheet_name: str) -> bool:
+    return "complete" in (sheet_name or "").strip().lower()
+
 
 # Rows that look like site labels but aren't
 SKIP_SITE_NAMES = {
@@ -365,6 +378,11 @@ def parse_workbook(path: Path):
 
     for sheet_name in wb.sheetnames:
         if sheet_name.strip().lower() in SKIP_SHEETS:
+            continue
+        if COMPLETE_ONLY and not is_complete_sheet(sheet_name):
+            sheet_stats.append(
+                {"sheet": sheet_name, "study": sheet_study_fallback(sheet_name), "rows": 0, "skip": "not_complete"}
+            )
             continue
         ws = wb[sheet_name]
         rows = list(ws.iter_rows(values_only=True))
@@ -1031,8 +1049,12 @@ def upsert_all(studies, sites, outcomes, match_report, dry_run=False):
         clean = {k: v for k, v in doc.items() if not k.startswith("_")}
         prev = by_outcome_id.get(clean["id"])
         if prev:
-            # Preserve existing funnel entirely; annotate provenance only.
-            # Never stamp workbook labels onto anterior rows.
+            # If previous row is also dry-eye, replace with Complete ingest (same id).
+            # If previous is anterior/other, preserve funnel — annotate only.
+            if prev.get("source") == SOURCE:
+                to_insert.append(clean)
+                match_report["outcomes_new"] += 1
+                continue
             merged = dict(prev)
             files = merged.get("sourceFiles") or (
                 [] if not merged.get("sourceFile") else [merged.get("sourceFile")]
@@ -1051,7 +1073,6 @@ def upsert_all(studies, sites, outcomes, match_report, dry_run=False):
             merged["sourceFiles"] = files
             merged["sources"] = [x for x in dict.fromkeys(prev_sources) if x]
             merged["updatedAt"] = clean["updatedAt"]
-            # Fill blanks only — never overwrite anterior numbers
             for k in ("scheduled", "screened", "enrolled", "targetScheduled", "visit1Start", "lplv", "pi"):
                 if merged.get(k) in (None, "") and clean.get(k) not in (None, ""):
                     merged[k] = clean[k]
@@ -1388,15 +1409,110 @@ def relink_to_feasibility(dry_run: bool = True):
     print(f"Relink done. Retargeted outcomes={len(retargets)}, stubs deleted={deleted}")
 
 
+def prune_non_complete_dry_eye(dry_run: bool = True, drop_all_dry_eye: bool = False):
+    """Delete dry-eye outcomes whose workbookSheet is not a *-Complete tab.
+
+    Also removes orphan studies/sites that were created only by dry-eye and
+    no longer have any outcomes. Never deletes anterior/feasibility docs that
+    still have other outcomes, and never touches non-dry-eye outcome rows.
+
+    drop_all_dry_eye=True: remove every source=dry-eye-overview outcome (clean slate
+    before Complete-only re-ingest).
+    """
+    load_key_from_local_settings()
+    if not KEY:
+        raise SystemExit("COSMOS_KEY missing")
+    client = CosmosClient(ENDPOINT, credential=KEY)
+    db = client.get_database_client(DATABASE_ID)
+    studies_c = db.get_container_client(STUDIES_CONTAINER)
+    sites_c = db.get_container_client(SITES_CONTAINER)
+    outcomes_c = db.get_container_client(OUTCOMES_CONTAINER)
+
+    all_outs = list(
+        outcomes_c.query_items("SELECT * FROM c", enable_cross_partition_query=True)
+    )
+    dry_outs = [o for o in all_outs if o.get("source") == SOURCE]
+    if drop_all_dry_eye:
+        to_drop = list(dry_outs)
+        keep = []
+    else:
+        to_drop = [
+            o
+            for o in dry_outs
+            if not is_complete_sheet(o.get("workbookSheet") or "")
+        ]
+        keep = [o for o in dry_outs if is_complete_sheet(o.get("workbookSheet") or "")]
+    print(f"Dry-eye outcomes: {len(dry_outs)} total, keep Complete={len(keep)}, drop={len(to_drop)}")
+    from collections import Counter
+
+    for sheet, n in sorted(
+        Counter(o.get("workbookSheet") or "(missing sheet)" for o in to_drop).items(),
+        key=lambda x: -x[1],
+    ):
+        print(f"  DROP {n:4}  {sheet}")
+
+    if dry_run:
+        print("DRY RUN prune — no deletes. Re-run with --apply")
+        return
+
+    for o in to_drop:
+        outcomes_c.delete_item(o["id"], partition_key=o["studyId"])
+    print(f"Deleted {len(to_drop)} dry-eye outcomes")
+
+    # Refresh outcome usage
+    remaining = list(
+        outcomes_c.query_items(
+            "SELECT c.studyId, c.siteId, c.source FROM c",
+            enable_cross_partition_query=True,
+        )
+    )
+    studies_used = {r.get("studyId") for r in remaining if r.get("studyId")}
+    sites_used = {r.get("siteId") for r in remaining if r.get("siteId")}
+
+    studies = list(
+        studies_c.query_items("SELECT c.id, c.source, c.sources FROM c", enable_cross_partition_query=True)
+    )
+    del_studies = 0
+    for st in studies:
+        if st["id"] in studies_used:
+            continue
+        if (st.get("source") or "") != SOURCE:
+            continue
+        studies_c.delete_item(st["id"], partition_key=st["id"])
+        del_studies += 1
+        print(f"  deleted orphan study {st['id']}")
+    print(f"Deleted {del_studies} orphan dry-eye studies")
+
+    sites = list(
+        sites_c.query_items("SELECT c.id, c.name, c.source FROM c", enable_cross_partition_query=True)
+    )
+    del_sites = 0
+    for site in sites:
+        if site["id"] in sites_used:
+            continue
+        if (site.get("source") or "") != SOURCE:
+            continue
+        sites_c.delete_item(site["id"], partition_key=site["id"])
+        del_sites += 1
+        print(f"  deleted orphan site {site.get('name')!r} ({site['id']})")
+    print(f"Deleted {del_sites} orphan dry-eye sites")
+    print("Prune done.")
+
+
 def main():
     flags = set(sys.argv[1:])
     dry = "--apply" not in flags
     if "--dry-run" in flags:
         dry = True
     do_relink = "--relink" in flags
+    do_prune = "--prune" in flags
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
 
-    if do_relink and not argv:
+    if do_prune and not argv and not do_relink:
+        prune_non_complete_dry_eye(dry_run=dry)
+        return
+
+    if do_relink and not argv and not do_prune:
         # Relink-only mode
         relink_to_feasibility(dry_run=dry)
         return
@@ -1405,10 +1521,18 @@ def main():
     if not path.exists():
         raise SystemExit(f"File not found: {path}")
 
-    print(f"Parsing {path} ...")
+    # Clean slate for dry-eye, then ingest Complete tabs only
+    print("=== PRUNE all prior dry-eye outcomes (Complete-only rebuild) ===")
+    prune_non_complete_dry_eye(dry_run=dry, drop_all_dry_eye=True)
+    if dry:
+        print("(dry-run: prune + ingest preview only)\n")
+
+    print(f"\nParsing Complete tabs from {path} ...")
     records, sheet_stats = parse_workbook(path)
-    print(f"Parsed {len(records)} site-study rows from {sum(1 for x in sheet_stats if x['rows'])} sheets")
+    print(f"Parsed {len(records)} site-study rows from {sum(1 for x in sheet_stats if x['rows'])} Complete sheets")
     for st in sheet_stats:
+        if st.get("skip") == "not_complete":
+            continue
         flag = "OK" if st["rows"] else "SKIP"
         print(f"  {flag:4} {st['sheet'][:40]:40} study={st['study']!r:40} rows={st['rows']}")
 
@@ -1425,8 +1549,6 @@ def main():
     upsert_all(studies, sites, outcomes, match_report, dry_run=dry)
     if dry:
         print("\nRe-run with --apply to write.")
-        if do_relink:
-            print("Relink skipped during dry-run ingest; run: python ingest/legacy_dry_eye_overview.py --relink --dry-run")
         return
 
     if do_relink:
