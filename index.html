@@ -245,6 +245,15 @@ const API_KEY = ''; // Optional. Prefer platform auth; leave empty for local/dev
 const SCHEDULING_TEST_MODE = true; // QA: skip eligibility/enrollment gates so visits can be booked
 const NASA_SESSION_KEY = 'nasa_session';
 
+const toLocalDateKey = (value) => {
+    const d = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(d.getTime())) return '';
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+};
+
 let msalInstance = null;
 let nasaEntraEnabled = false;
 let nasaInternalEmailDomains = ['oraclinical.com'];
@@ -1688,7 +1697,7 @@ const convertPatientToAzureFormat = (patient) => {
     const primaryAppt = getPrimaryAppointment(normalized);
     let primaryAppointmentDate = normalized.primaryAppointmentDate || null;
     if (primaryAppt?.time) {
-        try { primaryAppointmentDate = new Date(primaryAppt.time).toISOString().split('T')[0]; } catch { /* ignore */ }
+        try { primaryAppointmentDate = toLocalDateKey(primaryAppt.time); } catch { /* ignore */ }
     }
     return {
         ...normalized,
@@ -2199,12 +2208,23 @@ const getSchedulingContext = (patient) => {
         };
     }
     if (!SCHEDULING_TEST_MODE) return null;
-    const sched = state.schedules.find(s => s.studyId && s.siteId && Array.isArray(s.slots) && s.slots.length);
-    if (sched) return { studyId: sched.studyId, siteId: sched.siteId, enrollment: null };
-    const study = state.studies[0];
-    const site = state.sites.find(s => s.status === 'Active') || state.sites[0];
-    if (study?.id && site?.id) return { studyId: study.id, siteId: site.id, enrollment: null };
-    return null;
+    return { studyId: null, siteId: null, enrollment: null };
+};
+
+const getBookableSchedulesForPatient = (patient) => {
+    const completedVisits = patient?.completedVisits || [];
+    const ctx = getSchedulingContext(patient);
+    if (ctx?.studyId && ctx?.siteId) {
+        return state.schedules.filter(s =>
+            s.siteId === ctx.siteId &&
+            s.studyId === ctx.studyId &&
+            !completedVisits.includes(s.visit)
+        );
+    }
+    if (SCHEDULING_TEST_MODE) {
+        return state.schedules.filter(s => Array.isArray(s.slots) && s.slots.length);
+    }
+    return [];
 };
 
 const canSchedulePatient = (patient) => !getSchedulingBlockReason(patient);
@@ -4700,7 +4720,7 @@ const getDayAppointmentsModalHTML = (dateString) => {
     const slotsForDay = [];
     state.schedules.forEach(schedule => {
         (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
-            if (new Date(slot.startTime).toISOString().split('T')[0] === dateString) {
+            if (toLocalDateKey(slot.startTime) === dateString) {
                 slotsForDay.push({ schedule, slot });
             }
         });
@@ -5170,15 +5190,7 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
         `;
     }
     const { studyId: ctxStudyId, siteId: ctxSiteId } = schedulingContext;
-    const completedVisits = patient.completedVisits || [];
-    const availableSchedules = SCHEDULING_TEST_MODE
-        ? state.schedules.filter(s => Array.isArray(s.slots) && s.slots.length)
-        : state.schedules.filter(s => {
-            const matches = s.siteId === ctxSiteId &&
-                            s.studyId === ctxStudyId &&
-                            !completedVisits.includes(s.visit);
-            return matches;
-        });
+    const availableSchedules = getBookableSchedulesForPatient(patient);
     const uniqueVisits = [...new Set(availableSchedules.map(s => s.visit).filter(Boolean))].sort();
     if (availableSchedules.length === 0) {
         return `
@@ -5186,8 +5198,8 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
             <p class="text-red-500">No available schedules match the patient's assigned site, study, and visit history.</p>
             <div class="mt-4 p-4 bg-gray-100 dark:bg-gray-800 rounded text-sm">
                 <p><strong>Details:</strong></p>
-                <p>Patient Site ID: ${phi(ctxSiteId)}</p>
-                <p>Patient Study ID: ${phi(ctxStudyId)}</p>
+                <p>Patient Site ID: ${phi(ctxSiteId || '—')}</p>
+                <p>Patient Study ID: ${phi(ctxStudyId || '—')}</p>
                 <p>Total Schedules: ${state.schedules.length}</p>
             </div>
         `;
@@ -5212,7 +5224,8 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
                 const bookedCount = countPatientsInSlot(slot.id);
                 const capacity = SCHEDULING_TEST_MODE ? Math.max(slot.capacity || 0, 1) : (slot.capacity || 0);
                 if (SCHEDULING_TEST_MODE || bookedCount < capacity) {
-                    const slotDate = new Date(slot.startTime).toISOString().split('T')[0];
+                    const slotDate = toLocalDateKey(slot.startTime);
+                    if (!slotDate) return;
                     if (!availableSlotsByDay[slotDate]) {
                         availableSlotsByDay[slotDate] = [];
                     }
@@ -5232,7 +5245,7 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
         for (let i = 0; i < startDayOfWeek; i++) { calendarHTML += `<div></div>`; }
         for (let day = 1; day <= daysInMonth; day++) {
             const currentDate = new Date(year, month, day);
-            const dateString = currentDate.toISOString().split('T')[0];
+            const dateString = toLocalDateKey(currentDate);
             const hasSlots = availableSlotsByDay[dateString];
             const isPastDate = currentDate < today;
             const isToday = today.toDateString() === currentDate.toDateString();
@@ -5251,6 +5264,8 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
         calendarHTML += `</div>`;
         return calendarHTML;
     };
+    const studyLabel = ctxStudyId ? (state.studies.find(s => s.id === ctxStudyId)?.title || '—') : (SCHEDULING_TEST_MODE ? 'All (test mode)' : '—');
+    const siteLabel = ctxSiteId ? (state.sites.find(s => s.id === ctxSiteId)?.name || '—') : (SCHEDULING_TEST_MODE ? 'All (test mode)' : '—');
     return `
         <div class="flex justify-between items-center mb-4">
              <h2 class="text-2xl font-bold dark:text-white">Schedule for ${phiName(patient)}</h2>
@@ -5260,8 +5275,8 @@ const getBookingModalHTML = (patient, visitFilter = 'all') => {
              </select>
         </div>
         ${SCHEDULING_TEST_MODE ? '<p class="text-xs text-amber-600 dark:text-amber-400 mb-2">Test mode: showing all schedules with open slots.</p>' : ''}
-        <p class="dark:text-gray-300"><strong>Study:</strong> ${state.studies.find(s => s.id === ctxStudyId)?.title || '—'}</p>
-        <p class="dark:text-gray-300 mb-4"><strong>Site:</strong> ${state.sites.find(s => s.id === ctxSiteId)?.name || '—'}</p>
+        <p class="dark:text-gray-300"><strong>Study:</strong> ${studyLabel}</p>
+        <p class="dark:text-gray-300 mb-4"><strong>Site:</strong> ${siteLabel}</p>
         <div id="booking-calendar-container" data-patient-id="${patient.id}">
             ${renderBookingCalendar(state.bookingCalendarDate, patient, visitFilter)}
         </div>
@@ -9010,22 +9025,21 @@ document.addEventListener('click', async (e) => {
             }
             case 'select-booking-day': {
                 const patient = state.patients.find(p => p.id === document.getElementById('booking-calendar-container').dataset.patientId);
-                const currentEnrollment = patient.enrollments?.find(e => e.status === 'current');
-                const completedVisits = patient.completedVisits || [];
-                const availableSchedules = state.schedules.filter(s => 
-                    s.siteId === currentEnrollment.siteId && 
-                    s.studyId === currentEnrollment.studyId &&
-                    !completedVisits.includes(s.visit)
-                );
-                const slotsForDay = [];
+                const availableSchedules = getBookableSchedulesForPatient(patient);
+                const visitFilterEl = document.getElementById('booking-visit-filter');
+                const visitFilter = visitFilterEl?.value || 'all';
+                const schedulesForDay = visitFilter === 'all'
+                    ? availableSchedules
+                    : availableSchedules.filter(s => s.visit === visitFilter);
                 const allSlotsForDay = [];
-                availableSchedules.forEach(schedule => {
+                schedulesForDay.forEach(schedule => {
                     (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
-                        if (new Date(slot.startTime).toISOString().split('T')[0] !== date) return;
+                        if (toLocalDateKey(slot.startTime) !== date) return;
                         const bookedCount = countPatientsInSlot(slot.id);
                         allSlotsForDay.push({ scheduleId: schedule.id, scheduleType: schedule.visit, ...slot, booked: bookedCount });
                     });
                 });
+                allSlotsForDay.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
                 const slotsContainer = document.getElementById('booking-slots-container');
                 slotsContainer.innerHTML = allSlotsForDay.length > 0 ? allSlotsForDay.map(slot => {
                     const isFull = slot.booked >= (slot.capacity || 0);
@@ -11396,12 +11410,12 @@ const renderCalendar = () => {
     }
     for (let day = 1; day <= daysInMonth; day++) {
         const currentDate = new Date(year, month, day);
-        const dateString = currentDate.toISOString().split('T')[0];
+        const dateString = toLocalDateKey(currentDate);
         let appointmentsHTML = '';
         filteredSchedules.forEach(schedule => {
             (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
                 const slotDate = new Date(slot.startTime);
-                if (slotDate.toISOString().split('T')[0] === dateString) {
+                if (toLocalDateKey(slotDate) === dateString) {
                     const study = state.studies.find(s => s.id === schedule.studyId);
                     const bookedCount = state.patients.filter(p => p.appointment && p.appointment.slotId === slot.id).length;
                     const isFull = bookedCount >= (slot.capacity || 0);
@@ -11429,7 +11443,7 @@ const renderDayView = () => {
     const container = document.getElementById('day-view-container');
     if (!container) return;
     const date = state.calendarDate;
-    const dateString = date.toISOString().split('T')[0];
+    const dateString = toLocalDateKey(date);
     const dayName = date.toLocaleDateString('default', { weekday: 'long', month: 'long', day: 'numeric' });
     let filteredSchedules = state.schedules;
     if (state.schedulingSiteFilter !== 'all') {
@@ -11444,7 +11458,7 @@ const renderDayView = () => {
     const slotsForDay = [];
     filteredSchedules.forEach(schedule => {
         (Array.isArray(schedule.slots) ? schedule.slots : []).forEach(slot => {
-            if (new Date(slot.startTime).toISOString().split('T')[0] === dateString) {
+            if (toLocalDateKey(slot.startTime) === dateString) {
                 slotsForDay.push({schedule, slot});
             }
         });
