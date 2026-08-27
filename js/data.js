@@ -88,8 +88,8 @@ const EXAMPLE_QUESTIONS = [
   { text: "Which Ora dry eye studies enrolled the most subjects?", icon: "chart", needs: "Live · ora_veeva_study" },
   { text: "List Ora glaucoma studies", icon: "chart", needs: "Live · ora_veeva_study" },
   { text: "Which Ora sites enrolled the most in dry eye?", icon: "users", needs: "Live · ora_veeva_site" },
-  { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" },
-  { text: "Which projects are under budgeted GM?", icon: "chart", needs: "Certified · NetSuite profitability" }
+  { text: "Which Ora studies have no enrolled count?", icon: "chart", needs: "Missing ≠ zero" },
+  { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" }
 ];
 
 const FINANCE_QUESTIONS = [

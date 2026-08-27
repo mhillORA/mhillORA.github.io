@@ -17,6 +17,7 @@
     briefing: null,
     finance: null,
     pipeline: null,
+    scopeBoost: [],
     rm: null,
     rmPeople: null,
     rmPersonId: "",
@@ -97,7 +98,7 @@
 
   function guessKey(text) {
     const t = (text || "").toLowerCase();
-    if (/\b(netsuite|profitability|gross margin|\bgm\b|change order|billable)\b/.test(t)) return "netsuite";
+    if (/\b(netsuite|profitability|gross margin|\bgm\b|budgeted gm|change order|billable)\b/.test(t)) return "netsuite";
     if (/\b(pipeline|opportunit|net revenue|open deals|\bsalesforce\b|\bsf\b|ora net)\b/.test(t)) return "pipeline";
     if (/\b(sites?|investigator|scorecard|site psm)\b/.test(t) && !/\bvisits?\b/.test(t)) return "sites";
     const competitive = ["competitor", "sponsor", "registry", "market", "poland", "cac", "bid", "trialhub", "ct.gov"];
@@ -105,6 +106,34 @@
     const staffing = ["staff", "resource", "cra", "fte", "capacity", "assign", "backfill", "rolls off", "headcount", "over-allocated", "overallocated", "allocation"];
     if (staffing.some((w) => t.includes(w))) return "staffing";
     return "enrollment";
+  }
+
+  /** Purpose sets defaults; question intent can pull in other loaded packs (e.g. GM → NetSuite on ClinOps). */
+  function intentSourceIds(question) {
+    const key = guessKey(question);
+    if (key === "netsuite") return ["netsuite", "ora"];
+    if (key === "pipeline") return ["salesforce"];
+    if (key === "staffing") return ["insightsrm"];
+    if (key === "competitive") return ["ctgov", "trialhub"];
+    if (key === "sites" || key === "enrollment") return ["ora", "veeva"];
+    return [];
+  }
+
+  function purposeForSource(id) {
+    if (id === "netsuite") return "finance";
+    if (id === "insightsrm") return "staffing";
+    if (id === "salesforce") return "bd";
+    if (id === "ora" || id === "veeva") return "clinops";
+    if (id === "ctgov" || id === "trialhub") return "bd";
+    return null;
+  }
+
+  function toggleSource(id) {
+    const s = sourceById(id);
+    if (!s || !s.loaded) return;
+    state.enabled[id] = !state.enabled[id];
+    renderSources();
+    if (state.phase === "answered") renderAnswer();
   }
 
   function fmtPct(n) {
@@ -278,16 +307,30 @@
     state.error = "";
     state.traceOpen = false;
     state.answer = null;
+    // Intent expands purpose scope so ClinOps + "under budgeted GM" can still hit NetSuite.
+    const intentIds = intentSourceIds(question).filter((id) => {
+      const s = sourceById(id);
+      return s && s.loaded;
+    });
+    const added = [];
+    for (const id of intentIds) {
+      if (!state.enabled[id]) {
+        state.enabled[id] = true;
+        added.push(id);
+      }
+    }
+    state.scopeBoost = added;
     render();
 
     try {
       const prior = (state.thread || []).slice(-3);
+      const sources = [...new Set([...enabledList().map((s) => s.id), ...intentIds])];
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
-          sources: enabledList().map((s) => s.id),
+          sources,
           projectNumber: state.projectNumber || "",
           prior
         })
@@ -395,7 +438,12 @@
 
     document.getElementById("sourceList").innerHTML = SOURCES.map((s) => {
       const st = sourceStatus(s);
-      return `<div class="source-card ${st.key}" data-src="${s.id}">
+      const tip = !s.loaded
+        ? "Not loaded in Cosmos yet"
+        : state.enabled[s.id]
+          ? "In scope — click to remove from this Ask"
+          : "Out of scope — click to include in Ask";
+      return `<button type="button" class="source-card ${st.key}" data-src="${s.id}" ${s.loaded ? "" : "disabled"} title="${tip}">
         <span class="source-dot" style="background:${DOT[s.id] || "var(--ora-gray-400)"}"></span>
         <span style="min-width:0;flex:1">
           <span class="source-top">
@@ -405,8 +453,16 @@
           <span class="source-cat">${s.cat}</span>
           <span class="source-scope">${s.scope}</span>
         </span>
-      </div>`;
+      </button>`;
     }).join("");
+
+    document.querySelectorAll("#sourceList [data-src]").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleSource(btn.dataset.src);
+      };
+    });
 
     const panel = document.getElementById("sourcesPanel");
     if (panel) {
@@ -702,6 +758,21 @@
           <div class="gap-body">${escapeHtml(a.missingNote)}</div>
         </div></div>`
       : "";
+    const boostNote =
+      Array.isArray(state.scopeBoost) && state.scopeBoost.length
+        ? `<div class="gap gap-info"><div style="flex:1">
+            <div class="gap-title">Pulled in for this question</div>
+            <div class="gap-body">${escapeHtml(
+              state.scopeBoost
+                .map((id) => {
+                  const s = sourceById(id);
+                  return s ? s.name : id;
+                })
+                .join(" · ")
+            )} — purpose stays ${escapeHtml((purposeOf(state.purpose) && purposeOf(state.purpose).label) || state.purpose)}; Ask followed the question.</div>
+          </div></div>`
+        : "";
+    const switchPurpose = missing.length ? purposeForSource(missing[0]) : null;
     const gap = a.foundryError
       ? `<div class="gap"><div style="flex:1">
           <div class="gap-title">Foundry did not answer</div>
@@ -711,7 +782,30 @@
         ? `<div class="gap">
           <div style="flex:1">
             <div class="gap-title">${escapeHtml(missingNames.join(" and "))} ${missing.length > 1 ? "are" : "is"} out of scope</div>
-            <div class="gap-body">This answer needs ${escapeHtml(missingNames.join(" and "))}, which the current purpose leaves greyed. Switch purpose above and ask again — those sources stay dim until they are referenced.</div>
+            <div class="gap-body">Click the source in the sidebar to include it, or switch purpose${
+              switchPurpose ? ` to ${(purposeOf(switchPurpose) && purposeOf(switchPurpose).label) || switchPurpose}` : ""
+            }.</div>
+            <div class="gap-actions">
+              ${missing
+                .filter((id) => {
+                  const s = sourceById(id);
+                  return s && s.loaded;
+                })
+                .map(
+                  (id) =>
+                    `<button type="button" class="gap-btn" data-include-src="${id}">Include ${escapeHtml(
+                      (sourceById(id) && sourceById(id).name) || id
+                    )}</button>`
+                )
+                .join("")}
+              ${
+                switchPurpose
+                  ? `<button type="button" class="gap-btn primary" data-switch-purpose="${switchPurpose}">Switch to ${escapeHtml(
+                      (purposeOf(switchPurpose) && purposeOf(switchPurpose).label) || switchPurpose
+                    )} and re-ask</button>`
+                  : ""
+              }
+            </div>
           </div>
         </div>`
         : "";
@@ -759,6 +853,7 @@
 
     panel.innerHTML = `
       <div class="you"><span class="you-badge">You</span><p>${escapeHtml(state.askedText)}</p></div>
+      ${boostNote}
       ${gap}
       ${missingBanner}
       <div class="answer">
@@ -805,6 +900,22 @@
     };
     panel.querySelectorAll(".follow").forEach((btn) => {
       btn.onclick = () => run(guessKey(btn.textContent), btn.textContent);
+    });
+    panel.querySelectorAll("[data-include-src]").forEach((btn) => {
+      btn.onclick = () => {
+        const id = btn.dataset.includeSrc;
+        if (!state.enabled[id]) state.enabled[id] = true;
+        state.scopeBoost = [];
+        run("live", state.askedText);
+      };
+    });
+    panel.querySelectorAll("[data-switch-purpose]").forEach((btn) => {
+      btn.onclick = () => {
+        const pid = btn.dataset.switchPurpose;
+        const q = state.askedText;
+        setPurpose(pid, { keepView: true });
+        run("live", q);
+      };
     });
     panel.querySelectorAll("[data-pn]").forEach((row) => {
       row.onclick = () => openProject(row.dataset.pn);
@@ -2259,8 +2370,8 @@
     });
 
     help.innerHTML = `<div class="answer">
-      <p class="summary">Sources are display-only. Purpose (ClinOps / Finance / RM / BD) sets what is in scope for Ask. After an answer, referenced packs light up and the rest go grey. ClinOps reads live ora_veeva_*. Salesforce pipeline uses StageName as the stage indicator and Total_Ora_Net_Revenue__c as the dollar amount — never Amount. InsightsRM is actual RM in lens_rm_* until the DW feed exists.</p>
-      <p class="caveat">Blank enrolled, GM, or Ora net $ is missing, not zero. PSM needs FSI and LSI from ora_veeva_milestone. Project number joins to ora_veeva_study.study_number — no mapping table. Ask never falls back to ora_fact_* Excel dumps.</p>
+      <p class="summary">Purpose (ClinOps / Finance / RM / BD) sets the default briefing and source scope. Ask still follows the question — e.g. a GM question from ClinOps pulls NetSuite in automatically. You can also click any loaded source in the sidebar to include or exclude it. Salesforce pipeline uses StageName + Total_Ora_Net_Revenue__c (never Amount).</p>
+      <p class="caveat">Blank enrolled, GM, or Ora net $ is missing, not zero. PSM needs FSI and LSI from ora_veeva_milestone. Project number joins to ora_veeva_study.study_number — no mapping table.</p>
     </div>`;
   }
 
