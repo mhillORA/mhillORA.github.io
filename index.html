@@ -1690,6 +1690,7 @@ const sanitizePatientForApi = (patient) => {
 
 const applyPatientFormData = (target, data) => {
     const skipKeys = new Set(['enrollments', 'tags', 'race', 'medications', 'surveyDrafts', 'surveyResults', 'contactLog', 'auditTrail', 'tasks', 'consentRecords', 'communications', 'pendingConsentLinks', 'appointments']);
+    if (!isAdminUser()) skipKeys.add('globalId');
     Object.keys(target).forEach((key) => {
         if (data[key] === undefined || skipKeys.has(key)) return;
         if (PATIENT_FORM_STRING_FIELDS.has(key)) {
@@ -6754,7 +6755,7 @@ const getTakeSurveyModalHTML = () => {
         ? (question.isScript ? 'Script' : (section || 'Section'))
         : `Question ${numberedIndex} of ${numberedQs.length}`;
     const history = state.currentSurveyState.history || [];
-    const isContactDetails = section === 'Patient Contact Details' || /patient contact details/i.test(section);
+    const isContactDetails = /contact details/i.test(section);
     const isMedReviewSection = section === 'Medication Review' || /^medication/i.test(section);
     const contactDetailsHTML = isContactDetails ? `
         <div class="mb-4 p-4 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 space-y-3">
@@ -6792,11 +6793,6 @@ const getTakeSurveyModalHTML = () => {
     const callScripts = isCallScript
         ? (survey.questions || []).map((q, idx) => ({ q, idx })).filter(x => x.q.isScript && x.q.section === section)
         : [];
-    const allCallScriptIndexes = isCallScript
-        ? (survey.questions || []).map((q, idx) => ({ q, idx })).filter(x => x.q.isScript && (x.q.section === 'Voicemail Script' || x.q.section === 'Live Patient Script'))
-        : [];
-    const lastCallScriptIndex = allCallScriptIndexes.length ? Math.max(...allCallScriptIndexes.map(x => x.idx)) : currentQuestionIndex;
-    const afterCallScripts = lastCallScriptIndex + 1 < survey.questions.length ? String(lastCallScriptIndex + 2) : 'submit';
     const priorMulti = String(priorAnswer || '').split('|').map(s => s.trim()).filter(Boolean);
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-2 break-words">${survey.title}</h2>
@@ -6825,7 +6821,7 @@ const getTakeSurveyModalHTML = () => {
                 ${tableHTML}
             ` : '')}
             <input type="hidden" name="answer" value="${isContactDetails ? 'Contact details reviewed' : (isMedReviewSection ? 'Medications reviewed' : 'Script read')}">
-            <input type="hidden" name="answerNext" value="${isCallScript ? afterCallScripts : defaultNext}">
+            <input type="hidden" name="answerNext" value="${defaultNext}">
             ` : `
             <p class="text-lg font-semibold dark:text-white mb-4 break-words whitespace-normal">${questionText}</p>
             ${notesHTML}
@@ -8091,6 +8087,10 @@ document.addEventListener('click', async (e) => {
             }
             case 'edit-study': openModal(getEditStudyModalHTML(state.studies.find(s => s.id === id)), true); break;
             case 'archive-study': {
+                if (!isAdminUser()) {
+                    showNotification('Only admins can archive studies.', 'error');
+                    break;
+                }
                 const study = state.studies.find(s => s.id === id);
                 if (!study) break;
                 openModal(`
@@ -8104,6 +8104,10 @@ document.addEventListener('click', async (e) => {
                 break;
             }
             case 'confirm-archive-study': {
+                if (!isAdminUser()) {
+                    showNotification('Only admins can archive studies.', 'error');
+                    break;
+                }
                 try {
                     await updateDocument('studies', id, { status: 'Archived', archived: true, archivedAt: new Date().toISOString() });
                     await loadAllData();
@@ -10407,7 +10411,7 @@ document.addEventListener('submit', async (e) => {
             if (!state.currentSurveyState.history) state.currentSurveyState.history = [];
             const question = survey.questions[currentQuestionIndex];
             const section = question.section || question.header || '';
-            const isContactDetails = section === 'Patient Contact Details' || /patient contact details/i.test(section);
+            const isContactDetails = /contact details/i.test(section);
             const isMedReviewSection = section === 'Medication Review' || /^medication/i.test(section);
             if (isContactDetails) {
                 const contactUpdates = {};
@@ -10667,7 +10671,9 @@ document.addEventListener('submit', async (e) => {
                 const hasAppointment = patient.appointment && patient.appointment.time;
                 
                 const updatedPatient = { ...patient }; // Start with existing data
+                if (!isAdminUser()) delete data.globalId;
                 applyPatientFormData(updatedPatient, data);
+                if (!isAdminUser()) updatedPatient.globalId = patient.globalId;
                 // age recalculated below from DOB
                 updatedPatient.age = data.age ? parseInt(data.age) : null;
                 updatedPatient.inclusionCriteriaMet = form.querySelector('input[name="inclusionCriteriaMet"]')?.checked === true;
@@ -10885,15 +10891,41 @@ document.addEventListener('submit', async (e) => {
             break;
         }
         case 'edit-site-form': {
-            const siteId = form.dataset.id;
-            const updatedSite = { 
-                name: data.name, 
-                location: data.location, 
-                status: data.status,
-                lastUpdated: new Date().toISOString()
-            };
-            await updateDocument('sites', siteId, updatedSite);
-            closeModal();
+            try {
+                const siteId = form.dataset.id || form.dataset.siteId;
+                if (!siteId) {
+                    showNotification('Site id missing.', 'error');
+                    break;
+                }
+                const selectedIndications = Array.from(form.querySelectorAll('input[name="indication"]:checked')).map(cb => cb.value);
+                const existing = state.sites.find(s => s.id === siteId) || {};
+                const siteData = {
+                    ...existing,
+                    name: data.name,
+                    siteNameAbbreviation: data.siteNameAbbreviation || '',
+                    status: data.status || 'Active',
+                    address1: data.address1 || '',
+                    address2: data.address2 || '',
+                    city: data.city || '',
+                    state: data.state || '',
+                    zipCode: data.zipCode || '',
+                    country: data.country || '',
+                    pi: data.pi || '',
+                    piEmail: data.piEmail || '',
+                    siteCoordinator: data.siteCoordinator || '',
+                    siteCoordinatorEmail: data.siteCoordinatorEmail || '',
+                    indication: selectedIndications,
+                    location: [data.city, data.state].filter(Boolean).join(', ') || existing.location || '',
+                    lastUpdated: new Date().toISOString()
+                };
+                await updateDocument('sites', siteId, siteData);
+                await loadAllData();
+                closeModal();
+                render();
+                showNotification('Site updated.', 'success');
+            } catch (err) {
+                showNotification(err.message || 'Failed to update site.', 'error');
+            }
             break;
         }
         case 'create-study-form': {
@@ -11386,29 +11418,6 @@ document.addEventListener('submit', async (e) => {
                 indication: selectedIndications
             };
             await createDocument('sites', siteData);
-            closeModal();
-            break;
-        }
-        case 'edit-site-form': {
-            const { id } = form.dataset;
-            const selectedIndications = Array.from(form.querySelectorAll('input[name="indication"]:checked')).map(cb => cb.value);
-            const siteData = {
-                name: data.name,
-                siteNameAbbreviation: data.siteNameAbbreviation || '',
-                status: data.status || 'Active',
-                address1: data.address1 || '',
-                address2: data.address2 || '',
-                city: data.city || '',
-                state: data.state || '',
-                zipCode: data.zipCode || '',
-                country: data.country || '',
-                pi: data.pi || '',
-                piEmail: data.piEmail || '',
-                siteCoordinator: data.siteCoordinator || '',
-                siteCoordinatorEmail: data.siteCoordinatorEmail || '',
-                indication: selectedIndications
-            };
-            await updateDocument('sites', id, siteData);
             closeModal();
             break;
         }
