@@ -1,13 +1,12 @@
 """
 Ingest Completed Studies from Old ASO.xlsx → Cosmos legacy containers.
 
-Separate from Dry Eye Overview. Only sheets with "Enrollment Done" in the
-tab name (completed enrollment). PI surnames are the site labels; Group is
-often an explicit column.
+Separate from Dry Eye Overview. Includes Enrollment Done tabs **and** other
+study sheets in the workbook (e.g. YuYu). Skips blank/metrics summary tabs.
 
-Match existing legacy studies/sites 1:1 (prefer feasibility sites for survey
-lineup). Create docs only when no match. Outcome ids include this source so
-they never collide with anterior / dry-eye rows.
+PI surnames are the site labels (YuYu: PI column). Match existing legacy
+studies/sites 1:1. Outcome ids include this source so they never collide with
+anterior / dry-eye rows.
 
 Usage:
   python ingest/legacy_old_aso_completed.py --dry-run
@@ -47,11 +46,6 @@ SITES_CONTAINER = de.SITES_CONTAINER
 OUTCOMES_CONTAINER = de.OUTCOMES_CONTAINER
 
 SKIP_SHEETS = {"sheet1", "presbyopia metrics", "allergy metrics"}
-
-
-def is_enrollment_done_sheet(name: str) -> bool:
-    n = (name or "").strip().lower()
-    return "enrollment done" in n or n.endswith("-enrollment done")
 
 
 def outcome_id(study: str, site: str, group) -> str:
@@ -131,6 +125,192 @@ def resolve_study_label(sheet_name: str, extracted: str | None) -> str:
     return f"{base} ({token})"
 
 
+def _looks_like_junk_label(val: str | None) -> bool:
+    """Chart/metrics debris from YuYu-style sheets (dates, visit grids, ids)."""
+    if not val:
+        return True
+    t = str(val).strip()
+    if not t:
+        return True
+    low = t.lower()
+    if low in {"site", "total", "unique id", "graph date", "month end", "study"}:
+        return True
+    if re.fullmatch(r"\d+(\.\d+)?", t):
+        return True
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+        return True
+    if re.match(
+        r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", low
+    ) and re.search(r"\d", t):
+        return True
+    if "visit" in low and ("day" in low or "cae" in low):
+        return True
+    return False
+
+
+def parse_yuyu_flat(rows: list, sheet_name: str) -> list[dict]:
+    """YuYu-style flat table: Unique ID | Study | Site | Group | PI | ... | Scheduled | Screen | Randomized."""
+    hdr_i = None
+    col = {}
+    for i, row in enumerate(rows[:40]):
+        cells = [de.s(c) for c in (row or [])]
+        norms = [de.norm_name(c or "") for c in cells]
+        if not norms or norms[0] != "unique id":
+            continue
+        hdr_i = i
+        for j, n in enumerate(norms):
+            if n == "study":
+                col["study"] = j
+            elif n == "site":
+                col["site"] = j
+            elif n == "group":
+                col["group"] = j
+            elif n == "pi":
+                col["pi"] = j
+            elif n in {"fpfv", "visit1 start"}:
+                col["start"] = j
+            elif n == "lplv":
+                col["end"] = j
+            elif n == "target scheduled":
+                col["target_scheduled"] = j
+            elif n == "scheduled":
+                col["scheduled"] = j
+            elif n in {"screen", "screened"}:
+                col["screened"] = j
+            elif n in {"randomized", "enrolled", "actual enrolled", "number enrolled"}:
+                col["enrolled"] = j
+        break
+    if hdr_i is None or "pi" not in col or "study" not in col:
+        return []
+
+    out = []
+    blanks = 0
+    for row in rows[hdr_i + 1 :]:
+        if not row or all(c is None or str(c).strip() == "" for c in row):
+            blanks += 1
+            if blanks >= 2 and out:
+                break
+            continue
+        blanks = 0
+        uid = de.s(row[0]) if len(row) > 0 else None
+        if not uid:
+            continue
+        if uid.lower() in {"total", "unique id"}:
+            break
+        # Next block on YuYu is a visit grid whose first col is "Site"
+        if uid.lower() == "site" or _looks_like_junk_label(uid):
+            break
+
+        study = de.s(row[col["study"]]) if len(row) > col["study"] else None
+        pi = de.s(row[col["pi"]]) if len(row) > col["pi"] else None
+        clinic = de.s(row[col["site"]]) if "site" in col and len(row) > col["site"] else None
+        if _looks_like_junk_label(study) or _looks_like_junk_label(pi):
+            break
+        if not study or not pi:
+            continue
+        group = parse_group_cell(row[col["group"]]) if "group" in col and len(row) > col["group"] else None
+
+        def cell(role):
+            if role not in col:
+                return None
+            idx = col[role]
+            return row[idx] if len(row) > idx else None
+
+        scheduled = de.num(cell("scheduled"))
+        screened = de.num(cell("screened"))
+        enrolled = de.num(cell("enrolled"))
+        if scheduled is None and screened is None and enrolled is None:
+            continue
+
+        # PI is the site identity for matching (same as other Old ASO tabs)
+        site_name, g2 = de.parse_group_from_site(pi)
+        if group is None:
+            group = g2
+
+        out.append(
+            {
+                "sheet": sheet_name,
+                "study": study,
+                "site": site_name,
+                "site_raw": f"{pi} ({clinic})" if clinic else pi,
+                "group": group,
+                "pi": site_name,
+                "visit1_start": de.s(cell("start")),
+                "lplv": de.s(cell("end")),
+                "target_scheduled": de.num(cell("target_scheduled")),
+                "scheduled": scheduled,
+                "screened": screened,
+                "enrolled": enrolled,
+                "unique_id": uid,
+            }
+        )
+    return out
+
+
+def prune_junk_old_aso(db, dry_run: bool = True) -> None:
+    """Remove chart/metrics debris accidentally ingested as studies/sites/outcomes."""
+    _, _, outcomes = de.fetch_existing(db)
+    studies_c = db.get_container_client(STUDIES_CONTAINER)
+    sites_c = db.get_container_client(SITES_CONTAINER)
+    outs_c = db.get_container_client(OUTCOMES_CONTAINER)
+
+    studies = list(
+        studies_c.query_items(
+            "SELECT * FROM c WHERE c.type = 'legacyStudy'",
+            enable_cross_partition_query=True,
+        )
+    )
+    sites = list(
+        sites_c.query_items(
+            "SELECT * FROM c WHERE c.type = 'legacySite'",
+            enable_cross_partition_query=True,
+        )
+    )
+
+    junk_study_ids = {
+        s["id"]
+        for s in studies
+        if (s.get("source") or "") == SOURCE and _looks_like_junk_label(s.get("name"))
+    }
+    junk_site_ids = {
+        s["id"]
+        for s in sites
+        if (s.get("source") or "") == SOURCE and _looks_like_junk_label(s.get("name"))
+    }
+    junk_outs = [
+        o
+        for o in outcomes
+        if (o.get("source") or "") == SOURCE
+        and (
+            o.get("studyId") in junk_study_ids
+            or o.get("siteId") in junk_site_ids
+            or _looks_like_junk_label(o.get("studyName"))
+            or _looks_like_junk_label(o.get("workbookStudyLabel"))
+            or _looks_like_junk_label(o.get("siteName"))
+        )
+    ]
+    print(
+        f"Junk Old ASO: studies={len(junk_study_ids)} sites={len(junk_site_ids)} "
+        f"outcomes={len(junk_outs)}"
+    )
+    if dry_run:
+        for s in sorted(junk_study_ids):
+            print(f"  would delete study {s}")
+        for s in sorted(junk_site_ids)[:20]:
+            print(f"  would delete site {s}")
+        if len(junk_site_ids) > 20:
+            print(f"  ... +{len(junk_site_ids) - 20} sites")
+        return
+
+    for o in junk_outs:
+        outs_c.delete_item(o["id"], partition_key=o["studyId"])
+    for sid in junk_study_ids:
+        studies_c.delete_item(sid, partition_key=sid)
+    for sid in junk_site_ids:
+        sites_c.delete_item(sid, partition_key=sid)
+    print("Junk prune done.")
+
+
 def parse_workbook(path: Path):
     wb = load_workbook(path, read_only=True, data_only=True)
     records = []
@@ -140,18 +320,25 @@ def parse_workbook(path: Path):
         low = sheet_name.strip().lower()
         if low in SKIP_SHEETS:
             continue
-        if not is_enrollment_done_sheet(sheet_name):
+
+        rows = list(wb[sheet_name].iter_rows(values_only=True))
+        if not rows:
+            continue
+
+        # YuYu / flat Unique-ID table
+        flat = parse_yuyu_flat(rows, sheet_name)
+        if flat:
+            records.extend(flat)
             sheet_stats.append(
                 {
                     "sheet": sheet_name,
-                    "study": sheet_name,
-                    "rows": 0,
-                    "skip": "not_enrollment_done",
+                    "study": flat[0]["study"],
+                    "rows": len(flat),
+                    "skip": None,
                 }
             )
             continue
 
-        rows = list(wb[sheet_name].iter_rows(values_only=True))
         study_name = resolve_study_label(sheet_name, de.extract_study_name(rows))
 
         headers: list[tuple[int, dict]] = []
@@ -365,7 +552,7 @@ def build_docs(records, existing_studies, existing_sites, existing_outcomes, sou
                 "scheduled": r["scheduled"],
                 "screened": r["screened"],
                 "enrolled": r["enrolled"],
-                "uniqueId": None,
+                "uniqueId": r.get("unique_id"),
                 "source": SOURCE,
                 "sourceFile": source_file,
                 "workbookSiteLabel": r["site_raw"],
@@ -632,24 +819,29 @@ def main():
     if not path.exists():
         raise SystemExit(f"File not found: {path}")
 
-    print(f"Parsing Enrollment Done tabs from {path} ...")
-    records, sheet_stats = parse_workbook(path)
-    print(
-        f"Parsed {len(records)} site-study rows from "
-        f"{sum(1 for x in sheet_stats if x['rows'])} Enrollment Done sheets"
-    )
-    for st in sheet_stats:
-        if st.get("skip") == "not_enrollment_done":
-            print(f"  SKIP {st['sheet'][:50]:50} (not Enrollment Done)")
-            continue
-        flag = "OK" if st["rows"] else "SKIP"
-        print(f"  {flag:4} {st['sheet'][:50]:50} study={st['study']!r:30} rows={st['rows']}")
-
     de.load_key_from_local_settings()
     if not de.KEY:
         raise SystemExit("COSMOS_KEY missing")
     client = CosmosClient(ENDPOINT, credential=de.KEY)
     db = client.get_database_client(DATABASE_ID)
+
+    if "--prune-junk" in flags:
+        prune_junk_old_aso(db, dry_run=dry)
+        return
+
+    print(f"Parsing Old ASO study tabs from {path} ...")
+    records, sheet_stats = parse_workbook(path)
+    print(
+        f"Parsed {len(records)} site-study rows from "
+        f"{sum(1 for x in sheet_stats if x['rows'])} sheets"
+    )
+    for st in sheet_stats:
+        flag = "OK" if st["rows"] else "SKIP"
+        print(f"  {flag:4} {st['sheet'][:50]:50} study={st['study']!r:30} rows={st['rows']}")
+
+    if not dry:
+        prune_junk_old_aso(db, dry_run=False)
+
     existing_studies, existing_sites, existing_outcomes = de.fetch_existing(db)
 
     studies, sites, outcomes, match_report = build_docs(

@@ -1,6 +1,6 @@
 # Legacy Studies (ARTEMIS only)
 
-Site–study outcomes from **Anterior Segment Overview.xlsx**, **Dry Eye Overview.xlsx** (Complete tabs), and **Completed Studies from Old ASO.xlsx** (Enrollment Done tabs), stored in the same Cosmos account as ARTEMIS (`ora-clinical-recruiting` / `crcscheduling`).
+Site–study outcomes from **Anterior Segment Overview.xlsx**, **Dry Eye Overview.xlsx** (Complete tabs only), and **Completed Studies from Old ASO.xlsx** (Enrollment Done tabs plus other study sheets in that file, e.g. YuYu), stored in the same Cosmos account as ARTEMIS (`ora-clinical-recruiting` / `crcscheduling`).
 
 ## Containers (NEW — do not touch existing ARTEMIS tables)
 
@@ -65,7 +65,8 @@ python ingest/legacy_dry_eye_overview.py --dry-run
 python ingest/legacy_dry_eye_overview.py --apply
 python ingest/legacy_dry_eye_overview.py --relink --apply
 
-# Old ASO completed studies — **Enrollment Done** tabs only (PI = site label). Separate source from Dry Eye.
+# Old ASO — from that workbook only (Enrollment Done + YuYu-style sheets; skips metrics/Sheet1).
+# PI = site label. Separate source from Dry Eye. Use --prune-junk to drop chart debris if needed.
 python ingest/legacy_old_aso_completed.py --dry-run
 python ingest/legacy_old_aso_completed.py --apply
 
