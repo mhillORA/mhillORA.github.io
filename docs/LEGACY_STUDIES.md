@@ -1,6 +1,6 @@
 # Legacy Studies (ARTEMIS only)
 
-Site–study outcomes from **Anterior Segment Overview.xlsx** and **Dry Eye Overview.xlsx**, stored in the same Cosmos account as ARTEMIS (`ora-clinical-recruiting` / `crcscheduling`).
+Site–study outcomes from **Anterior Segment Overview.xlsx**, **Dry Eye Overview.xlsx** (Complete tabs), and **Completed Studies from Old ASO.xlsx** (Enrollment Done tabs), stored in the same Cosmos account as ARTEMIS (`ora-clinical-recruiting` / `crcscheduling`).
 
 ## Containers (NEW — do not touch existing ARTEMIS tables)
 
@@ -64,6 +64,10 @@ python ingest/legacy_anterior_segment.py "C:\path\to\Anterior Segment Overview.x
 python ingest/legacy_dry_eye_overview.py --dry-run
 python ingest/legacy_dry_eye_overview.py --apply
 python ingest/legacy_dry_eye_overview.py --relink --apply
+
+# Old ASO completed studies — **Enrollment Done** tabs only (PI = site label). Separate source from Dry Eye.
+python ingest/legacy_old_aso_completed.py --dry-run
+python ingest/legacy_old_aso_completed.py --apply
 ```
 
 Uses `COSMOS_ENDPOINT` / `COSMOS_KEY` / `DATABASE_ID` from env, or falls back to `data-api-connections.json` / `local.settings.json`.  

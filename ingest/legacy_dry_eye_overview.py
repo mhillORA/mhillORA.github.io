@@ -497,8 +497,9 @@ def match_study(name: str, existing_studies: list[dict]) -> dict | None:
 
     # Protocol / short codes embedded in dry-eye labels
     for src in (name, stripped):
+# Also try AR-style protocol codes used in Old ASO tabs
         for m in re.finditer(
-            r"\b(ADX-\d+|CYS-\d+|VELOS-\d+|Saturn[-\s]?\d+|OPP\s*\d+|RGN[-\s]?\d+|BRIM|HanAll|Allergan|Vanda|Palatin|Aerie|Aurinia|Nicox|Kowa|Mitotech)\b",
+            r"\b(ADX-\d+|AR\d+|CYS-\d+|VELOS-\d+|Saturn[-\s]?\d+|OPP\s*\d+|RGN[-\s]?\d+|BRIM|HanAll|Allergan|Vanda|Palatin|Aerie|Aurinia|Nicox|Kowa|Mitotech|Orasis|FirstString)\b",
             src or "",
             re.I,
         ):
