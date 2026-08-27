@@ -1,6 +1,6 @@
 # Legacy Studies (ARTEMIS only)
 
-Site–study outcomes from **Anterior Segment Overview.xlsx**, stored in the same Cosmos account as ARTEMIS (`ora-clinical-recruiting` / `crcscheduling`).
+Site–study outcomes from **Anterior Segment Overview.xlsx** and **Dry Eye Overview.xlsx**, stored in the same Cosmos account as ARTEMIS (`ora-clinical-recruiting` / `crcscheduling`).
 
 ## Containers (NEW — do not touch existing ARTEMIS tables)
 
@@ -58,7 +58,15 @@ pip install azure-cosmos openpyxl
 python ingest/legacy_anterior_segment.py
 # or
 python ingest/legacy_anterior_segment.py "C:\path\to\Anterior Segment Overview.xlsx"
+
+# Dry Eye Overview (per-study tabs; matches existing studies by protocol code / sites by PI)
+# Prefer feasibility sites so surveys line up. Never overwrites existing metrics/edits.
+python ingest/legacy_dry_eye_overview.py --dry-run
+python ingest/legacy_dry_eye_overview.py --apply
+# Retarget dry-eye outcomes onto feasibility sites; merge/delete PI stubs
+python ingest/legacy_dry_eye_overview.py --relink --dry-run
+python ingest/legacy_dry_eye_overview.py --relink --apply
 ```
 
-Uses `COSMOS_ENDPOINT` / `COSMOS_KEY` / `DATABASE_ID` from env, or falls back to `HoldAll\CHAOS\azure-api-fixed\local.settings.json`.  
-Re-ingest **preserves** manually edited study `name`, `title`, `oraProjectNumber`, `sponsor`, `phase`, `status`, `notes`, and site `name`, `siteCode`, `relationshipPreference`, `advantages`, `disadvantages`, `relationshipNotes`, `notes`. **`therapeuticArea` is kept in sync with `indication`** (TA = Indication).
+Uses `COSMOS_ENDPOINT` / `COSMOS_KEY` / `DATABASE_ID` from env, or falls back to `data-api-connections.json` / `local.settings.json`.  
+Re-ingest **preserves** manually edited study `name`, `title`, `oraProjectNumber`, `sponsor`, `phase`, `status`, `notes`, and site `name`, `siteCode`, `relationshipPreference`, `advantages`, `disadvantages`, `relationshipNotes`, `notes`. **`therapeuticArea` is kept in sync with `indication`** (TA = Indication). Dry Eye ingest reuses existing study/site ids when matched and does not overwrite anterior funnel numbers on colliding outcomes.
