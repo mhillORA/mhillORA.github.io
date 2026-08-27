@@ -65,3 +65,18 @@ WHERE c.relationshipPreference = "prefer"
 ```
 
 Re-ingest preserves manually edited site relationship fields.
+
+---
+
+## Feasibility surveys + site profiles (separate pack)
+
+For the SurveyMonkey/Monday feasibility master (site profiles, survey defs/responses):
+
+See [`BUDGET_BUDDY_FEASIBILITY_INGEST.md`](./BUDGET_BUDDY_FEASIBILITY_INGEST.md).
+
+```powershell
+python ingest/export_feasibility_for_budget_buddy.py --slim-answers
+python ingest/push_feasibility_to_bd_budgets.py
+```
+
+New bd-budgets containers: `feasibility_sites`, `feasibility_site_profiles`, `feasibility_survey_definitions`, `feasibility_survey_responses`.

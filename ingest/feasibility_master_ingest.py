@@ -918,8 +918,10 @@ def main():
                 def_map[def_id] = {
                     "id": def_id,
                     "title": study_name,
-                    "audience": ["pi", "coordinator"],
+                    "audience": ["PI", "Coordinator"],
                     "status": "active",
+                    "isPredefined": True,
+                    "library": "feasibility",
                     "source": SOURCE,
                     "sourcePlatform": plat,
                     "sourceTab": tab,

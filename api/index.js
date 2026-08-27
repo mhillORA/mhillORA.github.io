@@ -617,6 +617,22 @@ const validateSurveysSchema = (data) => {
 };
 
 // ARTEMIS Site/Staff Surveys (PI/Coordinator) - Definitions, Assignments (unique links), Responses
+const normalizeSurveyAudience = (audience) => {
+    const out = [];
+    const seen = new Set();
+    for (const raw of (Array.isArray(audience) ? audience : [])) {
+        const key = String(raw || '').trim().toLowerCase();
+        let label = null;
+        if (key === 'pi' || key === 'principal investigator' || key === 'investigator') label = 'PI';
+        else if (key === 'coordinator' || key === 'crc' || key === 'study coordinator') label = 'Coordinator';
+        else if (String(raw || '').trim()) label = String(raw).trim();
+        if (!label || seen.has(label)) continue;
+        seen.add(label);
+        out.push(label);
+    }
+    return out.length ? out : ['PI', 'Coordinator'];
+};
+
 const validateSurveyDefinitionsSchema = (data) => {
     const errors = [];
     if (!data.title || typeof data.title !== 'string') errors.push('title is required and must be a string');
@@ -625,6 +641,9 @@ const validateSurveyDefinitionsSchema = (data) => {
     if (data.status && !['draft', 'active', 'archived'].includes(String(data.status).toLowerCase())) errors.push('status must be one of: draft, active, archived');
     if (data.defaultValues && typeof data.defaultValues !== 'object') errors.push('defaultValues must be an object');
     if (errors.length > 0) throw new Error(`VALIDATION_ERROR: SurveyDefinitions validation failed: ${errors.join(', ')}`);
+    // Soft normalize audience casing for Comms / ingest consistency
+    data.audience = normalizeSurveyAudience(data.audience);
+    if (data.isPredefined != null) data.isPredefined = Boolean(data.isPredefined);
     return true;
 };
 

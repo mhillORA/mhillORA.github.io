@@ -25,10 +25,20 @@ python ingest/feasibility_master_ingest.py --apply
 
 Source: `Ora_Feasibility_Data_All_Sites.json` (SurveyMonkey + Monday tabs). Matches existing ARTEMIS/legacy sites by email/name/PI/address, then upserts **legacy-sites only**. Indication/TA is stored on survey defs, responses, profiles, and `legacy-sites.indicationsCovered`.
 
+## Budget Buddy export
+
+```powershell
+python ingest/export_feasibility_for_budget_buddy.py --slim-answers
+python ingest/push_feasibility_to_bd_budgets.py
+```
+
+See [`BUDGET_BUDDY_FEASIBILITY_INGEST.md`](./BUDGET_BUDDY_FEASIBILITY_INGEST.md). Pack lands in `exports/budget_buddy_feasibility_pack.json`.
+
 ## UI
 
 - **Legacy Sites** — Overview / **Surveys** (same accordion as live Sites) / **Site profile**; filter by indication/TA
 - **Feasibility Surveys** — list survey definitions → open one → site responses accordion (by survey, not by site)
+- **Comms** — **Predefined surveys** library (`isPredefined` / `library: feasibility`) with Clone + Send; custom surveys separate; Send Survey dropdown groups predefined vs custom
 - **Legacy Reporting** — funnel KPIs + **Feasibility by indication/TA** table + indication filter
 - **Legacy Studies** — list → open study → site table + edit metadata; sort A→Z / Z→A / enrolled
 - **Dashboard** — live ops charts + legacy overview panel at bottom

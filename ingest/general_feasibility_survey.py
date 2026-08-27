@@ -429,6 +429,8 @@ def main():
         "description": "Imported from the Monday.com General Feasibility form. Questions are the export column headers. Answers are shown on each matched ARTEMIS site.",
         "audience": ["PI", "Coordinator"],
         "status": "active",
+        "isPredefined": True,
+        "library": "feasibility",
         "questions": questions,
         "defaultValues": {},
         "source": SOURCE,
