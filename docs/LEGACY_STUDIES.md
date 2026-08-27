@@ -68,6 +68,10 @@ python ingest/legacy_dry_eye_overview.py --relink --apply
 # Old ASO completed studies — **Enrollment Done** tabs only (PI = site label). Separate source from Dry Eye.
 python ingest/legacy_old_aso_completed.py --dry-run
 python ingest/legacy_old_aso_completed.py --apply
+
+# Retarget dry-eye / old-aso outcomes onto feasibility/anterior legacy-sites (PI aliases)
+python ingest/relink_legacy_outcomes.py --dry-run
+python ingest/relink_legacy_outcomes.py --apply
 ```
 
 Uses `COSMOS_ENDPOINT` / `COSMOS_KEY` / `DATABASE_ID` from env, or falls back to `data-api-connections.json` / `local.settings.json`.  
