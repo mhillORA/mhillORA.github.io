@@ -79,6 +79,9 @@
         #sidebar.sidebar-collapsed .nav-item { justify-content: center; }
         #sidebar.sidebar-collapsed [data-action="toggle-sidebar-collapse"] { margin-left: 0; }
         body.patient-panel-open #sidebar { z-index: 40; }
+        #side-panel-container { z-index: 70; }
+        #modal-container { z-index: 80; }
+        #sidebar { z-index: 60; }
         .logo-bg { fill: #3B82F6; }
         .logo-swoosh { stroke: #EF4444; }
         .logo-inner-circle { fill: #1F2937; }
@@ -658,6 +661,8 @@ let state = {
     surveys: [],
     schedules: [],
     lastReportData: [], // To store data for CSV export
+    lastReportDateStart: null,
+    lastReportDateEnd: null,
     currentSurveyState: null,
     currentPatientProfileTab: 'details', // 'details' or 'contactLog' or 'surveyHistory' or 'visitDetails'
     selectedStudyId: null, // For the studies dropdown selector
@@ -810,16 +815,28 @@ const loadReferenceDataFromApi = async () => {
     return false;
 };
 
+const getCurrentUserRole = () => String(state.currentUser?.role || state.currentUser?.permissionLevel || '').toLowerCase();
+
 const isManagerUser = () => {
-    // Treat every signed-in user as admin/manager (includes deceased unlock)
-    return !!(state.currentUser);
+    if (!state.currentUser) return false;
+    const role = getCurrentUserRole();
+    return role === 'internal' || role === 'admin' || role.includes('manager') || role === 'ops';
 };
 
-/** Any signed-in NASA user gets admin capabilities (recruitment/user roles included). */
-const isAdminUser = () => !!(state.currentUser);
+/** Internal / Admin / Manager can edit Global ID, archive studies, visit outcomes, past enrollments. */
+const isAdminUser = () => {
+    if (!state.currentUser) return false;
+    const role = getCurrentUserRole();
+    if (role === 'internal' || role === 'admin' || role.includes('manager') || role === 'ops') return true;
+    if (state.currentUser.userPartition === 'internal' && role !== 'recruiter' && role !== 'external' && role !== 'site') return true;
+    return false;
+};
 
-/** Kept for older UI branches; currently no signed-in user is treated as recruiter-restricted. */
-const isRecruiterUser = () => false;
+const isRecruiterUser = () => {
+    if (!state.currentUser) return false;
+    const role = getCurrentUserRole();
+    return role === 'recruiter' || role === 'external' || role === 'site';
+};
 
 /** Local YYYY-MM-DD (avoids UTC off-by-one for Call Back due dates). */
 const localDateISO = (d = new Date()) => {
@@ -858,11 +875,11 @@ const isActualStudy = (study) => {
 };
 
 const isCrcOrManagerUser = () => {
-    const u = state.currentUser || {};
-    const role = String(u.role || u.permissionLevel || '').toLowerCase();
+    if (!state.currentUser) return false;
     if (isAdminUser()) return true;
+    const role = getCurrentUserRole();
     if (role.includes('crc') || role === 'coordinator' || role === 'internal') return true;
-    if (u.userPartition === 'internal' && role !== 'external' && role !== 'recruiter') return true;
+    if (state.currentUser.userPartition === 'internal' && role !== 'external' && role !== 'recruiter' && role !== 'site') return true;
     return false;
 };
 
@@ -2476,7 +2493,7 @@ const renderNav = () => {
         { id: 'pipeline', label: 'Pipeline', icon: 'git-branch' },
         { id: 'tasks', label: 'Tasks', icon: 'list-checks' },
         { id: 'studies', label: 'Studies', icon: 'file-text', hasDropdown: true },
-        { id: 'patients', label: 'Patients', icon: 'users' },
+        { id: 'patients', label: 'Participant Registry', icon: 'users' },
         { id: 'sites', label: 'Sites', icon: 'building' },
         { id: 'scheduling', label: 'Scheduling', icon: 'calendar' },
         { id: 'reporting', label: 'Reporting', icon: 'trending-up' },
@@ -3686,7 +3703,7 @@ const renderStudyParticipants = (studyId) => {
                 <td class="px-6 py-4 flex items-center gap-2">
                     <button data-action="view-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline text-sm">View</button>
                     <button data-action="survey-patient" data-id="${p.id}" class="text-green-600 dark:text-green-400 hover:underline text-sm">Survey</button>
-                    ${isAdminUser() ? `<button data-action="schedule-patient" data-id="${p.id}" class="text-purple-600 dark:text-purple-400 hover:underline text-sm">Schedule</button>` : ''}
+                    ${state.currentUser ? `<button data-action="schedule-patient" data-id="${p.id}" class="text-purple-600 dark:text-purple-400 hover:underline text-sm">Schedule</button>` : ''}
                 </td>
             </tr>
         `;
@@ -3791,7 +3808,7 @@ const getPatientsHTML = () => {
             ? ` (${state.patients.length.toLocaleString()} loaded)`
             : '';
     return `
-        <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Patients${totalLabel}</h2>
+        <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Participant Registry${totalLabel}</h2>
         <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-4">
             <input type="text" id="patient-search" value="${state.patientSearchTerm}" class="p-2 border dark:border-gray-600 rounded-md md:col-span-2 bg-white dark:bg-gray-700 dark:text-white" placeholder="Search by Name, Email, Phone, or Global ID...">
             <div class="flex gap-2 flex-wrap">
@@ -3800,6 +3817,10 @@ const getPatientsHTML = () => {
                 <button data-action="patients-my-leads" class="flex-1 min-w-[120px] bg-amber-600 text-white px-4 py-2 rounded-md hover:bg-amber-700">My Leads</button>
             </div>
         </div>
+        <details class="mb-6 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-900/30" open>
+            <summary class="cursor-pointer p-4 font-semibold text-gray-800 dark:text-gray-200">Advanced Registry Filters &amp; Study Assignment</summary>
+            <div class="p-4 border-t dark:border-gray-700">${getRegistryHTML()}</div>
+        </details>
         ${state.patientsUseServerQuery ? `
             <div class="flex justify-end gap-2 mb-2">
                 <button type="button" data-action="patients-prev-page" class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-600 rounded dark:text-white">Prev</button>
@@ -3811,11 +3832,7 @@ const getPatientsHTML = () => {
                 <thead class="bg-gray-50 dark:bg-gray-700"><tr><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Name</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Site</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Appointment</th><th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th></tr></thead>
                 <tbody id="patient-table-body" class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700"></tbody>
             </table>
-        </div>
-        <details class="mt-6 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-900/30">
-            <summary class="cursor-pointer p-4 font-semibold text-gray-800 dark:text-gray-200">Advanced Registry Filters &amp; Study Assignment</summary>
-            <div class="p-4 border-t dark:border-gray-700">${getRegistryHTML()}</div>
-        </details>`;
+        </div>`;
 };
 const renderPatientTable = () => {
     const tableBody = document.getElementById('patient-table-body');
@@ -3860,7 +3877,7 @@ const renderPatientTable = () => {
                 <td class="px-6 py-4">${appointmentInfo}</td>
                 <td class="px-6 py-4 flex items-center gap-4">
                     <button data-action="survey-patient" data-id="${p.id}" class="text-green-600 dark:text-green-400 hover:underline">Survey</button>
-                    ${isAdminUser() ? `<button data-action="schedule-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">Schedule</button>` : ''}
+                    ${state.currentUser ? `<button data-action="schedule-patient" data-id="${p.id}" class="text-blue-600 dark:text-blue-400 hover:underline">Schedule</button>` : ''}
                     <button data-action="edit-patient" data-id="${p.id}" class="text-gray-500 dark:text-gray-400 hover:text-blue-600"><i data-lucide="edit" class="w-4 h-4"></i></button>
                     <button data-action="delete-patient" data-id="${p.id}" class="text-red-500 hover:text-red-700"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
                 </td>
@@ -4631,15 +4648,15 @@ const getSchedulingHTML = () => {
                     tree[siteName][studyName][groupName].push(s);
                 });
                 return Object.keys(tree).sort().map(siteName => `
-                    <details class="border dark:border-gray-700 rounded-lg" open>
+                    <details class="border dark:border-gray-700 rounded-lg schedule-folder" data-folder-level="site">
                         <summary class="cursor-pointer px-4 py-3 font-semibold dark:text-white bg-gray-50 dark:bg-gray-900/40">${siteName}</summary>
                         <div class="p-3 space-y-2">
                             ${Object.keys(tree[siteName]).sort().map(studyName => `
-                                <details class="ml-2 border dark:border-gray-700 rounded" open>
+                                <details class="ml-2 border dark:border-gray-700 rounded schedule-folder" data-folder-level="study">
                                     <summary class="cursor-pointer px-3 py-2 text-sm font-medium dark:text-gray-200">${studyName}</summary>
                                     <div class="p-2 space-y-2">
                                         ${Object.keys(tree[siteName][studyName]).sort().map(groupName => `
-                                            <details class="ml-2 border dark:border-gray-600 rounded" open>
+                                            <details class="ml-2 border dark:border-gray-600 rounded schedule-folder" data-folder-level="group">
                                                 <summary class="cursor-pointer px-3 py-1.5 text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">${groupName}</summary>
                                                 <div class="p-2 space-y-2">
                                                     ${tree[siteName][studyName][groupName].map(s => {
@@ -4647,12 +4664,21 @@ const getSchedulingHTML = () => {
                                                         const totalCapacity = slots.reduce((sum, slot) => sum + (slot.capacity || 0), 0);
                                                         const totalBooked = slots.reduce((sum, slot) => sum + (slot.booked || 0), 0);
                                                         const availableSlots = totalCapacity - totalBooked;
-                                                        return `<div class="p-3 border dark:border-gray-700 rounded-lg dark:text-gray-300 flex justify-between items-center">
-                                                            <div>
-                                                                <h4 class="font-bold">${s.visit || 'General'}</h4>
+                                                        const slotDates = slots.map(slot => new Date(slot.startTime)).filter(d => !Number.isNaN(d.getTime())).sort((a, b) => a - b);
+                                                        let dateLabel = '';
+                                                        if (slotDates.length) {
+                                                            const fmt = (d) => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+                                                            const first = slotDates[0];
+                                                            const last = slotDates[slotDates.length - 1];
+                                                            dateLabel = toLocalDateKey(first) === toLocalDateKey(last) ? fmt(first) : `${fmt(first)}-${fmt(last)}`;
+                                                        }
+                                                        const visitLabel = `${s.visit || 'General'}${dateLabel ? ' - ' + dateLabel : ''}`;
+                                                        return `<div class="p-3 border dark:border-gray-700 rounded-lg dark:text-gray-300 flex justify-between items-center gap-2">
+                                                            <button type="button" data-action="open-booked-from-schedule" data-schedule-id="${s.id}" data-site-id="${s.siteId || ''}" data-study-id="${s.studyId || ''}" data-visit="${escapeHtmlPhi(s.visit || '')}" class="text-left flex-1 hover:bg-gray-50 dark:hover:bg-gray-700/50 rounded p-1 -m-1">
+                                                                <h4 class="font-bold text-blue-600 dark:text-blue-400 hover:underline">${visitLabel}</h4>
                                                                 <p class="text-sm">${availableSlots} of ${totalCapacity} total slots available.</p>
-                                                            </div>
-                                                            <div class="flex items-center gap-2">
+                                                            </button>
+                                                            <div class="flex items-center gap-2 shrink-0">
                                                                 <button data-action="edit-schedule" data-id="${s.id}" class="text-blue-600 hover:underline">Edit</button>
                                                                 <button data-action="delete-schedule" data-id="${s.id}" class="text-red-600 hover:underline">Delete</button>
                                                             </div>
@@ -4688,13 +4714,14 @@ const getSchedulingHTML = () => {
        <select id="scheduling-study-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
            <option value="all">All Studies</option>
            ${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}" ${state.schedulingStudyFilter === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}
+       </select>
+       <select id="scheduling-visit-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+           <option value="all">All Visits</option>
+           ${[1,2,3,4,5].map(v => `<option value="Visit ${v}" ${state.schedulingVisitFilter === `Visit ${v}` ? 'selected' : ''}>Visit ${v}</option>`).join('')}
        </select>`
         : '';
     const visitFilterHTML = (state.schedulingView === 'calendar' || state.schedulingView === 'day') 
-        ? `<select id="scheduling-visit-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-           <option value="all">All Visits</option>
-           ${[1,2,3,4,5].map(v => `<option value="Visit ${v}" ${state.schedulingVisitFilter === `Visit ${v}` ? 'selected' : ''}>Visit ${v}</option>`).join('')}
-       </select>` 
+        ? `` 
         : '';
     return `
     <div class="flex justify-between items-center mb-6 flex-wrap gap-4">
@@ -4780,19 +4807,21 @@ const getEditPatientSectionModalHTML = (patient, section) => {
         fields = `
             <div><label class="block text-sm dark:text-gray-300">Phone</label><input name="phoneNumber" value="${escapeHtmlPhi(patient.phoneNumber || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
             <div><label class="block text-sm dark:text-gray-300">Email</label><input type="email" name="email" value="${escapeHtmlPhi(patient.email || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
-            <div class="md:col-span-2"><label class="block text-sm dark:text-gray-300">Address</label><input name="address" value="${escapeHtmlPhi(patient.address || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
+            <div class="md:col-span-2"><label class="block text-sm dark:text-gray-300">Address</label><input name="address" id="patient-address-autocomplete" list="address-suggestions" autocomplete="street-address" value="${escapeHtmlPhi(patient.address || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white" placeholder="Start typing an address…"><datalist id="address-suggestions"></datalist></div>
             <div><label class="block text-sm dark:text-gray-300">City</label><input name="city" value="${escapeHtmlPhi(patient.city || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
             <div><label class="block text-sm dark:text-gray-300">State</label><input name="state" value="${escapeHtmlPhi(patient.state || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
             <div><label class="block text-sm dark:text-gray-300">Zip</label><input name="zipCode" value="${escapeHtmlPhi(patient.zipCode || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
             <label class="flex items-center gap-2 text-sm dark:text-gray-300"><input type="checkbox" name="smsOptIn" ${patient.smsOptIn ? 'checked' : ''}> SMS opt-in</label>`;
     } else if (section === 'demographics') {
+        const initials = patient.initials || `${(patient.firstName || '').charAt(0)}${(patient.lastName || '').charAt(0)}`.toUpperCase();
         fields = `
             <div><label class="block text-sm dark:text-gray-300">First Name</label><input name="firstName" required value="${escapeHtmlPhi(patient.firstName || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
             <div><label class="block text-sm dark:text-gray-300">Last Name</label><input name="lastName" required value="${escapeHtmlPhi(patient.lastName || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
+            <div><label class="block text-sm dark:text-gray-300">Initials</label><input name="initials" value="${escapeHtmlPhi(initials)}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white" readonly></div>
             <div><label class="block text-sm dark:text-gray-300">DOB</label><input type="date" name="dob" value="${escapeHtmlPhi(patient.dob || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>
             <div><label class="block text-sm dark:text-gray-300">Sex Assigned at Birth</label><select name="sexAssignedAtBirth" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"><option value="">—</option>${SEX_AT_BIRTH_OPTIONS.map(x => `<option ${patient.sexAssignedAtBirth === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
             <div><label class="block text-sm dark:text-gray-300">Ethnicity</label><select name="ethnicity" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"><option value="">—</option>${ETHNICITY_OPTIONS.map(x => `<option ${patient.ethnicity === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
-            ${isAdminUser() ? `<div><label class="block text-sm dark:text-gray-300">Global ID</label><input name="globalId" value="${escapeHtmlPhi(patient.globalId || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>` : ''}`;
+            ${isAdminUser() ? `<div><label class="block text-sm dark:text-gray-300">Global ID</label><input name="globalId" value="${escapeHtmlPhi(patient.globalId || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></div>` : `<div><label class="block text-sm dark:text-gray-300">Global ID</label><input value="${escapeHtmlPhi(patient.globalId || '')}" class="mt-1 w-full p-2 border rounded bg-gray-200 dark:bg-gray-800 dark:text-white cursor-not-allowed" readonly></div>`}`;
     } else if (section === 'tags') {
         fields = `<div class="md:col-span-2">${getTagsChecklistHTML(patient.tags || [])}</div>`;
     } else if (section === 'study') {
@@ -4913,6 +4942,9 @@ const getPatientProfileHTML = (patient) => {
     const assignee = (state.managedUsers || []).find(u => u.id === patient.assignedToUserId);
     const appointmentsTabHTML = `
         <div class="space-y-3">
+            <div class="flex justify-end mb-2">
+                <button type="button" data-action="schedule-remaining-visits" data-patient-id="${patient.id}" class="text-sm bg-indigo-600 text-white px-3 py-1.5 rounded hover:bg-indigo-700">Schedule remaining visits</button>
+            </div>
             ${getPatientAppointments(patient).length ? getPatientAppointments(patient).map(a => {
                 const visitLabel = a.visit || 'Visit';
                 const canEdit = canEditAppointmentVisit(visitLabel);
@@ -5806,6 +5838,11 @@ const getManageRHTML = () => {
                         <button type="button" data-action="patients-reindex" class="text-sm bg-gray-700 text-white px-3 py-2 rounded hover:bg-gray-800">Reindex patient search fields (batch)</button>
                         <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Backfills denormalized enrollment and appointment fields for registry queries.</p>
                     </div>
+                    <div class="mt-4 p-4 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-900/40">
+                        <h3 class="font-semibold dark:text-white mb-2">Visit Outcome options (Booked view)</h3>
+                        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">Current locked list used for Visit Outcome dropdowns. Contact ops/dev to change production values; shown here for recruiters/admins:</p>
+                        <ul class="text-sm dark:text-gray-300 list-disc pl-5">${VISIT_OUTCOME_OPTIONS.map(o => `<li>${o}</li>`).join('')}</ul>
+                    </div>
                 ` : ''}
             </div>
 
@@ -6220,6 +6257,53 @@ const setupEditManagedUserForm = (userId) => {
         render();
     });
 };
+const getEditPastEnrollmentModalHTML = (patient, enrollmentIndex) => {
+    if (!patient) return '<p>Patient not found.</p>';
+    const idx = Number(enrollmentIndex);
+    const enrollment = patient.enrollments?.[idx];
+    if (!enrollment) return '<p>Enrollment record not found.</p>';
+    if (!isAdminUser()) {
+        return `
+            <h2 class="text-2xl font-bold dark:text-white mb-4">Edit Enrollment Record</h2>
+            <p class="text-amber-600 dark:text-amber-400">Only admins can edit past enrollment records.</p>
+            <div class="flex justify-end mt-6"><button type="button" data-action="close-modal" class="px-4 py-2 rounded bg-gray-200 dark:bg-gray-600">Close</button></div>
+        `;
+    }
+    const enrolledDate = enrollment.enrolledDate ? String(enrollment.enrolledDate).slice(0, 10) : '';
+    const exitedDate = enrollment.exitedDate ? String(enrollment.exitedDate).slice(0, 10) : '';
+    return `
+        <h2 class="text-2xl font-bold dark:text-white mb-4">Edit Enrollment Record</h2>
+        <form id="edit-past-enrollment-form" data-patient-id="${patient.id}" data-enrollment-index="${idx}" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium dark:text-gray-300">Study</label>
+                <select name="studyId" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    ${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}" ${enrollment.studyId === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}
+                </select>
+            </div>
+            <div>
+                <label class="block text-sm font-medium dark:text-gray-300">Site</label>
+                <select name="siteId" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    ${state.sites.map(s => `<option value="${s.id}" ${enrollment.siteId === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}
+                </select>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Enrolled Date</label>
+                    <input type="date" name="enrolledDate" value="${enrolledDate}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Exited Date</label>
+                    <input type="date" name="exitedDate" value="${exitedDate}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                </div>
+            </div>
+            <div class="flex justify-end gap-2 pt-2">
+                <button type="button" data-action="close-modal" class="px-4 py-2 rounded bg-gray-200 dark:bg-gray-600">Cancel</button>
+                <button type="submit" class="px-4 py-2 rounded bg-blue-600 text-white">Save</button>
+            </div>
+        </form>
+    `;
+};
+
 const getEditStudyModalHTML = (study) => {
     const studySiteIds = study.siteIds || [];
     const assignedSites = state.sites.filter(site => studySiteIds.includes(site.id));
@@ -6242,7 +6326,7 @@ const getEditStudyModalHTML = (study) => {
                 <div>
                     <label class="block text-sm font-medium dark:text-gray-300">Status</label>
                     <select name="status" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                        ${['Recruiting', 'Enrolling', 'Active', 'Closed'].map(s => `<option ${study.status === s ? 'selected' : ''}>${s}</option>`).join('')}
+                        ${['Recruiting', 'Enrolling', 'Active', 'Closed', 'Archived'].map(s => `<option value="${s}" ${study.status === s ? 'selected' : ''}>${s}</option>`).join('')}
                     </select>
                 </div>
                 <div>
@@ -6670,6 +6754,30 @@ const getTakeSurveyModalHTML = () => {
         ? (question.isScript ? 'Script' : (section || 'Section'))
         : `Question ${numberedIndex} of ${numberedQs.length}`;
     const history = state.currentSurveyState.history || [];
+    const isContactDetails = section === 'Patient Contact Details' || /patient contact details/i.test(section);
+    const isMedReviewSection = section === 'Medication Review' || /^medication/i.test(section);
+    const contactDetailsHTML = isContactDetails ? `
+        <div class="mb-4 p-4 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 space-y-3">
+            <h3 class="font-semibold dark:text-white">Patient Contact Details</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                <label class="dark:text-gray-300">First Name<input name="contact_firstName" form="take-survey-form" value="${escapeHtmlPhi(patient.firstName || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+                <label class="dark:text-gray-300">Last Name<input name="contact_lastName" form="take-survey-form" value="${escapeHtmlPhi(patient.lastName || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+                <label class="dark:text-gray-300">Phone<input name="contact_phoneNumber" form="take-survey-form" value="${escapeHtmlPhi(patient.phoneNumber || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+                <label class="dark:text-gray-300">Email<input name="contact_email" form="take-survey-form" value="${escapeHtmlPhi(patient.email || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+                <label class="dark:text-gray-300">DOB<input type="date" name="contact_dob" form="take-survey-form" value="${escapeHtmlPhi(patient.dob || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+                <label class="dark:text-gray-300">Sex<select name="contact_sexAssignedAtBirth" form="take-survey-form" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"><option value="">—</option>${SEX_AT_BIRTH_OPTIONS.map(x => `<option ${patient.sexAssignedAtBirth === x ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
+                <label class="md:col-span-2 dark:text-gray-300">Address<input name="contact_address" form="take-survey-form" value="${escapeHtmlPhi(patient.address || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+                <label class="dark:text-gray-300">City<input name="contact_city" form="take-survey-form" value="${escapeHtmlPhi(patient.city || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+                <label class="dark:text-gray-300">State<input name="contact_state" form="take-survey-form" value="${escapeHtmlPhi(patient.state || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+                <label class="dark:text-gray-300">Zip<input name="contact_zipCode" form="take-survey-form" value="${escapeHtmlPhi(patient.zipCode || '')}" class="mt-1 w-full p-2 border rounded dark:border-gray-600 dark:bg-gray-700 dark:text-white"></label>
+            </div>
+            <p class="text-xs text-gray-500">Edits update the patient profile when you continue.</p>
+        </div>` : '';
+    const medEditorHTML = isMedReviewSection ? `
+        <div class="mb-4 border dark:border-gray-600 rounded-lg p-3 bg-white dark:bg-gray-800">
+            <h3 class="font-semibold dark:text-white mb-2">Medication Review</h3>
+            ${getMedicationsEditorHTML(patient)}
+        </div>` : '';
     const completedHTML = (answers || []).length
         ? `<details class="mb-4 border dark:border-gray-600 rounded-lg" open>
             <summary class="cursor-pointer px-3 py-2 text-sm font-semibold dark:text-white bg-gray-50 dark:bg-gray-900/40">Completed responses (${answers.length}) — scroll / expand to review</summary>
@@ -6682,36 +6790,41 @@ const getTakeSurveyModalHTML = () => {
         || (currentQuestionIndex + 2 <= survey.questions.length ? String(currentQuestionIndex + 2) : 'submit');
     const isCallScript = question.isScript && (section === 'Voicemail Script' || section === 'Live Patient Script');
     const callScripts = isCallScript
+        ? (survey.questions || []).map((q, idx) => ({ q, idx })).filter(x => x.q.isScript && x.q.section === section)
+        : [];
+    const allCallScriptIndexes = isCallScript
         ? (survey.questions || []).map((q, idx) => ({ q, idx })).filter(x => x.q.isScript && (x.q.section === 'Voicemail Script' || x.q.section === 'Live Patient Script'))
         : [];
-    const lastCallScriptIndex = callScripts.length ? Math.max(...callScripts.map(x => x.idx)) : currentQuestionIndex;
+    const lastCallScriptIndex = allCallScriptIndexes.length ? Math.max(...allCallScriptIndexes.map(x => x.idx)) : currentQuestionIndex;
     const afterCallScripts = lastCallScriptIndex + 1 < survey.questions.length ? String(lastCallScriptIndex + 2) : 'submit';
     const priorMulti = String(priorAnswer || '').split('|').map(s => s.trim()).filter(Boolean);
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-2 break-words">${survey.title}</h2>
-        ${section ? `<details class="mb-3 border dark:border-gray-600 rounded" open>
+        ${section && !isContactDetails ? `<details class="mb-3 border dark:border-gray-600 rounded" open>
             <summary class="cursor-pointer px-3 py-2 text-xs uppercase tracking-wide text-blue-600 dark:text-blue-400 font-semibold">${section}</summary>
         </details>` : ''}
         <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">${progressLabel} · Recruiter: ${vars['{{recruiter_name}}'] || '—'} · Site: ${vars['{{site_name}}'] || '—'} · Study: ${vars['{{study_name}}'] || '—'}</p>
         <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">Tokens auto-fill from patient site/study and your first name.</p>
         ${completedHTML}
-        ${medHint}
+        ${contactDetailsHTML}
+        ${medEditorHTML}
+        ${!isMedReviewSection ? medHint : ''}
         <form id="take-survey-form">
-            ${question.isScript ? `
+            ${question.isScript || isContactDetails || isMedReviewSection ? `
             ${isCallScript ? callScripts.map(({ q }) => `
                 <details class="mb-3 border border-indigo-300 dark:border-indigo-700 rounded-lg bg-indigo-50 dark:bg-indigo-950/30" open>
                     <summary class="cursor-pointer p-3 font-semibold text-indigo-800 dark:text-indigo-200">${q.section}</summary>
                     <div class="p-4 pt-1 text-base dark:text-white break-words whitespace-pre-wrap">${applyScriptVariables(q.text || '', patient)}</div>
                 </details>
-            `).join('') : `
+            `).join('') : (!isContactDetails && !isMedReviewSection ? `
                 <details class="mb-3 border border-indigo-300 dark:border-indigo-700 rounded-lg bg-indigo-50 dark:bg-indigo-950/30" open>
                     <summary class="cursor-pointer p-3 font-semibold text-indigo-800 dark:text-indigo-200">${section || 'Script'}</summary>
                     <div class="p-4 pt-1 text-base dark:text-white break-words whitespace-pre-wrap">${questionText}</div>
                 </details>
                 ${notesHTML}
                 ${tableHTML}
-            `}
-            <input type="hidden" name="answer" value="Script read">
+            ` : '')}
+            <input type="hidden" name="answer" value="${isContactDetails ? 'Contact details reviewed' : (isMedReviewSection ? 'Medications reviewed' : 'Script read')}">
             <input type="hidden" name="answerNext" value="${isCallScript ? afterCallScripts : defaultNext}">
             ` : `
             <p class="text-lg font-semibold dark:text-white mb-4 break-words whitespace-normal">${questionText}</p>
@@ -8940,7 +9053,16 @@ document.addEventListener('click', async (e) => {
                 break;
             }
             case 'toggle-studies': {
-                setState({ studiesExpanded: !state.studiesExpanded });
+                const nextExpanded = !state.studiesExpanded;
+                const collapsed = document.getElementById('sidebar')?.classList.contains('sidebar-collapsed');
+                if (collapsed) {
+                    setState({ activeTab: 'studies', studiesExpanded: true, selectedStudyId: null, sidebarCollapsed: false });
+                    document.getElementById('sidebar')?.classList.remove('sidebar-collapsed');
+                } else if (!nextExpanded && state.activeTab === 'studies') {
+                    setState({ studiesExpanded: false });
+                } else {
+                    setState({ activeTab: 'studies', studiesExpanded: true, selectedStudyId: state.selectedStudyId || null });
+                }
                 break;
             }
             case 'select-study': {
@@ -9113,10 +9235,114 @@ document.addEventListener('click', async (e) => {
                 }
                 break;
             }
+            case 'open-booked-from-schedule': {
+                const siteId = actionButton.dataset.siteId || 'all';
+                const studyId = actionButton.dataset.studyId || 'all';
+                const visit = actionButton.dataset.visit || 'all';
+                const params = new URLSearchParams({
+                    tab: 'scheduling',
+                    view: 'booked',
+                    site: siteId,
+                    study: studyId,
+                    visit: visit || 'all',
+                });
+                try {
+                    const shareUrl = `${window.location.origin}${window.location.pathname}?${params.toString()}`;
+                    if (navigator.clipboard?.writeText) {
+                        navigator.clipboard.writeText(shareUrl).catch(() => {});
+                    }
+                } catch { /* ignore */ }
+                setState({
+                    activeTab: 'scheduling',
+                    schedulingView: 'booked',
+                    schedulingSiteFilter: siteId || 'all',
+                    schedulingStudyFilter: studyId || 'all',
+                    schedulingVisitFilter: visit || 'all',
+                });
+                showNotification('Opened Booked view for this visit. Link copied to clipboard.', 'success');
+                break;
+            }
+            case 'schedule-remaining-visits': {
+                const remPatient = state.patients.find(p => p.id === patientId || p.id === id);
+                if (!remPatient) {
+                    showNotification('Patient not found.', 'error');
+                    break;
+                }
+                if ((remPatient.visitOutcome || '').toLowerCase().includes('screen fail') || remPatient.status === 'Screen Fail') {
+                    showNotification('Patient screen-failed — remaining visits are not offered.', 'info');
+                    break;
+                }
+                const ctx = remPatient.enrollments?.find(e => e.status === 'current');
+                const bookedVisits = new Set(getPatientAppointments(remPatient).filter(a => (a.status || 'scheduled') !== 'cancelled').map(a => a.visit));
+                const candidates = state.schedules.filter(s =>
+                    (!ctx || (s.studyId === ctx.studyId && s.siteId === ctx.siteId)) &&
+                    (!remPatient.group || !s.group || String(s.group) === String(remPatient.group)) &&
+                    s.visit && !bookedVisits.has(s.visit) &&
+                    Array.isArray(s.slots) && s.slots.some(slot => countPatientsInSlot(slot.id) < (slot.capacity || 0) && new Date(slot.startTime) >= new Date())
+                );
+                if (!candidates.length) {
+                    showNotification('No open future slots for remaining visits.', 'info');
+                    break;
+                }
+                openModal(`
+                    <h2 class="text-2xl font-bold dark:text-white mb-4">Schedule remaining visits</h2>
+                    <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">Pick a slot for each unbooked visit. Screen-fail clears this list later via visit outcome.</p>
+                    <div class="space-y-3 max-h-96 overflow-y-auto">
+                        ${candidates.map(s => {
+                            const openSlots = (s.slots || []).filter(slot => countPatientsInSlot(slot.id) < (slot.capacity || 0) && new Date(slot.startTime) >= new Date())
+                                .sort((a, b) => new Date(a.startTime) - new Date(b.startTime)).slice(0, 8);
+                            return `<div class="border dark:border-gray-700 rounded p-3">
+                                <h3 class="font-semibold dark:text-white mb-2">${s.visit}</h3>
+                                ${openSlots.map(slot => `
+                                    <button type="button" data-action="book-appointment" data-patient-id="${remPatient.id}" data-schedule-id="${s.id}" data-slot-id="${slot.id}" class="w-full text-left p-2 mb-1 border dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 dark:text-white text-sm">
+                                        ${new Date(slot.startTime).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} (${countPatientsInSlot(slot.id)}/${slot.capacity})
+                                    </button>
+                                `).join('') || '<p class="text-sm text-gray-500">No open slots</p>'}
+                            </div>`;
+                        }).join('')}
+                    </div>
+                    <div class="flex justify-end mt-4"><button type="button" data-action="close-modal" class="px-4 py-2 rounded bg-gray-200 dark:bg-gray-600">Close</button></div>
+                `, true);
+                break;
+            }
         }
     }
 });
 document.addEventListener('change', async (e) => {
+    if (e.target.matches('input[name$="-numbered"], select[name$="-section"]')) {
+        renumberSurveyQuestions();
+        updateBranchingLogicDropdowns();
+    }
+    if (e.target.id === 'patient-address-autocomplete') {
+        const q = String(e.target.value || '').trim();
+        const list = document.getElementById('address-suggestions');
+        if (!list || q.length < 4) return;
+        try {
+            const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&q=${encodeURIComponent(q)}`, {
+                headers: { 'Accept': 'application/json' }
+            });
+            if (!res.ok) return;
+            const results = await res.json();
+            list.innerHTML = (results || []).map(r => {
+                const a = r.address || {};
+                const line = [a.house_number, a.road].filter(Boolean).join(' ') || r.display_name.split(',')[0];
+                const label = r.display_name;
+                return `<option value="${String(line).replace(/"/g, '&quot;')}" label="${String(label).replace(/"/g, '&quot;')}"></option>`;
+            }).join('');
+            const first = results?.[0]?.address;
+            if (first) {
+                const form = e.target.closest('form');
+                if (form) {
+                    const city = form.querySelector('[name="city"]');
+                    const st = form.querySelector('[name="state"]');
+                    const zip = form.querySelector('[name="zipCode"]');
+                    if (city && !city.value) city.value = first.city || first.town || first.village || '';
+                    if (st && !st.value) st.value = first.state || '';
+                    if (zip && !zip.value) zip.value = first.postcode || '';
+                }
+            }
+        } catch { /* ignore network errors */ }
+    }
     if (e.target.id === 'contact-log-overall-status' || e.target.id === 'edit-patient-overall-status') {
         const val = e.target.value;
         const root = e.target.closest('form') || document;
@@ -10180,15 +10406,40 @@ document.addEventListener('submit', async (e) => {
             const { survey, patient, currentQuestionIndex, answers } = state.currentSurveyState;
             if (!state.currentSurveyState.history) state.currentSurveyState.history = [];
             const question = survey.questions[currentQuestionIndex];
+            const section = question.section || question.header || '';
+            const isContactDetails = section === 'Patient Contact Details' || /patient contact details/i.test(section);
+            const isMedReviewSection = section === 'Medication Review' || /^medication/i.test(section);
+            if (isContactDetails) {
+                const contactUpdates = {};
+                ['firstName','lastName','phoneNumber','email','dob','sexAssignedAtBirth','address','city','state','zipCode'].forEach(key => {
+                    const el = form.querySelector(`[name="contact_${key}"]`);
+                    if (el) contactUpdates[key] = el.value;
+                });
+                if (contactUpdates.firstName || contactUpdates.lastName) {
+                    contactUpdates.initials = `${(contactUpdates.firstName || patient.firstName || '').charAt(0)}${(contactUpdates.lastName || patient.lastName || '').charAt(0)}`.toUpperCase();
+                }
+                if (contactUpdates.dob) contactUpdates.age = calculateAge(contactUpdates.dob) || null;
+                try {
+                    await updatePatientFields(patient.id, contactUpdates, 'survey_contact_details_updated', survey.title);
+                    Object.assign(patient, contactUpdates);
+                    const idx = state.patients.findIndex(p => p.id === patient.id);
+                    if (idx >= 0) state.patients[idx] = { ...state.patients[idx], ...contactUpdates };
+                } catch (err) {
+                    showNotification(err.message || 'Could not save contact details.', 'error');
+                    return;
+                }
+            }
             let answer = '';
             let nextQuestionTarget = 'submit';
-            if (question.type === 'open-text' || question.isScript) {
+            if (isContactDetails || isMedReviewSection || question.type === 'open-text' || question.isScript) {
                 answer = String(form.querySelector('[name="answer"]')?.value || '').trim();
-                if (!answer && !question.isScript) {
+                if (!answer && !question.isScript && !isContactDetails && !isMedReviewSection) {
                     showNotification('Please enter a response.', 'error');
                     return;
                 }
-                if (question.isScript && !answer) answer = 'Script read';
+                if ((question.isScript || isContactDetails || isMedReviewSection) && !answer) {
+                    answer = isContactDetails ? 'Contact details reviewed' : (isMedReviewSection ? 'Medications reviewed' : 'Script read');
+                }
                 nextQuestionTarget = form.querySelector('[name="answerNext"]')?.value
                     || (question.options && question.options[0] && question.options[0].next)
                     || 'submit';
@@ -10375,7 +10626,7 @@ document.addEventListener('submit', async (e) => {
                 if (!patient) throw new Error('Patient not found');
                 const allowed = {
                     contact: ['phoneNumber','email','address','city','state','zipCode'],
-                    demographics: ['firstName','lastName','dob','sexAssignedAtBirth','ethnicity','globalId'],
+                    demographics: ['firstName','lastName','initials','dob','sexAssignedAtBirth','ethnicity','globalId'],
                     study: ['overallStatus','pipelineStage','eligibilityStatus','screeningNumber','group'],
                     patientInfo: ['source','therapeuticArea','registryStatus','homeSiteId'],
                 };
@@ -10598,26 +10849,39 @@ document.addEventListener('submit', async (e) => {
             break;
         }
         case 'edit-study-form': {
-            const studyId = form.dataset.id;
-            const formData = new FormData(form);
-            const selectedSiteIds = formData.getAll('siteIds');
-            const existingStudy = state.studies.find(study => study.id === studyId);
-            
-            const updatedStudy = {
-                title: data.title,
-                protocolNumber: data.protocolNumber,
-                status: data.status,
-                target: parseInt(data.target),
-                washoutDays: data.washoutDays ? parseInt(data.washoutDays) : 30,
-                siteIds: selectedSiteIds,
-                sourceSystem: existingStudy?.sourceSystem || existingStudy?.integrationSource || existingStudy?.source || 'manual',
-                lastUpdated: new Date().toISOString()
-            };
-            await updateDocument('studies', studyId, updatedStudy);
-            await loadAllData();
-            closeModal();
-            render();
-            showNotification("Study updated successfully!", "success");
+            try {
+                const studyId = form.dataset.id;
+                const formData = new FormData(form);
+                const selectedSiteIds = formData.getAll('siteIds');
+                const existingStudy = state.studies.find(study => study.id === studyId);
+                if (!existingStudy) {
+                    showNotification('Study not found.', 'error');
+                    break;
+                }
+                const status = String(data.status || existingStudy.status || 'Recruiting');
+                const isArchived = status.toLowerCase() === 'archived';
+                const updatedStudy = {
+                    ...existingStudy,
+                    title: String(data.title || '').trim() || existingStudy.title,
+                    protocolNumber: data.protocolNumber || '',
+                    status,
+                    target: parseInt(data.target, 10) || existingStudy.target || 0,
+                    washoutDays: data.washoutDays ? parseInt(data.washoutDays, 10) : (existingStudy.washoutDays ?? 30),
+                    siteIds: selectedSiteIds,
+                    archived: isArchived,
+                    archivedAt: isArchived ? (existingStudy.archivedAt || new Date().toISOString()) : null,
+                    sourceSystem: existingStudy?.sourceSystem || existingStudy?.integrationSource || existingStudy?.source || 'manual',
+                    lastUpdated: new Date().toISOString()
+                };
+                await updateDocument('studies', studyId, updatedStudy);
+                await loadAllData();
+                closeModal();
+                render();
+                showNotification('Study updated successfully!', 'success');
+            } catch (err) {
+                console.error(err);
+                showNotification(err.message || 'Failed to update study.', 'error');
+            }
             break;
         }
         case 'edit-site-form': {
@@ -11008,11 +11272,24 @@ document.addEventListener('submit', async (e) => {
             if (data.surveyOutcome !== 'all') {
                 filteredPatients = filteredPatients.filter(p => p.surveyResults?.some(sr => sr.outcome === data.surveyOutcome));
             }
-            if (data.startDate) {
-                filteredPatients = filteredPatients.filter(p => p.appointment && new Date(p.appointment.time) >= new Date(data.startDate));
-            }
-            if (data.endDate) {
-                filteredPatients = filteredPatients.filter(p => p.appointment && new Date(p.appointment.time) <= new Date(data.endDate));
+            if (data.startDate || data.endDate) {
+                state.lastReportDateStart = data.startDate || null;
+                state.lastReportDateEnd = data.endDate || null;
+                const inRange = (raw) => {
+                    if (!raw) return false;
+                    const t = new Date(raw);
+                    if (Number.isNaN(t.getTime())) return false;
+                    if (data.startDate && t < new Date(data.startDate + 'T00:00:00')) return false;
+                    if (data.endDate && t > new Date(data.endDate + 'T23:59:59')) return false;
+                    return true;
+                };
+                filteredPatients = filteredPatients.filter(p =>
+                    (p.appointment && inRange(p.appointment.time)) ||
+                    (p.surveyResults || []).some(sr => inRange(sr.completedAt))
+                );
+            } else {
+                state.lastReportDateStart = null;
+                state.lastReportDateEnd = null;
             }
             state.lastReportData = filteredPatients;
             const exportBtn = document.getElementById('export-csv-btn');
@@ -11061,19 +11338,32 @@ document.addEventListener('submit', async (e) => {
             break;
         }
         case 'edit-past-enrollment-form': {
-            const { patientId, enrollmentIndex } = form.dataset;
-            const patient = state.patients.find(p => p.id === patientId);
-            if (patient && patient.enrollments[enrollmentIndex]) {
-                const updatedEnrollments = [...patient.enrollments];
-                updatedEnrollments[enrollmentIndex] = {
-                    ...updatedEnrollments[enrollmentIndex],
-                    studyId: data.studyId,
-                    siteId: data.siteId,
-                    enrolledDate: data.enrolledDate ? new Date(data.enrolledDate).toISOString() : null,
-                    exitedDate: data.exitedDate ? new Date(data.exitedDate).toISOString() : null,
-                };
-                await updateDocument('patients', patientId, { enrollments: updatedEnrollments });
-                closeModal();
+            try {
+                if (!isAdminUser()) {
+                    showNotification('Only admins can edit past enrollment records.', 'error');
+                    break;
+                }
+                const { patientId, enrollmentIndex } = form.dataset;
+                const patient = state.patients.find(p => p.id === patientId);
+                const idx = Number(enrollmentIndex);
+                if (patient && patient.enrollments?.[idx]) {
+                    const updatedEnrollments = [...patient.enrollments];
+                    updatedEnrollments[idx] = {
+                        ...updatedEnrollments[idx],
+                        studyId: data.studyId,
+                        siteId: data.siteId,
+                        enrolledDate: data.enrolledDate ? new Date(data.enrolledDate + 'T00:00:00').toISOString() : null,
+                        exitedDate: data.exitedDate ? new Date(data.exitedDate + 'T00:00:00').toISOString() : null,
+                    };
+                    await updatePatientFields(patientId, { enrollments: updatedEnrollments }, 'enrollment_edited', String(idx));
+                    await loadAllData();
+                    closeModal();
+                    const refreshed = state.patients.find(p => p.id === patientId);
+                    if (refreshed) openSidePanel(getPatientProfileHTML(refreshed), true);
+                    showNotification('Enrollment record updated.', 'success');
+                }
+            } catch (err) {
+                showNotification(err.message || 'Could not update enrollment.', 'error');
             }
             break;
         }
@@ -11522,6 +11812,11 @@ const renderBookedAppointmentsView = () => {
             return (appointment.studyId || schedule.studyId || currentEnrollment?.studyId) === state.schedulingStudyFilter;
         });
     }
+    if (state.schedulingVisitFilter !== 'all') {
+        bookedAppointments = bookedAppointments.filter(({ appointment, schedule }) =>
+            (appointment.visit || schedule.visit) === state.schedulingVisitFilter
+        );
+    }
     bookedAppointments.sort((a,b) => new Date(a.slot.startTime) - new Date(b.slot.startTime));
     let bookedHTML = `<h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">All Booked Appointments</h3>`;
     if (bookedAppointments.length > 0) {
@@ -11533,13 +11828,11 @@ const renderBookedAppointmentsView = () => {
                     <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Date & Time</th>
                     <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Patient</th>
                     <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Initials</th>
-                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Global ID</th>
                     <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Screening #</th>
-                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Group</th>
-                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Phone</th>
-                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
-                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Visit</th>
                     <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">In-Clinic Status</th>
+                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Study</th>
+                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Group</th>
+                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Visit</th>
                     <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Visit Outcome</th>
                 </tr></thead>
                 <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
@@ -11552,17 +11845,15 @@ const renderBookedAppointmentsView = () => {
                         <td class="px-3 py-3 whitespace-nowrap">${phi(new Date(slot.startTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }))}</td>
                         <td class="px-3 py-3"><button data-action="view-patient" data-id="${patient.id}" class="text-blue-600 dark:text-blue-400 hover:underline">${phiName(patient)}</button></td>
                         <td class="px-3 py-3">${phi(patient.initials || '—')}</td>
-                        <td class="px-3 py-3">${phi(patient.globalId || '—')}</td>
                         <td class="px-3 py-3">${phi(patient.screeningNumber || '—')}</td>
-                        <td class="px-3 py-3">${phi(appointment.group || patient.group || schedule.group || '—')}</td>
-                        <td class="px-3 py-3 whitespace-nowrap">${phi(patient.phoneNumber || '—')}</td>
-                        <td class="px-3 py-3">${state.studies.find(s => s.id === schedule.studyId)?.title || 'N/A'}</td>
-                        <td class="px-3 py-3">${appointment.visit || schedule.visit || 'General'}</td>
                         <td class="px-3 py-3 min-w-[140px]">
                             <form class="booked-inline-form" data-patient-id="${patient.id}" data-appointment-id="${appointmentKey}" data-field="inClinicStatus">
                                 <input type="text" name="inClinicStatus" value="${String(inClinicStatus).replace(/"/g, '&quot;')}" class="w-full p-1 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-xs" placeholder="Status">
                             </form>
                         </td>
+                        <td class="px-3 py-3">${state.studies.find(s => s.id === schedule.studyId)?.title || 'N/A'}</td>
+                        <td class="px-3 py-3">${phi(appointment.group || patient.group || schedule.group || '—')}</td>
+                        <td class="px-3 py-3">${appointment.visit || schedule.visit || 'General'}</td>
                         <td class="px-3 py-3 min-w-[160px]">
                             <form class="booked-inline-form" data-patient-id="${patient.id}" data-appointment-id="${appointmentKey}" data-field="visitOutcome">
                                 <select name="visitOutcome" ${canEditOutcome ? '' : 'disabled'} class="w-full p-1 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-xs">
@@ -11658,27 +11949,36 @@ const exportFive9CSV = () => {
             showNotification('Please generate a report before exporting Five9 phones.', 'info');
             return;
         }
-        const headers = ['number', 'first_name', 'last_name', 'email', 'global_id', 'status', 'overall_status'];
+        const headers = ['number', 'first_name', 'last_name', 'email', 'global_id', 'status', 'overall_status', 'site_name', 'city', 'state', 'zip', 'registry_status', 'therapeutic_area', 'source'];
         const rows = [headers.join(',')];
         patients.forEach(p => {
             const num = formatPhoneFive9(p.phoneNumber);
             if (!num) return;
-            // number column: plain digits only (17153074271) — no quotes/punctuation
+            const enrollment = p.enrollments?.find(e => e.status === 'current');
+            const site = state.sites.find(s => s.id === (enrollment?.siteId || p.homeSiteId || p.siteId));
+            const q = (v) => '"' + String(v || '').replace(/"/g, '""') + '"';
             rows.push([
                 num,
-                '"' + String(p.firstName || '').replace(/"/g, '""') + '"',
-                '"' + String(p.lastName || '').replace(/"/g, '""') + '"',
-                '"' + String(p.email || '').replace(/"/g, '""') + '"',
-                '"' + String(p.globalId || '').replace(/"/g, '""') + '"',
-                '"' + String(p.status || '').replace(/"/g, '""') + '"',
-                '"' + String(p.overallStatus || '').replace(/"/g, '""') + '"'
+                q(p.firstName),
+                q(p.lastName),
+                q(p.email),
+                q(p.globalId),
+                q(p.status),
+                q(p.overallStatus),
+                q(site?.name || ''),
+                q(p.city || site?.city || ''),
+                q(p.state || site?.state || ''),
+                q(p.zipCode || site?.zipCode || ''),
+                q(p.registryStatus),
+                q(p.therapeuticArea),
+                q(p.source)
             ].join(','));
         });
         const blob = new Blob([rows.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
         const link = document.createElement('a');
         const url = URL.createObjectURL(blob);
         link.setAttribute('href', url);
-        link.setAttribute('download', 'five9_phones_' + new Date().toISOString().split('T')[0] + '.csv');
+        link.setAttribute('download', 'five9_phones_' + toLocalDateKey(new Date()) + '.csv');
         link.style.visibility = 'hidden';
         document.body.appendChild(link);
         link.click();
@@ -11753,13 +12053,16 @@ const exportSurveysToCSV = () => {
         for (const p of patients) {
             if (p.surveyResults && p.surveyResults.length > 0) {
                 for (const result of p.surveyResults) {
+                    const completedAt = result.completedAt ? new Date(result.completedAt) : null;
+                    if (state.lastReportDateStart && completedAt && completedAt < new Date(state.lastReportDateStart + 'T00:00:00')) continue;
+                    if (state.lastReportDateEnd && completedAt && completedAt > new Date(state.lastReportDateEnd + 'T23:59:59')) continue;
                     if (result.answers && result.answers.length > 0) {
                         for (const answer of result.answers) {
                             csvRows.push([
                                 `"${p.id}"`,
                                 `"${p.firstName} ${p.lastName}"`,
                                 `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
-                                `"${new Date(result.completedAt).toISOString()}"`,
+                                `"${completedAt ? completedAt.toISOString() : ''}"`,
                                 `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
                                 `"${(answer.question || '').replace(/"/g, '""')}"`,
                                 `"${(answer.answer || '').replace(/"/g, '""')}"`
@@ -11770,7 +12073,7 @@ const exportSurveysToCSV = () => {
                             `"${p.id}"`,
                             `"${p.firstName} ${p.lastName}"`,
                             `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
-                            `"${new Date(result.completedAt).toISOString()}"`,
+                            `"${completedAt ? completedAt.toISOString() : ''}"`,
                             `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
                             `"N/A"`,
                             `"N/A"`
@@ -12035,6 +12338,16 @@ const init = async () => {
         
         await loadAllData();
         setupDataRefresh();
+        try {
+            const params = new URLSearchParams(window.location.search);
+            if (params.get('tab') === 'scheduling') {
+                state.activeTab = 'scheduling';
+                if (params.get('view')) state.schedulingView = params.get('view');
+                if (params.get('site')) state.schedulingSiteFilter = params.get('site');
+                if (params.get('study')) state.schedulingStudyFilter = params.get('study');
+                if (params.get('visit')) state.schedulingVisitFilter = params.get('visit');
+            }
+        } catch { /* ignore */ }
         render();
         
     } catch (error) {
