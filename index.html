@@ -649,10 +649,13 @@ let state = {
     patientSearchTerm: '',
     studySearchTerm: '',
     siteSearchTerm: '',
-    schedulingView: 'creator', // 'creator', 'calendar', 'day', 'booked'
+    schedulingView: 'creator', // 'creator', 'calendar', 'day', 'booked' (Visits UI)
     schedulingVisitFilter: 'all', // 'all', 'Visit 1', etc.
     schedulingSiteFilter: 'all',
     schedulingStudyFilter: 'all',
+    schedulingBookedDateFilter: 'today', // 'all' | 'today' | YYYY-MM-DD
+    visitScheduleTabs: [], // browser-like tabs: { id, label, siteId, studyId, visit, scheduleId }
+    activeVisitScheduleTabId: null,
     calendarDate: new Date(),
     bookingCalendarDate: new Date(), // For the patient booking modal
     studies: [],
@@ -4719,7 +4722,14 @@ const getSchedulingHTML = () => {
        <select id="scheduling-visit-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
            <option value="all">All Visits</option>
            ${[1,2,3,4,5].map(v => `<option value="Visit ${v}" ${state.schedulingVisitFilter === `Visit ${v}` ? 'selected' : ''}>Visit ${v}</option>`).join('')}
-       </select>`
+       </select>
+       ${state.schedulingView === 'booked' ? `
+       <select id="scheduling-booked-date-filter" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+           <option value="today" ${state.schedulingBookedDateFilter === 'today' ? 'selected' : ''}>Today</option>
+           <option value="all" ${state.schedulingBookedDateFilter === 'all' ? 'selected' : ''}>All Days</option>
+       </select>
+       <input type="date" id="scheduling-booked-date-picker" value="${/^\d{4}-\d{2}-\d{2}$/.test(state.schedulingBookedDateFilter || '') ? state.schedulingBookedDateFilter : toLocalDateKey(new Date())}" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" title="Pick a specific day">
+       ` : ''}`
         : '';
     const visitFilterHTML = (state.schedulingView === 'calendar' || state.schedulingView === 'day') 
         ? `` 
@@ -4734,7 +4744,7 @@ const getSchedulingHTML = () => {
                 <button data-action="set-scheduling-view" data-view="creator" class="${state.schedulingView === 'creator' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 dark:text-gray-300'} px-4 py-2 rounded-md text-sm font-medium">Creator</button>
                 <button data-action="set-scheduling-view" data-view="calendar" class="${state.schedulingView === 'calendar' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 dark:text-gray-300'} px-4 py-2 rounded-md text-sm font-medium">Month</button>
                 <button data-action="set-scheduling-view" data-view="day" class="${state.schedulingView === 'day' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 dark:text-gray-300'} px-4 py-2 rounded-md text-sm font-medium">Day</button>
-                <button data-action="set-scheduling-view" data-view="booked" class="${state.schedulingView === 'booked' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 dark:text-gray-300'} px-4 py-2 rounded-md text-sm font-medium">Booked</button>
+                <button data-action="set-scheduling-view" data-view="booked" class="${state.schedulingView === 'booked' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 dark:text-gray-300'} px-4 py-2 rounded-md text-sm font-medium">Visits</button>
             </div>
         </div>
     </div>
@@ -5840,7 +5850,7 @@ const getManageRHTML = () => {
                         <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Backfills denormalized enrollment and appointment fields for registry queries.</p>
                     </div>
                     <div class="mt-4 p-4 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-900/40">
-                        <h3 class="font-semibold dark:text-white mb-2">Visit Outcome options (Booked view)</h3>
+                        <h3 class="font-semibold dark:text-white mb-2">Visit Outcome options (Visits view)</h3>
                         <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">Current locked list used for Visit Outcome dropdowns. Contact ops/dev to change production values; shown here for recruiters/admins:</p>
                         <ul class="text-sm dark:text-gray-300 list-disc pl-5">${VISIT_OUTCOME_OPTIONS.map(o => `<li>${o}</li>`).join('')}</ul>
                     </div>
@@ -9243,12 +9253,15 @@ document.addEventListener('click', async (e) => {
                 const siteId = actionButton.dataset.siteId || 'all';
                 const studyId = actionButton.dataset.studyId || 'all';
                 const visit = actionButton.dataset.visit || 'all';
+                const scheduleId = actionButton.dataset.scheduleId || '';
+                openVisitScheduleTab({ siteId, studyId, visit, scheduleId });
                 const params = new URLSearchParams({
                     tab: 'scheduling',
                     view: 'booked',
                     site: siteId,
                     study: studyId,
                     visit: visit || 'all',
+                    day: state.schedulingBookedDateFilter || 'today',
                 });
                 try {
                     const shareUrl = `${window.location.origin}${window.location.pathname}?${params.toString()}`;
@@ -9263,7 +9276,44 @@ document.addEventListener('click', async (e) => {
                     schedulingStudyFilter: studyId || 'all',
                     schedulingVisitFilter: visit || 'all',
                 });
-                showNotification('Opened Booked view for this visit. Link copied to clipboard.', 'success');
+                showNotification('Opened Visits tab for this schedule. Link copied to clipboard.', 'success');
+                break;
+            }
+            case 'activate-visit-schedule-tab': {
+                const tabId = actionButton.dataset.tabId;
+                const tab = (state.visitScheduleTabs || []).find(t => t.id === tabId);
+                if (!tab) break;
+                state.activeVisitScheduleTabId = tabId;
+                setState({
+                    activeTab: 'scheduling',
+                    schedulingView: 'booked',
+                    schedulingSiteFilter: tab.siteId || 'all',
+                    schedulingStudyFilter: tab.studyId || 'all',
+                    schedulingVisitFilter: tab.visit || 'all',
+                });
+                break;
+            }
+            case 'close-visit-schedule-tab': {
+                const tabId = actionButton.dataset.tabId;
+                const tabs = (state.visitScheduleTabs || []).filter(t => t.id !== tabId);
+                state.visitScheduleTabs = tabs;
+                if (state.activeVisitScheduleTabId === tabId) {
+                    const next = tabs[tabs.length - 1] || null;
+                    state.activeVisitScheduleTabId = next?.id || null;
+                    if (next) {
+                        setState({
+                            schedulingSiteFilter: next.siteId || 'all',
+                            schedulingStudyFilter: next.studyId || 'all',
+                            schedulingVisitFilter: next.visit || 'all',
+                            schedulingView: 'booked',
+                            activeTab: 'scheduling',
+                        });
+                    } else if (state.schedulingView === 'booked') {
+                        renderBookedAppointmentsView();
+                    }
+                } else if (state.schedulingView === 'booked') {
+                    renderBookedAppointmentsView();
+                }
                 break;
             }
             case 'schedule-remaining-visits': {
@@ -9433,6 +9483,13 @@ document.addEventListener('change', async (e) => {
     }
     if (e.target.id === 'scheduling-study-filter') {
         setState({ schedulingStudyFilter: e.target.value });
+    }
+    if (e.target.id === 'scheduling-booked-date-filter') {
+        setState({ schedulingBookedDateFilter: e.target.value });
+    }
+    if (e.target.id === 'scheduling-booked-date-picker') {
+        const day = e.target.value;
+        if (day) setState({ schedulingBookedDateFilter: day });
     }
     if (e.target.id === 'pipeline-study-filter' || e.target.id === 'pipeline-assignee-filter') {
         if (state.activeTab === 'pipeline') renderPipelineBoard();
@@ -11792,6 +11849,21 @@ const renderDayView = () => {
     container.innerHTML = dayHTML;
     lucide.createIcons();
 };
+const openVisitScheduleTab = ({ siteId, studyId, visit, scheduleId }) => {
+    const siteName = state.sites.find(s => s.id === siteId)?.name || 'Site';
+    const studyName = state.studies.find(s => s.id === studyId)?.title || 'Study';
+    const visitLabel = visit || 'Visit';
+    const tabId = [siteId || 'all', studyId || 'all', visitLabel].join('|');
+    const label = `${visitLabel} · ${studyName} · ${siteName}`;
+    const existing = (state.visitScheduleTabs || []).find(t => t.id === tabId);
+    const tabs = existing
+        ? state.visitScheduleTabs
+        : [...(state.visitScheduleTabs || []), { id: tabId, label, siteId: siteId || 'all', studyId: studyId || 'all', visit: visitLabel, scheduleId: scheduleId || '' }];
+    state.visitScheduleTabs = tabs;
+    state.activeVisitScheduleTabId = tabId;
+    return tabId;
+};
+
 const renderBookedAppointmentsView = () => {
     const container = document.getElementById('booked-view-container');
     if(!container) return;
@@ -11826,8 +11898,33 @@ const renderBookedAppointmentsView = () => {
             (appointment.visit || schedule.visit) === state.schedulingVisitFilter
         );
     }
+    const dateFilter = state.schedulingBookedDateFilter || 'today';
+    if (dateFilter !== 'all') {
+        const dayKey = dateFilter === 'today' ? toLocalDateKey(new Date()) : dateFilter;
+        bookedAppointments = bookedAppointments.filter(({ slot }) => toLocalDateKey(slot.startTime) === dayKey);
+    }
     bookedAppointments.sort((a,b) => new Date(a.slot.startTime) - new Date(b.slot.startTime));
-    let bookedHTML = `<h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">All Booked Appointments</h3>`;
+    const tabs = state.visitScheduleTabs || [];
+    const tabsHTML = tabs.length ? `
+        <div class="flex items-center gap-1 mb-4 overflow-x-auto border-b dark:border-gray-700 pb-0">
+            ${tabs.map(tab => `
+                <div class="flex items-center shrink-0 rounded-t-md border border-b-0 dark:border-gray-600 ${state.activeVisitScheduleTabId === tab.id ? 'bg-white dark:bg-gray-800 border-blue-500' : 'bg-gray-100 dark:bg-gray-900/50'}">
+                    <button type="button" data-action="activate-visit-schedule-tab" data-tab-id="${tab.id}" class="px-3 py-2 text-sm ${state.activeVisitScheduleTabId === tab.id ? 'text-blue-700 dark:text-blue-300 font-semibold' : 'text-gray-600 dark:text-gray-300'}">${escapeHtmlPhi(tab.label)}</button>
+                    <button type="button" data-action="close-visit-schedule-tab" data-tab-id="${tab.id}" class="px-2 py-2 text-gray-400 hover:text-red-500" title="Close tab"><i data-lucide="x" class="w-3.5 h-3.5"></i></button>
+                </div>
+            `).join('')}
+        </div>
+    ` : '';
+    const dayLabel = dateFilter === 'all'
+        ? 'All days'
+        : (dateFilter === 'today' ? `Today (${toLocalDateKey(new Date())})` : dateFilter);
+    let bookedHTML = `
+        ${tabsHTML}
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+            <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Clinic Visit Schedule</h3>
+            <p class="text-sm text-gray-500 dark:text-gray-400">${dayLabel} · ${bookedAppointments.length} visit${bookedAppointments.length === 1 ? '' : 's'}</p>
+        </div>
+    `;
     if (bookedAppointments.length > 0) {
         const canEditOutcome = isAdminUser();
         bookedHTML += `
@@ -11878,7 +11975,7 @@ const renderBookedAppointmentsView = () => {
             </div>
         `;
     } else {
-        bookedHTML += `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No appointments have been booked with the current filters.</p>`;
+        bookedHTML += `<p class="text-center text-gray-500 dark:text-gray-400 py-8">No clinic visits match the current filters.</p>`;
     }
     container.innerHTML = bookedHTML;
     lucide.createIcons();
@@ -12355,6 +12452,15 @@ const init = async () => {
                 if (params.get('site')) state.schedulingSiteFilter = params.get('site');
                 if (params.get('study')) state.schedulingStudyFilter = params.get('study');
                 if (params.get('visit')) state.schedulingVisitFilter = params.get('visit');
+                if (params.get('day')) state.schedulingBookedDateFilter = params.get('day');
+                if (params.get('view') === 'booked' && (params.get('visit') || params.get('site') || params.get('study'))) {
+                    openVisitScheduleTab({
+                        siteId: params.get('site') || 'all',
+                        studyId: params.get('study') || 'all',
+                        visit: params.get('visit') || 'all',
+                        scheduleId: '',
+                    });
+                }
             }
         } catch { /* ignore */ }
         render();
