@@ -1897,6 +1897,8 @@ const getUserScopeForApi = () => {
 const patientHasRecruitmentStatus = (patient) => String(patient?.status || '').trim().length > 0;
 
 const patientVisibleToCurrentUser = (patient) => {
+    if (!patient) return false;
+    if (patient.status === 'Merged' || patient.mergedIntoId) return false;
     const allowedSites = getUserAllowedSiteIds();
     const allowedStudies = getUserAllowedStudyIds();
     if (allowedSites === null && allowedStudies === null) return true;
@@ -2269,11 +2271,11 @@ const appendPatientAuditEntry = (patient, action, details = '') => ({
     user: getCurrentActor()
 });
 
-const updatePatientFields = async (patientId, fields, auditAction = null, auditDetails = '') => {
+const updatePatientFields = async (patientId, fields, auditAction = null, auditDetails = '', options = {}) => {
     const patient = await resolvePatientById(patientId);
     if (!patient) throw new Error('Patient not found');
     const unlocking = fields.profileLocked === false || fields.deceased === false;
-    if (isPatientProfileLocked(patient) && !(unlocking && isManagerUser())) {
+    if (isPatientProfileLocked(patient) && !(unlocking && isManagerUser()) && !options.allowWhenLocked) {
         throw new Error('Profile is locked (deceased). A manager must unlock it before edits.');
     }
     const updates = { ...fields, lastUpdated: new Date().toISOString() };
@@ -9830,19 +9832,34 @@ document.addEventListener('submit', async (e) => {
                     ...(updates.auditTrail || keep.auditTrail || []),
                     appendPatientAuditEntry(keep, 'profiles_merged', `Merged from ${mergeIds.join(', ')}`)
                 ];
-                await updatePatientFields(keepId, updates, 'profiles_merged', mergeIds.join(', '));
+                await updatePatientFields(keepId, updates, 'profiles_merged', mergeIds.join(', '), { allowWhenLocked: true });
+                const mergeErrors = [];
                 for (const mid of mergeIds) {
-                    await updatePatientFields(mid, {
-                        registryStatus: 'Inactive',
-                        status: 'Merged',
-                        mergedIntoId: keepId,
-                        profileLocked: true,
-                        doNotContact: true
-                    }, 'profile_merged_away', `Merged into ${keepId}`);
+                    try {
+                        await updatePatientFields(mid, {
+                            registryStatus: 'Inactive',
+                            status: 'Merged',
+                            mergedIntoId: keepId,
+                            profileLocked: true,
+                            doNotContact: true
+                        }, 'profile_merged_away', `Merged into ${keepId}`, { allowWhenLocked: true });
+                    } catch (dupErr) {
+                        console.warn('Soft-merge failed, attempting delete for', mid, dupErr);
+                        try {
+                            await deleteDocument('patients', mid);
+                        } catch (delErr) {
+                            mergeErrors.push(`${mid}: ${dupErr.message || delErr.message || 'failed'}`);
+                        }
+                    }
                 }
                 await loadAllData();
+                state.patients = (state.patients || []).filter(p => p.status !== 'Merged' && !p.mergedIntoId);
                 closeModal();
-                showNotification('Profiles merged. Duplicate(s) marked inactive.', 'success');
+                if (mergeErrors.length) {
+                    showNotification('Merged into keep profile, but some duplicates need cleanup: ' + mergeErrors.join('; '), 'warning');
+                } else {
+                    showNotification('Profiles merged. Duplicate(s) removed from active lists.', 'success');
+                }
                 openSidePanel(getPatientProfileHTML(state.patients.find(p => p.id === keepId)), true);
             } catch (err) {
                 console.error(err);

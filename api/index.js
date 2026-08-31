@@ -261,8 +261,8 @@ const validateStudiesSchema = (data) => {
             errors.push('target must be a non-negative number');
         }
         
-        if (data.status && !['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended'].includes(data.status)) {
-            errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended');
+        if (data.status && !['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended', 'Closed', 'Archived'].includes(data.status)) {
+            errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended, Closed, Archived');
         }
         
         if (data.indication && !Array.isArray(data.indication)) {
@@ -498,8 +498,8 @@ const validatePatientsSchema = (data) => {
         errors.push('condition must be a string');
     }
 
-    if (patient.status && !['Candidate', 'Pre-Screening', 'Enrolled', 'Screen Fail', 'Completed'].includes(patient.status)) {
-        errors.push('status must be one of: Candidate, Pre-Screening, Enrolled, Screen Fail, Completed');
+    if (patient.status && !['Candidate', 'Pre-Screening', 'Enrolled', 'Screen Fail', 'Completed', 'Merged'].includes(patient.status)) {
+        errors.push('status must be one of: Candidate, Pre-Screening, Enrolled, Screen Fail, Completed, Merged');
     }
 
     if (patient.registryStatus && !['Active', 'Inactive', 'Do Not Call'].includes(patient.registryStatus)) {
