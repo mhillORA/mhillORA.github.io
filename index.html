@@ -2116,11 +2116,22 @@ const ensureImportStudyAndSite = async ({
     return { studyId: study.id, siteId: site.id, study, site };
 };
 
-const ingestWaitlistCandidates = async ({ candidates, studyId, siteId }) => {
+const ingestWaitlistCandidates = async ({ candidates, studyId, siteId, onProgress = null }) => {
     if (!candidates?.length) return { created: 0, matched: 0 };
     let created = 0;
     let matched = 0;
-    for (const c of candidates) {
+    const total = candidates.length;
+    for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        if (typeof onProgress === 'function') {
+            onProgress({
+                phase: 'waitlist',
+                done: i,
+                total,
+                label: 'Importing waitlist',
+                detail: `${c.firstName || ''} ${c.lastName || ''}`.trim()
+            });
+        }
         const existing = findPatientForSubjectImport(c);
         if (existing) {
             matched += 1;
@@ -2152,6 +2163,9 @@ const ingestWaitlistCandidates = async ({ candidates, studyId, siteId }) => {
         const patient = normalizePatientRecord(convertPatientFromAzureFormat({ ...draftPatient, ...(createdDoc || {}) }));
         if (!state.patients.some(p => p.id === patient.id)) state.patients.push(patient);
         created += 1;
+    }
+    if (typeof onProgress === 'function') {
+        onProgress({ phase: 'waitlist', done: total, total, label: 'Waitlist complete', detail: `${created} new · ${matched} matched` });
     }
     return { created, matched };
 };
@@ -2428,7 +2442,17 @@ const getSubjectImportModalHTML = () => {
             </div>
             <div class="flex flex-wrap gap-2">
                 <button type="button" data-action="subject-import-load-sample" class="px-3 py-2 rounded-md bg-gray-200 dark:bg-gray-700 dark:text-white text-sm">Load sample subjects (today)</button>
-                <button type="submit" class="px-4 py-2 rounded-md bg-indigo-600 text-white text-sm hover:bg-indigo-700" ${mapped.length ? '' : 'disabled'}>Ingest into Visits (${mapped.length || 0} rows)</button>
+                <button type="submit" id="subject-import-submit" class="px-4 py-2 rounded-md bg-indigo-600 text-white text-sm hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed" ${mapped.length ? '' : 'disabled'}>Ingest into Visits (${mapped.length || 0} rows)</button>
+            </div>
+            <div id="subject-import-progress-wrap" class="hidden space-y-1">
+                <div class="flex justify-between text-xs text-gray-600 dark:text-gray-300">
+                    <span id="subject-import-progress-label">Preparing…</span>
+                    <span id="subject-import-progress-pct">0%</span>
+                </div>
+                <div class="h-2.5 w-full rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
+                    <div id="subject-import-progress-bar" class="h-full rounded-full bg-indigo-600 transition-[width] duration-200 ease-out" style="width:0%"></div>
+                </div>
+                <p id="subject-import-progress-detail" class="text-xs text-gray-500 dark:text-gray-400"></p>
             </div>
             <div id="subject-import-status" class="text-sm text-gray-500 dark:text-gray-400"></div>
             ${mapped.length ? `
@@ -2467,7 +2491,24 @@ const setupSubjectImportModalDependencies = () => {
     fillSites();
 };
 
-const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, startDate, endDate, startTime, intervalMinutes, includeSf = false }) => {
+const updateSubjectImportProgress = ({ done = 0, total = 0, label = '', detail = '' } = {}) => {
+    const wrap = document.getElementById('subject-import-progress-wrap');
+    const bar = document.getElementById('subject-import-progress-bar');
+    const pctEl = document.getElementById('subject-import-progress-pct');
+    const labelEl = document.getElementById('subject-import-progress-label');
+    const detailEl = document.getElementById('subject-import-progress-detail');
+    if (!wrap || !bar) return;
+    wrap.classList.remove('hidden');
+    const safeTotal = Math.max(0, Number(total) || 0);
+    const safeDone = Math.max(0, Math.min(safeTotal || Number(done) || 0, Number(done) || 0));
+    const pct = safeTotal > 0 ? Math.min(100, Math.round((safeDone / safeTotal) * 100)) : 0;
+    bar.style.width = `${pct}%`;
+    if (pctEl) pctEl.textContent = `${pct}%`;
+    if (labelEl) labelEl.textContent = label || (safeTotal ? `Uploading ${safeDone} of ${safeTotal}` : 'Working…');
+    if (detailEl) detailEl.textContent = detail || (safeTotal ? `${safeDone} / ${safeTotal}` : '');
+};
+
+const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, startDate, endDate, startTime, intervalMinutes, includeSf = false, onProgress = null }) => {
     if (!subjects?.length) throw new Error('No subjects to ingest.');
     if (!studyId || !siteId) throw new Error('Study and site are required.');
     const interval = Math.max(5, parseInt(intervalMinutes, 10) || 30);
@@ -2523,8 +2564,33 @@ const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, st
     const scheduleIds = [];
     const firstDay = toLocalDateKey(stamped[0].slotStart);
     const patientCache = new Map();
+    const totalRows = stamped.length;
+    const report = (done, visitName, subject) => {
+        if (typeof onProgress !== 'function') return;
+        const name = subject ? `${subject.firstName || ''} ${subject.lastName || ''}`.trim() : '';
+        onProgress({
+            phase: 'visits',
+            done,
+            total: totalRows,
+            label: `Uploading visits`,
+            detail: `${done} / ${totalRows}`
+                + (visitName ? ` · ${visitName}` : '')
+                + (name ? ` · ${name}` : '')
+                + ` · ${createdPatients} new · ${matchedPatients} matched`
+        });
+    };
+    report(0, '', null);
 
     for (const [visitName, visitSubjects] of byVisit.entries()) {
+        if (typeof onProgress === 'function') {
+            onProgress({
+                phase: 'schedule',
+                done: booked,
+                total: totalRows,
+                label: `Creating ${visitName} schedule`,
+                detail: `${visitSubjects.length} slots`
+            });
+        }
         const slots = visitSubjects.map((s, i) => ({
             id: `slot-import-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
             startTime: s.slotStart.toISOString(),
@@ -2551,6 +2617,7 @@ const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, st
         for (let i = 0; i < visitSubjects.length; i++) {
             const subject = visitSubjects[i];
             const slot = scheduleRef.slots[i];
+            report(booked, visitName, subject);
             const cacheKey = [
                 String(subject.globalId || '').trim(),
                 String(subject.screeningNumber || '').trim().toLowerCase(),
@@ -2634,6 +2701,7 @@ const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, st
             }, 'subject_import_booked', `${newAppt.visit} ${slot.startTime}`, { allowWhenLocked: true });
             slot.booked = subject.isCancelledOrSf ? 0 : 1;
             booked += 1;
+            report(booked, visitName, subject);
         }
 
         await updateDocument('schedules', scheduleId, {
@@ -2643,9 +2711,25 @@ const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, st
         });
     }
 
+    if (typeof onProgress === 'function') {
+        onProgress({
+            phase: 'visits',
+            done: totalRows,
+            total: totalRows,
+            label: 'Visits uploaded',
+            detail: `${booked} booked · ${createdPatients} new · ${matchedPatients} matched`
+        });
+    }
+
+    const visitSchedules = scheduleIds.map((id, index) => ({
+        scheduleId: id,
+        visit: [...byVisit.keys()][index] || visit || 'Visit',
+    }));
+
     return {
         scheduleId: scheduleIds[0],
         scheduleIds,
+        visitSchedules,
         createdPatients,
         matchedPatients,
         booked,
@@ -10404,7 +10488,13 @@ document.addEventListener('click', async (e) => {
                 const studyId = actionButton.dataset.studyId || 'all';
                 const visit = actionButton.dataset.visit || 'all';
                 const scheduleId = actionButton.dataset.scheduleId || '';
-                openVisitScheduleTab({ siteId, studyId, visit, scheduleId });
+                openVisitScheduleTab({
+                    siteId,
+                    studyId,
+                    visit,
+                    scheduleId,
+                    dayFilter: state.schedulingBookedDateFilter || 'today',
+                });
                 const params = new URLSearchParams({
                     tab: 'scheduling',
                     view: 'booked',
@@ -10426,7 +10516,7 @@ document.addEventListener('click', async (e) => {
                     schedulingStudyFilter: studyId || 'all',
                     schedulingVisitFilter: visit || 'all',
                 });
-                showNotification('Opened Visits tab for this schedule. Link copied to clipboard.', 'success');
+                showNotification(`Opened Visits tab (${state.visitScheduleTabs.length} open). Link copied.`, 'success');
                 break;
             }
             case 'activate-visit-schedule-tab': {
@@ -10440,6 +10530,7 @@ document.addEventListener('click', async (e) => {
                     schedulingSiteFilter: tab.siteId || 'all',
                     schedulingStudyFilter: tab.studyId || 'all',
                     schedulingVisitFilter: tab.visit || 'all',
+                    schedulingBookedDateFilter: tab.dayFilter || state.schedulingBookedDateFilter || 'today',
                 });
                 break;
             }
@@ -10455,6 +10546,7 @@ document.addEventListener('click', async (e) => {
                             schedulingSiteFilter: next.siteId || 'all',
                             schedulingStudyFilter: next.studyId || 'all',
                             schedulingVisitFilter: next.visit || 'all',
+                            schedulingBookedDateFilter: next.dayFilter || state.schedulingBookedDateFilter || 'today',
                             schedulingView: 'booked',
                             activeTab: 'scheduling',
                         });
@@ -10636,10 +10728,16 @@ document.addEventListener('change', async (e) => {
     }
     if (e.target.id === 'scheduling-booked-date-filter') {
         setState({ schedulingBookedDateFilter: e.target.value });
+        const activeTab = (state.visitScheduleTabs || []).find(t => t.id === state.activeVisitScheduleTabId);
+        if (activeTab) activeTab.dayFilter = e.target.value;
     }
     if (e.target.id === 'scheduling-booked-date-picker') {
         const day = e.target.value;
-        if (day) setState({ schedulingBookedDateFilter: day });
+        if (day) {
+            setState({ schedulingBookedDateFilter: day });
+            const activeTab = (state.visitScheduleTabs || []).find(t => t.id === state.activeVisitScheduleTabId);
+            if (activeTab) activeTab.dayFilter = day;
+        }
     }
     if (e.target.id === 'subject-import-file') {
         const file = e.target.files && e.target.files[0];
@@ -11677,10 +11775,15 @@ document.addEventListener('submit', async (e) => {
         }
         case 'subject-import-form': {
             const statusEl = document.getElementById('subject-import-status');
+            const submitBtn = document.getElementById('subject-import-submit') || form.querySelector('button[type="submit"]');
             const setStatus = (msg, cls = 'text-blue-500') => {
                 if (!statusEl) return;
                 statusEl.textContent = msg;
                 statusEl.className = `text-sm ${cls}`;
+            };
+            const onProgress = (p) => {
+                updateSubjectImportProgress(p);
+                setStatus(p.label || 'Uploading…');
             };
             try {
                 const draft = state.subjectImportDraft || {};
@@ -11689,12 +11792,14 @@ document.addEventListener('submit', async (e) => {
                     setStatus('Load a roster file or sample subjects first.', 'text-red-500');
                     return;
                 }
+                if (submitBtn) submitBtn.disabled = true;
                 const useVandaDefaults = !!(form.querySelector('[name="useVandaDefaults"]')?.checked || data.useVandaDefaults);
                 const includeSf = !!(form.querySelector('[name="includeSf"]')?.checked || data.includeSf);
                 const importWaitlist = !!(form.querySelector('[name="importWaitlist"]')?.checked || data.importWaitlist);
                 let studyId = data.studyId || '';
                 let siteId = data.siteId || '';
                 if (useVandaDefaults || !studyId || !siteId) {
+                    updateSubjectImportProgress({ done: 0, total: 1, label: 'Ensuring study + site…', detail: 'Vanda VSJ-2202 / Test Site' });
                     setStatus('Ensuring Vanda VSJ-2202 + Test Site…');
                     const ensured = await ensureImportStudyAndSite();
                     studyId = studyId || ensured.studyId;
@@ -11702,9 +11807,11 @@ document.addEventListener('submit', async (e) => {
                 }
                 if (!studyId || !siteId) {
                     setStatus('Select a study and site, or enable Vanda defaults.', 'text-red-500');
+                    if (submitBtn) submitBtn.disabled = false;
                     return;
                 }
                 setStatus(`Ingesting ${subjects.length} visit rows…`);
+                updateSubjectImportProgress({ done: 0, total: subjects.length, label: 'Starting ingest…', detail: `${subjects.length} rows` });
                 const result = await ingestSubjectRoster({
                     subjects,
                     studyId,
@@ -11715,7 +11822,8 @@ document.addEventListener('submit', async (e) => {
                     endDate: data.endDate,
                     startTime: data.startTime || '07:00',
                     intervalMinutes: data.interval || 20,
-                    includeSf
+                    includeSf,
+                    onProgress
                 });
                 let waitlistResult = { created: 0, matched: 0 };
                 if (importWaitlist && (draft.waitlistCandidates || []).length) {
@@ -11723,17 +11831,30 @@ document.addEventListener('submit', async (e) => {
                     waitlistResult = await ingestWaitlistCandidates({
                         candidates: draft.waitlistCandidates,
                         studyId,
-                        siteId
+                        siteId,
+                        onProgress
                     });
                 }
+                updateSubjectImportProgress({ done: 1, total: 1, label: 'Refreshing…', detail: 'Loading Visits' });
                 await loadAllData();
                 state.subjectImportDraft = null;
                 closeModal();
+                const tabEntries = (result.visitSchedules || []).map(vs => ({
+                    siteId,
+                    studyId,
+                    visit: vs.visit,
+                    scheduleId: vs.scheduleId,
+                    dayFilter: result.firstDay || 'today',
+                }));
+                if (tabEntries.length) openVisitScheduleTabs(tabEntries);
+                else openVisitScheduleTab({ siteId, studyId, visit: 'all', scheduleId: result.scheduleId, dayFilter: result.firstDay || 'today' });
                 openVisitScheduleTab({
                     siteId,
                     studyId,
                     visit: 'all',
-                    scheduleId: result.scheduleId
+                    scheduleId: '',
+                    dayFilter: result.firstDay || 'today',
+                    label: 'All visits · imported',
                 });
                 setState({
                     activeTab: 'scheduling',
@@ -11747,13 +11868,14 @@ document.addEventListener('submit', async (e) => {
                     `Ingested ${result.booked} visits / ${result.scheduleIds?.length || 1} schedules`
                     + ` (${result.createdPatients} new, ${result.matchedPatients} matched)`
                     + (importWaitlist ? `; waitlist +${waitlistResult.created}` : '')
-                    + '. Showing Visits.',
+                    + ` · ${state.visitScheduleTabs.length} Visits tabs open.`,
                     'success'
                 );
             } catch (err) {
                 console.error(err);
                 setStatus(err.message || 'Ingest failed.', 'text-red-500');
                 showNotification(err.message || 'Subject ingest failed.', 'error');
+                if (submitBtn) submitBtn.disabled = false;
             }
             break;
         }
@@ -13143,19 +13265,42 @@ const renderDayView = () => {
     container.innerHTML = dayHTML;
     lucide.createIcons();
 };
-const openVisitScheduleTab = ({ siteId, studyId, visit, scheduleId }) => {
+const openVisitScheduleTab = ({ siteId, studyId, visit, scheduleId, dayFilter, label: labelOverride } = {}) => {
     const siteName = state.sites.find(s => s.id === siteId)?.name || 'Site';
     const studyName = state.studies.find(s => s.id === studyId)?.title || 'Study';
-    const visitLabel = visit || 'Visit';
-    const tabId = [siteId || 'all', studyId || 'all', visitLabel].join('|');
-    const label = `${visitLabel} · ${studyName} · ${siteName}`;
-    const existing = (state.visitScheduleTabs || []).find(t => t.id === tabId);
-    const tabs = existing
-        ? state.visitScheduleTabs
-        : [...(state.visitScheduleTabs || []), { id: tabId, label, siteId: siteId || 'all', studyId: studyId || 'all', visit: visitLabel, scheduleId: scheduleId || '' }];
+    const visitLabel = visit || 'all';
+    // Include scheduleId so multiple schedules for the same visit stay as separate tabs
+    const tabId = [siteId || 'all', studyId || 'all', visitLabel, scheduleId || 'any'].join('|');
+    const label = labelOverride || (visitLabel === 'all'
+        ? `${studyName} · ${siteName}`
+        : `${visitLabel} · ${studyName} · ${siteName}`);
+    const tabs = [...(state.visitScheduleTabs || [])];
+    const existingIdx = tabs.findIndex(t => t.id === tabId);
+    const nextTab = {
+        id: tabId,
+        label,
+        siteId: siteId || 'all',
+        studyId: studyId || 'all',
+        visit: visitLabel,
+        scheduleId: scheduleId || '',
+        dayFilter: dayFilter || state.schedulingBookedDateFilter || 'today',
+    };
+    if (existingIdx >= 0) tabs[existingIdx] = { ...tabs[existingIdx], ...nextTab };
+    else tabs.push(nextTab);
     state.visitScheduleTabs = tabs;
     state.activeVisitScheduleTabId = tabId;
     return tabId;
+};
+
+/** Open one Visits tab per visit (keeps prior tabs). Activates the last one. */
+const openVisitScheduleTabs = (entries = []) => {
+    const list = (entries || []).filter(e => e && (e.visit || e.scheduleId || e.siteId || e.studyId));
+    if (!list.length) return null;
+    let lastId = null;
+    list.forEach(entry => {
+        lastId = openVisitScheduleTab(entry);
+    });
+    return lastId;
 };
 
 const renderBookedAppointmentsView = () => {
