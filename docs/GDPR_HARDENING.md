@@ -11,7 +11,7 @@ This is an engineering checklist — not legal advice. Have counsel confirm lawf
 | Area | Reality today |
 |------|----------------|
 | Personal data | Site PI/coordinator names & emails; survey answers; optional response `email`/`displayName`; patient enrollment records |
-| Public survey links | `site-survey.html?assignmentId=…` must stay reachable without login |
+| Public survey links | `site-survey.html?t=…` opaque invite token (hash at rest); legacy `assignmentId` rejected |
 | Admin UI | Gated by ARTEMIS login (session in browser); Azure Functions routes are still `authLevel: anonymous` |
 | Cross-origin | API returns `Access-Control-Allow-Origin: *` |
 | Chaos/NASA | Shared Cosmos + username auth; leave those contracts alone |
@@ -54,13 +54,15 @@ Env knobs:
 
 ## Phase 2 — Access control (next)
 
-- [ ] Keep public: `GET` assignment by id, `GET` definition by id, `POST` response for that assignment only
-- [ ] Require Function key **or** session token for:
-  - list-all survey definitions / assignments / responses
-  - create/edit definitions, create assignments, privacy ops
+- [x] Public responder uses opaque token (`/api/public/site-survey`) — not raw assignment list access from the form
+- [x] Invite token hashed at rest; raw shown once; expiry + resend rotation
+- [x] Rate-limit public survey GET/POST (in-function best-effort)
+- [x] Narrow CORS when `SURVEY_CORS_ORIGINS` / `STATIC_WEB_APP_URL` is a single origin
+- [ ] Require Function key **or** session token for list-all survey definitions / assignments / responses
 - [ ] Stop shipping a hardcoded admin backdoor in the client
-- [ ] Narrow CORS to the ARTEMIS Static Web App origin(s)
-- [ ] Rate-limit public survey POST (Azure Front Door / APIM / Function)
+- [ ] Front Door / APIM hard rate limits for public survey POST
+
+See also `docs/SITE_SURVEY_SECURITY.md`.
 
 **Do not** put Function keys in CHAOS/NASA clients.
 

@@ -653,7 +653,9 @@ const validateSurveyAssignmentsSchema = (data) => {
     if (!data.siteId || typeof data.siteId !== 'string') errors.push('siteId is required and must be a string');
     if (!data.targetRole || typeof data.targetRole !== 'string') errors.push('targetRole is required and must be a string');
     if (data.targetEmail && typeof data.targetEmail !== 'string') errors.push('targetEmail must be a string');
-    if (data.status && !['sent', 'opened', 'submitted', 'closed'].includes(String(data.status).toLowerCase())) errors.push('status must be one of: sent, opened, submitted, closed');
+    if (data.status && !['sent', 'opened', 'submitted', 'closed', 'revoked'].includes(String(data.status).toLowerCase())) {
+        errors.push('status must be one of: sent, opened, submitted, closed, revoked');
+    }
     if (errors.length > 0) throw new Error(`VALIDATION_ERROR: SurveyAssignments validation failed: ${errors.join(', ')}`);
     return true;
 };
@@ -1280,12 +1282,26 @@ app.http('surveyDefinitions', {
     handler: (request, context) => crudHandler(context, request, 'site-survey-definitions'),
 });
 
+const {
+    redactAssignment,
+    attachInviteToken,
+    buildInviteUrl,
+    registerSurveySecureRoutes,
+} = require('./survey-secure-routes');
+const { writeSurveyResponse: writeSiteSurveyResponse } = require('./lib/survey-response-service');
+
 function jsonHeaders() {
+    const allowed = (process.env.SURVEY_CORS_ORIGINS || process.env.STATIC_WEB_APP_URL || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const origin = allowed.length === 1 ? allowed[0] : '*';
     return {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': origin,
         'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+        'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Artemis-Operator',
+        'Cache-Control': 'no-store',
     };
 }
 
@@ -1343,12 +1359,27 @@ app.http('surveyAssignments', {
                             .query(query, { enableCrossPartitionQuery: true })
                             .fetchAll();
                         return {
-                            jsonBody: sortByIsoDesc(resources || [], ['createdAt', '_ts']),
+                            jsonBody: sortByIsoDesc(resources || [], ['createdAt', '_ts']).map(redactAssignment),
                             headers: jsonHeaders(),
                         };
                     } catch (error) {
                         return handleError(context, error, 'Query site-survey-assignments');
                     }
+                }
+            } else {
+                // Single assignment — never expose tokenHash
+                try {
+                    const container = getContainer('site-survey-assignments');
+                    const read = await container.item(id, id).read();
+                    if (!read.resource) {
+                        return { status: 404, jsonBody: { error: 'Assignment not found' }, headers: jsonHeaders() };
+                    }
+                    return { jsonBody: redactAssignment(read.resource), headers: jsonHeaders() };
+                } catch (error) {
+                    if (error.code === 404 || error.statusCode === 404) {
+                        return { status: 404, jsonBody: { error: 'Assignment not found' }, headers: jsonHeaders() };
+                    }
+                    return handleError(context, error, 'Get site-survey-assignments');
                 }
             }
         }
@@ -1359,9 +1390,35 @@ app.http('surveyAssignments', {
                 if (!body.status) body.status = 'sent';
                 if (!body.createdAt) body.createdAt = new Date().toISOString();
                 body.updatedAt = new Date().toISOString();
-                request.json = async () => body;
-            } catch (e) {
-                // fall through; crudHandler will return appropriate error
+                body.allowResubmit = body.allowResubmit !== false;
+                if (!body.id) body.id = generateId();
+
+                // Mint opaque invite token (raw returned once; hash stored)
+                const baseUrl = body.baseUrl ? String(body.baseUrl).replace(/\/$/, '') : '';
+                const { raw, inviteUrl } = attachInviteToken(body, {
+                    expiresInDays: body.expiresInDays,
+                    baseUrl: baseUrl || undefined,
+                });
+                delete body.baseUrl;
+                delete body.expiresInDays;
+                delete body.tokenRaw;
+                delete body.inviteToken;
+
+                validateSurveyAssignmentsSchema(body);
+                const container = getContainer('site-survey-assignments');
+                const { resource } = await container.items.create(body);
+                const safe = redactAssignment(resource);
+                return {
+                    status: 201,
+                    jsonBody: {
+                        ...safe,
+                        inviteUrl: inviteUrl || (baseUrl ? buildInviteUrl(baseUrl, raw) : null),
+                        inviteToken: raw,
+                    },
+                    headers: jsonHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'Create site-survey-assignments');
             }
         }
 
@@ -1382,6 +1439,12 @@ app.http('surveyAssignments', {
                         return { status: 404, jsonBody: { error: 'Assignment not found' }, headers: jsonHeaders() };
                     }
                     const body = await request.json();
+                    // Public clients must not rotate or clear invite secrets via PATCH
+                    delete body.tokenHash;
+                    delete body.tokenPrefix;
+                    delete body.tokenRaw;
+                    delete body.inviteToken;
+                    delete body.inviteUrl;
                     const merged = {
                         ...existing,
                         ...body,
@@ -1389,6 +1452,9 @@ app.http('surveyAssignments', {
                         surveyId: existing.surveyId,
                         siteId: existing.siteId,
                         targetRole: body.targetRole || existing.targetRole,
+                        tokenHash: existing.tokenHash,
+                        tokenPrefix: existing.tokenPrefix,
+                        expiresAt: existing.expiresAt || body.expiresAt,
                         updatedAt: new Date().toISOString(),
                     };
                     // Never reopen a submitted assignment via an "opened" ping
@@ -1398,14 +1464,22 @@ app.http('surveyAssignments', {
                     }
                     validateSurveyAssignmentsSchema(merged);
                     const { resource } = await container.items.upsert(merged);
-                    return { jsonBody: resource, headers: jsonHeaders() };
+                    return { jsonBody: redactAssignment(resource), headers: jsonHeaders() };
                 } catch (error) {
                     return handleError(context, error, 'Update site-survey-assignments');
                 }
             }
         }
 
-        return crudHandler(context, request, 'site-survey-assignments');
+        const result = await crudHandler(context, request, 'site-survey-assignments');
+        if (result?.jsonBody) {
+            if (Array.isArray(result.jsonBody)) {
+                result.jsonBody = result.jsonBody.map(redactAssignment);
+            } else if (result.jsonBody.id) {
+                result.jsonBody = redactAssignment(result.jsonBody);
+            }
+        }
+        return result;
     },
 });
 
@@ -1461,7 +1535,6 @@ app.http('surveyResponses', {
         if (request.method === 'POST') {
             try {
                 const body = await request.json();
-                const now = new Date().toISOString();
                 if (!body.assignmentId) {
                     return { status: 400, jsonBody: { error: 'assignmentId is required' }, headers: jsonHeaders() };
                 }
@@ -1478,119 +1551,22 @@ app.http('surveyResponses', {
                     return { status: 400, jsonBody: { error: 'Assignment not found' }, headers: jsonHeaders() };
                 }
 
-                // Stamp identity from assignment so the client cannot attach answers to the wrong site
-                body.surveyId = assignment.surveyId;
-                body.siteId = assignment.siteId;
-                body.targetRole = assignment.targetRole || body.targetRole;
-                body.submittedAt = body.submittedAt || now;
-                body.updatedAt = now;
-                if (!Array.isArray(body.answers)) body.answers = [];
+                const result = await writeSiteSurveyResponse(
+                    { getContainer, generateId, validateSurveyResponsesSchema },
+                    {
+                        assignment,
+                        answers: Array.isArray(body.answers) ? body.answers : [],
+                        email: body.email,
+                        displayName: body.displayName,
+                        isDraft: false,
+                    }
+                );
 
-                        // Compute score if definition has scoringWeight on questions
-                const computeScore = async (answers) => {
-                    try {
-                        const defC = getContainer('site-survey-definitions');
-                        const defRead = await defC.item(body.surveyId, body.surveyId).read();
-                        const def = defRead.resource;
-                        if (!def || !Array.isArray(def.questions)) return null;
-                        const scorableQs = def.questions.filter(q => typeof q.scoringWeight === 'number' && q.scoringWeight > 0 && q.scoringOptions);
-                        if (!scorableQs.length) return null;
-                        let totalWeight = 0;
-                        let earned = 0;
-                        scorableQs.forEach(q => {
-                            const ans = (Array.isArray(answers) ? answers : []).find(a => a.questionId === q.id || a.questionId === String(q.id));
-                            if (!ans || ans.skipped) return;
-                            totalWeight += q.scoringWeight;
-                            const opts = Array.isArray(q.scoringOptions) ? q.scoringOptions : [];
-                            const match = opts.find(o => String(o.value ?? o.label ?? '') === String(ans.value ?? '').trim());
-                            if (match && typeof match.points === 'number') earned += match.points;
-                        });
-                        if (totalWeight === 0) return null;
-                        return { earned, totalWeight, pct: Math.round((earned / totalWeight) * 100) };
-                    } catch (_) { return null; }
+                return {
+                    status: result.created ? 201 : 200,
+                    jsonBody: { ...result.resource, resubmitted: result.resubmitted },
+                    headers: jsonHeaders(),
                 };
-
-                const rspC = getContainer('site-survey-responses');
-                // Find prior responses for same siteId+surveyId+targetRole (any assignment link)
-                const { resources: existing } = await rspC.items.query({
-                    query: 'SELECT * FROM c WHERE c.siteId = @siteId AND c.surveyId = @surveyId AND c.targetRole = @targetRole',
-                    parameters: [
-                        { name: '@siteId', value: String(body.siteId) },
-                        { name: '@surveyId', value: String(body.surveyId) },
-                        { name: '@targetRole', value: String(body.targetRole) },
-                    ],
-                }, { enableCrossPartitionQuery: true }).fetchAll();
-
-                const score = await computeScore(body.answers);
-                if (score !== null) body.score = score;
-
-                if (existing && existing.length) {
-                    const prior = sortByIsoDesc(existing, ['submittedAt', 'createdAt'])[0];
-                    // Archive the old response (preserve history)
-                    try {
-                        await rspC.items.upsert({
-                            ...prior,
-                            id: `${prior.id}_archived_${now}`,
-                            _archived: true,
-                            _archivedAt: now,
-                            _replacedBy: prior.id,
-                        });
-                    } catch (_) { /* non-fatal */ }
-                    // Merge: new answers overwrite matching questionIds; old answers fill gaps where new answer is empty/skipped
-                    const oldAnswerMap = new Map((prior.answers || []).map(a => [String(a.questionId ?? a.id ?? ''), a]));
-                    const mergedAnswers = (Array.isArray(body.answers) ? body.answers : []).map(a => {
-                        const hasValue = !a.skipped && String(a.value ?? '').trim() !== '';
-                        if (!hasValue) {
-                            const prev = oldAnswerMap.get(String(a.questionId ?? ''));
-                            if (prev && !prev.skipped && String(prev.value ?? '').trim() !== '') {
-                                return { ...a, value: prev.value, _keptFromPrior: true };
-                            }
-                        }
-                        return a;
-                    });
-                    const reScore = await computeScore(mergedAnswers);
-                    const updated = {
-                        ...prior,
-                        ...body,
-                        id: prior.id,
-                        answers: mergedAnswers,
-                        submittedAt: now,
-                        updatedAt: now,
-                        _resubmitCount: (prior._resubmitCount || 0) + 1,
-                        score: reScore !== null ? reScore : body.score ?? prior.score ?? null,
-                    };
-                    validateSurveyResponsesSchema(updated);
-                    const { resource } = await rspC.items.upsert(updated);
-                    // Keep assignment stamped as submitted
-                    try {
-                        const asgC2 = getContainer('site-survey-assignments');
-                        await asgC2.items.upsert({
-                            ...assignment,
-                            status: 'submitted',
-                            submittedAt: prior.submittedAt || now,
-                            updatedAt: now,
-                        });
-                    } catch (_) { /* non-fatal */ }
-                    return { status: 200, jsonBody: { ...resource, resubmitted: true }, headers: jsonHeaders() };
-                }
-
-                validateSurveyResponsesSchema(body);
-                const created = { ...body, id: generateId(), createdAt: now };
-                const { resource } = await rspC.items.create(created);
-
-                try {
-                    const asgC = getContainer('site-survey-assignments');
-                    await asgC.items.upsert({
-                        ...assignment,
-                        status: 'submitted',
-                        submittedAt: now,
-                        updatedAt: now,
-                    });
-                } catch (markErr) {
-                    context.log.warn('Response saved but assignment status update failed', markErr);
-                }
-
-                return { status: 201, jsonBody: resource, headers: jsonHeaders() };
             } catch (error) {
                 return handleError(context, error, 'Create site-survey-responses');
             }
@@ -2671,4 +2647,16 @@ registerPrivacyRoutes(app, {
     getCosmosClient,
     handleError,
     generateId,
+});
+
+// =================================================================================
+// Secure site surveys (opaque tokens, public form, bulk send, notifications)
+// =================================================================================
+registerSurveySecureRoutes(app, {
+    getContainer,
+    getCosmosClient,
+    handleError,
+    generateId,
+    validateSurveyResponsesSchema,
+    validateSurveyAssignmentsSchema,
 });

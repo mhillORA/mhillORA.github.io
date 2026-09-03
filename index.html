@@ -951,7 +951,10 @@
             async createSiteSurveyAssignment(assignment) {
                 return this.request('/site-survey-assignments', {
                     method: 'POST',
-                    body: JSON.stringify(assignment)
+                    body: JSON.stringify({
+                        ...assignment,
+                        baseUrl: assignment.baseUrl || window.location.origin
+                    })
                 });
             }
 
@@ -965,6 +968,48 @@
             async deleteSiteSurveyAssignment(id) {
                 return this.request(`/site-survey-assignments/${id}`, {
                     method: 'DELETE'
+                });
+            }
+
+            /** Bulk send unique secure links to selected sites (staff emails). */
+            async sendSiteSurveys(payload) {
+                let operator = 'unknown';
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) operator = u.username;
+                } catch (_) {}
+                return this.request('/site-survey-send', {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({
+                        ...payload,
+                        baseUrl: payload.baseUrl || window.location.origin,
+                        operator
+                    })
+                });
+            }
+
+            async resendSiteSurvey(assignmentId, payload = {}) {
+                return this.request(`/site-survey-assignments/${encodeURIComponent(assignmentId)}/resend`, {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({
+                        ...payload,
+                        baseUrl: payload.baseUrl || window.location.origin
+                    })
+                });
+            }
+
+            async getSiteSurveyNotifications({ unreadOnly = false } = {}) {
+                const q = unreadOnly ? '?unread=1' : '';
+                return this.request(`/site-survey-notifications${q}`);
+            }
+
+            async markSiteSurveyNotificationsRead(ids) {
+                return this.request('/site-survey-notifications', {
+                    method: 'POST',
+                    body: JSON.stringify({ ids: Array.isArray(ids) ? ids : [ids] })
                 });
             }
 
@@ -2098,7 +2143,7 @@
             const pendingHtml = pending.length ? `
                 <div class="rounded-xl border border-amber-200 dark:border-amber-800/50 bg-amber-50/60 dark:bg-amber-900/10 p-4 mb-4">
                     <div class="text-sm font-semibold text-amber-900 dark:text-amber-100">${pending.length} survey link${pending.length === 1 ? '' : 's'} awaiting response</div>
-                    <div class="text-xs text-amber-800/80 dark:text-amber-200/80 mt-1">Open Comms to copy links or resend.</div>
+                    <div class="text-xs text-amber-800/80 dark:text-amber-200/80 mt-1">Open Comms to resend a secure link.</div>
                 </div>` : '';
 
             const cards = latestBySurvey.map((r, idx) => {
@@ -2806,9 +2851,8 @@
                                     Surveys:
                                     ${(s.assignments || []).length
                                         ? (s.assignments || []).slice(0, 4).map(a => {
-                                            const url = `${window.location.origin}/site-survey.html?assignmentId=${encodeURIComponent(a.id)}`;
-                                            const label = `${a.status || 'sent'} • ${String(a.createdAt || '').slice(0, 10) || 'date'} • ${String(a.surveyId || '').slice(0, 8)}`;
-                                            return `<a class="text-blue-600 dark:text-blue-400 underline mr-2" href="${url}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`;
+                                            const label = `${a.status || 'sent'} • ${String(a.createdAt || '').slice(0, 10) || 'date'}`;
+                                            return `<button type="button" class="resend-site-survey-btn text-blue-600 dark:text-blue-400 underline mr-2" data-assignment-id="${escapeHtml(a.id)}">${escapeHtml(label)}</button>`;
                                         }).join(' ')
                                         : '—'}
                                 </div>
@@ -2938,7 +2982,7 @@
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                         <div>
                             <h2 class="text-2xl sm:text-3xl font-bold text-gray-800 dark:text-gray-200">Communications</h2>
-                            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Predefined feasibility templates + custom surveys. Clone to reuse, Send for a unique link.</p>
+                            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Build templates, send unique secure links to site staff, track responses. Question-level reporting lives under Reporting.</p>
                         </div>
                         <div class="flex gap-2">
                             <button id="new-site-survey-btn" class="inline-flex items-center px-4 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 text-sm font-medium">
@@ -2987,16 +3031,29 @@
 
                     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                         <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden">
-                            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-700 font-semibold">Assignments (Unique Links)</div>
+                            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-700 font-semibold">Assignments (secure links)</div>
                             <div class="p-4">
                                 <div id="site-survey-assignments-list" class="space-y-2"></div>
                             </div>
                         </div>
                         <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden lg:col-span-1">
-                            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-700 font-semibold">Responses</div>
+                            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-700 font-semibold flex items-center justify-between gap-2">
+                                <span>Responses</span>
+                                <button type="button" id="jump-survey-reporting-btn" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline">Question report →</button>
+                            </div>
                             <div class="p-4">
                                 <div id="site-survey-responses-list" class="space-y-2"></div>
                             </div>
+                        </div>
+                    </div>
+
+                    <div class="rounded-lg border border-emerald-200 dark:border-emerald-900/40 bg-white dark:bg-gray-800 overflow-hidden">
+                        <div class="px-4 py-3 border-b border-emerald-200 dark:border-emerald-900/40 font-semibold text-emerald-900 dark:text-emerald-100 flex items-center justify-between gap-2">
+                            <span>Survey activity</span>
+                            <button type="button" id="mark-survey-notifications-read-btn" class="text-xs font-medium text-emerald-700 dark:text-emerald-300 hover:underline">Mark all read</button>
+                        </div>
+                        <div class="p-4">
+                            <div id="site-survey-activity-list" class="space-y-2 text-sm"></div>
                         </div>
                     </div>
 
@@ -3101,29 +3158,44 @@
             }
 
             if (asnEl) {
-                const base = window.location.origin;
                 let assignments = asSurveyList(allSiteSurveyAssignments).slice();
                 if (commsSiteFilterId) assignments = assignments.filter(a => a && a.siteId === commsSiteFilterId);
                 assignments.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
                 asnEl.innerHTML = assignments.length === 0
-                    ? `<div class="text-sm text-gray-500 dark:text-gray-400">No assignments yet.</div>`
+                    ? `<div class="text-sm text-gray-500 dark:text-gray-400">No assignments yet. Use Send Survey to mint unique links.</div>`
                     : assignments.map(a => {
                         const siteName = allSites.find(s => s.id === a.siteId)?.name || a.siteId;
                         const surveyTitle = asSurveyList(allSiteSurveyDefinitions).find(d => d.id === a.surveyId)?.title || a.surveyId;
-                        const url = `${base}/site-survey.html?assignmentId=${encodeURIComponent(a.id)}`;
+                        const exp = a.expiresAt ? new Date(a.expiresAt).toLocaleDateString() : '—';
+                        const email = a.targetEmail || '—';
                         return `
                             <div class="p-3 rounded-md border border-gray-200 dark:border-gray-700">
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <div class="font-semibold text-gray-900 dark:text-gray-100 truncate">${escapeHtml(siteName)} • ${escapeHtml(formatSiteSurveyRoleLabel(a.targetRole))}</div>
-                                        <div class="text-xs text-gray-500 dark:text-gray-400">${escapeHtml(surveyTitle)} • Status: ${escapeHtml(a.status || 'sent')}</div>
-                                        <div class="text-xs text-gray-500 dark:text-gray-400 truncate">Link: <a class="text-blue-600 dark:text-blue-400 underline" href="${url}" target="_blank" rel="noreferrer">${url}</a></div>
+                                        <div class="text-xs text-gray-500 dark:text-gray-400">${escapeHtml(surveyTitle)} • ${escapeHtml(a.status || 'sent')} • expires ${escapeHtml(exp)}</div>
+                                        <div class="text-xs text-gray-500 dark:text-gray-400 truncate">${escapeHtml(email)}${a.tokenPrefix ? ` · token ${escapeHtml(a.tokenPrefix)}…` : a.hasInviteToken ? '' : ' · legacy (no token)'}</div>
                                     </div>
-                                    <button type="button" class="copy-site-survey-link-btn px-3 py-1.5 rounded-md bg-gray-100 dark:bg-gray-700 text-sm" data-url="${url}">Copy</button>
+                                    <button type="button" class="resend-site-survey-btn px-3 py-1.5 rounded-md bg-gray-100 dark:bg-gray-700 text-sm shrink-0" data-assignment-id="${escapeHtml(a.id)}">Resend</button>
                                 </div>
                             </div>
                         `;
                     }).join('');
+            }
+
+            const activityEl = document.getElementById('site-survey-activity-list');
+            if (activityEl) {
+                const notes = Array.isArray(window.__siteSurveyNotifications) ? window.__siteSurveyNotifications : [];
+                activityEl.innerHTML = notes.length === 0
+                    ? `<div class="text-gray-500 dark:text-gray-400">No survey activity yet. Submits and sends will show up here.</div>`
+                    : notes.slice(0, 40).map(n => `
+                        <div class="flex items-start justify-between gap-2 py-2 border-b border-gray-100 dark:border-gray-700/80 ${n.read ? 'opacity-60' : ''}">
+                            <div class="min-w-0">
+                                <div class="font-medium text-gray-900 dark:text-gray-100">${escapeHtml(n.summary || n.kind || 'Event')}</div>
+                                <div class="text-xs text-gray-500 dark:text-gray-400">${escapeHtml(n.createdAt ? new Date(n.createdAt).toLocaleString() : '')}${n.kind ? ` · ${escapeHtml(n.kind)}` : ''}</div>
+                            </div>
+                            ${n.responseId ? `<button type="button" class="view-site-survey-response-btn text-xs text-indigo-600 dark:text-indigo-400 hover:underline shrink-0" data-response-id="${escapeHtml(n.responseId)}">View</button>` : ''}
+                        </div>`).join('');
             }
 
             if (rspEl) {
@@ -3552,49 +3624,75 @@
                 return `<option value="${escapeHtml(d.id)}" ${d.id === preferredSurveyId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
             };
 
+            const emailFor = (site, role) => {
+                if (role === 'pi') return site.piEmail || '';
+                return site.siteCoordinatorEmail || '';
+            };
+
+            const siteRows = sites.map(s => {
+                const checked = prefillSiteId && s.id === prefillSiteId ? 'checked' : (!prefillSiteId ? '' : '');
+                const pi = emailFor(s, 'pi');
+                const coord = emailFor(s, 'coordinator');
+                return `
+                    <label class="flex items-start gap-3 p-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/50 border border-transparent hover:border-gray-200 dark:hover:border-gray-600">
+                        <input type="checkbox" name="siteIds" value="${escapeHtml(s.id)}" class="mt-1" ${checked} ${noSites ? 'disabled' : ''} />
+                        <span class="min-w-0">
+                            <span class="block font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(s.name || s.id)}</span>
+                            <span class="block text-xs text-gray-500 dark:text-gray-400 truncate">PI: ${escapeHtml(pi || 'no email')} · Coord: ${escapeHtml(coord || 'no email')}</span>
+                        </span>
+                    </label>`;
+            }).join('');
+
             const modalHTML = `
                 <div class="modal-backdrop">
-                    <div class="modal-content import-modal-content dark:bg-gray-800">
+                    <div class="modal-content import-modal-content dark:bg-gray-800" style="max-width: 42rem;">
                         <form id="site-survey-assignment-form" ${prefillSiteId ? 'data-return-tab="sites"' : ''}>
                             <div class="p-6 space-y-4">
                                 <div>
                                     <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">Send Site Survey</h2>
-                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Creates a unique link for a site and role. Artemis does not send email by itself — the link is copied so you can paste it into your own message.</p>
+                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Pick a template and sites. Each site+role gets a unique secure link, prefilled from their latest answers. Staff PII only — never put patient data in surveys.</p>
                                 </div>
-                                ${noDefs ? `<div class="p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-900 dark:text-amber-100">Create a survey template first (New Site Survey). Without a definition, nothing can be assigned.</div>` : ''}
-                                ${noSites ? `<div class="p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-900 dark:text-amber-100">No sites loaded. Add sites (or fix API data) before sending a survey link.</div>` : ''}
-                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    <div class="md:col-span-2">
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Survey</label>
-                                        <select name="surveyId" required class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" ${noDefs ? 'disabled' : ''}>
-                                            <option value="">Select…</option>
-                                            ${predefined.length ? `<optgroup label="Predefined feasibility">${predefined.map(optionHtml).join('')}</optgroup>` : ''}
-                                            ${custom.length ? `<optgroup label="Custom surveys">${custom.map(optionHtml).join('')}</optgroup>` : ''}
-                                        </select>
-                                    </div>
-                                    <div class="md:col-span-2">
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site</label>
-                                        <select name="siteId" required class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" ${noSites ? 'disabled' : ''}>
-                                            <option value="">Select…</option>
-                                            ${sites.map(s => `<option value="${escapeHtml(s.id)}" ${s.id === prefillSiteId ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
-                                        </select>
-                                    </div>
+                                ${noDefs ? `<div class="p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-900 dark:text-amber-100">Create a survey template first (New Site Survey).</div>` : ''}
+                                ${noSites ? `<div class="p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-900 dark:text-amber-100">No sites loaded.</div>` : ''}
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Survey</label>
+                                    <select name="surveyId" required class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" ${noDefs ? 'disabled' : ''}>
+                                        <option value="">Select…</option>
+                                        ${predefined.length ? `<optgroup label="Predefined feasibility">${predefined.map(optionHtml).join('')}</optgroup>` : ''}
+                                        ${custom.length ? `<optgroup label="Custom surveys">${custom.map(optionHtml).join('')}</optgroup>` : ''}
+                                    </select>
+                                </div>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                    <fieldset>
+                                        <legend class="text-sm font-medium text-gray-700 dark:text-gray-300">Roles</legend>
+                                        <label class="mt-2 flex items-center gap-2 text-sm"><input type="checkbox" name="role_pi" value="pi" checked /> PI</label>
+                                        <label class="mt-1 flex items-center gap-2 text-sm"><input type="checkbox" name="role_coordinator" value="coordinator" /> Coordinator</label>
+                                    </fieldset>
                                     <div>
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Target Role</label>
-                                        <select name="targetRole" required class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" ${noDefs ? 'disabled' : ''}>
-                                            <option value="pi">PI</option>
-                                            <option value="coordinator">Coordinator</option>
-                                        </select>
-                                    </div>
-                                    <div>
-                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Recipient email (optional)</label>
-                                        <input name="targetEmail" type="email" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" placeholder="For your records; opens draft in mail app" ${noDefs ? 'disabled' : ''} />
+                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Link expires (days)</label>
+                                        <input name="expiresInDays" type="number" min="1" max="365" value="30" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
                                     </div>
                                 </div>
+                                <div>
+                                    <div class="flex items-center justify-between gap-2 mb-2">
+                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Sites</label>
+                                        <div class="flex gap-2 text-xs">
+                                            <button type="button" id="survey-send-select-all" class="text-indigo-600 dark:text-indigo-400 hover:underline">Select all</button>
+                                            <button type="button" id="survey-send-select-none" class="text-indigo-600 dark:text-indigo-400 hover:underline">Clear</button>
+                                        </div>
+                                    </div>
+                                    <div class="max-h-56 overflow-y-auto rounded-md border border-gray-200 dark:border-gray-600 p-2 space-y-1 bg-white dark:bg-gray-900/30">
+                                        ${siteRows || '<div class="text-sm text-gray-500 p-2">No sites</div>'}
+                                    </div>
+                                </div>
+                                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                                    <input type="checkbox" name="sendEmail" checked />
+                                    Attempt email delivery (uses SURVEY_EMAIL_WEBHOOK if configured; otherwise you can copy links after send)
+                                </label>
                                 <div id="site-survey-assignment-error" class="text-sm text-red-600 dark:text-red-300 hidden"></div>
                             </div>
                             <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 flex flex-row-reverse gap-2">
-                                <button type="submit" class="inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-gray-800 text-base font-medium text-white hover:bg-gray-900 sm:w-auto sm:text-sm disabled:opacity-50 disabled:cursor-not-allowed" ${noDefs || noSites ? 'disabled' : ''}>Create link &amp; copy</button>
+                                <button type="submit" class="inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 sm:w-auto sm:text-sm disabled:opacity-50 disabled:cursor-not-allowed" ${noDefs || noSites ? 'disabled' : ''}>Send secure links</button>
                                 <button type="button" data-action="cancel" class="inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-base font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 sm:w-auto sm:text-sm">Cancel</button>
                             </div>
                         </form>
@@ -3602,6 +3700,59 @@
                 </div>
             `;
             showModal(modalHTML);
+            document.getElementById('survey-send-select-all')?.addEventListener('click', () => {
+                document.querySelectorAll('#site-survey-assignment-form input[name="siteIds"]').forEach(cb => { cb.checked = true; });
+            });
+            document.getElementById('survey-send-select-none')?.addEventListener('click', () => {
+                document.querySelectorAll('#site-survey-assignment-form input[name="siteIds"]').forEach(cb => { cb.checked = false; });
+            });
+        };
+
+        const showSiteSurveySendResultsModal = (payload) => {
+            const results = Array.isArray(payload?.results) ? payload.results : [];
+            const rows = results.map(r => `
+                <tr class="border-t border-gray-100 dark:border-gray-700">
+                    <td class="py-2 pr-3 text-sm">${escapeHtml(r.siteName || r.siteId)}</td>
+                    <td class="py-2 pr-3 text-sm">${escapeHtml(formatSiteSurveyRoleLabel(r.targetRole))}</td>
+                    <td class="py-2 pr-3 text-sm truncate max-w-[10rem]">${escapeHtml(r.targetEmail || '—')}</td>
+                    <td class="py-2 pr-3 text-xs">${escapeHtml(r.email?.ok ? r.email.mode : (r.email?.error || r.email?.mode || 'manual'))}</td>
+                    <td class="py-2">
+                        <button type="button" class="copy-site-survey-link-btn text-indigo-600 dark:text-indigo-400 text-sm hover:underline" data-url="${escapeHtml(r.inviteUrl || '')}">Copy link</button>
+                    </td>
+                </tr>`).join('');
+            const modalHTML = `
+                <div class="modal-backdrop">
+                    <div class="modal-content import-modal-content dark:bg-gray-800" style="max-width: 48rem;">
+                        <div class="p-6 space-y-4">
+                            <div>
+                                <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">Links created</h2>
+                                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">${results.length} invite${results.length === 1 ? '' : 's'} for ${escapeHtml(payload.surveyTitle || payload.surveyId || 'survey')}. Raw tokens are shown once — copy now or use Resend later.</p>
+                            </div>
+                            <div class="overflow-x-auto max-h-80 overflow-y-auto">
+                                <table class="min-w-full text-left">
+                                    <thead class="text-xs uppercase text-gray-500">
+                                        <tr><th class="py-1 pr-3">Site</th><th class="py-1 pr-3">Role</th><th class="py-1 pr-3">Email</th><th class="py-1 pr-3">Delivery</th><th class="py-1">Link</th></tr>
+                                    </thead>
+                                    <tbody>${rows || '<tr><td class="py-3 text-sm text-gray-500" colspan="5">No results</td></tr>'}</tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 flex justify-end">
+                            <button type="button" data-action="cancel" class="inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-sm font-medium text-gray-700 dark:text-gray-200">Done</button>
+                        </div>
+                    </div>
+                </div>`;
+            showModal(modalHTML);
+            document.querySelectorAll('.copy-site-survey-link-btn').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    try {
+                        await navigator.clipboard.writeText(btn.getAttribute('data-url') || '');
+                        showNotification('Link copied', 'success');
+                    } catch {
+                        showNotification('Copy failed', 'error');
+                    }
+                });
+            });
         };
 
         const updateDashboardStats = (studies, sites, patients) => {
@@ -8444,57 +8595,41 @@
                 if (errEl) errEl.classList.add('hidden');
                 try {
                     const surveyId = form.surveyId.value;
-                    const siteId = form.siteId.value;
-                    const targetRole = form.targetRole.value;
-                    const targetEmail = form.targetEmail.value.trim();
+                    const siteIds = [...form.querySelectorAll('input[name="siteIds"]:checked')].map(cb => cb.value);
+                    const targetRoles = [];
+                    if (form.role_pi?.checked) targetRoles.push('pi');
+                    if (form.role_coordinator?.checked) targetRoles.push('coordinator');
+                    const expiresInDays = Number(form.expiresInDays?.value || 30);
+                    const sendEmail = !!form.sendEmail?.checked;
 
-                    if (!surveyId || !siteId) {
-                        throw new Error('Choose both a survey and a site. If lists are empty, create a survey or load sites from the API.');
-                    }
+                    if (!surveyId) throw new Error('Choose a survey template.');
+                    if (!siteIds.length) throw new Error('Select at least one site.');
+                    if (!targetRoles.length) throw new Error('Select at least one role (PI and/or Coordinator).');
 
-                    const created = await apiService.createSiteSurveyAssignment({
+                    const payload = await apiService.sendSiteSurveys({
                         surveyId,
-                        siteId,
-                        targetRole,
-                        targetEmail: targetEmail || undefined,
-                        status: 'sent',
-                        createdAt: new Date().toISOString()
+                        siteIds,
+                        targetRoles,
+                        expiresInDays,
+                        sendEmail,
+                        baseUrl: window.location.origin
                     });
-
-                    const url = `${window.location.origin}/site-survey.html?assignmentId=${encodeURIComponent(created.id)}`;
-                    let copied = false;
-                    try {
-                        await navigator.clipboard.writeText(url);
-                        copied = true;
-                    } catch {
-                        copied = false;
-                    }
-                    if (copied) {
-                        showNotification('Survey link created and copied to clipboard.', 'success');
-                    } else {
-                        console.info('Survey link (copy manually):', url);
-                        showNotification(`Link created. Clipboard unavailable — copy from the Communications list or console.`, 'warning');
-                    }
-
-                    if (targetEmail) {
-                        const subject = encodeURIComponent('Site survey — action requested');
-                        const body = encodeURIComponent(`Please complete the site survey using this link:\n\n${url}\n`);
-                        try {
-                            window.open(`mailto:${encodeURIComponent(targetEmail)}?subject=${subject}&body=${body}`);
-                        } catch (_) { /* ignore */ }
-                    }
 
                     closeModal();
                     await initializeDataLoaders();
+                    showSiteSurveySendResultsModal(payload);
+                    showNotification(`Created ${payload.count || 0} secure survey link(s)`, 'success');
+
                     if (form.getAttribute('data-return-tab') === 'sites') {
                         activeTab = 'sites';
+                        render();
                     } else {
                         activeTab = 'communications';
+                        render();
                     }
-                    render();
                 } catch (error) {
                     if (errEl) {
-                        errEl.textContent = error.message || 'Failed to create link';
+                        errEl.textContent = error.message || 'Failed to send survey';
                         errEl.classList.remove('hidden');
                     }
                 }
@@ -8813,6 +8948,51 @@
             if (e.target.id === 'new-site-survey-assignment-btn') {
                 createSiteSurveyAssignmentModal();
             }
+            if (e.target.id === 'jump-survey-reporting-btn') {
+                activeTab = 'reporting';
+                render();
+                return;
+            }
+            if (e.target.id === 'mark-survey-notifications-read-btn') {
+                const notes = Array.isArray(window.__siteSurveyNotifications) ? window.__siteSurveyNotifications : [];
+                const ids = notes.filter(n => n && !n.read).map(n => n.id).filter(Boolean);
+                if (!ids.length) {
+                    showNotification('Nothing unread', 'success');
+                    return;
+                }
+                apiService.markSiteSurveyNotificationsRead(ids).then(async () => {
+                    window.__siteSurveyNotifications = await apiService.getSiteSurveyNotifications().catch(() => []);
+                    showNotification('Marked read', 'success');
+                    if (activeTab === 'communications') render();
+                }).catch(err => showNotification(err.message || 'Failed', 'error'));
+                return;
+            }
+            const resendSurveyBtn = e.target.closest('.resend-site-survey-btn');
+            if (resendSurveyBtn) {
+                const assignmentId = resendSurveyBtn.getAttribute('data-assignment-id');
+                if (!assignmentId) return;
+                resendSurveyBtn.disabled = true;
+                apiService.resendSiteSurvey(assignmentId, { sendEmail: true })
+                    .then(async (result) => {
+                        showSiteSurveySendResultsModal({
+                            surveyTitle: 'Resent invite',
+                            surveyId: result?.assignment?.surveyId,
+                            results: [{
+                                siteName: allSites.find(s => s.id === result?.assignment?.siteId)?.name || result?.assignment?.siteId,
+                                siteId: result?.assignment?.siteId,
+                                targetRole: result?.assignment?.targetRole,
+                                targetEmail: result?.targetEmail,
+                                inviteUrl: result?.inviteUrl,
+                                email: result?.email
+                            }]
+                        });
+                        await initializeDataLoaders();
+                        showNotification('New secure link created', 'success');
+                    })
+                    .catch(err => showNotification(err.message || 'Resend failed', 'error'))
+                    .finally(() => { resendSurveyBtn.disabled = false; });
+                return;
+            }
             const sendSiteSurveyBtn = e.target.closest('.send-site-survey-btn');
             if (sendSiteSurveyBtn) {
                 const siteId = sendSiteSurveyBtn.getAttribute('data-site-id');
@@ -9011,14 +9191,16 @@
 
                 // Load site surveys with the first paint so Sites + Comms are not empty/broken
                 try {
-                    const [siteSurveyDefinitions, siteSurveyAssignments, siteSurveyResponses] = await Promise.all([
+                    const [siteSurveyDefinitions, siteSurveyAssignments, siteSurveyResponses, siteSurveyNotifications] = await Promise.all([
                         apiService.getSiteSurveyDefinitions().catch(() => []),
                         apiService.getSiteSurveyAssignments().catch(() => []),
-                        apiService.getSiteSurveyResponses().catch(() => [])
+                        apiService.getSiteSurveyResponses().catch(() => []),
+                        apiService.getSiteSurveyNotifications().catch(() => [])
                     ]);
                     allSiteSurveyDefinitions = asSurveyList(siteSurveyDefinitions);
                     allSiteSurveyAssignments = asSurveyList(siteSurveyAssignments);
                     allSiteSurveyResponses = asSurveyList(siteSurveyResponses);
+                    window.__siteSurveyNotifications = Array.isArray(siteSurveyNotifications) ? siteSurveyNotifications : [];
                 } catch (surveyLoadErr) {
                     console.error('Error loading site surveys:', surveyLoadErr);
                 }
