@@ -13,6 +13,7 @@
     </script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
     <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -656,6 +657,7 @@ let state = {
     schedulingBookedDateFilter: 'today', // 'all' | 'today' | YYYY-MM-DD
     visitScheduleTabs: [], // browser-like tabs: { id, label, siteId, studyId, visit, scheduleId }
     activeVisitScheduleTabId: null,
+    subjectImportDraft: null, // { headers, rows, fileName, mappedSubjects }
     calendarDate: new Date(),
     bookingCalendarDate: new Date(), // For the patient booking modal
     studies: [],
@@ -1529,6 +1531,903 @@ const toggleTheme = () => {
     } catch (error) {
         console.error('Error toggling theme:', error);
     }
+};
+
+/**
+ * Subject roster ingestion (Excel/CSV → patients + Visits)
+ */
+const SUBJECT_IMPORT_ALIASES = {
+    screeningNumber: ['screeningnumber', 'screening #', 'screening#', 'screening no', 'screening no.', 'subjectid', 'subject id', 'subject #', 'subject number', 'subject no', 'subj', 'pid', 'patient id', 'patientid', 'cmr #', 'cmr#'],
+    firstName: ['firstname', 'first name', 'first', 'given name', 'givenname'],
+    lastName: ['lastname', 'last name', 'last', 'surname', 'family name', 'familyname'],
+    initials: ['initials', 'subj initials', 'subject initials'],
+    dob: ['dob', 'date of birth', 'birthdate', 'birth date'],
+    phoneNumber: ['phone', 'phonenumber', 'phone number', 'phone #', 'phone#', 'mobile', 'cell'],
+    email: ['email', 'e-mail', 'email address'],
+    globalId: ['global id', 'globalid', 'global #'],
+    visitDate: ['visitdate', 'visit date', 'date', 'appointment date', 'appt date', 'scheduled date', 'day'],
+    visitTime: ['visittime', 'visit time', 'time', 'appointment time', 'appt time', 'start time'],
+    group: ['group', 'cohort', 'arm'],
+    visit: ['visit', 'visit type', 'visit name', 'visitlabel'],
+    visitStatus: ['visit status', 'status', 'outcome']
+};
+
+const normalizeHeaderKey = (h) => String(h || '').trim().toLowerCase().replace(/[_/]+/g, ' ').replace(/\s+/g, ' ');
+
+const mapSubjectImportHeaders = (headers) => {
+    const mapping = {};
+    const normalized = headers.map(normalizeHeaderKey);
+    Object.entries(SUBJECT_IMPORT_ALIASES).forEach(([field, aliases]) => {
+        const idx = normalized.findIndex(h => aliases.includes(h));
+        if (idx >= 0) mapping[field] = headers[idx];
+    });
+    return mapping;
+};
+
+const parseSubjectImportCsvText = (text) => {
+    const rows = [];
+    let row = [];
+    let cell = '';
+    let inQuotes = false;
+    const pushCell = () => { row.push(cell); cell = ''; };
+    const pushRow = () => {
+        if (row.some(c => String(c).trim() !== '')) rows.push(row);
+        row = [];
+    };
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        const next = text[i + 1];
+        if (inQuotes) {
+            if (ch === '"' && next === '"') { cell += '"'; i++; }
+            else if (ch === '"') inQuotes = false;
+            else cell += ch;
+        } else if (ch === '"') {
+            inQuotes = true;
+        } else if (ch === ',') {
+            pushCell();
+        } else if (ch === '\n') {
+            pushCell();
+            pushRow();
+        } else if (ch === '\r') {
+            // skip
+        } else {
+            cell += ch;
+        }
+    }
+    pushCell();
+    pushRow();
+    if (!rows.length) return { headers: [], rows: [] };
+    const headers = rows[0].map(h => String(h || '').trim());
+    const dataRows = rows.slice(1).map(r => {
+        const obj = {};
+        headers.forEach((h, i) => { obj[h] = r[i] != null ? String(r[i]).trim() : ''; });
+        return obj;
+    });
+    return { headers, rows: dataRows };
+};
+
+const excelCellToDisplay = (v) => {
+    if (v == null || v === '') return '';
+    if (v instanceof Date && !Number.isNaN(v.getTime())) {
+        if (v.getFullYear() === 1899 || v.getFullYear() === 1900) {
+            return `${String(v.getHours()).padStart(2, '0')}:${String(v.getMinutes()).padStart(2, '0')}`;
+        }
+        return toLocalDateKey(v);
+    }
+    if (typeof v === 'number' && v > 0 && v < 1) {
+        const totalMinutes = Math.round(v * 24 * 60);
+        const hh = Math.floor(totalMinutes / 60);
+        const mm = totalMinutes % 60;
+        return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+    }
+    return String(v).trim();
+};
+
+const isVandaClinicHeaderRow = (row) => {
+    const norms = (row || []).map(c => normalizeHeaderKey(c));
+    return norms.includes('time') && norms.includes('first name') && norms.includes('last name');
+};
+
+const parseVandaClinicWorkbook = (workbook) => {
+    const visitSheetNames = workbook.SheetNames.filter(n => /visit\s*\d+/i.test(n));
+    const sheetsToScan = visitSheetNames.length
+        ? visitSheetNames
+        : workbook.SheetNames.filter(n => !/waitlist|referral|do not call|visit windows/i.test(n));
+    const canonicalHeaders = [
+        'Time', 'Study', 'Site', 'Group', 'Visit', 'Date', 'First Name', 'Last Name',
+        'Global ID', 'Phone #', 'Email Address', 'Initials', 'Screening #', 'Visit Status', 'Comments', 'Sheet'
+    ];
+    const rows = [];
+    sheetsToScan.forEach(sheetName => {
+        const sheet = workbook.Sheets[sheetName];
+        if (!sheet) return;
+        const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+        let colIndex = null;
+        let sheetVisitHint = '';
+        const visitFromName = sheetName.match(/visit\s*(\d+)/i);
+        if (visitFromName) sheetVisitHint = `Visit ${visitFromName[1]}`;
+        matrix.forEach(row => {
+            if (isVandaClinicHeaderRow(row)) {
+                colIndex = {};
+                row.forEach((cell, i) => {
+                    const key = normalizeHeaderKey(cell);
+                    if (key) colIndex[key] = i;
+                });
+                return;
+            }
+            if (!colIndex) return;
+            const getByAliases = (aliases) => {
+                for (const alias of aliases) {
+                    const idx = colIndex[normalizeHeaderKey(alias)];
+                    if (idx == null) continue;
+                    const raw = row[idx];
+                    if (raw == null || raw === '') continue;
+                    return raw;
+                }
+                return '';
+            };
+            const firstName = excelCellToDisplay(getByAliases(['First Name']));
+            const lastName = excelCellToDisplay(getByAliases(['Last Name']));
+            if (!firstName && !lastName) return;
+            const study = excelCellToDisplay(getByAliases(['Study']));
+            const site = excelCellToDisplay(getByAliases(['Site']));
+            if (/^per\s/i.test(site) && !study) return;
+            let visitVal = excelCellToDisplay(getByAliases(['Visit']));
+            if (/^\d+$/.test(visitVal)) visitVal = `Visit ${visitVal}`;
+            if (!visitVal) visitVal = sheetVisitHint || 'Visit';
+            const dateRaw = getByAliases(['Date']);
+            const timeRaw = getByAliases(['Time']);
+            rows.push({
+                Time: excelCellToDisplay(timeRaw),
+                Study: study,
+                Site: site,
+                Group: excelCellToDisplay(getByAliases(['Group'])),
+                Visit: visitVal,
+                Date: excelCellToDisplay(dateRaw) || coerceImportDateKey(dateRaw),
+                'First Name': firstName,
+                'Last Name': lastName,
+                'Global ID': excelCellToDisplay(getByAliases(['Global ID'])),
+                'Phone #': excelCellToDisplay(getByAliases(['Phone #', 'Phone', 'Phone Number'])),
+                'Email Address': excelCellToDisplay(getByAliases(['Email Address', 'Email'])),
+                Initials: excelCellToDisplay(getByAliases(['Initials'])),
+                'Screening #': excelCellToDisplay(getByAliases(['Screening #', 'Screening Number'])),
+                'Visit Status': excelCellToDisplay(getByAliases(['Visit Status', 'Status'])),
+                Comments: excelCellToDisplay(getByAliases(['Comments', 'Notes'])),
+                Sheet: sheetName
+            });
+        });
+    });
+    const waitlist = parseVandaWaitlistSheet(workbook);
+    return {
+        headers: canonicalHeaders,
+        rows,
+        waitlist,
+        sheetName: visitSheetNames.join(', ') || 'clinic-workbook',
+        format: 'vanda-clinic'
+    };
+};
+
+const parseVandaWaitlistSheet = (workbook) => {
+    const sheetName = workbook.SheetNames.find(n => /waitlist/i.test(n));
+    if (!sheetName) return [];
+    const sheet = workbook.Sheets[sheetName];
+    const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+    let colIndex = null;
+    const out = [];
+    matrix.forEach(row => {
+        const norms = (row || []).map(c => normalizeHeaderKey(c));
+        if (norms.includes('first name') && norms.includes('last name')) {
+            colIndex = {};
+            row.forEach((cell, i) => {
+                const key = normalizeHeaderKey(cell);
+                if (key) colIndex[key] = i;
+            });
+            return;
+        }
+        if (!colIndex) return;
+        const get = (...aliases) => {
+            for (const a of aliases) {
+                const idx = colIndex[normalizeHeaderKey(a)];
+                if (idx == null) continue;
+                const v = row[idx];
+                if (v == null || String(v).trim() === '') continue;
+                return String(v).trim();
+            }
+            return '';
+        };
+        const firstName = get('First name', 'First Name');
+        const lastName = get('Last Name', 'Last name');
+        if (!firstName || !lastName) return;
+        out.push({
+            firstName,
+            lastName,
+            phoneNumber: get('Phone Number', 'Phone #', 'Phone'),
+            group: '1',
+            notes: get('Preferred Group', 'Notes'),
+            siteHint: get('Site Name', 'Site')
+        });
+    });
+    return out;
+};
+
+const getNextMondayDateKey = (from = new Date()) => {
+    const d = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+    const day = d.getDay(); // 0 Sun … 1 Mon
+    const add = day === 1 ? 7 : ((8 - day) % 7) || 7;
+    // If today is Monday, still use next Monday for "next week"; if Tue-Sun go to upcoming Monday
+    const daysUntilMon = day === 0 ? 1 : (day === 1 ? 7 : (8 - day));
+    d.setDate(d.getDate() + daysUntilMon);
+    return toLocalDateKey(d);
+};
+
+const addDaysToDateKey = (dateKey, days) => {
+    if (!dateKey) return '';
+    const d = new Date(`${dateKey}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return '';
+    d.setDate(d.getDate() + days);
+    return toLocalDateKey(d);
+};
+
+const shiftSubjectsToNextWeek = (subjects) => {
+    const dates = subjects.map(s => coerceImportDateKey(s.visitDate)).filter(Boolean).sort();
+    if (!dates.length) {
+        return { subjects: [...subjects], shiftDays: 0, targetStart: getNextMondayDateKey(), targetEnd: '' };
+    }
+    const targetStart = getNextMondayDateKey();
+    const d0 = new Date(`${dates[0]}T00:00:00`);
+    const d1 = new Date(`${targetStart}T00:00:00`);
+    const shiftDays = Math.round((d1 - d0) / 86400000);
+    const shifted = subjects.map(s => {
+        const original = coerceImportDateKey(s.visitDate);
+        return {
+            ...s,
+            visitDateOriginal: original,
+            visitDate: original ? addDaysToDateKey(original, shiftDays) : s.visitDate
+        };
+    });
+    const targetEnd = shifted.map(s => s.visitDate).filter(Boolean).sort().slice(-1)[0] || targetStart;
+    return { subjects: shifted, shiftDays, targetStart, targetEnd };
+};
+
+const buildSyntheticVisit79Subjects = (subjects) => {
+    const v6 = subjects.filter(s => String(s.visit || '').toLowerCase() === 'visit 6');
+    const v6Dates = v6.map(s => s.visitDate).filter(Boolean).sort();
+    if (!v6Dates.length) return [];
+    const v6Last = v6Dates[v6Dates.length - 1];
+    const continuing = [];
+    const seen = new Set();
+    v6.forEach(s => {
+        if (String(s.visitStatus || '').toLowerCase() !== 'complete') return;
+        const key = `${String(s.screeningNumber || '').toLowerCase()}|${String(s.firstName || '').toLowerCase()}|${String(s.lastName || '').toLowerCase()}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        continuing.push(s);
+    });
+    if (!continuing.length) {
+        // fall back to unique V6 subjects who are not SF
+        v6.forEach(s => {
+            if (s.isCancelledOrSf) return;
+            const key = `${String(s.screeningNumber || '').toLowerCase()}|${String(s.firstName || '').toLowerCase()}|${String(s.lastName || '').toLowerCase()}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            continuing.push(s);
+        });
+    }
+    const out = [];
+    [[7, 1], [8, 2], [9, 3]].forEach(([vn, weeks]) => {
+        const day = addDaysToDateKey(v6Last, 7 * weeks);
+        continuing.forEach((s, i) => {
+            const mins = 7 * 60 + i * 20;
+            const hh = Math.floor(mins / 60);
+            const mm = mins % 60;
+            if (hh >= 16) return;
+            out.push({
+                ...s,
+                rowIndex: `v${vn}-${i}`,
+                visit: `Visit ${vn}`,
+                visitDate: day,
+                visitTime: `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`,
+                visitStatus: `V${vn}`,
+                isCancelledOrSf: false,
+                synthetic: true
+            });
+        });
+    });
+    return out;
+};
+
+const prepareVandaImportDraft = (parsed, fileName) => {
+    const mapping = mapSubjectImportHeaders(parsed.headers);
+    let mappedSubjects = buildMappedSubjectsFromImport(parsed.headers, parsed.rows, mapping);
+    const rawMappedSubjects = mappedSubjects.map(s => ({ ...s }));
+    const shifted = shiftSubjectsToNextWeek(mappedSubjects);
+    mappedSubjects = shifted.subjects;
+    const visit79 = buildSyntheticVisit79Subjects(mappedSubjects);
+    mappedSubjects = [...mappedSubjects, ...visit79];
+    const dates = mappedSubjects.map(s => s.visitDate).filter(Boolean).sort();
+    return {
+        fileName,
+        headers: parsed.headers,
+        rows: parsed.rows,
+        mapping,
+        format: 'vanda-clinic',
+        rawMappedSubjects,
+        mappedSubjects,
+        waitlistCandidates: parsed.waitlist || [],
+        shiftDays: shifted.shiftDays,
+        targetStart: dates[0] || shifted.targetStart,
+        targetEnd: dates[dates.length - 1] || shifted.targetEnd,
+        visit79Count: visit79.length
+    };
+};
+
+const ensureImportStudyAndSite = async ({
+    studyTitle = 'Vanda VSJ-2202',
+    protocolNumber = 'VSJ-2202',
+    siteName = 'Test Site'
+} = {}) => {
+    let site = (state.sites || []).find(s => String(s.name || '').trim().toLowerCase() === siteName.toLowerCase())
+        || (state.sites || []).find(s => /test\s*site/i.test(s.name || ''));
+    if (!site) {
+        const sitePayload = {
+            id: ensureId('site'),
+            name: siteName,
+            status: 'Active',
+            siteNameAbbreviation: 'TEST',
+            address1: '',
+            city: '',
+            state: '',
+            zipCode: '',
+            country: 'US',
+            lastUpdated: new Date().toISOString()
+        };
+        const createdSite = await createDocument('sites', sitePayload);
+        site = { ...sitePayload, ...(createdSite || {}) };
+        if (!state.sites.some(s => s.id === site.id)) state.sites.push(site);
+    }
+
+    let study = (state.studies || []).find(s => String(s.title || '').trim().toLowerCase() === studyTitle.toLowerCase())
+        || (state.studies || []).find(s => /vsj-?2202/i.test(s.title || '') || /vsj-?2202/i.test(s.protocolNumber || ''));
+    if (!study) {
+        const studyPayload = {
+            id: ensureId('study'),
+            title: studyTitle,
+            protocolNumber,
+            status: 'Recruiting',
+            target: 100,
+            washoutDays: 30,
+            enrolled: 0,
+            screenFails: 0,
+            siteIds: [site.id],
+            visitProfiles: [1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => ({
+                visitName: `Visit ${n}`,
+                defaultStartTime: '07:00',
+                defaultEndTime: '16:00',
+                patientsPerHour: 3
+            })),
+            sourceSystem: 'manual',
+            lastUpdated: new Date().toISOString()
+        };
+        const createdStudy = await createDocument('studies', studyPayload);
+        study = { ...studyPayload, ...(createdStudy || {}) };
+        if (!state.studies.some(s => s.id === study.id)) state.studies.push(study);
+    } else {
+        const siteIds = Array.isArray(study.siteIds) ? [...study.siteIds] : [];
+        if (!siteIds.includes(site.id)) {
+            siteIds.push(site.id);
+            await updateDocument('studies', study.id, { ...study, siteIds, lastUpdated: new Date().toISOString() });
+            study = { ...study, siteIds };
+            const idx = state.studies.findIndex(s => s.id === study.id);
+            if (idx >= 0) state.studies[idx] = study;
+        }
+    }
+    return { studyId: study.id, siteId: site.id, study, site };
+};
+
+const ingestWaitlistCandidates = async ({ candidates, studyId, siteId }) => {
+    if (!candidates?.length) return { created: 0, matched: 0 };
+    let created = 0;
+    let matched = 0;
+    for (const c of candidates) {
+        const existing = findPatientForSubjectImport(c);
+        if (existing) {
+            matched += 1;
+            continue;
+        }
+        const draftPatient = patientTemplate();
+        draftPatient.id = ensureId('patient');
+        draftPatient.firstName = c.firstName;
+        draftPatient.lastName = c.lastName;
+        draftPatient.phoneNumber = c.phoneNumber || '';
+        draftPatient.group = c.group || '1';
+        draftPatient.status = 'Candidate';
+        draftPatient.registryStatus = 'Active';
+        draftPatient.pipelineStage = 'lead';
+        draftPatient.globalId = generateShortId();
+        draftPatient.initials = `${(c.firstName[0] || '').toUpperCase()}${(c.lastName[0] || '').toUpperCase()}`;
+        draftPatient.inclusionCriteriaMet = false;
+        draftPatient.exclusionCriteriaMet = false;
+        draftPatient.comments = c.notes || '';
+        draftPatient.source = 'subject-import-waitlist';
+        draftPatient.enrollments = studyId && siteId ? [{
+            studyId,
+            siteId,
+            status: 'candidate',
+            enrolledDate: new Date().toISOString()
+        }] : [];
+        const createdDoc = await createDocument('patients', draftPatient);
+        const patient = normalizePatientRecord(convertPatientFromAzureFormat({ ...draftPatient, ...(createdDoc || {}) }));
+        if (!state.patients.some(p => p.id === patient.id)) state.patients.push(patient);
+        created += 1;
+    }
+    return { created, matched };
+};
+
+const parseSubjectImportWorkbook = (arrayBuffer) => {
+    if (typeof XLSX === 'undefined') throw new Error('Spreadsheet parser not loaded. Use CSV or refresh the page.');
+    const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: true });
+    const looksLikeVanda = workbook.SheetNames.some(n => /visit\s*\d+/i.test(n))
+        || workbook.SheetNames.some(n => /visit windows/i.test(n));
+    if (looksLikeVanda) {
+        const parsed = parseVandaClinicWorkbook(workbook);
+        if (parsed.rows.length) return parsed;
+    }
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+    if (!matrix.length) return { headers: [], rows: [] };
+    const headers = matrix[0].map(h => String(h || '').trim());
+    const rows = matrix.slice(1).filter(r => r.some(c => String(c || '').trim() !== '')).map(r => {
+        const obj = {};
+        headers.forEach((h, i) => {
+            const v = r[i];
+            obj[h] = v == null ? '' : (v instanceof Date ? toLocalDateKey(v) : String(v).trim());
+        });
+        return obj;
+    });
+    return { headers, rows, sheetName, format: 'flat' };
+};
+
+const coerceImportDateKey = (value) => {
+    if (!value && value !== 0) return '';
+    if (value instanceof Date && !Number.isNaN(value.getTime())) return toLocalDateKey(value);
+    const s = String(value).trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+    const mdy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+    if (mdy) {
+        const mm = mdy[1].padStart(2, '0');
+        const dd = mdy[2].padStart(2, '0');
+        let yyyy = mdy[3];
+        if (yyyy.length === 2) yyyy = String(2000 + parseInt(yyyy, 10));
+        return `${yyyy}-${mm}-${dd}`;
+    }
+    const parsed = new Date(s);
+    if (!Number.isNaN(parsed.getTime())) return toLocalDateKey(parsed);
+    return '';
+};
+
+const coerceImportTime = (value, fallback = '08:00') => {
+    if (!value && value !== 0) return fallback;
+    if (typeof value === 'number' && value > 0 && value < 1) {
+        const totalMinutes = Math.round(value * 24 * 60);
+        return `${String(Math.floor(totalMinutes / 60)).padStart(2, '0')}:${String(totalMinutes % 60).padStart(2, '0')}`;
+    }
+    const s = String(value).trim();
+    const m24 = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*$/);
+    if (m24) return `${String(parseInt(m24[1], 10)).padStart(2, '0')}:${m24[2]}`;
+    const m12 = s.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/i);
+    if (m12) {
+        let h = parseInt(m12[1], 10);
+        const min = m12[2];
+        const ap = m12[3].toLowerCase();
+        if (ap === 'pm' && h < 12) h += 12;
+        if (ap === 'am' && h === 12) h = 0;
+        return `${String(h).padStart(2, '0')}:${min}`;
+    }
+    return fallback;
+};
+
+const isCancelledOrScreenFailStatus = (status) => {
+    const s = String(status || '').toLowerCase();
+    if (!s) return false;
+    return /\bsf\b/.test(s) || s.includes('screen fail') || /\bcx\b/.test(s) || s.includes('cancel')
+        || s.includes('ncns') || s.includes('no show') || s.includes('do not');
+};
+
+const buildMappedSubjectsFromImport = (headers, rows, mapping) => {
+    const map = mapping || mapSubjectImportHeaders(headers);
+    return rows.map((row, index) => {
+        const get = (field) => {
+            const key = map[field];
+            return key ? String(row[key] || '').trim() : '';
+        };
+        let firstName = get('firstName');
+        let lastName = get('lastName');
+        const initials = get('initials');
+        if ((!firstName || !lastName) && initials) {
+            firstName = firstName || initials;
+            lastName = lastName || 'Subject';
+        }
+        if (!firstName && !lastName) {
+            const screening = get('screeningNumber') || `ROW-${index + 1}`;
+            firstName = 'Subject';
+            lastName = screening;
+        }
+        let visit = get('visit');
+        if (/^\d+$/.test(visit)) visit = `Visit ${visit}`;
+        const emailRaw = get('email');
+        const email = !emailRaw || /^n\/?a$/i.test(emailRaw) ? '' : emailRaw;
+        const globalId = get('globalId');
+        const visitStatus = get('visitStatus') || String(row['Visit Status'] || '').trim();
+        return {
+            rowIndex: index,
+            screeningNumber: get('screeningNumber'),
+            firstName,
+            lastName,
+            initials: initials || `${(firstName[0] || '').toUpperCase()}${(lastName[0] || '').toUpperCase()}`,
+            dob: coerceImportDateKey(get('dob')),
+            phoneNumber: get('phoneNumber'),
+            email,
+            globalId: globalId && !/^(called|texted|lvm)/i.test(globalId) && globalId.length > 4 ? globalId : '',
+            visitDate: coerceImportDateKey(get('visitDate')),
+            visitTime: get('visitTime'),
+            group: get('group'),
+            visit,
+            visitStatus,
+            isCancelledOrSf: isCancelledOrScreenFailStatus(visitStatus) || isCancelledOrScreenFailStatus(String(row.Comments || '')),
+            raw: row
+        };
+    }).filter(s => s.firstName || s.lastName || s.screeningNumber);
+};
+
+const getSampleSubjectRoster = (dayKey) => {
+    const base = dayKey || toLocalDateKey(new Date());
+    return [
+        { firstName: 'Ava', lastName: 'Nguyen', screeningNumber: 'SCR-1001', initials: 'AN', visitDate: base, visitTime: '08:00', group: '1' },
+        { firstName: 'Marcus', lastName: 'Cole', screeningNumber: 'SCR-1002', initials: 'MC', visitDate: base, visitTime: '08:30', group: '1' },
+        { firstName: 'Priya', lastName: 'Shah', screeningNumber: 'SCR-1003', initials: 'PS', visitDate: base, visitTime: '09:00', group: '2' },
+        { firstName: 'Jordan', lastName: 'Lee', screeningNumber: 'SCR-1004', initials: 'JL', visitDate: base, visitTime: '09:30', group: '2' },
+        { firstName: 'Elena', lastName: 'Ruiz', screeningNumber: 'SCR-1005', initials: 'ER', visitDate: base, visitTime: '10:00', group: '3' }
+    ].map((s, index) => ({ ...s, rowIndex: index, dob: '', phoneNumber: '', email: '', visit: '', raw: s }));
+};
+
+const findPatientForSubjectImport = (subject) => {
+    const gid = String(subject.globalId || '').trim();
+    if (gid) {
+        const byGid = (state.patients || []).find(p => String(p.globalId || '').trim() === gid);
+        if (byGid) return byGid;
+    }
+    const screening = String(subject.screeningNumber || '').trim().toLowerCase();
+    if (screening && /^101-/.test(screening)) {
+        const byScreen = (state.patients || []).find(p => String(p.screeningNumber || '').trim().toLowerCase() === screening);
+        if (byScreen) return byScreen;
+    } else if (screening) {
+        const byScreen = (state.patients || []).find(p => String(p.screeningNumber || '').trim().toLowerCase() === screening);
+        if (byScreen) return byScreen;
+    }
+    const fn = String(subject.firstName || '').trim().toLowerCase();
+    const ln = String(subject.lastName || '').trim().toLowerCase();
+    const dob = String(subject.dob || '').trim();
+    const phone = String(subject.phoneNumber || '').replace(/\D/g, '');
+    return (state.patients || []).find(p => {
+        const sameName = String(p.firstName || '').trim().toLowerCase() === fn
+            && String(p.lastName || '').trim().toLowerCase() === ln;
+        if (!sameName) return false;
+        if (dob && String(p.dob || '').trim() === dob) return true;
+        if (phone && String(p.phoneNumber || '').replace(/\D/g, '') === phone) return true;
+        return !dob && !phone;
+    }) || null;
+};
+
+const getSubjectImportModalHTML = () => {
+    const activeStatuses = new Set(['recruiting', 'enrolling', 'active', 'closed']);
+    const activeStudies = state.studies.filter(isActualStudy).filter(s => activeStatuses.has(String(s.status || '').toLowerCase()) || /vsj-?2202|vanda/i.test(s.title || ''));
+    const draft = state.subjectImportDraft;
+    const today = toLocalDateKey(new Date());
+    const mapped = draft?.mappedSubjects || [];
+    const dateHints = mapped.map(s => s.visitDate).filter(Boolean).sort();
+    const defaultStart = draft?.targetStart || dateHints[0] || today;
+    const defaultEnd = draft?.targetEnd || dateHints[dateHints.length - 1] || today;
+    const visitCounts = {};
+    mapped.forEach(s => {
+        const key = s.visit || 'Visit';
+        visitCounts[key] = (visitCounts[key] || 0) + 1;
+    });
+    const visitSummary = Object.keys(visitCounts).sort((a, b) => {
+        const na = parseInt(String(a).replace(/\D/g, ''), 10) || 0;
+        const nb = parseInt(String(b).replace(/\D/g, ''), 10) || 0;
+        return na - nb || String(a).localeCompare(String(b));
+    }).map(k => `${k}: ${visitCounts[k]}`).join(' · ');
+    const sfCount = mapped.filter(s => s.isCancelledOrSf).length;
+    const waitlistCount = (draft?.waitlistCandidates || []).length;
+    const isVanda = draft?.format === 'vanda-clinic';
+    const defaultGroup = mapped.find(s => s.group)?.group || (isVanda ? '1' : '');
+    const previewRows = mapped.slice(0, 25).map(s => `
+        <tr class="dark:text-gray-300">
+            <td class="px-2 py-1">${escapeHtmlPhi(s.visit || '—')}</td>
+            <td class="px-2 py-1">${escapeHtmlPhi(s.screeningNumber || '—')}</td>
+            <td class="px-2 py-1">${escapeHtmlPhi(s.firstName)} ${escapeHtmlPhi(s.lastName)}</td>
+            <td class="px-2 py-1">${escapeHtmlPhi(s.visitDate || '—')}</td>
+            <td class="px-2 py-1">${escapeHtmlPhi(s.visitTime || '—')}</td>
+            <td class="px-2 py-1">${escapeHtmlPhi(s.visitStatus || '—')}</td>
+        </tr>
+    `).join('');
+    return `
+        <h2 class="text-2xl font-bold dark:text-white mb-2">Import subjects</h2>
+        <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">Clinic workbooks (Visit 1…N day grids like Vanda Group sheets) auto-shift to next week, keep SF/CX as outcomes, invent Visits 7–9 after Visit 6, and can import the Waitlist as candidates.</p>
+        <form id="subject-import-form" class="space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-medium dark:text-gray-300">Roster file</label>
+                    <input type="file" id="subject-import-file" name="file" accept=".csv,.xlsx,.xls" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                    <p class="text-xs text-gray-500 mt-1">${draft?.fileName ? `Loaded: ${escapeHtmlPhi(draft.fileName)} · ${mapped.length} appointment rows${isVanda ? ` (clinic workbook · shifted ${draft.shiftDays || 0} days → ${escapeHtmlPhi(defaultStart)}…${escapeHtmlPhi(defaultEnd)})` : ''}${visitSummary ? `<br>${escapeHtmlPhi(visitSummary)}` : ''}${sfCount ? `<br>${sfCount} SF/CX/cancel rows kept as outcomes` : ''}${waitlistCount ? `<br>${waitlistCount} waitlist candidates` : ''}${draft?.visit79Count ? `<br>${draft.visit79Count} synthetic Visit 7–9 slots` : ''}` : 'Upload a Group visit workbook (.xlsx) or flat CSV.'}</p>
+                </div>
+                <div class="md:col-span-2 flex items-center gap-2">
+                    <input type="checkbox" id="subject-import-use-vanda-defaults" name="useVandaDefaults" value="1" class="rounded border-gray-400" ${isVanda ? 'checked' : ''}>
+                    <label for="subject-import-use-vanda-defaults" class="text-sm dark:text-gray-300">Map to <strong>Vanda VSJ-2202</strong> + <strong>Test Site</strong> (create if missing)</label>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Study (optional if defaults checked)</label>
+                    <select name="studyId" id="subject-import-study" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="">Select study</option>
+                        ${activeStudies.map(s => `<option value="${s.id}">${escapeHtmlPhi(s.title)}</option>`).join('')}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Site</label>
+                    <select name="siteId" id="subject-import-site" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                        <option value="">Select study first</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Default visit (if row has none)</label>
+                    <input type="text" name="visit" value="Visit 1" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Default group</label>
+                    <input type="text" name="group" value="${escapeHtmlPhi(defaultGroup)}" placeholder="e.g. 1" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Start date (filter)</label>
+                    <input type="date" name="startDate" value="${defaultStart}" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">End date (filter)</label>
+                    <input type="date" name="endDate" value="${defaultEnd}" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Default start time</label>
+                    <input type="time" name="startTime" value="07:00" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium dark:text-gray-300">Interval (min, if no time)</label>
+                    <input type="number" name="interval" value="20" min="5" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
+                </div>
+                <div class="md:col-span-2 flex flex-col gap-2">
+                    <label class="inline-flex items-center gap-2 text-sm dark:text-gray-300"><input type="checkbox" name="includeSf" value="1" class="rounded border-gray-400" ${isVanda ? 'checked' : ''}> Include SF / CX / NCNS as visit outcomes</label>
+                    <label class="inline-flex items-center gap-2 text-sm dark:text-gray-300"><input type="checkbox" name="importWaitlist" value="1" class="rounded border-gray-400" ${isVanda && waitlistCount ? 'checked' : ''}> Import Waitlist tab as candidates (${waitlistCount})</label>
+                </div>
+            </div>
+            <div class="flex flex-wrap gap-2">
+                <button type="button" data-action="subject-import-load-sample" class="px-3 py-2 rounded-md bg-gray-200 dark:bg-gray-700 dark:text-white text-sm">Load sample subjects (today)</button>
+                <button type="submit" class="px-4 py-2 rounded-md bg-indigo-600 text-white text-sm hover:bg-indigo-700" ${mapped.length ? '' : 'disabled'}>Ingest into Visits (${mapped.length || 0} rows)</button>
+            </div>
+            <div id="subject-import-status" class="text-sm text-gray-500 dark:text-gray-400"></div>
+            ${mapped.length ? `
+                <div class="border dark:border-gray-700 rounded overflow-x-auto max-h-64">
+                    <table class="min-w-full text-sm">
+                        <thead class="bg-gray-50 dark:bg-gray-700"><tr>
+                            <th class="px-2 py-2 text-left text-xs uppercase">Visit</th>
+                            <th class="px-2 py-2 text-left text-xs uppercase">Screening #</th>
+                            <th class="px-2 py-2 text-left text-xs uppercase">Name</th>
+                            <th class="px-2 py-2 text-left text-xs uppercase">Date</th>
+                            <th class="px-2 py-2 text-left text-xs uppercase">Time</th>
+                            <th class="px-2 py-2 text-left text-xs uppercase">Status</th>
+                        </tr></thead>
+                        <tbody>${previewRows}${mapped.length > 25 ? `<tr><td colspan="6" class="px-2 py-2 text-xs text-gray-500">…and ${mapped.length - 25} more</td></tr>` : ''}</tbody>
+                    </table>
+                </div>
+            ` : `<p class="text-sm text-gray-500 dark:text-gray-400">Upload a clinic workbook or load sample subjects to preview.</p>`}
+        </form>
+    `;
+};
+
+const setupSubjectImportModalDependencies = () => {
+    const studySelect = document.getElementById('subject-import-study');
+    const siteSelect = document.getElementById('subject-import-site');
+    if (!studySelect || !siteSelect) return;
+    const fillSites = (preferredSiteId = '') => {
+        const study = state.studies.find(s => s.id === studySelect.value);
+        const siteIds = study?.siteIds || [];
+        let sites = (state.sites || []).filter(s => !siteIds.length || siteIds.includes(s.id));
+        if (!sites.length) sites = state.sites || [];
+        siteSelect.innerHTML = `<option value="">Select site</option>` + sites.map(s => `<option value="${s.id}" ${preferredSiteId === s.id || /test\s*site/i.test(s.name || '') ? 'selected' : ''}>${escapeHtmlPhi(s.name)}</option>`).join('');
+    };
+    studySelect.addEventListener('change', () => fillSites());
+    const preferredStudy = (state.studies || []).find(s => /vsj-?2202/i.test(s.title || '') || /vsj-?2202/i.test(s.protocolNumber || '') || String(s.title || '').toLowerCase() === 'vanda vsj-2202');
+    if (preferredStudy) studySelect.value = preferredStudy.id;
+    fillSites();
+};
+
+const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, startDate, endDate, startTime, intervalMinutes, includeSf = false }) => {
+    if (!subjects?.length) throw new Error('No subjects to ingest.');
+    if (!studyId || !siteId) throw new Error('Study and site are required.');
+    const interval = Math.max(5, parseInt(intervalMinutes, 10) || 30);
+    const [defaultHour, defaultMinute] = String(startTime || '08:00').split(':').map(Number);
+    const rangeStart = coerceImportDateKey(startDate) || toLocalDateKey(new Date());
+    const rangeEnd = coerceImportDateKey(endDate) || rangeStart;
+
+    let working = subjects.filter(s => includeSf || !s.isCancelledOrSf);
+    working = working.filter(s => {
+        const day = coerceImportDateKey(s.visitDate);
+        if (!day) return true;
+        return day >= rangeStart && day <= rangeEnd;
+    });
+    if (!working.length) throw new Error('No subjects left after date/SF filters.');
+
+    const stamped = working.map((subject, index) => {
+        const day = coerceImportDateKey(subject.visitDate) || rangeStart;
+        const time = coerceImportTime(subject.visitTime, null);
+        let hour = defaultHour;
+        let minute = defaultMinute + (time ? 0 : index * interval);
+        if (time) {
+            const [h, m] = time.split(':').map(Number);
+            hour = h;
+            minute = m;
+        } else {
+            hour += Math.floor(minute / 60);
+            minute = minute % 60;
+        }
+        const start = new Date(`${day}T00:00:00`);
+        start.setHours(hour, minute, 0, 0);
+        return {
+            ...subject,
+            visit: subject.visit || visit || 'Visit 1',
+            group: subject.group || group || '',
+            slotStart: start
+        };
+    }).sort((a, b) => a.slotStart - b.slotStart);
+
+    const byVisit = new Map();
+    stamped.forEach(s => {
+        const key = s.visit || visit || 'Visit 1';
+        if (!byVisit.has(key)) byVisit.set(key, []);
+        byVisit.get(key).push(s);
+    });
+
+    let createdPatients = 0;
+    let matchedPatients = 0;
+    let booked = 0;
+    const scheduleIds = [];
+    const firstDay = toLocalDateKey(stamped[0].slotStart);
+    const patientCache = new Map();
+
+    for (const [visitName, visitSubjects] of byVisit.entries()) {
+        const slots = visitSubjects.map((s, i) => ({
+            id: `slot-import-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+            startTime: s.slotStart.toISOString(),
+            booked: 0,
+            capacity: 1
+        }));
+        const newSchedule = {
+            id: ensureId('sched'),
+            siteId,
+            studyId,
+            visit: visitName,
+            group: group || visitSubjects[0]?.group || '',
+            shiftId: null,
+            source: 'subject-import',
+            slots,
+            lastUpdated: new Date().toISOString()
+        };
+        const createdSchedule = await createDocument('schedules', newSchedule);
+        const scheduleId = createdSchedule?.id || newSchedule.id;
+        if (!scheduleId) throw new Error('Schedule create did not return an id.');
+        scheduleIds.push(scheduleId);
+        const scheduleRef = { ...newSchedule, id: scheduleId, slots: slots.map(s => ({ ...s })) };
+
+        for (let i = 0; i < visitSubjects.length; i++) {
+            const subject = visitSubjects[i];
+            const slot = scheduleRef.slots[i];
+            const cacheKey = [
+                String(subject.globalId || '').trim(),
+                String(subject.screeningNumber || '').trim().toLowerCase(),
+                String(subject.firstName || '').trim().toLowerCase(),
+                String(subject.lastName || '').trim().toLowerCase(),
+                String(subject.phoneNumber || '').replace(/\D/g, '')
+            ].join('|');
+            let patient = patientCache.get(cacheKey) || findPatientForSubjectImport(subject);
+            if (!patient) {
+                const draftPatient = patientTemplate();
+                draftPatient.firstName = subject.firstName;
+                draftPatient.lastName = subject.lastName;
+                draftPatient.initials = subject.initials;
+                draftPatient.screeningNumber = subject.screeningNumber || '';
+                draftPatient.dob = subject.dob || '';
+                draftPatient.phoneNumber = subject.phoneNumber || '';
+                draftPatient.email = subject.email || '';
+                draftPatient.group = subject.group || '';
+                draftPatient.status = subject.isCancelledOrSf ? 'Screen Fail' : 'Enrolled';
+                draftPatient.registryStatus = 'Active';
+                draftPatient.globalId = subject.globalId || generateShortId();
+                draftPatient.age = draftPatient.dob ? calculateAge(draftPatient.dob) : null;
+                draftPatient.inclusionCriteriaMet = true;
+                draftPatient.exclusionCriteriaMet = false;
+                draftPatient.enrollments = [{
+                    studyId,
+                    siteId,
+                    status: 'current',
+                    enrolledDate: new Date().toISOString()
+                }];
+                draftPatient.source = 'subject-import';
+                draftPatient.id = ensureId('patient');
+                const created = await createDocument('patients', draftPatient);
+                patient = normalizePatientRecord(convertPatientFromAzureFormat({ ...draftPatient, ...(created || {}) }));
+                if (!state.patients.some(p => p.id === patient.id)) state.patients.push(patient);
+                createdPatients += 1;
+            } else {
+                matchedPatients += 1;
+                const enrollments = Array.isArray(patient.enrollments) ? [...patient.enrollments] : [];
+                if (!enrollments.some(e => e.studyId === studyId && e.status === 'current')) {
+                    enrollments.forEach(e => { if (e.status === 'current') e.status = 'past'; });
+                    enrollments.push({ studyId, siteId, status: 'current', enrolledDate: new Date().toISOString() });
+                }
+                const patch = {
+                    enrollments,
+                    screeningNumber: patient.screeningNumber || subject.screeningNumber || '',
+                    initials: patient.initials || subject.initials || '',
+                    group: subject.group || patient.group || '',
+                    globalId: patient.globalId || subject.globalId || patient.globalId
+                };
+                await updatePatientFields(patient.id, patch, 'subject_import_matched', scheduleId);
+                patient = { ...patient, ...patch };
+                const idx = state.patients.findIndex(p => p.id === patient.id);
+                if (idx >= 0) state.patients[idx] = { ...state.patients[idx], ...patient };
+            }
+            patientCache.set(cacheKey, patient);
+
+            const newAppt = {
+                id: ensureId('appt'),
+                scheduleId,
+                slotId: slot.id,
+                time: slot.startTime,
+                visit: visitName,
+                studyId,
+                siteId,
+                group: subject.group || group || '',
+                status: subject.isCancelledOrSf ? 'cancelled' : 'scheduled',
+                visitStatus: subject.visitStatus || (subject.isCancelledOrSf ? 'Screen Fail' : 'Scheduled'),
+                inClinicStatus: '',
+                visitOutcome: subject.isCancelledOrSf ? (subject.visitStatus || 'Screen Fail') : '',
+                checkInStatus: 'not-checked-in',
+                createdAt: new Date().toISOString(),
+                source: 'subject-import'
+            };
+            const appointments = [...getPatientAppointments(patient), newAppt];
+            await updatePatientFields(patient.id, {
+                appointment: newAppt,
+                appointments,
+                group: subject.group || patient.group || ''
+            }, 'subject_import_booked', `${newAppt.visit} ${slot.startTime}`, { allowWhenLocked: true });
+            slot.booked = subject.isCancelledOrSf ? 0 : 1;
+            booked += 1;
+        }
+
+        await updateDocument('schedules', scheduleId, {
+            ...scheduleRef,
+            slots: scheduleRef.slots,
+            lastUpdated: new Date().toISOString()
+        });
+    }
+
+    return {
+        scheduleId: scheduleIds[0],
+        scheduleIds,
+        createdPatients,
+        matchedPatients,
+        booked,
+        firstDay
+    };
 };
 
 /**
@@ -4600,7 +5499,15 @@ const getSchedulingHTML = () => {
     
     const creatorView = `
         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
-            <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Create Appointment Schedule</h3>
+            <div class="flex flex-wrap items-start justify-between gap-3 mb-4">
+                <div>
+                    <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Create Appointment Schedule</h3>
+                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Generate empty slots, or ingest a subject roster with visit dates.</p>
+                </div>
+                <button type="button" data-action="import-subjects-modal" class="inline-flex items-center px-4 py-2 rounded-md bg-indigo-600 text-white text-sm hover:bg-indigo-700">
+                    <i data-lucide="upload" class="w-4 h-4 mr-2"></i> Import subjects
+                </button>
+            </div>
             <form id="schedule-creator-form" class="space-y-4">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Study</label><select name="studyId" id="schedule-study-select" required class="mt-1 block w-full p-2 border rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white"><option value="">Select a Study</option>${activeStudies.map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select></div>
@@ -8141,6 +9048,24 @@ document.addEventListener('click', async (e) => {
             }
             case 'survey-patient': openModal(getSelectSurveyModalHTML(state.patients.find(p => p.id === id))); break;
             case 'import-patients-modal': openModal(getImportPatientsModalHTML()); break;
+            case 'import-subjects-modal': {
+                openModal(getSubjectImportModalHTML(), true);
+                setTimeout(() => setupSubjectImportModalDependencies(), 0);
+                break;
+            }
+            case 'subject-import-load-sample': {
+                const today = toLocalDateKey(new Date());
+                state.subjectImportDraft = {
+                    fileName: 'sample-subjects.csv',
+                    headers: ['screeningNumber', 'firstName', 'lastName', 'initials', 'visitDate', 'visitTime', 'group'],
+                    rows: [],
+                    mappedSubjects: getSampleSubjectRoster(today)
+                };
+                openModal(getSubjectImportModalHTML(), true);
+                setTimeout(() => setupSubjectImportModalDependencies(), 0);
+                showNotification('Loaded 5 sample subjects for today.', 'success');
+                break;
+            }
             case 'registry-add-condition': {
                 state.registryCriteria = collectRegistryCriteriaFromDom();
                 state.registryCriteria.conditions.push({ field: 'registryStatus', op: 'equals', value: 'Active' });
@@ -9493,6 +10418,53 @@ document.addEventListener('change', async (e) => {
         const day = e.target.value;
         if (day) setState({ schedulingBookedDateFilter: day });
     }
+    if (e.target.id === 'subject-import-file') {
+        const file = e.target.files && e.target.files[0];
+        const statusEl = document.getElementById('subject-import-status');
+        if (!file) return;
+        const finish = (parsed, fileName) => {
+            if (parsed.format === 'vanda-clinic') {
+                state.subjectImportDraft = prepareVandaImportDraft(parsed, fileName);
+            } else {
+                const mapping = mapSubjectImportHeaders(parsed.headers);
+                const mappedSubjects = buildMappedSubjectsFromImport(parsed.headers, parsed.rows, mapping);
+                state.subjectImportDraft = { fileName, headers: parsed.headers, rows: parsed.rows, mapping, mappedSubjects, format: parsed.format || 'flat', waitlistCandidates: [] };
+            }
+            const draft = state.subjectImportDraft;
+            openModal(getSubjectImportModalHTML(), true);
+            setTimeout(() => setupSubjectImportModalDependencies(), 0);
+            showNotification(`Parsed ${draft.mappedSubjects.length} rows from ${fileName}${draft.shiftDays ? ` (shifted ${draft.shiftDays} days)` : ''}.`, 'success');
+        };
+        const name = file.name || 'roster';
+        if (/\.xlsx?$/i.test(name) || file.type.includes('sheet') || file.type.includes('excel')) {
+            const reader = new FileReader();
+            reader.onload = () => {
+                try {
+                    const parsed = parseSubjectImportWorkbook(reader.result);
+                    finish(parsed, name);
+                } catch (err) {
+                    console.error(err);
+                    if (statusEl) statusEl.textContent = err.message || 'Could not parse spreadsheet.';
+                    showNotification(err.message || 'Could not parse spreadsheet.', 'error');
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        } else {
+            const reader = new FileReader();
+            reader.onload = () => {
+                try {
+                    const parsed = parseSubjectImportCsvText(String(reader.result || ''));
+                    finish({ ...parsed, format: 'flat' }, name);
+                } catch (err) {
+                    console.error(err);
+                    if (statusEl) statusEl.textContent = err.message || 'Could not parse CSV.';
+                    showNotification(err.message || 'Could not parse CSV.', 'error');
+                }
+            };
+            reader.readAsText(file);
+        }
+        return;
+    }
     if (e.target.id === 'pipeline-study-filter' || e.target.id === 'pipeline-assignee-filter') {
         if (state.activeTab === 'pipeline') renderPipelineBoard();
     }
@@ -10478,6 +11450,88 @@ document.addEventListener('submit', async (e) => {
                 }
             };
             reader.readAsText(file);
+            break;
+        }
+        case 'subject-import-form': {
+            const statusEl = document.getElementById('subject-import-status');
+            const setStatus = (msg, cls = 'text-blue-500') => {
+                if (!statusEl) return;
+                statusEl.textContent = msg;
+                statusEl.className = `text-sm ${cls}`;
+            };
+            try {
+                const draft = state.subjectImportDraft || {};
+                const subjects = draft.mappedSubjects || [];
+                if (!subjects.length) {
+                    setStatus('Load a roster file or sample subjects first.', 'text-red-500');
+                    return;
+                }
+                const useVandaDefaults = !!(form.querySelector('[name="useVandaDefaults"]')?.checked || data.useVandaDefaults);
+                const includeSf = !!(form.querySelector('[name="includeSf"]')?.checked || data.includeSf);
+                const importWaitlist = !!(form.querySelector('[name="importWaitlist"]')?.checked || data.importWaitlist);
+                let studyId = data.studyId || '';
+                let siteId = data.siteId || '';
+                if (useVandaDefaults || !studyId || !siteId) {
+                    setStatus('Ensuring Vanda VSJ-2202 + Test Site…');
+                    const ensured = await ensureImportStudyAndSite();
+                    studyId = studyId || ensured.studyId;
+                    siteId = siteId || ensured.siteId;
+                }
+                if (!studyId || !siteId) {
+                    setStatus('Select a study and site, or enable Vanda defaults.', 'text-red-500');
+                    return;
+                }
+                setStatus(`Ingesting ${subjects.length} visit rows…`);
+                const result = await ingestSubjectRoster({
+                    subjects,
+                    studyId,
+                    siteId,
+                    visit: data.visit || 'Visit 1',
+                    group: data.group || '',
+                    startDate: data.startDate,
+                    endDate: data.endDate,
+                    startTime: data.startTime || '07:00',
+                    intervalMinutes: data.interval || 20,
+                    includeSf
+                });
+                let waitlistResult = { created: 0, matched: 0 };
+                if (importWaitlist && (draft.waitlistCandidates || []).length) {
+                    setStatus('Importing waitlist candidates…');
+                    waitlistResult = await ingestWaitlistCandidates({
+                        candidates: draft.waitlistCandidates,
+                        studyId,
+                        siteId
+                    });
+                }
+                await loadAllData();
+                state.subjectImportDraft = null;
+                closeModal();
+                openVisitScheduleTab({
+                    siteId,
+                    studyId,
+                    visit: 'all',
+                    scheduleId: result.scheduleId
+                });
+                setState({
+                    activeTab: 'scheduling',
+                    schedulingView: 'booked',
+                    schedulingBookedDateFilter: result.firstDay || toLocalDateKey(new Date()),
+                    schedulingSiteFilter: siteId,
+                    schedulingStudyFilter: studyId,
+                    schedulingVisitFilter: 'all'
+                });
+                showNotification(
+                    `Ingested ${result.booked} visits / ${result.scheduleIds?.length || 1} schedules`
+                    + ` (${result.createdPatients} new, ${result.matchedPatients} matched)`
+                    + (importWaitlist ? `; waitlist +${waitlistResult.created}` : '')
+                    + '. Showing Visits.',
+                    'success'
+                );
+            } catch (err) {
+                console.error(err);
+                setStatus(err.message || 'Ingest failed.', 'text-red-500');
+                showNotification(err.message || 'Subject ingest failed.', 'error');
+            }
             break;
         }
         case 'take-survey-form': {
