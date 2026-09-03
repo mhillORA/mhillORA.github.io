@@ -422,6 +422,81 @@ const normalizePatientInput = (data) => {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
     if (isPatientQueryBody(data)) return data;
     const normalized = { ...data };
+
+    const fullName = normalized.fullName || normalized.name || normalized.patientName || normalized.subjectName;
+    let first = normalized.firstName != null ? String(normalized.firstName).trim().replace(/\s+/g, ' ') : '';
+    let last = normalized.lastName != null ? String(normalized.lastName).trim().replace(/\s+/g, ' ') : '';
+    const full = fullName != null ? String(fullName).trim().replace(/\s+/g, ' ') : '';
+
+    const splitFull = (raw) => {
+        const s = String(raw || '').trim().replace(/\s+/g, ' ');
+        if (!s) return { firstName: '', lastName: '' };
+        if (s.includes(',')) {
+            const [ln, rest] = s.split(',').map((p) => p.trim()).filter(Boolean);
+            const fn = (rest || '').trim();
+            return { firstName: fn || ln, lastName: fn ? ln : '' };
+        }
+        const parts = s.split(/\s+/).filter(Boolean);
+        if (parts.length === 1) return { firstName: parts[0], lastName: '' };
+        if (parts.length === 2) return { firstName: parts[0], lastName: parts[1] };
+        return { firstName: parts.slice(0, -1).join(' '), lastName: parts[parts.length - 1] };
+    };
+    const looksFull = (v) => {
+        const s = String(v || '').trim();
+        return !!(s && (s.includes(',') || s.split(/\s+/).filter(Boolean).length >= 2));
+    };
+
+    if (full && looksFull(full)) {
+        const same = (v) => v && v.toLowerCase() === full.toLowerCase();
+        if (!first || !last || same(first) || same(last) || first.toLowerCase() === last.toLowerCase()) {
+            const split = splitFull(full);
+            first = split.firstName || first;
+            last = split.lastName || last;
+        }
+    }
+    if (looksFull(first) && (!last || first.toLowerCase() === last.toLowerCase())) {
+        const split = splitFull(first);
+        first = split.firstName;
+        last = split.lastName || last;
+    }
+    if (looksFull(last) && (
+        !first
+        || first.toLowerCase() === last.toLowerCase()
+        || last.toLowerCase().startsWith(`${first.toLowerCase()} `)
+    )) {
+        const split = splitFull(last);
+        first = split.firstName || first;
+        last = split.lastName;
+    }
+    if ((!first || !last) && full) {
+        const split = splitFull(full);
+        first = first || split.firstName;
+        last = last || split.lastName;
+    }
+    if (!first && last) {
+        if (looksFull(last)) {
+            const split = splitFull(last);
+            first = split.firstName;
+            last = split.lastName || 'Unknown';
+        } else {
+            first = last;
+            last = 'Unknown';
+        }
+    }
+    if (!last && first) {
+        if (looksFull(first)) {
+            const split = splitFull(first);
+            first = split.firstName;
+            last = split.lastName || 'Unknown';
+        } else {
+            last = 'Unknown';
+        }
+    }
+    if (!first) first = 'Unknown';
+    if (!last) last = 'Unknown';
+    normalized.firstName = first;
+    normalized.lastName = last;
+
     const requiredStrings = ['firstName', 'lastName'];
     const optionalStrings = [
         'globalId', 'phoneNumber', 'email', 'dob', 'address', 'city', 'state', 'zipCode',

@@ -1540,6 +1540,7 @@ const SUBJECT_IMPORT_ALIASES = {
     screeningNumber: ['screeningnumber', 'screening #', 'screening#', 'screening no', 'screening no.', 'subjectid', 'subject id', 'subject #', 'subject number', 'subject no', 'subj', 'pid', 'patient id', 'patientid', 'cmr #', 'cmr#'],
     firstName: ['firstname', 'first name', 'first', 'given name', 'givenname'],
     lastName: ['lastname', 'last name', 'last', 'surname', 'family name', 'familyname'],
+    fullName: ['full name', 'fullname name', 'patient name', 'subject name', 'name', 'participant name'],
     initials: ['initials', 'subj initials', 'subject initials'],
     dob: ['dob', 'date of birth', 'birthdate', 'birth date'],
     phoneNumber: ['phone', 'phonenumber', 'phone number', 'phone #', 'phone#', 'mobile', 'cell'],
@@ -1553,6 +1554,96 @@ const SUBJECT_IMPORT_ALIASES = {
 };
 
 const normalizeHeaderKey = (h) => String(h || '').trim().toLowerCase().replace(/[_/]+/g, ' ').replace(/\s+/g, ' ');
+
+/** Split "Anne Marie Hill" / "Doe, Jane" into first/last for older roster sheets.
+ *  3+ tokens → last word is surname ("Anne Marie" / "Hill"); 2 tokens → first/last. */
+const splitImportFullName = (fullName) => {
+    const raw = String(fullName || '').trim().replace(/\s+/g, ' ');
+    if (!raw) return { firstName: '', lastName: '' };
+    if (raw.includes(',')) {
+        const [last, rest] = raw.split(',').map(p => p.trim()).filter(Boolean);
+        const first = (rest || '').trim();
+        return { firstName: first || last, lastName: first ? last : '' };
+    }
+    const parts = raw.split(/\s+/).filter(Boolean);
+    if (parts.length === 1) return { firstName: parts[0], lastName: '' };
+    if (parts.length === 2) return { firstName: parts[0], lastName: parts[1] };
+    return { firstName: parts.slice(0, -1).join(' '), lastName: parts[parts.length - 1] };
+};
+
+const looksLikeFullName = (value) => {
+    const s = String(value || '').trim();
+    if (!s) return false;
+    if (s.includes(',')) return true;
+    return s.split(/\s+/).filter(Boolean).length >= 2;
+};
+
+/**
+ * Messy clinic sheets often put the whole name in First, Last, or a Full Name column.
+ * Pivot: split whichever field looks like a full name when the other side is missing/duplicate.
+ */
+const coerceImportPersonName = (firstName, lastName, fullName = '', fallback = 'Unknown') => {
+    let first = String(firstName || '').trim().replace(/\s+/g, ' ');
+    let last = String(lastName || '').trim().replace(/\s+/g, ' ');
+    const full = String(fullName || '').trim().replace(/\s+/g, ' ');
+
+    // Dedicated full-name column wins when first/last are incomplete or identical copies of it
+    if (full && looksLikeFullName(full)) {
+        const sameAsFull = (v) => v && v.toLowerCase() === full.toLowerCase();
+        if (!first || !last || sameAsFull(first) || sameAsFull(last) || first.toLowerCase() === last.toLowerCase()) {
+            const split = splitImportFullName(full);
+            first = split.firstName || first;
+            last = split.lastName || last;
+        }
+    }
+
+    // Full name dumped into First Name only (or First == Last both full)
+    if (looksLikeFullName(first) && (!last || first.toLowerCase() === last.toLowerCase())) {
+        const split = splitImportFullName(first);
+        first = split.firstName;
+        last = split.lastName || last;
+    }
+
+    // Full name dumped into Last Name only (or Last starts with First as "Jane" + "Jane Doe")
+    if (looksLikeFullName(last) && (
+        !first
+        || first.toLowerCase() === last.toLowerCase()
+        || last.toLowerCase().startsWith(`${first.toLowerCase()} `)
+    )) {
+        const split = splitImportFullName(last);
+        first = split.firstName || first;
+        last = split.lastName;
+    }
+
+    // Still only one token somewhere — use fullName leftovers or mirror
+    if ((!first || !last) && full) {
+        const split = splitImportFullName(full);
+        first = first || split.firstName;
+        last = last || split.lastName;
+    }
+    if (!first && last) {
+        if (looksLikeFullName(last)) {
+            const split = splitImportFullName(last);
+            first = split.firstName;
+            last = split.lastName || fallback;
+        } else {
+            first = last;
+            last = fallback;
+        }
+    }
+    if (!last && first) {
+        if (looksLikeFullName(first)) {
+            const split = splitImportFullName(first);
+            first = split.firstName;
+            last = split.lastName || fallback;
+        } else {
+            last = fallback;
+        }
+    }
+    if (!first) first = fallback;
+    if (!last) last = fallback;
+    return { firstName: first, lastName: last };
+};
 
 const mapSubjectImportHeaders = (headers) => {
     const mapping = {};
@@ -1606,6 +1697,26 @@ const parseSubjectImportCsvText = (text) => {
     return { headers, rows: dataRows };
 };
 
+/** Excel serial day → YYYY-MM-DD (1900 date system). Rejects time-only fractions and out-of-range years. */
+const excelSerialToDateKey = (serial) => {
+    if (typeof serial !== 'number' || !Number.isFinite(serial)) return '';
+    if (serial > 0 && serial < 1) return ''; // time-only fraction
+    const whole = Math.floor(serial);
+    // ~1982–2064 keeps clinic schedules / avoids Global IDs and epoch junk
+    if (whole < 30000 || whole > 60000) return '';
+    const utc = new Date(Date.UTC(1899, 11, 30));
+    utc.setUTCDate(utc.getUTCDate() + whole);
+    const y = utc.getUTCFullYear();
+    if (y < 2015 || y > 2040) return '';
+    return `${y}-${String(utc.getUTCMonth() + 1).padStart(2, '0')}-${String(utc.getUTCDate()).padStart(2, '0')}`;
+};
+
+const isPlausibleClinicDateKey = (key, { minYear = 2018, maxYear = 2038 } = {}) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(key || ''))) return false;
+    const y = parseInt(String(key).slice(0, 4), 10);
+    return y >= minYear && y <= maxYear;
+};
+
 const excelCellToDisplay = (v) => {
     if (v == null || v === '') return '';
     if (v instanceof Date && !Number.isNaN(v.getTime())) {
@@ -1614,11 +1725,15 @@ const excelCellToDisplay = (v) => {
         }
         return toLocalDateKey(v);
     }
-    if (typeof v === 'number' && v > 0 && v < 1) {
-        const totalMinutes = Math.round(v * 24 * 60);
-        const hh = Math.floor(totalMinutes / 60);
-        const mm = totalMinutes % 60;
-        return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+    if (typeof v === 'number' && Number.isFinite(v)) {
+        if (v > 0 && v < 1) {
+            const totalMinutes = Math.round(v * 24 * 60);
+            const hh = Math.floor(totalMinutes / 60);
+            const mm = totalMinutes % 60;
+            return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+        }
+        const fromSerial = excelSerialToDateKey(v);
+        if (fromSerial) return fromSerial;
     }
     return String(v).trim();
 };
@@ -1634,7 +1749,7 @@ const parseVandaClinicWorkbook = (workbook) => {
         ? visitSheetNames
         : workbook.SheetNames.filter(n => !/waitlist|referral|do not call|visit windows/i.test(n));
     const canonicalHeaders = [
-        'Time', 'Study', 'Site', 'Group', 'Visit', 'Date', 'First Name', 'Last Name',
+        'Time', 'Study', 'Site', 'Group', 'Visit', 'Date', 'First Name', 'Last Name', 'Full Name',
         'Global ID', 'Phone #', 'Email Address', 'Initials', 'Screening #', 'Visit Status', 'Comments', 'Sheet'
     ];
     const rows = [];
@@ -1666,9 +1781,13 @@ const parseVandaClinicWorkbook = (workbook) => {
                 }
                 return '';
             };
-            const firstName = excelCellToDisplay(getByAliases(['First Name']));
-            const lastName = excelCellToDisplay(getByAliases(['Last Name']));
-            if (!firstName && !lastName) return;
+            const firstNameRaw = excelCellToDisplay(getByAliases(['First Name']));
+            const lastNameRaw = excelCellToDisplay(getByAliases(['Last Name']));
+            const fullNameRaw = excelCellToDisplay(getByAliases(['Full Name', 'Patient Name', 'Subject Name', 'Name']));
+            const named = coerceImportPersonName(firstNameRaw, lastNameRaw, fullNameRaw);
+            if (!named.firstName && !named.lastName) return;
+            const firstName = named.firstName;
+            const lastName = named.lastName;
             const study = excelCellToDisplay(getByAliases(['Study']));
             const site = excelCellToDisplay(getByAliases(['Site']));
             if (/^per\s/i.test(site) && !study) return;
@@ -1677,15 +1796,17 @@ const parseVandaClinicWorkbook = (workbook) => {
             if (!visitVal) visitVal = sheetVisitHint || 'Visit';
             const dateRaw = getByAliases(['Date']);
             const timeRaw = getByAliases(['Time']);
+            const dateKey = coerceImportDateKey(dateRaw);
             rows.push({
-                Time: excelCellToDisplay(timeRaw),
+                Time: excelCellToDisplay(timeRaw) || coerceImportTime(timeRaw, ''),
                 Study: study,
                 Site: site,
                 Group: excelCellToDisplay(getByAliases(['Group'])),
                 Visit: visitVal,
-                Date: excelCellToDisplay(dateRaw) || coerceImportDateKey(dateRaw),
+                Date: dateKey,
                 'First Name': firstName,
                 'Last Name': lastName,
+                'Full Name': fullNameRaw || `${firstName} ${lastName}`.trim(),
                 'Global ID': excelCellToDisplay(getByAliases(['Global ID'])),
                 'Phone #': excelCellToDisplay(getByAliases(['Phone #', 'Phone', 'Phone Number'])),
                 'Email Address': excelCellToDisplay(getByAliases(['Email Address', 'Email'])),
@@ -1735,12 +1856,14 @@ const parseVandaWaitlistSheet = (workbook) => {
             }
             return '';
         };
-        const firstName = get('First name', 'First Name');
-        const lastName = get('Last Name', 'Last name');
-        if (!firstName || !lastName) return;
+        const firstNameRaw = get('First name', 'First Name');
+        const lastNameRaw = get('Last Name', 'Last name');
+        const fullNameRaw = get('Full Name', 'Patient Name', 'Name');
+        const named = coerceImportPersonName(firstNameRaw, lastNameRaw, fullNameRaw);
+        if (!named.firstName && !named.lastName) return;
         out.push({
-            firstName,
-            lastName,
+            firstName: named.firstName,
+            lastName: named.lastName,
             phoneNumber: get('Phone Number', 'Phone #', 'Phone'),
             group: '1',
             notes: get('Preferred Group', 'Notes'),
@@ -1768,25 +1891,93 @@ const addDaysToDateKey = (dateKey, days) => {
     return toLocalDateKey(d);
 };
 
+/** Pick a stable schedule anchor: prefer the densest early cluster, not a single outlier min. */
+const pickImportScheduleAnchor = (dateKeys) => {
+    const sorted = [...dateKeys].filter(isPlausibleClinicDateKey).sort();
+    if (!sorted.length) return '';
+    if (sorted.length === 1) return sorted[0];
+    // Mode of YYYY-MM buckets among the earliest half — resists one bad 2000-01-01 row
+    const half = sorted.slice(0, Math.max(1, Math.ceil(sorted.length / 2)));
+    const counts = {};
+    half.forEach(k => {
+        const bucket = k.slice(0, 7);
+        counts[bucket] = (counts[bucket] || 0) + 1;
+    });
+    const bestBucket = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0];
+    return half.find(k => k.startsWith(bestBucket)) || sorted[0];
+};
+
+const visitNumberFromLabel = (visit) => {
+    const m = String(visit || '').match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : 1;
+};
+
 const shiftSubjectsToNextWeek = (subjects) => {
-    const dates = subjects.map(s => coerceImportDateKey(s.visitDate)).filter(Boolean).sort();
-    if (!dates.length) {
-        return { subjects: [...subjects], shiftDays: 0, targetStart: getNextMondayDateKey(), targetEnd: '' };
-    }
     const targetStart = getNextMondayDateKey();
-    const d0 = new Date(`${dates[0]}T00:00:00`);
+    const plausible = subjects.map(s => coerceImportDateKey(s.visitDate)).filter(isPlausibleClinicDateKey).sort();
+    const anchor = pickImportScheduleAnchor(plausible);
+
+    // No usable dates → rebuild onto next week by visit number (1 week apart)
+    if (!anchor) {
+        const remapped = subjects.map(s => {
+            const vn = visitNumberFromLabel(s.visit);
+            const day = addDaysToDateKey(targetStart, Math.max(0, vn - 1) * 7);
+            return {
+                ...s,
+                visitDateOriginal: coerceImportDateKey(s.visitDate) || '',
+                visitDate: day,
+                dateRemapped: true
+            };
+        });
+        const ends = remapped.map(s => s.visitDate).filter(isPlausibleClinicDateKey).sort();
+        return {
+            subjects: remapped,
+            shiftDays: 0,
+            targetStart,
+            targetEnd: ends[ends.length - 1] || targetStart,
+            remapped: true
+        };
+    }
+
+    const d0 = new Date(`${anchor}T00:00:00`);
     const d1 = new Date(`${targetStart}T00:00:00`);
-    const shiftDays = Math.round((d1 - d0) / 86400000);
+    let shiftDays = Math.round((d1 - d0) / 86400000);
+    // Cap so a single epoch/serial bug can't push end dates into the 2050s
+    const MAX_SHIFT = 4000;
+    if (Math.abs(shiftDays) > MAX_SHIFT) {
+        shiftDays = shiftDays > 0 ? MAX_SHIFT : -MAX_SHIFT;
+    }
+
     const shifted = subjects.map(s => {
         const original = coerceImportDateKey(s.visitDate);
+        if (!original || !isPlausibleClinicDateKey(original)) {
+            const vn = visitNumberFromLabel(s.visit);
+            return {
+                ...s,
+                visitDateOriginal: original || '',
+                visitDate: addDaysToDateKey(targetStart, Math.max(0, vn - 1) * 7),
+                dateRemapped: true
+            };
+        }
+        const next = addDaysToDateKey(original, shiftDays);
+        // After shift, still reject nonsense years
+        if (!isPlausibleClinicDateKey(next, { minYear: 2020, maxYear: 2035 })) {
+            const vn = visitNumberFromLabel(s.visit);
+            return {
+                ...s,
+                visitDateOriginal: original,
+                visitDate: addDaysToDateKey(targetStart, Math.max(0, vn - 1) * 7),
+                dateRemapped: true
+            };
+        }
         return {
             ...s,
             visitDateOriginal: original,
-            visitDate: original ? addDaysToDateKey(original, shiftDays) : s.visitDate
+            visitDate: next
         };
     });
-    const targetEnd = shifted.map(s => s.visitDate).filter(Boolean).sort().slice(-1)[0] || targetStart;
-    return { subjects: shifted, shiftDays, targetStart, targetEnd };
+    const targetEnd = shifted.map(s => s.visitDate).filter(isPlausibleClinicDateKey).sort().slice(-1)[0] || targetStart;
+    return { subjects: shifted, shiftDays, targetStart, targetEnd, remapped: false };
 };
 
 const buildSyntheticVisit79Subjects = (subjects) => {
@@ -1844,7 +2035,7 @@ const prepareVandaImportDraft = (parsed, fileName) => {
     mappedSubjects = shifted.subjects;
     const visit79 = buildSyntheticVisit79Subjects(mappedSubjects);
     mappedSubjects = [...mappedSubjects, ...visit79];
-    const dates = mappedSubjects.map(s => s.visitDate).filter(Boolean).sort();
+    const dates = mappedSubjects.map(s => s.visitDate).filter(isPlausibleClinicDateKey).sort();
     return {
         fileName,
         headers: parsed.headers,
@@ -1855,6 +2046,7 @@ const prepareVandaImportDraft = (parsed, fileName) => {
         mappedSubjects,
         waitlistCandidates: parsed.waitlist || [],
         shiftDays: shifted.shiftDays,
+        remappedDates: !!shifted.remapped,
         targetStart: dates[0] || shifted.targetStart,
         targetEnd: dates[dates.length - 1] || shifted.targetEnd,
         visit79Count: visit79.length
@@ -1934,17 +2126,18 @@ const ingestWaitlistCandidates = async ({ candidates, studyId, siteId }) => {
             matched += 1;
             continue;
         }
+        const named = coerceImportPersonName(c.firstName, c.lastName, c.fullName || '', 'Candidate');
         const draftPatient = patientTemplate();
         draftPatient.id = ensureId('patient');
-        draftPatient.firstName = c.firstName;
-        draftPatient.lastName = c.lastName;
+        draftPatient.firstName = named.firstName;
+        draftPatient.lastName = named.lastName;
         draftPatient.phoneNumber = c.phoneNumber || '';
         draftPatient.group = c.group || '1';
         draftPatient.status = 'Candidate';
         draftPatient.registryStatus = 'Active';
         draftPatient.pipelineStage = 'lead';
         draftPatient.globalId = generateShortId();
-        draftPatient.initials = `${(c.firstName[0] || '').toUpperCase()}${(c.lastName[0] || '').toUpperCase()}`;
+        draftPatient.initials = `${(named.firstName[0] || '').toUpperCase()}${(named.lastName[0] || '').toUpperCase()}`;
         draftPatient.inclusionCriteriaMet = false;
         draftPatient.exclusionCriteriaMet = false;
         draftPatient.comments = c.notes || '';
@@ -1981,29 +2174,50 @@ const parseSubjectImportWorkbook = (arrayBuffer) => {
         const obj = {};
         headers.forEach((h, i) => {
             const v = r[i];
-            obj[h] = v == null ? '' : (v instanceof Date ? toLocalDateKey(v) : String(v).trim());
+            obj[h] = v == null ? '' : (v instanceof Date ? (coerceImportDateKey(v) || toLocalDateKey(v)) : String(v).trim());
         });
         return obj;
     });
     return { headers, rows, sheetName, format: 'flat' };
 };
 
-const coerceImportDateKey = (value) => {
-    if (!value && value !== 0) return '';
-    if (value instanceof Date && !Number.isNaN(value.getTime())) return toLocalDateKey(value);
-    const s = String(value).trim();
-    if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
-    const mdy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
-    if (mdy) {
-        const mm = mdy[1].padStart(2, '0');
-        const dd = mdy[2].padStart(2, '0');
-        let yyyy = mdy[3];
-        if (yyyy.length === 2) yyyy = String(2000 + parseInt(yyyy, 10));
-        return `${yyyy}-${mm}-${dd}`;
+const coerceImportDateKey = (value, { forVisit = true } = {}) => {
+    if (value == null || value === '') return '';
+    let key = '';
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        const y = value.getFullYear();
+        if (y === 1899 || y === 1900) return ''; // time-only Excel date
+        key = toLocalDateKey(value);
+    } else if (typeof value === 'number' && Number.isFinite(value)) {
+        key = excelSerialToDateKey(value);
+    } else {
+        const s = String(value).trim();
+        if (!s) return '';
+        // Bare Excel serial as text (SheetJS raw:false / String() path)
+        if (/^\d{5}(\.\d+)?$/.test(s)) {
+            key = excelSerialToDateKey(parseFloat(s));
+        } else if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+            key = s.slice(0, 10);
+        } else {
+            const mdy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+            if (mdy) {
+                const mm = mdy[1].padStart(2, '0');
+                const dd = mdy[2].padStart(2, '0');
+                let yyyy = mdy[3];
+                if (yyyy.length === 2) yyyy = String(2000 + parseInt(yyyy, 10));
+                key = `${yyyy}-${mm}-${dd}`;
+            } else if (!/^\d{1,2}:\d{2}/.test(s)) {
+                const parsed = new Date(s);
+                if (!Number.isNaN(parsed.getTime())) {
+                    const y = parsed.getFullYear();
+                    if (y !== 1899 && y !== 1900) key = toLocalDateKey(parsed);
+                }
+            }
+        }
     }
-    const parsed = new Date(s);
-    if (!Number.isNaN(parsed.getTime())) return toLocalDateKey(parsed);
-    return '';
+    if (!key) return '';
+    if (forVisit) return isPlausibleClinicDateKey(key) ? key : '';
+    return isPlausibleClinicDateKey(key, { minYear: 1920, maxYear: 2018 }) ? key : '';
 };
 
 const coerceImportTime = (value, fallback = '08:00') => {
@@ -2039,19 +2253,23 @@ const buildMappedSubjectsFromImport = (headers, rows, mapping) => {
     return rows.map((row, index) => {
         const get = (field) => {
             const key = map[field];
-            return key ? String(row[key] || '').trim() : '';
+            return key ? String(row[key] ?? '').trim() : '';
         };
-        let firstName = get('firstName');
-        let lastName = get('lastName');
+        const getRaw = (field) => {
+            const key = map[field];
+            return key ? row[key] : '';
+        };
+        const named = coerceImportPersonName(
+            get('firstName'),
+            get('lastName'),
+            get('fullName') || String(row['Full Name'] || row['Patient Name'] || row['Name'] || '').trim(),
+            get('screeningNumber') || `ROW-${index + 1}`
+        );
+        let firstName = named.firstName;
+        let lastName = named.lastName;
         const initials = get('initials');
-        if ((!firstName || !lastName) && initials) {
-            firstName = firstName || initials;
-            lastName = lastName || 'Subject';
-        }
-        if (!firstName && !lastName) {
-            const screening = get('screeningNumber') || `ROW-${index + 1}`;
-            firstName = 'Subject';
-            lastName = screening;
+        if (initials && (firstName === lastName || lastName === 'Unknown')) {
+            // keep initials for display; names already coerced
         }
         let visit = get('visit');
         if (/^\d+$/.test(visit)) visit = `Visit ${visit}`;
@@ -2065,11 +2283,11 @@ const buildMappedSubjectsFromImport = (headers, rows, mapping) => {
             firstName,
             lastName,
             initials: initials || `${(firstName[0] || '').toUpperCase()}${(lastName[0] || '').toUpperCase()}`,
-            dob: coerceImportDateKey(get('dob')),
+            dob: coerceImportDateKey(getRaw('dob') !== '' && getRaw('dob') != null ? getRaw('dob') : get('dob'), { forVisit: false }),
             phoneNumber: get('phoneNumber'),
             email,
             globalId: globalId && !/^(called|texted|lvm)/i.test(globalId) && globalId.length > 4 ? globalId : '',
-            visitDate: coerceImportDateKey(get('visitDate')),
+            visitDate: coerceImportDateKey(getRaw('visitDate') !== '' && getRaw('visitDate') != null ? getRaw('visitDate') : get('visitDate')),
             visitTime: get('visitTime'),
             group: get('group'),
             visit,
@@ -2077,7 +2295,7 @@ const buildMappedSubjectsFromImport = (headers, rows, mapping) => {
             isCancelledOrSf: isCancelledOrScreenFailStatus(visitStatus) || isCancelledOrScreenFailStatus(String(row.Comments || '')),
             raw: row
         };
-    }).filter(s => s.firstName || s.lastName || s.screeningNumber);
+    }).filter(s => String(s.firstName || '').trim() && String(s.lastName || '').trim());
 };
 
 const getSampleSubjectRoster = (dayKey) => {
@@ -2125,9 +2343,9 @@ const getSubjectImportModalHTML = () => {
     const draft = state.subjectImportDraft;
     const today = toLocalDateKey(new Date());
     const mapped = draft?.mappedSubjects || [];
-    const dateHints = mapped.map(s => s.visitDate).filter(Boolean).sort();
-    const defaultStart = draft?.targetStart || dateHints[0] || today;
-    const defaultEnd = draft?.targetEnd || dateHints[dateHints.length - 1] || today;
+    const dateHints = mapped.map(s => s.visitDate).filter(isPlausibleClinicDateKey).sort();
+    const defaultStart = (isPlausibleClinicDateKey(draft?.targetStart) && draft.targetStart) || dateHints[0] || today;
+    const defaultEnd = (isPlausibleClinicDateKey(draft?.targetEnd) && draft.targetEnd) || dateHints[dateHints.length - 1] || today;
     const visitCounts = {};
     mapped.forEach(s => {
         const key = s.visit || 'Visit';
@@ -2160,7 +2378,7 @@ const getSubjectImportModalHTML = () => {
                 <div class="md:col-span-2">
                     <label class="block text-sm font-medium dark:text-gray-300">Roster file</label>
                     <input type="file" id="subject-import-file" name="file" accept=".csv,.xlsx,.xls" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white">
-                    <p class="text-xs text-gray-500 mt-1">${draft?.fileName ? `Loaded: ${escapeHtmlPhi(draft.fileName)} · ${mapped.length} appointment rows${isVanda ? ` (clinic workbook · shifted ${draft.shiftDays || 0} days → ${escapeHtmlPhi(defaultStart)}…${escapeHtmlPhi(defaultEnd)})` : ''}${visitSummary ? `<br>${escapeHtmlPhi(visitSummary)}` : ''}${sfCount ? `<br>${sfCount} SF/CX/cancel rows kept as outcomes` : ''}${waitlistCount ? `<br>${waitlistCount} waitlist candidates` : ''}${draft?.visit79Count ? `<br>${draft.visit79Count} synthetic Visit 7–9 slots` : ''}` : 'Upload a Group visit workbook (.xlsx) or flat CSV.'}</p>
+                    <p class="text-xs text-gray-500 mt-1">${draft?.fileName ? `Loaded: ${escapeHtmlPhi(draft.fileName)} · ${mapped.length} appointment rows${isVanda ? ` (clinic workbook · ${draft.remappedDates ? 'dates rebuilt onto next week' : `shifted ${draft.shiftDays || 0} days`} → ${escapeHtmlPhi(defaultStart)}…${escapeHtmlPhi(defaultEnd)})` : ''}${visitSummary ? `<br>${escapeHtmlPhi(visitSummary)}` : ''}${sfCount ? `<br>${sfCount} SF/CX/cancel rows kept as outcomes` : ''}${waitlistCount ? `<br>${waitlistCount} waitlist candidates` : ''}${draft?.visit79Count ? `<br>${draft.visit79Count} synthetic Visit 7–9 slots` : ''}` : 'Upload a Group visit workbook (.xlsx) or flat CSV.'}</p>
                 </div>
                 <div class="md:col-span-2 flex items-center gap-2">
                     <input type="checkbox" id="subject-import-use-vanda-defaults" name="useVandaDefaults" value="1" class="rounded border-gray-400" ${isVanda ? 'checked' : ''}>
@@ -2255,7 +2473,11 @@ const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, st
     const interval = Math.max(5, parseInt(intervalMinutes, 10) || 30);
     const [defaultHour, defaultMinute] = String(startTime || '08:00').split(':').map(Number);
     const rangeStart = coerceImportDateKey(startDate) || toLocalDateKey(new Date());
-    const rangeEnd = coerceImportDateKey(endDate) || rangeStart;
+    let rangeEnd = coerceImportDateKey(endDate) || rangeStart;
+    // Guard against a bad end date from older drafts / manual edits
+    if (!isPlausibleClinicDateKey(rangeEnd, { minYear: 2020, maxYear: 2035 }) || rangeEnd < rangeStart) {
+        rangeEnd = rangeStart;
+    }
 
     let working = subjects.filter(s => includeSf || !s.isCancelledOrSf);
     working = working.filter(s => {
@@ -2338,10 +2560,11 @@ const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, st
             ].join('|');
             let patient = patientCache.get(cacheKey) || findPatientForSubjectImport(subject);
             if (!patient) {
+                const named = coerceImportPersonName(subject.firstName, subject.lastName, subject.raw?.['Full Name'] || '', subject.screeningNumber || 'Unknown');
                 const draftPatient = patientTemplate();
-                draftPatient.firstName = subject.firstName;
-                draftPatient.lastName = subject.lastName;
-                draftPatient.initials = subject.initials;
+                draftPatient.firstName = named.firstName;
+                draftPatient.lastName = named.lastName;
+                draftPatient.initials = subject.initials || `${(named.firstName[0] || '').toUpperCase()}${(named.lastName[0] || '').toUpperCase()}`;
                 draftPatient.screeningNumber = subject.screeningNumber || '';
                 draftPatient.dob = subject.dob || '';
                 draftPatient.phoneNumber = subject.phoneNumber || '';
@@ -2349,7 +2572,7 @@ const ingestSubjectRoster = async ({ subjects, studyId, siteId, visit, group, st
                 draftPatient.group = subject.group || '';
                 draftPatient.status = subject.isCancelledOrSf ? 'Screen Fail' : 'Enrolled';
                 draftPatient.registryStatus = 'Active';
-                draftPatient.globalId = subject.globalId || generateShortId();
+                draftPatient.globalId = subject.globalId ? String(subject.globalId) : generateShortId();
                 draftPatient.age = draftPatient.dob ? calculateAge(draftPatient.dob) : null;
                 draftPatient.inclusionCriteriaMet = true;
                 draftPatient.exclusionCriteriaMet = false;
