@@ -1789,62 +1789,14 @@ async function crudHandler(context, request, containerName) {
     }
 }
 
-// SWA managed functions are capped (~25 Standard / 10 Free). Register in-memory and expose one catch-all.
-const __httpHandlers = [];
-const registerHttp = (name, config) => {
-    __httpHandlers.push({
-        name,
-        methods: config.methods || ['GET'],
-        route: config.route,
-        handler: config.handler,
-        authLevel: config.authLevel,
-    });
-};
-
-const matchHttpRoute = (pattern, pathValue) => {
-    const patternParts = String(pattern || '').split('/').filter(Boolean);
-    const pathParts = String(pathValue || '').replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
-    const params = {};
-    let pi = 0;
-    let pj = 0;
-    while (pi < patternParts.length) {
-        const part = patternParts[pi];
-        if (/^\{[\w]+\?\}$/.test(part)) {
-            const name = part.slice(1, -2);
-            if (pj < pathParts.length) params[name] = pathParts[pj++];
-            pi += 1;
-            continue;
-        }
-        if (/^\{[\w]+\}$/.test(part)) {
-            const name = part.slice(1, -1);
-            if (pj >= pathParts.length) return null;
-            params[name] = pathParts[pj++];
-            pi += 1;
-            continue;
-        }
-        if (pathParts[pj] !== part) return null;
-        pj += 1;
-        pi += 1;
-    }
-    if (pj !== pathParts.length) return null;
-    return params;
-};
-
-const routeSpecificity = (route) => {
-    const parts = String(route || '').split('/').filter(Boolean);
-    const staticCount = parts.filter((p) => !p.startsWith('{')).length;
-    const optionalCount = parts.filter((p) => p.includes('?')).length;
-    return (staticCount * 100) + (parts.length * 10) - optionalCount;
-};
-
-registerHttp('studies', {
+app.http('studies', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'studies/{id?}', 
     handler: (request, context) => crudHandler(context, request, 'studies'),
 });
 
-registerHttp('sites', {
+app.http('sites', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'sites/{id?}',
@@ -1952,7 +1904,7 @@ const handlePatientsSubRoute = async (context, request) => {
     }
 };
 
-registerHttp('patients', {
+app.http('patients', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'patients/{id?}',
@@ -1963,42 +1915,28 @@ registerHttp('patients', {
     },
 });
 
-registerHttp('crcs', {
+app.http('crcs', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'crcs/{id?}',
     handler: (request, context) => crudHandler(context, request, 'crcs'),
 });
 
-registerHttp('events', {
+app.http('events', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'events/{id?}',
     handler: (request, context) => crudHandler(context, request, 'events'),
 });
 
-registerHttp('roles', {
+app.http('roles', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'roles/{id?}',
     handler: (request, context) => crudHandler(context, request, 'roles'),
 });
 
-registerHttp('training-types', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'training-types/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'roles'),  // Use roles container for training types
-});
-
-registerHttp('schedules', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    authLevel: 'anonymous', 
-    route: 'schedules/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'patient-schedules'),
-});
-
-registerHttp('patientSchedules', {
+app.http('patientSchedules', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'patient-schedules/{id?}',
@@ -2416,7 +2354,7 @@ const ensureBootstrapAdminUser = async (container) => {
     return resource;
 };
 
-registerHttp('health', {
+app.http('health', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'health',
@@ -2440,7 +2378,7 @@ registerHttp('health', {
     },
 });
 
-registerHttp('entraConfig', {
+app.http('entraConfig', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'entra-config',
@@ -2462,7 +2400,7 @@ registerHttp('entraConfig', {
     },
 });
 
-registerHttp('usersAuthenticateEntra', {
+app.http('usersAuthenticateEntra', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'users/authenticate-entra',
@@ -2553,7 +2491,7 @@ registerHttp('usersAuthenticateEntra', {
     },
 });
 
-registerHttp('usersAuthenticate', {
+app.http('usersAuthenticate', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'users/authenticate',
@@ -2600,21 +2538,21 @@ registerHttp('usersAuthenticate', {
     },
 });
 
-registerHttp('surveys', {
+app.http('surveys', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'surveys/{id?}',
     handler: (request, context) => crudHandler(context, request, 'surveys'),
 });
 
-registerHttp('recruitmentSettings', {
+app.http('recruitmentSettings', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'recruitment-settings/{id?}',
     handler: (request, context) => crudHandler(context, request, 'recruitment-settings'),
 });
 
-registerHttp('users', {
+app.http('users', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'users/{id?}',
@@ -2668,7 +2606,7 @@ const validateAccessRequestsSchema = (data) => {
     return true;
 };
 
-registerHttp('accessRequestsApprove', {
+app.http('accessRequestsApprove', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'access-requests/{id}/approve',
@@ -2752,7 +2690,7 @@ registerHttp('accessRequestsApprove', {
     },
 });
 
-registerHttp('accessRequestsDeny', {
+app.http('accessRequestsDeny', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'access-requests/{id}/deny',
@@ -2782,127 +2720,15 @@ registerHttp('accessRequestsDeny', {
     },
 });
 
-registerHttp('accessRequests', {
+app.http('accessRequests', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'access-requests/{id?}',
     handler: (request, context) => crudHandler(context, request, 'access-requests'),
 });
 
-registerHttp('patientsQuery', {
-    methods: ['POST', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'patients/query',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            return await runPatientsQuery(request, context);
-        } catch (error) {
-            return handleError(context, error, 'Patient query failed');
-        }
-    },
-});
-
-registerHttp('patientsToday', {
-    methods: ['GET', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'patients/today',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            return await runPatientsToday(request, context);
-        } catch (error) {
-            return handleError(context, error, 'Patients today query failed');
-        }
-    },
-});
-
-registerHttp('patientsActions', {
-    methods: ['POST', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'patients/actions',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            return await runPatientsActions(request, context);
-        } catch (error) {
-            return handleError(context, error, 'Patient action failed');
-        }
-    },
-});
-
-registerHttp('patientsReindex', {
-    methods: ['POST', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'patients/reindex',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            return await runPatientsReindex(request, context);
-        } catch (error) {
-            return handleError(context, error, 'Patient reindex failed');
-        }
-    },
-});
-
 // Aliases avoid Azure SWA routing POST /patients/query into patients/{id?} CRUD create.
-registerHttp('patientQuery', {
-    methods: ['POST', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'patient-query',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            return await runPatientsQuery(request, context);
-        } catch (error) {
-            return handleError(context, error, 'Patient query failed');
-        }
-    },
-});
-
-registerHttp('patientToday', {
-    methods: ['GET', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'patient-today',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            return await runPatientsToday(request, context);
-        } catch (error) {
-            return handleError(context, error, 'Patients today query failed');
-        }
-    },
-});
-
-registerHttp('patientActions', {
-    methods: ['POST', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'patient-actions',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            return await runPatientsActions(request, context);
-        } catch (error) {
-            return handleError(context, error, 'Patient action failed');
-        }
-    },
-});
-
-registerHttp('patientReindex', {
-    methods: ['POST', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'patient-reindex',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            return await runPatientsReindex(request, context);
-        } catch (error) {
-            return handleError(context, error, 'Patient reindex failed');
-        }
-    },
-});
-
-registerHttp('cohortsPreview', {
+app.http('cohortsPreview', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'cohorts/preview',
@@ -2933,7 +2759,7 @@ registerHttp('cohortsPreview', {
     },
 });
 
-registerHttp('cohortsAssign', {
+app.http('cohortsAssign', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'cohorts/assign',
@@ -2984,7 +2810,7 @@ registerHttp('cohortsAssign', {
     },
 });
 
-registerHttp('bulkJobs', {
+app.http('bulkJobs', {
     methods: ['GET', 'POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'bulk-jobs/{id?}',
@@ -3012,7 +2838,7 @@ registerHttp('bulkJobs', {
     },
 });
 
-registerHttp('bulkJobsContinue', {
+app.http('bulkJobsContinue', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'bulk-jobs/{id}/continue',
@@ -3033,37 +2859,11 @@ registerHttp('bulkJobsContinue', {
     },
 });
 
-registerHttp('cohortRules', {
+app.http('cohortRules', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'cohort-rules/{id?}',
     handler: (request, context) => crudHandler(context, request, 'cohort-rules'),
-});
-
-registerHttp('cohortMemberships', {
-    methods: ['GET', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'cohort-memberships',
-    handler: async (request, context) => {
-        try {
-            if (request.method === 'OPTIONS') return { status: 200, headers: jsonHeaders };
-            await requireUser(request);
-            const studyId = request.query.get('studyId');
-            const container = getContainer('cohort-memberships');
-            let resources = [];
-            if (studyId) {
-                resources = await safeQueryAll(container, {
-                    query: 'SELECT TOP 500 * FROM c WHERE c.studyId = @studyId ORDER BY c.assignedAt DESC',
-                    parameters: [{ name: '@studyId', value: studyId }],
-                });
-            } else {
-                resources = (await safeReadAll(container)).slice(0, 500);
-            }
-            return { jsonBody: resources, headers: jsonHeaders };
-        } catch (error) {
-            return handleError(context, error, 'Cohort memberships failed');
-        }
-    },
 });
 
 const CONSENT_LINKS_CONTAINER = 'consent-links';
@@ -3256,7 +3056,7 @@ const handleEconsentCreate = async (request, context) => {
 };
 
 /** Staff: create a unique patient eConsent link (ICF + signature capture). */
-registerHttp('econsentCreateLink', {
+app.http('econsentCreateLink', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'econsent/create-link',
@@ -3264,15 +3064,8 @@ registerHttp('econsentCreateLink', {
 });
 
 /** Back-compat alias for older UI builds. */
-registerHttp('econsentCreateLinkLegacy', {
-    methods: ['POST', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: 'econsent/links',
-    handler: handleEconsentCreate,
-});
-
 /** Public: load ICF for a unique consent token (minimal PHI). */
-registerHttp('econsentGetByToken', {
+app.http('econsentGetByToken', {
     methods: ['GET', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'econsent/{token}',
@@ -3304,7 +3097,7 @@ registerHttp('econsentGetByToken', {
 });
 
 /** Public: patient signs ICF; signature + record land on the patient profile. */
-registerHttp('econsentSignByToken', {
+app.http('econsentSignByToken', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     route: 'econsent/{token}/sign',
@@ -3412,42 +3205,5 @@ registerHttp('econsentSignByToken', {
         } catch (error) {
             return handleError(context, error, 'eConsent sign failed');
         }
-    },
-});
-
-
-app.http('nasaApi', {
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    authLevel: 'anonymous',
-    route: '{*path}',
-    handler: async (request, context) => {
-        const pathValue = String((request.params && request.params.path) || '').replace(/^\/+|\/+$/g, '');
-        const method = String(request.method || 'GET').toUpperCase();
-        const ranked = [...__httpHandlers].sort((a, b) => routeSpecificity(b.route) - routeSpecificity(a.route));
-        for (const h of ranked) {
-            const methods = (h.methods || []).map((m) => String(m).toUpperCase());
-            if (!methods.includes(method)) continue;
-            const params = matchHttpRoute(h.route, pathValue);
-            if (!params) continue;
-            const wrapped = new Proxy(request, {
-                get(target, prop, receiver) {
-                    if (prop === 'params') {
-                        return {
-                            ...(target.params || {}),
-                            ...params,
-                            path: (target.params && target.params.path) || pathValue,
-                        };
-                    }
-                    const value = Reflect.get(target, prop, receiver);
-                    return typeof value === 'function' ? value.bind(target) : value;
-                },
-            });
-            return h.handler(wrapped, context);
-        }
-        return {
-            status: 404,
-            jsonBody: { error: `No API route for /${pathValue || ''}` },
-            headers: corsJsonHeaders,
-        };
     },
 });
