@@ -184,6 +184,17 @@
     return artemisLegacyIndex;
   }
 
+  function goArtemisTab(tabId, reportPanel) {
+    if (typeof global.navigateToTab === 'function') {
+      global.navigateToTab(tabId, reportPanel ? { reportPanel } : {});
+      return;
+    }
+    const sel = reportPanel
+      ? `[data-nav-tab="${tabId}"][data-report-panel="${reportPanel}"]`
+      : `[data-nav-tab="${tabId}"]`;
+    document.querySelector(sel)?.click();
+  }
+
   function getLegacyForArtemisSite(siteId) {
     if (!siteId || !artemisLegacyIndex) return null;
     return artemisLegacyIndex.get(siteId) || null;
@@ -506,7 +517,7 @@
       <div class="space-y-4 px-1 sm:px-0" id="legacy-studies-root">
         <div class="flex flex-col gap-3">
           <div>
-            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Legacy Studies</h2>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Past studies</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
               Site–study outcomes from Anterior Segment Overview. Open a study for full site / PI / Visit1 / LPLV breakdown.
             </p>
@@ -534,7 +545,7 @@
       <div class="space-y-4 px-1 sm:px-0" id="legacy-reporting-root">
         <div class="flex flex-col gap-3">
           <div>
-            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Legacy Reporting</h2>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Historical funnel</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
               <strong>By Site</strong> = one row per unique site, not ~700 study×site lines.
             </p>
@@ -579,7 +590,7 @@
       <div class="space-y-4 px-1 sm:px-0" id="legacy-sites-root">
         <div class="rounded-xl overflow-hidden border border-[#1B2A4A]/20 dark:border-[#1B2A4A]/60">
           <div class="bg-[#1B2A4A] px-4 py-3 sm:px-5 sm:py-4 text-white">
-            <h2 class="text-xl sm:text-2xl font-bold tracking-tight">Legacy Sites</h2>
+            <h2 class="text-xl sm:text-2xl font-bold tracking-tight">Past sites</h2>
             <p class="text-sm text-white/75 mt-1 max-w-3xl">
               Historical funnel + feasibility. Promote links (or creates) a live Site — Chaos schedules and NASA sync stay untouched.
             </p>
@@ -627,7 +638,7 @@
       <div class="space-y-4 px-1 sm:px-0" id="legacy-feasibility-root">
         <div class="flex flex-col gap-3">
           <div class="rounded-xl bg-[#1B2A4A] px-4 py-3 sm:px-5 text-white">
-            <h2 class="text-xl sm:text-2xl font-bold tracking-tight">Feasibility Surveys</h2>
+            <h2 class="text-xl sm:text-2xl font-bold tracking-tight">Feasibility surveys</h2>
             <p class="text-sm text-white/75 mt-1">
               Browse by survey — site responses stay on legacy ids (not shared with Chaos).
             </p>
@@ -1181,7 +1192,7 @@
     if (!detail) {
       // Switch to Legacy Sites tab via header button, then open
       global.__legacyPendingSiteId = siteId;
-      document.getElementById('legacy-sites-tab-btn')?.click();
+      goArtemisTab('legacy-sites');
       return;
     }
     if (!site) {
@@ -1510,7 +1521,7 @@
       <section id="legacy-dashboard-root" class="border-t border-gray-200 dark:border-gray-700 pt-8 space-y-6">
         <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
           <div>
-            <h3 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Legacy Studies Overview</h3>
+            <h3 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Past studies overview</h3>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
               Anterior Segment historical site–study outcomes (Completed Projects funnel).
             </p>
@@ -2263,10 +2274,10 @@
       renderDashboard();
     });
     document.getElementById('legacy-dash-view-sites')?.addEventListener('click', () => {
-      document.getElementById('legacy-sites-tab-btn')?.click();
+      goArtemisTab('legacy-sites');
     });
     document.getElementById('legacy-dash-view-all')?.addEventListener('click', () => {
-      document.getElementById('legacy-reporting-tab-btn')?.click();
+      goArtemisTab('reporting', 'history');
     });
   }
 
@@ -3182,7 +3193,7 @@
         const siteId = btn.getAttribute('data-site-id');
         if (!siteId) return;
         global.__legacyPendingSiteId = siteId;
-        document.getElementById('legacy-sites-tab-btn')?.click();
+        goArtemisTab('legacy-sites');
       });
     });
 

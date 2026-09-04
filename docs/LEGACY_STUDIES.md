@@ -12,7 +12,9 @@ Site–study outcomes from **Anterior Segment Overview.xlsx**, **Dry Eye Overvie
 | `site-profiles` | `/id` | Feasibility site profile master (keyed by **legacy site id**). ARTEMIS-only; for Budget Buddy later. |
 | `site-survey-*` | `/id` | Feasibility survey defs/assignments/responses; **`siteId` = legacy site id** so Chaos shared `sites` is untouched |
 
-**Never written:** live `sites`, `studies`, `patients`, `crcs`, `events`, `schedules`, etc.
+**Promote (link only):** `POST /api/legacy-sites/promote` links a legacy site to a live `sites` row (or creates a minimal live stub). Writes link metadata only (`linkedArtemisSiteId` / soft `legacySiteIds`) — never overwrites Chaos scheduling fields, studyIds, or NASA sync.
+
+**Otherwise never written from legacy UI:** live `sites` schedules, `studies`, `patients`, `crcs`, `events`, etc.
 
 **Not shipped to:** CHAOS or NASA branches — this lives on the ARTEMIS Static Web App only.
 
@@ -36,17 +38,20 @@ See [`BUDGET_BUDDY_FEASIBILITY_INGEST.md`](./BUDGET_BUDDY_FEASIBILITY_INGEST.md)
 
 ## UI
 
-- **Legacy Sites** — Overview / **Surveys** (same accordion as live Sites) / **Site profile**; filter by indication/TA
-- **Feasibility Surveys** — list survey definitions → open one → site responses accordion (by survey, not by site)
-- **Comms** — **Predefined surveys** library (`isPredefined` / `library: feasibility`) with Clone + Send; custom surveys separate; Send Survey dropdown groups predefined vs custom
-- **Legacy Reporting** — funnel KPIs + **Feasibility by indication/TA** table + indication filter
-- **Legacy Studies** — list → open study → site table + edit metadata; sort A→Z / Z→A / enrolled
-- **Dashboard** — live ops charts + legacy overview panel at bottom
+Top nav: primary work tabs + **History** dropdown (past studies / past sites / feasibility surveys / historical funnel) + **People** (sites / CRCs / PI-Coord) + **Actions**.
+
+- **Past sites** (History) — Overview / **Surveys** / **Site profile**; promote to live Site; filter by indication/TA
+- **Feasibility surveys** (History) — list survey definitions → open one → site responses accordion
+- **Comms** — predefined surveys library with Clone + Send; Send Survey shows **prior answers** for selected sites before send
+- **Reporting → History** — funnel KPIs + feasibility-by-indication (same as Historical funnel in History menu)
+- **Past studies** (History) — list → open study → site table + edit metadata
+- **Dashboard** — needs-attention strip + live ops charts + legacy overview panel
 
 ## API routes
 
 - `GET/POST/PATCH/DELETE /api/legacy-studies/{id?}`
 - `GET/POST/PATCH/DELETE /api/legacy-sites/{id?}`
+- `POST /api/legacy-sites/promote` (dry-run supported)
 - `GET/POST /api/legacy-study-site-outcomes?studyId=`
 - `GET /api/legacy-reporting/summary`
 - `GET /api/site-profiles/{id?}` (optional `?indication=`)
