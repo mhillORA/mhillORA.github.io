@@ -2478,6 +2478,370 @@
             }
         };
 
+        let __xlsxLoading = null;
+        const ensureXlsxLib = () => {
+            if (window.XLSX) return Promise.resolve(window.XLSX);
+            if (__xlsxLoading) return __xlsxLoading;
+            __xlsxLoading = new Promise((resolve, reject) => {
+                const s = document.createElement('script');
+                s.src = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
+                s.async = true;
+                s.onload = () => (window.XLSX ? resolve(window.XLSX) : reject(new Error('SheetJS failed to load')));
+                s.onerror = () => reject(new Error('Could not load Excel library'));
+                document.head.appendChild(s);
+            }).catch((e) => {
+                __xlsxLoading = null;
+                throw e;
+            });
+            return __xlsxLoading;
+        };
+
+        const surveyInviteStats = (surveyId, targetRole = 'all') => {
+            const roleFilter = String(targetRole || 'all').trim().toLowerCase();
+            let assignments = asSurveyList(allSiteSurveyAssignments).filter(a => a && a.surveyId === surveyId);
+            if (roleFilter && roleFilter !== 'all') {
+                assignments = assignments.filter(a => String(a.targetRole || '').toLowerCase() === roleFilter);
+            }
+            const bySite = new Map();
+            assignments.forEach(a => {
+                if (!a.siteId) return;
+                const prev = bySite.get(a.siteId);
+                const rank = String(a.status || '').toLowerCase() === 'submitted' ? 2 : 1;
+                if (!prev || rank >= prev.rank) bySite.set(a.siteId, { assignment: a, rank });
+            });
+            const invited = bySite.size;
+            const submitted = [...bySite.values()].filter(x => String(x.assignment.status || '').toLowerCase() === 'submitted').length;
+            return { invited, submitted, pending: Math.max(0, invited - submitted), assignments };
+        };
+
+        const buildSponsorPackModel = ({ surveyId, targetRole = 'all' } = {}) => {
+            const sid = surveyId || feasibilityReportSurveyId;
+            const role = targetRole || feasibilityReportRole || 'all';
+            const report = buildFeasibilityQuestionReport(sid, role);
+            if (!report?.def) return null;
+            const invites = surveyInviteStats(sid, role);
+            const responded = report.siteRows.length;
+            const invited = Math.max(invites.invited, responded);
+            const rate = invited ? Math.round((responded / invited) * 100) : (responded ? 100 : 0);
+            const generatedAt = new Date();
+            const closedQs = report.questionStats.filter(s => !s.isLongText && s.distribution.length && s.answered);
+            const highlights = closedQs
+                .slice()
+                .sort((a, b) => b.answered - a.answered)
+                .slice(0, 8)
+                .map(s => ({
+                    question: s.question.label || s.question.id,
+                    answered: s.answered,
+                    top: s.distribution[0] || null,
+                    distribution: s.distribution.slice(0, 5)
+                }));
+            return { report, invites, invited, responded, rate, role, generatedAt, highlights, surveyId: sid };
+        };
+
+        const exportSponsorPackExcel = async ({ surveyId, targetRole = 'all' } = {}) => {
+            try {
+                const model = buildSponsorPackModel({ surveyId, targetRole });
+                if (!model) {
+                    showNotification('Select a survey with a definition first.', 'info');
+                    return;
+                }
+                if (!model.report.siteRows.length) {
+                    showNotification('No responses to include in the sponsor pack.', 'info');
+                    return;
+                }
+                showNotification('Building Excel sponsor pack…', 'info');
+                const XLSX = await ensureXlsxLib();
+                const { report, invited, responded, rate, role, generatedAt, highlights } = model;
+                const safeTitle = String(report.def.title || model.surveyId).replace(/[^a-z0-9]+/gi, '_').slice(0, 36);
+                const roleLabel = role === 'all' ? 'All roles' : formatSiteSurveyRoleLabel(role);
+                const wb = XLSX.utils.book_new();
+
+                const summaryAoA = [
+                    ['Ora Clinical Research — Site Feasibility Sponsor Pack'],
+                    ['Survey', report.def.title || model.surveyId],
+                    ['Audience filter', roleLabel],
+                    ['Generated', generatedAt.toLocaleString()],
+                    ['Confidential', 'For sponsor review — site-staff operational data only'],
+                    [],
+                    ['Metric', 'Value'],
+                    ['Sites with responses', responded],
+                    ['Sites invited (assignments)', invited],
+                    ['Response rate', `${rate}%`],
+                    ['Questions', report.questions.length],
+                    [],
+                    ['Highlights (top answer share among closed questions)'],
+                    ['Question', 'Answered sites', 'Leading answer', 'Share']
+                ];
+                highlights.forEach(h => {
+                    summaryAoA.push([
+                        h.question,
+                        h.answered,
+                        h.top?.value || '—',
+                        h.top ? `${h.top.pct}% (${h.top.count})` : '—'
+                    ]);
+                });
+                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summaryAoA), 'Summary');
+
+                const distAoA = [['Question', 'Answer', 'Sites', 'Percent of answered', 'Skipped / blank']];
+                report.questionStats.forEach(stat => {
+                    const qLabel = stat.question.label || stat.question.id || '';
+                    if (!stat.distribution.length) {
+                        distAoA.push([qLabel, '(no answers)', 0, '0%', stat.skipped]);
+                        return;
+                    }
+                    stat.distribution.forEach((d, i) => {
+                        distAoA.push([
+                            i === 0 ? qLabel : '',
+                            d.value,
+                            d.count,
+                            `${d.pct}%`,
+                            i === 0 ? stat.skipped : ''
+                        ]);
+                    });
+                });
+                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(distAoA), 'Distributions');
+
+                const matrixHeaders = ['Site', 'Role', 'Submitted', 'Score %', ...report.questions.map(q => q.label || q.id || '')];
+                const matrixAoA = [matrixHeaders];
+                report.siteRows.forEach(row => {
+                    const scorePct = typeof row.response?.score?.pct === 'number' ? row.response.score.pct : '';
+                    matrixAoA.push([
+                        row.siteName,
+                        formatSiteSurveyRoleLabel(row.response.targetRole),
+                        row.when ? new Date(row.when).toLocaleString() : '',
+                        scorePct,
+                        ...report.questions.map(q => findAnswerForQuestion(row.response, q).value || '')
+                    ]);
+                });
+                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(matrixAoA), 'Site Matrix');
+
+                const detailAoA = [['Site', 'Role', 'Submitted', 'Question', 'Answer']];
+                report.siteRows.forEach(row => {
+                    report.questions.forEach(q => {
+                        const { value } = findAnswerForQuestion(row.response, q);
+                        detailAoA.push([
+                            row.siteName,
+                            formatSiteSurveyRoleLabel(row.response.targetRole),
+                            row.when ? new Date(row.when).toLocaleString() : '',
+                            q.label || q.id || '',
+                            value || ''
+                        ]);
+                    });
+                });
+                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(detailAoA), 'Detail');
+
+                const rosterAoA = [['Site', 'Role', 'Submitted', 'Answers filled', 'Score %', 'Response ID']];
+                report.siteRows.forEach(row => {
+                    const filled = asSurveyList(row.response?.answers).filter(a => a && !a.skipped && String(a.value ?? '').trim() !== '').length;
+                    rosterAoA.push([
+                        row.siteName,
+                        formatSiteSurveyRoleLabel(row.response.targetRole),
+                        row.when ? new Date(row.when).toLocaleString() : '',
+                        filled,
+                        typeof row.response?.score?.pct === 'number' ? row.response.score.pct : '',
+                        row.response?.id || ''
+                    ]);
+                });
+                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rosterAoA), 'Site Roster');
+
+                XLSX.writeFile(wb, `ORA_SponsorPack_${safeTitle}_${generatedAt.toISOString().slice(0, 10)}.xlsx`);
+                showNotification('Sponsor Excel pack downloaded.', 'success');
+            } catch (err) {
+                console.error(err);
+                showNotification(err.message || 'Failed to export sponsor Excel.', 'error');
+            }
+        };
+
+        const exportSponsorPackPdf = ({ surveyId, targetRole = 'all' } = {}) => {
+            try {
+                const model = buildSponsorPackModel({ surveyId, targetRole });
+                if (!model) {
+                    showNotification('Select a survey with a definition first.', 'info');
+                    return;
+                }
+                if (!model.report.siteRows.length) {
+                    showNotification('No responses to include in the sponsor pack.', 'info');
+                    return;
+                }
+                const { report, invited, responded, rate, role, generatedAt, highlights } = model;
+                const roleLabel = role === 'all' ? 'All roles' : formatSiteSurveyRoleLabel(role);
+                const esc = escapeHtml;
+
+                const distBlocks = highlights.map(h => {
+                    const bars = (h.distribution || []).map(d => {
+                        const w = Math.max(4, Math.min(100, d.pct || 0));
+                        return `<div class="bar-row">
+                            <div class="bar-label">${esc(d.value)}</div>
+                            <div class="bar-track"><span style="width:${w}%"></span></div>
+                            <div class="bar-pct">${d.pct}% · ${d.count}</div>
+                        </div>`;
+                    }).join('');
+                    return `<div class="card">
+                        <div class="card-title">${esc(h.question)}</div>
+                        <div class="card-sub">${h.answered} site${h.answered === 1 ? '' : 's'} answered</div>
+                        ${bars || '<div class="muted">No closed-ended distribution</div>'}
+                    </div>`;
+                }).join('');
+
+                const matrixHead = report.questions.slice(0, 10).map(q => {
+                    const label = q.label || q.id || '';
+                    const short = label.length > 28 ? `${label.slice(0, 27)}…` : label;
+                    return `<th title="${esc(label)}">${esc(short)}</th>`;
+                }).join('');
+
+                const matrixBody = report.siteRows.map(row => {
+                    const cells = report.questions.slice(0, 10).map(q => {
+                        const { value } = findAnswerForQuestion(row.response, q);
+                        const display = !value ? '—' : (value.length > 40 ? `${value.slice(0, 39)}…` : value);
+                        return `<td title="${esc(value || '')}">${esc(display)}</td>`;
+                    }).join('');
+                    return `<tr>
+                        <td class="site">${esc(row.siteName)}</td>
+                        <td>${esc(formatSiteSurveyRoleLabel(row.response.targetRole))}</td>
+                        ${cells}
+                    </tr>`;
+                }).join('');
+
+                const siteAppendix = report.siteRows.map((row, idx) => {
+                    const answers = report.questions.map(q => {
+                        const { value, skipped } = findAnswerForQuestion(row.response, q);
+                        if (skipped && !value) return '';
+                        return `<tr>
+                            <td class="q">${esc(q.label || q.id || '')}</td>
+                            <td class="a">${esc(value || '—')}</td>
+                        </tr>`;
+                    }).join('');
+                    return `<section class="site-block ${idx ? 'break' : ''}">
+                        <h3>${esc(row.siteName)}</h3>
+                        <div class="meta-line">${esc(formatSiteSurveyRoleLabel(row.response.targetRole))}
+                            · Submitted ${esc(row.when ? new Date(row.when).toLocaleString() : '—')}
+                            ${typeof row.response?.score?.pct === 'number' ? ` · Score ${row.response.score.pct}%` : ''}
+                        </div>
+                        <table class="detail">${answers || '<tr><td colspan="2" class="muted">No answers</td></tr>'}</table>
+                    </section>`;
+                }).join('');
+
+                const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ORA Sponsor Pack — ${esc(report.def.title || model.surveyId)}</title>
+<style>
+  :root { --navy:#1B2A4A; --teal:#0F6E56; --teal-light:#E1F5EE; --gray-100:#F1F3F5; --gray-200:#E9ECEF; --gray-500:#868E96; --gray-600:#6C757D; --bg:#F5F7FA; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family: Inter, Segoe UI, system-ui, sans-serif; color:var(--navy); background:#fff; line-height:1.45; }
+  .page { max-width:900px; margin:0 auto; padding:32px 28px 48px; }
+  .header { background:var(--navy); color:#fff; border-radius:14px; padding:28px 30px; position:relative; overflow:hidden; margin-bottom:22px; }
+  .header::after { content:''; position:absolute; top:0; right:0; width:220px; height:100%; background:linear-gradient(135deg,transparent 30%,rgba(15,110,86,.22)); }
+  .eyebrow { font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:rgba(255,255,255,.45); font-weight:600; margin-bottom:8px; }
+  h1 { font-size:22px; margin:0 0 6px; letter-spacing:-.01em; }
+  .header p { margin:0; font-size:13px; color:rgba(255,255,255,.65); max-width:560px; }
+  .header-meta { margin-top:14px; display:flex; flex-wrap:wrap; gap:14px 18px; font-size:11.5px; color:rgba(255,255,255,.55); }
+  .header-meta strong { color:rgba(255,255,255,.8); font-weight:500; }
+  .kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:22px; }
+  .kpi { border:1px solid var(--gray-200); border-radius:12px; padding:14px 16px; background:#fff; }
+  .kpi .l { font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--gray-500); font-weight:600; }
+  .kpi .v { font-size:22px; font-weight:700; margin-top:4px; }
+  .intro { background:var(--teal-light); border-left:3px solid var(--teal); border-radius:10px; padding:12px 16px; font-size:13px; color:#085041; margin-bottom:24px; }
+  h2 { font-size:16px; margin:0 0 12px; padding-bottom:8px; border-bottom:2px solid var(--gray-200); }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:28px; }
+  .card { border:1px solid var(--gray-200); border-radius:10px; padding:12px 14px; background:#fff; break-inside:avoid; }
+  .card-title { font-size:12.5px; font-weight:600; }
+  .card-sub { font-size:11px; color:var(--gray-500); margin:2px 0 8px; }
+  .bar-row { display:grid; grid-template-columns:1fr 1.2fr 72px; gap:8px; align-items:center; margin-bottom:5px; font-size:11px; }
+  .bar-label { color:var(--gray-600); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bar-track { height:7px; background:var(--gray-100); border-radius:99px; overflow:hidden; }
+  .bar-track > span { display:block; height:100%; background:var(--teal); }
+  .bar-pct { text-align:right; color:var(--gray-500); font-size:10px; }
+  table.matrix { width:100%; border-collapse:collapse; font-size:11px; margin-bottom:28px; }
+  table.matrix th, table.matrix td { border-bottom:1px solid var(--gray-200); padding:7px 8px; text-align:left; vertical-align:top; }
+  table.matrix th { font-size:9.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--gray-500); background:var(--gray-100); }
+  table.matrix td.site { font-weight:600; white-space:nowrap; }
+  table.detail { width:100%; border-collapse:collapse; font-size:12px; }
+  table.detail td { padding:6px 8px; border-bottom:1px solid var(--gray-100); vertical-align:top; }
+  table.detail td.q { width:36%; color:var(--gray-600); }
+  table.detail td.a { font-weight:500; }
+  .site-block { margin-bottom:18px; break-inside:avoid; }
+  .site-block.pagebreak { break-before:page; page-break-before:always; }
+  .site-block h3 { margin:0 0 4px; font-size:15px; }
+  .meta-line { font-size:11.5px; color:var(--gray-500); margin-bottom:8px; }
+  .muted { color:var(--gray-500); font-size:12px; }
+  .footer { margin-top:28px; padding-top:12px; border-top:1px solid var(--gray-200); text-align:center; font-size:11px; color:var(--gray-500); }
+  .toolbar { position:sticky; top:0; z-index:5; background:rgba(245,247,250,.95); backdrop-filter:blur(6px); border-bottom:1px solid var(--gray-200); padding:10px 28px; display:flex; justify-content:flex-end; gap:8px; }
+  .toolbar button { font:inherit; font-size:13px; font-weight:600; border-radius:8px; padding:8px 14px; cursor:pointer; border:1px solid var(--gray-200); background:#fff; color:var(--navy); }
+  .toolbar button.primary { background:var(--teal); color:#fff; border-color:var(--teal); }
+  @media print {
+    .toolbar { display:none !important; }
+    .page { padding:12px 0; max-width:100%; }
+    .header { border-radius:0; }
+    body { background:#fff; }
+  }
+  @media (max-width:720px) {
+    .kpis, .grid { grid-template-columns:1fr 1fr; }
+    .bar-row { grid-template-columns:1fr; }
+  }
+</style>
+</head>
+<body>
+  <div class="toolbar">
+    <button type="button" onclick="window.close()">Close</button>
+    <button type="button" class="primary" onclick="window.print()">Print / Save PDF</button>
+  </div>
+  <div class="page">
+    <div class="header">
+      <div class="eyebrow">Ora Clinical Research — Sponsor Feasibility Pack</div>
+      <h1>${esc(report.def.title || 'Site feasibility survey')}</h1>
+      <p>${esc(report.def.description || 'Site-staff feasibility responses for sponsor review. Patient identifiers are not included.')}</p>
+      <div class="header-meta">
+        <span><strong>Audience:</strong> ${esc(roleLabel)}</span>
+        <span><strong>Generated:</strong> ${esc(generatedAt.toLocaleString())}</span>
+        <span><strong>Sites:</strong> ${responded} responded</span>
+      </div>
+    </div>
+
+    <div class="kpis">
+      <div class="kpi"><div class="l">Responses</div><div class="v">${responded}</div></div>
+      <div class="kpi"><div class="l">Invited</div><div class="v">${invited}</div></div>
+      <div class="kpi"><div class="l">Response rate</div><div class="v">${rate}%</div></div>
+      <div class="kpi"><div class="l">Questions</div><div class="v">${report.questions.length}</div></div>
+    </div>
+
+    <div class="intro">
+      This pack summarizes site feasibility answers for sponsor discussion. The first pages highlight response coverage and closed-ended answer patterns; the appendix lists each site’s full responses.
+    </div>
+
+    <h2>1 · Key answer patterns</h2>
+    <div class="grid">${distBlocks || '<div class="muted">No closed-ended highlights available — see matrix and appendix.</div>'}</div>
+
+    <h2>2 · Site × question snapshot${report.questions.length > 10 ? ' (first 10 questions)' : ''}</h2>
+    <table class="matrix">
+      <thead><tr><th>Site</th><th>Role</th>${matrixHead}</tr></thead>
+      <tbody>${matrixBody}</tbody>
+    </table>
+
+    <h2>3 · Site detail appendix</h2>
+    ${siteAppendix}
+
+    <div class="footer">Ora Clinical Research — Confidential · Site-staff operational data · Not for patient-level disclosure</div>
+  </div>
+</body>
+</html>`;
+
+                const w = window.open('', '_blank');
+                if (!w) {
+                    showNotification('Pop-up blocked — allow pop-ups to open the PDF view.', 'error');
+                    return;
+                }
+                w.document.open();
+                w.document.write(html);
+                w.document.close();
+                showNotification('Sponsor PDF view opened — use Print / Save PDF.', 'success');
+            } catch (err) {
+                console.error(err);
+                showNotification(err.message || 'Failed to open sponsor PDF.', 'error');
+            }
+        };
+
         const refreshFeasibilityReportRoot = () => {
             const root = document.getElementById('feasibility-report-root');
             if (!root) return;
@@ -3130,7 +3494,10 @@
             if (titleEl) titleEl.textContent = titles[commsPanel] || 'Comms';
             if (actionsEl) {
                 if (commsPanel === 'responses') {
-                    actionsEl.innerHTML = `<button type="button" id="jump-survey-reporting-btn" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline">Question report →</button>`;
+                    actionsEl.innerHTML = `
+                        <button type="button" id="jump-survey-reporting-btn" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline">Question report →</button>
+                        <button type="button" id="comms-sponsor-excel-btn" class="text-xs font-medium px-2 py-1 rounded bg-teal-700 text-white">Sponsor Excel</button>
+                        <button type="button" id="comms-sponsor-pdf-btn" class="text-xs font-medium px-2 py-1 rounded bg-indigo-600 text-white">Sponsor PDF</button>`;
                 } else if (commsPanel === 'activity') {
                     actionsEl.innerHTML = `<button type="button" id="mark-survey-notifications-read-btn" class="text-xs font-medium text-emerald-700 dark:text-emerald-300 hover:underline">Mark all read</button>`;
                 } else {
@@ -3996,7 +4363,7 @@
                          <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
                              <div>
                                  <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Feasibility Questions</h3>
-                                 <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Answer distributions and site × question matrix. Defaults to General Feasibility. Latest response per site.</p>
+                                 <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Answer distributions and site × question matrix. Use <strong>Sponsor Excel / PDF</strong> for a polished pack to share with sponsors.</p>
                              </div>
                              <div class="flex flex-wrap items-end gap-2">
                                  <label class="block text-xs text-gray-500 dark:text-gray-400">Survey
@@ -4014,8 +4381,10 @@
                                          <option value="coordinator">Coordinator</option>
                                      </select>
                                  </label>
-                                 <button type="button" id="feasibility-export-wide-btn" class="px-3 py-2 rounded-md bg-indigo-600 text-white text-sm hover:bg-indigo-700">Export CSV</button>
-                                 <button type="button" id="feasibility-export-long-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">Export long CSV</button>
+                                 <button type="button" id="feasibility-export-wide-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">CSV</button>
+                                 <button type="button" id="feasibility-export-long-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">Long CSV</button>
+                                 <button type="button" id="feasibility-sponsor-excel-btn" class="px-3 py-2 rounded-md bg-teal-700 text-white text-sm hover:bg-teal-800">Sponsor Excel</button>
+                                 <button type="button" id="feasibility-sponsor-pdf-btn" class="px-3 py-2 rounded-md bg-indigo-600 text-white text-sm hover:bg-indigo-700">Sponsor PDF</button>
                              </div>
                          </div>
                          <div id="feasibility-report-root" class="mt-6">
@@ -8939,6 +9308,30 @@
                     surveyId: surveySel?.value || feasibilityReportSurveyId,
                     mode: 'long',
                     targetRole: roleSel?.value || feasibilityReportRole
+                });
+            }
+            if (e.target.id === 'feasibility-sponsor-excel-btn' || e.target.id === 'comms-sponsor-excel-btn') {
+                const surveySel = document.getElementById('feasibility-survey-select');
+                const roleSel = document.getElementById('feasibility-role-select');
+                const surveyId = surveySel?.value
+                    || feasibilityReportSurveyId
+                    || (allSiteSurveyDefinitions || []).find(d => d.id === 'survey-general-feasibility')?.id
+                    || (allSiteSurveyDefinitions || [])[0]?.id;
+                exportSponsorPackExcel({
+                    surveyId,
+                    targetRole: roleSel?.value || feasibilityReportRole || 'all'
+                });
+            }
+            if (e.target.id === 'feasibility-sponsor-pdf-btn' || e.target.id === 'comms-sponsor-pdf-btn') {
+                const surveySel = document.getElementById('feasibility-survey-select');
+                const roleSel = document.getElementById('feasibility-role-select');
+                const surveyId = surveySel?.value
+                    || feasibilityReportSurveyId
+                    || (allSiteSurveyDefinitions || []).find(d => d.id === 'survey-general-feasibility')?.id
+                    || (allSiteSurveyDefinitions || [])[0]?.id;
+                exportSponsorPackPdf({
+                    surveyId,
+                    targetRole: roleSel?.value || feasibilityReportRole || 'all'
                 });
             }
             if (e.target.id === 'generate-dashboard-btn') {
