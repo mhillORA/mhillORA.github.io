@@ -1552,7 +1552,24 @@ async function crudHandler(context, request, containerName) {
                 }
                 if (id) {
                     const resource = await safeItemRead(container, id);
-                    if (!resource) return { status: 404, jsonBody: { error: `${containerName} not found` }, headers: corsJsonHeaders };
+                    if (!resource) {
+                        // First-run seed for NASA reference lists — avoid noisy 404s on boot
+                        if (containerName === 'recruitment-settings' && id === 'nasa-reference-data') {
+                            return {
+                                jsonBody: {
+                                    id: 'nasa-reference-data',
+                                    medications: [],
+                                    tags: [],
+                                    nqReasons: [],
+                                    niReasons: [],
+                                    updatedAt: new Date().toISOString(),
+                                    _missing: true,
+                                },
+                                headers: corsJsonHeaders,
+                            };
+                        }
+                        return { status: 404, jsonBody: { error: `${containerName} not found` }, headers: corsJsonHeaders };
+                    }
                     return { jsonBody: resource, headers: corsJsonHeaders };
                 }
                 const resources = await safeReadAll(container);
