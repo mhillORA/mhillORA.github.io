@@ -24,15 +24,21 @@
   }
 
   async function req(path, options = {}) {
+    const method = options.method || 'GET';
+    let body = options.body;
+    if (body != null && typeof body !== 'string') {
+      body = JSON.stringify(body);
+    }
     if (global.apiService && typeof global.apiService.request === 'function') {
       return global.apiService.request(path.startsWith('/') ? path : `/${path}`, {
-        method: options.method || 'GET',
-        body: options.body,
+        method,
+        body,
       });
     }
     const res = await fetch(`${apiBase()}${path}`, {
+      method,
       headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-      ...options,
+      body,
     });
     if (!res.ok) throw new Error(await res.text());
     if (res.status === 204) return null;
@@ -1010,6 +1016,10 @@
 
     siteSummaryCards(summary, sites);
 
+    const visibleIds = rows.map((s) => s.id);
+    const allVisibleSelected =
+      visibleIds.length > 0 && visibleIds.every((id) => promoteSelected.has(id));
+
     const cardHtml = rows
       .map((s) => {
         const m = s.metrics || {};
@@ -1019,26 +1029,34 @@
         const screened = t.screened || num(m.screened);
         const scheduled = t.scheduled || num(m.scheduled);
         const nStudies = new Set(siteOutcomes.map((o) => o.studyId)).size || m.nStudies || 0;
-        return `<button type="button" data-legacy-open-site="${escapeHtml(s.id)}"
-          class="w-full text-left p-4 border-b dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-700/40 active:bg-indigo-50 dark:active:bg-indigo-900/20 transition-colors">
-          <div class="flex items-start justify-between gap-2 mb-2">
-            <div class="min-w-0">
-              <div class="font-semibold text-gray-900 dark:text-white truncate">${escapeHtml(s.name)}</div>
-              <div class="text-xs text-gray-500 font-mono truncate">${escapeHtml(s.siteCode || s.id)}</div>
+        const checked = promoteSelected.has(s.id) ? 'checked' : '';
+        return `<div class="flex items-start gap-2 p-4 border-b dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-700/40">
+          <input type="checkbox" class="mt-1.5 shrink-0" data-legacy-promote-id="${escapeHtml(s.id)}" ${checked}
+            aria-label="Select ${escapeHtml(s.name || s.id)} for promote" />
+          <button type="button" data-legacy-open-site="${escapeHtml(s.id)}"
+            class="min-w-0 flex-1 text-left active:bg-indigo-50 dark:active:bg-indigo-900/20 transition-colors rounded-md -m-1 p-1">
+            <div class="flex items-start justify-between gap-2 mb-2">
+              <div class="min-w-0">
+                <div class="font-semibold text-gray-900 dark:text-white truncate flex flex-wrap items-center gap-1.5">
+                  <span class="truncate">${escapeHtml(s.name)}</span>
+                  ${liveLinkBadge(s)}
+                </div>
+                <div class="text-xs text-gray-500 font-mono truncate">${escapeHtml(s.siteCode || s.id)}</div>
+              </div>
+              ${preferenceBadge(s.relationshipPreference)}
             </div>
-            ${preferenceBadge(s.relationshipPreference)}
-          </div>
-          <div class="grid grid-cols-4 gap-1.5 mb-3">
-            ${metricChip('Studies', nStudies)}
-            ${metricChip('Sched', fmt(scheduled))}
-            ${metricChip('Screen', fmt(screened))}
-            ${metricChip('Enrolled', fmt(enrolled), true)}
-          </div>
-          <div class="flex items-center justify-between text-xs text-gray-500">
-            <span>E/S ${rate(enrolled, screened)} · S/Sched ${rate(screened, scheduled)}</span>
-            <span class="text-indigo-600 dark:text-indigo-300 font-medium">Open →</span>
-          </div>
-        </button>`;
+            <div class="grid grid-cols-4 gap-1.5 mb-3">
+              ${metricChip('Studies', nStudies)}
+              ${metricChip('Sched', fmt(scheduled))}
+              ${metricChip('Screen', fmt(screened))}
+              ${metricChip('Enrolled', fmt(enrolled), true)}
+            </div>
+            <div class="flex items-center justify-between text-xs text-gray-500">
+              <span>E/S ${rate(enrolled, screened)} · S/Sched ${rate(screened, scheduled)}</span>
+              <span class="text-indigo-600 dark:text-indigo-300 font-medium">Open →</span>
+            </div>
+          </button>
+        </div>`;
       })
       .join('');
 
@@ -1052,8 +1070,18 @@
         const scheduled = t.scheduled || num(m.scheduled);
         const target = t.targetScheduled || num(m.targetScheduled);
         const nStudies = new Set(siteOutcomes.map((o) => o.studyId)).size || m.nStudies || 0;
+        const checked = promoteSelected.has(s.id) ? 'checked' : '';
         return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
-          <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">${escapeHtml(s.name)}</td>
+          <td class="px-3 py-2">
+            <input type="checkbox" data-legacy-promote-id="${escapeHtml(s.id)}" ${checked}
+              aria-label="Select ${escapeHtml(s.name || s.id)} for promote" />
+          </td>
+          <td class="px-3 py-2 font-medium text-gray-900 dark:text-white">
+            <div class="flex flex-wrap items-center gap-1.5">
+              <span>${escapeHtml(s.name)}</span>
+              ${liveLinkBadge(s)}
+            </div>
+          </td>
           <td class="px-3 py-2 text-xs font-mono text-gray-500">${escapeHtml(s.siteCode || '—')}</td>
           <td class="px-3 py-2">${preferenceBadge(s.relationshipPreference)}</td>
           <td class="px-3 py-2 text-right">${nStudies}</td>
@@ -1076,6 +1104,10 @@
         <table class="min-w-full text-sm">
           <thead class="bg-gray-50 dark:bg-gray-900/50 text-left">
             <tr>
+              <th class="px-3 py-2 w-10">
+                <input type="checkbox" id="legacy-promote-select-all" ${allVisibleSelected ? 'checked' : ''}
+                  aria-label="Select all visible sites for promote" ${visibleIds.length ? '' : 'disabled'} />
+              </th>
               <th class="px-3 py-2">Site</th>
               <th class="px-3 py-2">Code</th>
               <th class="px-3 py-2">Relationship</th>
@@ -1096,6 +1128,36 @@
     wrap.querySelectorAll('[data-legacy-open-site]').forEach((btn) => {
       btn.addEventListener('click', () => openSiteDetail(btn.getAttribute('data-legacy-open-site')));
     });
+
+    wrap.querySelectorAll('[data-legacy-promote-id]').forEach((cb) => {
+      cb.addEventListener('click', (e) => e.stopPropagation());
+      cb.addEventListener('change', () => {
+        const id = cb.getAttribute('data-legacy-promote-id');
+        if (!id) return;
+        if (cb.checked) promoteSelected.add(id);
+        else promoteSelected.delete(id);
+        const selectAll = wrap.querySelector('#legacy-promote-select-all');
+        if (selectAll) {
+          selectAll.checked =
+            visibleIds.length > 0 && visibleIds.every((vid) => promoteSelected.has(vid));
+        }
+        updatePromoteToolbar();
+      });
+    });
+
+    wrap.querySelector('#legacy-promote-select-all')?.addEventListener('change', (e) => {
+      const on = !!e.target.checked;
+      visibleIds.forEach((id) => {
+        if (on) promoteSelected.add(id);
+        else promoteSelected.delete(id);
+      });
+      wrap.querySelectorAll('[data-legacy-promote-id]').forEach((cb) => {
+        cb.checked = on;
+      });
+      updatePromoteToolbar();
+    });
+
+    updatePromoteToolbar();
   }
 
   async function openSiteDetail(siteId) {
@@ -1181,6 +1243,36 @@
       profile = null;
     }
 
+    if (site.linkedArtemisSiteId && !site._liveSiteName) {
+      try {
+        const live = await req(`/sites/${encodeURIComponent(site.linkedArtemisSiteId)}`);
+        if (live?.name) site._liveSiteName = live.name;
+      } catch (_) {
+        /* linked id still usable for jump */
+      }
+    }
+    const liveLinked = !!site.linkedArtemisSiteId;
+    const liveDisplayName = site._liveSiteName || site.linkedArtemisSiteId || '';
+    const liveLinkPanel = liveLinked
+      ? `<div class="mt-3 rounded-md border border-teal-200 dark:border-teal-800/60 bg-teal-50/60 dark:bg-teal-900/20 px-3 py-2.5">
+            <div class="text-xs font-medium text-teal-900 dark:text-teal-200 mb-1">Live site link</div>
+            <div class="flex flex-wrap items-center gap-2">
+              ${liveLinkBadge(site)}
+              <span class="text-sm text-gray-800 dark:text-gray-200">${escapeHtml(liveDisplayName)}</span>
+              ${
+                site._liveSiteName && site._liveSiteName !== site.linkedArtemisSiteId
+                  ? `<span class="text-xs text-gray-500">${escapeHtml(site.linkedArtemisSiteId)}</span>`
+                  : ''
+              }
+              <button type="button" id="legacy-jump-live-site" class="text-sm font-medium text-indigo-600 dark:text-indigo-400 hover:underline">Open live site →</button>
+            </div>
+          </div>`
+      : `<div class="mt-3 rounded-md border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-900/40 px-3 py-2.5">
+            <div class="text-xs font-medium text-gray-600 dark:text-gray-300 mb-1">Live site link</div>
+            <div class="flex flex-wrap items-center gap-2 mb-1">${liveLinkBadge(site)}</div>
+            <p class="text-xs text-gray-500 dark:text-gray-400">Promote from the list links or creates a live site without touching Chaos schedules.</p>
+          </div>`;
+
     detail.innerHTML = `
       <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4 space-y-5">
         <div class="flex flex-col gap-3">
@@ -1195,6 +1287,7 @@
             <div class="flex flex-wrap gap-1.5 mt-2">
               ${inds.map((i) => `<span class="inline-flex px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200">${escapeHtml(i)}</span>`).join('') || '<span class="text-xs text-gray-400">No indications / TA tagged</span>'}
             </div>
+            ${liveLinkPanel}
           </div>
           <button type="button" id="legacy-save-site" class="${TAP_BTN} w-full sm:w-auto">Save site</button>
         </div>
@@ -1359,6 +1452,12 @@
           surveyUi.createSiteSurveyResponseModal(response);
         }
       });
+    });
+
+    document.getElementById('legacy-jump-live-site')?.addEventListener('click', () => {
+      if (!site.linkedArtemisSiteId) return;
+      global.__pendingLiveSiteId = site.linkedArtemisSiteId;
+      document.getElementById('sites-tab-btn')?.click();
     });
 
     document.getElementById('legacy-back-sites')?.addEventListener('click', () => {
@@ -2708,6 +2807,15 @@
         rerender();
       }
     });
+
+    const root = document.getElementById('legacy-sites-root') || document.getElementById('legacy-sites-table-wrap')?.parentElement;
+    if (root && !root.dataset.promoteBound) {
+      root.dataset.promoteBound = '1';
+      document.getElementById('legacy-promote-selected')?.addEventListener('click', () => openPromoteWizard({ all: false }));
+      document.getElementById('legacy-promote-all')?.addEventListener('click', () => openPromoteWizard({ all: true }));
+    }
+    updatePromoteToolbar();
+
     if (global.__legacyPendingSiteId) {
       const id = global.__legacyPendingSiteId;
       global.__legacyPendingSiteId = null;
@@ -2998,7 +3106,6 @@
                   ${scoreBadge}
                 </div>
                 <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-xs text-gray-500 dark:text-gray-400">
-                  <span class="font-mono">${escapeHtml(r.siteId || '')}</span>
                   <span>${escapeHtml(when)}</span>
                   <span>${answerCount} answer${answerCount === 1 ? '' : 's'}</span>
                   ${ind ? `<span>${escapeHtml(ind)}</span>` : ''}

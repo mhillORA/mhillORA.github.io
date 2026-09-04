@@ -1486,6 +1486,11 @@
                     case 'sites':
                         mainContentArea.innerHTML = getSitesHTML();
                         renderAllSites();
+                        if (window.__pendingLiveSiteId) {
+                            const pendingLiveId = window.__pendingLiveSiteId;
+                            window.__pendingLiveSiteId = null;
+                            setTimeout(() => createSiteDetailsModal(pendingLiveId), 50);
+                        }
                         break;
                     case 'staff':
                         mainContentArea.innerHTML = getStaffHTML();
@@ -2238,17 +2243,6 @@
             return `${s.slice(0, max - 1)}…`;
         };
 
-        const findAnswerForQuestion = (response, question) => {
-            const answers = asSurveyList(response?.answers);
-            const qid = question?.id;
-            const a = answers.find(x => x && (x.questionId === qid || String(x.questionId) === String(qid)
-                || (x.label && question?.label && String(x.label).trim() === String(question.label).trim())));
-            if (!a) return { skipped: true, value: '' };
-            if (a.skipped && (a.value == null || String(a.value).trim() === '')) return { skipped: true, value: '' };
-            const value = String(a.value ?? '').trim();
-            return { skipped: !value, value };
-        };
-
         /** True for Cosmos / ingest ids that must never appear on sponsor-facing packs. */
         const looksLikeInternalSiteId = (value) => {
             const s = String(value || '').trim();
@@ -2344,8 +2338,11 @@
         };
 
         const formatSponsorQuestionLabel = (question, index = 0) => {
-            const label = String(question?.label || '').trim();
-            if (label && !/^q[-_]?\d+$/i.test(label) && !looksLikeInternalSiteId(label)) return label;
+            let label = String(question?.label || '').trim();
+            label = label.replace(/\s*\|\s*\d{4}-\d{1,2}-\d{1,2}.*$/, '').trim();
+            if (label && !/^q[-_]?\d+$/i.test(label) && !looksLikeInternalSiteId(label) && !isSpuriousExcelDateValue(label)) {
+                return label;
+            }
             return `Question ${index + 1}`;
         };
 
@@ -2366,6 +2363,52 @@
             } catch (_) {
                 return '—';
             }
+        };
+
+        const isSpuriousExcelDateValue = (value) => {
+            const s = String(value || '').trim();
+            if (!s) return false;
+            return /^\d{4}-\d{1,2}-\d{1,2}([ T]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?)?$/.test(s)
+                || /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(s);
+        };
+
+        const isDateQuestionLabel = (label) => {
+            const l = String(label || '').toLowerCase();
+            if (l.includes('update')) return false;
+            return /\bdate\b|completion date|start date|end date/.test(l);
+        };
+
+        const isSponsorInsightQuestion = (question) => {
+            const label = String(question?.label || '');
+            if (!label.trim()) return false;
+            if (/\|\s*\d{4}-\d{1,2}-\d{1,2}/.test(label)) return false;
+            if (isSpuriousExcelDateValue(label)) return false;
+            if (isDateQuestionLabel(label)) return false;
+            const l = label.toLowerCase();
+            if (/person completing|email|phone|address|ip address|collector|respondent id/.test(l)) return false;
+            return true;
+        };
+
+        const normalizeSponsorAnswerValue = (value, question) => {
+            const raw = String(value ?? '').trim();
+            if (!raw) return '';
+            if (isSpuriousExcelDateValue(raw) && !isDateQuestionLabel(question?.label)) return '';
+            if (isSpuriousExcelDateValue(raw) && isDateQuestionLabel(question?.label)) {
+                return formatSponsorDate(raw.includes('T') || raw.includes(' ') ? raw : `${raw}T00:00:00`);
+            }
+            return raw;
+        };
+
+        const findAnswerForQuestion = (response, question) => {
+            const answers = asSurveyList(response?.answers);
+            const qid = question?.id;
+            const a = answers.find(x => x && (x.questionId === qid || String(x.questionId) === String(qid)
+                || (x.label && question?.label && String(x.label).trim() === String(question.label).trim())));
+            if (!a) return { skipped: true, value: '' };
+            if (a.skipped && (a.value == null || String(a.value).trim() === '')) return { skipped: true, value: '' };
+            const value = normalizeSponsorAnswerValue(a.value, question);
+            if (!value) return { skipped: true, value: '' };
+            return { skipped: false, value };
         };
 
         const buildFeasibilityQuestionReport = (surveyId, targetRole = 'all') => {
@@ -2596,22 +2639,80 @@
             }
         };
 
-        let __xlsxLoading = null;
-        const ensureXlsxLib = () => {
-            if (window.XLSX) return Promise.resolve(window.XLSX);
-            if (__xlsxLoading) return __xlsxLoading;
-            __xlsxLoading = new Promise((resolve, reject) => {
+        let __excelJsLoading = null;
+        const ensureExcelJsLib = () => {
+            if (window.ExcelJS) return Promise.resolve(window.ExcelJS);
+            if (__excelJsLoading) return __excelJsLoading;
+            __excelJsLoading = new Promise((resolve, reject) => {
                 const s = document.createElement('script');
-                s.src = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
+                s.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
                 s.async = true;
-                s.onload = () => (window.XLSX ? resolve(window.XLSX) : reject(new Error('SheetJS failed to load')));
+                s.onload = () => (window.ExcelJS ? resolve(window.ExcelJS) : reject(new Error('ExcelJS failed to load')));
                 s.onerror = () => reject(new Error('Could not load Excel library'));
                 document.head.appendChild(s);
             }).catch((e) => {
-                __xlsxLoading = null;
+                __excelJsLoading = null;
                 throw e;
             });
-            return __xlsxLoading;
+            return __excelJsLoading;
+        };
+
+        const downloadExcelJsWorkbook = async (workbook, filename) => {
+            const buffer = await workbook.xlsx.writeBuffer();
+            const blob = new Blob([buffer], {
+                type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1500);
+        };
+
+        const applySponsorReviewColumns = (sheet, startRow, endRow, includeCol, feedbackCol, notesCol) => {
+            if (endRow < startRow) return;
+            const includeLetter = sheet.getColumn(includeCol).letter;
+            sheet.dataValidations.add(`${includeLetter}${startRow}:${includeLetter}${endRow}`, {
+                type: 'list',
+                allowBlank: true,
+                formulae: ['"Include,Exclude"'],
+                showErrorMessage: true,
+                errorTitle: 'Include / Exclude',
+                error: 'Select Include or Exclude from the list.',
+                promptTitle: 'Site decision',
+                prompt: 'Choose Include or Exclude',
+                showInputMessage: true
+            });
+            for (let r = startRow; r <= endRow; r++) {
+                const includeCell = sheet.getCell(r, includeCol);
+                includeCell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+                includeCell.border = {
+                    top: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+                    left: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+                    bottom: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+                    right: { style: 'thin', color: { argb: 'FFCBD5E1' } }
+                };
+                includeCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
+
+                [feedbackCol, notesCol].forEach((col) => {
+                    const cell = sheet.getCell(r, col);
+                    cell.alignment = { vertical: 'top', horizontal: 'left', wrapText: true };
+                    cell.border = {
+                        top: { style: 'thin', color: { argb: 'FF94A3B8' } },
+                        left: { style: 'thin', color: { argb: 'FF94A3B8' } },
+                        bottom: { style: 'thin', color: { argb: 'FF94A3B8' } },
+                        right: { style: 'thin', color: { argb: 'FF94A3B8' } }
+                    };
+                    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFBEB' } };
+                });
+                sheet.getRow(r).height = Math.max(sheet.getRow(r).height || 0, 48);
+            }
+            sheet.getColumn(includeCol).width = 16;
+            sheet.getColumn(feedbackCol).width = 36;
+            sheet.getColumn(notesCol).width = 36;
         };
 
         const surveyInviteStats = (surveyId, targetRole = 'all') => {
@@ -2643,7 +2744,13 @@
             const rate = invited ? Math.round((responded / invited) * 100) : (responded ? 100 : 0);
             const generatedAt = new Date();
             const surveyTitle = formatSponsorSurveyTitle(report.def, sid);
-            const closedQs = report.questionStats.filter(s => !s.isLongText && s.distribution.length && s.answered);
+            const closedQs = report.questionStats.filter(s =>
+                !s.isLongText
+                && s.distribution.length
+                && s.answered
+                && isSponsorInsightQuestion(s.question)
+                && !s.distribution.every(d => isSpuriousExcelDateValue(d.value))
+            );
             const highlights = closedQs
                 .slice()
                 .sort((a, b) => b.answered - a.answered)
@@ -2680,49 +2787,91 @@
                     return;
                 }
                 showNotification('Building Excel sponsor pack…', 'info');
-                const XLSX = await ensureXlsxLib();
+                const ExcelJS = await ensureExcelJsLib();
                 const { report, invited, responded, rate, role, generatedAt, highlights, surveyTitle } = model;
                 const safeTitle = String(surveyTitle).replace(/[^a-z0-9]+/gi, '_').slice(0, 36);
                 const roleLabel = role === 'all' ? 'All respondents' : formatSponsorRoleLabel(role);
-                const wb = XLSX.utils.book_new();
+                const wb = new ExcelJS.Workbook();
+                wb.creator = 'Ora Clinical Research';
+                wb.created = generatedAt;
 
-                const summaryAoA = [
-                    ['Ora Clinical Research'],
-                    ['Site Feasibility — Sponsor Pack'],
-                    [],
-                    ['Survey', surveyTitle],
-                    ['Audience', roleLabel],
-                    ['Generated', formatSponsorDate(generatedAt.toISOString())],
-                    ['Classification', 'Confidential — for sponsor review'],
-                    [],
-                    ['Metric', 'Value'],
-                    ['Participating sites', responded],
-                    ['Sites invited', invited],
-                    ['Response rate', `${rate}%`],
-                    ['Questions', report.questions.length],
-                    [],
-                    ['Key answer patterns'],
-                    ['Question', 'Sites answered', 'Leading response', 'Share']
-                ];
+                const styleHeaderRow = (row) => {
+                    row.font = { bold: true, color: { argb: 'FF0F172A' } };
+                    row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
+                    row.alignment = { vertical: 'middle', wrapText: true };
+                    row.height = 22;
+                };
+
+                const summary = wb.addWorksheet('Summary', { views: [{ state: 'frozen', ySplit: 1 }] });
+                summary.addRow(['Ora Clinical Research']);
+                summary.addRow(['Site Feasibility — Sponsor Pack']);
+                summary.addRow([]);
+                summary.addRow(['Survey', surveyTitle]);
+                summary.addRow(['Audience', roleLabel]);
+                summary.addRow(['Generated', formatSponsorDate(generatedAt.toISOString())]);
+                summary.addRow(['Classification', 'Confidential — for sponsor review']);
+                summary.addRow([]);
+                summary.addRow(['Metric', 'Value']);
+                summary.addRow(['Participating sites', responded]);
+                summary.addRow(['Sites invited', invited]);
+                summary.addRow(['Response rate', `${rate}%`]);
+                summary.addRow(['Questions', report.questions.length]);
+                summary.addRow([]);
+                summary.addRow(['Key answer patterns']);
+                summary.addRow(['Question', 'Sites answered', 'Leading response', 'Share']);
                 highlights.forEach(h => {
-                    summaryAoA.push([
+                    summary.addRow([
                         h.question,
                         h.answered,
                         h.top?.value || '—',
                         h.top ? `${h.top.pct}%` : '—'
                     ]);
                 });
-                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summaryAoA), 'Summary');
+                summary.getColumn(1).width = 42;
+                summary.getColumn(2).width = 18;
+                summary.getColumn(3).width = 28;
+                summary.getColumn(4).width = 12;
 
-                const distAoA = [['Question', 'Answer', 'Sites', 'Percent', 'Blank']];
+                // Primary sponsor markup sheet
+                const review = wb.addWorksheet('Site Review', { views: [{ state: 'frozen', ySplit: 2 }] });
+                review.mergeCells('A1:H1');
+                review.getCell('A1').value = 'Sponsor site decisions — use Include/Exclude dropdown; type Feedback and Notes in the yellow boxes.';
+                review.getCell('A1').font = { italic: true, color: { argb: 'FF475569' }, size: 10 };
+                review.getCell('A1').alignment = { vertical: 'middle', wrapText: true };
+                review.getRow(1).height = 28;
+                const reviewHeaders = ['Site', 'Respondent', 'Submitted', 'Answers completed', 'Score %', 'Include / Exclude', 'Feedback', 'Notes'];
+                const reviewHeaderRow = review.addRow(reviewHeaders);
+                styleHeaderRow(reviewHeaderRow);
+                report.siteRows.forEach(row => {
+                    const filled = asSurveyList(row.response?.answers).filter(a => a && !a.skipped && String(a.value ?? '').trim() !== '').length;
+                    review.addRow([
+                        row.siteName,
+                        formatSponsorRoleLabel(row.response.targetRole),
+                        formatSponsorDate(row.when),
+                        filled,
+                        typeof row.response?.score?.pct === 'number' ? row.response.score.pct : '',
+                        '',
+                        '',
+                        ''
+                    ]);
+                });
+                review.getColumn(1).width = 28;
+                review.getColumn(2).width = 14;
+                review.getColumn(3).width = 14;
+                review.getColumn(4).width = 16;
+                review.getColumn(5).width = 10;
+                applySponsorReviewColumns(review, 3, 2 + report.siteRows.length, 6, 7, 8);
+
+                const dist = wb.addWorksheet('Distributions');
+                styleHeaderRow(dist.addRow(['Question', 'Answer', 'Sites', 'Percent', 'Blank']));
                 report.questionStats.forEach((stat, qi) => {
                     const qLabel = formatSponsorQuestionLabel(stat.question, qi);
                     if (!stat.distribution.length) {
-                        distAoA.push([qLabel, '(no answers)', 0, '0%', stat.skipped]);
+                        dist.addRow([qLabel, '(no answers)', 0, '0%', stat.skipped]);
                         return;
                     }
                     stat.distribution.forEach((d, i) => {
-                        distAoA.push([
+                        dist.addRow([
                             i === 0 ? qLabel : '',
                             d.value,
                             d.count,
@@ -2731,33 +2880,60 @@
                         ]);
                     });
                 });
-                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(distAoA), 'Distributions');
+                dist.getColumn(1).width = 40;
+                dist.getColumn(2).width = 28;
+                dist.getColumn(3).width = 10;
+                dist.getColumn(4).width = 10;
+                dist.getColumn(5).width = 10;
 
+                const matrix = wb.addWorksheet('Site Matrix', { views: [{ state: 'frozen', xSplit: 1, ySplit: 1 }] });
                 const matrixHeaders = [
                     'Site',
                     'Respondent',
                     'Submitted',
                     'Score %',
-                    ...report.questions.map((q, i) => formatSponsorQuestionLabel(q, i))
+                    ...report.questions.map((q, i) => formatSponsorQuestionLabel(q, i)),
+                    'Include / Exclude',
+                    'Feedback',
+                    'Notes'
                 ];
-                const matrixAoA = [matrixHeaders];
+                styleHeaderRow(matrix.addRow(matrixHeaders));
                 report.siteRows.forEach(row => {
                     const scorePct = typeof row.response?.score?.pct === 'number' ? row.response.score.pct : '';
-                    matrixAoA.push([
+                    matrix.addRow([
                         row.siteName,
                         formatSponsorRoleLabel(row.response.targetRole),
                         formatSponsorDate(row.when),
                         scorePct,
-                        ...report.questions.map(q => findAnswerForQuestion(row.response, q).value || '')
+                        ...report.questions.map(q => findAnswerForQuestion(row.response, q).value || ''),
+                        '',
+                        '',
+                        ''
                     ]);
                 });
-                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(matrixAoA), 'Site Matrix');
+                matrix.getColumn(1).width = 26;
+                matrix.getColumn(2).width = 14;
+                matrix.getColumn(3).width = 14;
+                matrix.getColumn(4).width = 10;
+                for (let c = 5; c <= 4 + report.questions.length; c++) {
+                    matrix.getColumn(c).width = 18;
+                }
+                const matrixIncludeCol = 5 + report.questions.length;
+                applySponsorReviewColumns(
+                    matrix,
+                    2,
+                    1 + report.siteRows.length,
+                    matrixIncludeCol,
+                    matrixIncludeCol + 1,
+                    matrixIncludeCol + 2
+                );
 
-                const detailAoA = [['Site', 'Respondent', 'Submitted', 'Question', 'Answer']];
+                const detail = wb.addWorksheet('Detail');
+                styleHeaderRow(detail.addRow(['Site', 'Respondent', 'Submitted', 'Question', 'Answer']));
                 report.siteRows.forEach(row => {
                     report.questions.forEach((q, qi) => {
                         const { value } = findAnswerForQuestion(row.response, q);
-                        detailAoA.push([
+                        detail.addRow([
                             row.siteName,
                             formatSponsorRoleLabel(row.response.targetRole),
                             formatSponsorDate(row.when),
@@ -2766,22 +2942,14 @@
                         ]);
                     });
                 });
-                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(detailAoA), 'Detail');
+                detail.getColumn(1).width = 26;
+                detail.getColumn(2).width = 14;
+                detail.getColumn(3).width = 14;
+                detail.getColumn(4).width = 40;
+                detail.getColumn(5).width = 36;
 
-                const rosterAoA = [['Site', 'Respondent', 'Submitted', 'Answers completed', 'Score %']];
-                report.siteRows.forEach(row => {
-                    const filled = asSurveyList(row.response?.answers).filter(a => a && !a.skipped && String(a.value ?? '').trim() !== '').length;
-                    rosterAoA.push([
-                        row.siteName,
-                        formatSponsorRoleLabel(row.response.targetRole),
-                        formatSponsorDate(row.when),
-                        filled,
-                        typeof row.response?.score?.pct === 'number' ? row.response.score.pct : ''
-                    ]);
-                });
-                XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rosterAoA), 'Site Roster');
-
-                XLSX.writeFile(wb, `ORA_Feasibility_SponsorPack_${safeTitle}_${generatedAt.toISOString().slice(0, 10)}.xlsx`);
+                const filename = `ORA_Feasibility_SponsorPack_${safeTitle}_${generatedAt.toISOString().slice(0, 10)}.xlsx`;
+                await downloadExcelJsWorkbook(wb, filename);
                 showNotification('Sponsor Excel pack downloaded.', 'success');
             } catch (err) {
                 console.error(err);

@@ -561,15 +561,37 @@ def match_identity(ident, sites, email_index, pi_index, legacy, alias_to_site):
 def responses_to_questions_and_answers(responses: dict):
     questions = []
     answers = []
+    date_full = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}([ T]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?)?$")
+    slash_date = re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
+
+    def is_excel_date(val: str) -> bool:
+        s = (val or "").strip()
+        return bool(date_full.match(s) or slash_date.match(s))
+
+    def is_date_label(label: str) -> bool:
+        lab = (label or "").lower()
+        if "update" in lab:
+            return False
+        return bool(re.search(r"\bdate\b|completion date|start date|end date", lab))
+
     for i, (label, value) in enumerate(responses.items()):
         if not label or str(label).strip().lower() == "form view":
             continue
+        # Skip option headers that are themselves Excel dates (matrix corruption)
+        if is_excel_date(str(label).strip()) or re.search(r"\|\s*\d{4}-\d{1,2}-\d{1,2}", str(label)):
+            # still keep the field if it has a real non-date value; scrub label tail
+            label = re.sub(r"\s*\|\s*\d{4}-\d{1,2}-\d{1,2}.*$", "", str(label)).strip() or label
         qid = f"q_{i:03d}_{slugify(label, 40)}"
         val = None if value is None or str(value).strip() == "" else str(value).strip()
+        # Drop Excel datetimes dumped into count/text fields
+        if val and is_excel_date(val) and not is_date_label(label):
+            val = None
         # infer type lightly
         qtype = "textarea" if val and len(val) > 100 else "text"
         if val and val.lower() in {"yes", "no"}:
             qtype = "select"
+        if val and is_date_label(label) and is_excel_date(val):
+            qtype = "date"
         questions.append({
             "id": qid,
             "label": label,
