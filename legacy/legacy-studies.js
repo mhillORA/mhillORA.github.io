@@ -571,39 +571,48 @@
   function getLegacySitesHTML() {
     return `
       <div class="space-y-4 px-1 sm:px-0" id="legacy-sites-root">
-        <div class="flex flex-col gap-3">
-          <div>
-            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Legacy Sites</h2>
-            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              Funnel history, relationship notes, and the same feasibility surveys / site profile as live Sites — stored on legacy only (not shared with Chaos).
+        <div class="rounded-xl overflow-hidden border border-[#1B2A4A]/20 dark:border-[#1B2A4A]/60">
+          <div class="bg-[#1B2A4A] px-4 py-3 sm:px-5 sm:py-4 text-white">
+            <h2 class="text-xl sm:text-2xl font-bold tracking-tight">Legacy Sites</h2>
+            <p class="text-sm text-white/75 mt-1 max-w-3xl">
+              Historical funnel + feasibility. Promote links (or creates) a live Site — Chaos schedules and NASA sync stay untouched.
             </p>
           </div>
-          <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2 w-full">
-            <select id="legacy-site-sort" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Sort sites">
-              <option value="name-asc" selected>A → Z</option>
-              <option value="name-desc">Z → A</option>
-              <option value="enrolled">Most enrolled</option>
-            </select>
-            <select id="legacy-site-pref-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]">
-              <option value="">All preferences</option>
-              <option value="prefer">Prefer</option>
-              <option value="neutral">Neutral</option>
-              <option value="cautious">Cautious</option>
-              <option value="avoid">Avoid</option>
-              <option value="unset">Not set</option>
-            </select>
-            <select id="legacy-site-indication-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Filter by indication / TA">
-              <option value="">All indications / TA</option>
-            </select>
-            <input id="legacy-site-search" type="search" placeholder="Search sites…"
-              class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:flex-1 sm:min-w-[12rem] min-h-[44px]" />
-            <button id="legacy-sites-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 min-h-[44px] shrink-0">Refresh</button>
+          <div class="bg-[#F5F7FA] dark:bg-gray-900/40 px-3 py-3 sm:px-4 sticky top-0 z-10 border-b dark:border-gray-700 flex flex-col gap-2">
+            <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2 w-full">
+              <select id="legacy-site-sort" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Sort sites">
+                <option value="name-asc" selected>A → Z</option>
+                <option value="name-desc">Z → A</option>
+                <option value="enrolled">Most enrolled</option>
+              </select>
+              <select id="legacy-site-pref-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]">
+                <option value="">All preferences</option>
+                <option value="prefer">Prefer</option>
+                <option value="neutral">Neutral</option>
+                <option value="cautious">Cautious</option>
+                <option value="avoid">Avoid</option>
+                <option value="unset">Not set</option>
+              </select>
+              <select id="legacy-site-indication-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Filter by indication / TA">
+                <option value="">All indications / TA</option>
+              </select>
+              <input id="legacy-site-search" type="search" placeholder="Search sites…"
+                class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:flex-1 sm:min-w-[12rem] min-h-[44px]" />
+              <button id="legacy-sites-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-[#0F6E56] text-white hover:bg-[#0c5a46] min-h-[44px] shrink-0">Refresh</button>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <button type="button" id="legacy-promote-selected" class="px-3 py-2 text-sm rounded-md bg-[#1B2A4A] text-white hover:bg-[#152238] min-h-[40px] disabled:opacity-40" disabled>Promote selected</button>
+              <button type="button" id="legacy-promote-all" class="px-3 py-2 text-sm rounded-md border border-[#1B2A4A] text-[#1B2A4A] dark:text-white dark:border-gray-500 hover:bg-white dark:hover:bg-gray-800 min-h-[40px]">Promote all (preview)</button>
+              <span id="legacy-promote-count" class="text-xs text-gray-600 dark:text-gray-400">0 selected</span>
+              <span class="text-[11px] text-gray-500 dark:text-gray-400">Dry-run first · link matches only · new sites are inert stubs</span>
+            </div>
           </div>
         </div>
         <div id="legacy-sites-summary" class="grid grid-cols-2 md:grid-cols-5 gap-2 sm:gap-3"></div>
         <div id="legacy-sites-load-status" class="text-xs text-gray-500"></div>
         <div id="legacy-sites-table-wrap" class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden"></div>
         <div id="legacy-site-detail" class="hidden"></div>
+        <div id="legacy-promote-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40"></div>
       </div>`;
   }
 
@@ -611,13 +620,13 @@
     return `
       <div class="space-y-4 px-1 sm:px-0" id="legacy-feasibility-root">
         <div class="flex flex-col gap-3">
-          <div>
-            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Feasibility Surveys</h2>
-            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              Browse by survey definition — open a survey to see every site response (legacy-only; not shared with Chaos).
+          <div class="rounded-xl bg-[#1B2A4A] px-4 py-3 sm:px-5 text-white">
+            <h2 class="text-xl sm:text-2xl font-bold tracking-tight">Feasibility Surveys</h2>
+            <p class="text-sm text-white/75 mt-1">
+              Browse by survey — site responses stay on legacy ids (not shared with Chaos).
             </p>
           </div>
-          <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2 w-full">
+          <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2 w-full sticky top-0 z-10 bg-[#F5F7FA]/95 dark:bg-gray-900/90 py-2">
             <select id="legacy-feas-sort" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Sort surveys">
               <option value="responses-desc" selected>Most responses</option>
               <option value="responses-asc">Fewest responses</option>
@@ -629,7 +638,7 @@
             </select>
             <input id="legacy-feas-search" type="search" placeholder="Search surveys…"
               class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:flex-1 sm:min-w-[12rem] min-h-[44px]" />
-            <button id="legacy-feas-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 min-h-[44px] shrink-0">Refresh</button>
+            <button id="legacy-feas-refresh" class="px-4 py-3 sm:py-2 text-sm rounded-md bg-[#0F6E56] text-white hover:bg-[#0c5a46] min-h-[44px] shrink-0">Refresh</button>
           </div>
         </div>
         <div id="legacy-feas-summary" class="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-3"></div>
@@ -647,11 +656,157 @@
   }
 
   const TAP_BTN =
-    'inline-flex items-center justify-center px-4 py-2.5 min-h-[44px] text-sm font-medium rounded-md bg-indigo-600 text-white hover:bg-indigo-700';
+    'inline-flex items-center justify-center px-4 py-2.5 min-h-[44px] text-sm font-medium rounded-md bg-[#0F6E56] text-white hover:bg-[#0c5a46]';
   const TAP_LINK =
-    'inline-flex items-center justify-center px-3 py-2.5 min-h-[44px] text-sm font-medium text-indigo-600 dark:text-indigo-300';
+    'inline-flex items-center justify-center px-3 py-2.5 min-h-[44px] text-sm font-medium text-[#0F6E56] dark:text-emerald-300';
   const TAP_BACK =
-    'inline-flex items-center px-3 py-2.5 min-h-[44px] text-sm font-medium text-indigo-600 dark:text-indigo-300 -ml-2';
+    'inline-flex items-center px-3 py-2.5 min-h-[44px] text-sm font-medium text-[#0F6E56] dark:text-emerald-300 -ml-2';
+
+  const promoteSelected = new Set();
+
+  function updatePromoteToolbar() {
+    const countEl = document.getElementById('legacy-promote-count');
+    const btn = document.getElementById('legacy-promote-selected');
+    const n = promoteSelected.size;
+    if (countEl) countEl.textContent = `${n} selected`;
+    if (btn) btn.disabled = n === 0;
+  }
+
+  function liveLinkBadge(site) {
+    if (!site?.linkedArtemisSiteId) {
+      return `<span class="inline-flex px-2 py-0.5 rounded text-[10px] font-medium bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300">Unlinked</span>`;
+    }
+    const status = site.promoteStatus === 'created' ? 'Created live' : 'Linked';
+    const name = site._liveSiteName || site.linkedArtemisSiteId;
+    return `<span class="inline-flex px-2 py-0.5 rounded text-[10px] font-medium bg-teal-100 text-teal-900 dark:bg-teal-900/40 dark:text-teal-200" title="${escapeHtml(site.linkedArtemisSiteId)}">${escapeHtml(status)} → ${escapeHtml(name)}</span>`;
+  }
+
+  async function runPromote({ legacySiteIds, dryRun }) {
+    const body = { dryRun: !!dryRun };
+    if (Array.isArray(legacySiteIds) && legacySiteIds.length) body.legacySiteIds = legacySiteIds;
+    return req('/legacy-sites/promote', { method: 'POST', body });
+  }
+
+  function closePromoteModal() {
+    const modal = document.getElementById('legacy-promote-modal');
+    if (!modal) return;
+    modal.classList.add('hidden');
+    modal.innerHTML = '';
+  }
+
+  function renderPromotePreview(payload, { scopeLabel, ids }) {
+    const modal = document.getElementById('legacy-promote-modal');
+    if (!modal) return;
+    const results = payload?.results || [];
+    const s = payload?.summary || {};
+    const rows = results
+      .slice(0, 200)
+      .map((r) => {
+        const action = r.action || '';
+        const tone =
+          action === 'linked'
+            ? 'text-teal-700'
+            : action === 'created'
+              ? 'text-indigo-700'
+              : action === 'ambiguous'
+                ? 'text-amber-700'
+                : action === 'error'
+                  ? 'text-rose-700'
+                  : 'text-gray-600';
+        return `<tr class="border-t dark:border-gray-700">
+          <td class="px-2 py-1.5 text-sm">${escapeHtml(r.legacyName || r.legacySiteId)}</td>
+          <td class="px-2 py-1.5 text-sm font-medium ${tone}">${escapeHtml(action)}</td>
+          <td class="px-2 py-1.5 text-sm">${escapeHtml(r.liveSiteName || r.liveSiteId || '—')}</td>
+          <td class="px-2 py-1.5 text-xs text-gray-500">${escapeHtml(r.reason || '')}</td>
+        </tr>`;
+      })
+      .join('');
+    modal.classList.remove('hidden');
+    modal.innerHTML = `
+      <div class="bg-white dark:bg-gray-800 rounded-xl shadow-xl max-w-3xl w-full max-h-[85vh] overflow-hidden flex flex-col" role="dialog" aria-modal="true">
+        <div class="px-4 py-3 bg-[#1B2A4A] text-white">
+          <h3 class="font-semibold text-lg">Promote preview — ${escapeHtml(scopeLabel)}</h3>
+          <p class="text-xs text-white/70 mt-1">Chaos/NASA safe: link metadata only on matches; new live sites have no study membership or schedules.</p>
+        </div>
+        <div class="p-4 space-y-3 overflow-y-auto flex-1">
+          <div class="flex flex-wrap gap-2 text-xs">
+            <span class="px-2 py-1 rounded bg-teal-50 text-teal-800">Link ${s.linked || 0}</span>
+            <span class="px-2 py-1 rounded bg-indigo-50 text-indigo-800">Create ${s.created || 0}</span>
+            <span class="px-2 py-1 rounded bg-gray-100 text-gray-700">Skip ${s.skipped || 0}</span>
+            <span class="px-2 py-1 rounded bg-amber-50 text-amber-800">Ambiguous ${s.ambiguous || 0}</span>
+            <span class="px-2 py-1 rounded bg-rose-50 text-rose-800">Error ${s.error || 0}</span>
+          </div>
+          <div class="overflow-x-auto rounded border dark:border-gray-700 max-h-64">
+            <table class="min-w-full text-sm">
+              <thead class="bg-gray-50 dark:bg-gray-900/50 text-left sticky top-0"><tr>
+                <th class="px-2 py-1.5">Legacy</th><th class="px-2 py-1.5">Action</th><th class="px-2 py-1.5">Live site</th><th class="px-2 py-1.5">Reason</th>
+              </tr></thead>
+              <tbody>${rows || '<tr><td class="p-3 text-gray-500" colspan="4">Nothing to promote.</td></tr>'}</tbody>
+            </table>
+          </div>
+          ${(s.ambiguous || 0) > 0 ? '<p class="text-xs text-amber-700">Ambiguous name matches are skipped — link them manually from site detail.</p>' : ''}
+        </div>
+        <div class="px-4 py-3 border-t dark:border-gray-700 flex flex-wrap justify-end gap-2 bg-[#F5F7FA] dark:bg-gray-900/40">
+          <button type="button" id="legacy-promote-cancel" class="px-4 py-2 text-sm rounded-md border dark:border-gray-600">Cancel</button>
+          <button type="button" id="legacy-promote-confirm" class="px-4 py-2 text-sm rounded-md bg-[#0F6E56] text-white hover:bg-[#0c5a46]"
+            ${(s.linked || 0) + (s.created || 0) === 0 ? 'disabled' : ''}>Confirm promote</button>
+        </div>
+      </div>`;
+    modal.querySelector('#legacy-promote-cancel')?.addEventListener('click', closePromoteModal);
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) closePromoteModal();
+    });
+    modal.querySelector('#legacy-promote-confirm')?.addEventListener('click', async () => {
+      const confirmBtn = modal.querySelector('#legacy-promote-confirm');
+      if (confirmBtn) {
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = 'Promoting…';
+      }
+      try {
+        const applied = await runPromote({ legacySiteIds: ids, dryRun: false });
+        closePromoteModal();
+        promoteSelected.clear();
+        state.loaded = false;
+        await ensureLoaded(true);
+        const sum = applied?.summary || {};
+        alert(
+          `Promote complete.\nLinked: ${sum.linked || 0}\nCreated: ${sum.created || 0}\nSkipped: ${sum.skipped || 0}\nAmbiguous: ${sum.ambiguous || 0}\nErrors: ${sum.error || 0}`
+        );
+        document.getElementById('legacy-sites-refresh')?.click();
+      } catch (err) {
+        console.error(err);
+        alert(`Promote failed: ${err.message || err}`);
+        if (confirmBtn) {
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = 'Confirm promote';
+        }
+      }
+    });
+  }
+
+  async function openPromoteWizard({ all = false } = {}) {
+    const ids = all ? null : [...promoteSelected];
+    if (!all && (!ids || !ids.length)) {
+      alert('Select at least one legacy site.');
+      return;
+    }
+    if (all) {
+      const ok = confirm(
+        'Preview promote for ALL legacy sites?\n\nMatched names link only (no Chaos field overwrite).\nUnmatched create inert live site stubs.\nAmbiguous matches stay manual.'
+      );
+      if (!ok) return;
+    }
+    try {
+      const preview = await runPromote({ legacySiteIds: ids || undefined, dryRun: true });
+      renderPromotePreview(preview, {
+        scopeLabel: all ? 'all legacy sites' : `${ids.length} selected`,
+        ids: ids || undefined,
+      });
+    } catch (err) {
+      console.error(err);
+      alert(`Promote preview failed: ${err.message || err}`);
+    }
+  }
 
   const RELATIONSHIP_OPTIONS = [
     { value: '', label: 'Not set' },

@@ -2638,6 +2638,13 @@ registerLegacyRoutes(app, {
     generateId,
 });
 
+const { registerPromoteLegacyRoutes } = require('./promote-legacy-routes');
+registerPromoteLegacyRoutes(app, {
+    getContainer,
+    handleError,
+    generateId,
+});
+
 // =================================================================================
 // PRIVACY / GDPR ops (ARTEMIS only) — survey export, erase, retention; no Chaos/NASA
 // =================================================================================
