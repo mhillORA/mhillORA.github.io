@@ -102,15 +102,23 @@ Not assigned = cannot get in. Good.
 
 1. Azure Portal → **ARTEMIS Static Web App**.
 2. **Configuration** (Application settings).
-3. Add exactly these names:
+3. Add / fix exactly these names:
 
 | Name | Value |
 |------|--------|
-| `AZURE_CLIENT_ID` | Client ID from Step 2 |
-| `AZURE_CLIENT_SECRET_APP_SETTING_NAME` | Secret **Value** from Step 4 |
+| `AZURE_CLIENT_ID` | Client ID from Step 2 (`cc33a488-…` for SMOScheduler) |
+| `AZURE_CLIENT_SECRET` | Secret **Value** from Step 4 (long string — **not** Secret ID) |
 
-4. Save / Apply.
-5. Wait a minute.
+4. If you still have an old setting named `AZURE_CLIENT_SECRET_APP_SETTING_NAME`, you can delete it after `AZURE_CLIENT_SECRET` is set.
+5. Save / Apply.
+6. Wait a minute.
+
+**Also check (common “couldn’t sign you in” causes):**
+
+- SWA **Hosting plan** = **Standard** (custom Entra does not work on Free)
+- Entra app → Authentication → **ID tokens** = On
+- Enterprise app SMOScheduler → you are in **Users and groups**
+- Password protection on SWA = Disabled (or staging only)
 
 Secrets stay in Azure. Not in GitHub.
 
@@ -213,7 +221,7 @@ Staff UI + other APIs → must be signed in.
         "registration": {
           "openIdIssuer": "https://login.microsoftonline.com/2f298692-acc9-4632-b71b-841d51376914/v2.0",
           "clientIdSettingName": "AZURE_CLIENT_ID",
-          "clientSecretSettingName": "AZURE_CLIENT_SECRET_APP_SETTING_NAME"
+          "clientSecretSettingName": "AZURE_CLIENT_SECRET"
         }
       }
     }
