@@ -5050,13 +5050,14 @@
         const createLibraryQuestionModal = (existing = null) => {
             const isEdit = !!(existing && existing.id);
             const opts = Array.isArray(existing?.options) ? existing.options : ['Yes', 'No'];
+            const typeLabels = { select: 'Multiple choice', text: 'Short text', textarea: 'Long text', number: 'Number', date: 'Date' };
             const modalHTML = `
                 <div class="modal-backdrop">
                     <div class="modal-content dark:bg-gray-800" style="max-width: 36rem;">
                         <form id="library-question-form" ${isEdit ? `data-edit-id="${escapeHtml(existing.id)}"` : ''}>
                             <div class="px-5 py-4 border-b border-gray-200 dark:border-gray-700">
                                 <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">${isEdit ? 'Edit library question' : 'New library question'}</h3>
-                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Reusable question — surveys reference it so answers prefill across templates.</p>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Reusable question with a fixed data type — surveys pick it so answers normalize and prefill across templates.</p>
                             </div>
                             <div class="p-5 space-y-3">
                                 <div>
@@ -5065,9 +5066,9 @@
                                 </div>
                                 <div class="grid grid-cols-2 gap-3">
                                     <div>
-                                        <label class="block text-sm font-medium">Type</label>
+                                        <label class="block text-sm font-medium">Data type (collection)</label>
                                         <select name="type" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2">
-                                            ${['select','text','textarea','number','date'].map(t => `<option value="${t}" ${(existing?.type || 'select') === t ? 'selected' : ''}>${t === 'select' ? 'Multiple choice' : t}</option>`).join('')}
+                                            ${['select','text','textarea','number','date'].map(t => `<option value="${t}" ${(existing?.type || 'select') === t ? 'selected' : ''}>${typeLabels[t] || t}</option>`).join('')}
                                         </select>
                                     </div>
                                     <div>
@@ -5077,7 +5078,7 @@
                                 </div>
                                 <label class="flex items-center gap-2 text-sm"><input name="required" type="checkbox" class="h-4 w-4" ${existing?.required !== false ? 'checked' : ''} /> Required (default)</label>
                                 <div>
-                                    <label class="block text-sm font-medium">Choices (one per line, select only)</label>
+                                    <label class="block text-sm font-medium">Choices (one per line, multiple choice only)</label>
                                     <textarea name="options" rows="4" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm">${escapeHtml(opts.join('\n'))}</textarea>
                                 </div>
                                 <div id="library-question-error" class="text-sm text-red-600 hidden"></div>
@@ -5092,21 +5093,134 @@
             showModal(modalHTML);
         };
 
+        const SURVEY_QUESTION_TYPES = ['select', 'text', 'textarea', 'number', 'date'];
+        const surveyQuestionTypeLabel = (t) => ({
+            select: 'Multiple choice',
+            text: 'Short text',
+            textarea: 'Long text',
+            number: 'Number',
+            date: 'Date',
+        }[String(t || '').toLowerCase()] || t || 'Text');
+
+        const normalizeSurveyQuestionType = (type) => {
+            const t = String(type || 'text').toLowerCase().trim();
+            if (t === 'yesno' || t === 'yes/no' || t === 'boolean') return 'select';
+            if (SURVEY_QUESTION_TYPES.includes(t)) return t;
+            if (t === 'longtext' || t === 'paragraph') return 'textarea';
+            if (t === 'shorttext' || t === 'string') return 'text';
+            return 'text';
+        };
+
+        const normalizeLibraryLabelKey = (label) => String(label || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+        const stripCosmosMeta = (doc) => {
+            if (!doc || typeof doc !== 'object') return doc;
+            const { _rid, _self, _etag, _attachments, _ts, ...rest } = doc;
+            return rest;
+        };
+
+        const libraryItemToBuilderQuestion = (lib) => {
+            const type = normalizeSurveyQuestionType(lib?.type);
+            let options = Array.isArray(lib?.options)
+                ? lib.options.map((o) => (typeof o === 'string' ? o : String(o?.label ?? o?.value ?? ''))).filter(Boolean)
+                : [];
+            if (type === 'select' && options.length < 2) options = ['Yes', 'No'];
+            return {
+                id: `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+                label: String(lib?.label || '').trim(),
+                type,
+                required: lib?.required !== false,
+                options: type === 'select' ? options : [],
+                logic: null,
+                scoringWeight: typeof lib?.scoringWeight === 'number' ? lib.scoringWeight : 0,
+                scoringOptions: Array.isArray(lib?.scoringOptions) ? lib.scoringOptions : [],
+                category: lib?.category || 'General',
+                knockout: !!lib?.knockout,
+                knockoutOnBlank: !!lib?.knockoutOnBlank,
+                knockoutFailValues: Array.isArray(lib?.knockoutFailValues) ? lib.knockoutFailValues : [],
+                libraryQuestionId: lib?.id || null,
+            };
+        };
+
+        /** Ensure each survey question has libraryQuestionId + canonical type for cross-survey normalize/prefill. */
+        const ensureQuestionsLinkedToLibrary = async (questions) => {
+            let lib = asSurveyList(allSiteSurveyQuestionLibrary).filter((q) => q && q.status !== 'archived');
+            if (!lib.length) {
+                lib = asSurveyList(await apiService.getSiteSurveyQuestionLibrary().catch(() => [])).filter((q) => q && q.status !== 'archived');
+                allSiteSurveyQuestionLibrary = lib;
+            }
+            const byId = new Map(lib.map((q) => [q.id, q]));
+            const byLabelType = new Map(lib.map((q) => [`${normalizeLibraryLabelKey(q.label)}::${normalizeSurveyQuestionType(q.type)}`, q]));
+            const byLabel = new Map();
+            lib.forEach((q) => {
+                const k = normalizeLibraryLabelKey(q.label);
+                if (k && !byLabel.has(k)) byLabel.set(k, q);
+            });
+
+            const out = [];
+            for (const q of questions) {
+                const type = normalizeSurveyQuestionType(q.type);
+                const label = String(q.label || '').trim();
+                let libraryQuestionId = q.libraryQuestionId || null;
+                if (libraryQuestionId && byId.has(libraryQuestionId)) {
+                    const canon = byId.get(libraryQuestionId);
+                    out.push({
+                        ...q,
+                        type: normalizeSurveyQuestionType(canon.type || type),
+                        libraryQuestionId,
+                    });
+                    continue;
+                }
+                const key = `${normalizeLibraryLabelKey(label)}::${type}`;
+                let hit = byLabelType.get(key) || byLabel.get(normalizeLibraryLabelKey(label));
+                if (hit) {
+                    out.push({ ...q, type: normalizeSurveyQuestionType(hit.type || type), libraryQuestionId: hit.id });
+                    continue;
+                }
+                try {
+                    const created = await apiService.createSiteSurveyQuestionLibraryItem({
+                        label,
+                        type,
+                        required: q.required !== false,
+                        options: type === 'select' ? (q.options || []) : [],
+                        category: q.category || 'General',
+                        scoringWeight: q.scoringWeight || 0,
+                        scoringOptions: q.scoringOptions || [],
+                        knockout: !!q.knockout,
+                        knockoutOnBlank: !!q.knockoutOnBlank,
+                        status: 'active',
+                        tags: ['from-survey'],
+                    });
+                    lib.push(created);
+                    byId.set(created.id, created);
+                    byLabelType.set(key, created);
+                    byLabel.set(normalizeLibraryLabelKey(label), created);
+                    out.push({ ...q, type, libraryQuestionId: created.id });
+                } catch (_) {
+                    out.push({ ...q, type, libraryQuestionId: libraryQuestionId || undefined });
+                }
+            }
+            allSiteSurveyQuestionLibrary = lib;
+            return out;
+        };
+
         const importLibraryQuestionsFromTemplates = async () => {
             const defs = asSurveyList(allSiteSurveyDefinitions);
-            const existing = asSurveyList(allSiteSurveyQuestionLibrary);
-            const byLabel = new Map(existing.map(q => [String(q.label || '').trim().toLowerCase().replace(/\s+/g, ' '), q]));
+            let existing = asSurveyList(allSiteSurveyQuestionLibrary);
+            const byLabel = new Map(existing.map(q => [normalizeLibraryLabelKey(q.label), q]));
             let created = 0;
             let skipped = 0;
+            let linkedDefs = 0;
             for (const def of defs) {
                 for (const q of asSurveyList(def.questions)) {
                     const label = String(q.label || q.title || '').trim();
                     if (!label) continue;
-                    const key = label.toLowerCase().replace(/\s+/g, ' ');
+                    const key = normalizeLibraryLabelKey(label);
                     if (byLabel.has(key)) { skipped += 1; continue; }
+                    const type = normalizeSurveyQuestionType(q.type);
                     const item = {
                         label,
-                        type: String(q.type || 'text').toLowerCase(),
+                        type,
                         required: q.required !== false,
                         options: Array.isArray(q.options) ? q.options.map(o => typeof o === 'string' ? o : String(o.label ?? o.value ?? '')).filter(Boolean) : [],
                         category: q.category || 'General',
@@ -5122,13 +5236,125 @@
                     try {
                         const saved = await apiService.createSiteSurveyQuestionLibraryItem(item);
                         byLabel.set(key, saved);
+                        existing.push(saved);
                         created += 1;
                     } catch (_) { /* skip bad rows */ }
                 }
             }
+
+            // Backfill libraryQuestionId + canonical type onto existing survey templates
+            for (const def of defs) {
+                const qs = asSurveyList(def.questions);
+                if (!qs.length) continue;
+                let changed = false;
+                const nextQs = qs.map((q) => {
+                    const label = String(q.label || q.title || '').trim();
+                    const hit = byLabel.get(normalizeLibraryLabelKey(label));
+                    if (!hit) return q;
+                    const nextType = normalizeSurveyQuestionType(hit.type || q.type);
+                    if (q.libraryQuestionId === hit.id && normalizeSurveyQuestionType(q.type) === nextType) return q;
+                    changed = true;
+                    return { ...q, libraryQuestionId: hit.id, type: nextType };
+                });
+                if (!changed) continue;
+                try {
+                    await apiService.updateSiteSurveyDefinition(def.id, {
+                        ...stripCosmosMeta(def),
+                        questions: nextQs,
+                        updatedAt: new Date().toISOString(),
+                    });
+                    linkedDefs += 1;
+                } catch (_) { /* non-fatal */ }
+            }
+
             allSiteSurveyQuestionLibrary = await apiService.getSiteSurveyQuestionLibrary().catch(() => existing);
-            showNotification(`Imported ${created} unique question${created === 1 ? '' : 's'}${skipped ? ` · ${skipped} already in library` : ''}`, 'success');
+            allSiteSurveyDefinitions = await apiService.getSiteSurveyDefinitions().catch(() => allSiteSurveyDefinitions);
+            showNotification(
+                `Imported ${created} unique question${created === 1 ? '' : 's'}${skipped ? ` · ${skipped} already in library` : ''}${linkedDefs ? ` · linked ${linkedDefs} template${linkedDefs === 1 ? '' : 's'}` : ''}`,
+                'success'
+            );
             if (activeTab === 'communications') render();
+        };
+
+        const showLibraryQuestionPicker = ({ excludeLibraryIds = [], onAdd } = {}) => {
+            const exclude = new Set((excludeLibraryIds || []).filter(Boolean).map(String));
+            const lib = asSurveyList(allSiteSurveyQuestionLibrary)
+                .filter((q) => q && q.status !== 'archived' && !exclude.has(String(q.id)))
+                .slice()
+                .sort((a, b) => String(a.label || '').localeCompare(String(b.label || '')));
+
+            const host = document.getElementById('modal-container') || document.body;
+            const overlay = document.createElement('div');
+            overlay.id = 'library-question-picker-overlay';
+            overlay.className = 'fixed inset-0 z-[80] flex items-center justify-center p-4';
+            overlay.style.background = 'rgba(15, 23, 42, 0.55)';
+            overlay.innerHTML = `
+                <div class="bg-white dark:bg-gray-800 rounded-xl shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden border border-gray-200 dark:border-gray-700">
+                    <div class="px-5 py-4 border-b border-gray-200 dark:border-gray-700">
+                        <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Add from question library</h3>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Select existing questions (with data types). Same library id keeps answers comparable across surveys.</p>
+                        <input id="library-picker-search" type="search" placeholder="Search questions…" class="mt-3 w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" />
+                    </div>
+                    <div id="library-picker-list" class="flex-1 overflow-y-auto p-3 space-y-1"></div>
+                    <div class="px-5 py-3 border-t border-gray-200 dark:border-gray-700 flex flex-wrap items-center gap-2 justify-between bg-gray-50 dark:bg-gray-900/40">
+                        <div class="text-xs text-gray-500 dark:text-gray-400"><span id="library-picker-count">0</span> selected · ${lib.length} available</div>
+                        <div class="flex gap-2">
+                            <button type="button" id="library-picker-cancel" class="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 text-sm">Cancel</button>
+                            <button type="button" id="library-picker-add" class="px-3 py-1.5 rounded-md bg-indigo-600 text-white text-sm" ${lib.length ? '' : 'disabled'}>Add selected</button>
+                        </div>
+                    </div>
+                </div>`;
+            host.appendChild(overlay);
+
+            const listEl = overlay.querySelector('#library-picker-list');
+            const countEl = overlay.querySelector('#library-picker-count');
+            const selected = new Set();
+
+            const renderList = (filter = '') => {
+                const q = filter.trim().toLowerCase();
+                const rows = lib.filter((item) => {
+                    if (!q) return true;
+                    const blob = `${item.label || ''} ${item.category || ''} ${item.type || ''} ${(item.tags || []).join(' ')}`.toLowerCase();
+                    return blob.includes(q);
+                });
+                if (!rows.length) {
+                    listEl.innerHTML = `<div class="text-sm text-gray-500 dark:text-gray-400 text-center py-8">${lib.length ? 'No matches.' : 'Library is empty. Import from templates (Comms → Questions) or create questions first.'}</div>`;
+                    return;
+                }
+                listEl.innerHTML = rows.map((item) => {
+                    const opts = Array.isArray(item.options) ? item.options.length : 0;
+                    const checked = selected.has(item.id) ? 'checked' : '';
+                    return `
+                        <label class="flex items-start gap-3 px-3 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer border border-transparent hover:border-gray-200 dark:hover:border-gray-600">
+                            <input type="checkbox" class="library-pick mt-1 h-4 w-4" data-lib-id="${escapeHtml(item.id)}" ${checked} />
+                            <div class="min-w-0 flex-1">
+                                <div class="text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.label || '(untitled)')}</div>
+                                <div class="text-xs text-gray-500 dark:text-gray-400">${escapeHtml(surveyQuestionTypeLabel(item.type))} · ${escapeHtml(item.category || 'General')}${opts ? ` · ${opts} choices` : ''}</div>
+                            </div>
+                        </label>`;
+                }).join('');
+            };
+
+            const syncCount = () => { if (countEl) countEl.textContent = String(selected.size); };
+            renderList();
+            syncCount();
+
+            overlay.querySelector('#library-picker-search')?.addEventListener('input', (e) => renderList(e.target.value || ''));
+            listEl.addEventListener('change', (e) => {
+                const cb = e.target.closest('.library-pick');
+                if (!cb) return;
+                const id = cb.getAttribute('data-lib-id');
+                if (cb.checked) selected.add(id); else selected.delete(id);
+                syncCount();
+            });
+            const close = () => overlay.remove();
+            overlay.querySelector('#library-picker-cancel')?.addEventListener('click', close);
+            overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+            overlay.querySelector('#library-picker-add')?.addEventListener('click', () => {
+                const picks = lib.filter((q) => selected.has(q.id)).map(libraryItemToBuilderQuestion);
+                close();
+                if (typeof onAdd === 'function') onAdd(picks);
+            });
         };
 
         const createSiteSurveyDefinitionModal = (existingDefinition = null, options = {}) => {
@@ -5142,7 +5368,7 @@
                         ? `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
                         : (q.id || `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`),
                     label: q.label || q.title || '',
-                    type: String(q.type || 'text').toLowerCase(),
+                    type: normalizeSurveyQuestionType(q.type),
                     required: q.required !== false,
                     options: Array.isArray(q.options) ? q.options.map(o => (typeof o === 'string' ? o : String(o.label ?? o.value ?? ''))) : [],
                     logic: q.logic && typeof q.logic === 'object' ? q.logic : null,
@@ -5243,12 +5469,15 @@
                                         <div id="scoring-zone-bar-host">${scoringZoneBarHtml(passThresholdVal, borderlineThresholdVal)}</div>
                                     </div>
                                     <div class="md:col-span-2">
-                                        <div class="flex items-center justify-between gap-2">
+                                        <div class="flex flex-wrap items-center justify-between gap-2">
                                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Questions</label>
-                                            <button type="button" id="add-site-survey-question-btn" class="px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 text-sm">Add question</button>
+                                            <div class="flex flex-wrap gap-2">
+                                                <button type="button" id="add-from-library-question-btn" class="px-3 py-1.5 rounded-md border border-indigo-300 dark:border-indigo-700 text-indigo-700 dark:text-indigo-200 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 text-sm">Add from library</button>
+                                                <button type="button" id="add-site-survey-question-btn" class="px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 text-sm">New question</button>
+                                            </div>
                                         </div>
                                         <div id="site-survey-questions-builder" class="mt-2 space-y-3"></div>
-                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">Each question defaults to <strong>required</strong>. Branching (“Show only if…”) questions are only required when the site qualifies and the question is shown. General Feasibility is auto-added at the top of every sent survey.</p>
+                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">Prefer <strong>Add from library</strong> so each question keeps one identity and data type for prefill/deltas. New questions are linked into the library on save. Required by default; branching only when shown. General Feasibility is auto-added at the top of every sent survey.</p>
                                     </div>
                                     <div class="md:col-span-2">
                                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Status</label>
@@ -5316,18 +5545,25 @@
                     select: 'Multiple choice',
                 };
                 root.innerHTML = questions.map((q, idx) => {
-                    const allIds = questions.map(qq => qq.id);
                     const showIfQId = q.logic?.showIf?.questionId || '';
                     const showIfEquals = q.logic?.showIf?.equals ?? '';
-                    const qType = String(q.type || 'text');
+                    const qType = normalizeSurveyQuestionType(q.type);
                     const isSelect = qType === 'select';
                     const opts = Array.isArray(q.options) ? q.options : [];
                     const scored = (q.scoringWeight || 0) > 0 || q.knockout || (q.scoringOptions || []).some(o => o && (o.knockout || o.fail));
+                    const fromLib = !!q.libraryQuestionId;
+                    const libBadge = fromLib
+                        ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200" title="Linked library question ${escapeHtml(q.libraryQuestionId)}">Library</span>`
+                        : `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400">New</span>`;
                     return `
                         <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden" data-q-idx="${idx}">
                             <div class="flex items-center justify-between gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-900/40 border-b border-gray-200 dark:border-gray-700">
-                                <div class="text-xs font-semibold uppercase tracking-wide text-gray-500">Question ${idx + 1}</div>
+                                <div class="flex items-center gap-2 min-w-0">
+                                    <div class="text-xs font-semibold uppercase tracking-wide text-gray-500">Question ${idx + 1}</div>
+                                    ${libBadge}
+                                </div>
                                 <div class="flex gap-1">
+                                    ${fromLib ? `<button type="button" class="q-unlink-library px-2 py-1 rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 text-xs text-gray-600 dark:text-gray-300" title="Keep text but stop linking to library">Unlink</button>` : ''}
                                     <button type="button" class="q-move-up px-2 py-1 rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 text-sm" ${idx === 0 ? 'disabled' : ''}>↑</button>
                                     <button type="button" class="q-move-down px-2 py-1 rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 text-sm" ${idx === questions.length - 1 ? 'disabled' : ''}>↓</button>
                                     <button type="button" class="q-remove px-2 py-1 rounded bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-200 text-sm border border-red-100 dark:border-red-800">Remove</button>
@@ -5343,10 +5579,11 @@
 
                                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                     <div>
-                                        <label class="block text-sm font-medium text-gray-800 dark:text-gray-100">Type of answer</label>
+                                        <label class="block text-sm font-medium text-gray-800 dark:text-gray-100">Data type (collection)</label>
                                         <select name="q_type_${idx}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2">
                                             ${['select','text','textarea','number','date'].map(t => `<option value="${t}" ${qType===t?'selected':''}>${typeLabels[t] || t}</option>`).join('')}
                                         </select>
+                                        <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-1">Controls how answers are stored and compared across surveys.</p>
                                     </div>
                                     <div class="flex items-end pb-2">
                                         <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
@@ -5480,7 +5717,7 @@
                     const card = root.querySelector(`[data-q-idx="${idx}"]`);
                     if (!card) return;
                     q.label = (card.querySelector(`[name="q_label_${idx}"]`)?.value || '').trim();
-                    q.type = (card.querySelector(`[name="q_type_${idx}"]`)?.value || 'text').trim();
+                    q.type = normalizeSurveyQuestionType(card.querySelector(`[name="q_type_${idx}"]`)?.value || 'text');
                     q.required = card.querySelector(`#q_required_${idx}`)?.checked !== false;
                     q.category = (card.querySelector(`[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
                     const weightRaw = parseInt(card.querySelector(`[name="q_scoring_weight_${idx}"]`)?.value || '0', 10);
@@ -5523,6 +5760,7 @@
 
             const builderRoot = document.getElementById('site-survey-questions-builder');
             const addBtn = document.getElementById('add-site-survey-question-btn');
+            const addFromLibBtn = document.getElementById('add-from-library-question-btn');
             if (addBtn) {
                 addBtn.addEventListener('click', () => {
                     syncBuilderFromDom();
@@ -5548,6 +5786,29 @@
                     renderBuilder();
                 });
             }
+            if (addFromLibBtn) {
+                addFromLibBtn.addEventListener('click', async () => {
+                    syncBuilderFromDom();
+                    if (!asSurveyList(allSiteSurveyQuestionLibrary).length) {
+                        allSiteSurveyQuestionLibrary = asSurveyList(await apiService.getSiteSurveyQuestionLibrary().catch(() => []));
+                    }
+                    const already = (window.__siteSurveyBuilderQuestions || [])
+                        .map((q) => q.libraryQuestionId)
+                        .filter(Boolean);
+                    showLibraryQuestionPicker({
+                        excludeLibraryIds: already,
+                        onAdd: (picks) => {
+                            if (!picks.length) return;
+                            window.__siteSurveyBuilderQuestions = [
+                                ...(window.__siteSurveyBuilderQuestions || []),
+                                ...picks,
+                            ];
+                            renderBuilder();
+                            showNotification(`Added ${picks.length} library question${picks.length === 1 ? '' : 's'}`, 'success');
+                        },
+                    });
+                });
+            }
 
             if (builderRoot) {
                 builderRoot.addEventListener('click', (e) => {
@@ -5556,6 +5817,13 @@
                     const idx = parseInt(card.getAttribute('data-q-idx'), 10);
                     if (Number.isNaN(idx)) return;
 
+                    if (e.target.closest('.q-unlink-library')) {
+                        const qs = syncBuilderFromDom();
+                        if (qs[idx]) qs[idx].libraryQuestionId = null;
+                        window.__siteSurveyBuilderQuestions = qs;
+                        renderBuilder();
+                        return;
+                    }
                     if (e.target.closest('.q-remove')) {
                         const qs = syncBuilderFromDom();
                         qs.splice(idx, 1);
@@ -10892,9 +11160,9 @@
                 try {
                     const editId = form.getAttribute('data-edit-id') || '';
                     const label = form.label.value.trim();
-                    const type = String(form.type.value || 'text').toLowerCase();
+                    const type = normalizeSurveyQuestionType(form.type.value || 'text');
                     const category = (form.category.value || 'General').trim() || 'General';
-                    const required = !!form.required?.checked;
+                    const required = form.required?.checked !== false;
                     let options = String(form.options.value || '').split('\n').map(s => s.trim()).filter(Boolean);
                     if (!label) throw new Error('Question text is required');
                     if (type === 'select' && options.length < 2) {
@@ -10902,7 +11170,7 @@
                     }
                     const prev = editId ? (allSiteSurveyQuestionLibrary || []).find(q => q.id === editId) : null;
                     const payload = {
-                        ...(prev || {}),
+                        ...stripCosmosMeta(prev || {}),
                         label,
                         type,
                         category,
@@ -10951,9 +11219,9 @@
                     const builderQs = window.__siteSurveyBuilderQuestions || [];
                     const questionsRoot = document.getElementById('site-survey-questions-builder');
                     if (!questionsRoot) throw new Error('Survey builder not ready');
-                    const questions = builderQs.map((q, idx) => {
+                    let questions = builderQs.map((q, idx) => {
                         const label = (questionsRoot.querySelector(`[name="q_label_${idx}"]`)?.value || '').trim();
-                        const type = (questionsRoot.querySelector(`[name="q_type_${idx}"]`)?.value || 'text').trim();
+                        const type = normalizeSurveyQuestionType(questionsRoot.querySelector(`[name="q_type_${idx}"]`)?.value || 'text');
                         const required = questionsRoot.querySelector(`#q_required_${idx}`)?.checked !== false;
                         const scoreOn = !!questionsRoot.querySelector(`.q-score-enable[data-q-idx="${idx}"]`)?.checked;
                         let options = [];
@@ -11001,7 +11269,6 @@
                             throw new Error(`Question ${idx + 1}: add at least two answer choices`);
                         }
                         if (scoreOn && type === 'select' && scoringOptions.length === 0 && options.length >= 2) {
-                            // Auto-build points from choices so save doesn't fail after choice edits
                             const weight = scoringWeight || 10;
                             scoringOptions = options.map((opt, oi) => ({
                                 value: opt,
@@ -11026,6 +11293,9 @@
                         };
                     });
 
+                    // Link/create library entries so types + identity normalize across surveys going forward
+                    questions = await ensureQuestionsLinkedToLibrary(questions);
+
                     // Default values are optional; for now keep empty object (future UI can populate)
                     const defaultValues = {};
                     const passThreshold = Math.max(0, Math.min(100, parseInt(form.passThreshold?.value || '70', 10) || 70));
@@ -11035,7 +11305,7 @@
                     if (editId) {
                         const prev = (allSiteSurveyDefinitions || []).find(d => d.id === editId) || {};
                         await apiService.updateSiteSurveyDefinition(editId, {
-                            ...prev,
+                            ...stripCosmosMeta(prev),
                             id: editId,
                             title,
                             description,
