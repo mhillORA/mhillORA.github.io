@@ -27,6 +27,7 @@ const {
     deliverSurveyEmail,
     inviteEmailCopy,
     opsNotifyCopy,
+    emailProviderStatus,
 } = require('./lib/survey-email');
 
 const ASSIGNMENTS = 'site-survey-assignments';
@@ -635,6 +636,7 @@ function registerSurveySecureRoutes(app, deps) {
                                 to: email,
                                 subject: copy.subject,
                                 text: copy.text,
+                                html: copy.html,
                                 meta: {
                                     assignmentId: assignment.id,
                                     siteId,
@@ -682,6 +684,7 @@ function registerSurveySecureRoutes(app, deps) {
                         count: results.length,
                         surveyId,
                         surveyTitle: definition.title,
+                        emailProvider: emailProviderStatus(),
                         results,
                     },
                     headers: corsHeaders(),
@@ -763,6 +766,7 @@ function registerSurveySecureRoutes(app, deps) {
                         to: email,
                         subject: copy.subject,
                         text: copy.text,
+                        html: copy.html,
                         meta: { assignmentId: assignment.id, resend: true },
                     });
                     await getContainer(ASSIGNMENTS).items.upsert({

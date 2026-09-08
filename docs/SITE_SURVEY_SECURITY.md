@@ -29,8 +29,11 @@ Legacy links `?assignmentId=` are rejected on the public page — use **Resend**
 | Variable | Purpose |
 |----------|---------|
 | `SURVEY_TOKEN_PEPPER` | Pepper for token hashing (falls back to `PRIVACY_OPS_KEY` / `COSMOS_KEY`) |
-| `SURVEY_EMAIL_WEBHOOK` | POST JSON invites `{to,subject,text,meta}` |
-| `SURVEY_OPS_NOTIFY_EMAIL` | Optional ops alert on submit (via same webhook) |
+| `SURVEY_EMAIL_FROM` | From mailbox for Graph/SendGrid (see `docs/SURVEY_EMAIL_SETUP.md`) |
+| `AZURE_CLIENT_ID` / client secret | Graph `Mail.Send` (app permission + admin consent) |
+| `SENDGRID_API_KEY` | Optional SendGrid instead of Graph |
+| `SURVEY_EMAIL_WEBHOOK` | Optional POST JSON invites `{to,subject,text,html,meta}` |
+| `SURVEY_OPS_NOTIFY_EMAIL` | Optional ops alert on submit |
 | `SURVEY_CORS_ORIGINS` / `STATIC_WEB_APP_URL` | Narrow CORS when set to a single origin |
 | `PRIVACY_CONTACT_EMAIL` | Shown on the public privacy notice |
 
