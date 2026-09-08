@@ -2,6 +2,15 @@
  * Shared site-survey response write path (submit + resubmit merge).
  * Used by public token API and legacy POST /site-survey-responses.
  */
+const {
+    normalizeQuestionLabel,
+    readAnswerValue,
+    answerIsFilled,
+    compareSurveyResponses,
+    mergeGeneralFeasibilityQuestions,
+    GENERAL_FEASIBILITY_SURVEY_ID,
+} = require('./survey-compare');
+
 function sortByIsoDesc(rows, keys) {
     const list = Array.isArray(rows) ? rows.slice() : [];
     const fields = Array.isArray(keys) ? keys : [keys];
@@ -23,11 +32,63 @@ function answersToPrefillMap(answers) {
         if (!a) return;
         const qid = a.questionId ?? a.id ?? a.qid;
         if (!qid) return;
-        if (a.skipped) return;
-        const v = a.value;
-        if (v == null || String(v).trim() === '') return;
+        const v = readAnswerValue(a);
+        if (!v) return;
         map[String(qid)] = v;
     });
+    return map;
+}
+
+/**
+ * Prefill current survey questions from any prior site responses.
+ * Match order per question: same questionId → libraryQuestionId → normalized label text.
+ * Prefer same-role responses, but fall back to any role (e.g. gen feas stored as PI).
+ * Newest responses win (caller should pass newest-first).
+ */
+function buildPrefillMapForQuestions(questions, responseList, { preferRole } = {}) {
+    const map = {};
+    const qs = Array.isArray(questions) ? questions : [];
+    const role = preferRole ? normalizeRole(preferRole) : '';
+    const responses = Array.isArray(responseList) ? responseList.slice() : [];
+    if (role) {
+        responses.sort((a, b) => {
+            const ar = normalizeRole(a?.targetRole) === role ? 0 : 1;
+            const br = normalizeRole(b?.targetRole) === role ? 0 : 1;
+            if (ar !== br) return ar - br;
+            return 0;
+        });
+    }
+
+    for (const q of qs) {
+        const qid = String(q?.id || '');
+        if (!qid || map[qid] != null) continue;
+        const libId = q?.libraryQuestionId ? String(q.libraryQuestionId) : '';
+        const norm = normalizeQuestionLabel(q?.label || q?.title);
+
+        for (const resp of responses) {
+            const answers = Array.isArray(resp?.answers) ? resp.answers : [];
+            let found = answers.find(
+                (a) => answerIsFilled(a) && String(a.questionId ?? a.id ?? '') === qid
+            );
+            if (!found && libId) {
+                found = answers.find(
+                    (a) =>
+                        answerIsFilled(a) &&
+                        (String(a.libraryQuestionId || '') === libId ||
+                            String(a.questionId ?? '') === libId)
+                );
+            }
+            if (!found && norm) {
+                found = answers.find(
+                    (a) => answerIsFilled(a) && normalizeQuestionLabel(a.label) === norm
+                );
+            }
+            if (found) {
+                map[qid] = readAnswerValue(found);
+                break;
+            }
+        }
+    }
     return map;
 }
 
@@ -214,6 +275,99 @@ async function findLatestLiveResponse(getContainer, { siteId, surveyId, targetRo
     return sortByIsoDesc(resources, ['submittedAt', 'updatedAt', 'createdAt'])[0];
 }
 
+/** All live responses for a site+role (any survey) — newest first. Used for cross-survey prefill. */
+async function findSiteRoleLiveResponses(getContainer, { siteId, targetRole, limit = 50 }) {
+    const rspC = getContainer('site-survey-responses');
+    const role = normalizeRole(targetRole);
+    const { resources } = await rspC.items
+        .query(
+            {
+                query:
+                    'SELECT * FROM c WHERE c.siteId = @siteId AND LOWER(c.targetRole) = @targetRole AND (NOT IS_DEFINED(c._archived) OR c._archived != true)',
+                parameters: [
+                    { name: '@siteId', value: String(siteId) },
+                    { name: '@targetRole', value: role },
+                ],
+            },
+            { enableCrossPartitionQuery: true }
+        )
+        .fetchAll();
+    const sorted = sortByIsoDesc(resources || [], ['submittedAt', 'updatedAt', 'createdAt']);
+    const cap = Math.max(1, Math.min(200, Number(limit) || 50));
+    return sorted.slice(0, cap);
+}
+
+/**
+ * All live responses for one or more site ids (any role/survey) — newest first.
+ * Used when gen-feas answers were stored as PI but coordinator opens a link, or legacy site ids.
+ */
+async function findSiteLiveResponses(getContainer, { siteIds, limit = 80 }) {
+    const ids = [...new Set((Array.isArray(siteIds) ? siteIds : [siteIds]).map(String).filter(Boolean))];
+    if (!ids.length) return [];
+    const rspC = getContainer('site-survey-responses');
+    const clauses = ids.map((_, i) => `c.siteId = @s${i}`);
+    const parameters = ids.map((id, i) => ({ name: `@s${i}`, value: id }));
+    const { resources } = await rspC.items
+        .query(
+            {
+                query: `SELECT * FROM c WHERE (${clauses.join(' OR ')}) AND (NOT IS_DEFINED(c._archived) OR c._archived != true)`,
+                parameters,
+            },
+            { enableCrossPartitionQuery: true }
+        )
+        .fetchAll();
+    const sorted = sortByIsoDesc(resources || [], ['submittedAt', 'updatedAt', 'createdAt']);
+    const cap = Math.max(1, Math.min(200, Number(limit) || 80));
+    return sorted.slice(0, cap);
+}
+
+async function resolveRelatedSiteIds(getContainer, siteId) {
+    const ids = new Set([String(siteId)]);
+    try {
+        const read = await getContainer('sites').item(String(siteId), String(siteId)).read();
+        const site = read.resource;
+        if (Array.isArray(site?.legacySiteIds)) {
+            site.legacySiteIds.forEach((id) => {
+                if (id) ids.add(String(id));
+            });
+        }
+        if (site?.promotedFromLegacySiteId) ids.add(String(site.promotedFromLegacySiteId));
+    } catch (_) {
+        /* ignore */
+    }
+    return [...ids];
+}
+
+async function loadGeneralFeasibilityDefinition(getContainer) {
+    try {
+        const read = await getContainer('site-survey-definitions')
+            .item(GENERAL_FEASIBILITY_SURVEY_ID, GENERAL_FEASIBILITY_SURVEY_ID)
+            .read();
+        return read.resource || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+/** Definition questions with General Feasibility always first (deduped). Required defaults to true. */
+async function resolvePublicSurveyQuestions(getContainer, definition) {
+    const studyQs = Array.isArray(definition?.questions) ? definition.questions : [];
+    let genQs = [];
+    if (definition?.id !== GENERAL_FEASIBILITY_SURVEY_ID) {
+        const genDef = await loadGeneralFeasibilityDefinition(getContainer);
+        genQs = Array.isArray(genDef?.questions) ? genDef.questions : [];
+    }
+    const merged = mergeGeneralFeasibilityQuestions(studyQs, genQs, {
+        studySurveyId: definition?.id,
+    });
+    return merged.map((q, idx) => ({
+        ...q,
+        id: q.id || `q_${idx}`,
+        // Default required unless explicitly false. Branching still only enforced when visible.
+        required: q.required !== false,
+    }));
+}
+
 /**
  * Upsert a submitted (or draft) response bound to an assignment.
  * @returns {{ resource, resubmitted: boolean, created: boolean }}
@@ -318,10 +472,21 @@ module.exports = {
     sortByIsoDesc,
     normalizeRole,
     answersToPrefillMap,
+    normalizeQuestionLabel,
+    readAnswerValue,
+    buildPrefillMapForQuestions,
     mergeAnswers,
     scoreAnswers,
     computeScore,
     readPassThresholds,
     findLatestLiveResponse,
+    findSiteRoleLiveResponses,
+    findSiteLiveResponses,
+    resolveRelatedSiteIds,
+    loadGeneralFeasibilityDefinition,
+    resolvePublicSurveyQuestions,
+    compareSurveyResponses,
+    mergeGeneralFeasibilityQuestions,
+    GENERAL_FEASIBILITY_SURVEY_ID,
     writeSurveyResponse,
 };

@@ -666,6 +666,50 @@ const validateSurveyDefinitionsSchema = (data) => {
     return true;
 };
 
+const validateSurveyQuestionLibrarySchema = (data) => {
+    const errors = [];
+    if (!data.label || typeof data.label !== 'string' || !data.label.trim()) {
+        errors.push('label (question text) is required');
+    }
+    const type = String(data.type || 'text').toLowerCase();
+    if (!['text', 'textarea', 'number', 'date', 'select'].includes(type)) {
+        errors.push('type must be text, textarea, number, date, or select');
+    }
+    data.type = type;
+    data.label = String(data.label).trim();
+    data.required = data.required !== false;
+    data.options = Array.isArray(data.options)
+        ? data.options.map((o) => (typeof o === 'string' ? o.trim() : String(o?.label ?? o?.value ?? '').trim())).filter(Boolean)
+        : [];
+    if (type === 'select' && data.options.length < 2) {
+        errors.push('select questions need at least two options');
+    }
+    data.category = String(data.category || 'General').trim() || 'General';
+    data.scoringWeight = typeof data.scoringWeight === 'number' ? Math.max(0, data.scoringWeight) : 0;
+    data.scoringOptions = Array.isArray(data.scoringOptions) ? data.scoringOptions : [];
+    data.knockout = !!data.knockout;
+    data.knockoutOnBlank = !!data.knockoutOnBlank;
+    data.knockoutFailValues = Array.isArray(data.knockoutFailValues) ? data.knockoutFailValues : [];
+    data.status = ['active', 'archived'].includes(String(data.status || '').toLowerCase())
+        ? String(data.status).toLowerCase()
+        : 'active';
+    data.tags = Array.isArray(data.tags)
+        ? data.tags.map((t) => String(t || '').trim()).filter(Boolean)
+        : [];
+    if (errors.length > 0) {
+        throw new Error(`VALIDATION_ERROR: Question library validation failed: ${errors.join(', ')}`);
+    }
+    return true;
+};
+
+const ensureCosmosContainer = async (containerName) => {
+    const { database } = getCosmosClient();
+    await database.containers.createIfNotExists({
+        id: containerName,
+        partitionKey: { paths: ['/id'] },
+    });
+};
+
 const validateSurveyAssignmentsSchema = (data) => {
     const errors = [];
     if (!data.surveyId || typeof data.surveyId !== 'string') errors.push('surveyId is required and must be a string');
@@ -882,7 +926,7 @@ async function crudHandler(context, request, containerName) {
                         
                         // For travel/events containers, always return empty array on any list error
                         // (events is unused by ARTEMIS UI but was timing out / 500ing and spamming clients)
-                        if (containerName === 'travel' || containerName === 'events') {
+                        if (containerName === 'travel' || containerName === 'events' || containerName === 'site-survey-question-library') {
                             context.log.warn(`${containerName} container list failed, returning empty array. Error: ${error.message}`);
                             return { 
                                 jsonBody: [],
@@ -988,6 +1032,9 @@ async function crudHandler(context, request, containerName) {
                         case 'site-survey-definitions':
                             validateSurveyDefinitionsSchema(body);
                             break;
+                        case 'site-survey-question-library':
+                            validateSurveyQuestionLibrarySchema(body);
+                            break;
                         case 'site-survey-assignments':
                             validateSurveyAssignmentsSchema(body);
                             break;
@@ -1010,7 +1057,20 @@ async function crudHandler(context, request, containerName) {
                     };
                 }
                 
-                const newItem = { ...body, id: generateId() };
+                if (containerName === 'site-survey-question-library') {
+                    try {
+                        await ensureCosmosContainer(containerName);
+                        container = getContainer(containerName);
+                    } catch (ensureErr) {
+                        context.log.warn(`Could not ensure ${containerName}: ${ensureErr.message}`);
+                    }
+                }
+
+                const newItem = { ...body, id: body.id || generateId() };
+                if (containerName === 'site-survey-question-library') {
+                    newItem.createdAt = newItem.createdAt || new Date().toISOString();
+                    newItem.updatedAt = new Date().toISOString();
+                }
                 const { resource: createdItem } = await container.items.create(newItem);
                 
                 // Calculate enrollment for studies
@@ -1098,6 +1158,9 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'site-survey-definitions':
                             validateSurveyDefinitionsSchema(requestBody);
+                            break;
+                        case 'site-survey-question-library':
+                            validateSurveyQuestionLibrarySchema(requestBody);
                             break;
                         case 'site-survey-assignments':
                             validateSurveyAssignmentsSchema(requestBody);
@@ -1308,6 +1371,20 @@ app.http('surveyDefinitions', {
     authLevel: 'anonymous',
     route: 'site-survey-definitions/{id?}',
     handler: (request, context) => crudHandler(context, request, 'site-survey-definitions'),
+});
+
+app.http('surveyQuestionLibrary', {
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'site-survey-question-library/{id?}',
+    handler: async (request, context) => {
+        if (request.method === 'POST' || request.method === 'PUT') {
+            try {
+                await ensureCosmosContainer('site-survey-question-library');
+            } catch (_) { /* create path also retries */ }
+        }
+        return crudHandler(context, request, 'site-survey-question-library');
+    },
 });
 
 const {

@@ -18,10 +18,17 @@ const {
 } = require('./lib/survey-tokens');
 const {
     answersToPrefillMap,
+    buildPrefillMapForQuestions,
     findLatestLiveResponse,
+    findSiteRoleLiveResponses,
+    findSiteLiveResponses,
+    resolveRelatedSiteIds,
+    resolvePublicSurveyQuestions,
+    compareSurveyResponses,
     writeSurveyResponse,
     normalizeRole,
     sortByIsoDesc,
+    GENERAL_FEASIBILITY_SURVEY_ID,
 } = require('./lib/survey-response-service');
 const {
     deliverSurveyEmail,
@@ -96,18 +103,29 @@ function roleLabel(role) {
     return role || 'Staff';
 }
 
+function publicQuestionsFromList(questions) {
+    const list = Array.isArray(questions) ? questions : [];
+    return list.map((q, idx) => {
+        const hasBranch = !!(q.logic && q.logic.showIf && q.logic.showIf.questionId);
+        return {
+            id: q.id || `q_${idx}`,
+            label: q.label || q.title || `Question ${idx + 1}`,
+            type: (q.type || 'text').toLowerCase(),
+            // Default required; branching questions are still required when visible only
+            required: q.required !== false,
+            branching: hasBranch,
+            options: Array.isArray(q.options) ? q.options : undefined,
+            logic: q.logic || undefined,
+            libraryQuestionId: q.libraryQuestionId || undefined,
+            fromGeneralFeasibility: q._fromGeneralFeasibility === true,
+            sensitivity: q.sensitivity === 'pii' || q.sensitivity === 'phi' ? q.sensitivity : 'none',
+            defaultValue: q.defaultValue,
+        };
+    });
+}
+
 function publicQuestions(def) {
-    const questions = Array.isArray(def?.questions) ? def.questions : [];
-    return questions.map((q, idx) => ({
-        id: q.id || `q_${idx}`,
-        label: q.label || q.title || `Question ${idx + 1}`,
-        type: (q.type || 'text').toLowerCase(),
-        required: !!q.required,
-        options: Array.isArray(q.options) ? q.options : undefined,
-        logic: q.logic || undefined,
-        sensitivity: q.sensitivity === 'pii' || q.sensitivity === 'phi' ? q.sensitivity : 'none',
-        defaultValue: q.defaultValue,
-    }));
+    return publicQuestionsFromList(def?.questions);
 }
 
 async function ensureNotificationsContainer(getCosmosClient) {
@@ -225,13 +243,31 @@ async function resolveRecipientEmail(getContainer, siteId, targetRole) {
     return null;
 }
 
-function buildPublicPayload({ assignment, definition, siteName, prior, draftAnswers }) {
+function buildPublicPayload({
+    assignment,
+    definition,
+    siteName,
+    prior,
+    draftAnswers,
+    siteRoleResponses,
+    questions,
+    delta,
+}) {
+    const qList = Array.isArray(questions) ? questions : definition?.questions;
+    // Cross-survey first (label / libraryQuestionId / gen-feas ids), then same-survey ids, then draft.
+    const crossPrefill = buildPrefillMapForQuestions(qList, siteRoleResponses || (prior ? [prior] : []), {
+        preferRole: assignment?.targetRole,
+    });
     const prefill = {
         ...(definition?.defaultValues || {}),
+        ...crossPrefill,
         ...answersToPrefillMap(prior?.answers),
         ...answersToPrefillMap(draftAnswers || assignment.draftAnswers),
     };
-    const hasPrior = Boolean(prior) || Boolean(assignment.draftAnswers?.length);
+    const hasPrior =
+        Boolean(prior) ||
+        Boolean(assignment.draftAnswers?.length) ||
+        Object.keys(crossPrefill).length > 0;
     const status = String(assignment.status || '').toLowerCase();
     return {
         siteDisplayName: siteName,
@@ -249,11 +285,13 @@ function buildPublicPayload({ assignment, definition, siteName, prior, draftAnsw
             id: definition.id,
             title: definition.title || 'Site survey',
             description: definition.description || '',
-            questions: publicQuestions(definition),
+            questions: publicQuestionsFromList(qList),
+            includesGeneralFeasibility: definition.id !== GENERAL_FEASIBILITY_SURVEY_ID,
         },
         prefill,
         hasPrior,
         alreadySubmitted: status === 'submitted',
+        delta: delta || null,
     };
 }
 
@@ -350,14 +388,58 @@ function registerSurveySecureRoutes(app, deps) {
                 }
 
                 const siteName = await resolveSiteName(getContainer, assignment.siteId);
+                const relatedSiteIds = await resolveRelatedSiteIds(getContainer, assignment.siteId);
+                const questions = await resolvePublicSurveyQuestions(getContainer, definition);
+
                 const prior = await findLatestLiveResponse(getContainer, {
                     siteId: assignment.siteId,
                     surveyId: assignment.surveyId,
                     targetRole: assignment.targetRole,
                 });
 
+                let siteResponses = [];
+                try {
+                    siteResponses = await findSiteLiveResponses(getContainer, {
+                        siteIds: relatedSiteIds,
+                    });
+                } catch (_) {
+                    try {
+                        siteResponses = await findSiteRoleLiveResponses(getContainer, {
+                            siteId: assignment.siteId,
+                            targetRole: assignment.targetRole,
+                        });
+                    } catch (__) {
+                        siteResponses = prior ? [prior] : [];
+                    }
+                }
+
+                // Last two distinct submissions for delta (prefer newest pair)
+                const latestTwo = siteResponses.slice(0, 2);
+                const delta =
+                    latestTwo.length >= 2
+                        ? compareSurveyResponses({
+                              current: latestTwo[0],
+                              previous: latestTwo[1],
+                              questions,
+                          })
+                        : latestTwo.length === 1
+                          ? compareSurveyResponses({
+                                current: latestTwo[0],
+                                previous: null,
+                                questions,
+                            })
+                          : null;
+
                 return {
-                    jsonBody: buildPublicPayload({ assignment, definition, siteName, prior }),
+                    jsonBody: buildPublicPayload({
+                        assignment,
+                        definition,
+                        siteName,
+                        prior,
+                        siteRoleResponses: siteResponses,
+                        questions,
+                        delta,
+                    }),
                     headers: corsHeaders(),
                 };
             } catch (error) {
@@ -429,7 +511,7 @@ function registerSurveySecureRoutes(app, deps) {
                     };
                 }
 
-                // Light server-side required check against definition
+                // Light server-side required check against merged questions (gen feas + study)
                 let definition = null;
                 try {
                     const defRead = await getContainer(DEFINITIONS)
@@ -437,16 +519,20 @@ function registerSurveySecureRoutes(app, deps) {
                         .read();
                     definition = defRead.resource;
                 } catch (_) {}
-                if (definition?.questions?.length) {
+                const questions = definition
+                    ? await resolvePublicSurveyQuestions(getContainer, definition)
+                    : [];
+                if (questions.length) {
                     const byId = new Map(answers.map((a) => [String(a.questionId), a]));
                     const missing = [];
-                    for (const q of definition.questions) {
-                        if (!q.required) continue;
-                        // Skip conditional questions that aren't visible (client marks skipped)
+                    for (const q of questions) {
+                        // Default required; branching rows marked skipped when not qualified
+                        if (q.required === false) continue;
                         const a = byId.get(String(q.id));
                         if (a?.skipped) continue;
-                        if (!a || String(a.value ?? '').trim() === '') {
-                            missing.push(q.label || q.title || q.id);
+                        const val = a?.value ?? a?.answer ?? a?.answerText;
+                        if (val == null || String(val).trim() === '') {
+                            missing.push(q.label || q.id);
                         }
                     }
                     if (missing.length) {

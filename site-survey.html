@@ -226,6 +226,43 @@
     .btn-secondary:hover:not(:disabled) { background: var(--gray-50); }
     .submit-note { font-size: 11.5px; color: var(--gray-500); line-height: 1.5; }
 
+    .delta-panel {
+      background: var(--surface); border: 1px solid var(--gray-200);
+      border-radius: 12px; padding: 16px 18px; margin-bottom: 20px;
+    }
+    .delta-panel h3 { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+    .delta-summary {
+      display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 12px;
+      font-size: 11px; font-weight: 600;
+    }
+    .delta-pill {
+      padding: 4px 8px; border-radius: 999px;
+      background: var(--gray-100); color: var(--gray-700);
+    }
+    .delta-pill.changed { background: var(--amber-light); color: var(--amber-dark); }
+    .delta-pill.unchanged { background: var(--green-light); color: var(--green-dark); }
+    .delta-pill.unanswered { background: var(--coral-light); color: #7a2e24; }
+    .delta-section { margin-top: 12px; }
+    .delta-section-title {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
+      text-transform: uppercase; color: var(--gray-500); margin-bottom: 6px;
+    }
+    .delta-row {
+      display: grid; grid-template-columns: 1.2fr 1fr 1fr;
+      gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--gray-100);
+      font-size: 12px;
+    }
+    .delta-row:last-child { border-bottom: none; }
+    .delta-label { font-weight: 600; color: var(--navy); }
+    .delta-muted { color: var(--gray-500); }
+    .delta-flag {
+      display: inline-block; margin-left: 6px; font-size: 10px; font-weight: 700;
+      padding: 2px 6px; border-radius: 6px; background: var(--coral-light); color: #7a2e24;
+    }
+    @media (max-width: 640px) {
+      .delta-row { grid-template-columns: 1fr; }
+    }
+
     .privacy, .footer {
       margin-top: 28px; padding-top: 14px;
       border-top: 1px solid var(--gray-200);
@@ -422,6 +459,7 @@
           questionId: id,
           label: q.label || q.title || `Question ${idx + 1}`,
           type: (q.type || 'text').toLowerCase(),
+          libraryQuestionId: q.libraryQuestionId || undefined,
           sensitivity: q.sensitivity || 'none',
           skipped: !visible,
           value: visible ? fd.get(id) : null,
@@ -444,7 +482,7 @@
     }
 
     function renderSurvey(payload) {
-      const { survey, assignment, siteDisplayName, prefill, hasPrior, alreadySubmitted, privacyContact } = payload;
+      const { survey, assignment, siteDisplayName, prefill, hasPrior, alreadySubmitted, privacyContact, delta } = payload;
       const questions = Array.isArray(survey.questions) ? survey.questions : [];
       const defaults = prefill || {};
       const withPrior = questions.filter((q, idx) => {
@@ -463,6 +501,7 @@
         <span><strong>Site:</strong> ${escapeHtml(siteDisplayName)}</span>
         <span><strong>Role:</strong> ${escapeHtml(roleLabel(assignment.targetRole))}</span>
         ${assignment.expiresAt ? `<span><strong>Expires:</strong> ${escapeHtml(new Date(assignment.expiresAt).toLocaleDateString())}</span>` : ''}
+        ${survey.includesGeneralFeasibility ? `<span><strong>Includes:</strong> General Feasibility</span>` : ''}
       `;
       setChip(
         alreadySubmitted ? 'Update prior submission' : hasPrior ? 'Confirm & update' : 'In progress',
@@ -488,8 +527,8 @@
       el.intro.hidden = false;
       el.intro.className = 'intro';
       el.intro.innerHTML = hasPrior
-        ? `Your site profile has been <strong>pre-populated from your most recent survey</strong>. Review each field, update anything that has changed, and complete any new questions. Blank updates keep the value on file when you submit.`
-        : `Please complete the questions below for your site. Save a draft anytime — you can return with this same secure link before it expires.`;
+        ? `Your site profile has been <strong>pre-populated from prior survey answers</strong> (including General Feasibility when on file). Review each field, update anything that changed, and complete any new questions. Branching questions only appear when you qualify — those stay optional until shown.`
+        : `Please complete the questions below for your site. All visible questions are required. Branching follow-ups only appear when you qualify. Save a draft anytime — you can return with this same secure link before it expires.`;
 
       if (privacyContact) el.contact.textContent = privacyContact;
       el.privacy.hidden = false;
@@ -503,7 +542,8 @@
       };
 
       const reqBits = (q) => {
-        const required = !!q.required;
+        // Default required unless explicitly false
+        const required = q.required !== false;
         const logicQ = q.logic?.showIf?.questionId;
         return {
           reqHtml: required ? ' <span class="req">*</span>' : '',
@@ -511,6 +551,40 @@
           reqDeferred: required && logicQ ? 'data-required-when-visible="true"' : '',
         };
       };
+
+      const deltaHtml = (() => {
+        if (!delta || !delta.summary) return '';
+        const s = delta.summary;
+        const block = (title, rows, emptyMsg) => {
+          if (!rows || !rows.length) {
+            return `<div class="delta-section"><div class="delta-section-title">${escapeHtml(title)}</div><div class="delta-muted">${escapeHtml(emptyMsg)}</div></div>`;
+          }
+          return `<div class="delta-section"><div class="delta-section-title">${escapeHtml(title)} (${rows.length})</div>
+            ${rows.slice(0, 40).map((r) => `
+              <div class="delta-row">
+                <div class="delta-label">${escapeHtml(r.label || r.questionId || 'Question')}${r.flagNotAnswered ? '<span class="delta-flag">Not answered</span>' : ''}</div>
+                <div class="delta-muted">${escapeHtml(r.previousValue == null || r.previousValue === '' ? '—' : r.previousValue)}</div>
+                <div>${escapeHtml(r.currentValue == null || r.currentValue === '' ? '—' : r.currentValue)}</div>
+              </div>`).join('')}
+            ${rows.length > 40 ? `<div class="delta-muted">Showing first 40 of ${rows.length}.</div>` : ''}
+          </div>`;
+        };
+        return `<div class="delta-panel">
+          <h3>Compared with last two surveys on file</h3>
+          <div class="delta-muted">Changed answers, same answers, and questions this site has not answered.</div>
+          <div class="delta-summary">
+            <span class="delta-pill changed">${s.changed} changed</span>
+            <span class="delta-pill unchanged">${s.unchanged} unchanged</span>
+            <span class="delta-pill unanswered">${s.unanswered} not answered</span>
+          </div>
+          <div class="delta-row" style="font-weight:600;color:var(--gray-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em;">
+            <div>Question</div><div>Previous</div><div>Latest</div>
+          </div>
+          ${block('Changed', delta.changed, 'No changes between the last two surveys.')}
+          ${block('Unchanged', delta.unchanged, 'No matching unchanged answers.')}
+          ${block('Not answered', delta.unanswered, 'All questions have an answer on the latest survey.')}
+        </div>`;
+      })();
 
       const confirmRows = withPrior.map((q, idx) => {
         const id = q.id || `q_${idx}`;
@@ -533,8 +607,10 @@
         const label = q.label || q.title || `Question ${realIdx + 1}`;
         const { reqHtml, reqNative, reqDeferred } = reqBits(q);
         const help = q.help || q.context || q.description || '';
+        const gf = q.fromGeneralFeasibility ? '<div class="q-context">General Feasibility</div>' : '';
         return `<div class="question q" data-qid="${escapeHtml(qid)}" ${logicAttrs(q)}>
           <div class="q-text">${escapeHtml(label)}${reqHtml}</div>
+          ${gf}
           ${help ? `<div class="q-context">${escapeHtml(help)}</div>` : ''}
           ${fieldControl(q, qid, '', reqNative, reqDeferred)}
         </div>`;
@@ -561,7 +637,7 @@
             </thead>
             <tbody>${confirmRows}</tbody>
           </table>
-          <div class="hint-box">If a value is still correct, you can leave the Update column as-is. Clearing a field and submitting keeps the previous answer on file.</div>
+          <div class="hint-box">If a value is still correct, you can leave the Update column as-is. Clearing a field and submitting keeps the previous answer on file. Hidden branching questions do not need answers.</div>
         </div>` : '';
 
       const sectionNum = withPrior.length ? '2' : '1';
@@ -581,6 +657,7 @@
         </div>`;
 
       el.content.innerHTML = `
+        ${deltaHtml}
         <form id="survey-form" novalidate>
           ${section1}
           ${withoutPrior.length || !withPrior.length ? section2 : ''}

@@ -1069,6 +1069,30 @@
                 return this.request('/site-survey-definitions');
             }
 
+            async getSiteSurveyQuestionLibrary() {
+                return this.request('/site-survey-question-library');
+            }
+
+            async createSiteSurveyQuestionLibraryItem(item) {
+                return this.request('/site-survey-question-library', {
+                    method: 'POST',
+                    body: JSON.stringify(item)
+                });
+            }
+
+            async updateSiteSurveyQuestionLibraryItem(id, item) {
+                return this.request(`/site-survey-question-library/${id}`, {
+                    method: 'PUT',
+                    body: JSON.stringify(item)
+                });
+            }
+
+            async deleteSiteSurveyQuestionLibraryItem(id) {
+                return this.request(`/site-survey-question-library/${id}`, {
+                    method: 'DELETE'
+                });
+            }
+
             async createSiteSurveyDefinition(definition) {
                 return this.request('/site-survey-definitions', {
                     method: 'POST',
@@ -1282,6 +1306,7 @@
         let allSiteSurveyDefinitions = [];
         let allSiteSurveyAssignments = [];
         let allSiteSurveyResponses = [];
+        let allSiteSurveyQuestionLibrary = [];
         let allSiteStaff = [];
         let user = null;
         const VALID_TABS = new Set([
@@ -1322,7 +1347,7 @@
         let lastReportData = [];
         /** When set, Comms tab filters assignments/responses to this site id */
         let commsSiteFilterId = null;
-        let commsPanel = 'templates'; // templates | links | responses | activity | privacy
+        let commsPanel = 'templates'; // templates | questions | links | responses | activity | privacy
         const COMMS_LIST_CAP = 25;
 
         const SESSION_USER_KEY = 'artemis.session.user';
@@ -2489,6 +2514,153 @@
             }).join('')}</div>`;
         };
 
+        const normalizeSurveyDeltaLabel = (label) => String(label || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        const readSurveyAnswerValue = (a) => {
+            if (!a || typeof a !== 'object') return '';
+            const v = a.value ?? a.answer ?? a.answerText ?? a.response ?? '';
+            if (v == null) return '';
+            return String(v).trim();
+        };
+
+        /** Compare latest response vs previous for a site — changed / unchanged / not answered. */
+        const compareSiteSurveyResponses = (current, previous, questions = []) => {
+            const buildLookup = (answers) => {
+                const byId = new Map();
+                const byLabel = new Map();
+                asSurveyList(answers).forEach((a) => {
+                    if (!a) return;
+                    const value = readSurveyAnswerValue(a);
+                    const filled = value !== '';
+                    const entry = {
+                        value,
+                        filled,
+                        questionId: String(a.questionId ?? a.id ?? ''),
+                        label: String(a.label || '').trim(),
+                    };
+                    if (entry.questionId) byId.set(entry.questionId, entry);
+                    const norm = normalizeSurveyDeltaLabel(entry.label);
+                    if (norm) byLabel.set(norm, entry);
+                });
+                return { byId, byLabel };
+            };
+            const cur = buildLookup(current?.answers);
+            const prev = buildLookup(previous?.answers);
+            const keys = new Map();
+            const remember = (meta) => {
+                const qid = meta.questionId ? String(meta.questionId) : '';
+                const norm = normalizeSurveyDeltaLabel(meta.label);
+                const key = qid || (norm ? `label:${norm}` : '');
+                if (!key || keys.has(key)) return;
+                keys.set(key, { questionId: qid || null, label: meta.label || qid || 'Question' });
+            };
+            asSurveyList(questions).forEach((q, idx) => remember({ questionId: q.id || `q_${idx}`, label: q.label || q.title || '' }));
+            for (const e of cur.byId.values()) remember(e);
+            for (const e of prev.byId.values()) remember(e);
+            for (const e of cur.byLabel.values()) remember(e);
+            for (const e of prev.byLabel.values()) remember(e);
+
+            const resolve = (lookup, meta) => {
+                if (meta.questionId && lookup.byId.has(meta.questionId)) return lookup.byId.get(meta.questionId);
+                const norm = normalizeSurveyDeltaLabel(meta.label);
+                if (norm && lookup.byLabel.has(norm)) return lookup.byLabel.get(norm);
+                return null;
+            };
+
+            const rows = [...keys.values()].map((meta) => {
+                const c = resolve(cur, meta);
+                const p = resolve(prev, meta);
+                const currentValue = c?.filled ? c.value : '';
+                const previousValue = p?.filled ? p.value : '';
+                const currentAnswered = !!c?.filled;
+                const previousAnswered = !!p?.filled;
+                let status = 'unanswered';
+                if (!currentAnswered) status = 'unanswered';
+                else if (!previousAnswered) status = 'unchanged';
+                else if (String(currentValue) === String(previousValue)) status = 'unchanged';
+                else status = 'changed';
+                return {
+                    label: meta.label,
+                    questionId: meta.questionId,
+                    status,
+                    currentValue: currentAnswered ? currentValue : null,
+                    previousValue: previousAnswered ? previousValue : null,
+                    flagNotAnswered: !currentAnswered,
+                };
+            });
+            rows.sort((a, b) => {
+                const order = { changed: 0, unanswered: 1, unchanged: 2 };
+                return (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.label).localeCompare(String(b.label));
+            });
+            const changed = rows.filter(r => r.status === 'changed');
+            const unchanged = rows.filter(r => r.status === 'unchanged');
+            const unanswered = rows.filter(r => r.status === 'unanswered');
+            return {
+                summary: { changed: changed.length, unchanged: unchanged.length, unanswered: unanswered.length, total: rows.length },
+                changed,
+                unchanged,
+                unanswered,
+                rows,
+                currentSurveyId: current?.surveyId || null,
+                previousSurveyId: previous?.surveyId || null,
+                currentSubmittedAt: current?.submittedAt || null,
+                previousSubmittedAt: previous?.submittedAt || null,
+            };
+        };
+
+        const surveyDeltaHtml = (delta) => {
+            if (!delta || !delta.summary) return '';
+            const s = delta.summary;
+            const section = (title, list, tone, empty) => {
+                const toneCls = tone === 'changed'
+                    ? 'border-amber-200 dark:border-amber-800 bg-amber-50/40 dark:bg-amber-950/20'
+                    : tone === 'unanswered'
+                        ? 'border-red-200 dark:border-red-800 bg-red-50/40 dark:bg-red-950/20'
+                        : 'border-emerald-200 dark:border-emerald-800 bg-emerald-50/30 dark:bg-emerald-950/20';
+                if (!list.length) {
+                    return `<div class="rounded-lg border ${toneCls} p-3"><div class="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-1">${escapeHtml(title)}</div><div class="text-sm text-gray-500">${escapeHtml(empty)}</div></div>`;
+                }
+                return `<div class="rounded-lg border ${toneCls} p-3">
+                    <div class="text-xs font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300 mb-2">${escapeHtml(title)} (${list.length})</div>
+                    <div class="space-y-2 max-h-56 overflow-y-auto">
+                        ${list.map(r => `
+                            <div class="text-sm border-b border-black/5 dark:border-white/5 pb-2 last:border-0 last:pb-0">
+                                <div class="font-medium text-gray-900 dark:text-gray-100">${escapeHtml(r.label || r.questionId || 'Question')}${r.flagNotAnswered ? ' <span class="text-[10px] font-bold uppercase tracking-wide text-red-700 dark:text-red-300">Not answered</span>' : ''}</div>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-1 mt-1 text-xs text-gray-600 dark:text-gray-300">
+                                    <div><span class="text-gray-400">Previous:</span> ${escapeHtml(r.previousValue == null || r.previousValue === '' ? '—' : r.previousValue)}</div>
+                                    <div><span class="text-gray-400">Latest:</span> ${escapeHtml(r.currentValue == null || r.currentValue === '' ? '—' : r.currentValue)}</div>
+                                </div>
+                            </div>`).join('')}
+                    </div>
+                </div>`;
+            };
+            const prevTitle = (allSiteSurveyDefinitions || []).find(d => d.id === delta.previousSurveyId)?.title || delta.previousSurveyId || 'Previous';
+            const curTitle = (allSiteSurveyDefinitions || []).find(d => d.id === delta.currentSurveyId)?.title || delta.currentSurveyId || 'Latest';
+            return `
+                <div class="mb-5 space-y-3">
+                    <div>
+                        <div class="text-sm font-semibold text-gray-900 dark:text-gray-100">Last two surveys — deltas</div>
+                        <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">${escapeHtml(prevTitle)} → ${escapeHtml(curTitle)} · ${s.changed} changed · ${s.unchanged} unchanged · ${s.unanswered} not answered</div>
+                    </div>
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                        ${section('Changed', delta.changed || [], 'changed', 'No answer changes.')}
+                        ${section('Unchanged', delta.unchanged || [], 'unchanged', 'No matching unchanged answers.')}
+                        ${section('Not answered', delta.unanswered || [], 'unanswered', 'All questions answered on latest.')}
+                    </div>
+                </div>`;
+        };
+
+        const previousResponseForCompare = (response) => {
+            if (!response) return null;
+            const ids = siteIdsForSurveyLookup(response.siteId);
+            const role = String(response.targetRole || '').toLowerCase();
+            const pool = (allSiteSurveyResponses || [])
+                .filter(r => r && !r._archived && ids.has(r.siteId) && r.id !== response.id)
+                .slice()
+                .sort((a, b) => String(b.submittedAt || b.createdAt || '').localeCompare(String(a.submittedAt || a.createdAt || '')));
+            const sameRole = pool.find(r => String(r.targetRole || '').toLowerCase() === role);
+            return sameRole || pool[0] || null;
+        };
+
         const siteSurveySectionsHtml = (siteId) => {
             const latestBySurvey = latestSurveyResponsesBySurvey(siteId);
             const pending = (allSiteSurveyAssignments || []).filter(
@@ -2668,6 +2840,10 @@
                             <div class="font-semibold text-gray-900 dark:text-gray-100">${escapeHtml(name)}</div>
                             <div class="text-xs text-gray-500 dark:text-gray-400">${responses.length} prior submission${responses.length === 1 ? '' : 's'}</div>
                         </div>
+                        ${responses.length >= 1 ? surveyDeltaHtml(compareSiteSurveyResponses(responses[0], responses[1] || null, [
+                            ...asSurveyList((allSiteSurveyDefinitions || []).find(d => d.id === 'survey-general-feasibility')?.questions),
+                            ...asSurveyList((allSiteSurveyDefinitions || []).find(d => d.id === (surveyId || responses[0].surveyId))?.questions),
+                        ])) : ''}
                         ${cards}
                     </div>`;
             }).join('');
@@ -4004,6 +4180,14 @@
                    </div>`
                 : '';
 
+            const previous = previousResponseForCompare(response);
+            const genDef = (allSiteSurveyDefinitions || []).find(d => d.id === 'survey-general-feasibility');
+            const questionUniverse = [
+                ...asSurveyList(genDef?.questions),
+                ...asSurveyList(def?.questions),
+            ];
+            const delta = compareSiteSurveyResponses(response, previous, questionUniverse);
+
             const modalHTML = `
                 <div class="modal-backdrop">
                     <div class="modal-content dark:bg-gray-800" style="max-width: 56rem;">
@@ -4033,6 +4217,8 @@
                             </div>
                             <div class="p-6 max-h-[65vh] overflow-y-auto">
                                 ${knockoutHtml}
+                                ${surveyDeltaHtml(delta)}
+                                <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-2">All answers</div>
                                 ${surveyAnswersListHtml(response, { skipEmpty: false })}
                             </div>
                         </div>
@@ -4465,12 +4651,14 @@
                         </div>
                         <div class="flex gap-2 shrink-0">
                             <button id="new-site-survey-btn" class="inline-flex items-center px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">New template</button>
+                            <button id="new-library-question-btn" class="inline-flex items-center px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">New question</button>
                             <button id="new-site-survey-assignment-btn" class="inline-flex items-center px-3 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 text-sm font-medium">Send survey</button>
                         </div>
                     </div>
 
                     <div class="flex flex-wrap gap-1.5 p-1 rounded-lg bg-gray-100 dark:bg-gray-800/80 border border-gray-200 dark:border-gray-700">
                         ${tab('templates', 'Templates', allDefs.length)}
+                        ${tab('questions', 'Questions', (allSiteSurveyQuestionLibrary || []).filter(q => q && q.status !== 'archived').length)}
                         ${tab('links', 'Links', assignments.length)}
                         ${tab('responses', 'Responses', responses.length)}
                         ${tab('activity', 'Activity', unread || notes.length)}
@@ -4483,7 +4671,7 @@
                             <div class="flex items-center gap-2" id="comms-panel-actions"></div>
                         </div>
                         <div class="p-2 sm:p-3">
-                            <div id="comms-search-wrap" class="mb-2 ${['templates','links','responses'].includes(commsPanel) ? '' : 'hidden'}">
+                            <div id="comms-search-wrap" class="mb-2 ${['templates','questions','links','responses'].includes(commsPanel) ? '' : 'hidden'}">
                                 <input id="comms-list-search" type="search" placeholder="Filter list…" class="w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm" />
                             </div>
                             <div id="comms-panel-body" class="max-h-[min(58vh,560px)] overflow-y-auto space-y-1"></div>
@@ -4586,11 +4774,12 @@
 
             const notes = Array.isArray(window.__siteSurveyNotifications) ? window.__siteSurveyNotifications : [];
             const cap = COMMS_LIST_CAP;
-            const showSearch = ['templates', 'links', 'responses'].includes(commsPanel);
+            const showSearch = ['templates', 'questions', 'links', 'responses'].includes(commsPanel);
             if (searchWrap) searchWrap.classList.toggle('hidden', !showSearch);
 
             const titles = {
                 templates: 'Templates',
+                questions: 'Question library',
                 links: 'Secure links',
                 responses: 'Responses',
                 activity: 'Activity',
@@ -4605,6 +4794,10 @@
                         <button type="button" id="comms-sponsor-pdf-btn" class="text-xs font-medium px-2 py-1 rounded bg-indigo-600 text-white">Sponsor PDF</button>`;
                 } else if (commsPanel === 'activity') {
                     actionsEl.innerHTML = `<button type="button" id="mark-survey-notifications-read-btn" class="text-xs font-medium text-emerald-700 dark:text-emerald-300 hover:underline">Mark all read</button>`;
+                } else if (commsPanel === 'questions') {
+                    actionsEl.innerHTML = `
+                        <button type="button" id="import-questions-from-templates-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Import from templates</button>
+                        <button type="button" id="new-library-question-btn-panel" class="text-xs font-medium px-2 py-1 rounded bg-indigo-600 text-white">New question</button>`;
                 } else {
                     actionsEl.innerHTML = '';
                 }
@@ -4623,6 +4816,38 @@
                 }
                 const total = custom.length + predefined.length;
                 if (footerEl) footerEl.textContent = `${total} template${total === 1 ? '' : 's'} · use Filter to jump`;
+            } else if (commsPanel === 'questions') {
+                const lib = asSurveyList(allSiteSurveyQuestionLibrary)
+                    .slice()
+                    .sort((a, b) => String(a.label || '').localeCompare(String(b.label || '')));
+                const active = lib.filter(q => q && q.status !== 'archived');
+                const archived = lib.filter(q => q && q.status === 'archived');
+                const typeLabel = (t) => ({ select: 'Multiple choice', text: 'Short text', textarea: 'Long text', number: 'Number', date: 'Date' }[t] || t);
+                const row = (q) => {
+                    const opts = Array.isArray(q.options) ? q.options.length : 0;
+                    const scored = (q.scoringWeight || 0) > 0 || q.knockout;
+                    const search = `${q.label || ''} ${q.category || ''} ${q.type || ''} ${(q.tags || []).join(' ')}`.toLowerCase();
+                    return `
+                        <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40" data-search="${escapeHtml(search)}">
+                            <div class="min-w-0 flex-1">
+                                <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(q.label || '(untitled)')}</div>
+                                <div class="text-xs text-gray-500 dark:text-gray-400 truncate">${escapeHtml(typeLabel(q.type))} · ${escapeHtml(q.category || 'General')}${opts ? ` · ${opts} choices` : ''}${scored ? ' · scored' : ''}</div>
+                            </div>
+                            <div class="flex items-center gap-1 shrink-0">
+                                <button type="button" class="edit-library-question-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700" data-question-id="${escapeHtml(q.id)}">Edit</button>
+                                <button type="button" class="archive-library-question-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600" data-question-id="${escapeHtml(q.id)}" data-archive="${q.status === 'archived' ? '0' : '1'}">${q.status === 'archived' ? 'Restore' : 'Archive'}</button>
+                            </div>
+                        </div>`;
+                };
+                if (!lib.length) {
+                    body.innerHTML = empty('No library questions yet. Create reusable questions here, then pick them when building a survey.');
+                } else {
+                    body.innerHTML = `
+                        ${active.length ? `<div class="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 sticky top-0 bg-white dark:bg-gray-800 z-[1]">Active (${active.length})</div>${active.map(row).join('')}` : ''}
+                        ${archived.length ? `<div class="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 sticky top-0 bg-white dark:bg-gray-800 z-[1] ${active.length ? 'mt-1' : ''}">Archived (${archived.length})</div>${archived.map(row).join('')}` : ''}
+                    `;
+                }
+                if (footerEl) footerEl.textContent = `${lib.length} library question${lib.length === 1 ? '' : 's'}`;
             } else if (commsPanel === 'links') {
                 const rows = assignments.map(a => {
                     const siteName = allSites.find(s => s.id === a.siteId)?.name || a.siteId;
@@ -4822,6 +5047,90 @@
             loadPrivacyAudit();
         };
 
+        const createLibraryQuestionModal = (existing = null) => {
+            const isEdit = !!(existing && existing.id);
+            const opts = Array.isArray(existing?.options) ? existing.options : ['Yes', 'No'];
+            const modalHTML = `
+                <div class="modal-backdrop">
+                    <div class="modal-content dark:bg-gray-800" style="max-width: 36rem;">
+                        <form id="library-question-form" ${isEdit ? `data-edit-id="${escapeHtml(existing.id)}"` : ''}>
+                            <div class="px-5 py-4 border-b border-gray-200 dark:border-gray-700">
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">${isEdit ? 'Edit library question' : 'New library question'}</h3>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Reusable question — surveys reference it so answers prefill across templates.</p>
+                            </div>
+                            <div class="p-5 space-y-3">
+                                <div>
+                                    <label class="block text-sm font-medium">Question</label>
+                                    <input name="label" required value="${escapeHtml(existing?.label || '')}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
+                                </div>
+                                <div class="grid grid-cols-2 gap-3">
+                                    <div>
+                                        <label class="block text-sm font-medium">Type</label>
+                                        <select name="type" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2">
+                                            ${['select','text','textarea','number','date'].map(t => `<option value="${t}" ${(existing?.type || 'select') === t ? 'selected' : ''}>${t === 'select' ? 'Multiple choice' : t}</option>`).join('')}
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm font-medium">Category</label>
+                                        <input name="category" value="${escapeHtml(existing?.category || 'General')}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
+                                    </div>
+                                </div>
+                                <label class="flex items-center gap-2 text-sm"><input name="required" type="checkbox" class="h-4 w-4" ${existing?.required !== false ? 'checked' : ''} /> Required (default)</label>
+                                <div>
+                                    <label class="block text-sm font-medium">Choices (one per line, select only)</label>
+                                    <textarea name="options" rows="4" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm">${escapeHtml(opts.join('\n'))}</textarea>
+                                </div>
+                                <div id="library-question-error" class="text-sm text-red-600 hidden"></div>
+                            </div>
+                            <div class="px-5 py-3 bg-gray-50 dark:bg-gray-700 flex flex-row-reverse gap-2">
+                                <button type="submit" class="px-4 py-2 rounded-md bg-indigo-600 text-white text-sm">${isEdit ? 'Save' : 'Create'}</button>
+                                <button type="button" data-action="cancel" class="px-4 py-2 rounded-md border border-gray-300 dark:border-gray-500 text-sm">Cancel</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>`;
+            showModal(modalHTML);
+        };
+
+        const importLibraryQuestionsFromTemplates = async () => {
+            const defs = asSurveyList(allSiteSurveyDefinitions);
+            const existing = asSurveyList(allSiteSurveyQuestionLibrary);
+            const byLabel = new Map(existing.map(q => [String(q.label || '').trim().toLowerCase().replace(/\s+/g, ' '), q]));
+            let created = 0;
+            let skipped = 0;
+            for (const def of defs) {
+                for (const q of asSurveyList(def.questions)) {
+                    const label = String(q.label || q.title || '').trim();
+                    if (!label) continue;
+                    const key = label.toLowerCase().replace(/\s+/g, ' ');
+                    if (byLabel.has(key)) { skipped += 1; continue; }
+                    const item = {
+                        label,
+                        type: String(q.type || 'text').toLowerCase(),
+                        required: q.required !== false,
+                        options: Array.isArray(q.options) ? q.options.map(o => typeof o === 'string' ? o : String(o.label ?? o.value ?? '')).filter(Boolean) : [],
+                        category: q.category || 'General',
+                        scoringWeight: typeof q.scoringWeight === 'number' ? q.scoringWeight : 0,
+                        scoringOptions: Array.isArray(q.scoringOptions) ? q.scoringOptions : [],
+                        knockout: !!q.knockout,
+                        knockoutOnBlank: !!q.knockoutOnBlank,
+                        status: 'active',
+                        tags: [def.id === 'survey-general-feasibility' ? 'general-feasibility' : 'template'],
+                        sourceSurveyId: def.id,
+                    };
+                    if (item.type === 'select' && item.options.length < 2) item.options = ['Yes', 'No'];
+                    try {
+                        const saved = await apiService.createSiteSurveyQuestionLibraryItem(item);
+                        byLabel.set(key, saved);
+                        created += 1;
+                    } catch (_) { /* skip bad rows */ }
+                }
+            }
+            allSiteSurveyQuestionLibrary = await apiService.getSiteSurveyQuestionLibrary().catch(() => existing);
+            showNotification(`Imported ${created} unique question${created === 1 ? '' : 's'}${skipped ? ` · ${skipped} already in library` : ''}`, 'success');
+            if (activeTab === 'communications') render();
+        };
+
         const createSiteSurveyDefinitionModal = (existingDefinition = null, options = {}) => {
             const isClone = !!(options && options.clone);
             const isEdit = !!(existingDefinition && existingDefinition.id) && !isClone;
@@ -4834,7 +5143,7 @@
                         : (q.id || `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`),
                     label: q.label || q.title || '',
                     type: String(q.type || 'text').toLowerCase(),
-                    required: !!q.required,
+                    required: q.required !== false,
                     options: Array.isArray(q.options) ? q.options.map(o => (typeof o === 'string' ? o : String(o.label ?? o.value ?? ''))) : [],
                     logic: q.logic && typeof q.logic === 'object' ? q.logic : null,
                     scoringWeight: typeof q.scoringWeight === 'number' ? q.scoringWeight : 0,
@@ -4843,13 +5152,14 @@
                     knockout: q.knockout === true,
                     knockoutOnBlank: q.knockoutOnBlank === true,
                     knockoutFailValues: Array.isArray(q.knockoutFailValues) ? q.knockoutFailValues : [],
+                    libraryQuestionId: q.libraryQuestionId || null,
                 }));
             };
 
             const fromDef = cloneQuestionsFromDef();
             window.__siteSurveyBuilderQuestions = fromDef && fromDef.length
                 ? fromDef
-                : [{ id: `q_${Date.now().toString(36)}`, label: 'Comments', type: 'textarea', required: true, options: [], logic: null, scoringWeight: 0, scoringOptions: [], category: 'General', knockout: false, knockoutOnBlank: false, knockoutFailValues: [] }];
+                : [{ id: `q_${Date.now().toString(36)}`, label: 'Comments', type: 'textarea', required: true, options: [], logic: null, scoringWeight: 0, scoringOptions: [], category: 'General', knockout: false, knockoutOnBlank: false, knockoutFailValues: [], libraryQuestionId: null }];
             window.__siteSurveyBuilderMeta = {
                 isClone,
                 clonedFromId: isClone ? existingDefinition?.id : null,
@@ -4938,7 +5248,7 @@
                                             <button type="button" id="add-site-survey-question-btn" class="px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 text-sm">Add question</button>
                                         </div>
                                         <div id="site-survey-questions-builder" class="mt-2 space-y-3"></div>
-                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">Each question: ask → choose answer type → set scoring in the amber box (no pipe syntax).</p>
+                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">Each question defaults to <strong>required</strong>. Branching (“Show only if…”) questions are only required when the site qualifies and the question is shown. General Feasibility is auto-added at the top of every sent survey.</p>
                                     </div>
                                     <div class="md:col-span-2">
                                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Status</label>
@@ -5040,7 +5350,7 @@
                                     </div>
                                     <div class="flex items-end pb-2">
                                         <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                                            <input id="q_required_${idx}" name="q_required_${idx}" type="checkbox" class="h-4 w-4" ${q.required ? 'checked' : ''} />
+                                            <input id="q_required_${idx}" name="q_required_${idx}" type="checkbox" class="h-4 w-4" ${q.required !== false ? 'checked' : ''} />
                                             Required
                                         </label>
                                     </div>
@@ -5171,23 +5481,22 @@
                     if (!card) return;
                     q.label = (card.querySelector(`[name="q_label_${idx}"]`)?.value || '').trim();
                     q.type = (card.querySelector(`[name="q_type_${idx}"]`)?.value || 'text').trim();
-                    q.required = !!card.querySelector(`#q_required_${idx}`)?.checked;
+                    q.required = card.querySelector(`#q_required_${idx}`)?.checked !== false;
                     q.category = (card.querySelector(`[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
                     const weightRaw = parseInt(card.querySelector(`[name="q_scoring_weight_${idx}"]`)?.value || '0', 10);
                     const scoreOn = !!card.querySelector(`.q-score-enable[data-q-idx="${idx}"]`)?.checked;
                     q.scoringWeight = scoreOn ? (Number.isNaN(weightRaw) ? 10 : Math.max(0, weightRaw)) : 0;
                     q.knockoutOnBlank = !!card.querySelector(`[name="q_knockout_blank_${idx}"]`)?.checked;
                     if (q.type === 'select') {
-                        const choiceInputs = [...card.querySelectorAll(`input[name^="q_choice_${idx}_"]`)];
+                        const choiceInputs = [...card.querySelectorAll(`[data-choice-list="${idx}"] input[type="text"]`)];
                         q.options = choiceInputs.map(inp => inp.value.trim()).filter(Boolean);
                         const grid = card.querySelector(`[data-score-option-grid="${idx}"]`);
                         if (grid && scoreOn) {
                             q.scoringOptions = [...grid.querySelectorAll('[data-score-opt-row]')].map((row) => {
-                                const ptsInput = row.querySelector(`input[name^="q_opt_pts_${idx}_"]`);
-                                const koInput = row.querySelector(`input[name^="q_opt_ko_${idx}_"]`);
-                                const val = (ptsInput?.getAttribute('data-opt-value') || '').trim()
-                                    || choiceInputs[Number(row.getAttribute('data-score-opt-row'))]?.value?.trim()
-                                    || '';
+                                const oi = Number(row.getAttribute('data-score-opt-row'));
+                                const ptsInput = row.querySelector(`input[name="q_opt_pts_${idx}_${oi}"]`) || row.querySelector('input[type="number"]');
+                                const koInput = row.querySelector(`input[name="q_opt_ko_${idx}_${oi}"]`) || row.querySelector('input[type="checkbox"]');
+                                const val = (choiceInputs[oi]?.value || ptsInput?.getAttribute('data-opt-value') || '').trim();
                                 const pts = parseFloat(ptsInput?.value || '0');
                                 return {
                                     value: val,
@@ -5221,7 +5530,7 @@
                         id: `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
                         label: '',
                         type: 'select',
-                        required: false,
+                        required: true,
                         options: ['Yes', 'No'],
                         logic: null,
                         scoringWeight: 10,
@@ -5233,6 +5542,7 @@
                         knockout: true,
                         knockoutOnBlank: false,
                         knockoutFailValues: [],
+                        libraryQuestionId: null,
                     };
                     window.__siteSurveyBuilderQuestions = [...(window.__siteSurveyBuilderQuestions || []), q];
                     renderBuilder();
@@ -5372,7 +5682,7 @@
                             <div class="p-6 space-y-4">
                                 <div>
                                     <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">Send Site Survey</h2>
-                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Pick a template and sites. Each site+role gets a unique secure link, prefilled from their latest answers. Review prior answers below before you send.</p>
+                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Pick a template and sites. Each site+role gets a unique secure link. <strong>General Feasibility</strong> is auto-added at the top of every survey. Links prefill from prior site answers. Review prior answers and deltas below before you send.</p>
                                 </div>
                                 ${noDefs ? `<div class="p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-900 dark:text-amber-100">Create a survey template first (New Site Survey).</div>` : ''}
                                 ${noSites ? `<div class="p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-900 dark:text-amber-100">No sites loaded.</div>` : ''}
@@ -10574,6 +10884,58 @@
                 }
                 return;
             }
+            if (e.target.id === 'library-question-form') {
+                e.preventDefault();
+                const form = e.target;
+                const errEl = document.getElementById('library-question-error');
+                if (errEl) errEl.classList.add('hidden');
+                try {
+                    const editId = form.getAttribute('data-edit-id') || '';
+                    const label = form.label.value.trim();
+                    const type = String(form.type.value || 'text').toLowerCase();
+                    const category = (form.category.value || 'General').trim() || 'General';
+                    const required = !!form.required?.checked;
+                    let options = String(form.options.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+                    if (!label) throw new Error('Question text is required');
+                    if (type === 'select' && options.length < 2) {
+                        options = options.length ? [...options, 'No'] : ['Yes', 'No'];
+                    }
+                    const prev = editId ? (allSiteSurveyQuestionLibrary || []).find(q => q.id === editId) : null;
+                    const payload = {
+                        ...(prev || {}),
+                        label,
+                        type,
+                        category,
+                        required,
+                        options: type === 'select' ? options : [],
+                        status: prev?.status || 'active',
+                        scoringWeight: prev?.scoringWeight || 0,
+                        scoringOptions: prev?.scoringOptions || [],
+                        knockout: !!prev?.knockout,
+                        knockoutOnBlank: !!prev?.knockoutOnBlank,
+                        updatedAt: new Date().toISOString(),
+                    };
+                    if (editId) {
+                        await apiService.updateSiteSurveyQuestionLibraryItem(editId, { ...payload, id: editId });
+                        showNotification('Question updated', 'success');
+                    } else {
+                        payload.createdAt = new Date().toISOString();
+                        await apiService.createSiteSurveyQuestionLibraryItem(payload);
+                        showNotification('Question created', 'success');
+                    }
+                    closeModal();
+                    allSiteSurveyQuestionLibrary = await apiService.getSiteSurveyQuestionLibrary().catch(() => allSiteSurveyQuestionLibrary);
+                    activeTab = 'communications';
+                    commsPanel = 'questions';
+                    render();
+                } catch (error) {
+                    if (errEl) {
+                        errEl.textContent = error.message || 'Failed to save question';
+                        errEl.classList.remove('hidden');
+                    }
+                }
+                return;
+            }
             if (e.target.id === 'site-survey-definition-form') {
                 e.preventDefault();
                 const form = e.target;
@@ -10592,11 +10954,11 @@
                     const questions = builderQs.map((q, idx) => {
                         const label = (questionsRoot.querySelector(`[name="q_label_${idx}"]`)?.value || '').trim();
                         const type = (questionsRoot.querySelector(`[name="q_type_${idx}"]`)?.value || 'text').trim();
-                        const required = !!questionsRoot.querySelector(`#q_required_${idx}`)?.checked;
+                        const required = questionsRoot.querySelector(`#q_required_${idx}`)?.checked !== false;
                         const scoreOn = !!questionsRoot.querySelector(`.q-score-enable[data-q-idx="${idx}"]`)?.checked;
                         let options = [];
                         if (type === 'select') {
-                            options = [...questionsRoot.querySelectorAll(`input[name^="q_choice_${idx}_"]`)]
+                            options = [...questionsRoot.querySelectorAll(`[data-choice-list="${idx}"] input[type="text"]`)]
                                 .map(inp => inp.value.trim())
                                 .filter(Boolean);
                             if (!options.length) {
@@ -10617,9 +10979,9 @@
                         const optGrid = questionsRoot.querySelector(`[data-score-option-grid="${idx}"]`);
                         if (scoreOn && optGrid && type === 'select') {
                             scoringOptions = [...optGrid.querySelectorAll('[data-score-opt-row]')].map((row, oi) => {
-                                const ptsInput = row.querySelector(`input[name^="q_opt_pts_${idx}_"]`);
-                                const koInput = row.querySelector(`input[name^="q_opt_ko_${idx}_"]`);
-                                const val = (ptsInput?.getAttribute('data-opt-value') || options[oi] || '').trim();
+                                const ptsInput = row.querySelector(`input[name="q_opt_pts_${idx}_${oi}"]`) || row.querySelector('input[type="number"]');
+                                const koInput = row.querySelector(`input[name="q_opt_ko_${idx}_${oi}"]`) || row.querySelector('input[type="checkbox"]');
+                                const val = (options[oi] || ptsInput?.getAttribute('data-opt-value') || '').trim();
                                 const pts = parseFloat(ptsInput?.value || '0');
                                 const knockoutFlag = !!koInput?.checked;
                                 return {
@@ -10638,8 +11000,13 @@
                         if (type === 'select' && options.length < 2) {
                             throw new Error(`Question ${idx + 1}: add at least two answer choices`);
                         }
-                        if (scoreOn && type === 'select' && scoringOptions.length === 0) {
-                            throw new Error(`Question ${idx + 1}: turn on scoring requires points on each choice`);
+                        if (scoreOn && type === 'select' && scoringOptions.length === 0 && options.length >= 2) {
+                            // Auto-build points from choices so save doesn't fail after choice edits
+                            const weight = scoringWeight || 10;
+                            scoringOptions = options.map((opt, oi) => ({
+                                value: opt,
+                                points: oi === 0 ? weight : 0,
+                            }));
                         }
 
                         return {
@@ -10655,6 +11022,7 @@
                             knockout,
                             knockoutOnBlank,
                             knockoutFailValues,
+                            libraryQuestionId: q.libraryQuestionId || undefined,
                         };
                     });
 
@@ -11123,6 +11491,40 @@
             if (e.target.id === 'new-site-survey-btn') {
                 createSiteSurveyDefinitionModal();
             }
+            if (e.target.id === 'new-library-question-btn' || e.target.id === 'new-library-question-btn-panel') {
+                createLibraryQuestionModal();
+                return;
+            }
+            if (e.target.id === 'import-questions-from-templates-btn') {
+                e.target.disabled = true;
+                importLibraryQuestionsFromTemplates()
+                    .catch(err => showNotification(err.message || 'Import failed', 'error'))
+                    .finally(() => { e.target.disabled = false; });
+                return;
+            }
+            const editLibBtn = e.target.closest('.edit-library-question-btn');
+            if (editLibBtn) {
+                const q = (allSiteSurveyQuestionLibrary || []).find(x => x && x.id === editLibBtn.getAttribute('data-question-id'));
+                if (q) createLibraryQuestionModal(q);
+                return;
+            }
+            const archiveLibBtn = e.target.closest('.archive-library-question-btn');
+            if (archiveLibBtn) {
+                const id = archiveLibBtn.getAttribute('data-question-id');
+                const q = (allSiteSurveyQuestionLibrary || []).find(x => x && x.id === id);
+                if (!q) return;
+                const archive = archiveLibBtn.getAttribute('data-archive') === '1';
+                archiveLibBtn.disabled = true;
+                apiService.updateSiteSurveyQuestionLibraryItem(id, { ...q, status: archive ? 'archived' : 'active', updatedAt: new Date().toISOString() })
+                    .then(async () => {
+                        allSiteSurveyQuestionLibrary = await apiService.getSiteSurveyQuestionLibrary().catch(() => allSiteSurveyQuestionLibrary);
+                        showNotification(archive ? 'Archived' : 'Restored', 'success');
+                        if (activeTab === 'communications') render();
+                    })
+                    .catch(err => showNotification(err.message || 'Update failed', 'error'))
+                    .finally(() => { archiveLibBtn.disabled = false; });
+                return;
+            }
             const commsPanelBtn = e.target.closest('.comms-panel-btn');
             if (commsPanelBtn) {
                 commsPanel = commsPanelBtn.getAttribute('data-comms-panel') || 'templates';
@@ -11426,7 +11828,8 @@
                         // Do NOT call getEvents/getRoles — results were unused and /api/events 500/hangs
                         const [
                             patients, schedules, surveys, siteStaff,
-                            siteSurveyDefinitions, siteSurveyAssignments, siteSurveyResponses, siteSurveyNotifications
+                            siteSurveyDefinitions, siteSurveyAssignments, siteSurveyResponses, siteSurveyNotifications,
+                            siteSurveyQuestionLibrary
                         ] = await Promise.all([
                             apiService.getPatients().catch(() => []),
                             apiService.getSchedules().catch(() => []),
@@ -11435,7 +11838,8 @@
                             apiService.getSiteSurveyDefinitions().catch(() => []),
                             apiService.getSiteSurveyAssignments().catch(() => []),
                             apiService.getSiteSurveyResponses().catch(() => []),
-                            apiService.getSiteSurveyNotifications().catch(() => [])
+                            apiService.getSiteSurveyNotifications().catch(() => []),
+                            apiService.getSiteSurveyQuestionLibrary().catch(() => [])
                         ]);
                         allPatients = patients;
                         allSchedules = schedules;
@@ -11444,6 +11848,7 @@
                         allSiteSurveyDefinitions = asSurveyList(siteSurveyDefinitions);
                         allSiteSurveyAssignments = asSurveyList(siteSurveyAssignments);
                         allSiteSurveyResponses = asSurveyList(siteSurveyResponses);
+                        allSiteSurveyQuestionLibrary = asSurveyList(siteSurveyQuestionLibrary);
                         window.__siteSurveyNotifications = Array.isArray(siteSurveyNotifications) ? siteSurveyNotifications : [];
                         console.log('Secondary ARTEMIS data loaded (deferred)');
                         refreshArtemisLegacySiteIndex().catch(() => {});
