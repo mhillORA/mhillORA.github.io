@@ -47,32 +47,147 @@ function mergeAnswers(incoming, priorAnswers) {
     });
 }
 
+function normalizeAnswerValue(value) {
+    return String(value ?? '').trim();
+}
+
+function findAnswerForQuestionId(answers, questionId) {
+    const qid = String(questionId ?? '');
+    return (Array.isArray(answers) ? answers : []).find(
+        (a) => a && (a.questionId === questionId || String(a.questionId) === qid)
+    );
+}
+
+function optionMatches(opt, answerValue) {
+    const av = normalizeAnswerValue(answerValue);
+    if (!av) return false;
+    const ov = normalizeAnswerValue(opt?.value ?? opt?.label ?? '');
+    return ov !== '' && ov === av;
+}
+
+function readPassThresholds(def) {
+    const scoring = def?.scoring && typeof def.scoring === 'object' ? def.scoring : {};
+    const passRaw = def?.passThreshold ?? scoring.passThreshold ?? 70;
+    const borderRaw = def?.borderlineThreshold ?? scoring.borderlineThreshold ?? 50;
+    let passThreshold = Number(passRaw);
+    let borderlineThreshold = Number(borderRaw);
+    if (!Number.isFinite(passThreshold)) passThreshold = 70;
+    if (!Number.isFinite(borderlineThreshold)) borderlineThreshold = 50;
+    passThreshold = Math.max(0, Math.min(100, passThreshold));
+    borderlineThreshold = Math.max(0, Math.min(passThreshold, borderlineThreshold));
+    return { passThreshold, borderlineThreshold };
+}
+
+/**
+ * Pure scoring against a survey definition.
+ * @returns {null|object} null when the definition has no scoring or knockout config
+ */
+function scoreAnswers(def, answers) {
+    if (!def || !Array.isArray(def.questions) || !def.questions.length) return null;
+
+    const { passThreshold, borderlineThreshold } = readPassThresholds(def);
+    const knockouts = [];
+    const byCategory = {};
+    let earned = 0;
+    let totalWeight = 0;
+    let scoredQuestionCount = 0;
+    let configuredScorable = 0;
+    let configuredKnockouts = 0;
+
+    def.questions.forEach((q) => {
+        if (!q) return;
+        const opts = Array.isArray(q.scoringOptions) ? q.scoringOptions : [];
+        const weight = typeof q.scoringWeight === 'number' && q.scoringWeight > 0 ? q.scoringWeight : 0;
+        if (weight > 0 && opts.length) configuredScorable += 1;
+
+        const failFromOpts = opts.filter((o) => o && (o.knockout === true || o.fail === true));
+        const explicitFails = Array.isArray(q.knockoutFailValues)
+            ? q.knockoutFailValues.map(normalizeAnswerValue).filter(Boolean)
+            : [];
+        const isKnockoutConfigured =
+            q.knockout === true || failFromOpts.length > 0 || explicitFails.length > 0;
+        if (isKnockoutConfigured) configuredKnockouts += 1;
+
+        const ans = findAnswerForQuestionId(answers, q.id);
+        const ansVal = ans && !ans.skipped ? normalizeAnswerValue(ans.value) : '';
+        const match = ansVal ? opts.find((o) => optionMatches(o, ansVal)) : null;
+
+        if (isKnockoutConfigured) {
+            const failSet = new Set([
+                ...explicitFails,
+                ...failFromOpts.map((o) => normalizeAnswerValue(o.value ?? o.label)),
+            ]);
+            if (ansVal && failSet.has(ansVal)) {
+                knockouts.push({
+                    questionId: q.id,
+                    label: q.label || q.id,
+                    answer: ansVal,
+                    reason: 'Failed knockout criterion',
+                });
+            } else if (q.knockout === true && q.knockoutOnBlank === true && !ansVal) {
+                knockouts.push({
+                    questionId: q.id,
+                    label: q.label || q.id,
+                    answer: '(blank)',
+                    reason: 'Required knockout left blank',
+                });
+            }
+        }
+
+        if (!(weight > 0 && opts.length)) return;
+        if (!ansVal) return;
+
+        scoredQuestionCount += 1;
+        totalWeight += weight;
+        const pts = match && typeof match.points === 'number' ? match.points : 0;
+        earned += pts;
+
+        const cat = String(q.category || 'General').trim() || 'General';
+        if (!byCategory[cat]) byCategory[cat] = { earned: 0, totalWeight: 0, pct: 0 };
+        byCategory[cat].earned += pts;
+        byCategory[cat].totalWeight += weight;
+    });
+
+    if (configuredScorable === 0 && configuredKnockouts === 0) return null;
+
+    Object.keys(byCategory).forEach((cat) => {
+        const row = byCategory[cat];
+        row.pct = row.totalWeight > 0 ? Math.round((row.earned / row.totalWeight) * 100) : 0;
+    });
+
+    const pct = totalWeight > 0 ? Math.round((earned / totalWeight) * 100) : 0;
+    let outcome = 'unscored';
+    if (knockouts.length) {
+        outcome = 'fail';
+    } else if (totalWeight > 0) {
+        if (pct >= passThreshold) outcome = 'pass';
+        else if (pct >= borderlineThreshold) outcome = 'borderline';
+        else outcome = 'fail';
+    } else if (configuredKnockouts > 0) {
+        outcome = 'pass';
+    }
+
+    return {
+        earned,
+        totalWeight,
+        pct,
+        outcome,
+        passThreshold,
+        borderlineThreshold,
+        knockouts,
+        byCategory,
+        scoredQuestionCount,
+        hasScoring: configuredScorable > 0 || configuredKnockouts > 0,
+        scoredAt: new Date().toISOString(),
+    };
+}
+
 async function computeScore(getContainer, surveyId, answers) {
     try {
         const defC = getContainer('site-survey-definitions');
         const defRead = await defC.item(surveyId, surveyId).read();
         const def = defRead.resource;
-        if (!def || !Array.isArray(def.questions)) return null;
-        const scorableQs = def.questions.filter(
-            (q) => typeof q.scoringWeight === 'number' && q.scoringWeight > 0 && q.scoringOptions
-        );
-        if (!scorableQs.length) return null;
-        let totalWeight = 0;
-        let earned = 0;
-        scorableQs.forEach((q) => {
-            const ans = (Array.isArray(answers) ? answers : []).find(
-                (a) => a.questionId === q.id || a.questionId === String(q.id)
-            );
-            if (!ans || ans.skipped) return;
-            totalWeight += q.scoringWeight;
-            const opts = Array.isArray(q.scoringOptions) ? q.scoringOptions : [];
-            const match = opts.find(
-                (o) => String(o.value ?? o.label ?? '') === String(ans.value ?? '').trim()
-            );
-            if (match && typeof match.points === 'number') earned += match.points;
-        });
-        if (totalWeight === 0) return null;
-        return { earned, totalWeight, pct: Math.round((earned / totalWeight) * 100) };
+        return scoreAnswers(def, answers);
     } catch (_) {
         return null;
     }
@@ -204,7 +319,9 @@ module.exports = {
     normalizeRole,
     answersToPrefillMap,
     mergeAnswers,
+    scoreAnswers,
     computeScore,
+    readPassThresholds,
     findLatestLiveResponse,
     writeSurveyResponse,
 };

@@ -755,6 +755,7 @@
             async request(endpoint, options = {}) {
                 const url = `${API_BASE_URL}${endpoint}`;
                 const config = {
+                    credentials: 'include',
                     headers: {
                         'Content-Type': 'application/json',
                         ...options.headers
@@ -1231,12 +1232,16 @@
                 });
             }
 
-            // Users (username/password auth for Artemis/CHAOS shared container)
+            // Users — Entra (SWA Easy Auth) primary; password kept for rare local/legacy use
             async authenticateUser(username, password) {
                 return this.request('/users/authenticate', {
                     method: 'POST',
                     body: JSON.stringify({ username, password })
                 });
+            }
+
+            async resolveSignedInUser() {
+                return this.request('/users/me', { method: 'GET' });
             }
 
             async getUsers() {
@@ -1308,7 +1313,7 @@
         const COMMS_LIST_CAP = 25;
 
         const SESSION_USER_KEY = 'artemis.session.user';
-        // Simple admin backdoor for recovery/testing only (client-side)
+        // Simple admin backdoor for recovery/testing only (client-side) — local/dev only
         const ADMIN_BACKDOOR_USERNAME = 'admin';
         const ADMIN_BACKDOOR_PASSWORD = 'Password1!';
 
@@ -1333,46 +1338,92 @@
             }
         };
 
+        const redirectToEntraLogin = () => {
+            window.location.href = '/.auth/login/aad';
+        };
+
+        const parseAuthMePrincipal = (payload) => {
+            const principal = Array.isArray(payload) ? payload[0] : payload?.clientPrincipal;
+            return principal || null;
+        };
+
+        const loadEntraSessionUser = async () => {
+            try {
+                const res = await fetch('/.auth/me', { credentials: 'include' });
+                if (!res.ok) return null;
+                const payload = await res.json();
+                const principal = parseAuthMePrincipal(payload);
+                if (!principal) return null;
+                // Prefer Cosmos user (permissionLevel) via SWA principal
+                try {
+                    const cosmosUser = await apiService.resolveSignedInUser();
+                    if (cosmosUser && cosmosUser.id) return cosmosUser;
+                } catch (err) {
+                    console.warn('users/me sync failed; using principal only', err);
+                }
+                const claims = {};
+                for (const c of principal.claims || []) {
+                    if (!c || c.typ == null) continue;
+                    claims[c.typ] = c.val;
+                    const short = String(c.typ).split('/').pop();
+                    if (short && claims[short] == null) claims[short] = c.val;
+                }
+                const email = principal.userDetails || claims.preferred_username || claims.email || '';
+                const name = claims.name || email || principal.userId || 'User';
+                return {
+                    id: principal.userId || email || 'entra-user',
+                    entraId: principal.userId || '',
+                    username: email || name,
+                    email,
+                    name,
+                    permissionLevel: 'CRC',
+                    authSource: 'entra_principal_only'
+                };
+            } catch {
+                return null;
+            }
+        };
+
         const showLoginModal = () => {
             const modalHTML = `
                 <div class="modal-backdrop">
                     <div class="modal-content confirm-modal-content dark:bg-gray-800">
-                        <form id="login-form">
-                            <div class="p-6">
-                                <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">Sign in to ARTEMIS</h2>
-                                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Use your CHAOS / SMO Scheduler username and password.</p>
-                                <div class="mt-4 space-y-3">
+                        <div class="p-6">
+                            <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">Sign in to ARTEMIS</h2>
+                            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Use your Ora Microsoft account (SMOScheduler / Entra).</p>
+                            <div class="mt-5">
+                                <a id="entra-login-btn" href="/.auth/login/aad"
+                                   class="inline-flex w-full justify-center rounded-md border border-transparent shadow-sm px-4 py-2.5 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 sm:text-sm no-underline">
+                                    Sign in with Microsoft
+                                </a>
+                            </div>
+                            <details class="mt-4 text-sm text-gray-500 dark:text-gray-400">
+                                <summary class="cursor-pointer select-none">Local / legacy password (dev only)</summary>
+                                <form id="login-form" class="mt-3 space-y-3">
                                     <div>
                                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300" for="login-username">Username</label>
-                                        <input id="login-username" name="username" type="text" required class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200 px-3 py-2" autocomplete="username" />
+                                        <input id="login-username" name="username" type="text" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200 px-3 py-2" autocomplete="username" />
                                     </div>
                                     <div>
                                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300" for="login-password">Password</label>
-                                        <input id="login-password" name="password" type="password" required class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200 px-3 py-2" autocomplete="current-password" />
+                                        <input id="login-password" name="password" type="password" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200 px-3 py-2" autocomplete="current-password" />
                                     </div>
                                     <div id="login-error" class="text-sm text-red-600 dark:text-red-300 hidden"></div>
-                                </div>
-                            </div>
-                            <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 flex flex-row-reverse gap-2">
-                                <button id="login-submit-btn" type="submit" class="inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 sm:w-auto sm:text-sm">Sign in</button>
-                            </div>
-                        </form>
+                                    <button id="login-submit-btn" type="submit" class="inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-600 text-base font-medium text-gray-800 dark:text-gray-100 hover:bg-gray-50 sm:text-sm">Sign in with password</button>
+                                </form>
+                            </details>
+                        </div>
                     </div>
                 </div>
             `;
             showModal(modalHTML);
-            setTimeout(() => {
-                const u = document.getElementById('login-username');
-                if (u) u.focus();
-            }, 50);
         };
 
         const logout = async () => {
             user = null;
             setSessionUser(null);
-            showNotification('Signed out', 'info');
-            // lock the UI and require re-login
-            await init();
+            // SWA Easy Auth logout (Data Lens pattern)
+            window.location.href = '/.auth/logout?post_logout_redirect_uri=/';
         };
 
         // --- Utility Functions ---
@@ -2296,28 +2347,70 @@
             return asSurveyList(response?.answers).filter(a => a && String(a.value ?? '').trim() !== '').length;
         };
 
+        const surveyDefinitionHasScoring = (def) => {
+            const qs = asSurveyList(def?.questions);
+            return qs.some((q) => {
+                if (!q) return false;
+                const opts = Array.isArray(q.scoringOptions) ? q.scoringOptions : [];
+                const weighted = typeof q.scoringWeight === 'number' && q.scoringWeight > 0 && opts.length > 0;
+                const knockout = q.knockout === true
+                    || (Array.isArray(q.knockoutFailValues) && q.knockoutFailValues.length > 0)
+                    || opts.some((o) => o && (o.knockout === true || o.fail === true));
+                return weighted || knockout;
+            });
+        };
+
+        const resolveScoreOutcome = (score, def = null) => {
+            if (score?.outcome && ['pass', 'borderline', 'fail', 'unscored'].includes(String(score.outcome))) {
+                return String(score.outcome);
+            }
+            if (Array.isArray(score?.knockouts) && score.knockouts.length) return 'fail';
+            if (!score || typeof score.pct !== 'number') return 'unscored';
+            const pass = Number(score.passThreshold ?? def?.passThreshold ?? def?.scoring?.passThreshold ?? 70);
+            const border = Number(score.borderlineThreshold ?? def?.borderlineThreshold ?? def?.scoring?.borderlineThreshold ?? 50);
+            if (score.pct >= pass) return 'pass';
+            if (score.pct >= border) return 'borderline';
+            return 'fail';
+        };
+
+        const surveyOutcomeBadgeHtml = (response, def = null) => {
+            const outcome = resolveScoreOutcome(response?.score, def);
+            if (outcome === 'unscored' && !(response?.score && typeof response.score.pct === 'number')) {
+                return `<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300" title="Survey template has no scoring rules, or this response was not scored">Unscored</span>`;
+            }
+            const map = {
+                pass: { label: 'Pass', cls: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200' },
+                borderline: { label: 'Borderline', cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200' },
+                fail: { label: 'Fail', cls: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200' },
+                unscored: { label: 'Unscored', cls: 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300' },
+            };
+            const m = map[outcome] || map.unscored;
+            const ko = Array.isArray(response?.score?.knockouts) && response.score.knockouts.length
+                ? ` · ${response.score.knockouts.length} knockout${response.score.knockouts.length === 1 ? '' : 's'}`
+                : '';
+            const pct = typeof response?.score?.pct === 'number' ? ` ${response.score.pct}%` : '';
+            return `<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${m.cls}" title="${escapeHtml(m.label)}${escapeHtml(pct)}${escapeHtml(ko)}">${m.label}${pct ? ` · ${response.score.pct}%` : ''}</span>`;
+        };
+
         const surveyScoreBadgeHtml = (response) => {
             const score = response?.score;
-            if (!score || typeof score.pct !== 'number') return '';
-            const pct = score.pct;
-            const color = pct >= 80
-                ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200'
-                : pct >= 50
-                    ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200'
-                    : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200';
-            return `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${color}" title="Score: ${score.earned} / ${score.totalWeight} pts">Score ${pct}%</span>`;
+            if (!score || typeof score.pct !== 'number') {
+                return surveyOutcomeBadgeHtml(response);
+            }
+            return surveyOutcomeBadgeHtml(response);
         };
 
         const surveyScoreRingHtml = (response) => {
             const score = response?.score;
             if (!score || typeof score.pct !== 'number') return '';
+            const outcome = resolveScoreOutcome(score);
             const pct = score.pct;
-            const stroke = pct >= 80 ? '#10b981' : pct >= 50 ? '#f59e0b' : '#ef4444';
+            const stroke = outcome === 'pass' ? '#10b981' : outcome === 'borderline' ? '#f59e0b' : outcome === 'fail' ? '#ef4444' : '#94a3b8';
             const r = 18;
             const c = 2 * Math.PI * r;
             const offset = c - (pct / 100) * c;
             return `
-                <div class="relative w-11 h-11 shrink-0" title="Score ${pct}% (${score.earned}/${score.totalWeight} pts)">
+                <div class="relative w-11 h-11 shrink-0" title="${escapeHtml(outcome)} ${pct}% (${score.earned}/${score.totalWeight} pts)">
                     <svg class="w-11 h-11 -rotate-90" viewBox="0 0 44 44">
                         <circle cx="22" cy="22" r="${r}" fill="none" stroke="#e2e8f0" stroke-width="4"/>
                         <circle cx="22" cy="22" r="${r}" fill="none" stroke="${stroke}" stroke-width="4"
@@ -2743,13 +2836,31 @@
                 });
 
             const siteRows = Array.from(bySite.entries()).map(([siteId, response]) => {
+                const outcome = resolveScoreOutcome(response?.score, def);
+                const pct = typeof response?.score?.pct === 'number' ? response.score.pct : null;
+                const knockouts = Array.isArray(response?.score?.knockouts) ? response.score.knockouts : [];
                 return {
                     siteId,
                     siteName: resolveSponsorSiteDisplayName(siteId, response),
                     response,
-                    when: response.submittedAt || response.createdAt || ''
+                    when: response.submittedAt || response.createdAt || '',
+                    outcome,
+                    pct,
+                    knockouts,
                 };
-            }).sort((a, b) => String(a.siteName).localeCompare(String(b.siteName)));
+            });
+
+            const outcomeRank = { pass: 0, borderline: 1, fail: 2, unscored: 3 };
+            siteRows.sort((a, b) => {
+                const oa = outcomeRank[a.outcome] ?? 9;
+                const ob = outcomeRank[b.outcome] ?? 9;
+                if (oa !== ob) return oa - ob;
+                const pa = a.pct == null ? -1 : a.pct;
+                const pb = b.pct == null ? -1 : b.pct;
+                if (pb !== pa) return pb - pa;
+                return String(a.siteName).localeCompare(String(b.siteName));
+            });
+            siteRows.forEach((row, idx) => { row.rank = idx + 1; });
 
             const questionStats = questions.map(q => {
                 const counts = new Map();
@@ -2779,7 +2890,143 @@
                 return { question: q, answered, skipped, distribution, samples, isLongText };
             });
 
-            return { def, questions, siteRows, questionStats };
+            return { def, questions, siteRows, questionStats, hasScoring: surveyDefinitionHasScoring(def) };
+        };
+
+        const renderFeasibilityRankBoardHtml = (report) => {
+            if (!report?.siteRows?.length) return '';
+            const passN = report.siteRows.filter(r => r.outcome === 'pass').length;
+            const borderN = report.siteRows.filter(r => r.outcome === 'borderline').length;
+            const failN = report.siteRows.filter(r => r.outcome === 'fail').length;
+            const unscoredN = report.siteRows.filter(r => r.outcome === 'unscored').length;
+            const passTh = report.def?.passThreshold ?? report.def?.scoring?.passThreshold ?? 70;
+            const borderTh = report.def?.borderlineThreshold ?? report.def?.scoring?.borderlineThreshold ?? 50;
+            const scoringNote = report.hasScoring
+                ? `Pass ≥ ${passTh}% · Borderline ≥ ${borderTh}% · Fail below or knockout`
+                : 'This survey template has no scoring rules yet — outcomes show as Unscored until you configure weights/knockouts and sites resubmit.';
+
+            const rows = report.siteRows.map((row) => {
+                const when = row.when ? new Date(row.when).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—';
+                const koText = row.knockouts?.length
+                    ? row.knockouts.map(k => `${k.label}: ${k.answer}`).join('; ')
+                    : '—';
+                return `
+                    <tr class="hover:bg-gray-50 dark:hover:bg-gray-700/40">
+                        <td class="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">${row.rank}</td>
+                        <td class="px-3 py-2 text-sm font-medium text-gray-900 dark:text-gray-100">
+                            <button type="button" class="view-site-details-btn hover:underline" data-site-id="${escapeHtml(row.siteId)}">${escapeHtml(row.siteName)}</button>
+                        </td>
+                        <td class="px-3 py-2 text-xs">${surveyOutcomeBadgeHtml(row.response, report.def)}</td>
+                        <td class="px-3 py-2 text-sm text-gray-700 dark:text-gray-300">${row.pct == null ? '—' : `${row.pct}%`}</td>
+                        <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300">
+                            <button type="button" class="view-site-survey-response-btn text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(row.response.id)}">${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole))}</button>
+                        </td>
+                        <td class="px-3 py-2 text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">${escapeHtml(when)}</td>
+                        <td class="px-3 py-2 text-xs text-red-700 dark:text-red-300 max-w-[16rem]" title="${escapeHtml(koText)}">${escapeHtml(koText)}</td>
+                    </tr>`;
+            }).join('');
+
+            return `
+                <div class="mb-6 rounded-xl border border-[#1B2A4A]/20 dark:border-[#1B2A4A]/50 overflow-hidden">
+                    <div class="bg-[#1B2A4A] text-white px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                            <div class="font-semibold">Site Ops ranking</div>
+                            <div class="text-xs text-white/75 mt-0.5">${escapeHtml(scoringNote)}</div>
+                        </div>
+                        <button type="button" id="feasibility-ops-html-btn" class="px-3 py-1.5 rounded-md bg-white/15 hover:bg-white/25 text-sm font-medium">Export Site Ops HTML</button>
+                    </div>
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-0 divide-x divide-gray-200 dark:divide-gray-700 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40">
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">Pass</div><div class="text-lg font-bold text-emerald-700 dark:text-emerald-300">${passN}</div></div>
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">Borderline</div><div class="text-lg font-bold text-amber-700 dark:text-amber-300">${borderN}</div></div>
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">Fail</div><div class="text-lg font-bold text-red-700 dark:text-red-300">${failN}</div></div>
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">Unscored</div><div class="text-lg font-bold text-gray-600 dark:text-gray-300">${unscoredN}</div></div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                            <thead class="bg-gray-50 dark:bg-gray-700">
+                                <tr>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">#</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Site</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Outcome</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Score</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Submitted</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Knockouts</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">${rows}</tbody>
+                        </table>
+                    </div>
+                </div>`;
+        };
+
+        const exportSiteOpsRankHtml = ({ surveyId, targetRole = 'all' } = {}) => {
+            const report = buildFeasibilityQuestionReport(surveyId || feasibilityReportSurveyId, targetRole || feasibilityReportRole || 'all');
+            if (!report?.def || !report.siteRows.length) {
+                showNotification('No ranked responses to export.', 'info');
+                return;
+            }
+            const title = formatSponsorSurveyTitle(report.def, report.def.id);
+            const passTh = report.def?.passThreshold ?? report.def?.scoring?.passThreshold ?? 70;
+            const borderTh = report.def?.borderlineThreshold ?? report.def?.scoring?.borderlineThreshold ?? 50;
+            const generated = new Date().toLocaleString();
+            const rows = report.siteRows.map((row) => {
+                const outcome = row.outcome || 'unscored';
+                const color = outcome === 'pass' ? '#0F6E56' : outcome === 'borderline' ? '#B45309' : outcome === 'fail' ? '#B91C1C' : '#64748B';
+                const ko = row.knockouts?.length
+                    ? row.knockouts.map(k => `<li><strong>${escapeHtml(k.label)}</strong>: ${escapeHtml(k.answer)} <em>(${escapeHtml(k.reason || 'knockout')})</em></li>`).join('')
+                    : '<li>—</li>';
+                return `
+                    <tr>
+                        <td>${row.rank}</td>
+                        <td>${escapeHtml(row.siteName)}</td>
+                        <td><span style="color:${color};font-weight:700;text-transform:uppercase">${escapeHtml(outcome)}</span></td>
+                        <td>${row.pct == null ? '—' : `${row.pct}%`}</td>
+                        <td>${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole))}</td>
+                        <td>${escapeHtml(row.when ? new Date(row.when).toLocaleString() : '—')}</td>
+                        <td><ul style="margin:0;padding-left:1.1rem">${ko}</ul></td>
+                    </tr>`;
+            }).join('');
+
+            const html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>Site Ops Ranking — ${escapeHtml(title)}</title>
+<style>
+  body{font-family:Georgia,'Times New Roman',serif;color:#0f172a;margin:32px;line-height:1.45}
+  h1{font-size:1.6rem;margin:0 0 .25rem;color:#1B2A4A}
+  .meta{color:#64748b;font-size:.9rem;margin-bottom:1.25rem}
+  .banner{background:#1B2A4A;color:#fff;padding:14px 16px;border-radius:8px;margin-bottom:1rem}
+  table{width:100%;border-collapse:collapse;font-size:.9rem}
+  th,td{border:1px solid #e2e8f0;padding:8px 10px;vertical-align:top;text-align:left}
+  th{background:#f8fafc;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em;color:#64748b}
+  .note{margin-top:1.25rem;font-size:.85rem;color:#64748b}
+  @media print{body{margin:12px}}
+</style></head><body>
+  <div class="banner">
+    <div style="font-size:.75rem;letter-spacing:.12em;text-transform:uppercase;opacity:.8">Ora Clinical · Site Ops</div>
+    <div style="font-size:1.25rem;font-weight:700;margin-top:4px">Feasibility ranking — who passed / failed</div>
+  </div>
+  <h1>${escapeHtml(title)}</h1>
+  <div class="meta">Generated ${escapeHtml(generated)} · Audience filter: ${escapeHtml(targetRole === 'all' ? 'All respondents' : formatSiteSurveyRoleLabel(targetRole))} · Pass ≥ ${passTh}% · Borderline ≥ ${borderTh}%</div>
+  ${report.hasScoring ? '' : '<p class="meta"><strong>Warning:</strong> This survey template has no scoring rules. Outcomes are Unscored until weights/knockouts are configured and sites resubmit.</p>'}
+  <table>
+    <thead><tr><th>#</th><th>Site</th><th>Outcome</th><th>Score</th><th>Role</th><th>Submitted</th><th>Knockouts</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <p class="note">Confidential — for Ora Site Ops. Prior submissions are archived on resubmit; ranking uses the latest live response per site.</p>
+</body></html>`;
+
+            const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const safe = String(title).replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
+            a.href = url;
+            a.download = `ORA_SiteOps_Ranking_${safe}_${new Date().toISOString().slice(0, 10)}.html`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1500);
+            showNotification('Site Ops ranking HTML downloaded.', 'success');
         };
 
         const renderFeasibilityReportBodyHtml = (report) => {
@@ -2833,6 +3080,7 @@
 
             const matrixHead = `
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase sticky left-0 bg-gray-50 dark:bg-gray-700 z-10">Site</th>
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Outcome</th>
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
                 ${report.questions.map(q => `
                     <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap" title="${escapeHtml(q.label || q.id || '')}">${escapeHtml(truncateLabel(q.label || q.id || ''))}</th>`).join('')}`;
@@ -2850,6 +3098,7 @@
                             <button type="button" class="view-site-details-btn hover:underline" data-site-id="${escapeHtml(row.siteId)}">${escapeHtml(row.siteName)}</button>
                             <div class="text-[10px] text-gray-400 font-normal">${escapeHtml(when)}</div>
                         </td>
+                        <td class="px-3 py-2 text-xs whitespace-nowrap">${surveyOutcomeBadgeHtml(row.response, report.def)}</td>
                         <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">
                             <button type="button" class="view-site-survey-response-btn text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(row.response.id)}">${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole))}</button>
                         </td>
@@ -2858,6 +3107,7 @@
             }).join('');
 
             return `
+                ${renderFeasibilityRankBoardHtml(report)}
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
                     <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 text-center">
                         <div class="text-xs text-gray-500 dark:text-gray-400">Questions</div>
@@ -2870,12 +3120,13 @@
                     <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 text-center">
                         <div class="text-xs text-gray-500 dark:text-gray-400">Survey</div>
                         <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate" title="${escapeHtml(report.def.title || report.def.id)}">${escapeHtml(report.def.title || report.def.id)}</div>
+                        <div class="text-[10px] mt-1">${report.hasScoring ? '<span class="text-emerald-700 dark:text-emerald-300">Scoring configured</span>' : '<span class="text-amber-700 dark:text-amber-300">No scoring rules</span>'}</div>
                     </div>
                 </div>
                 <h4 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Answer distributions</h4>
                 <div class="space-y-3 mb-6">${distHtml}</div>
                 <h4 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Site × question matrix</h4>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">Latest response per site. Use Export CSV for full cell values.</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">Latest response per site (ranked by outcome). Use Export CSV for full cell values.</p>
                 <div class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
                     <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                         <thead class="bg-gray-50 dark:bg-gray-700"><tr>${matrixHead}</tr></thead>
@@ -3744,6 +3995,7 @@
             siteSurveySectionsHtml: (...args) => siteSurveySectionsHtml(...args),
             surveyAnswersListHtml: (...args) => surveyAnswersListHtml(...args),
             surveyScoreBadgeHtml: (...args) => surveyScoreBadgeHtml(...args),
+            surveyOutcomeBadgeHtml: (...args) => surveyOutcomeBadgeHtml(...args),
             createSiteSurveyResponseModal: (...args) => createSiteSurveyResponseModal(...args),
             latestSurveyResponsesBySurvey: (...args) => latestSurveyResponsesBySurvey(...args),
             surveyAnswerCount: (...args) => surveyAnswerCount(...args),
@@ -4521,13 +4773,17 @@
                     logic: q.logic && typeof q.logic === 'object' ? q.logic : null,
                     scoringWeight: typeof q.scoringWeight === 'number' ? q.scoringWeight : 0,
                     scoringOptions: Array.isArray(q.scoringOptions) ? q.scoringOptions : [],
+                    category: q.category || 'General',
+                    knockout: q.knockout === true,
+                    knockoutOnBlank: q.knockoutOnBlank === true,
+                    knockoutFailValues: Array.isArray(q.knockoutFailValues) ? q.knockoutFailValues : [],
                 }));
             };
 
             const fromDef = cloneQuestionsFromDef();
             window.__siteSurveyBuilderQuestions = fromDef && fromDef.length
                 ? fromDef
-                : [{ id: `q_${Date.now().toString(36)}`, label: 'Comments', type: 'textarea', required: true, options: [], logic: null, scoringWeight: 0, scoringOptions: [] }];
+                : [{ id: `q_${Date.now().toString(36)}`, label: 'Comments', type: 'textarea', required: true, options: [], logic: null, scoringWeight: 0, scoringOptions: [], category: 'General', knockout: false, knockoutOnBlank: false, knockoutFailValues: [] }];
             window.__siteSurveyBuilderMeta = {
                 isClone,
                 clonedFromId: isClone ? existingDefinition?.id : null,
@@ -4538,6 +4794,8 @@
             const audNorm = aud.map(a => String(a).trim().toLowerCase());
             const piChecked = isEdit || isClone ? audNorm.includes('pi') : true;
             const coordChecked = isEdit || isClone ? audNorm.includes('coordinator') : true;
+            const passThresholdVal = Number(existingDefinition?.passThreshold ?? existingDefinition?.scoring?.passThreshold ?? 70);
+            const borderlineThresholdVal = Number(existingDefinition?.borderlineThreshold ?? existingDefinition?.scoring?.borderlineThreshold ?? 50);
 
             const baseTitle = existingDefinition?.title || '';
             const titleVal = isEdit
@@ -4549,10 +4807,10 @@
                 : (isClone ? 'draft' : 'draft');
             const heading = isEdit ? 'Edit Site Survey' : (isClone ? 'Clone Survey' : 'New Site Survey');
             const sub = isEdit
-                ? 'Update the template; existing assignment links keep the same survey id.'
+                ? 'Update the template; existing assignment links keep the same survey id. Changing scoring affects new submissions and resubmits.'
                 : (isClone
                     ? 'Creates a new custom survey from a predefined template. The original library survey is unchanged.'
-                    : 'Creates a survey template for PI/Coordinator.');
+                    : 'Creates a survey template for PI/Coordinator. Configure scoring to enable Pass / Fail ranking.');
 
             const modalHTML = `
                 <div class="modal-backdrop">
@@ -4585,13 +4843,27 @@
                                             </label>
                                         </div>
                                     </div>
+                                    <div class="md:col-span-2 rounded-lg border border-[#1B2A4A]/20 dark:border-[#1B2A4A]/50 bg-[#1B2A4A]/5 dark:bg-[#1B2A4A]/20 p-4">
+                                        <div class="text-sm font-semibold text-[#1B2A4A] dark:text-indigo-200 mb-1">Feasibility scoring (Site Ops)</div>
+                                        <p class="text-xs text-gray-600 dark:text-gray-400 mb-3">Pass / Borderline / Fail is computed on each submit. Knockouts fail the site regardless of percentage.</p>
+                                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                            <div>
+                                                <label class="block text-xs font-medium text-gray-700 dark:text-gray-300">Pass threshold (%)</label>
+                                                <input name="passThreshold" type="number" min="0" max="100" step="1" value="${escapeHtml(String(Number.isFinite(passThresholdVal) ? passThresholdVal : 70))}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-gray-700 dark:text-gray-300">Borderline threshold (%)</label>
+                                                <input name="borderlineThreshold" type="number" min="0" max="100" step="1" value="${escapeHtml(String(Number.isFinite(borderlineThresholdVal) ? borderlineThresholdVal : 50))}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
+                                            </div>
+                                        </div>
+                                    </div>
                                     <div class="md:col-span-2">
                                         <div class="flex items-center justify-between gap-2">
                                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Questions</label>
                                             <button type="button" id="add-site-survey-question-btn" class="px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 text-sm">Add question</button>
                                         </div>
                                         <div id="site-survey-questions-builder" class="mt-2 space-y-3"></div>
-                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">You can add a large number of questions. Each question has a stable ID for reporting.</p>
+                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">Use select questions for scored options. Mark knockout answers that should auto-fail the site.</p>
                                     </div>
                                     <div class="md:col-span-2">
                                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Status</label>
@@ -4679,24 +4951,46 @@
                                 </div>
 
                                 <div class="md:col-span-2">
-                                    <details class="rounded-md border border-amber-200 dark:border-amber-800/60 p-3 bg-amber-50/40 dark:bg-amber-900/10" ${(q.scoringWeight||0) > 0 ? 'open' : ''}>
-                                        <summary class="cursor-pointer text-sm font-medium text-amber-800 dark:text-amber-200">Scoring (optional)</summary>
+                                    <details class="rounded-md border border-amber-200 dark:border-amber-800/60 p-3 bg-amber-50/40 dark:bg-amber-900/10" ${(q.scoringWeight||0) > 0 || q.knockout ? 'open' : ''}>
+                                        <summary class="cursor-pointer text-sm font-medium text-amber-800 dark:text-amber-200">Scoring &amp; knockouts</summary>
                                         <div class="mt-3 space-y-3">
-                                            <div>
-                                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Max points for this question</label>
-                                                <input name="q_scoring_weight_${idx}" type="number" min="0" max="100" step="1"
-                                                    value="${escapeHtml(String(q.scoringWeight || 0))}"
-                                                    class="mt-1 block w-32 rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
-                                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Set to 0 to exclude from scoring. Questions are only scored if this is &gt; 0 and scoring options are defined below.</p>
+                                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                                <div>
+                                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Category</label>
+                                                    <input name="q_category_${idx}" value="${escapeHtml(q.category || 'General')}" list="survey-score-categories" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" placeholder="Patient access" />
+                                                </div>
+                                                <div>
+                                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Max points (weight)</label>
+                                                    <input name="q_scoring_weight_${idx}" type="number" min="0" max="100" step="1"
+                                                        value="${escapeHtml(String(q.scoringWeight || 0))}"
+                                                        class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
+                                                </div>
                                             </div>
                                             <div>
-                                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Scoring options — one per line: <code class="bg-gray-100 dark:bg-gray-700 px-1 rounded">option value | points</code></label>
+                                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Scoring options — one per line: <code class="bg-gray-100 dark:bg-gray-700 px-1 rounded">option value | points</code> or <code class="bg-gray-100 dark:bg-gray-700 px-1 rounded">value | points | knockout</code></label>
                                                 <textarea name="q_scoring_options_${idx}" rows="4"
                                                     class="mt-1 block w-full font-mono text-xs rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2"
-                                                    placeholder="Yes | 10&#10;No | 0&#10;Maybe | 5"
-                                                    >${escapeHtml((q.scoringOptions||[]).map(o => `${o.value} | ${o.points}`).join('\n'))}</textarea>
-                                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">For select questions the value must match the dropdown option exactly. For text/textarea, the value must match the answer exactly.</p>
+                                                    placeholder="Yes | 10&#10;No | 0 | knockout&#10;Maybe | 5"
+                                                    >${escapeHtml((q.scoringOptions||[]).map(o => {
+                                                        const base = `${o.value} | ${o.points}`;
+                                                        return (o.knockout || o.fail) ? `${base} | knockout` : base;
+                                                    }).join('\n'))}</textarea>
                                             </div>
+                                            <div class="flex flex-wrap gap-4">
+                                                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                                                    <input type="checkbox" name="q_knockout_${idx}" ${q.knockout ? 'checked' : ''} class="h-4 w-4" />
+                                                    Treat listed fail values as knockouts
+                                                </label>
+                                                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                                                    <input type="checkbox" name="q_knockout_blank_${idx}" ${q.knockoutOnBlank ? 'checked' : ''} class="h-4 w-4" />
+                                                    Blank answer fails knockout
+                                                </label>
+                                            </div>
+                                            <div>
+                                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Knockout fail values (one per line; optional if using <code class="text-xs">| knockout</code> above)</label>
+                                                <textarea name="q_knockout_fails_${idx}" rows="2" class="mt-1 block w-full font-mono text-xs rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2">${escapeHtml((q.knockoutFailValues||[]).join('\n'))}</textarea>
+                                            </div>
+                                            <p class="text-xs text-gray-500 dark:text-gray-400">Set weight to 0 to exclude from percentage. Knockouts still fail the site even when weight is 0.</p>
                                         </div>
                                     </details>
                                 </div>
@@ -4704,13 +4998,20 @@
                         </div>
                     `;
                 }).join('');
+                if (!document.getElementById('survey-score-categories')) {
+                    const dl = document.createElement('datalist');
+                    dl.id = 'survey-score-categories';
+                    dl.innerHTML = ['General','Patient access','Staffing','Infrastructure','Experience','Logistics','Regulatory']
+                        .map(c => `<option value="${c}"></option>`).join('');
+                    document.body.appendChild(dl);
+                }
             };
 
             const builderRoot = document.getElementById('site-survey-questions-builder');
             const addBtn = document.getElementById('add-site-survey-question-btn');
             if (addBtn) {
                 addBtn.addEventListener('click', () => {
-                    const q = { id: `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,6)}`, label: '', type: 'text', required: false, options: [], logic: null };
+                    const q = { id: `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,6)}`, label: '', type: 'text', required: false, options: [], logic: null, scoringWeight: 0, scoringOptions: [], category: 'General', knockout: false, knockoutOnBlank: false, knockoutFailValues: [] };
                     window.__siteSurveyBuilderQuestions = [...(window.__siteSurveyBuilderQuestions || []), q];
                     renderBuilder();
                 });
@@ -5321,6 +5622,8 @@
                                     <button type="button" id="feasibility-sponsor-pdf-btn" class="px-3 py-2 rounded-md text-white text-sm hover:opacity-90" style="background-color:#0F6E56">Sponsor PDF</button>
 
                                     <button type="button" id="feasibility-sponsor-excel-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">Sponsor Excel</button>
+
+                                    <button type="button" id="feasibility-ops-html-btn-toolbar" class="px-3 py-2 rounded-md border border-[#1B2A4A] text-sm text-[#1B2A4A] dark:text-indigo-200 hover:bg-gray-50 dark:hover:bg-gray-700">Site Ops HTML</button>
 
                                     <button type="button" id="feasibility-export-wide-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">CSV</button>
 
@@ -9860,7 +10163,7 @@
                 if (!button) return;
 
                 if (button.id === 'login-btn') {
-                    showLoginModal();
+                    redirectToEntraLogin();
                 } else if (button.id === 'logout-btn') {
                     logout();
                 } else if (button.id === 'add-study-btn') {
@@ -10008,15 +10311,24 @@
                         const rawScoringWeight = parseInt(questionsRoot.querySelector(`[name="q_scoring_weight_${idx}"]`)?.value || '0', 10);
                         const scoringWeight = Number.isNaN(rawScoringWeight) ? 0 : Math.max(0, rawScoringWeight);
                         const rawScoringOptionsText = (questionsRoot.querySelector(`[name="q_scoring_options_${idx}"]`)?.value || '').trim();
-                        const scoringOptions = scoringWeight > 0
-                            ? rawScoringOptionsText.split('\n').map(s => s.trim()).filter(Boolean).map(line => {
-                                const pipeIdx = line.lastIndexOf('|');
-                                if (pipeIdx === -1) return { value: line.trim(), points: 0 };
-                                const val = line.slice(0, pipeIdx).trim();
-                                const pts = parseFloat(line.slice(pipeIdx + 1).trim());
-                                return { value: val, points: Number.isNaN(pts) ? 0 : pts };
-                            })
-                            : [];
+                        const scoringOptions = rawScoringOptionsText.split('\n').map(s => s.trim()).filter(Boolean).map(line => {
+                            const parts = line.split('|').map(p => p.trim());
+                            const val = parts[0] || '';
+                            const pts = parseFloat(parts[1] || '0');
+                            const flag = String(parts[2] || '').toLowerCase();
+                            const knockoutFlag = flag === 'knockout' || flag === 'fail';
+                            return {
+                                value: val,
+                                points: Number.isNaN(pts) ? 0 : pts,
+                                ...(knockoutFlag ? { knockout: true } : {}),
+                            };
+                        });
+                        const category = (questionsRoot.querySelector(`[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
+                        const knockout = !!questionsRoot.querySelector(`[name="q_knockout_${idx}"]`)?.checked
+                            || scoringOptions.some(o => o.knockout);
+                        const knockoutOnBlank = !!questionsRoot.querySelector(`[name="q_knockout_blank_${idx}"]`)?.checked;
+                        const knockoutFailValues = (questionsRoot.querySelector(`[name="q_knockout_fails_${idx}"]`)?.value || '')
+                            .split('\n').map(s => s.trim()).filter(Boolean);
 
                         if (!label) throw new Error(`Question ${idx + 1} label is required`);
 
@@ -10028,12 +10340,19 @@
                             options,
                             logic,
                             scoringWeight,
-                            scoringOptions,
+                            scoringOptions: scoringWeight > 0 || knockout ? scoringOptions : [],
+                            category,
+                            knockout,
+                            knockoutOnBlank,
+                            knockoutFailValues,
                         };
                     });
 
                     // Default values are optional; for now keep empty object (future UI can populate)
                     const defaultValues = {};
+                    const passThreshold = Math.max(0, Math.min(100, parseInt(form.passThreshold?.value || '70', 10) || 70));
+                    const borderlineThreshold = Math.max(0, Math.min(passThreshold, parseInt(form.borderlineThreshold?.value || '50', 10) || 50));
+                    const scoring = { passThreshold, borderlineThreshold };
 
                     if (editId) {
                         const prev = (allSiteSurveyDefinitions || []).find(d => d.id === editId) || {};
@@ -10045,6 +10364,9 @@
                             audience: normalizeSurveyAudience(audience),
                             status,
                             questions,
+                            passThreshold,
+                            borderlineThreshold,
+                            scoring,
                             defaultValues: prev.defaultValues && typeof prev.defaultValues === 'object' ? prev.defaultValues : defaultValues,
                             isPredefined: prev.isPredefined === true,
                             library: prev.library || undefined,
@@ -10068,6 +10390,9 @@
                             audience: normalizeSurveyAudience(audience),
                             status,
                             questions,
+                            passThreshold,
+                            borderlineThreshold,
+                            scoring,
                             defaultValues,
                             isPredefined: false,
                             clonedFromId: cloneFrom || undefined,
@@ -10465,6 +10790,18 @@
                     targetRole: roleSel?.value || feasibilityReportRole || 'all'
                 });
             }
+            if (e.target.id === 'feasibility-ops-html-btn' || e.target.id === 'feasibility-ops-html-btn-toolbar') {
+                const surveySel = document.getElementById('feasibility-survey-select');
+                const roleSel = document.getElementById('feasibility-role-select');
+                const surveyId = surveySel?.value
+                    || feasibilityReportSurveyId
+                    || (allSiteSurveyDefinitions || []).find(d => d.id === 'survey-general-feasibility')?.id
+                    || (allSiteSurveyDefinitions || [])[0]?.id;
+                exportSiteOpsRankHtml({
+                    surveyId,
+                    targetRole: roleSel?.value || feasibilityReportRole || 'all'
+                });
+            }
             if (e.target.id === 'generate-dashboard-btn') {
                 renderDashboardCharts();
             }
@@ -10648,8 +10985,13 @@
                     themeToggleBtn.addEventListener('click', toggleTheme);
                 }
 
-                // Restore session user (username/password auth)
-                user = getSessionUser();
+                // Prefer live Entra / SWA session; fall back to sessionStorage (local/legacy)
+                user = await loadEntraSessionUser();
+                if (user) {
+                    setSessionUser(user);
+                } else {
+                    user = getSessionUser();
+                }
 
                 // Check API health
                 const apiHealthy = await checkApiHealth();
@@ -10666,17 +11008,20 @@
                             <div class="flex items-center justify-center h-[60vh]">
                                 <div class="text-center max-w-md">
                                     <h2 class="text-2xl font-bold text-gray-900 dark:text-gray-100">Sign in required</h2>
-                                    <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">Please sign in to access ARTEMIS.</p>
-                                    <button id="login-cta-btn" class="mt-4 inline-flex items-center px-4 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
-                                        Login
+                                    <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">Sign in with your Ora Microsoft account to access ARTEMIS.</p>
+                                    <a id="login-cta-btn" href="/.auth/login/aad"
+                                       class="mt-4 inline-flex items-center px-4 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 no-underline">
+                                        Sign in with Microsoft
+                                    </a>
+                                    <button id="login-legacy-btn" type="button" class="mt-3 block mx-auto text-xs text-gray-500 underline">
+                                        Local / legacy password
                                     </button>
                                 </div>
                             </div>
                         `;
-                        const cta = document.getElementById('login-cta-btn');
-                        if (cta) cta.addEventListener('click', () => showLoginModal());
+                        const legacy = document.getElementById('login-legacy-btn');
+                        if (legacy) legacy.addEventListener('click', () => showLoginModal());
                     }
-                    showLoginModal();
                     return;
                 }
 

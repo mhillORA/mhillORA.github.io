@@ -640,8 +640,27 @@ const validateSurveyDefinitionsSchema = (data) => {
     if (!data.questions || !Array.isArray(data.questions) || data.questions.length === 0) errors.push('questions is required and must be a non-empty array');
     if (data.status && !['draft', 'active', 'archived'].includes(String(data.status).toLowerCase())) errors.push('status must be one of: draft, active, archived');
     if (data.defaultValues && typeof data.defaultValues !== 'object') errors.push('defaultValues must be an object');
+    if (data.passThreshold != null) {
+        const n = Number(data.passThreshold);
+        if (!Number.isFinite(n) || n < 0 || n > 100) errors.push('passThreshold must be a number 0–100');
+        else data.passThreshold = n;
+    }
+    if (data.borderlineThreshold != null) {
+        const n = Number(data.borderlineThreshold);
+        if (!Number.isFinite(n) || n < 0 || n > 100) errors.push('borderlineThreshold must be a number 0–100');
+        else data.borderlineThreshold = n;
+    }
+    if (data.scoring && typeof data.scoring === 'object') {
+        if (data.passThreshold == null && data.scoring.passThreshold != null) {
+            const n = Number(data.scoring.passThreshold);
+            if (Number.isFinite(n)) data.passThreshold = n;
+        }
+        if (data.borderlineThreshold == null && data.scoring.borderlineThreshold != null) {
+            const n = Number(data.scoring.borderlineThreshold);
+            if (Number.isFinite(n)) data.borderlineThreshold = n;
+        }
+    }
     if (errors.length > 0) throw new Error(`VALIDATION_ERROR: SurveyDefinitions validation failed: ${errors.join(', ')}`);
-    // Soft normalize audience casing for Comms / ingest consistency
     data.audience = normalizeSurveyAudience(data.audience);
     if (data.isPredefined != null) data.isPredefined = Boolean(data.isPredefined);
     return true;
@@ -1683,9 +1702,217 @@ app.http('time-off-requests', {
     },
 });
 
+const headerGet = (request, name) => {
+    try {
+        if (request.headers && typeof request.headers.get === 'function') {
+            return request.headers.get(name) || request.headers.get(name.toLowerCase()) || '';
+        }
+    } catch (_) { /* ignore */ }
+    return '';
+};
+
+const claimMapFromPrincipal = (raw) => {
+    const map = {};
+    const claims = Array.isArray(raw?.claims) ? raw.claims : [];
+    for (const c of claims) {
+        if (!c || c.typ == null) continue;
+        map[c.typ] = c.val;
+        const short = String(c.typ).split('/').pop();
+        if (short && map[short] == null) map[short] = c.val;
+    }
+    return map;
+};
+
+/** Prefer SWA Easy Auth header; never trust a client-supplied JWT as the gate. */
+const signedInUserFromRequest = (request) => {
+    const encoded = headerGet(request, 'x-ms-client-principal');
+    if (encoded) {
+        try {
+            const raw = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+            const claims = claimMapFromPrincipal(raw);
+            const email =
+                raw.userDetails ||
+                claims.preferred_username ||
+                claims.email ||
+                claims.emails ||
+                headerGet(request, 'x-ms-client-principal-name') ||
+                null;
+            const displayName =
+                claims.name ||
+                claims['http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name'] ||
+                null;
+            const entraId =
+                raw.userId ||
+                claims.oid ||
+                claims.sub ||
+                headerGet(request, 'x-ms-client-principal-id') ||
+                null;
+            return {
+                entraId: entraId ? String(entraId) : null,
+                email: email ? String(email) : null,
+                name: (displayName || email || 'User').toString(),
+                identityProvider: raw.identityProvider || headerGet(request, 'x-ms-client-principal-idp') || 'aad',
+                source: 'swa_principal'
+            };
+        } catch (_) {
+            /* fall through */
+        }
+    }
+
+    const headerName = headerGet(request, 'x-ms-client-principal-name');
+    if (headerName) {
+        return {
+            entraId: headerGet(request, 'x-ms-client-principal-id') || null,
+            email: headerName.includes('@') ? headerName : null,
+            name: headerName,
+            identityProvider: headerGet(request, 'x-ms-client-principal-idp') || 'aad',
+            source: 'swa_headers'
+        };
+    }
+
+    return null;
+};
+
+const stripUserPassword = (user) => {
+    if (!user || typeof user !== 'object') return user;
+    const { password: _pw, ...rest } = user;
+    return rest;
+};
+
+async function findOrCreateUserFromPrincipal(principal, context) {
+    const container = getContainer('users');
+    const entraId = principal.entraId;
+    const email = principal.email ? String(principal.email).trim() : '';
+    const name = principal.name || email || 'User';
+
+    let user = null;
+
+    if (entraId) {
+        const { resources } = await container.items
+            .query({
+                query: 'SELECT * FROM c WHERE c.entraId = @entraId',
+                parameters: [{ name: '@entraId', value: entraId }]
+            })
+            .fetchAll();
+        if (resources && resources.length) user = resources[0];
+    }
+
+    if (!user && email) {
+        const { resources } = await container.items
+            .query({
+                query: 'SELECT * FROM c WHERE LOWER(c.email) = @email OR LOWER(c.username) = @email',
+                parameters: [{ name: '@email', value: email.toLowerCase() }]
+            })
+            .fetchAll();
+        if (resources && resources.length) user = resources[0];
+    }
+
+    if (user) {
+        const updates = {};
+        if (entraId && user.entraId !== entraId) updates.entraId = entraId;
+        if (email && user.email !== email) updates.email = email;
+        if (name && user.name !== name) updates.name = name;
+        if (email && !user.username) updates.username = email;
+        if (Object.keys(updates).length) {
+            const { resource } = await container.items.upsert({ ...user, ...updates });
+            user = resource;
+            context.log(`Synced Entra fields for user ${user.id}`);
+        }
+        return stripUserPassword(user);
+    }
+
+    const newUser = {
+        id: generateId(),
+        entraId: entraId || '',
+        username: email || entraId || generateId(),
+        email: email || '',
+        name,
+        permissionLevel: 'CRC',
+        createdAt: new Date().toISOString(),
+        authSource: 'entra_swa'
+    };
+    const { resource: createdUser } = await container.items.create(newUser);
+    context.log(`Created Cosmos user from Entra principal: ${createdUser.id}`);
+    return stripUserPassword(createdUser);
+}
+
+// SWA Easy Auth rolesSource — assignment required in Entra still gates who can sign in
+app.http('GetRoles', {
+    methods: ['POST', 'GET', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'GetRoles',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return {
+                status: 204,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+                    'Access-Control-Allow-Headers': 'content-type'
+                }
+            };
+        }
+        try {
+            if (request.method === 'POST') {
+                await request.json().catch(() => ({}));
+            }
+        } catch (_) {
+            /* ignore body parse errors */
+        }
+        context.log('GetRoles: returning reader');
+        return {
+            status: 200,
+            jsonBody: { roles: ['reader'] },
+            headers: { 'Content-Type': 'application/json' }
+        };
+    }
+});
+
+// Map SWA principal → Cosmos users row (permissionLevel lives in Cosmos)
+app.http('usersMe', {
+    methods: ['GET', 'POST', 'OPTIONS'],
+    authLevel: 'anonymous',
+    route: 'users/me',
+    handler: async (request, context) => {
+        if (request.method === 'OPTIONS') {
+            return {
+                status: 204,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'content-type'
+                }
+            };
+        }
+        try {
+            const principal = signedInUserFromRequest(request);
+            if (!principal || (!principal.entraId && !principal.email)) {
+                return {
+                    status: 401,
+                    jsonBody: { error: 'Not signed in via Entra / SWA Easy Auth' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+            const user = await findOrCreateUserFromPrincipal(principal, context);
+            return {
+                status: 200,
+                jsonBody: user,
+                headers: { 'Content-Type': 'application/json' }
+            };
+        } catch (error) {
+            context.log.error('users/me error:', error);
+            return {
+                status: 500,
+                jsonBody: { error: 'Failed to resolve signed-in user' },
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+    }
+});
+
 // Register authenticate endpoint BEFORE users endpoint to ensure specific route matches first
 // Register authenticate route BEFORE users route to ensure proper matching
-// Register Entra ID authentication endpoint
+// Legacy JWT decode path (not the primary SWA Easy Auth gate)
 app.http('usersAuthenticateEntra', {
     methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
