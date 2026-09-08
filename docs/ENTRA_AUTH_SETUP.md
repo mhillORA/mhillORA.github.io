@@ -107,11 +107,12 @@ Not assigned = cannot get in. Good.
 | Name | Value |
 |------|--------|
 | `AZURE_CLIENT_ID` | Client ID from Step 2 (`cc33a488-…` for SMOScheduler) |
-| `AZURE_CLIENT_SECRET` | Secret **Value** from Step 4 (long string — **not** Secret ID) |
+| `AZURE_CLIENT_SECRET_APP_SETTING_NAME` | Secret **Value** from Step 4 (long string — **not** Secret ID) |
 
-4. If you still have an old setting named `AZURE_CLIENT_SECRET_APP_SETTING_NAME`, you can delete it after `AZURE_CLIENT_SECRET` is set.
-5. Save / Apply.
-6. Wait a minute.
+4. Save / Apply.
+5. Wait a minute.
+
+**Auth-loop note:** Do **not** put a label/name in that secret setting — put the secret **Value** itself. Wrong/missing secret → Microsoft signs you in → SWA rejects the callback → login again forever.
 
 **Also check (common “couldn’t sign you in” causes):**
 
@@ -221,7 +222,7 @@ Staff UI + other APIs → must be signed in.
         "registration": {
           "openIdIssuer": "https://login.microsoftonline.com/2f298692-acc9-4632-b71b-841d51376914/v2.0",
           "clientIdSettingName": "AZURE_CLIENT_ID",
-          "clientSecretSettingName": "AZURE_CLIENT_SECRET"
+          "clientSecretSettingName": "AZURE_CLIENT_SECRET_APP_SETTING_NAME"
         }
       }
     }
@@ -232,14 +233,8 @@ Staff UI + other APIs → must be signed in.
     { "route": "/api/public/*", "allowedRoles": ["anonymous", "authenticated"] },
     { "route": "/site-survey.html", "allowedRoles": ["anonymous", "authenticated"] },
     { "route": "/api/*", "allowedRoles": ["authenticated"] },
-    { "route": "/*", "allowedRoles": ["authenticated"] }
-  ],
-  "responseOverrides": {
-    "401": {
-      "redirect": "/.auth/login/aad",
-      "statusCode": 302
-    }
-  }
+    { "route": "/*", "allowedRoles": ["anonymous", "authenticated"] }
+  ]
 }
 ```
 
