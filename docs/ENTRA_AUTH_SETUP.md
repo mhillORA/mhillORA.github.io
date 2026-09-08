@@ -120,10 +120,9 @@ Secrets stay in Azure. Not in GitHub.
 
 Repo now has:
 
-1. `staticwebapp.config.json` — Entra + public survey carve-outs  
-2. `/api/GetRoles`  
-3. `/api/users/me` — maps SWA principal → Cosmos `users`  
-4. UI Login → `/.auth/login/aad`, Logout → `/.auth/logout`  
+1. `staticwebapp.config.json` — Entra + public survey carve-outs (no GetRoles / rolesSource)  
+2. `/api/users/me` — maps SWA principal → Cosmos `users`  
+3. UI Login → `/.auth/login/aad`, Logout → `/.auth/logout`  
 
 **Push / merge the `ARTEMIS` branch** so GitHub Actions deploys to `smostrategy.oraclinical.com`, then do Step 8.
 
@@ -209,7 +208,6 @@ Staff UI + other APIs → must be signed in.
     "apiRuntime": "node:18"
   },
   "auth": {
-    "rolesSource": "/api/GetRoles",
     "identityProviders": {
       "azureActiveDirectory": {
         "registration": {
@@ -223,7 +221,6 @@ Staff UI + other APIs → must be signed in.
   "routes": [
     { "route": "/.auth/*", "allowedRoles": ["anonymous", "authenticated"] },
     { "route": "/login", "rewrite": "/.auth/login/aad" },
-    { "route": "/api/GetRoles", "allowedRoles": ["anonymous"] },
     { "route": "/api/public/*", "allowedRoles": ["anonymous", "authenticated"] },
     { "route": "/site-survey.html", "allowedRoles": ["anonymous", "authenticated"] },
     { "route": "/api/*", "allowedRoles": ["authenticated"] },
@@ -237,6 +234,8 @@ Staff UI + other APIs → must be signed in.
   }
 }
 ```
+
+Note: we do **not** use `rolesSource` / GetRoles. Entra assignment gates who can sign in; Cosmos `users.permissionLevel` gates what they can do in the app.
 
 ### Day-2 ops
 
