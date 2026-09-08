@@ -1349,12 +1349,19 @@
 
         const loadEntraSessionUser = async () => {
             try {
-                const res = await fetch('/.auth/me', { credentials: 'include' });
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), 4000);
+                let res;
+                try {
+                    res = await fetch('/.auth/me', { credentials: 'include', signal: ctrl.signal });
+                } finally {
+                    clearTimeout(timer);
+                }
                 if (!res.ok) return null;
                 const payload = await res.json();
                 const principal = parseAuthMePrincipal(payload);
                 if (!principal) return null;
-                // Prefer Cosmos user (permissionLevel) via SWA principal
+                // Prefer Cosmos user via SWA principal (short timeout so login isn't blocked)
                 try {
                     const cosmosUser = await apiService.resolveSignedInUser();
                     if (cosmosUser && cosmosUser.id) return cosmosUser;
@@ -1786,7 +1793,12 @@
             const historyActive = ['legacy-studies', 'legacy-sites', 'legacy-feasibility'].includes(activeTab)
                 || (activeTab === 'reporting' && window.__artemisReportPanel === 'history');
             const peopleActive = ['sites', 'crcs', 'staff'].includes(activeTab);
-            const canSync = !user || /admin|manager|director/i.test(String(user.permissionLevel || ''));
+            // Entra assignment gates access — do not use CRC/Manager ladders for workspace actions
+            const canSync = !user
+                || !!user.entraId
+                || user.authSource === 'entra_swa'
+                || user.authSource === 'entra_principal_only'
+                || /admin|manager|director|user/i.test(String(user.permissionLevel || ''));
 
             const pill = (tab) => {
                 const reportingOn = tab.id === 'reporting' && activeTab === 'reporting' && window.__artemisReportPanel !== 'history';
@@ -1796,9 +1808,10 @@
 
             if (headerButtons) {
                 const signedIn = !!user;
+                const label = escapeHtml(user?.username || user?.email || user?.name || 'User');
                 const userChip = signedIn ? `
                     <span class="hidden xl:inline text-[11px] px-2.5 py-1.5 rounded-md border border-white/20 text-white/85">
-                        ${escapeHtml(user?.permissionLevel || '')} · ${escapeHtml(user?.username || user?.email || 'User')}
+                        ${label}
                     </span>
                     <button id="logout-btn" type="button" class="nav-action-btn">Logout</button>
                 ` : `
@@ -10969,14 +10982,17 @@
         });
         
         // --- API Health Check ---
+        // Lightweight ping — do NOT pull /api/studies (that doubles cold-start load).
         const checkApiHealth = async () => {
             try {
-                const response = await fetch('/api/studies', {
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), 2500);
+                const response = await fetch('/api/GetRoles', {
                     method: 'GET',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    }
+                    credentials: 'include',
+                    signal: ctrl.signal
                 });
+                clearTimeout(timer);
                 return response.ok;
             } catch (error) {
                 console.warn('API health check failed:', error);
@@ -10997,16 +11013,13 @@
                     themeToggleBtn.addEventListener('click', toggleTheme);
                 }
 
-                // Prefer live Entra / SWA session; fall back to sessionStorage (local/legacy)
-                user = await loadEntraSessionUser();
-                if (user) {
-                    setSessionUser(user);
-                } else {
-                    user = getSessionUser();
-                }
-
-                // Check API health
-                const apiHealthy = await checkApiHealth();
+                // Auth + health in parallel (don't serialize startup)
+                const [entraUser, apiHealthy] = await Promise.all([
+                    loadEntraSessionUser(),
+                    checkApiHealth()
+                ]);
+                user = entraUser || getSessionUser();
+                if (entraUser) setSessionUser(entraUser);
                 if (!apiHealthy) {
                     showNotification('API server is not responding. Data will be saved locally.', 'warning');
                 }
@@ -11033,6 +11046,8 @@
                     showLoginModal();
                     return;
                 }
+
+                try { closeModal(); } catch (_) { /* ignore */ }
 
                 // Initialize data loading after login
                 await initializeDataLoaders();
@@ -11076,108 +11091,70 @@
                 allSiteSurveyAssignments = asSurveyList(allSiteSurveyAssignments);
                 allSiteSurveyResponses = asSurveyList(allSiteSurveyResponses);
                 allSiteStaff = allSiteStaff || [];
+                window.__siteSurveyNotifications = window.__siteSurveyNotifications || [];
 
-                // Load site surveys with the first paint so Sites + Comms are not empty/broken
-                try {
-                    const [siteSurveyDefinitions, siteSurveyAssignments, siteSurveyResponses, siteSurveyNotifications] = await Promise.all([
-                        apiService.getSiteSurveyDefinitions().catch(() => []),
-                        apiService.getSiteSurveyAssignments().catch(() => []),
-                        apiService.getSiteSurveyResponses().catch(() => []),
-                        apiService.getSiteSurveyNotifications().catch(() => [])
-                    ]);
-                    allSiteSurveyDefinitions = asSurveyList(siteSurveyDefinitions);
-                    allSiteSurveyAssignments = asSurveyList(siteSurveyAssignments);
-                    allSiteSurveyResponses = asSurveyList(siteSurveyResponses);
-                    window.__siteSurveyNotifications = Array.isArray(siteSurveyNotifications) ? siteSurveyNotifications : [];
-                } catch (surveyLoadErr) {
-                    console.error('Error loading site surveys:', surveyLoadErr);
-                }
+                // First paint NOW — do not wait on survey packs / patients / schedules / broken events
+                loadingIndicator.style.display = 'none';
+                if (headerButtons) renderHeaderButtons();
+                render();
 
-                // Defer heavy collections so first paint is fast (existing tabs still work when data arrives)
                 const deferSecondary = async () => {
-                    const [patients, events, roles, schedules, surveys, siteStaff] = await Promise.all([
-                        apiService.getPatients().catch(() => []),
-                        apiService.getEvents().catch(() => []),
-                        apiService.getRoles().catch(() => []),
-                        apiService.getSchedules().catch(() => []),
-                        apiService.getSurveys().catch(() => []),
-                        apiService.getSiteStaff().catch(() => [])
-                    ]);
-                    allPatients = patients;
-                    allSchedules = schedules;
-                    allSurveys = surveys;
-                    allSiteStaff = siteStaff;
-                    console.log('Secondary ARTEMIS data loaded (deferred)');
-                    refreshArtemisLegacySiteIndex().then(() => {
-                        if (['dashboard', 'sites'].includes(activeTab)) {
+                    try {
+                        // Do NOT call getEvents/getRoles — results were unused and /api/events 500/hangs
+                        const [
+                            patients, schedules, surveys, siteStaff,
+                            siteSurveyDefinitions, siteSurveyAssignments, siteSurveyResponses, siteSurveyNotifications
+                        ] = await Promise.all([
+                            apiService.getPatients().catch(() => []),
+                            apiService.getSchedules().catch(() => []),
+                            apiService.getSurveys().catch(() => []),
+                            apiService.getSiteStaff().catch(() => []),
+                            apiService.getSiteSurveyDefinitions().catch(() => []),
+                            apiService.getSiteSurveyAssignments().catch(() => []),
+                            apiService.getSiteSurveyResponses().catch(() => []),
+                            apiService.getSiteSurveyNotifications().catch(() => [])
+                        ]);
+                        allPatients = patients;
+                        allSchedules = schedules;
+                        allSurveys = surveys;
+                        allSiteStaff = siteStaff;
+                        allSiteSurveyDefinitions = asSurveyList(siteSurveyDefinitions);
+                        allSiteSurveyAssignments = asSurveyList(siteSurveyAssignments);
+                        allSiteSurveyResponses = asSurveyList(siteSurveyResponses);
+                        window.__siteSurveyNotifications = Array.isArray(siteSurveyNotifications) ? siteSurveyNotifications : [];
+                        console.log('Secondary ARTEMIS data loaded (deferred)');
+                        refreshArtemisLegacySiteIndex().catch(() => {});
+                        if (['dashboard', 'sites', 'scheduling', 'communications', 'staff', 'reporting'].includes(activeTab)) {
                             render();
                         }
-                    }).catch(() => {});
-                    if (['scheduling','communications','staff','reporting','sites'].includes(activeTab)) {
-                        render();
+                    } catch (err) {
+                        console.error('Deferred secondary load failed:', err);
                     }
                 };
                 if (window.requestIdleCallback) {
-                    requestIdleCallback(() => { deferSecondary(); }, { timeout: 2500 });
+                    requestIdleCallback(() => { deferSecondary(); }, { timeout: 1200 });
                 } else {
-                    setTimeout(deferSecondary, 100);
+                    setTimeout(deferSecondary, 50);
                 }
 
-                // placeholder so later code that referenced destructured vars still has names if any
-                const patients = allPatients;
-                const schedules = allSchedules;
-                const surveys = allSurveys;
-                const siteSurveyDefinitions = allSiteSurveyDefinitions;
-                const siteSurveyAssignments = allSiteSurveyAssignments;
-                const siteSurveyResponses = allSiteSurveyResponses;
-                const siteStaff = allSiteStaff;
-
-                // Hide loading indicator and render
-                loadingIndicator.style.display = 'none';
-                
-                // Render header buttons first
-                if (headerButtons) {
-                    renderHeaderButtons();
-                }
-                
-                render();
-                
                 // Reload map markers if map is already initialized
-                // Wait for map to be fully ready before loading markers
                 if (azureMap) {
-                    console.log('Map exists, checking if ready...');
-                    // Check if map is ready, if not wait for ready event
                     if (azureMap.getMapContainer() && azureMap.getMapContainer().style.display !== 'none') {
-                        setTimeout(() => {
-                            console.log('Loading map markers after data load. Sites:', allSites.length, 'CRCs:', allCrcs.length);
-                            loadMapMarkers();
-                        }, 1000); // Give map more time to be ready
+                        setTimeout(() => loadMapMarkers(), 400);
                     } else {
-                        // Map not ready yet, wait for ready event
-                        azureMap.events.add('ready', () => {
-                            console.log('Map ready after data load, loading markers. Sites:', allSites.length, 'CRCs:', allCrcs.length);
-                            loadMapMarkers();
-                        });
+                        azureMap.events.add('ready', () => loadMapMarkers());
                     }
-                } else {
-                    console.log('Map not initialized yet, will load markers when map is ready');
                 }
 
-                console.log('Data loaded successfully:', {
+                console.log('Core data loaded:', {
                     studies: allStudies.length,
                     sites: allSites.length,
-                    patients: allPatients.length,
-                    crcs: allCrcs.length,
-                    schedules: allSchedules.length,
-                    surveys: allSurveys.length,
-                    siteSurveyDefinitions: allSiteSurveyDefinitions.length,
-                    siteSurveyAssignments: allSiteSurveyAssignments.length,
-                    siteSurveyResponses: allSiteSurveyResponses.length,
-                    siteStaff: allSiteStaff.length
+                    crcs: allCrcs.length
                 });
 
             } catch (error) {
-                console.error('Error loading data:', error);
+                console.error('Error initializing data loaders:', error);
+                loadingIndicator.style.display = 'none';
                 showErrorToUser('Failed to load application data. Please check your connection and refresh.');
             }
         };

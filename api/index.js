@@ -880,10 +880,10 @@ async function crudHandler(context, request, containerName) {
                         const errorCode = error.code || error.statusCode;
                         const errorMessage = (error.message || '').toLowerCase();
                         
-                        // For travel container specifically, always return empty array on any error
-                        // This prevents launch failures
-                        if (containerName === 'travel') {
-                            context.log.warn(`Travel container does not exist yet or error occurred, returning empty array. Error: ${error.message}`);
+                        // For travel/events containers, always return empty array on any list error
+                        // (events is unused by ARTEMIS UI but was timing out / 500ing and spamming clients)
+                        if (containerName === 'travel' || containerName === 'events') {
+                            context.log.warn(`${containerName} container list failed, returning empty array. Error: ${error.message}`);
                             return { 
                                 jsonBody: [],
                                 headers: { 'Content-Type': 'application/json' }
@@ -1230,7 +1230,16 @@ app.http('events', {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     authLevel: 'anonymous', 
     route: 'events/{id?}',
-    handler: (request, context) => crudHandler(context, request, 'events'),
+    handler: async (request, context) => {
+        // ARTEMIS does not use the events collection in the UI; avoid expensive/failing Cosmos reads on boot.
+        if (request.method === 'GET' && !getIdFromRequest(request)) {
+            return {
+                jsonBody: [],
+                headers: { 'Content-Type': 'application/json' }
+            };
+        }
+        return crudHandler(context, request, 'events');
+    },
 });
 
 app.http('roles', {
