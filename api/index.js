@@ -1813,6 +1813,12 @@ async function findOrCreateUserFromPrincipal(principal, context) {
         if (email && user.email !== email) updates.email = email;
         if (name && user.name !== name) updates.name = name;
         if (email && !user.username) updates.username = email;
+        // ARTEMIS: Entra assignment is the access gate — no app role ladder
+        if (!user.permissionLevel || String(user.permissionLevel).toUpperCase() === 'CRC') {
+            if (user.authSource === 'entra_swa' || !user.password) {
+                updates.permissionLevel = 'User';
+            }
+        }
         if (Object.keys(updates).length) {
             const { resource } = await container.items.upsert({ ...user, ...updates });
             user = resource;
@@ -1827,7 +1833,8 @@ async function findOrCreateUserFromPrincipal(principal, context) {
         username: email || entraId || generateId(),
         email: email || '',
         name,
-        permissionLevel: 'CRC',
+        // Entra enterprise-app assignment gates access; ARTEMIS does not use CRC/Manager roles here
+        permissionLevel: 'User',
         createdAt: new Date().toISOString(),
         authSource: 'entra_swa'
     };
