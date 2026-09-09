@@ -330,297 +330,300 @@ function registerSurveySecureRoutes(app, deps) {
 
     const serviceDeps = { getContainer, generateId, validateSurveyResponsesSchema };
 
-    // ---------- Public: load survey by token ----------
-    app.http('publicSiteSurveyGet', {
-        methods: ['GET', 'OPTIONS'],
-        authLevel: 'anonymous',
-        route: 'public/site-survey',
-        handler: async (request, context) => {
-            if (request.method === 'OPTIONS') {
-                return { status: 204, headers: corsHeaders() };
-            }
-            const ip = clientIp(request);
-            if (!rateLimit(`get:${ip}`, 60, 60_000)) {
-                return { status: 429, jsonBody: { error: 'Too many requests' }, headers: corsHeaders() };
-            }
+    // Azure Functions host cannot register two HTTP functions on the same route.
+    // GET + POST must share one app.http registration (otherwise production returns empty 404).
+    const handlePublicSiteSurveyGet = async (request, context) => {
+        const ip = clientIp(request);
+        if (!rateLimit(`get:${ip}`, 60, 60_000)) {
+            return { status: 429, jsonBody: { error: 'Too many requests' }, headers: corsHeaders() };
+        }
 
-            try {
-                const raw = readQueryParam(request, 't') || readQueryParam(request, 'token');
-                if (!raw) {
-                    return {
-                        status: 400,
-                        jsonBody: { error: 'Missing survey token. Use the link from your invitation email.' },
-                        headers: corsHeaders(),
-                    };
-                }
-
-                const assignment = await findAssignmentByToken(getContainer, raw);
-                const bad = assertTokenUsable(assignment);
-                if (bad) {
-                    return { status: bad.status, jsonBody: { error: bad.error }, headers: corsHeaders() };
-                }
-
-                let definition = null;
-                try {
-                    const defRead = await getContainer(DEFINITIONS)
-                        .item(assignment.surveyId, assignment.surveyId)
-                        .read();
-                    definition = defRead.resource;
-                } catch (_) {
-                    definition = null;
-                }
-                if (!definition) {
-                    return {
-                        status: 404,
-                        jsonBody: { error: 'Survey definition was not found.' },
-                        headers: corsHeaders(),
-                    };
-                }
-
-                // Mark opened (first open only; never reopen past submitted)
-                if (!assignment.openedAt) {
-                    try {
-                        const now = new Date().toISOString();
-                        const next = {
-                            ...assignment,
-                            openedAt: now,
-                            updatedAt: now,
-                            status:
-                                String(assignment.status || '').toLowerCase() === 'submitted'
-                                    ? 'submitted'
-                                    : 'opened',
-                        };
-                        await getContainer(ASSIGNMENTS).items.upsert(next);
-                        Object.assign(assignment, next);
-                    } catch (_) {}
-                }
-
-                const siteName = await resolveSiteName(getContainer, assignment.siteId);
-                const relatedSiteIds = await resolveRelatedSiteIds(getContainer, assignment.siteId);
-                const questions = await resolvePublicSurveyQuestions(getContainer, definition, {
-                    generalFeasibilityVariant: assignment.generalFeasibilityVariant || 'long',
-                });
-
-                const prior = await findLatestLiveResponse(getContainer, {
-                    siteId: assignment.siteId,
-                    surveyId: assignment.surveyId,
-                    targetRole: assignment.targetRole,
-                });
-
-                let siteResponses = [];
-                try {
-                    siteResponses = await findSiteLiveResponses(getContainer, {
-                        siteIds: relatedSiteIds,
-                    });
-                } catch (_) {
-                    try {
-                        siteResponses = await findSiteRoleLiveResponses(getContainer, {
-                            siteId: assignment.siteId,
-                            targetRole: assignment.targetRole,
-                        });
-                    } catch (__) {
-                        siteResponses = prior ? [prior] : [];
-                    }
-                }
-
-                // Last two distinct submissions for delta (prefer newest pair)
-                const latestTwo = siteResponses.slice(0, 2);
-                const delta =
-                    latestTwo.length >= 2
-                        ? compareSurveyResponses({
-                              current: latestTwo[0],
-                              previous: latestTwo[1],
-                              questions,
-                          })
-                        : latestTwo.length === 1
-                          ? compareSurveyResponses({
-                                current: latestTwo[0],
-                                previous: null,
-                                questions,
-                            })
-                          : null;
-
+        try {
+            const raw = readQueryParam(request, 't') || readQueryParam(request, 'token');
+            if (!raw) {
                 return {
-                    jsonBody: buildPublicPayload({
-                        assignment,
-                        definition,
-                        siteName,
-                        prior,
-                        siteRoleResponses: siteResponses,
-                        questions,
-                        delta,
-                    }),
+                    status: 400,
+                    jsonBody: { error: 'Missing survey token. Use the link from your invitation email.' },
                     headers: corsHeaders(),
                 };
-            } catch (error) {
-                return handleError(context, error, 'public/site-survey GET');
-            }
-        },
-    });
-
-    // ---------- Public: save draft or submit ----------
-    app.http('publicSiteSurveyPost', {
-        methods: ['POST', 'OPTIONS'],
-        authLevel: 'anonymous',
-        route: 'public/site-survey',
-        handler: async (request, context) => {
-            if (request.method === 'OPTIONS') {
-                return { status: 204, headers: corsHeaders() };
-            }
-            const ip = clientIp(request);
-            if (!rateLimit(`post:${ip}`, 30, 60_000)) {
-                return { status: 429, jsonBody: { error: 'Too many requests' }, headers: corsHeaders() };
             }
 
+            const assignment = await findAssignmentByToken(getContainer, raw);
+            const bad = assertTokenUsable(assignment);
+            if (bad) {
+                return { status: bad.status, jsonBody: { error: bad.error }, headers: corsHeaders() };
+            }
+
+            let definition = null;
             try {
-                const body = await request.json();
-                const raw = body?.t || body?.token;
-                const action = String(body?.action || 'submit').toLowerCase();
-                if (!raw) {
+                const defRead = await getContainer(DEFINITIONS)
+                    .item(assignment.surveyId, assignment.surveyId)
+                    .read();
+                definition = defRead.resource;
+            } catch (_) {
+                definition = null;
+            }
+            if (!definition) {
+                return {
+                    status: 404,
+                    jsonBody: { error: 'Survey definition was not found.' },
+                    headers: corsHeaders(),
+                };
+            }
+
+            // Mark opened (first open only; never reopen past submitted)
+            if (!assignment.openedAt) {
+                try {
+                    const now = new Date().toISOString();
+                    const next = {
+                        ...assignment,
+                        openedAt: now,
+                        updatedAt: now,
+                        status:
+                            String(assignment.status || '').toLowerCase() === 'submitted'
+                                ? 'submitted'
+                                : 'opened',
+                    };
+                    await getContainer(ASSIGNMENTS).items.upsert(next);
+                    Object.assign(assignment, next);
+                } catch (_) {}
+            }
+
+            const siteName = await resolveSiteName(getContainer, assignment.siteId);
+            const relatedSiteIds = await resolveRelatedSiteIds(getContainer, assignment.siteId);
+            const questions = await resolvePublicSurveyQuestions(getContainer, definition, {
+                generalFeasibilityVariant: assignment.generalFeasibilityVariant || 'long',
+            });
+
+            const prior = await findLatestLiveResponse(getContainer, {
+                siteId: assignment.siteId,
+                surveyId: assignment.surveyId,
+                targetRole: assignment.targetRole,
+            });
+
+            let siteResponses = [];
+            try {
+                siteResponses = await findSiteLiveResponses(getContainer, {
+                    siteIds: relatedSiteIds,
+                });
+            } catch (_) {
+                try {
+                    siteResponses = await findSiteRoleLiveResponses(getContainer, {
+                        siteId: assignment.siteId,
+                        targetRole: assignment.targetRole,
+                    });
+                } catch (__) {
+                    siteResponses = prior ? [prior] : [];
+                }
+            }
+
+            // Last two distinct submissions for delta (prefer newest pair)
+            const latestTwo = siteResponses.slice(0, 2);
+            const delta =
+                latestTwo.length >= 2
+                    ? compareSurveyResponses({
+                          current: latestTwo[0],
+                          previous: latestTwo[1],
+                          questions,
+                      })
+                    : latestTwo.length === 1
+                      ? compareSurveyResponses({
+                            current: latestTwo[0],
+                            previous: null,
+                            questions,
+                        })
+                      : null;
+
+            return {
+                jsonBody: buildPublicPayload({
+                    assignment,
+                    definition,
+                    siteName,
+                    prior,
+                    siteRoleResponses: siteResponses,
+                    questions,
+                    delta,
+                }),
+                headers: corsHeaders(),
+            };
+        } catch (error) {
+            return handleError(context, error, 'public/site-survey GET');
+        }
+    };
+
+    const handlePublicSiteSurveyPost = async (request, context) => {
+        const ip = clientIp(request);
+        if (!rateLimit(`post:${ip}`, 30, 60_000)) {
+            return { status: 429, jsonBody: { error: 'Too many requests' }, headers: corsHeaders() };
+        }
+
+        try {
+            const body = await request.json();
+            const raw = body?.t || body?.token;
+            const action = String(body?.action || 'submit').toLowerCase();
+            if (!raw) {
+                return {
+                    status: 400,
+                    jsonBody: { error: 'Missing survey token' },
+                    headers: corsHeaders(),
+                };
+            }
+
+            const assignment = await findAssignmentByToken(getContainer, raw);
+            const bad = assertTokenUsable(assignment);
+            if (bad) {
+                return { status: bad.status, jsonBody: { error: bad.error }, headers: corsHeaders() };
+            }
+
+            const alreadySubmitted =
+                String(assignment.status || '').toLowerCase() === 'submitted';
+            if (alreadySubmitted && assignment.allowResubmit === false && action === 'submit') {
+                return {
+                    status: 409,
+                    jsonBody: { error: 'This survey was already submitted and cannot be updated.' },
+                    headers: corsHeaders(),
+                };
+            }
+
+            const answers = Array.isArray(body.answers) ? body.answers : [];
+
+            if (action === 'draft' || action === 'save') {
+                const result = await writeSurveyResponse(serviceDeps, {
+                    assignment,
+                    answers,
+                    email: body.email,
+                    displayName: body.displayName,
+                    isDraft: true,
+                });
+                return {
+                    status: 200,
+                    jsonBody: {
+                        ok: true,
+                        draft: true,
+                        draftSavedAt: result.assignment?.draftSavedAt,
+                    },
+                    headers: corsHeaders(),
+                };
+            }
+
+            // Light server-side required check against merged questions (gen feas + study)
+            let definition = null;
+            try {
+                const defRead = await getContainer(DEFINITIONS)
+                    .item(assignment.surveyId, assignment.surveyId)
+                    .read();
+                definition = defRead.resource;
+            } catch (_) {}
+            const questions = definition
+                ? await resolvePublicSurveyQuestions(getContainer, definition, {
+                      generalFeasibilityVariant: assignment.generalFeasibilityVariant || 'long',
+                  })
+                : [];
+            if (questions.length) {
+                const byId = new Map(answers.map((a) => [String(a.questionId), a]));
+                const missing = [];
+                for (const q of questions) {
+                    // Default required; branching rows marked skipped when not qualified
+                    if (q.required === false) continue;
+                    const a = byId.get(String(q.id));
+                    if (a?.skipped) continue;
+                    const val = a?.value ?? a?.answer ?? a?.answerText;
+                    if (val == null || String(val).trim() === '') {
+                        missing.push(q.label || q.id);
+                    }
+                }
+                if (missing.length) {
                     return {
                         status: 400,
-                        jsonBody: { error: 'Missing survey token' },
-                        headers: corsHeaders(),
-                    };
-                }
-
-                const assignment = await findAssignmentByToken(getContainer, raw);
-                const bad = assertTokenUsable(assignment);
-                if (bad) {
-                    return { status: bad.status, jsonBody: { error: bad.error }, headers: corsHeaders() };
-                }
-
-                const alreadySubmitted =
-                    String(assignment.status || '').toLowerCase() === 'submitted';
-                if (alreadySubmitted && assignment.allowResubmit === false && action === 'submit') {
-                    return {
-                        status: 409,
-                        jsonBody: { error: 'This survey was already submitted and cannot be updated.' },
-                        headers: corsHeaders(),
-                    };
-                }
-
-                const answers = Array.isArray(body.answers) ? body.answers : [];
-
-                if (action === 'draft' || action === 'save') {
-                    const result = await writeSurveyResponse(serviceDeps, {
-                        assignment,
-                        answers,
-                        email: body.email,
-                        displayName: body.displayName,
-                        isDraft: true,
-                    });
-                    return {
-                        status: 200,
                         jsonBody: {
-                            ok: true,
-                            draft: true,
-                            draftSavedAt: result.assignment?.draftSavedAt,
+                            error: 'Please complete required questions',
+                            missing,
                         },
                         headers: corsHeaders(),
                     };
                 }
+            }
 
-                // Light server-side required check against merged questions (gen feas + study)
-                let definition = null;
-                try {
-                    const defRead = await getContainer(DEFINITIONS)
-                        .item(assignment.surveyId, assignment.surveyId)
-                        .read();
-                    definition = defRead.resource;
-                } catch (_) {}
-                const questions = definition
-                    ? await resolvePublicSurveyQuestions(getContainer, definition, {
-                          generalFeasibilityVariant: assignment.generalFeasibilityVariant || 'long',
-                      })
-                    : [];
-                if (questions.length) {
-                    const byId = new Map(answers.map((a) => [String(a.questionId), a]));
-                    const missing = [];
-                    for (const q of questions) {
-                        // Default required; branching rows marked skipped when not qualified
-                        if (q.required === false) continue;
-                        const a = byId.get(String(q.id));
-                        if (a?.skipped) continue;
-                        const val = a?.value ?? a?.answer ?? a?.answerText;
-                        if (val == null || String(val).trim() === '') {
-                            missing.push(q.label || q.id);
-                        }
-                    }
-                    if (missing.length) {
-                        return {
-                            status: 400,
-                            jsonBody: {
-                                error: 'Please complete required questions',
-                                missing,
-                            },
-                            headers: corsHeaders(),
-                        };
-                    }
-                }
+            const result = await writeSurveyResponse(serviceDeps, {
+                assignment,
+                answers,
+                email: body.email || assignment.targetEmail,
+                displayName: body.displayName,
+                isDraft: false,
+            });
 
-                const result = await writeSurveyResponse(serviceDeps, {
-                    assignment,
-                    answers,
-                    email: body.email || assignment.targetEmail,
-                    displayName: body.displayName,
-                    isDraft: false,
-                });
+            const siteName = await resolveSiteName(getContainer, assignment.siteId);
+            let surveyTitle = assignment.surveyId;
+            try {
+                const defRead = await getContainer(DEFINITIONS)
+                    .item(assignment.surveyId, assignment.surveyId)
+                    .read();
+                surveyTitle = defRead.resource?.title || surveyTitle;
+            } catch (_) {}
 
-                const siteName = await resolveSiteName(getContainer, assignment.siteId);
-                let surveyTitle = assignment.surveyId;
-                try {
-                    const defRead = await getContainer(DEFINITIONS)
-                        .item(assignment.surveyId, assignment.surveyId)
-                        .read();
-                    surveyTitle = defRead.resource?.title || surveyTitle;
-                } catch (_) {}
+            const statusWord = result.resubmitted ? 'updated' : 'submitted';
+            await writeNotification(deps, {
+                kind: result.resubmitted ? 'survey_resubmitted' : 'survey_submitted',
+                assignmentId: assignment.id,
+                surveyId: assignment.surveyId,
+                siteId: assignment.siteId,
+                siteName,
+                surveyTitle,
+                targetRole: assignment.targetRole,
+                responseId: result.resource?.id,
+                summary: `${siteName} · ${roleLabel(assignment.targetRole)} · ${surveyTitle}`,
+            });
 
-                const statusWord = result.resubmitted ? 'updated' : 'submitted';
-                await writeNotification(deps, {
-                    kind: result.resubmitted ? 'survey_resubmitted' : 'survey_submitted',
-                    assignmentId: assignment.id,
-                    surveyId: assignment.surveyId,
-                    siteId: assignment.siteId,
+            // Optional ops email/webhook (no answer payloads)
+            const notifyTo = process.env.SURVEY_OPS_NOTIFY_EMAIL;
+            if (notifyTo) {
+                const copy = opsNotifyCopy({
                     siteName,
                     surveyTitle,
-                    targetRole: assignment.targetRole,
-                    responseId: result.resource?.id,
-                    summary: `${siteName} · ${roleLabel(assignment.targetRole)} · ${surveyTitle}`,
+                    roleLabel: roleLabel(assignment.targetRole),
+                    status: statusWord,
                 });
-
-                // Optional ops email/webhook (no answer payloads)
-                const notifyTo = process.env.SURVEY_OPS_NOTIFY_EMAIL;
-                if (notifyTo) {
-                    const copy = opsNotifyCopy({
-                        siteName,
-                        surveyTitle,
-                        roleLabel: roleLabel(assignment.targetRole),
-                        status: statusWord,
-                    });
-                    await deliverSurveyEmail({
-                        to: notifyTo,
-                        subject: copy.subject,
-                        text: copy.text,
-                        meta: { kind: 'ops_notify', assignmentId: assignment.id },
-                    });
-                }
-
-                return {
-                    status: result.created ? 201 : 200,
-                    jsonBody: {
-                        ok: true,
-                        resubmitted: result.resubmitted,
-                        responseId: result.resource?.id,
-                        confirmationCode: String(result.resource?.id || '')
-                            .slice(-8)
-                            .toUpperCase(),
-                    },
-                    headers: corsHeaders(),
-                };
-            } catch (error) {
-                return handleError(context, error, 'public/site-survey POST');
+                await deliverSurveyEmail({
+                    to: notifyTo,
+                    subject: copy.subject,
+                    text: copy.text,
+                    meta: { kind: 'ops_notify', assignmentId: assignment.id },
+                });
             }
+
+            return {
+                status: result.created ? 201 : 200,
+                jsonBody: {
+                    ok: true,
+                    resubmitted: result.resubmitted,
+                    responseId: result.resource?.id,
+                    confirmationCode: String(result.resource?.id || '')
+                        .slice(-8)
+                        .toUpperCase(),
+                },
+                headers: corsHeaders(),
+            };
+        } catch (error) {
+            return handleError(context, error, 'public/site-survey POST');
+        }
+    };
+
+    // ---------- Public: load / draft / submit by token ----------
+    app.http('publicSiteSurvey', {
+        methods: ['GET', 'POST', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'public/site-survey',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            if (request.method === 'GET') {
+                return handlePublicSiteSurveyGet(request, context);
+            }
+            if (request.method === 'POST') {
+                return handlePublicSiteSurveyPost(request, context);
+            }
+            return { status: 405, jsonBody: { error: 'Method not allowed' }, headers: corsHeaders() };
         },
     });
 
