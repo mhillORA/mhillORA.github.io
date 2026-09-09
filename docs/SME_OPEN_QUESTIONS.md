@@ -1,59 +1,40 @@
 # SME open questions (blocking full delivery)
 
-Updated 2026-09-09. Answer these so we can finish the remaining pieces.
+Updated 2026-09-09.
 
-## 1. Lookup values (need the lists)
-Please paste options for each:
+## Answered
+
+### Site Profile entity
+**Decision:** Keep Site Profile — open **per site as a tab** (not a separate orphan page). Fold into the site detail experience as a tab alongside site info / feasibility / history.
+
+### Feasibility Links + Responses
+**Decision:** Stay under **Feasibility**. Prefer clear **tabs within** Feasibility (e.g. Templates | Question bank | Links | Responses | Study status).
+
+### Study × group rows
+**Decision:** Model as **study → group**. Show study as the parent; **collapse groups** when a study has more than one group/arm.
+
+## Still need more info
+
+### Role dashboards
+Ops / Monitoring / Exec selector exists — need exact tiles/metrics per role.
+
+### Site Code format
+Required + immutable after set — need preferred format (free text vs auto vs external ID like Veeva/Monday).
+
+### Lookup lists (still needed)
 1. Study Statuses  
-2. Study Phases (we temporarily used I / II / III / IV / Other — confirm or replace)  
+2. Study Phases  
 3. Site Statuses  
 4. Site Type  
 5. Question Categories  
-6. Survey Outcomes (Recommend / Needs review / Do Not Recommend / Unanswered — confirm names)  
+6. Survey Outcomes  
 7. Site Status By Study  
-8. Indications (canonical list)  
-9. Services (for Add Study — what replaces current services?)  
-10. Sponsors — do you want Sponsor **profiles** (name, contacts, linked studies), or just a free-text / dropdown name for now?
+8. Indications  
+9. Services  
+10. Sponsors (profiles vs name-only?)
 
-## 2. I/E Criteria Repository
-Shell page is in nav. What fields per criterion?
-- Inclusion vs Exclusion?
-- Indication / study link?
-- Versioning?
-- Free text only, or structured (category, operator, value)?
+### I/E Criteria fields
+Still need content model (Inclusion/Exclusion, study link, versioning, free text vs structured).
 
-## 3. Feasibility Links + Responses placement
-Keep under Feasibility panels, or move to:
-- Reporting?
-- Per-study page?
-- A new “Questionnaire ops” area?
-
-## 4. Study × group rows
-On Completed Studies / site history tables, what does each “study × group” row mean?
-- One row per study?
-- One row per treatment group/arm?
-- Something else?
-
-## 5. Site Profile entity
-Keep a separate Site Profile (Budget Buddy fields), or fold everything into the Sites record and drop the extra tab?
-
-## 6. Role dashboards — exact tiles
-Ops / Monitoring / Exec selector exists. What should each role see?
-- Ops: ?
-- Monitoring: ?
-- Exec Leadership: ?
-
-## 7. Scope confirmation (later)
-Confirm these stay **later** (not this push):
-- Veeva-linked milestones
-- FPFV/LPLV vs budget + ahead/behind flags
-- Assumed vs actual enrollment progress flags
-- Budgeted SF vs actual SF flags
-- Full portfolio management report
-- PI/Coordinator auto-fill from feasibility on Add Site (we can do next if you want it now)
-
-## 8. Site Unique Identifier format
-Site Code is now required + immutable after set. Preferred format?
-- Free text (e.g. `ANDOVER-01`)?
-- Auto-generated?
-- Must match an existing external ID (Veeva / Monday)?
+### Later scope (confirm when ready)
+Veeva milestones, FPFV/LPLV vs budget, enrollment progress flags, SF budget flags, portfolio report, PI/Coord autofill from feasibility.
