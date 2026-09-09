@@ -188,6 +188,14 @@ const validateStudiesSchema = (data) => {
         if (data.lplv && typeof data.lplv !== 'string') {
             errors.push('lplv must be a string');
         }
+
+        if (data.sponsor != null && typeof data.sponsor !== 'string') {
+            errors.push('sponsor must be a string');
+        }
+
+        if (data.phase != null && typeof data.phase !== 'string') {
+            errors.push('phase must be a string');
+        }
     }
     
     if (errors.length > 0) {
@@ -204,6 +212,12 @@ const validateSitesSchema = (data) => {
     
     if (!data.name || typeof data.name !== 'string') {
         errors.push('name is required and must be a string');
+    }
+
+    if (data.siteCode != null && typeof data.siteCode !== 'string') {
+        errors.push('siteCode must be a string');
+    } else if (typeof data.siteCode === 'string') {
+        data.siteCode = data.siteCode.trim();
     }
     
     if (data.siteNameAbbreviation && typeof data.siteNameAbbreviation !== 'string') {

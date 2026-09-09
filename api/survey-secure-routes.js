@@ -29,6 +29,9 @@ const {
     normalizeRole,
     sortByIsoDesc,
     GENERAL_FEASIBILITY_SURVEY_ID,
+    GENERAL_FEASIBILITY_SHORT_SURVEY_ID,
+    normalizeGeneralFeasibilityVariant,
+    isGeneralFeasibilitySurveyId,
 } = require('./lib/survey-response-service');
 const {
     deliverSurveyEmail,
@@ -286,7 +289,12 @@ function buildPublicPayload({
             title: definition.title || 'Site survey',
             description: definition.description || '',
             questions: publicQuestionsFromList(qList),
-            includesGeneralFeasibility: definition.id !== GENERAL_FEASIBILITY_SURVEY_ID,
+            includesGeneralFeasibility:
+                !isGeneralFeasibilitySurveyId(definition.id) &&
+                normalizeGeneralFeasibilityVariant(assignment?.generalFeasibilityVariant) !== 'none',
+            generalFeasibilityVariant: normalizeGeneralFeasibilityVariant(
+                assignment?.generalFeasibilityVariant ?? 'long'
+            ),
         },
         prefill,
         hasPrior,
@@ -389,7 +397,9 @@ function registerSurveySecureRoutes(app, deps) {
 
                 const siteName = await resolveSiteName(getContainer, assignment.siteId);
                 const relatedSiteIds = await resolveRelatedSiteIds(getContainer, assignment.siteId);
-                const questions = await resolvePublicSurveyQuestions(getContainer, definition);
+                const questions = await resolvePublicSurveyQuestions(getContainer, definition, {
+                    generalFeasibilityVariant: assignment.generalFeasibilityVariant || 'long',
+                });
 
                 const prior = await findLatestLiveResponse(getContainer, {
                     siteId: assignment.siteId,
@@ -520,7 +530,9 @@ function registerSurveySecureRoutes(app, deps) {
                     definition = defRead.resource;
                 } catch (_) {}
                 const questions = definition
-                    ? await resolvePublicSurveyQuestions(getContainer, definition)
+                    ? await resolvePublicSurveyQuestions(getContainer, definition, {
+                          generalFeasibilityVariant: assignment.generalFeasibilityVariant || 'long',
+                      })
                     : [];
                 if (questions.length) {
                     const byId = new Map(answers.map((a) => [String(a.questionId), a]));
@@ -640,6 +652,12 @@ function registerSurveySecureRoutes(app, deps) {
                     body?.operator ||
                     readHeader(request, 'X-Artemis-Operator') ||
                     'unknown';
+                let generalFeasibilityVariant = normalizeGeneralFeasibilityVariant(
+                    body?.generalFeasibilityVariant ?? 'long'
+                );
+                if (isGeneralFeasibilitySurveyId(surveyId)) {
+                    generalFeasibilityVariant = 'none';
+                }
 
                 if (!surveyId) {
                     return {
@@ -695,6 +713,7 @@ function registerSurveySecureRoutes(app, deps) {
                             targetEmail: email || undefined,
                             status: 'sent',
                             allowResubmit: true,
+                            generalFeasibilityVariant,
                             createdAt: now,
                             updatedAt: now,
                             lastSentAt: now,

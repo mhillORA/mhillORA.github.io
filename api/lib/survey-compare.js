@@ -3,6 +3,47 @@
  * Status buckets: changed | unchanged | unanswered
  */
 const GENERAL_FEASIBILITY_SURVEY_ID = 'survey-general-feasibility';
+const GENERAL_FEASIBILITY_SHORT_SURVEY_ID = 'survey-general-feasibility-short';
+const GENERAL_FEASIBILITY_SURVEY_IDS = new Set([
+    GENERAL_FEASIBILITY_SURVEY_ID,
+    GENERAL_FEASIBILITY_SHORT_SURVEY_ID,
+]);
+
+/** Compact GF uses the same question ids as Long so prefill/deltas stay aligned. */
+const GENERAL_FEASIBILITY_SHORT_QUESTION_IDS = [
+    'gf_02_site-name',
+    'gf_03_address',
+    'gf_04_phone',
+    'gf_05_practice-setting',
+    'gf_06_investigators',
+    'gf_07_investigator-1',
+    'gf_08_inv-1-credentials',
+    'gf_09_inv-1-email',
+    'gf_10_inv-1-specialties',
+    'gf_11_experience-yrs',
+    'gf_15_research-contact',
+    'gf_16_poc-email',
+    'gf_17_poc-role',
+    'gf_18_site-coordinators',
+    'gf_19_research-experience',
+    'gf_20_please-indicate-the-types-of-ophthalmic-studies-your-sit',
+    'gf_25_equipment',
+    'gf_29_central-irb',
+    'gf_30_contracting-contact',
+    'gf_31_trials-last-12-mo',
+    'gf_32_enrolled-last-12-mo',
+];
+
+function normalizeGeneralFeasibilityVariant(raw) {
+    const v = String(raw || 'long').trim().toLowerCase();
+    if (v === 'none' || v === 'off' || v === 'skip') return 'none';
+    if (v === 'short' || v === 'sm') return 'short';
+    return 'long';
+}
+
+function isGeneralFeasibilitySurveyId(id) {
+    return GENERAL_FEASIBILITY_SURVEY_IDS.has(String(id || ''));
+}
 
 function normalizeQuestionLabel(label) {
     return String(label || '')
@@ -187,10 +228,11 @@ function compareSurveyResponses({ current, previous, questions } = {}) {
 function mergeGeneralFeasibilityQuestions(studyQuestions, genQuestions, { studySurveyId } = {}) {
     const gen = Array.isArray(genQuestions) ? genQuestions : [];
     const study = Array.isArray(studyQuestions) ? studyQuestions : [];
-    if (!gen.length) return study.map((q) => ({ ...q }));
-    if (studySurveyId && String(studySurveyId) === GENERAL_FEASIBILITY_SURVEY_ID) {
-        return gen.map((q) => ({ ...q, _fromGeneralFeasibility: true }));
+    // Standing alone as GF long/short — do not prepend again.
+    if (studySurveyId && isGeneralFeasibilitySurveyId(studySurveyId)) {
+        return study.map((q) => ({ ...q, _fromGeneralFeasibility: true }));
     }
+    if (!gen.length) return study.map((q) => ({ ...q }));
 
     const seenIds = new Set();
     const seenLabels = new Set();
@@ -224,6 +266,11 @@ function mergeGeneralFeasibilityQuestions(studyQuestions, genQuestions, { studyS
 
 module.exports = {
     GENERAL_FEASIBILITY_SURVEY_ID,
+    GENERAL_FEASIBILITY_SHORT_SURVEY_ID,
+    GENERAL_FEASIBILITY_SURVEY_IDS,
+    GENERAL_FEASIBILITY_SHORT_QUESTION_IDS,
+    normalizeGeneralFeasibilityVariant,
+    isGeneralFeasibilitySurveyId,
     normalizeQuestionLabel,
     readAnswerValue,
     answerIsFilled,

@@ -9,6 +9,10 @@ const {
     compareSurveyResponses,
     mergeGeneralFeasibilityQuestions,
     GENERAL_FEASIBILITY_SURVEY_ID,
+    GENERAL_FEASIBILITY_SHORT_SURVEY_ID,
+    GENERAL_FEASIBILITY_SHORT_QUESTION_IDS,
+    normalizeGeneralFeasibilityVariant,
+    isGeneralFeasibilitySurveyId,
 } = require('./survey-compare');
 
 function sortByIsoDesc(rows, keys) {
@@ -338,23 +342,51 @@ async function resolveRelatedSiteIds(getContainer, siteId) {
     return [...ids];
 }
 
-async function loadGeneralFeasibilityDefinition(getContainer) {
+async function loadGeneralFeasibilityDefinition(getContainer, variant = 'long') {
+    const v = normalizeGeneralFeasibilityVariant(variant);
+    if (v === 'none') return null;
+    const primaryId = v === 'short' ? GENERAL_FEASIBILITY_SHORT_SURVEY_ID : GENERAL_FEASIBILITY_SURVEY_ID;
     try {
-        const read = await getContainer('site-survey-definitions')
-            .item(GENERAL_FEASIBILITY_SURVEY_ID, GENERAL_FEASIBILITY_SURVEY_ID)
-            .read();
-        return read.resource || null;
+        const read = await getContainer('site-survey-definitions').item(primaryId, primaryId).read();
+        if (read.resource) return read.resource;
     } catch (_) {
-        return null;
+        /* fall through */
     }
+    // Short missing: derive from Long using shared question ids
+    if (v === 'short') {
+        try {
+            const read = await getContainer('site-survey-definitions')
+                .item(GENERAL_FEASIBILITY_SURVEY_ID, GENERAL_FEASIBILITY_SURVEY_ID)
+                .read();
+            const longDef = read.resource;
+            if (!longDef) return null;
+            const allow = new Set(GENERAL_FEASIBILITY_SHORT_QUESTION_IDS);
+            return {
+                ...longDef,
+                id: GENERAL_FEASIBILITY_SHORT_SURVEY_ID,
+                title: 'General Feasibility (Short)',
+                questions: (longDef.questions || []).filter((q) => allow.has(String(q?.id || ''))),
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+    return null;
 }
 
 /** Definition questions with General Feasibility always first (deduped). Required defaults to true. */
-async function resolvePublicSurveyQuestions(getContainer, definition) {
+async function resolvePublicSurveyQuestions(getContainer, definition, opts = {}) {
     const studyQs = Array.isArray(definition?.questions) ? definition.questions : [];
+    let variant = normalizeGeneralFeasibilityVariant(
+        opts.generalFeasibilityVariant ?? definition?.generalFeasibilityVariant ?? 'long'
+    );
+    // Sending GF itself — do not double-prepend
+    if (isGeneralFeasibilitySurveyId(definition?.id)) {
+        variant = 'none';
+    }
     let genQs = [];
-    if (definition?.id !== GENERAL_FEASIBILITY_SURVEY_ID) {
-        const genDef = await loadGeneralFeasibilityDefinition(getContainer);
+    if (variant !== 'none') {
+        const genDef = await loadGeneralFeasibilityDefinition(getContainer, variant);
         genQs = Array.isArray(genDef?.questions) ? genDef.questions : [];
     }
     const merged = mergeGeneralFeasibilityQuestions(studyQs, genQs, {
@@ -365,6 +397,7 @@ async function resolvePublicSurveyQuestions(getContainer, definition) {
         id: q.id || `q_${idx}`,
         // Default required unless explicitly false. Branching still only enforced when visible.
         required: q.required !== false,
+        fromGeneralFeasibility: !!q._fromGeneralFeasibility || !!q.fromGeneralFeasibility,
     }));
 }
 
@@ -488,5 +521,8 @@ module.exports = {
     compareSurveyResponses,
     mergeGeneralFeasibilityQuestions,
     GENERAL_FEASIBILITY_SURVEY_ID,
+    GENERAL_FEASIBILITY_SHORT_SURVEY_ID,
+    normalizeGeneralFeasibilityVariant,
+    isGeneralFeasibilitySurveyId,
     writeSurveyResponse,
 };

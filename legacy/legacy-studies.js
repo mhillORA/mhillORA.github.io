@@ -243,11 +243,35 @@
     </select>`;
   }
 
+  /** Whole-number display for screened / scheduled / enrolled counts. */
   function fmt(n) {
     if (n == null || n === '') return '—';
     const x = Number(n);
     if (Number.isNaN(x)) return String(n);
-    return x.toLocaleString(undefined, { maximumFractionDigits: 1 });
+    return Math.round(x).toLocaleString();
+  }
+
+  /** Rank this site's enrolled count among all sites for a study (1 = highest). */
+  function enrollmentRankForStudy(studyId, siteId) {
+    if (!studyId || !siteId) return '—';
+    const bySite = new Map();
+    for (const raw of state.outcomes || []) {
+      const o = normOutcome(raw);
+      if (o.studyId !== studyId || !o.siteId) continue;
+      bySite.set(o.siteId, (bySite.get(o.siteId) || 0) + num(o.enrolled));
+    }
+    if (!bySite.size || !bySite.has(siteId)) return '—';
+    const ranked = [...bySite.entries()].sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])));
+    const idx = ranked.findIndex(([id]) => id === siteId);
+    return idx >= 0 ? String(idx + 1) : '—';
+  }
+
+  function sfRate(screened, enrolled) {
+    const s = Number(screened);
+    const e = Number(enrolled);
+    if (!s || Number.isNaN(s) || Number.isNaN(e) || s <= 0) return '—';
+    const fails = Math.max(0, s - e);
+    return `${Math.min(100, Math.max(0, (fails / s) * 100)).toFixed(1)}%`;
   }
 
   /** Conversion rate as percentage. Funnel steps (E/S, S/Sched) cap at 100%. */
@@ -288,6 +312,7 @@
       visit1Start: o.visit1Start || o.visit1_start || o.Visit1Start || '',
       lplv: o.lplv || o.LPLV || '',
       targetScheduled: o.targetScheduled ?? o.target_scheduled ?? null,
+      targetEnrolled: o.targetEnrolled ?? o.target_enrolled ?? o.enrollmentTarget ?? null,
       scheduled: o.scheduled ?? null,
       screened: o.screened ?? o.screen ?? null,
       enrolled: o.enrolled ?? null,
@@ -308,6 +333,7 @@
       (a, raw) => {
         const o = normOutcome(raw);
         a.targetScheduled += num(o.targetScheduled);
+        a.targetEnrolled += num(o.targetEnrolled);
         a.scheduled += num(o.scheduled);
         a.screened += num(o.screened);
         a.enrolled += num(o.enrolled);
@@ -319,6 +345,7 @@
       },
       {
         targetScheduled: 0,
+        targetEnrolled: 0,
         scheduled: 0,
         screened: 0,
         enrolled: 0,
@@ -517,7 +544,7 @@
       <div class="space-y-4 px-1 sm:px-0" id="legacy-studies-root">
         <div class="flex flex-col gap-3">
           <div>
-            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Past studies</h2>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Completed Studies</h2>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
               Site–study outcomes from Anterior Segment Overview. Open a study for full site / PI / Visit1 / LPLV breakdown.
             </p>
@@ -590,7 +617,7 @@
       <div class="space-y-4 px-1 sm:px-0" id="legacy-sites-root">
         <div class="rounded-xl overflow-hidden border border-[#1B2A4A]/20 dark:border-[#1B2A4A]/60">
           <div class="bg-[#1B2A4A] px-4 py-3 sm:px-5 sm:py-4 text-white">
-            <h2 class="text-xl sm:text-2xl font-bold tracking-tight">Past sites</h2>
+            <h2 class="text-xl sm:text-2xl font-bold tracking-tight">Master Site List</h2>
             <p class="text-sm text-white/75 mt-1 max-w-3xl">
               Historical funnel + feasibility. Promote links (or creates) a live Site — Chaos schedules and NASA sync stay untouched.
             </p>
@@ -602,8 +629,8 @@
                 <option value="name-desc">Z → A</option>
                 <option value="enrolled">Most enrolled</option>
               </select>
-              <select id="legacy-site-pref-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]">
-                <option value="">All preferences</option>
+              <select id="legacy-site-pref-filter" class="px-3 py-3 sm:py-2 border rounded-md dark:bg-gray-800 dark:border-gray-600 text-base sm:text-sm w-full sm:w-auto min-h-[44px]" aria-label="Filter by site status">
+                <option value="">All site statuses</option>
                 <option value="prefer">Prefer</option>
                 <option value="neutral">Neutral</option>
                 <option value="cautious">Cautious</option>
@@ -1079,7 +1106,6 @@
         const enrolled = t.enrolled || num(m.enrolled);
         const screened = t.screened || num(m.screened);
         const scheduled = t.scheduled || num(m.scheduled);
-        const target = t.targetScheduled || num(m.targetScheduled);
         const nStudies = new Set(siteOutcomes.map((o) => o.studyId)).size || m.nStudies || 0;
         const checked = promoteSelected.has(s.id) ? 'checked' : '';
         return `<tr class="border-t dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40">
@@ -1096,7 +1122,6 @@
           <td class="px-3 py-2 text-xs font-mono text-gray-500">${escapeHtml(s.siteCode || '—')}</td>
           <td class="px-3 py-2">${preferenceBadge(s.relationshipPreference)}</td>
           <td class="px-3 py-2 text-right">${nStudies}</td>
-          <td class="px-3 py-2 text-right">${fmt(target)}</td>
           <td class="px-3 py-2 text-right">${fmt(scheduled)}</td>
           <td class="px-3 py-2 text-right">${fmt(screened)}</td>
           <td class="px-3 py-2 text-right font-semibold">${fmt(enrolled)}</td>
@@ -1121,14 +1146,13 @@
               </th>
               <th class="px-3 py-2">Site</th>
               <th class="px-3 py-2">Code</th>
-              <th class="px-3 py-2">Relationship</th>
+              <th class="px-3 py-2">Site Status</th>
               <th class="px-3 py-2 text-right">Studies</th>
-              <th class="px-3 py-2 text-right">Target</th>
               <th class="px-3 py-2 text-right">Sched</th>
               <th class="px-3 py-2 text-right">Screen</th>
               <th class="px-3 py-2 text-right">Enrolled</th>
-              <th class="px-3 py-2 text-right">E/S</th>
-              <th class="px-3 py-2 text-right">S/Sched</th>
+              <th class="px-3 py-2 text-right">Enrollment %</th>
+              <th class="px-3 py-2 text-right">Sched→Screen</th>
               <th class="px-3 py-2"></th>
             </tr>
           </thead>
@@ -1223,7 +1247,14 @@
       .map((st) => {
         const stTotals = sumOutcomes(st.rows);
         const meta = state.studies.find((x) => x.id === st.studyId);
-        return { ...st, t: stTotals, meta };
+        const groups = [...new Set(st.rows.map((r) => normOutcome(r).group).filter((g) => g != null && g !== ''))];
+        return {
+          ...st,
+          t: stTotals,
+          meta,
+          groupList: groups.length ? groups.join(', ') : '—',
+          enrollRank: enrollmentRankForStudy(st.studyId, site.id),
+        };
       })
       .sort((a, b) => b.t.enrolled - a.t.enrolled);
 
@@ -1231,6 +1262,18 @@
     const prefOptions = RELATIONSHIP_OPTIONS.map(
       (o) => `<option value="${o.value}" ${pref === o.value ? 'selected' : ''}>${o.label}</option>`
     ).join('');
+
+    const screenedVal = t.screened || m.screened;
+    const enrolledVal = t.enrolled || m.enrolled;
+    const scheduledVal = t.scheduled || m.scheduled;
+    const targetEnrolledVal =
+      t.targetEnrolled || m.targetEnrolled || m.targetEnrollment || null;
+    const targetEnrolledDisplay =
+      targetEnrolledVal != null && Number(targetEnrolledVal) > 0 ? fmt(targetEnrolledVal) : '—';
+    const enrolledVsTarget =
+      targetEnrolledVal != null && Number(targetEnrolledVal) > 0
+        ? rate(enrolledVal, targetEnrolledVal, { cap: false })
+        : '—';
 
     const inds = siteIndications(site);
     const surveyUi = global.ArtemisSurveyUI;
@@ -1246,6 +1289,20 @@
     const surveysHtml = surveyUi?.siteSurveySectionsHtml
       ? surveyUi.siteSurveySectionsHtml(site.id)
       : `<div class="text-sm text-gray-500">Survey UI not loaded.</div>`;
+
+    const lastFeasAt = (latestSurveys || [])
+      .map((r) => Date.parse(r.submittedAt || r.createdAt || ''))
+      .filter((t) => Number.isFinite(t))
+      .sort((a, b) => b - a)[0];
+    const feasStale =
+      !latestSurveys?.length ||
+      !Number.isFinite(lastFeasAt) ||
+      Date.now() - lastFeasAt > 90 * 24 * 60 * 60 * 1000;
+    const feasStaleBadge = feasStale
+      ? `<span class="inline-flex items-center gap-1.5 rounded-md border border-amber-200 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 px-2 py-0.5 text-xs font-semibold text-amber-900 dark:text-amber-200">Feasibility outdated
+          <button type="button" id="legacy-send-recurring-feas" class="text-indigo-700 dark:text-indigo-300 hover:underline font-semibold">Send recurring feasibility</button>
+        </span>`
+      : '';
 
     let profile = null;
     try {
@@ -1288,12 +1345,13 @@
       <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4 space-y-5">
         <div class="flex flex-col gap-3">
           <div>
-            <button type="button" id="legacy-back-sites" class="${TAP_BACK}">← All legacy sites</button>
+            <button type="button" id="legacy-back-sites" class="${TAP_BACK}">← Master Site List</button>
             <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1" id="legacy-site-heading">${escapeHtml(site.name)}</h3>
             <p class="text-sm text-gray-500 flex flex-wrap items-center gap-2 mt-1">
-              <span class="font-mono text-xs">${escapeHtml(site.siteCode || site.id)}</span>
+              <span class="font-mono text-xs font-semibold">${escapeHtml(site.siteCode || site.id)}</span>
               ${preferenceBadge(site.relationshipPreference)}
-              <span>· ${studyIds.length} studies · ${outcomes.length} rows · ${pis.length} PI(s) · ${latestSurveys.length} surveys</span>
+              ${feasStaleBadge}
+              <span>· ${studyIds.length} completed studies · ${outcomes.length} rows · ${pis.length} PI(s) · ${latestSurveys.length} surveys</span>
             </p>
             <div class="flex flex-wrap gap-1.5 mt-2">
               ${inds.map((i) => `<span class="inline-flex px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200">${escapeHtml(i)}</span>`).join('') || '<span class="text-xs text-gray-400">No indications / TA tagged</span>'}
@@ -1317,28 +1375,27 @@
             <input id="legacy-site-name" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]"
               value="${escapeHtml(site.name || '')}" required />
           </label>
-          <label class="text-sm">Site code
+          <label class="text-sm">Site code <span class="text-rose-600">*</span>
             <input id="legacy-site-code" class="mt-1 w-full px-3 py-3 sm:py-1.5 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px] font-mono"
-              value="${escapeHtml(site.siteCode || '')}" placeholder="Optional short code" />
+              value="${escapeHtml(site.siteCode || '')}" placeholder="Unique site identifier" required />
+            <p class="text-xs text-gray-500 mt-1">Required unique identifier for this site.</p>
           </label>
         </div>
 
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-sm">
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Target sched</div><div class="font-semibold">${fmt(t.targetScheduled || m.targetScheduled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Scheduled</div><div class="font-semibold">${fmt(t.scheduled || m.scheduled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Screened</div><div class="font-semibold">${fmt(t.screened || m.screened)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enrolled</div><div class="font-semibold text-indigo-600 dark:text-indigo-300">${fmt(t.enrolled || m.enrolled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Sched / Target</div><div class="font-semibold">${rate(t.scheduled || m.scheduled, t.targetScheduled || m.targetScheduled, { cap: false })}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Screen / Sched</div><div class="font-semibold">${rate(t.screened || m.screened, t.scheduled || m.scheduled)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enroll / Screen</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.screened || m.screened)}</div></div>
-          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enroll / Sched</div><div class="font-semibold">${rate(t.enrolled || m.enrolled, t.scheduled || m.scheduled)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Screened</div><div class="font-semibold">${fmt(screenedVal)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enrolled</div><div class="font-semibold text-indigo-600 dark:text-indigo-300">${fmt(enrolledVal)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Target Enrolled</div><div class="font-semibold">${targetEnrolledDisplay}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5"><div class="text-gray-500 text-xs">Enrolled Vs. Target</div><div class="font-semibold">${enrolledVsTarget}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5 sm:col-span-2"><div class="text-gray-500 text-xs">Scheduled to Screened Rate</div><div class="font-semibold">${rate(screenedVal, scheduledVal)}</div></div>
+          <div class="rounded border dark:border-gray-700 p-2.5 sm:col-span-2"><div class="text-gray-500 text-xs">Enrollment %</div><div class="font-semibold">${rate(enrolledVal, screenedVal)}</div></div>
         </div>
 
         <div class="rounded-lg border border-indigo-200 dark:border-indigo-800 bg-indigo-50/50 dark:bg-indigo-950/20 p-3 sm:p-4 space-y-3">
-          <h4 class="font-semibold text-gray-900 dark:text-white">Site relationship</h4>
-          <p class="text-xs text-gray-500">How we like working with this site — preserved across re-ingest.</p>
+          <h4 class="font-semibold text-gray-900 dark:text-white">Site Status</h4>
+          <p class="text-xs text-gray-500">Working preference for this site — preserved across re-ingest.</p>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <label class="text-sm md:col-span-2">Working preference
+            <label class="text-sm md:col-span-2">Site Status
               <select id="legacy-site-pref" class="mt-1 w-full px-3 py-3 sm:py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm min-h-[44px]">
                 ${prefOptions}
               </select>
@@ -1351,7 +1408,7 @@
               <textarea id="legacy-site-disadvantages" rows="4" placeholder="Friction, risk, or watch-outs…"
                 class="mt-1 w-full px-3 py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm">${escapeHtml(site.disadvantages || '')}</textarea>
             </label>
-            <label class="text-sm md:col-span-2">Relationship notes
+            <label class="text-sm md:col-span-2">Site status notes
               <textarea id="legacy-site-rel-notes" rows="2" placeholder="Contacts, history, context…"
                 class="mt-1 w-full px-3 py-2 border rounded dark:bg-gray-900 dark:border-gray-600 text-base sm:text-sm">${escapeHtml(site.relationshipNotes || '')}</textarea>
             </label>
@@ -1363,7 +1420,7 @@
         </div>
 
         <div>
-          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Studies at this site (${studyParts.length})</h4>
+          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Completed Studies (${studyParts.length})</h4>
           <div class="md:hidden space-y-2">
             ${studyParts
               .map((st) => {
@@ -1371,28 +1428,30 @@
                 const stPis = [...new Set(st.rows.map((r) => r.pi).filter(Boolean))].join(', ') || '—';
                 return `<div class="rounded-lg border dark:border-gray-700 p-3">
                   <div class="font-medium text-gray-900 dark:text-white">${escapeHtml(st.studyName || st.studyId)}</div>
-                  <div class="text-xs text-gray-500 mt-0.5">${escapeHtml(ta)} · PI ${escapeHtml(stPis)}</div>
+                  <div class="text-xs text-gray-500 mt-0.5">${escapeHtml(ta)} · PI ${escapeHtml(stPis)} · Groups ${escapeHtml(st.groupList)}</div>
                   <div class="grid grid-cols-3 gap-1.5 mt-2">
                     ${metricChip('Sched', fmt(st.t.scheduled))}
                     ${metricChip('Screen', fmt(st.t.screened))}
                     ${metricChip('Enrolled', fmt(st.t.enrolled), true)}
                   </div>
+                  <div class="text-xs text-gray-500 mt-2">SF rate ${sfRate(st.t.screened, st.t.enrolled)} · Rank ${escapeHtml(st.enrollRank)}</div>
                 </div>`;
               })
-              .join('') || '<p class="text-sm text-gray-500">No studies.</p>'}
+              .join('') || '<p class="text-sm text-gray-500">No completed studies.</p>'}
           </div>
           <div class="hidden md:block overflow-x-auto rounded border dark:border-gray-700">
             <table class="min-w-full text-sm">
               <thead class="bg-gray-50 dark:bg-gray-900/40 text-left">
                 <tr>
-                  <th class="px-3 py-2">Study</th>
-                  <th class="px-3 py-2">TA / Indication</th>
-                  <th class="px-3 py-2">PI(s)</th>
-                  <th class="px-3 py-2 text-right">Rows</th>
-                  <th class="px-3 py-2 text-right">Sched</th>
-                  <th class="px-3 py-2 text-right">Screen</th>
+                  <th class="px-3 py-2">Study Name</th>
+                  <th class="px-3 py-2">Indication</th>
+                  <th class="px-3 py-2">PI</th>
+                  <th class="px-3 py-2">Groups</th>
+                  <th class="px-3 py-2 text-right">Scheduled</th>
+                  <th class="px-3 py-2 text-right">Screened</th>
                   <th class="px-3 py-2 text-right">Enrolled</th>
-                  <th class="px-3 py-2 text-right">E/S</th>
+                  <th class="px-3 py-2 text-right">SF rate</th>
+                  <th class="px-3 py-2 text-right">Enrollment Ranking</th>
                 </tr>
               </thead>
               <tbody>
@@ -1404,11 +1463,12 @@
                       <td class="px-3 py-1.5 font-medium">${escapeHtml(st.studyName || st.studyId)}</td>
                       <td class="px-3 py-1.5">${escapeHtml(ta)}</td>
                       <td class="px-3 py-1.5 text-xs">${escapeHtml(stPis)}</td>
-                      <td class="px-3 py-1.5 text-right">${st.rows.length}</td>
+                      <td class="px-3 py-1.5 text-xs">${escapeHtml(st.groupList)}</td>
                       <td class="px-3 py-1.5 text-right">${fmt(st.t.scheduled)}</td>
                       <td class="px-3 py-1.5 text-right">${fmt(st.t.screened)}</td>
                       <td class="px-3 py-1.5 text-right font-semibold">${fmt(st.t.enrolled)}</td>
-                      <td class="px-3 py-1.5 text-right">${rate(st.t.enrolled, st.t.screened)}</td>
+                      <td class="px-3 py-1.5 text-right">${sfRate(st.t.screened, st.t.enrolled)}</td>
+                      <td class="px-3 py-1.5 text-right">${escapeHtml(st.enrollRank)}</td>
                     </tr>`;
                   })
                   .join('')}
@@ -1471,6 +1531,14 @@
       document.getElementById('sites-tab-btn')?.click();
     });
 
+    document.getElementById('legacy-send-recurring-feas')?.addEventListener('click', () => {
+      // Lightweight: jump to Feasibility send panel (assignment modal needs a live site id).
+      document.querySelector('[data-nav-tab="feasibility"]')?.click();
+      setTimeout(() => {
+        document.getElementById('new-site-survey-assignment-btn')?.click();
+      }, 80);
+    });
+
     document.getElementById('legacy-back-sites')?.addEventListener('click', () => {
       detail.classList.add('hidden');
       detail.innerHTML = '';
@@ -1490,9 +1558,14 @@
         alert('Site name is required');
         return;
       }
+      const codeVal = document.getElementById('legacy-site-code')?.value.trim();
+      if (!codeVal) {
+        alert('Site code is required as the unique identifier');
+        return;
+      }
       const payload = {
         name: nameVal,
-        siteCode: document.getElementById('legacy-site-code')?.value.trim() || null,
+        siteCode: codeVal,
         relationshipPreference: document.getElementById('legacy-site-pref').value || null,
         advantages: document.getElementById('legacy-site-advantages').value.trim() || null,
         disadvantages: document.getElementById('legacy-site-disadvantages').value.trim() || null,
@@ -1521,7 +1594,7 @@
       <section id="legacy-dashboard-root" class="border-t border-gray-200 dark:border-gray-700 pt-8 space-y-6">
         <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
           <div>
-            <h3 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Past studies overview</h3>
+            <h3 class="text-2xl font-bold text-gray-800 dark:text-gray-200">Completed Studies overview</h3>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
               Anterior Segment historical site–study outcomes (Completed Projects funnel).
             </p>
@@ -1762,7 +1835,7 @@
       <div class="rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4 space-y-4">
         <div class="flex flex-col gap-3">
           <div>
-            <button type="button" id="legacy-back-list" class="${TAP_BACK}">← All legacy studies</button>
+            <button type="button" id="legacy-back-list" class="${TAP_BACK}">← Completed Studies</button>
             <h3 class="text-xl font-bold text-gray-900 dark:text-white mt-1" id="legacy-study-heading">${escapeHtml(study.name || study.title)}</h3>
             <p class="text-sm text-gray-500">
               ${study.oraProjectNumber ? `ORA ${escapeHtml(study.oraProjectNumber)} · ` : ''}
@@ -2540,7 +2613,7 @@
             <table class="min-w-full text-sm">
               <thead><tr class="text-left bg-gray-50 dark:bg-gray-900/40">
                 <th class="px-3 py-2">Site</th>
-                <th class="px-3 py-2">Relationship</th>
+                <th class="px-3 py-2">Site Status</th>
                 <th class="px-3 py-2">Code</th>
                 <th class="px-3 py-2 text-right">Studies</th>
                 <th class="px-3 py-2 text-right">Rows</th>
